@@ -45,7 +45,7 @@ from breezy import (
     urlutils,
     )
 from vcsgraph import graph
-from breezy.bzr import (
+from bzrformats import (
     versionedfile,
     weave,
     )
@@ -448,7 +448,7 @@ class ConvertBzrDir4To5(Converter):
         Reads the inventory using the format 4 serializer and writes it
         back using the format 5 serializer.
         """
-        from .xml4 import inventory_serializer_v4
+        from bzrformats.xml4 import inventory_serializer_v4
 
         inv = inventory_serializer_v4.read_inventory(
             self.branch._transport.get("inventory")
@@ -557,7 +557,7 @@ class ConvertBzrDir4To5(Converter):
         Returns:
             The loaded inventory object.
         """
-        from .xml4 import inventory_serializer_v4
+        from bzrformats.xml4 import inventory_serializer_v4
 
         with self.branch.repository.inventory_store.get(rev_id) as f:
             inv = inventory_serializer_v4.read_inventory(f)

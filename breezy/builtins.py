@@ -21,6 +21,7 @@ import sys
 
 import breezy.bzr
 import breezy.git
+from bzrformats.errors import BzrFormatsError
 
 from . import controldir, errors, lazy_import, osutils, transport
 
@@ -617,6 +618,8 @@ class cmd_repair_workingtree(Command):  # noqa: D101
             try:
                 tree.check_state()
             except errors.BzrError:
+                pass  # There seems to be a real error here, so we'll reset
+            except BzrFormatsError:
                 pass  # There seems to be a real error here, so we'll reset
             else:
                 # Refuse

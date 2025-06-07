@@ -18,10 +18,10 @@
 from io import BytesIO
 
 import vcsgraph.graph as _mod_graph
+from bzrformats import inventory
 
 from ... import errors
 from ... import revision as _mod_revision
-from ...bzr import inventory
 from ...bzr.inventorytree import InventoryTreeChange
 
 
@@ -214,7 +214,7 @@ class RevisionStore:
 
     def _init_chk_inventory(self, revision_id, root_id):
         """Generate a CHKInventory for a parentless revision."""
-        from ...bzr import chk_map
+        from bzrformats import chk_map
 
         # Get the creation parameters
         chk_store = self.repo.chk_bytes

@@ -34,9 +34,10 @@ from vcsgraph.errors import NoCommonAncestor
 from vcsgraph.graph import FrozenHeadsCache
 from vcsgraph.tsort import topo_sort
 
+from bzrformats.generate_ids import gen_revision_id
+
 from ... import config as _mod_config
 from ... import osutils, ui
-from ...bzr.generate_ids import gen_revision_id
 from ...bzr.inventorytree import InventoryTreeChange
 from ...errors import BzrError, UnknownFormatError, UnrelatedBranches
 from ...merge import Merger

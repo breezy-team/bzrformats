@@ -35,7 +35,7 @@ lazy_import.lazy_import(
 from breezy import (
     add,
     )
-from breezy.bzr import (
+from bzrformats import (
     inventory as _mod_inventory,
     )
 """,
@@ -420,7 +420,7 @@ class InventoryTree(Tree):
             return iter_entries(self.root_inventory)
 
     def _get_plan_merge_data(self, path, other, base):
-        from . import versionedfile
+        from bzrformats import versionedfile
 
         file_id = self.path2id(path)
         vf = versionedfile._PlanMergeVersionedFile(file_id)
@@ -470,7 +470,7 @@ class InventoryTree(Tree):
 
     def _get_file_revision(self, path, file_id, vf, tree_revision):
         """Ensure that file_id, tree_revision is in vf to plan the merge."""
-        from . import versionedfile
+        from bzrformats import versionedfile
 
         last_revision = tree_revision
         parent_keys = [
@@ -593,7 +593,7 @@ class MutableInventoryTree(MutableTree, InventoryTree):
         :return None:
         :seealso Inventory.apply_delta: For details on the changes parameter.
         """
-        from .inventory_delta import InventoryDelta
+        from bzrformats.inventory_delta import InventoryDelta
 
         with self.lock_tree_write():
             self.flush()

@@ -19,8 +19,8 @@
 from vcsgraph.errors import GhostRevisionsHaveNoRevno
 
 from breezy import hooks
-from breezy.bzr import rio
 from breezy.version_info_formats import VersionInfoBuilder, create_date_str
+from bzrformats import rio
 
 from ..revision import NULL_REVISION
 

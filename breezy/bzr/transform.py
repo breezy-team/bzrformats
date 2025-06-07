@@ -25,6 +25,8 @@ import time
 from stat import S_IEXEC, S_ISREG
 from typing import Any
 
+from bzrformats import inventory
+
 from .. import (
     annotate,
     controldir,
@@ -61,7 +63,7 @@ from ..transform import (
 )
 from ..transport.local import file_kind
 from ..tree import find_previous_path
-from . import inventory, inventorytree, multiparent
+from . import inventorytree
 from .conflicts import Conflict
 
 

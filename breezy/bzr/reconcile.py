@@ -23,6 +23,7 @@ __all__ = [
     "VersionedFileRepoReconciler",
 ]
 
+from bzrformats.versionedfile import AdapterFactory, ChunkedContentFactory
 from vcsgraph.errors import RevisionNotPresent as VcsGraphRevisionNotPresent
 from vcsgraph.tsort import topo_sort
 
@@ -31,7 +32,6 @@ from .. import revision as _mod_revision
 from ..i18n import gettext
 from ..reconcile import ReconcileResult
 from ..trace import mutter
-from .versionedfile import AdapterFactory, ChunkedContentFactory
 
 
 class VersionedFileRepoReconciler:

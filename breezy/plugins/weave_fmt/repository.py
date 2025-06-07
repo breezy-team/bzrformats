@@ -41,15 +41,17 @@ from vcsgraph import (
 )
 """,
 )
-from ... import debug, errors, lockdir, osutils, trace, urlutils
-from ... import transport as _mod_transport
-from ...bzr import lockable_files, tuned_gzip, versionedfile, weave, weavefile
-from ...bzr.repository import RepositoryFormatMetaDir
-from ...bzr.versionedfile import (
+from bzrformats import tuned_gzip, versionedfile, weave, weavefile
+from bzrformats.versionedfile import (
     AbsentContentFactory,
     FulltextContentFactory,
     VersionedFiles,
 )
+
+from ... import debug, errors, lockdir, osutils, trace, urlutils
+from ... import transport as _mod_transport
+from ...bzr import lockable_files
+from ...bzr.repository import RepositoryFormatMetaDir
 from ...bzr.vf_repository import (
     InterSameDataRepository,
     MetaDirVersionedFileRepository,
@@ -68,13 +70,13 @@ class AllInOneRepository(VersionedFileRepository):
 
     @property
     def _revision_serializer(self):
-        from ...bzr.xml5 import revision_serializer_v5
+        from bzrformats.xml5 import revision_serializer_v5
 
         return revision_serializer_v5
 
     @property
     def _inventory_serializer(self):
-        from ...bzr.xml5 import inventory_serializer_v5
+        from bzrformats.xml5 import inventory_serializer_v5
 
         return inventory_serializer_v5
 
@@ -524,7 +526,7 @@ class RepositoryFormat4(PreSplitOutRepositoryFormat):
         return None
 
     def _get_revisions(self, repo_transport, repo):
-        from .xml4 import revision_serializer_v4
+        from bzrformats.xml4 import revision_serializer_v4
 
         return RevisionTextStore(
             repo_transport.clone("revision-store"),
@@ -563,13 +565,13 @@ class RepositoryFormat5(PreSplitOutRepositoryFormat):
 
     @property
     def _revision_serializer(self):
-        from ...bzr.xml5 import revision_serializer_v5
+        from bzrformats.xml5 import revision_serializer_v5
 
         return revision_serializer_v5
 
     @property
     def _inventory_serializer(self):
-        from ...bzr.xml5 import inventory_serializer_v5
+        from bzrformats.xml5 import inventory_serializer_v5
 
         return inventory_serializer_v5
 
@@ -588,7 +590,7 @@ class RepositoryFormat5(PreSplitOutRepositoryFormat):
         )
 
     def _get_revisions(self, repo_transport, repo):
-        from ...bzr.xml5 import revision_serializer_v5
+        from bzrformats.xml5 import revision_serializer_v5
 
         return RevisionTextStore(
             repo_transport.clone("revision-store"),
@@ -631,13 +633,13 @@ class RepositoryFormat6(PreSplitOutRepositoryFormat):
 
     @property
     def _revision_serializer(self):
-        from ...bzr.xml5 import revision_serializer_v5
+        from bzrformats.xml5 import revision_serializer_v5
 
         return revision_serializer_v5
 
     @property
     def _inventory_serializer(self):
-        from ...bzr.xml5 import inventory_serializer_v5
+        from bzrformats.xml5 import inventory_serializer_v5
 
         return inventory_serializer_v5
 
@@ -656,7 +658,7 @@ class RepositoryFormat6(PreSplitOutRepositoryFormat):
         )
 
     def _get_revisions(self, repo_transport, repo):
-        from ...bzr.xml5 import revision_serializer_v5
+        from bzrformats.xml5 import revision_serializer_v5
 
         return RevisionTextStore(
             repo_transport.clone("revision-store"),
@@ -708,13 +710,13 @@ class RepositoryFormat7(MetaDirVersionedFileRepositoryFormat):
 
     @property
     def _revision_serializer(self):
-        from ...bzr.xml5 import revision_serializer_v5
+        from bzrformats.xml5 import revision_serializer_v5
 
         return revision_serializer_v5
 
     @property
     def _inventory_serializer(self):
-        from ...bzr.xml5 import inventory_serializer_v5
+        from bzrformats.xml5 import inventory_serializer_v5
 
         return inventory_serializer_v5
 
@@ -734,7 +736,7 @@ class RepositoryFormat7(MetaDirVersionedFileRepositoryFormat):
         )
 
     def _get_revisions(self, repo_transport, repo):
-        from ...bzr.xml5 import revision_serializer_v5
+        from bzrformats.xml5 import revision_serializer_v5
 
         return RevisionTextStore(
             repo_transport.clone("revision-store"),

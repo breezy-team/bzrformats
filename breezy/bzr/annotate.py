@@ -27,7 +27,7 @@ from .. import errors, osutils, ui
 from ..annotate import Annotator
 
 if TYPE_CHECKING:
-    from .versionedfile import VersionedFiles
+    from bzrformats.versionedfile import VersionedFiles
 
 
 class VersionedFileAnnotator(Annotator):

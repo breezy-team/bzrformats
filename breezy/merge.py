@@ -1843,7 +1843,7 @@ class WeaveMerger(Merge3Merger):
         There is no distinction between lines that are meant to contain <<<<<<<
         and conflicts.
         """
-        from .bzr.versionedfile import PlanWeaveMerge
+        from bzrformats.versionedfile import PlanWeaveMerge
 
         base = self.base_tree if self.cherrypick else None
         plan = self._generate_merge_plan(this_path, base)
@@ -2096,8 +2096,8 @@ class MergeIntoMergeType(Merge3Merger):
         if target_id is None:
             raise PathNotInTree(self._target_subdir, "Target tree")
         name_in_target = osutils.basename(self._target_subdir)
-        from .bzr import generate_ids
-        from .bzr.inventory import InventoryDirectory
+        from bzrformats import generate_ids
+        from bzrformats.inventory import InventoryDirectory
 
         try:
             self.this_tree.id2path(subdir.file_id)
@@ -2563,9 +2563,8 @@ class _PlanMerge(_PlanMergeBase):
         return all_texts
 
     def _build_weave(self):
+        from bzrformats import weave
         from vcsgraph.tsort import merge_sort
-
-        from .bzr import weave
 
         self._weave = weave.Weave(weave_name="in_memory_weave", allow_reserved=True)
         parent_map = self._find_recursive_lcas()

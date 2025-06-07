@@ -25,20 +25,23 @@ from breezy import (
     transactions,
     )
 from breezy.bzr import (
-    knit as _mod_knit,
     lockable_files,
+    )
+from bzrformats import (
+    knit as _mod_knit,
     versionedfile,
     )
 """,
 )
 import contextlib
 
+from bzrformats.serializer import InventorySerializer, RevisionSerializer
+
 from .. import controldir, errors, lockdir, trace
 from .. import revision as _mod_revision
 from .. import transport as _mod_transport
 from ..repository import InterRepository, IsInWriteGroupError, Repository
 from .repository import RepositoryFormatMetaDir
-from .serializer import InventorySerializer, RevisionSerializer
 from .vf_repository import (
     InterSameDataRepository,
     MetaDirVersionedFileRepository,
@@ -246,13 +249,13 @@ class RepositoryFormatKnit(MetaDirVersionedFileRepositoryFormat):
 
     @property
     def _revision_serializer(self):
-        from .xml5 import revision_serializer_v5
+        from bzrformats.xml5 import revision_serializer_v5
 
         return revision_serializer_v5
 
     @property
     def _inventory_serializer(self):
-        from .xml5 import inventory_serializer_v5
+        from bzrformats.xml5 import inventory_serializer_v5
 
         return inventory_serializer_v5
 
@@ -407,13 +410,13 @@ class RepositoryFormatKnit1(RepositoryFormatKnit):
 
     @property
     def _revision_serializer(self):
-        from .xml5 import revision_serializer_v5
+        from bzrformats.xml5 import revision_serializer_v5
 
         return revision_serializer_v5
 
     @property
     def _inventory_serializer(self):
-        from .xml5 import inventory_serializer_v5
+        from bzrformats.xml5 import inventory_serializer_v5
 
         return inventory_serializer_v5
 
@@ -462,13 +465,13 @@ class RepositoryFormatKnit3(RepositoryFormatKnit):
 
     @property
     def _revision_serializer(self):
-        from .xml5 import revision_serializer_v5
+        from bzrformats.xml5 import revision_serializer_v5
 
         return revision_serializer_v5
 
     @property
     def _inventory_serializer(self):
-        from .xml7 import inventory_serializer_v7
+        from bzrformats.xml7 import inventory_serializer_v7
 
         return inventory_serializer_v7
 
@@ -513,13 +516,13 @@ class RepositoryFormatKnit4(RepositoryFormatKnit):
 
     @property
     def _revision_serializer(self):
-        from .xml5 import revision_serializer_v5
+        from bzrformats.xml5 import revision_serializer_v5
 
         return revision_serializer_v5
 
     @property
     def _inventory_serializer(self):
-        from .xml6 import inventory_serializer_v6
+        from bzrformats.xml6 import inventory_serializer_v6
 
         return inventory_serializer_v6
 
