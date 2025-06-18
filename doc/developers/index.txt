@@ -77,6 +77,7 @@ Other documents
    specifications
    implementation-notes
    miscellaneous-notes
+   bzrformats/index
 
 
 Licence
