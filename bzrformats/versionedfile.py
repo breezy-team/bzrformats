@@ -24,8 +24,9 @@ from io import BytesIO
 from typing import Any
 from zlib import adler32
 
-from breezy import errors, multiparent, revision, urlutils
-from breezy import graph as _mod_graph
+from breezy import errors, revision, urlutils
+from vcsgraph import multiparent
+from vcsgraph import graph as _mod_graph
 from breezy import transport as _mod_transport
 
 # Import complex osutils functions that are too difficult to replace

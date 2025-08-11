@@ -18,7 +18,9 @@
 
 import zlib
 
-from breezy import config, osutils, tests, trace
+import logging
+
+from breezy import config, osutils, tests
 from breezy.osutils import sha_string
 from breezy.tests.scenarios import load_tests_apply_scenarios
 
@@ -792,20 +794,28 @@ class TestGroupCompressVersionedFiles(TestCaseWithGroupCompressVersionedFiles):
 
     def test_inconsistent_redundant_inserts_warn(self):
         """Should not insert a record that is already present."""
-        warnings = []
-
-        def warning(template, args):
-            warnings.append(template % args)
-
-        _trace_warning = trace.warning
-        trace.warning = warning
+        # Capture logging warnings
+        import io
+        log_stream = io.StringIO()
+        handler = logging.StreamHandler(log_stream)
+        handler.setLevel(logging.WARNING)
+        
+        # Get the groupcompress logger
+        gc_logger = logging.getLogger('bzrformats.groupcompress')
+        gc_logger.addHandler(handler)
+        old_level = gc_logger.level
+        gc_logger.setLevel(logging.WARNING)
+        
         try:
             self.do_inconsistent_inserts(inconsistency_fatal=False)
         finally:
-            trace.warning = _trace_warning
+            gc_logger.removeHandler(handler)
+            gc_logger.setLevel(old_level)
+        
+        warnings = log_stream.getvalue()
         self.assertContainsRe(
-            "\n".join(warnings),
-            r"^inconsistent details in skipped record: \(b?'b',\)"
+            warnings,
+            r"inconsistent details in skipped record: \(b?'b',\)"
             r" \(b?'42 32 0 8', \(\(\),\)\)"
             r" \(b?'74 32 0 8', \(\(\(b?'a',\),\),\)\)$",
         )

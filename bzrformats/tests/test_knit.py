@@ -22,7 +22,8 @@ from io import BytesIO
 
 from patiencediff import PatienceSequenceMatcher
 
-from breezy import errors, multiparent, osutils
+from breezy import errors, osutils
+from vcsgraph import multiparent
 from breezy import transport as _mod_transport
 from breezy.bzr import knitpack_repo, pack_repo
 from breezy.tests import (

@@ -835,23 +835,23 @@ class Weave(VersionedFile):
         result = []
 
         # wow.
-        #  449       0   4474.6820   2356.5590   breezy.weave:556(_extract)
+        #  449       0   4474.6820   2356.5590   bzrformats.weave:556(_extract)
         #  +285282   0   1676.8040   1676.8040   +<isinstance>
         # 1.6 seconds in 'isinstance'.
         # changing the first isinstance:
-        #  449       0   2814.2660   1577.1760   breezy.weave:556(_extract)
+        #  449       0   2814.2660   1577.1760   bzrformats.weave:556(_extract)
         #  +140414   0    762.8050    762.8050   +<isinstance>
         # note that the inline time actually dropped (less function calls)
         # and total processing time was halved.
         # we're still spending ~1/4 of the method in isinstance though.
         # so lets hard code the acceptable string classes we expect:
-        #  449       0   1202.9420    786.2930   breezy.weave:556(_extract)
+        #  449       0   1202.9420    786.2930   bzrformats.weave:556(_extract)
         # +71352     0    377.5560    377.5560   +<method 'append' of 'list'
         #                                          objects>
         # yay, down to ~1/4 the initial extract time, and our inline time
         # has shrunk again, with isinstance no longer dominating.
         # tweaking the stack inclusion test to use a set gives:
-        #  449       0   1122.8030    713.0080   breezy.weave:556(_extract)
+        #  449       0   1122.8030    713.0080   bzrformats.weave:556(_extract)
         # +71352     0    354.9980    354.9980   +<method 'append' of 'list'
         #                                          objects>
         # - a 5% win, or possibly just noise. However with large istacks that
