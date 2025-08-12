@@ -1,15 +1,22 @@
 # Comprehensive Summary of Breezy Dependencies in bzrformats
 
-**Last Updated**: After moving graph-related imports to vcsgraph
+**Last Updated**: After moving all pack_repo classes including RetryWithNewPacks from breezy.bzr.pack_repo to bzrformats.pack_repo
 
 ## Overview
 
-- **Total breezy modules used**: 16 distinct modules (down from 20)
-- **Total files with breezy imports**: 38 out of 59 Python files (64%)
+- **Total breezy modules used**: 12 distinct modules (down from 20)
+- **Total files with breezy imports**: 35 out of 59 Python files (59%)
 - **Test files with breezy imports**: 23 files (most dependencies are in tests)
-- **Non-test files with breezy imports**: 15 files
+- **Non-test files with breezy imports**: 12 files
 
-Note: Graph-related imports (tsort, graph, multiparent) have been moved to vcsgraph package.
+Note: 
+- Graph-related imports (tsort, graph, multiparent) have been moved to vcsgraph package
+- _PlanMerge classes have been moved to bzrformats.merge
+- breezy.trace has been replaced with Python's standard logging module
+- textmerge and bisect_multi have been moved to bzrformats
+- _PrematchedMatcher has been moved from breezy.diff to bzrformats.diff
+- All pack_repo classes (_DirectPackAccess, Pack, ExistingPack, ResumedPack, NewPack, RetryWithNewPacks) have been moved from breezy.bzr.pack_repo to bzrformats.pack_repo
+- RetryWithNewPacks now derives from bzrformats.errors.BzrFormatsError instead of breezy.errors.BzrError
 
 ## Key Dependencies by Category
 
@@ -58,24 +65,17 @@ Note: breezy.trace has been removed - all files now use Python's standard loggin
 - **breezy.progress** (used in 1 file)
 
 ### 7. Algorithms & Utilities
-- **breezy.diff** (used in 1 file - knit.py)
-  
-- **breezy.bisect_multi** (used in 1 file - index.py)
 
-Note: tsort, graph, and multiparent imports have been moved to vcsgraph package.
+Note: The following have been moved:
+- tsort, graph, multiparent → vcsgraph package
+- bisect_multi → bzrformats.bisect_multi
+- _PrematchedMatcher → bzrformats.diff
+- textmerge → bzrformats.textmerge
+- All pack_repo classes → bzrformats.pack_repo
 
 ### 8. Higher-Level Components
 - **breezy.bzr.annotate** (used in 3 files)
   - `VersionedFileAnnotator` class
-  
-- **breezy.bzr.pack_repo** (used in 2 files)
-  - `_DirectPackAccess`, `RetryWithNewPacks`
-  
-- **breezy.merge** (used in 1 file - versionedfile.py)
-  - `_PlanMerge`, `_PlanLCAMerge`
-  
-- **breezy.textmerge** (used in 1 file - versionedfile.py)
-  - `TextMerge` class
 
 ### 9. Test Infrastructure
 - **breezy.tests** (used in 15 files)
@@ -97,15 +97,15 @@ Note: tsort, graph, and multiparent imports have been moved to vcsgraph package.
 ### Priority 3 - Significant Effort
 1. **Transport layer**: This is deeply integrated and would need a major abstraction
 2. **Revision and RevisionID types**: Would need careful API preservation
-3. **Annotate and merge functionality**: Complex algorithms that would need careful extraction
+3. **Annotate functionality**: VersionedFileAnnotator class would need careful extraction
 
 ### Priority 4 - Test-Only Dependencies
 Most test dependencies could remain as they only affect test execution, not the core functionality.
 
 ## Files with Most Dependencies
-1. **versionedfile.py** - 7 different breezy imports (was 9, now uses vcsgraph)
-2. **knit.py** - 7 different breezy imports (was 8, now uses vcsgraph) 
-3. **groupcompress.py** - 6 different breezy imports (was 7, now uses vcsgraph)
+1. **versionedfile.py** - 6 different breezy imports (was 9, now uses vcsgraph and local merge)
+2. **knit.py** - 6 different breezy imports (was 8, now uses vcsgraph and local diff module) 
+3. **groupcompress.py** - 5 different breezy imports (was 7, now uses vcsgraph and standard logging)
 4. **weave.py** - 5 different breezy imports (was 6, now uses vcsgraph)
 5. **dirstate.py** - 5 different breezy imports
 

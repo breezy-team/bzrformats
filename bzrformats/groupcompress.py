@@ -1072,9 +1072,8 @@ def make_pack_factory(graph, delta, keylength, inconsistency_fatal=True):
     :param delta: Delta compress contents.
     :param keylength: How long should keys be.
     """
-    from breezy.bzr.pack_repo import _DirectPackAccess
-
     from .pack import ContainerWriter
+    from .pack_repo import _DirectPackAccess
 
     def factory(transport):
         parents = graph
@@ -1511,7 +1510,7 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
         :return: An iterator of ContentFactory objects, each of which is only
             valid until the iterator is advanced.
         """
-        from breezy.bzr.pack_repo import RetryWithNewPacks
+        from .pack_repo import RetryWithNewPacks
 
         # keys might be a generator
         orig_keys = list(keys)

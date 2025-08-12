@@ -58,9 +58,10 @@ import operator
 import os
 from io import BytesIO
 
-from breezy import debug, diff, errors, ui
+from breezy import debug, errors, ui
+from . import diff
 from breezy import transport as _mod_transport
-from breezy.bzr import pack_repo
+from . import pack_repo
 from breezy.bzr.annotate import VersionedFileAnnotator
 from breezy.errors import InvalidRevisionId, RevisionNotPresent
 from breezy.osutils import sha_string, sha_strings
