@@ -725,7 +725,7 @@ class GraphIndex:
             keys supplied. No additional keys will be returned, and every
             key supplied that is in the index will be returned.
         """
-        from breezy import bisect_multi
+        from . import bisect_multi
 
         keys = set(keys)
         if not keys:

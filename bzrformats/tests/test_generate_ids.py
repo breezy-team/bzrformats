@@ -16,12 +16,12 @@
 
 """Tests for breezy/generate_ids.py."""
 
-from breezy import tests
+from . import TestCase, TestCaseInTempDir, TestCaseWithTransport
 
 from .. import generate_ids
 
 
-class TestFileIds(tests.TestCase):
+class TestFileIds(TestCase):
     """Test functions which generate file ids."""
 
     def assertGenFileId(self, regex, filename):
@@ -88,7 +88,7 @@ class TestFileIds(tests.TestCase):
         self.assertStartsWith(root_id, b"tree_root-")
 
 
-class TestGenRevisionId(tests.TestCase):
+class TestGenRevisionId(TestCase):
     """Test generating revision ids."""
 
     def assertGenRevisionId(self, regex, username, timestamp=None):

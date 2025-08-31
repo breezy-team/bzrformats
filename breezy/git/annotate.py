@@ -25,6 +25,7 @@ from bzrformats.versionedfile import UnavailableRepresentation
 
 from .. import osutils
 from ..errors import NoSuchRevision
+from vcsgraph.graph import Graph
 from ..revision import NULL_REVISION
 from .mapping import decode_git_path, encode_git_path
 

@@ -30,6 +30,7 @@ from vcsgraph import (
 )
 
 from .. import check, errors, lock, repository, trace, transactions, ui
+import vcsgraph.graph as _mod_graph
 from .. import revision as _mod_revision
 from ..decorators import only_raises
 from ..foreign import ForeignRepository

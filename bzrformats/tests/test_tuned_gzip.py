@@ -20,11 +20,11 @@
 import gzip
 from io import BytesIO
 
-from breezy import tests
+from . import TestCase, TestCaseInTempDir, TestCaseWithTransport
 from bzrformats import tuned_gzip
 
 
-class TestToGzip(tests.TestCase):
+class TestToGzip(TestCase):
     def assertToGzip(self, chunks):
         raw_bytes = b"".join(chunks)
         gzfromchunks = tuned_gzip.chunks_to_gzip(chunks)

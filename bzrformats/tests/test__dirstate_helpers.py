@@ -20,10 +20,12 @@ import bisect
 import os
 import time
 
-from breezy import osutils, tests
+from breezy import osutils
 from breezy.tests import features
-from breezy.tests.scenarios import load_tests_apply_scenarios, multiply_scenarios
-from breezy.tests.test_osutils import dir_reader_scenarios
+
+from . import TestCase
+from testscenarios import load_tests_apply_scenarios, multiply_scenarios
+from . import dir_reader_scenarios
 
 from .. import _dirstate_helpers_py, dirstate
 from . import test_dirstate
@@ -32,7 +34,7 @@ load_tests = load_tests_apply_scenarios
 
 
 compiled_dirstate_helpers_feature = features.ModuleAvailableFeature(
-    "breezy.bzr._dirstate_helpers_pyx"
+    "bzrformats._dirstate_helpers_pyx"
 )
 
 
@@ -224,7 +226,7 @@ class TestBisectPathMixin:
             self.assertBisect(paths, split_paths, path, exists=True)
 
 
-class TestBisectPathLeft(tests.TestCase, TestBisectPathMixin):
+class TestBisectPathLeft(TestCase, TestBisectPathMixin):
     """Run all Bisect Path tests against bisect_path_left."""
 
     def get_bisect_path(self):
@@ -236,7 +238,7 @@ class TestBisectPathLeft(tests.TestCase, TestBisectPathMixin):
         return bisect.bisect_left, 0
 
 
-class TestBisectPathRight(tests.TestCase, TestBisectPathMixin):
+class TestBisectPathRight(TestCase, TestBisectPathMixin):
     """Run all Bisect Path tests against bisect_path_right."""
 
     def get_bisect_path(self):
@@ -248,7 +250,7 @@ class TestBisectPathRight(tests.TestCase, TestBisectPathMixin):
         return bisect.bisect_right, -1
 
 
-class TestLtByDirs(tests.TestCase):
+class TestLtByDirs(TestCase):
     """Test an implementation of lt_by_dirs().
 
     lt_by_dirs() compares 2 paths by their directory sections, rather than as
@@ -345,7 +347,7 @@ class TestLtByDirs(tests.TestCase):
         self.assertCmpByDirs(-1, b"b/a", b"b/\xc2\xb5")  # u'b/a', u'b/\xb5'
 
 
-class TestLtPathByDirblock(tests.TestCase):
+class TestLtPathByDirblock(TestCase):
     """Test an implementation of lt_path_by_dirblock().
 
     lt_path_by_dirblock() compares two paths using the sort order used by
@@ -579,7 +581,7 @@ class TestCompiledReadDirblocks(TestReadDirblocks):
         return _read_dirblocks
 
 
-class TestUsingCompiledIfAvailable(tests.TestCase):
+class TestUsingCompiledIfAvailable(TestCase):
     """Check that any compiled functions that are available are the default.
 
     It is possible to have typos, etc in the import line, such that

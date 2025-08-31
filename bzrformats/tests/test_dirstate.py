@@ -22,11 +22,12 @@ import os
 import struct
 import tempfile
 
-from breezy import controldir, errors, memorytree, osutils, tests
+from breezy import controldir, errors, memorytree, osutils
 from breezy import revision as _mod_revision
 from breezy.bzr import inventorytree, workingtree_4
-from breezy.tests import features, test_osutils
-from breezy.tests.scenarios import load_tests_apply_scenarios
+from breezy.tests import features
+from . import TestCase, TestCaseInTempDir, TestCaseWithTransport, dir_reader_scenarios
+from testscenarios import load_tests_apply_scenarios
 
 from .. import dirstate, inventory
 from ..inventory import _make_delta
@@ -45,7 +46,7 @@ from ..inventory_delta import InventoryDelta
 # set_path_id  setting id when state is in memory modified
 
 
-class TestErrors(tests.TestCase):
+class TestErrors(TestCase):
     def test_dirstate_corrupt(self):
         error = dirstate.DirstateCorrupt(
             ".bzr/checkout/dirstate", 'trailing garbage: "x"'
@@ -60,10 +61,10 @@ class TestErrors(tests.TestCase):
 load_tests = load_tests_apply_scenarios
 
 
-class TestCaseWithDirState(tests.TestCaseWithTransport):
+class TestCaseWithDirState(TestCaseWithTransport):
     """Helper functions for creating DirState objects with various content."""
 
-    scenarios = test_osutils.dir_reader_scenarios()
+    scenarios = dir_reader_scenarios()
 
     # Set by load_tests
     _dir_reader_class = None
@@ -71,6 +72,9 @@ class TestCaseWithDirState(tests.TestCaseWithTransport):
 
     def setUp(self):
         super().setUp()
+        # If scenarios haven't been applied, use default unicode reader
+        if self._dir_reader_class is None:
+            self._dir_reader_class = osutils.UnicodeDirReader
         self.overrideAttr(osutils, "_selected_dir_reader", self._dir_reader_class())
 
     def create_empty_dirstate(self):
@@ -1685,10 +1689,10 @@ class TestDirStateManipulations(TestCaseWithDirState):
         state = dirstate.DirState.initialize("dirstate")
         self.addCleanup(state.unlock)
         self.assertRaises(
-            errors.BzrError, state.add, ".", b"ass-id", "directory", None, None
+            inventory.InvalidEntryName, state.add, ".", b"ass-id", "directory", None, None
         )
         self.assertRaises(
-            errors.BzrError, state.add, "..", b"ass-id", "directory", None, None
+            inventory.InvalidEntryName, state.add, "..", b"ass-id", "directory", None, None
         )
 
     def test_set_state_with_rename_b_a_bug_395556(self):
@@ -2175,7 +2179,7 @@ class TestIterChildEntries(TestCaseWithDirState):
         self.assertEqual(expected_result, list(state._iter_child_entries(1, b"")))
 
 
-class TestDirstateSortOrder(tests.TestCaseWithTransport):
+class TestDirstateSortOrder(TestCaseWithTransport):
     """Test that DirState adds entries in the right order."""
 
     def test_add_sorting(self):
@@ -2322,7 +2326,7 @@ class _FakeStat:
         )
 
 
-class TestPackStat(tests.TestCaseWithTransport):
+class TestPackStat(TestCaseWithTransport):
     def assertPackStat(self, expected, stat_value):
         """Check the packed and serialized form of a stat value."""
         self.assertEqual(expected, dirstate.pack_stat(stat_value))
@@ -2907,7 +2911,7 @@ class TestDiscardMergeParents(TestCaseWithDirState):
         self.assertEqual(exp_dirblocks, state._dirblocks)
 
 
-class Test_InvEntryToDetails(tests.TestCase):
+class Test_InvEntryToDetails(TestCase):
     def assertDetails(self, expected, inv_entry):
         details = dirstate._inv_entry_to_details(inv_entry)
         self.assertEqual(expected, details)
@@ -2932,7 +2936,7 @@ class Test_InvEntryToDetails(tests.TestCase):
         )
 
 
-class TestSHA1Provider(tests.TestCaseInTempDir):
+class TestSHA1Provider(TestCaseInTempDir):
     def test_sha1provider_is_an_interface(self):
         p = dirstate.SHA1Provider()
         self.assertRaises(NotImplementedError, p.sha1, "foo")
@@ -2969,7 +2973,7 @@ class _Repo:
         pass
 
 
-class TestUpdateBasisByDelta(tests.TestCase):
+class TestUpdateBasisByDelta(TestCase):
     def path_to_ie(self, path, file_id, rev_id, dir_ids):
         if path.endswith("/"):
             is_dir = True
@@ -3371,7 +3375,7 @@ class TestUpdateBasisByDelta(tests.TestCase):
         )
 
 
-class TestBisectDirblock(tests.TestCase):
+class TestBisectDirblock(TestCase):
     """Test that bisect_dirblock() returns the expected values.
 
     bisect_dirblock is intended to work like bisect.bisect_left() except it
@@ -3514,7 +3518,7 @@ def _unpack_stat(packed_stat):
     }
 
 
-class TestPackStatRobust(tests.TestCase):
+class TestPackStatRobust(TestCase):
     """Check packed representaton of stat values is robust on all inputs."""
 
     def pack(self, statlike_tuple):

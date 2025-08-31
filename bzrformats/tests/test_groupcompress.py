@@ -20,8 +20,10 @@ import zlib
 
 import logging
 
-from breezy import config, osutils, tests
+from breezy import config, osutils
 from breezy.osutils import sha_string
+
+from . import TestCase, TestCaseWithMemoryTransport, TestCaseWithTransport, TestNotApplicable
 from breezy.tests.scenarios import load_tests_apply_scenarios
 
 from .. import btree_index, groupcompress, knit, versionedfile
@@ -41,7 +43,7 @@ def group_compress_implementation_scenarios():
 load_tests = load_tests_apply_scenarios
 
 
-class TestGroupCompressor(tests.TestCase):
+class TestGroupCompressor(TestCase):
     def _chunks_to_repr_lines(self, chunks):
         return "\n".join(map(repr, b"".join(chunks).split(b"\n")))
 
@@ -301,7 +303,7 @@ class TestPythonGroupCompressor(TestGroupCompressor):
         self.assertEqual(sum(map(len, expected_lines)), end_point)
 
 
-class TestGroupCompressBlock(tests.TestCase):
+class TestGroupCompressBlock(TestCase):
     def make_block(self, key_to_text):
         """Create a GroupCompressBlock, filling it with the given texts."""
         compressor = groupcompress.GroupCompressor()
@@ -506,7 +508,7 @@ class TestGroupCompressBlock(tests.TestCase):
         )
 
 
-class TestCaseWithGroupCompressVersionedFiles(tests.TestCaseWithMemoryTransport):
+class TestCaseWithGroupCompressVersionedFiles(TestCaseWithMemoryTransport):
     def make_test_vf(
         self,
         create_graph,
@@ -842,7 +844,7 @@ class TestGroupCompressVersionedFiles(TestCaseWithGroupCompressVersionedFiles):
         self.assertEqual(0, len(vf._group_cache))
 
 
-class TestGroupCompressConfig(tests.TestCaseWithTransport):
+class TestGroupCompressConfig(TestCaseWithTransport):
     def make_test_vf(self):
         t = self.get_transport(".")
         t.ensure_base()
@@ -992,7 +994,7 @@ class Test_BatchingBlockFetcher(TestCaseWithGroupCompressVersionedFiles):
         self.assertEqual("groupcompress-block", factories[0].storage_kind)
 
 
-class TestLazyGroupCompress(tests.TestCaseWithTransport):
+class TestLazyGroupCompress(TestCaseWithTransport):
     _texts = {
         (b"key1",): b"this is a text\n"
         b"with a reasonable amount of compressible bytes\n"
@@ -1195,7 +1197,7 @@ class TestLazyGroupCompress(tests.TestCaseWithTransport):
         if not isinstance(
             groupcompress.GroupCompressor, groupcompress.PyrexGroupCompressor
         ):
-            raise tests.TestNotApplicable(
+            raise TestNotApplicable(
                 "pure-python compressor does not handle compressor_settings"
             )
         locations, old_block = self.make_block(self._texts)
@@ -1264,7 +1266,7 @@ class TestLazyGroupCompress(tests.TestCaseWithTransport):
         self.assertTrue(manager.check_is_well_utilized())
 
 
-class Test_GCBuildDetails(tests.TestCase):
+class Test_GCBuildDetails(TestCase):
     def test_acts_like_tuple(self):
         # _GCBuildDetails inlines some of the data that used to be spread out
         # across a bunch of tuples
@@ -1287,7 +1289,7 @@ class Test_GCBuildDetails(tests.TestCase):
         )
 
 
-class TestBase128Int(tests.TestCase):
+class TestBase128Int(TestCase):
     def assertEqualEncode(self, bytes, val):
         self.assertEqual(bytes, groupcompress.encode_base128_int(val))
 

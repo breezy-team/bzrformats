@@ -19,7 +19,7 @@
 
 import zlib
 
-from breezy.tests import TestCaseWithTransport
+from . import TestCaseWithTransport
 
 from .. import chunk_writer
 

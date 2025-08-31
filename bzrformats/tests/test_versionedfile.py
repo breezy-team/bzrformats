@@ -16,13 +16,14 @@
 
 """Tests for VersionedFile classes."""
 
-from breezy import errors, tests
+from breezy import errors
 from vcsgraph import multiparent
 
+from . import TestCase, TestCaseWithMemoryTransport
 from .. import groupcompress, versionedfile
 
 
-class Test_MPDiffGenerator(tests.TestCaseWithMemoryTransport):
+class Test_MPDiffGenerator(TestCaseWithMemoryTransport):
     # Should this be a per vf test?
 
     def make_vf(self):
@@ -138,7 +139,7 @@ class Test_MPDiffGenerator(tests.TestCaseWithMemoryTransport):
         self.assertEqual(expected_diffs, diffs)
 
 
-class ErrorTests(tests.TestCase):
+class ErrorTests(TestCase):
     def test_unavailable_representation(self):
         error = versionedfile.UnavailableRepresentation(("key",), "mpdiff", "fulltext")
         self.assertEqualDiff(

@@ -32,8 +32,18 @@ import sys
 from breezy import errors, osutils
 from breezy.osutils import (is_inside, is_inside_any, parent_directories, pathjoin,
                        splitpath)
-from .dirstate import DirState, DirstateCorrupt
-from .inventorytree import InventoryTreeChange
+from breezy.bzr.inventorytree import InventoryTreeChange
+
+# Delay import to avoid circular dependency
+DirstateCorrupt = None
+DirState = None
+
+def _ensure_dirstate_import():
+    global DirstateCorrupt, DirState
+    if DirstateCorrupt is None:
+        from .dirstate import DirstateCorrupt as DC, DirState as DS
+        DirstateCorrupt = DC
+        DirState = DS
 
 from cpython.tuple cimport PyTuple_New, PyTuple_SET_ITEM
 
@@ -60,8 +70,8 @@ cdef extern from "python-compat.h":
 cdef extern from *:
     ctypedef unsigned long size_t
 
-cdef extern from "_dirstate_helpers_pyx.h":
-    ctypedef int intptr_t
+cdef extern from "stdint.h":
+    ctypedef long intptr_t
 
 
 cdef extern from "stdlib.h":
@@ -213,6 +223,7 @@ cdef class Reader:
     cdef char *next # Pointer to the end of this record
 
     def __init__(self, text, state):
+        _ensure_dirstate_import()
         self.state = state
         self.text = text
         self.text_cstr = PyBytes_AsString(text)

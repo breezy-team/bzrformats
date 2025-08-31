@@ -27,6 +27,7 @@ from bzrformats.inventory import InventoryDirectory, InventoryFile
 
 from ...branchbuilder import BranchBuilder
 from ...errors import NoSuchRevision
+from vcsgraph.graph import DictParentsProvider, Graph
 from ...tests import TestCase, TestCaseWithTransport
 from ...tests.features import SymlinkFeature
 from ..cache import DictGitShaMap

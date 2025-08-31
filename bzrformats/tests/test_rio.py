@@ -26,7 +26,7 @@ import re
 from tempfile import TemporaryFile
 
 from breezy.osutils import IterableFile
-from breezy.tests import TestCase
+from . import TestCase
 
 from .. import rio as _mod_rio
 from ..rio_patch import read_patch_stanza, to_patch_lines

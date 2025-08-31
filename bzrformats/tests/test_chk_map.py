@@ -16,8 +16,9 @@
 
 """Tests for maps built on a CHK versionedfiles facility."""
 
-from breezy import errors, osutils, tests
+from breezy import errors, osutils
 
+from . import TestCase, TestCaseWithMemoryTransport
 from .. import chk_map, groupcompress
 from ..chk_map import (
     CHKMap,
@@ -32,7 +33,7 @@ from ..chk_map import (
 )
 
 
-class TestDeserialiseLeafNode(tests.TestCase):
+class TestDeserialiseLeafNode(TestCase):
     def assertDeserialiseErrors(self, text):
         self.assertRaises(
             (ValueError, IndexError),
@@ -151,7 +152,7 @@ class TestDeserialiseLeafNode(tests.TestCase):
         self.assertEqual(None, node.key())
 
 
-class TestDeserialiseInternalNode(tests.TestCase):
+class TestDeserialiseInternalNode(TestCase):
     def assertDeserialiseErrors(self, text):
         self.assertRaises(
             (ValueError, IndexError),
@@ -233,7 +234,7 @@ class TestDeserialiseInternalNode(tests.TestCase):
         self.assertEqual({b"pref\x00fo\x00": (b"sha1:abcd",)}, node._items)
 
 
-class TestNode(tests.TestCase):
+class TestNode(TestCase):
     def assertCommonPrefix(self, expected_common, prefix, key):
         common = common_prefix_pair(prefix, key)
         self.assertLessEqual(len(common), len(prefix))
@@ -260,7 +261,7 @@ class TestNode(tests.TestCase):
         self.assertCommonPrefix(b"", b"", b"")
 
 
-class TestCaseWithStore(tests.TestCaseWithMemoryTransport):
+class TestCaseWithStore(TestCaseWithMemoryTransport):
     def get_chk_bytes(self):
         # This creates a standalone CHK store.
         factory = groupcompress.make_pack_factory(False, False, 1)
@@ -3322,7 +3323,7 @@ class TestIterInterestingNodes(TestCaseWithExampleMaps):
         )
 
 
-class TestSearchKeys(tests.TestCase):
+class TestSearchKeys(TestCase):
     def assertSearchKey16(self, expected, key):
         self.assertEqual(expected, _search_key_16(key))
 
@@ -3365,7 +3366,7 @@ class TestSearchKeys(tests.TestCase):
         self.assertEqual({b"\n"}, unused_chars)
 
 
-class Test_BytesToTextKey(tests.TestCase):
+class Test_BytesToTextKey(TestCase):
     def assertBytesToTextKey(self, key, bytes):
         self.assertEqual(key, _bytes_to_text_key(bytes))
 

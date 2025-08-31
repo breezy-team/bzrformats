@@ -60,15 +60,6 @@ DEFAULT_CONTEXT_AMOUNT = 3
 # list, write them out directly, etc etc.
 
 
-class _PrematchedMatcher(difflib.SequenceMatcher):
-    """Allow SequenceMatcher operations to use predetermined blocks."""
-
-    def __init__(self, matching_blocks):
-        difflib.SequenceMatcher(self, None, None)
-        self.matching_blocks = matching_blocks
-        self.opcodes = None
-
-
 def internal_diff(
     old_label,
     oldlines,

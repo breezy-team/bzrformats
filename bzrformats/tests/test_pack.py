@@ -18,12 +18,12 @@
 
 from io import BytesIO
 
-from breezy import tests
+from . import TestCase, TestCaseInTempDir, TestCaseWithTransport
 
 from .. import pack
 
 
-class TestContainerSerialiser(tests.TestCase):
+class TestContainerSerialiser(TestCase):
     """Tests for the ContainerSerialiser class."""
 
     def test_construct(self):
@@ -72,7 +72,7 @@ class TestContainerSerialiser(tests.TestCase):
         self.assertEqual(b"B32\nname1\nname2\n\n", record)
 
 
-class TestContainerWriter(tests.TestCase):
+class TestContainerWriter(TestCase):
     def setUp(self):
         super().setUp()
         self.output = BytesIO()
@@ -223,7 +223,7 @@ class TestContainerWriter(tests.TestCase):
         self.assertEqual(2, self.writer.records_written)
 
 
-class TestContainerReader(tests.TestCase):
+class TestContainerReader(TestCase):
     """Tests for the ContainerReader.
 
     The ContainerReader reads format 1 containers, so these tests explicitly
@@ -356,7 +356,7 @@ class TestContainerReader(tests.TestCase):
         self.assertRaises(pack.InvalidRecordError, reader.validate)
 
 
-class TestBytesRecordReader(tests.TestCase):
+class TestBytesRecordReader(TestCase):
     """Tests for reading and validating Bytes records with
     BytesRecordReader.
 
@@ -524,7 +524,7 @@ class TestBytesRecordReader(tests.TestCase):
         self.assertEqual(b"", get_bytes(99))
 
 
-class TestMakeReadvReader(tests.TestCaseWithTransport):
+class TestMakeReadvReader(TestCaseWithTransport):
     def test_read_skipping_records(self):
         pack_data = BytesIO()
         writer = pack.ContainerWriter(pack_data.write)
@@ -545,7 +545,7 @@ class TestMakeReadvReader(tests.TestCaseWithTransport):
         self.assertEqual([([], b"abc"), ([(b"name2",)], b"ghi")], result)
 
 
-class TestReadvFile(tests.TestCaseWithTransport):
+class TestReadvFile(TestCaseWithTransport):
     """Tests of the ReadVFile class.
 
     Error cases are deliberately undefined: this code adapts the underlying
@@ -592,7 +592,7 @@ class TestReadvFile(tests.TestCaseWithTransport):
         self.assertEqual([b"0", b"\n", b"2\n4\n"], results)
 
 
-class PushParserTestCase(tests.TestCase):
+class PushParserTestCase(TestCase):
     """Base class for TestCases involving ContainerPushParser."""
 
     def make_parser_expecting_record_type(self):
@@ -733,7 +733,7 @@ class TestContainerPushParserBytesParsing(PushParserTestCase):
         self.assertEqual([], parser.read_pending_records())
 
 
-class TestErrors(tests.TestCase):
+class TestErrors(TestCase):
     def test_unknown_container_format(self):
         """Test the formatting of UnknownContainerFormatError."""
         e = pack.UnknownContainerFormatError("bad format string")

@@ -23,7 +23,7 @@ from io import BytesIO
 
 from breezy import osutils
 from breezy.revision import NULL_REVISION
-from breezy.tests import TestCase
+from . import TestCase
 from bzrformats import inventory, inventory_delta
 from bzrformats.inventory import Inventory, _make_delta
 from bzrformats.inventory_delta import InventoryDelta, InventoryDeltaError

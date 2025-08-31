@@ -1,4 +1,4 @@
-# Copyright (C) 2005 Canonical Ltd
+# Copyright (C) 2004-2011 Canonical Ltd.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -14,16 +14,15 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
-"""RIO (Repeated Input/Output) format.
+"""Diff utilities for bzrformats."""
 
-RIO is a simple text format for storing structured data in a text file.
-It is used in Bazaar for storing inventory, revisions, and other metadata.
-"""
+import difflib
 
-# Re-export everything from the Rust implementation
-from ._bzr_rs import rio
 
-# Import all public symbols from the rio module
-for name in dir(rio):
-    if not name.startswith("_"):
-        globals()[name] = getattr(rio, name)
+class _PrematchedMatcher(difflib.SequenceMatcher):
+    """Allow SequenceMatcher operations to use predetermined blocks."""
+
+    def __init__(self, matching_blocks):
+        difflib.SequenceMatcher(self, None, None)
+        self.matching_blocks = matching_blocks
+        self.opcodes = None

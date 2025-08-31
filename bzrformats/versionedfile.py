@@ -32,7 +32,7 @@ from breezy import transport as _mod_transport
 # Import complex osutils functions that are too difficult to replace
 from breezy.osutils import file_iterator
 from breezy.registry import Registry
-from breezy.textmerge import TextMerge
+from .textmerge import TextMerge
 
 from vcsgraph import (
     graph as _mod_graph,
@@ -1839,7 +1839,7 @@ class _PlanMergeVersionedFile(VersionedFiles):
 
     def plan_merge(self, ver_a, ver_b, base=None):
         """See VersionedFile.plan_merge."""
-        from breezy.merge import _PlanMerge
+        from .merge import _PlanMerge
 
         if base is None:
             return _PlanMerge(ver_a, ver_b, self, (self._file_id,)).plan_merge()

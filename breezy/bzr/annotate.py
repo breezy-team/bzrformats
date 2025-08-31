@@ -24,6 +24,7 @@ from vcsgraph import (
 
 from .. import annotate as _mod_annotate
 from .. import errors, osutils, ui
+from vcsgraph import graph as _mod_graph
 from ..annotate import Annotator
 
 if TYPE_CHECKING:

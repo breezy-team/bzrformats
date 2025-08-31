@@ -18,7 +18,7 @@
 
 import sys
 
-from breezy import tests
+from . import TestCase, TestCaseInTempDir, TestCaseWithTransport
 from breezy.tests import features
 from breezy.tests.scenarios import load_tests_apply_scenarios
 
@@ -110,7 +110,7 @@ same rabin hash
 """
 
 
-class TestMakeAndApplyDelta(tests.TestCase):
+class TestMakeAndApplyDelta(TestCase):
     scenarios = module_scenarios()
     _gc_module = None  # Set by load_tests
 
@@ -226,7 +226,7 @@ class TestMakeAndApplyDelta(tests.TestCase):
         )
 
 
-class TestMakeAndApplyCompatible(tests.TestCase):
+class TestMakeAndApplyCompatible(TestCase):
     scenarios = two_way_scenarios()
 
     make_delta = None  # Set by load_tests
@@ -247,7 +247,7 @@ class TestMakeAndApplyCompatible(tests.TestCase):
         self.assertMakeAndApply(_text3, _text2)
 
 
-class TestDeltaIndex(tests.TestCase):
+class TestDeltaIndex(TestCase):
     def setUp(self):
         super().setUp()
         # This test isn't multiplied, because we only have DeltaIndex for the

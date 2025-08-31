@@ -16,12 +16,12 @@
 
 """Tests for indices."""
 
-from breezy import tests, transport
+from . import TestCase, TestCaseInTempDir, TestCaseWithTransport, TestCaseWithMemoryTransport, transport
 
 from .. import index as _mod_index
 
 
-class ErrorTests(tests.TestCase):
+class ErrorTests(TestCase):
     def test_bad_index_format_signature(self):
         error = _mod_index.BadIndexFormatSignature("foo", "bar")
         self.assertEqual("foo is not an index of type bar.", str(error))
@@ -47,7 +47,7 @@ class ErrorTests(tests.TestCase):
         self.assertEqual("The value 'foo' is not a valid value.", str(error))
 
 
-class TestGraphIndexBuilder(tests.TestCaseWithMemoryTransport):
+class TestGraphIndexBuilder(TestCaseWithMemoryTransport):
     def test_build_index_empty(self):
         builder = _mod_index.GraphIndexBuilder()
         stream = builder.finish()
@@ -477,7 +477,7 @@ class TestGraphIndexBuilder(tests.TestCaseWithMemoryTransport):
         self.assertFalse(builder._optimize_for_size)
 
 
-class TestGraphIndex(tests.TestCaseWithMemoryTransport):
+class TestGraphIndex(TestCaseWithMemoryTransport):
     def make_key(self, number):
         return ((b"%d" % number) + b"X" * 100,)
 
@@ -1318,7 +1318,7 @@ class TestGraphIndex(tests.TestCaseWithMemoryTransport):
         _mod_index.GraphIndex(trans, "index", size, unlimited_cache=True)
 
 
-class TestCombinedGraphIndex(tests.TestCaseWithMemoryTransport):
+class TestCombinedGraphIndex(TestCaseWithMemoryTransport):
     def make_index(self, name, ref_lists=0, key_elements=1, nodes=None):
         if nodes is None:
             nodes = []
@@ -1828,7 +1828,7 @@ class TestCombinedGraphIndex(tests.TestCaseWithMemoryTransport):
         self.assertEqual({(b"one",), (b"two",)}, missing_keys)
 
 
-class TestInMemoryGraphIndex(tests.TestCaseWithMemoryTransport):
+class TestInMemoryGraphIndex(TestCaseWithMemoryTransport):
     def make_index(self, ref_lists=0, key_elements=1, nodes=None):
         if nodes is None:
             nodes = []
@@ -2015,7 +2015,7 @@ class TestInMemoryGraphIndex(tests.TestCaseWithMemoryTransport):
         index.validate()
 
 
-class TestGraphIndexPrefixAdapter(tests.TestCaseWithMemoryTransport):
+class TestGraphIndexPrefixAdapter(TestCaseWithMemoryTransport):
     def make_index(self, ref_lists=1, key_elements=2, nodes=None, add_callback=False):
         if nodes is None:
             nodes = []

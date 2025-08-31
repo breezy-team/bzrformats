@@ -26,10 +26,10 @@ from ... import controldir, errors, gpg, osutils, repository, tests, transport, 
 from ... import revision as _mod_revision
 from ...tests import TestCaseWithTransport, TestNotApplicable, test_server
 from ...transport import memory
-from .. import inventory
-from ..btree_index import BTreeGraphIndex
+from bzrformats import inventory
+from bzrformats.btree_index import BTreeGraphIndex
 from ..groupcompress_repo import RepositoryFormat2a
-from ..index import GraphIndex
+from bzrformats.index import GraphIndex
 from ..smart import client
 
 

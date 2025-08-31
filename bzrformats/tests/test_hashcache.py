@@ -18,7 +18,7 @@ import os
 import time
 
 from breezy import osutils
-from breezy.tests import TestCaseInTempDir
+from . import TestCaseInTempDir
 from breezy.tests.features import OsFifoFeature
 
 from .. import hashcache

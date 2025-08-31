@@ -17,7 +17,7 @@
 
 """Tests for the revision/inventory Serializers."""
 
-from breezy.tests import TestCase
+from . import TestCase
 from bzrformats import chk_serializer, xml5, xml6, xml7, xml8
 
 from .. import serializer

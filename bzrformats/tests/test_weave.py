@@ -25,7 +25,7 @@ from io import BytesIO
 from pprint import pformat
 
 from breezy import errors
-from breezy.tests import TestCase, TestCaseInTempDir
+from . import TestCase, TestCaseInTempDir
 
 from ..osutils import sha_string
 from ..weave import Weave, WeaveFormatError, WeaveInvalidChecksum

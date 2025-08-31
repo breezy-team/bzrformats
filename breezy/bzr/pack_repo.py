@@ -47,6 +47,7 @@ from bzrformats.index import (
 )
 from bzrformats import btree_index
 from bzrformats import index as _mod_index
+from bzrformats.pack_repo import RetryWithNewPacks
 from bzrformats import pack as _mod_pack
 from bzrformats.serializer import InventorySerializer, RevisionSerializer
 
@@ -65,39 +66,7 @@ from .vf_repository import (
 )
 
 
-class RetryWithNewPacks(errors.BzrError):
-    """Raised when we realize that the packs on disk have changed.
-
-    This is meant as more of a signaling exception, to trap between where a
-    local error occurred and the code that can actually handle the error and
-    code that can retry appropriately.
-    """
-
-    internal_error = True
-
-    _fmt = (
-        "Pack files have changed, reload and retry. context: %(context)s %(orig_error)s"
-    )
-
-    def __init__(self, context, reload_occurred, exc_info):
-        """Create a new RetryWithNewPacks error.
-
-        :param reload_occurred: Set to True if we know that the packs have
-            already been reloaded, and we are failing because of an in-memory
-            cache miss. If set to True then we will ignore if a reload says
-            nothing has changed, because we assume it has already reloaded. If
-            False, then a reload with nothing changed will force an error.
-        :param exc_info: The original exception traceback, so if there is a
-            problem we can raise the original error (value from sys.exc_info())
-        """
-        errors.BzrError.__init__(self)
-        self.context = context
-        self.reload_occurred = reload_occurred
-        self.exc_info = exc_info
-        self.orig_error = exc_info[1]
-        # TODO: The global error handler should probably treat this by
-        #       raising/printing the original exception with a bit about
-        #       RetryWithNewPacks also not being caught
+# RetryWithNewPacks is now imported from bzrformats.pack_repo above
 
 
 class RetryAutopack(RetryWithNewPacks):
@@ -162,7 +131,7 @@ class PackCommitBuilder(VersionedFileCommitBuilder):
             lossy=lossy,
             owns_transaction=owns_transaction,
         )
-        from ..graph import Graph
+        from vcsgraph.graph import Graph
 
         self._file_graph = Graph(repository._pack_collection.text_index.combined_index)
 
@@ -2019,7 +1988,7 @@ class PackRepository(MetaDirVersionedFileRepository):
         self._revision_serializer = _revision_serializer
         self._inventory_serializer = _inventory_serializer
         self._reconcile_fixes_text_parents = True
-        from ..graph import CachingParentsProvider
+        from vcsgraph.graph import CachingParentsProvider
 
         if self._format.supports_external_lookups:
             self._unstacked_provider = CachingParentsProvider(
@@ -2041,7 +2010,7 @@ class PackRepository(MetaDirVersionedFileRepository):
     def _make_parents_provider(self):
         if not self._format.supports_external_lookups:
             return self._unstacked_provider
-        from ..graph import StackedParentsProvider
+        from vcsgraph.graph import StackedParentsProvider
 
         return StackedParentsProvider(
             _LazyListJoin([self._unstacked_provider], self._fallback_repositories)

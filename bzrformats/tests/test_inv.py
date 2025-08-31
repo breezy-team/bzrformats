@@ -16,7 +16,7 @@
 
 
 from breezy import errors, osutils, repository, revision, tests, workingtree
-from breezy.tests import TestCase, TestCaseWithTransport
+from . import TestCase, TestCaseWithTransport, TestCaseWithMemoryTransport
 from breezy.tests.scenarios import load_tests_apply_scenarios
 from bzrformats import chk_map, groupcompress, inventory
 from bzrformats.inventory import (
@@ -853,7 +853,7 @@ class TestDescribeChanges(TestCase):
         self.assertEqual(expected_change, change)
 
 
-class TestCHKInventory(tests.TestCaseWithMemoryTransport):
+class TestCHKInventory(TestCaseWithMemoryTransport):
     def get_chk_bytes(self):
         factory = groupcompress.make_pack_factory(True, True, 1)
         trans = self.get_transport("")
@@ -1583,7 +1583,7 @@ class TestCHKInventory(tests.TestCaseWithMemoryTransport):
         )
 
 
-class TestCHKInventoryExpand(tests.TestCaseWithMemoryTransport):
+class TestCHKInventoryExpand(TestCaseWithMemoryTransport):
     def get_chk_bytes(self):
         factory = groupcompress.make_pack_factory(True, True, 1)
         trans = self.get_transport("")

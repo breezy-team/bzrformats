@@ -26,11 +26,13 @@ from breezy import errors, osutils
 from vcsgraph import multiparent
 from breezy import transport as _mod_transport
 from breezy.bzr import knitpack_repo, pack_repo
-from breezy.tests import (
+from . import (
     TestCase,
     TestCaseWithMemoryTransport,
     TestCaseWithTransport,
     TestNotApplicable,
+)
+from breezy.tests import (
     features,
 )
 

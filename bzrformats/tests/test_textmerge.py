@@ -15,10 +15,9 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 #
 # Author: Aaron Bentley <aaron.bentley@utoronto.ca>
-
 """Tests for text merging functionality."""
 
-from breezy.tests import TestCase
+from . import TestCase
 
 from ..textmerge import Merge2
 

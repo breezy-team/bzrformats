@@ -32,7 +32,7 @@ from vcsgraph import (
 
 from breezy import errors, osutils, progress, transport, ui
 from breezy.errors import RevisionAlreadyPresent, RevisionNotPresent
-from breezy.tests import (
+from . import (
     TestCase,
     TestCaseWithMemoryTransport,
     TestNotApplicable,

@@ -21,7 +21,7 @@ import pprint
 import zlib
 
 from breezy import fifo_cache, lru_cache, osutils, tests, transport
-from breezy.tests import TestCaseWithTransport, features, scenarios
+from . import TestCase, TestCaseWithTransport, features, scenarios
 
 from .. import btree_index
 from .. import index as _mod_index
@@ -39,7 +39,7 @@ def btreeparser_scenarios():
 
 
 compiled_btreeparser_feature = features.ModuleAvailableFeature(
-    "breezy.bzr._btree_serializer_pyx"
+    "bzrformats._btree_serializer_pyx"
 )
 
 
@@ -90,8 +90,7 @@ class BTreeTestCase(TestCaseWithTransport):
 
     def shrink_page_size(self):
         """Shrink the default page size so that less fits in a page."""
-        self.overrideAttr(btree_index, "_PAGE_SIZE")
-        btree_index._PAGE_SIZE = 2048
+        self.overrideAttr(btree_index, "_PAGE_SIZE", 2048)
 
     def assertEqualApproxCompressed(self, expected, actual, slop=6):
         """Check a count of compressed bytes is approximately as expected.
@@ -1440,14 +1439,14 @@ class TestBTreeNodes(BTreeTestCase):
         )
 
 
-class TestCompiledBtree(tests.TestCase):
+class TestCompiledBtree(TestCase):
     def test_exists(self):
         # This is just to let the user know if they don't have the feature
         # available
         self.requireFeature(compiled_btreeparser_feature)
 
 
-class TestMultiBisectRight(tests.TestCase):
+class TestMultiBisectRight(TestCase):
     def assertMultiBisectRight(self, offsets, search_keys, fixed_keys):
         self.assertEqual(
             offsets,
@@ -1489,7 +1488,7 @@ class TestMultiBisectRight(tests.TestCase):
         )
 
 
-class TestExpandOffsets(tests.TestCase):
+class TestExpandOffsets(TestCase):
     def make_index(self, size, recommended_pages=None):
         """Make an index with a generic size.
 
