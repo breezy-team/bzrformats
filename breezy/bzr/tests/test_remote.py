@@ -38,7 +38,8 @@ from bzrformats._bzr_rs import revision_bencode_serializer
 from ... import branch, config, controldir, errors, repository, tests, treebuilder
 from ... import transport as _mod_transport
 from ...branch import Branch
-from ...revision import NULL_REVISION, Revision
+from ...revision import NULL_REVISION
+from bzrformats.revision import Revision
 from ...tests import test_server
 from ...tests.scenarios import load_tests_apply_scenarios
 from ...transport.memory import MemoryTransport

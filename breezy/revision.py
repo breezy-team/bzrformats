@@ -26,21 +26,105 @@ trees.
 
 __docformat__ = "google"
 
-from bzrformats._bzr_rs import (  # noqa: F401
-    CURRENT_REVISION,
-    NULL_REVISION,
-    Revision,
-    check_not_reserved_id,
-    is_null,
-    is_reserved_id,
-)
+from typing import Protocol, Optional, runtime_checkable
 
 from . import errors
+
+# Special revision IDs
+NULL_REVISION = b"null:"
+CURRENT_REVISION = b"current:"
 
 RevisionID = bytes
 
 
-def iter_bugs(rev):
+def is_null(revision_id: RevisionID) -> bool:
+    """Check if a revision ID is the null revision."""
+    return revision_id == NULL_REVISION
+
+
+def is_reserved_id(revision_id: Optional[RevisionID]) -> bool:
+    """Check if a revision ID is reserved.
+    
+    Reserved IDs include null: and current:.
+    """
+    if revision_id is None:
+        return False
+    return revision_id in (NULL_REVISION, CURRENT_REVISION)
+
+
+def check_not_reserved_id(revision_id: Optional[RevisionID]) -> None:
+    """Raise an error if a revision ID is reserved."""
+    if is_reserved_id(revision_id):
+        raise errors.ReservedId(revision_id)
+
+
+@runtime_checkable
+class Revision(Protocol):
+    """Protocol for revision objects across different VCS backends.
+    
+    This protocol defines the common interface that all revision
+    implementations must provide, whether they're from Bazaar, Git,
+    or other version control systems.
+    """
+    
+    @property
+    def revision_id(self) -> RevisionID:
+        """The unique identifier for this revision."""
+        ...
+    
+    @property
+    def parent_ids(self) -> list[RevisionID]:
+        """List of parent revision IDs."""
+        ...
+    
+    @property
+    def committer(self) -> Optional[str]:
+        """The person who committed this revision."""
+        ...
+    
+    @property
+    def message(self) -> str:
+        """The commit message."""
+        ...
+    
+    @property
+    def timestamp(self) -> float:
+        """Unix timestamp when the revision was committed."""
+        ...
+    
+    @property
+    def timezone(self) -> Optional[int]:
+        """Timezone offset in seconds from UTC."""
+        ...
+    
+    @property
+    def properties(self) -> dict[str, bytes]:
+        """Additional properties stored with the revision."""
+        ...
+    
+    @property
+    def inventory_sha1(self) -> Optional[bytes]:
+        """SHA1 of the inventory for this revision (Bazaar-specific, optional)."""
+        ...
+    
+    def get_summary(self) -> str:
+        """Get the first line of the commit message."""
+        ...
+    
+    def get_apparent_authors(self) -> list[str]:
+        """Get the apparent authors of this revision.
+        
+        Returns authors from properties if available, otherwise
+        returns the committer.
+        """
+        ...
+    
+    def bug_urls(self) -> list[str]:
+        """Get bug URLs associated with this revision."""
+        ...
+
+
+def iter_bugs(rev: Revision):
     """Iterate over the bugs associated with this revision."""
     from . import bugtracker
 

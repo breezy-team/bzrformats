@@ -18,7 +18,7 @@ from io import BytesIO
 
 import breezy.osutils
 import bzrformats.xml5
-from breezy.revision import Revision
+from ..revision import Revision
 from . import TestCase
 from bzrformats import inventory, serializer, xml6, xml7, xml8
 from bzrformats.inventory import Inventory

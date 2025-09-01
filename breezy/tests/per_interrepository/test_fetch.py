@@ -26,7 +26,8 @@ from bzrformats.inventory_delta import InventoryDelta
 from ...bzr.vf_search import SearchResult
 from ...errors import NoSuchRevision
 from ...repository import WriteGroup
-from ...revision import NULL_REVISION, Revision
+from ...revision import NULL_REVISION
+from bzrformats.revision import Revision
 from .test_interrepository import check_repo_format_for_funky_id_on_win32
 
 
