@@ -26,21 +26,26 @@ import itertools
 from gzip import GzipFile
 from io import BytesIO
 
-from vcsgraph import (
-    known_graph as _mod_known_graph,
-)
+from vcsgraph import graph as _mod_graph
+from vcsgraph import known_graph as _mod_known_graph
 
-from breezy import errors, osutils, progress, transport, ui
-from breezy.errors import RevisionAlreadyPresent, RevisionNotPresent
+from ..transport import TransportNoSuchFile
+from ..inventory import Inventory, InventoryDirectory
+from bzrformats import osutils
+from ..errors import RevisionNotPresent
+from ..revision import Revision
+from bzrformats.errors import (
+    OutSideTransaction, ReadOnlyError, ReadOnlyObjectDirtiedError,
+    ReservedId, RevisionAlreadyPresent,
+)
 from . import (
     TestCase,
     TestCaseWithMemoryTransport,
     TestNotApplicable,
     TestSkipped,
 )
-from breezy.tests.http_utils import TestCaseWithWebserver
-from breezy.tests.scenarios import load_tests_apply_scenarios
-from breezy.transport.memory import MemoryTransport
+from testscenarios import load_tests_apply_scenarios
+from ..transport import MemoryTransport
 
 from .. import groupcompress
 from .. import knit as _mod_knit
@@ -248,14 +253,14 @@ class VersionedFileTestMixIn:
         # versioned files version sequences of bytes only.
         vf = self.get_file()
         self.assertRaises(
-            errors.BzrBadParameterUnicode,
+            TypeError,
             vf.add_lines,
             b"a",
             [],
             [b"a\n", "b\n", b"c\n"],
         )
         self.assertRaises(
-            (errors.BzrBadParameterUnicode, NotImplementedError),
+            (TypeError, NotImplementedError),
             vf.add_lines_with_ghosts,
             b"a",
             [],
@@ -291,10 +296,10 @@ class VersionedFileTestMixIn:
         # \r characters are not permitted in lines being added
         vf = self.get_file()
         self.assertRaises(
-            errors.BzrBadParameterContainsNewline, vf.add_lines, b"a", [], [b"a\n\n"]
+            ValueError, vf.add_lines, b"a", [], [b"a\n\n"]
         )
         self.assertRaises(
-            (errors.BzrBadParameterContainsNewline, NotImplementedError),
+            (ValueError, NotImplementedError),
             vf.add_lines_with_ghosts,
             b"a",
             [],
@@ -308,7 +313,7 @@ class VersionedFileTestMixIn:
     def test_add_reserved(self):
         vf = self.get_file()
         self.assertRaises(
-            errors.ReservedId, vf.add_lines, b"a:", [], [b"a\n", b"b\n", b"c\n"]
+            ReservedId, vf.add_lines, b"a:", [], [b"a\n", b"b\n", b"c\n"]
         )
 
     def test_add_lines_nostoresha(self):
@@ -334,7 +339,7 @@ class VersionedFileTestMixIn:
                 nostore_sha=sha,
             )
             # and no new version should have been added.
-            self.assertRaises(errors.RevisionNotPresent, vf.get_lines, version + b"2")
+            self.assertRaises(RevisionNotPresent, vf.get_lines, version + b"2")
 
     def test_add_lines_with_ghosts_nostoresha(self):
         """When nostore_sha is supplied using old content raises."""
@@ -364,7 +369,7 @@ class VersionedFileTestMixIn:
                 nostore_sha=sha,
             )
             # and no new version should have been added.
-            self.assertRaises(errors.RevisionNotPresent, vf.get_lines, version + b"2")
+            self.assertRaises(RevisionNotPresent, vf.get_lines, version + b"2")
 
     def test_add_lines_return_value(self):
         # add_lines should return the sha1 and the text size.
@@ -391,9 +396,9 @@ class VersionedFileTestMixIn:
 
     def test_get_reserved(self):
         vf = self.get_file()
-        self.assertRaises(errors.ReservedId, vf.get_texts, [b"b:"])
-        self.assertRaises(errors.ReservedId, vf.get_lines, b"b:")
-        self.assertRaises(errors.ReservedId, vf.get_text, b"b:")
+        self.assertRaises(ReservedId, vf.get_texts, [b"b:"])
+        self.assertRaises(ReservedId, vf.get_lines, b"b:")
+        self.assertRaises(ReservedId, vf.get_text, b"b:")
 
     def test_add_unchanged_last_line_noeol_snapshot(self):
         """Add a text with an unchanged last line with no eol should work."""
@@ -474,7 +479,7 @@ class VersionedFileTestMixIn:
         self.assertEqualDiff(b"newline\nline", vf.get_text(b"noeol2"))
 
     def test_make_mpdiffs(self):
-        from breezy.bzr import multiparent
+        from .. import multiparent
 
         vf = self.get_file("foo")
         self._setup_for_deltas(vf)
@@ -500,7 +505,7 @@ class VersionedFileTestMixIn:
         except NotImplementedError:
             # old Weave formats do not allow ghosts
             return
-        self.assertRaises(errors.RevisionNotPresent, vf.make_mpdiffs, [b"ghost"])
+        self.assertRaises(RevisionNotPresent, vf.make_mpdiffs, [b"ghost"])
 
     def _setup_for_deltas(self, f):
         self.assertFalse(f.has_version("base"))
@@ -592,9 +597,9 @@ class VersionedFileTestMixIn:
         self._transaction = "before"
         f = self.get_file()
         self._transaction = "after"
-        self.assertRaises(errors.OutSideTransaction, f.add_lines, b"", [], [])
+        self.assertRaises(OutSideTransaction, f.add_lines, b"", [], [])
         self.assertRaises(
-            errors.OutSideTransaction, f.add_lines_with_ghosts, b"", [], []
+            OutSideTransaction, f.add_lines_with_ghosts, b"", [], []
         )
 
     def test_copy_to(self):
@@ -671,13 +676,15 @@ class VersionedFileTestMixIn:
         # the ordering here is to make a tree so that dumb searches have
         # more changes to muck up.
 
-        class InstrumentedProgress(progress.ProgressTask):
+        class InstrumentedProgress:
             def __init__(self):
-                progress.ProgressTask.__init__(self)
                 self.updates = []
 
             def update(self, msg=None, current=None, total=None):
                 self.updates.append((msg, current, total))
+
+            def finished(self):
+                pass
 
         vf = self.get_file()
         # add a base to get included
@@ -813,9 +820,9 @@ class VersionedFileTestMixIn:
         factory = self.get_factory()
         vf = factory("id", t, 0o777, create=True, access_mode="w")
         vf = factory("id", t, access_mode="r")
-        self.assertRaises(errors.ReadOnlyError, vf.add_lines, b"base", [], [])
+        self.assertRaises(ReadOnlyError, vf.add_lines, b"base", [], [])
         self.assertRaises(
-            errors.ReadOnlyError, vf.add_lines_with_ghosts, b"base", [], []
+            ReadOnlyError, vf.add_lines_with_ghosts, b"base", [], []
         )
 
     def test_get_sha1s(self):
@@ -887,7 +894,7 @@ class TestWeave(TestCaseWithMemoryTransport, VersionedFileTestMixIn):
 
     def test_no_implicit_create(self):
         self.assertRaises(
-            transport.NoSuchFile,
+            TransportNoSuchFile,
             WeaveFile,
             "foo",
             self.get_transport(),
@@ -972,42 +979,6 @@ class TestPlanMergeVersionedFile(TestCaseWithMemoryTransport):
         self.assertEqual("absent", get_record(b"F").storage_kind)
 
 
-class TestReadonlyHttpMixin:
-    def get_transaction(self):
-        return 1
-
-    def test_readonly_http_works(self):
-        # we should be able to read from http with a versioned file.
-        self.get_file()
-        # try an empty file access
-        readonly_vf = self.get_factory()(
-            "foo", transport.get_transport_from_url(self.get_readonly_url("."))
-        )
-        self.assertEqual([], readonly_vf.versions())
-
-    def test_readonly_http_works_with_feeling(self):
-        # we should be able to read from http with a versioned file.
-        vf = self.get_file()
-        # now with feeling.
-        vf.add_lines(b"1", [], [b"a\n"])
-        vf.add_lines(b"2", [b"1"], [b"b\n", b"a\n"])
-        readonly_vf = self.get_factory()(
-            "foo", transport.get_transport_from_url(self.get_readonly_url("."))
-        )
-        self.assertEqual([b"1", b"2"], vf.versions())
-        self.assertEqual([b"1", b"2"], readonly_vf.versions())
-        for version in readonly_vf.versions():
-            readonly_vf.get_lines(version)
-
-
-class TestWeaveHTTP(TestCaseWithWebserver, TestReadonlyHttpMixin):
-    def get_file(self):
-        return WeaveFile(
-            "foo", self.get_transport(), create=True, get_scope=self.get_transaction
-        )
-
-    def get_factory(self):
-        return WeaveFile
 
 
 class MergeCasesMixin:
@@ -1727,8 +1698,12 @@ class TestVersionedFiles(TestCaseWithMemoryTransport):
 
     def test_check_progressbar_parameter(self):
         """A progress bar can be supplied because check can be a generator."""
-        pb = ui.ui_factory.nested_progress_bar()
-        self.addCleanup(pb.finished)
+
+        class _DummyProgressBar:
+            def update(self, *args): pass
+            def finished(self): pass
+
+        pb = _DummyProgressBar()
         files = self.get_versionedfiles()
         files.check(progress_bar=pb)
 
@@ -2651,7 +2626,7 @@ class TestVersionedFiles(TestCaseWithMemoryTransport):
         stream = source.get_record_stream(
             [(b"missing",) * self.key_length], "topological", False
         )
-        self.assertRaises(errors.RevisionNotPresent, files.insert_record_stream, stream)
+        self.assertRaises(RevisionNotPresent, files.insert_record_stream, stream)
 
     def test_insert_record_stream_out_of_order(self):
         """An out of order stream can either error or work."""
@@ -2781,7 +2756,7 @@ class TestVersionedFiles(TestCaseWithMemoryTransport):
             self.assertEqual(set(keys), set(files.get_parent_map(keys)))
         else:
             self.assertRaises(
-                errors.RevisionNotPresent, files.insert_record_stream, entries
+                RevisionNotPresent, files.insert_record_stream, entries
             )
             files.check()
 
@@ -2824,13 +2799,15 @@ class TestVersionedFiles(TestCaseWithMemoryTransport):
         # the ordering here is to make a tree so that dumb searches have
         # more changes to muck up.
 
-        class InstrumentedProgress(progress.ProgressTask):
+        class InstrumentedProgress:
             def __init__(self):
-                progress.ProgressTask.__init__(self)
                 self.updates = []
 
             def update(self, msg=None, current=None, total=None):
                 self.updates.append((msg, current, total))
+
+            def finished(self):
+                pass
 
         files = self.get_versionedfiles()
         # add a base to get included
@@ -2907,7 +2884,7 @@ class TestVersionedFiles(TestCaseWithMemoryTransport):
         )
 
     def test_make_mpdiffs(self):
-        from breezy.bzr import multiparent
+        from .. import multiparent
 
         files = self.get_versionedfiles("source")
         # add texts that should trip the knit maximum delta chain threshold
@@ -3070,57 +3047,3 @@ class VirtualVersionedFilesTests(TestCase):
         )
 
 
-class TestOrderingVersionedFilesDecorator(TestCaseWithMemoryTransport):
-    def get_ordering_vf(self, key_priority):
-        builder = self.make_branch_builder("test")
-        builder.start_series()
-        builder.build_snapshot(
-            None, [("add", ("", b"TREE_ROOT", "directory", None))], revision_id=b"A"
-        )
-        builder.build_snapshot([b"A"], [], revision_id=b"B")
-        builder.build_snapshot([b"B"], [], revision_id=b"C")
-        builder.build_snapshot([b"C"], [], revision_id=b"D")
-        builder.finish_series()
-        b = builder.get_branch()
-        b.lock_read()
-        self.addCleanup(b.unlock)
-        vf = b.repository.inventories
-        return versionedfile.OrderingVersionedFilesDecorator(vf, key_priority)
-
-    def test_get_empty(self):
-        vf = self.get_ordering_vf({})
-        self.assertEqual([], vf.calls)
-
-    def test_get_record_stream_topological(self):
-        vf = self.get_ordering_vf({(b"A",): 3, (b"B",): 2, (b"C",): 4, (b"D",): 1})
-        request_keys = [(b"B",), (b"C",), (b"D",), (b"A",)]
-        keys = [r.key for r in vf.get_record_stream(request_keys, "topological", False)]
-        # We should have gotten the keys in topological order
-        self.assertEqual([(b"A",), (b"B",), (b"C",), (b"D",)], keys)
-        # And recorded that the request was made
-        self.assertEqual(
-            [("get_record_stream", request_keys, "topological", False)], vf.calls
-        )
-
-    def test_get_record_stream_ordered(self):
-        vf = self.get_ordering_vf({(b"A",): 3, (b"B",): 2, (b"C",): 4, (b"D",): 1})
-        request_keys = [(b"B",), (b"C",), (b"D",), (b"A",)]
-        keys = [r.key for r in vf.get_record_stream(request_keys, "unordered", False)]
-        # They should be returned based on their priority
-        self.assertEqual([(b"D",), (b"B",), (b"A",), (b"C",)], keys)
-        # And the request recorded
-        self.assertEqual(
-            [("get_record_stream", request_keys, "unordered", False)], vf.calls
-        )
-
-    def test_get_record_stream_implicit_order(self):
-        vf = self.get_ordering_vf({(b"B",): 2, (b"D",): 1})
-        request_keys = [(b"B",), (b"C",), (b"D",), (b"A",)]
-        keys = [r.key for r in vf.get_record_stream(request_keys, "unordered", False)]
-        # A and C are not in the map, so they get sorted to the front. A comes
-        # before C alphabetically, so it comes back first
-        self.assertEqual([(b"A",), (b"C",), (b"D",), (b"B",)], keys)
-        # And the request recorded
-        self.assertEqual(
-            [("get_record_stream", request_keys, "unordered", False)], vf.calls
-        )

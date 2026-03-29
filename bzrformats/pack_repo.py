@@ -14,18 +14,19 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
-"""Pack repository objects that don't depend on breezy."""
+"""Pack repository objects."""
 
 import hashlib
 import sys
 import time
 
-from breezy import debug, errors, osutils
-from breezy import transport as _mod_transport
-from breezy.trace import mutter
+import logging
+
+logger = logging.getLogger(__name__)
 
 from . import btree_index, pack as _mod_pack
-from .errors import BzrFormatsError
+from .errors import BzrCheckError, BzrFormatsError, NoSuchFile
+from .transport import TransportNoSuchFile
 
 
 class RetryWithNewPacks(BzrFormatsError):
@@ -172,7 +173,7 @@ class _DirectPackAccess:
                 reader = _mod_pack.make_readv_reader(transport, path, offsets)
                 for _names, read_func in reader.iter_records():
                     yield read_func(None)
-            except _mod_transport.NoSuchFile as e:
+            except TransportNoSuchFile as e:
                 # A NoSuchFile error indicates that a pack file has gone
                 # missing on disk, we need to trigger a reload, and start over.
                 if self._reload_func is None:
@@ -299,7 +300,7 @@ class Pack:
         if missing_items:
             from pprint import pformat
 
-            raise errors.BzrCheckError(
+            raise BzrCheckError(
                 f"Newly created pack file {self!r} has delta references to "
                 f"items not in its repository:\n{pformat(missing_items)}"
             )
@@ -571,21 +572,21 @@ class NewPack(Pack):
         # under creation.
         self._cache_limit = 0
         # the temporary pack file name.
-        self.random_name = osutils.rand_chars(20) + upload_suffix
+        from .osutils import rand_chars
+        self.random_name = rand_chars(20) + upload_suffix
         # when was this pack started ?
         self.start_time = time.time()
         # open an output stream for the data added to the pack.
         self.write_stream = self.upload_transport.open_write_stream(
             self.random_name, mode=self._file_mode
         )
-        if debug.debug_flag_enabled("pack"):
-            mutter(
-                "%s: create_pack: pack stream open: %s%s t+%6.3fs",
-                time.ctime(),
-                self.upload_transport.base,
-                self.random_name,
-                time.time() - self.start_time,
-            )
+        logger.debug(
+            "%s: create_pack: pack stream open: %s%s t+%6.3fs",
+            time.ctime(),
+            self.upload_transport.base,
+            self.random_name,
+            time.time() - self.start_time,
+        )
         # A list of byte sequences to be written to the new pack, and the
         # aggregate size of them.  Stored as a list rather than separate
         # variables so that the _write_data closure below can update them.
@@ -707,16 +708,15 @@ class NewPack(Pack):
             new_name = "../packs/" + new_name
         self.upload_transport.move(self.random_name, new_name)
         self._state = "finished"
-        if debug.debug_flag_enabled("pack"):
-            # XXX: size might be interesting?
-            mutter(
-                "%s: create_pack: pack finished: %s%s->%s t+%6.3fs",
-                time.ctime(),
-                self.upload_transport.base,
-                self.random_name,
-                new_name,
-                time.time() - self.start_time,
-            )
+        # XXX: size might be interesting?
+        logger.debug(
+            "%s: create_pack: pack finished: %s%s->%s t+%6.3fs",
+            time.ctime(),
+            self.upload_transport.base,
+            self.random_name,
+            new_name,
+            time.time() - self.start_time,
+        )
 
     def flush(self):
         """Flush any current data."""
@@ -751,16 +751,15 @@ class NewPack(Pack):
             )
         )
         self.index_sizes[self.index_offset(index_type)] = len(index_bytes)
-        if debug.debug_flag_enabled("pack"):
-            # XXX: size might be interesting?
-            mutter(
-                "%s: create_pack: wrote %s index: %s%s t+%6.3fs",
-                time.ctime(),
-                label,
-                self.upload_transport.base,
-                self.random_name,
-                time.time() - self.start_time,
-            )
+        # XXX: size might be interesting?
+        logger.debug(
+            "%s: create_pack: wrote %s index: %s%s t+%6.3fs",
+            time.ctime(),
+            label,
+            self.upload_transport.base,
+            self.random_name,
+            time.time() - self.start_time,
+        )
         # Replace the writable index on this object with a readonly,
         # presently unloaded index. We should alter
         # the index layer to make its finish() error if add_node is

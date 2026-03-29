@@ -23,7 +23,8 @@ import tempfile
 import zlib
 from io import BytesIO
 
-from breezy import debug, fifo_cache, lru_cache, transport
+from . import lru_cache
+from .lru_cache import FIFOCache
 
 from . import chunk_writer, osutils
 from . import index as _mod_index
@@ -43,6 +44,7 @@ _NODE_CACHE_SIZE = 1000
 
 
 logger = logging.getLogger(name="bzrformats.btree_index")
+evil_logger = logging.getLogger(name="bzrformats.evil")
 
 
 class _BuilderRow:
@@ -186,11 +188,11 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
             (new_backing_file, size, backing_pos) = self._spill_mem_keys_and_combine()
         else:
             new_backing_file, size = self._spill_mem_keys_without_combining()
-        # Note: The transport here isn't strictly needed, because we will use
-        #       direct access to the new_backing._file object
-        new_backing = BTreeGraphIndex(
-            transport.get_transport_from_path("."), "<temp>", size
-        )
+        # The transport isn't used because we override _file directly below
+        class _DummyTransport:
+            def recommended_page_size(self):
+                return 4096
+        new_backing = BTreeGraphIndex(_DummyTransport(), "<temp>", size)
         # GC will clean up the file
         new_backing._file = new_backing_file
         if self._combine_backing_indices:
@@ -342,8 +344,7 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
             # division point, then we need a new root:
             if new_row:
                 # We need a new row
-                if debug.debug_flag_enabled("index"):
-                    logger.debug("Inserting new global row.")
+                logger.debug("Inserting new global row.")
                 new_row = _InternalBuilderRow()
                 reserved_bytes = 0
                 rows.insert(0, new_row)
@@ -456,8 +457,7 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
             no defined order for the result iteration - it will be in the most
             efficient order for the index (in this case dictionary hash order).
         """
-        if debug.debug_flag_enabled("evil"):
-            logger.debug("iter_all_entries scales with size of history.")
+        evil_logger.debug("iter_all_entries scales with size of history.")
         # Doing serial rather than ordered would be faster; but this shouldn't
         # be getting called routinely anyway.
         iterators = [self._iter_mem_nodes()]
@@ -682,7 +682,7 @@ class BTreeGraphIndex:
             # We use a FIFO here just to prevent possible blowout. However, a
             # 300k record btree has only 3k leaf nodes, and only 20 internal
             # nodes. A value of 100 scales to ~100*100*100 = 1M records.
-            self._internal_node_cache = fifo_cache.FIFOCache(100)
+            self._internal_node_cache = FIFOCache(100)
         self._key_count = None
         self._row_lengths = None
         self._row_offsets = None  # Start of each row, [-1] is the end
@@ -783,22 +783,19 @@ class BTreeGraphIndex:
         :param offsets: The offsets to be read
         :return: A list of offsets to download
         """
-        if debug.debug_flag_enabled("index"):
-            logger.debug("expanding: %s\toffsets: %s", self._name, offsets)
+        logger.debug("expanding: %s\toffsets: %s", self._name, offsets)
 
         if len(offsets) >= self._recommended_pages:
             # Don't add more, we are already requesting more than enough
-            if debug.debug_flag_enabled("index"):
-                logger.debug(
-                    "  not expanding large request (%s >= %s)",
-                    len(offsets),
-                    self._recommended_pages,
-                )
+            logger.debug(
+                "  not expanding large request (%s >= %s)",
+                len(offsets),
+                self._recommended_pages,
+            )
             return offsets
         if self._size is None:
             # Don't try anything, because we don't know where the file ends
-            if debug.debug_flag_enabled("index"):
-                logger.debug("  not expanding without knowing index size")
+            logger.debug("  not expanding without knowing index size")
             return offsets
         total_pages = self._compute_total_pages_in_index()
         cached_offsets = self._get_offsets_to_cached_pages()
@@ -810,8 +807,7 @@ class BTreeGraphIndex:
                 expanded = [x for x in range(total_pages) if x not in cached_offsets]
             else:
                 expanded = list(range(total_pages))
-            if debug.debug_flag_enabled("index"):
-                logger.debug("  reading all unread pages: %s", expanded)
+            evil_logger.debug("  reading all unread pages: %s", expanded)
             return expanded
 
         if self._root_node is None:
@@ -830,16 +826,14 @@ class BTreeGraphIndex:
                 # then it isn't worth expanding our request. Once we've read at
                 # least 2 nodes, then we are probably doing a search, and we
                 # start expanding our requests.
-                if debug.debug_flag_enabled("index"):
-                    logger.debug("  not expanding on first reads")
+                logger.debug("  not expanding on first reads")
                 return offsets
             final_offsets = self._expand_to_neighbors(
                 offsets, cached_offsets, total_pages
             )
 
         final_offsets = sorted(final_offsets)
-        if debug.debug_flag_enabled("index"):
-            logger.debug("expanded:  %s", final_offsets)
+        logger.debug("expanded:  %s", final_offsets)
         return final_offsets
 
     def _expand_to_neighbors(self, offsets, cached_offsets, total_pages):
@@ -1000,8 +994,7 @@ class BTreeGraphIndex:
             There is no defined order for the result iteration - it will be in
             the most efficient order for the index.
         """
-        if debug.debug_flag_enabled("evil"):
-            logger.debug("iter_all_entries scales with size of history.")
+        evil_logger.debug("iter_all_entries scales with size of history.")
         if not self.key_count():
             return
         if self._row_offsets[-1] == 1:

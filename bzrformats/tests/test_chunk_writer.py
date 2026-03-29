@@ -19,12 +19,12 @@
 
 import zlib
 
-from . import TestCaseWithTransport
+from . import TestCase
 
 from .. import chunk_writer
 
 
-class TestWriter(TestCaseWithTransport):
+class TestWriter(TestCase):
     def check_chunk(self, bytes_list, size):
         data = b"".join(bytes_list)
         self.assertEqual(size, len(data))

@@ -20,13 +20,13 @@ import logging
 import time
 import zlib
 
-from breezy import debug, errors
-from breezy.lru_cache import LRUSizeCache
+from .errors import InvalidRevisionId, ObjectNotLocked, ReadOnlyError
+from .lru_cache import LRUSizeCache
 
 from . import osutils
 from ._bzr_rs import groupcompress as _groupcompress_rs
 from .btree_index import BTreeBuilder
-from .errors import BzrFormatsError
+from .errors import BzrFormatsError, RevisionNotPresent
 from .osutils import sha_strings
 from .versionedfile import (
     AbsentContentFactory,
@@ -38,6 +38,7 @@ from .versionedfile import (
     adapter_registry,
 )
 
+evil_logger = logging.getLogger("bzrformats.evil")
 logger = logging.getLogger("bzrformats.groupcompress")
 
 _null_sha1 = _groupcompress_rs.NULL_SHA1
@@ -104,7 +105,7 @@ class DecompressCorruption(BzrFormatsError):
             self.orig_error = f", {orig_error}"
         else:
             self.orig_error = ""
-        errors.BzrError.__init__(self)
+        super().__init__()
 
 
 # The max zlib window size is 32kB, so if we set 'max_size' output of the
@@ -1388,7 +1389,7 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
         Returns:
             A VersionedFileAnnotator instance.
         """
-        from breezy.bzr.annotate import VersionedFileAnnotator
+        from .annotate import VersionedFileAnnotator
 
         return VersionedFileAnnotator(self)
 
@@ -1412,7 +1413,7 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
         """Check that version_id and lines are safe to add."""
         version_id = key[-1]
         if version_id is not None and osutils.contains_whitespace(version_id):
-            raise errors.InvalidRevisionId(version_id, self)
+            raise InvalidRevisionId(version_id, self)
         self.check_not_reserved_id(version_id)
         # TODO: If random_id==False and the key is already present, we should
         # probably check that the existing content is identical to what is
@@ -1724,27 +1725,8 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
             pass
 
     def _get_compressor_settings(self):
-        from breezy.config import GlobalConfig
-
         if self._max_bytes_to_index is None:
-            # TODO: VersionedFiles don't know about their containing
-            #       repository, so they don't have much of an idea about their
-            #       location. So for now, this is only a global option.
-            c = GlobalConfig()
-            val = c.get_user_option("bzr.groupcompress.max_bytes_to_index")
-            if val is not None:
-                try:
-                    val = int(val)
-                except ValueError:
-                    logger.warning(
-                        "Value for "
-                        '"bzr.groupcompress.max_bytes_to_index"'
-                        f" {val!r} is not an integer"
-                    )
-                    val = None
-            if val is None:
-                val = self._DEFAULT_MAX_BYTES_TO_INDEX
-            self._max_bytes_to_index = val
+            self._max_bytes_to_index = self._DEFAULT_MAX_BYTES_TO_INDEX
         return {"max_bytes_to_index": self._max_bytes_to_index}
 
     def _make_group_compressor(self):
@@ -1815,7 +1797,7 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
         for record in stream:
             # Raise an error when a record is missing.
             if record.storage_kind == "absent":
-                raise errors.RevisionNotPresent(record.key, self)
+                raise RevisionNotPresent(record.key, self)
             if random_id:
                 if record.key in inserted_keys:
                     logger.info(
@@ -1970,7 +1952,7 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
             if pb is not None:
                 pb.update("Walking content", key_idx, total)
             if record.storage_kind == "absent":
-                raise errors.RevisionNotPresent(key, self)
+                raise RevisionNotPresent(key, self)
             for line in record.iter_bytes_as("lines"):
                 yield line, key
         if pb is not None:
@@ -1978,8 +1960,7 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
 
     def keys(self):
         """See VersionedFiles.keys."""
-        if debug.debug_flag_enabled("evil"):
-            logger.debug("keys scales with size of history")
+        evil_logger.debug("keys scales with size of history")
         sources = [self._index] + self._immediate_fallback_vfs
         result = set()
         for source in sources:
@@ -2065,7 +2046,7 @@ class _GCGraphIndex:
     ):
         """Construct a _GCGraphIndex on a graph_index.
 
-        :param graph_index: An implementation of breezy.index.GraphIndex.
+        :param graph_index: An implementation of bzrformats.index.GraphIndex.
         :param is_locked: A callback, returns True if the index is locked and
             thus usable.
         :param parents: If True, record knits parents, if not do not record
@@ -2109,7 +2090,7 @@ class _GCGraphIndex:
             and no check for existence will be performed.
         """
         if not self._add_callback:
-            raise errors.ReadOnlyError(self)
+            raise ReadOnlyError(self)
         # we hope there are no repositories with inconsistent parentage
         # anymore.
 
@@ -2173,12 +2154,12 @@ class _GCGraphIndex:
     def _check_read(self):
         """Raise an exception if reads are not permitted."""
         if not self._is_locked():
-            raise errors.ObjectNotLocked(self)
+            raise ObjectNotLocked(self)
 
     def _check_write_ok(self):
         """Raise an exception if writes are not permitted."""
         if not self._is_locked():
-            raise errors.ObjectNotLocked(self)
+            raise ObjectNotLocked(self)
 
     def _get_entries(self, keys, check_present=False):
         """Get the entries for keys.
@@ -2202,7 +2183,7 @@ class _GCGraphIndex:
         if check_present:
             missing_keys = keys.difference(found_keys)
             if missing_keys:
-                raise errors.RevisionNotPresent(missing_keys.pop(), self)
+                raise RevisionNotPresent(missing_keys.pop(), self)
 
     def find_ancestry(self, keys):
         """See CombinedGraphIndex.find_ancestry."""

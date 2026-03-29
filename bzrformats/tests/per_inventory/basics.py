@@ -19,7 +19,9 @@
 # NOTE: Don't import Inventory here, to make sure that we don't accidentally
 # hardcode that when we should be using self.make_inventory
 
-from breezy import errors, osutils
+from bzrformats import osutils
+from bzrformats.errors import InconsistentDelta
+from bzrformats.inventory import NoSuchId
 from bzrformats import inventory
 from bzrformats.tests.per_inventory import TestCaseWithInventory
 
@@ -110,7 +112,7 @@ class TestInventoryCreateByApplyDelta(TestInventory):
             ),
             b"new-rev-2",
         )
-        self.assertRaises(errors.NoSuchId, inv.id2path, b"a-id")
+        self.assertRaises(NoSuchId, inv.id2path, b"a-id")
 
     def test_rename(self):
         inv = self.make_init_inventory()
@@ -134,7 +136,7 @@ class TestInventoryCreateByApplyDelta(TestInventory):
         # A file-id cannot appear in a delta more than once
         inv = self.make_init_inventory()
         self.assertRaises(
-            errors.InconsistentDelta,
+            InconsistentDelta,
             inv.create_by_apply_delta,
             InventoryDelta(
                 [

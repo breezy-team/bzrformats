@@ -24,8 +24,8 @@
 from io import BytesIO
 from pprint import pformat
 
-from breezy import errors
 from . import TestCase, TestCaseInTempDir
+from ..errors import ReservedId, RevisionAlreadyPresent, RevisionNotPresent
 
 from ..osutils import sha_string
 from ..weave import Weave, WeaveFormatError, WeaveInvalidChecksum
@@ -89,7 +89,7 @@ class InvalidAdd(TestBase):
         k = Weave()
 
         self.assertRaises(
-            errors.RevisionNotPresent, k.add_lines, b"text0", [b"69"], [b"new text!"]
+            RevisionNotPresent, k.add_lines, b"text0", [b"69"], [b"new text!"]
         )
 
 
@@ -109,14 +109,14 @@ class InvalidRepeatedAdd(TestBase):
         k.add_lines(b"basis", [], TEXT_0)
         k.add_lines(b"text0", [], TEXT_0)
         self.assertRaises(
-            errors.RevisionAlreadyPresent,
+            RevisionAlreadyPresent,
             k.add_lines,
             b"text0",
             [],
             [b"not the same text"],
         )
         self.assertRaises(
-            errors.RevisionAlreadyPresent,
+            RevisionAlreadyPresent,
             k.add_lines,
             b"text0",
             [b"basis"],  # not the right parents
@@ -744,7 +744,7 @@ class TestWeave(TestCase):
         # Add lines is checked at the WeaveFile level, not at the Weave level
         w.add_lines(b"name:", [], TEXT_1)
         # But get_lines is checked at this level
-        self.assertRaises(errors.ReservedId, w.get_lines, b"name:")
+        self.assertRaises(ReservedId, w.get_lines, b"name:")
 
     def test_allow_reserved_true(self):
         w = Weave("name", allow_reserved=True)

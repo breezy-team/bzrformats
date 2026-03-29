@@ -25,7 +25,7 @@ but this depends on the transport.
 import re
 from tempfile import TemporaryFile
 
-from breezy.osutils import IterableFile
+from ..osutils import IterableFile
 from . import TestCase
 
 from .. import rio as _mod_rio

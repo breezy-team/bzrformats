@@ -20,22 +20,22 @@ import zlib
 
 import logging
 
-from breezy import config, osutils
-from breezy.osutils import sha_string
+from .. import osutils
+from ..osutils import sha_string
 
-from . import TestCase, TestCaseWithMemoryTransport, TestCaseWithTransport, TestNotApplicable
-from breezy.tests.scenarios import load_tests_apply_scenarios
+from . import TestCase, TestCaseWithMemoryTransport, TestNotApplicable
+from testscenarios import load_tests_apply_scenarios
 
 from .. import btree_index, groupcompress, knit, versionedfile
 from .. import index as _mod_index
-from .test__groupcompress import compiled_groupcompress_feature
+from .test__groupcompress import _compiled_groupcompress_module
 
 
 def group_compress_implementation_scenarios():
     scenarios = [
         ("python", {"compressor": groupcompress.PythonGroupCompressor}),
     ]
-    if compiled_groupcompress_feature.available():
+    if _compiled_groupcompress_module is not None:
         scenarios.append(("C", {"compressor": groupcompress.PyrexGroupCompressor}))
     return scenarios
 
@@ -135,8 +135,12 @@ class TestAllGroupCompressors(TestGroupCompressor):
 
 
 class TestPyrexGroupCompressor(TestGroupCompressor):
-    _test_needs_features = [compiled_groupcompress_feature]
     compressor = groupcompress.PyrexGroupCompressor
+
+    def setUp(self):
+        super().setUp()
+        if _compiled_groupcompress_module is None:
+            self.skipTest("bzrformats._groupcompress_pyx not available")
 
     def test_stats(self):
         compressor = self.compressor()
@@ -844,7 +848,7 @@ class TestGroupCompressVersionedFiles(TestCaseWithGroupCompressVersionedFiles):
         self.assertEqual(0, len(vf._group_cache))
 
 
-class TestGroupCompressConfig(TestCaseWithTransport):
+class TestGroupCompressConfig(TestCaseWithMemoryTransport):
     def make_test_vf(self):
         t = self.get_transport(".")
         t.ensure_base()
@@ -864,21 +868,16 @@ class TestGroupCompressConfig(TestCaseWithTransport):
                 vf._DEFAULT_MAX_BYTES_TO_INDEX, gc._delta_index._max_bytes_to_index
             )
 
-    def test_max_bytes_to_index_in_config(self):
-        c = config.GlobalConfig()
-        c.set_user_option("bzr.groupcompress.max_bytes_to_index", "10000")
+    def test_max_bytes_to_index_set_directly(self):
         vf = self.make_test_vf()
+        vf._max_bytes_to_index = 10000
         gc = vf._make_group_compressor()
         self.assertEqual(10000, vf._max_bytes_to_index)
         if isinstance(gc, groupcompress.PyrexGroupCompressor):
             self.assertEqual(10000, gc._delta_index._max_bytes_to_index)
 
-    def test_max_bytes_to_index_bad_config(self):
-        c = config.GlobalConfig()
-        c.set_user_option("bzr.groupcompress.max_bytes_to_index", "boogah")
+    def test_max_bytes_to_index_default(self):
         vf = self.make_test_vf()
-        # TODO: This is triggering a warning, we might want to trap and make
-        #       sure it is readable.
         gc = vf._make_group_compressor()
         self.assertEqual(vf._DEFAULT_MAX_BYTES_TO_INDEX, vf._max_bytes_to_index)
         if isinstance(gc, groupcompress.PyrexGroupCompressor):
@@ -994,7 +993,7 @@ class Test_BatchingBlockFetcher(TestCaseWithGroupCompressVersionedFiles):
         self.assertEqual("groupcompress-block", factories[0].storage_kind)
 
 
-class TestLazyGroupCompress(TestCaseWithTransport):
+class TestLazyGroupCompress(TestCaseWithMemoryTransport):
     _texts = {
         (b"key1",): b"this is a text\n"
         b"with a reasonable amount of compressible bytes\n"

@@ -46,12 +46,24 @@ import contextlib
 from collections import deque
 from collections.abc import Iterable
 
-from breezy import errors
-
 from . import osutils
 from ._bzr_rs import ROOT_ID
 from ._bzr_rs import inventory as _mod_inventory_rs
-from .errors import BzrFormatsError
+from .errors import BadFileKindError, BzrFormatsError, InconsistentDelta
+
+
+class NoSuchId(BzrFormatsError):
+    """File ID not found in tree.
+
+    Raised when a requested file ID is not present in the tree.
+    """
+
+    _fmt = 'The file id "%(file_id)s" is not present in the tree %(tree)s.'
+
+    def __init__(self, tree, file_id):
+        super().__init__()
+        self.tree = tree
+        self.file_id = file_id
 
 FileId = bytes
 InventoryEntry = _mod_inventory_rs.InventoryEntry
@@ -220,7 +232,7 @@ class CHKInventory:
                 if file_id is not None:
                     try:
                         path = self.id2path(file_id)
-                    except errors.NoSuchId:
+                    except NoSuchId:
                         pass
                     else:
                         yield path, self.get_entry(file_id)
@@ -271,7 +283,7 @@ class CHKInventory:
             stack.extend(reversed(child_dirs))
 
     def make_entry(self, kind, name, parent_id, file_id=None, revision=None, **kwargs):
-        """Simple thunk to breezy.bzr.inventory.make_entry."""
+        """Simple thunk to bzrformats.inventory.make_entry."""
         return make_entry(kind, name, parent_id, file_id, revision, **kwargs)
 
     def entries(self):
@@ -303,7 +315,7 @@ class CHKInventory:
 
         try:
             parent = self.root
-        except errors.NoSuchId:
+        except NoSuchId:
             # root doesn't exist yet so nothing else can
             return None, None, None
         if parent is None:
@@ -336,7 +348,7 @@ class CHKInventory:
 
         try:
             parent = self.root
-        except errors.NoSuchId:
+        except NoSuchId:
             # root doesn't exist yet so nothing else can
             return None
         if parent is None:
@@ -658,7 +670,7 @@ class CHKInventory:
             else:
                 old_key = (file_id,)
                 if self.id2path(file_id) != old_path:
-                    raise errors.InconsistentDelta(
+                    raise InconsistentDelta(
                         old_path,
                         file_id,
                         "Entry was at wrong other path {!r}.".format(
@@ -702,7 +714,7 @@ class CHKInventory:
             # map to just get the child file ids.
             for child in self.iter_sorted_children(entry.file_id):
                 if child.file_id not in altered:
-                    raise errors.InconsistentDelta(
+                    raise InconsistentDelta(
                         self.id2path(child.file_id),
                         child.file_id,
                         "Child not deleted or reparented when parent deleted.",
@@ -724,17 +736,17 @@ class CHKInventory:
         for parent_path, parent in parents:
             try:
                 if result.get_entry(parent).kind != "directory":
-                    raise errors.InconsistentDelta(
+                    raise InconsistentDelta(
                         result.id2path(parent),
                         parent,
                         "Not a directory, but given children",
                     )
-            except errors.NoSuchId as e:
-                raise errors.InconsistentDelta(
+            except NoSuchId as e:
+                raise InconsistentDelta(
                     "<unknown>", parent, "Parent is not present in resulting inventory."
                 ) from e
             if result.path2id(parent_path) != parent:
-                raise errors.InconsistentDelta(
+                raise InconsistentDelta(
                     parent_path,
                     parent,
                     f"Parent has wrong path {result.path2id(parent_path)!r}.",
@@ -768,9 +780,9 @@ class CHKInventory:
         for line in lines[1:]:
             key, value = line.rstrip(b"\n").split(b": ", 1)
             if key not in allowed_keys:
-                raise errors.BzrError(f"Unknown key in inventory: {key!r}\n{bytes!r}")
+                raise BzrFormatsError(f"Unknown key in inventory: {key!r}\n{bytes!r}")
             if key in info:
-                raise errors.BzrError(f"Duplicate key in inventory: {key!r}\n{bytes!r}")
+                raise BzrFormatsError(f"Duplicate key in inventory: {key!r}\n{bytes!r}")
             info[key] = value
         revision_id = info[b"revision_id"]
         root_id = info[b"root_id"]
@@ -879,7 +891,7 @@ class CHKInventory:
     def get_entry(self, file_id):
         """Map a single file_id -> InventoryEntry."""
         if file_id is None:
-            raise errors.NoSuchId(self, file_id)
+            raise NoSuchId(self, file_id)
         result = self._fileid_to_entry_cache.get(file_id, None)
         if result is not None:
             return result
@@ -889,7 +901,7 @@ class CHKInventory:
             )
         except StopIteration as e:
             # really we're passing an inventory, not a tree...
-            raise errors.NoSuchId(self, file_id) from e
+            raise NoSuchId(self, file_id) from e
 
     def _getitems(self, file_ids: Iterable[FileId]) -> list[InventoryEntry]:  # type: ignore
         """Similar to get_entry, but lets you query for multiple.
@@ -943,7 +955,7 @@ class CHKInventory:
             try:
                 ie = self.get_entry(file_id)
             except KeyError as e:
-                raise errors.NoSuchId(tree=self, file_id=file_id) from e
+                raise NoSuchId(tree=self, file_id=file_id) from e
             yield ie
             file_id = ie.parent_id
 
@@ -1152,7 +1164,7 @@ class CHKInventory:
                 items = parent_id_index.iteritems(key_filter)
                 for (parent_id, name_utf8), file_id in items:  # noqa: B007
                     if parent_id != current_id or name_utf8 != basename_utf8:
-                        raise errors.BzrError(
+                        raise BzrFormatsError(
                             "corrupt inventory lookup! {!r} {!r} {!r} {!r}".format(
                                 parent_id, current_id, name_utf8, basename_utf8
                             )
@@ -1218,7 +1230,7 @@ def make_entry(kind, name, parent_id, file_id=None, revision=None, **kwargs):
     try:
         factory = entry_factory[kind]
     except KeyError as e:
-        raise errors.BadFileKindError(name, kind) from e
+        raise BadFileKindError(name, kind) from e
     return factory(file_id, name, parent_id, revision, **kwargs)
 
 

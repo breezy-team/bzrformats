@@ -241,6 +241,77 @@ class DecompressCorruption(BzrFormatsError):
 
 
 # Versioned file errors
+class VersionedFileError(BzrFormatsError):
+    """Base class for versioned file errors.
+
+    Raised when operations on versioned files encounter problems.
+    """
+
+    _fmt = "Versioned file error"
+
+
+class RevisionNotPresent(VersionedFileError):
+    """Revision not present in versioned file.
+
+    Raised when attempting to access a revision that does not exist
+    in the specified versioned file.
+    """
+
+    _fmt = 'Revision {%(revision_id)s} not present in "%(file_id)s".'
+
+    def __init__(self, revision_id, file_id):
+        """Initialize with revision and file information.
+
+        Args:
+            revision_id: The revision ID that was not found.
+            file_id: The file ID where the revision was not found.
+        """
+        super().__init__()
+        self.revision_id = revision_id
+        self.file_id = file_id
+
+
+class RevisionAlreadyPresent(VersionedFileError):
+    """Revision already present in versioned file.
+
+    Raised when attempting to add a revision that already exists
+    in the specified versioned file.
+    """
+
+    _fmt = 'Revision {%(revision_id)s} already present in "%(file_id)s".'
+
+    def __init__(self, revision_id, file_id):
+        """Initialize with revision and file information.
+
+        Args:
+            revision_id: The revision ID that is already present.
+            file_id: The file ID where the revision already exists.
+        """
+        super().__init__()
+        self.revision_id = revision_id
+        self.file_id = file_id
+
+
+class InvalidRevisionId(BzrFormatsError):
+    """Invalid revision ID specified.
+
+    Raised when a revision ID is not valid or not found in the branch.
+    """
+
+    _fmt = "Invalid revision-id {%(revision_id)s} in %(branch)s"
+
+    def __init__(self, revision_id, branch):
+        """Initialize with the invalid revision ID and branch.
+
+        Args:
+            revision_id: The invalid revision ID.
+            branch: The branch where the revision ID was not found.
+        """
+        super().__init__()
+        self.revision_id = revision_id
+        self.branch = branch
+
+
 class UnavailableRepresentation(BzrFormatsError):
     _fmt = (
         "The encoding '%(wanted)s' is not available for key %(key)s which "
@@ -315,3 +386,208 @@ class BadInventoryFormat(BzrFormatsError):
     def __init__(self, tag):
         super().__init__()
         self.tag = tag
+
+
+
+
+class ReservedId(BzrFormatsError):
+    """A revision ID that is reserved for internal use was encountered."""
+
+    _fmt = "Reserved revision-id {%(revision_id)s}"
+
+    def __init__(self, revision_id):
+        super().__init__()
+        self.revision_id = revision_id
+
+
+class BadFileKindError(BzrFormatsError):
+    """Cannot operate on file of unsupported kind.
+
+    Raised when attempting to perform an operation on a file whose type
+    (kind) is not supported by the current operation.
+    """
+
+    _fmt = "Cannot operate on %(filename)s of unsupported kind %(kind)s"
+
+    def __init__(self, filename, kind):
+        """Create a BadFileKindError.
+
+        Args:
+            filename: Path to the file with unsupported kind.
+            kind: The unsupported file kind.
+        """
+        super().__init__()
+        self.filename = filename
+        self.kind = kind
+
+
+# Transport-related errors
+class PathError(BzrFormatsError):
+    """Base class for path-related errors."""
+
+    _fmt = "Path error: %(path)r%(extra)s"
+
+    def __init__(self, path, extra=None):
+        super().__init__()
+        self.path = path
+        if extra:
+            self.extra = ": " + str(extra)
+        else:
+            self.extra = ""
+
+
+class NoSuchFile(PathError):
+    """Exception raised when a file or directory does not exist.
+
+    This is the standard exception raised by transports when attempting
+    to access a non-existent file or directory.
+    """
+
+    _fmt = "No such file: %(path)r%(extra)s"
+
+
+class VersionedFileInvalidChecksum(VersionedFileError):
+    """Text checksum validation failed.
+
+    Raised when the checksum of text in a versioned file does not match
+    the expected checksum, indicating data corruption.
+    """
+
+    _fmt = "Text did not match its checksum: %(msg)s"
+
+
+class InconsistentDelta(BzrFormatsError):
+    """Used when we get a delta that is not valid."""
+
+    _fmt = (
+        "An inconsistent delta was supplied involving %(path)r,"
+        " %(file_id)r\nreason: %(reason)s"
+    )
+
+    def __init__(self, path, file_id, reason):
+        """Initialize with delta inconsistency details.
+
+        Args:
+            path: The path involved in the inconsistent delta.
+            file_id: The file ID involved in the inconsistent delta.
+            reason: The reason why the delta is inconsistent.
+        """
+        super().__init__()
+        self.path = path
+        self.file_id = file_id
+        self.reason = reason
+
+
+class InconsistentDeltaDelta(InconsistentDelta):
+    """Used when we get a delta that is not valid."""
+
+    _fmt = "An inconsistent delta was supplied: %(delta)r\nreason: %(reason)s"
+
+    def __init__(self, delta, reason):
+        """Initialize with delta and inconsistency reason.
+
+        Args:
+            delta: The inconsistent delta.
+            reason: The reason why the delta is inconsistent.
+        """
+        BzrFormatsError.__init__(self)
+        self.delta = delta
+        self.reason = reason
+
+
+class InternalBzrFormatsError(BzrFormatsError):
+    """Base class for errors that indicate a bug in bzrformats."""
+
+    internal_error = True
+
+
+class BzrCheckError(InternalBzrFormatsError):
+    _fmt = "Internal check failed: %(msg)s"
+
+    def __init__(self, msg):
+        super().__init__()
+        self.msg = msg
+
+
+class LockError(BzrFormatsError):
+    _fmt = "Lock error: %(msg)s"
+
+    internal_error = False
+
+
+class ObjectNotLocked(LockError):
+    _fmt = "%(obj)r is not locked"
+
+    def __init__(self, obj):
+        super().__init__()
+        self.obj = obj
+
+
+class ReadOnlyError(LockError):
+    _fmt = "A write attempt was made in a read only transaction on %(obj)s"
+
+    def __init__(self, obj):
+        super().__init__()
+        self.obj = obj
+
+
+class ReadOnlyObjectDirtiedError(ReadOnlyError):
+    _fmt = "Cannot change object %(obj)r in read only transaction"
+
+
+class OutSideTransaction(BzrFormatsError):
+    _fmt = "A transaction related operation was attempted after the transaction finished."
+
+
+class LockContention(LockError):
+    _fmt = 'Could not acquire lock "%(lock)s": %(msg)s'
+
+    def __init__(self, lock, msg=""):
+        super().__init__()
+        self.lock = lock
+        self.msg = msg
+
+
+class LockNotHeld(LockError):
+    _fmt = "Lock not held: %(lock)s"
+
+    def __init__(self, lock):
+        super().__init__()
+        self.lock = lock
+
+
+class InvalidNormalization(PathError):
+    _fmt = 'Path "%(path)s" is not unicode normalized'
+
+
+class AlreadyVersionedError(BzrFormatsError):
+    _fmt = "%(context_info)s%(path)s is already versioned."
+
+    def __init__(self, path, context_info=None):
+        super().__init__()
+        self.path = path
+        if context_info is None:
+            self.context_info = ""
+        else:
+            self.context_info = context_info + ". "
+
+
+class NotVersionedError(BzrFormatsError):
+    _fmt = "%(context_info)s%(path)s is not versioned."
+
+    def __init__(self, path, context_info=""):
+        super().__init__()
+        self.path = path
+        if context_info:
+            self.context_info = context_info + ". "
+        else:
+            self.context_info = ""
+
+
+class NoSuchRevision(InternalBzrFormatsError):
+    _fmt = "%(branch)s has no revision %(revision)s"
+
+    def __init__(self, branch, revision):
+        super().__init__()
+        self.branch = branch
+        self.revision = revision

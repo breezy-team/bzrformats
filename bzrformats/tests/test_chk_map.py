@@ -16,7 +16,8 @@
 
 """Tests for maps built on a CHK versionedfiles facility."""
 
-from breezy import errors, osutils
+from bzrformats.errors import InconsistentDeltaDelta
+from bzrformats import osutils
 
 from . import TestCase, TestCaseWithMemoryTransport
 from .. import chk_map, groupcompress
@@ -741,7 +742,7 @@ class TestMap(TestCaseWithStore):
         root_key = CHKMap.from_dict(chk_bytes, {(b"a",): b"b"})
         chkmap = CHKMap(chk_bytes, root_key)
         self.assertRaises(
-            errors.InconsistentDelta, chkmap.apply_delta, [(None, (b"a",), b"b")]
+            InconsistentDeltaDelta, chkmap.apply_delta, [(None, (b"a",), b"b")]
         )
         # As an error occured, the update should have left us without changing
         # anything (the root should be unchanged).

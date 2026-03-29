@@ -16,11 +16,10 @@
 
 """XML serialization support for weave format version 4."""
 
-from breezy import revision as _mod_revision
-
 from . import inventory
 from .errors import BzrFormatsError as BzrError
 from .inventory import ROOT_ID, Inventory
+from . import revision as _mod_revision
 from .xml_serializer import (
     Element,
     SubElement,

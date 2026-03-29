@@ -16,11 +16,19 @@
 
 """Bazaar-specific revision implementation."""
 
-from bzrformats._bzr_rs import (  # noqa: F401
+from bzrformats._bzr_rs import (
+    CURRENT_REVISION,
+    NULL_REVISION,
     Revision as BzrRevision,
+    check_not_reserved_id,
+    is_null,
+    is_reserved_id,
 )
+
+RevisionID = bytes
 
 # Re-export the Bazaar revision implementation
 Revision = BzrRevision
 
-__all__ = ['Revision', 'BzrRevision']
+__all__ = ['Revision', 'BzrRevision', 'CURRENT_REVISION', 'NULL_REVISION', 'RevisionID',
+           'check_not_reserved_id', 'is_null', 'is_reserved_id']

@@ -42,7 +42,9 @@ import threading
 from collections.abc import Callable, Generator, Iterator
 from typing import Union
 
-from breezy import errors, lru_cache, registry
+from . import lru_cache
+from .errors import NoSuchRevision
+from .registry import Registry
 
 from . import osutils
 from ._bzr_rs import chk_map as _chk_map_rs
@@ -101,7 +103,7 @@ def _search_key_plain(key: Key) -> SerialisedKey:
     return b"\x00".join(key)
 
 
-search_key_registry = registry.Registry[bytes, Callable[[Key], SerialisedKey], None]()
+search_key_registry = Registry[bytes, Callable[[Key], SerialisedKey], None]()
 search_key_registry.register(b"plain", _search_key_plain)
 
 
@@ -245,7 +247,8 @@ class CHKMap:
         }
         existing_new = list(self.iteritems(key_filter=new_items))
         if existing_new:
-            raise errors.InconsistentDeltaDelta(
+            from .errors import InconsistentDeltaDelta
+            raise InconsistentDeltaDelta(
                 delta, f"New items are already in the map {existing_new!r}."
             )
         # Now apply changes.
@@ -1782,7 +1785,7 @@ class CHKMapDifference:
             if self._pb is not None:
                 self._pb.tick()
             if record.storage_kind == "absent":
-                raise errors.NoSuchRevision(self._store, record.key)
+                raise NoSuchRevision(self._store, record.key)
             bytes = record.get_bytes_as("fulltext")
             node = _deserialise(
                 bytes, record.key, search_key_func=self._search_key_func

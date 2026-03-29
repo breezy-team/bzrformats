@@ -229,29 +229,18 @@ import sys
 import time
 from stat import S_IEXEC
 
-from breezy import (
-    _transport_rs,
-    cache_utf8,
-    config,
-    debug,
-    errors,
-    lock,
-    urlutils,
-)
-from breezy.bzr.inventorytree import InventoryTreeChange
-
-# Import complex osutils functions that are too difficult to replace
-from breezy.osutils import (
-    _walkdirs_utf8,
-    is_inside,
-    is_inside_any,
-    parent_directories,
-)
+from . import lock
 
 from . import inventory, osutils
-from .errors import BzrFormatsError
+from .osutils import _walkdirs_utf8, is_inside, is_inside_any, parent_directories
+from .errors import (
+    BadFileKindError, BzrFormatsError, InconsistentDelta, InconsistentDeltaDelta,
+    InvalidNormalization, LockContention, LockNotHeld, NotVersionedError,
+    ObjectNotLocked,
+)
 
 logger = logging.getLogger("bzrformats.dirstate")
+evil_logger = logging.getLogger("bzrformats.evil")
 
 # This is the Windows equivalent of ENOTDIR
 # It is defined in pywin32.winerror, but we don't want a strong dependency for
@@ -298,6 +287,101 @@ class SHA1Provider:
         while the sha may be the sha of its canonical content.
         """
         raise NotImplementedError(self.stat_and_sha1)
+
+
+class DirstateInventoryChange:
+    """Change information from dirstate that can be converted to InventoryTreeChange."""
+
+    def __init__(
+        self,
+        file_id,
+        path,
+        changed_content,
+        versioned,
+        parent_id,
+        name,
+        kind,
+        executable,
+        copied=False,
+    ):
+        """Initialize a DirstateInventoryChange.
+
+        Args:
+            file_id: The file ID of the changed item.
+            path: Tuple of (old_path, new_path).
+            changed_content: Whether content changed.
+            versioned: Tuple of (old_versioned, new_versioned).
+            parent_id: Tuple of (old_parent_id, new_parent_id).
+            name: Tuple of (old_name, new_name).
+            kind: Tuple of (old_kind, new_kind).
+            executable: Tuple of (old_executable, new_executable).
+            copied: Whether this represents a copy (default False).
+        """
+        self.file_id = file_id
+        self.path = path
+        self.changed_content = changed_content
+        self.versioned = versioned
+        self.parent_id = parent_id
+        self.name = name
+        self.kind = kind
+        self.executable = executable
+        self.copied = copied
+
+    def meta_modified(self):
+        if self.versioned == (True, True):
+            return self.executable[0] != self.executable[1]
+        return False
+
+    def is_reparented(self):
+        return self.parent_id[0] != self.parent_id[1]
+
+    @property
+    def renamed(self):
+        return (
+            not self.copied
+            and None not in self.name
+            and None not in self.parent_id
+            and (self.name[0] != self.name[1] or self.parent_id[0] != self.parent_id[1])
+        )
+
+    def discard_new(self):
+        return self.__class__(
+            self.file_id,
+            (self.path[0], None),
+            self.changed_content,
+            (self.versioned[0], None),
+            (self.parent_id[0], None),
+            (self.name[0], None),
+            (self.kind[0], None),
+            (self.executable[0], None),
+            copied=False,
+        )
+
+    def _as_tuple(self):
+        return (
+            self.file_id,
+            self.path,
+            self.changed_content,
+            self.versioned,
+            self.parent_id,
+            self.name,
+            self.kind,
+            self.executable,
+            self.copied,
+        )
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}{self._as_tuple()!r}"
+
+    def __getitem__(self, index):
+        return self._as_tuple()[index]
+
+    def __eq__(self, other):
+        if hasattr(other, '_as_tuple'):
+            return self._as_tuple() == other._as_tuple()
+        if isinstance(other, tuple):
+            return self._as_tuple() == other
+        return NotImplemented
 
 
 class DirState:
@@ -360,7 +444,8 @@ class DirState:
     HEADER_FORMAT_3 = b"#bazaar dirstate flat format 3\n"
 
     def __init__(
-        self, path, sha1_provider, worth_saving_limit=0, use_filesystem_for_exec=True
+        self, path, sha1_provider, worth_saving_limit=0, use_filesystem_for_exec=True,
+        fdatasync=False,
     ):
         """Create a  DirState object.
 
@@ -404,10 +489,7 @@ class DirState:
         self._split_path_cache = {}
         self._bisect_page_size = DirState.BISECT_PAGE_SIZE
         self._sha1_provider = sha1_provider
-        if debug.debug_flag_enabled("hashcache"):
-            self._sha1_file = self._sha1_file_and_mutter
-        else:
-            self._sha1_file = self._sha1_provider.sha1
+        self._sha1_file = self._sha1_provider.sha1
         # These two attributes provide a simple cache for lookups into the
         # dirstate in-memory vectors. By probing respectively for the last
         # block, and for the next entry, we save nearly 2 bisections per path
@@ -418,7 +500,7 @@ class DirState:
         self._known_hash_changes = set()
         # How many hash changed entries can we have without saving
         self._worth_saving_limit = worth_saving_limit
-        self._config_stack = config.LocationStack(urlutils.local_path_to_url(path))
+        self._fdatasync = fdatasync
         self._use_filesystem_for_exec = use_filesystem_for_exec
 
     def __repr__(self):
@@ -489,7 +571,7 @@ class DirState:
             if can_access:
                 basename = norm_name
             else:
-                raise errors.InvalidNormalization(path)
+                raise InvalidNormalization(path)
         # you should never have files called . or ..; just add the directory
         # in the parent, or according to the special treatment for the root
         if basename == "." or basename == "..":
@@ -548,7 +630,7 @@ class DirState:
                 parent_present,
             ) = self._get_block_entry_index(parent_dir, parent_base, 0)
             if not parent_present:
-                raise errors.NotVersionedError(path, str(self))
+                raise NotVersionedError(path, str(self))
             self._ensure_block(parent_block_idx, parent_entry_idx, dirname)
         block = self._dirblocks[block_index][1]
         entry_key = (dirname, basename, file_id)
@@ -596,7 +678,7 @@ class DirState:
                 + parent_info,
             )
         else:
-            raise errors.BzrError(f"unknown kind {kind!r}")
+            raise BzrFormatsError(f"unknown kind {kind!r}")
         entry_index, present = self._find_entry_index(entry_key, block)
         if not present:
             block.insert(entry_index, entry_data)
@@ -669,7 +751,7 @@ class DirState:
 
             count += 1
             if count > max_count:
-                raise errors.BzrError("Too many seeks, most likely a bug.")
+                raise BzrFormatsError("Too many seeks, most likely a bug.")
 
             mid = max(low, (low + high - page_size) // 2)
 
@@ -858,7 +940,7 @@ class DirState:
 
             count += 1
             if count > max_count:
-                raise errors.BzrError("Too many seeks, most likely a bug.")
+                raise BzrFormatsError("Too many seeks, most likely a bug.")
 
             mid = max(low, (low + high - page_size) // 2)
 
@@ -1227,7 +1309,7 @@ class DirState:
                 if not self._get_block_entry_index(parent_base, parent_name, 0)[3]:
                     # some parent path has not been added - its an error to add
                     # this child
-                    raise errors.NotVersionedError(key[0:2], str(self))
+                    raise NotVersionedError(key[0:2], str(self))
             self._dirblocks.insert(block_index, (key[0], []))
         return self._dirblocks[block_index]
 
@@ -1403,14 +1485,14 @@ class DirState:
             self._apply_insertions(insertions.values())
             # Validate parents
             self._after_delta_check_parents(parents, 0)
-        except errors.BzrError as e:
+        except BzrFormatsError as e:
             self._changes_aborted = True
             if "integrity error" not in str(e):
                 raise
             # _get_entry raises BzrError when a request is inconsistent; we
             # want such errors to be shown as InconsistentDelta - and that
             # fits the behaviour we trigger.
-            raise errors.InconsistentDeltaDelta(
+            raise InconsistentDeltaDelta(
                 delta, f"error from _get_entry. {e}"
             ) from e
 
@@ -1461,7 +1543,7 @@ class DirState:
                 self.update_minimal(
                     key, minikind, executable, fingerprint, path_utf8=path_utf8
                 )
-        except errors.NotVersionedError:
+        except NotVersionedError:
             self._raise_invalid(path_utf8.decode("utf8"), key[2], "Missing parent")
 
     def update_basis_by_delta(self, delta, new_revid):
@@ -1499,7 +1581,6 @@ class DirState:
         deletes = []
         # The paths this function accepts are unicode and must be encoded as we
         # go.
-        encode = cache_utf8.encode
         inv_to_entry = _inv_entry_to_details
         # delta is now (deletes, changes), (adds) in reverse lexographical
         # order.
@@ -1530,12 +1611,12 @@ class DirState:
             else:
                 if inv_entry is None:
                     self._raise_invalid(new_path, file_id, "new_path with no entry")
-                new_path_utf8 = encode(new_path)
+                new_path_utf8 = new_path.encode('utf-8')
                 # note the parent for validation
                 dirname_utf8, basename_utf8 = osutils.split(new_path_utf8)
                 if basename_utf8:
                     parents.add((dirname_utf8, inv_entry.parent_id))
-            old_path_utf8 = None if old_path is None else encode(old_path)
+            old_path_utf8 = None if old_path is None else old_path.encode('utf-8')
             if old_path is None:
                 adds.append(
                     (None, new_path_utf8, file_id, inv_to_entry(inv_entry), True)
@@ -1611,14 +1692,14 @@ class DirState:
             self._update_basis_apply_changes(changes)
             # Validate parents
             self._after_delta_check_parents(parents, 1)
-        except errors.BzrError as e:
+        except BzrFormatsError as e:
             self._changes_aborted = True
             if "integrity error" not in str(e):
                 raise
             # _get_entry raises BzrError when a request is inconsistent; we
             # want such errors to be shown as InconsistentDelta - and that
             # fits the behaviour we trigger.
-            raise errors.InconsistentDeltaDelta(
+            raise InconsistentDeltaDelta(
                 delta, f"error from _get_entry. {e}"
             ) from e
 
@@ -1652,7 +1733,7 @@ class DirState:
 
     def _raise_invalid(self, path, file_id, reason):
         self._changes_aborted = True
-        raise errors.InconsistentDelta(path, file_id, reason)
+        raise InconsistentDelta(path, file_id, reason)
 
     def _update_basis_apply_adds(self, adds):
         """Apply a sequence of adds to tree 1 during update_basis_by_delta.
@@ -1975,12 +2056,6 @@ class DirState:
         """Return the os.lstat value for this path."""
         return os.lstat(abspath)
 
-    def _sha1_file_and_mutter(self, abspath):
-        # when -Dhashcache is turned on, this is monkey-patched in to log
-        # file reads
-        logger.debug("dirstate sha1 " + abspath)
-        return self._sha1_provider.sha1(abspath)
-
     def _is_executable(self, mode, old_executable):
         """Is this file executable?"""
         if self._use_filesystem_for_exec:
@@ -2196,7 +2271,7 @@ class DirState:
         self._read_dirblocks_if_needed()
         if path_utf8 is not None:
             if not isinstance(path_utf8, bytes):
-                raise errors.BzrError(
+                raise BzrFormatsError(
                     f"path_utf8 is not bytes: {type(path_utf8)} {path_utf8!r}"
                 )
             # path lookups are faster
@@ -2214,7 +2289,7 @@ class DirState:
                 raise AssertionError("unversioned entry?")
             if fileid_utf8 and entry[0][2] != fileid_utf8:
                 self._changes_aborted = True
-                raise errors.BzrError(
+                raise BzrFormatsError(
                     "integrity error ? : mismatching tree_index, file_id and path"
                 )
             return entry
@@ -2386,6 +2461,7 @@ class DirState:
         sha1_provider=None,
         worth_saving_limit=0,
         use_filesystem_for_exec=True,
+        fdatasync=False,
     ):
         """Construct a DirState on the file at path "path".
 
@@ -2406,6 +2482,7 @@ class DirState:
             sha1_provider,
             worth_saving_limit=worth_saving_limit,
             use_filesystem_for_exec=use_filesystem_for_exec,
+            fdatasync=fdatasync,
         )
         return result
 
@@ -2444,7 +2521,7 @@ class DirState:
         """Read the header of the dirstate file if needed."""
         # inline this as it will be called a lot
         if not self._lock_token:
-            raise errors.ObjectNotLocked(self)
+            raise ObjectNotLocked(self)
         if self._header_state == DirState.NOT_IN_MEMORY:
             self._read_header()
 
@@ -2459,14 +2536,14 @@ class DirState:
         """
         header = self._state_file.readline()
         if header != DirState.HEADER_FORMAT_3:
-            raise errors.BzrError(f"invalid header line: {header!r}")
+            raise BzrFormatsError(f"invalid header line: {header!r}")
         crc_line = self._state_file.readline()
         if not crc_line.startswith(b"crc32: "):
-            raise errors.BzrError(f"missing crc32 checksum: {crc_line!r}")
+            raise BzrFormatsError(f"missing crc32 checksum: {crc_line!r}")
         self.crc_expected = int(crc_line[len(b"crc32: ") : -1])
         num_entries_line = self._state_file.readline()
         if not num_entries_line.startswith(b"num_entries: "):
-            raise errors.BzrError("missing num_entries line")
+            raise BzrFormatsError("missing num_entries line")
         self._num_entries = int(num_entries_line[len(b"num_entries: ") : -1])
 
     def sha1_from_stat(self, path, stat_result):
@@ -2539,7 +2616,7 @@ class DirState:
 
     def _maybe_fdatasync(self):
         """Flush to disk if possible and if not configured off."""
-        if self._config_stack.get("dirstate.fdatasync"):
+        if self._fdatasync:
             osutils.fdatasync(self._state_file.fileno())
 
     def _worth_saving(self):
@@ -2797,11 +2874,10 @@ class DirState:
 
         :param new_inv: The inventory object to set current state from.
         """
-        if debug.debug_flag_enabled("evil"):
-            logger.debug(
-                "set_state_from_inventory called; please mutate the tree instead"
-            )
-        tracing = debug.debug_flag_enabled("dirstate")
+        evil_logger.debug(
+            "set_state_from_inventory called; please mutate the tree instead"
+        )
+        tracing = logger.isEnabledFor(logging.DEBUG)
         if tracing:
             logger.debug("set_state_from_inventory trace:")
         self._read_dirblocks_if_needed()
@@ -3415,12 +3491,12 @@ class DirState:
     def lock_read(self):
         """Acquire a read lock on the dirstate."""
         if self._lock_token is not None:
-            raise errors.LockContention(self._lock_token)
+            raise LockContention(self._lock_token)
         # TODO: jam 20070301 Rather than wiping completely, if the blocks are
         #       already in memory, we could read just the header and check for
         #       any modification. If not modified, we can just leave things
         #       alone
-        self._lock_token = _transport_rs.ReadLock(self._filename)
+        self._lock_token = lock.ReadLock(self._filename)
         self._lock_state = "r"
         self._state_file = self._lock_token.f
         self._wipe_state()
@@ -3429,12 +3505,12 @@ class DirState:
     def lock_write(self):
         """Acquire a write lock on the dirstate."""
         if self._lock_token is not None:
-            raise errors.LockContention(self._lock_token)
+            raise LockContention(self._lock_token)
         # TODO: jam 20070301 Rather than wiping completely, if the blocks are
         #       already in memory, we could read just the header and check for
         #       any modification. If not modified, we can just leave things
         #       alone
-        self._lock_token = _transport_rs.WriteLock(self._filename)
+        self._lock_token = lock.WriteLock(self._filename)
         self._lock_state = "w"
         self._state_file = self._lock_token.f
         self._wipe_state()
@@ -3443,7 +3519,7 @@ class DirState:
     def unlock(self):
         """Drop any locks held on the dirstate."""
         if self._lock_token is None:
-            raise errors.LockNotHeld(self)
+            raise LockNotHeld(self)
         # TODO: jam 20070301 Rather than wiping completely, if the blocks are
         #       already in memory, we could read just the header and check for
         #       any modification. If not modified, we can just leave things
@@ -3457,7 +3533,7 @@ class DirState:
     def _requires_lock(self):
         """Check that a lock is currently held by someone on the dirstate."""
         if not self._lock_token:
-            raise errors.ObjectNotLocked(self)
+            raise ObjectNotLocked(self)
 
 
 def py_update_entry(
@@ -3648,7 +3724,7 @@ class ProcessEntryPython:
         self.target_index = target_index
         if target_index != 0:
             # A lot of code in here depends on target_index == 0
-            raise errors.BzrError("unsupported target index")
+            raise BzrFormatsError("unsupported target index")
         self.want_unversioned = want_unversioned
         self.tree = tree
 
@@ -3776,7 +3852,7 @@ class ProcessEntryPython:
                 else:
                     if path is None:
                         path = pathjoin(old_dirname, old_basename)
-                    raise errors.BadFileKindError(path, path_info[2])
+                    raise BadFileKindError(path, path_info[2])
             if source_minikind == b"d":
                 if path is None:
                     old_path = path = pathjoin(old_dirname, old_basename)
@@ -3843,7 +3919,7 @@ class ProcessEntryPython:
                     else:
                         path_u = self.utf8_decode(path, "surrogateescape")[0]
                 source_kind = DirState._minikind_to_kind[source_minikind]
-                return InventoryTreeChange(
+                return DirstateInventoryChange(
                     entry[0][2],
                     (old_path_u, path_u),
                     content_change,
@@ -3877,7 +3953,7 @@ class ProcessEntryPython:
                     )
                 else:
                     target_exec = target_details[3]
-                return InventoryTreeChange(
+                return DirstateInventoryChange(
                     entry[0][2],
                     (None, self.utf8_decode(path, "surrogateescape")[0]),
                     True,
@@ -3889,7 +3965,7 @@ class ProcessEntryPython:
                 ), True
             else:
                 # Its a missing file, report it as such.
-                return InventoryTreeChange(
+                return DirstateInventoryChange(
                     entry[0][2],
                     (None, self.utf8_decode(path, "surrogateescape")[0]),
                     False,
@@ -3911,7 +3987,7 @@ class ProcessEntryPython:
             ][2]
             if parent_id == entry[0][2]:
                 parent_id = None
-            return InventoryTreeChange(
+            return DirstateInventoryChange(
                 entry[0][2],
                 (self.utf8_decode(old_path, "surrogateescape")[0], None),
                 True,
@@ -4059,7 +4135,7 @@ class ProcessEntryPython:
                     stat.S_ISREG(root_dir_info[3].st_mode)
                     and stat.S_IEXEC & root_dir_info[3].st_mode
                 )
-                yield InventoryTreeChange(
+                yield DirstateInventoryChange(
                     None,
                     (None, current_root_unicode),
                     True,
@@ -4131,7 +4207,7 @@ class ProcessEntryPython:
                                     stat.S_ISREG(current_path_info[3].st_mode)
                                     and stat.S_IEXEC & current_path_info[3].st_mode
                                 )
-                                yield InventoryTreeChange(
+                                yield DirstateInventoryChange(
                                     None,
                                     (
                                         None,
@@ -4279,7 +4355,7 @@ class ProcessEntryPython:
                                 relpath_unicode = utf8_decode(
                                     current_path_info[0], "surrogateescape"
                                 )[0]
-                                yield InventoryTreeChange(
+                                yield DirstateInventoryChange(
                                     None,
                                     (None, relpath_unicode),
                                     True,

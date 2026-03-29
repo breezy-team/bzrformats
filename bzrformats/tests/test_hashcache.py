@@ -17,9 +17,8 @@
 import os
 import time
 
-from breezy import osutils
+from bzrformats import osutils
 from . import TestCaseInTempDir
-from breezy.tests.features import OsFifoFeature
 
 from .. import hashcache
 
@@ -104,7 +103,8 @@ class TestHashCache(TestCaseInTempDir):
 
     def test_hashcache_raise(self):
         """Check that hashcache can raise BzrError."""
-        self.requireFeature(OsFifoFeature)
+        if getattr(os, "mkfifo", None) is None:
+            self.skipTest("os.mkfifo not available")
         hc = self.make_hashcache()
         os.mkfifo("a")
         # It's possible that the system supports fifos but the filesystem

@@ -29,10 +29,11 @@ import os
 import stat
 import sys
 
-from breezy import errors, osutils
-from breezy.osutils import (is_inside, is_inside_any, parent_directories, pathjoin,
-                       splitpath)
-from breezy.bzr.inventorytree import InventoryTreeChange
+from .errors import BzrFormatsError, BadFileKindError
+from . import osutils
+from .osutils import (is_inside, is_inside_any, parent_directories, pathjoin,
+                     splitpath, file_kind_from_stat_mode, sha_file, _walkdirs_utf8)
+from .dirstate import DirstateInventoryChange
 
 # Delay import to avoid circular dependency
 DirstateCorrupt = None
@@ -768,12 +769,12 @@ cdef class ProcessEntryC:
         self.path_index = 0
         self.root_dir_info = None
         self.bisect_left = bisect.bisect_left
-        self.pathjoin = osutils.pathjoin
+        self.pathjoin = pathjoin
         self.fstat = os.fstat
-        self.sha_file = osutils.sha_file
+        self.sha_file = sha_file
         if target_index != 0:
             # A lot of code in here depends on target_index == 0
-            raise errors.BzrError('unsupported target index')
+            raise BzrFormatsError('unsupported target index')
 
     cdef _process_entry(self, entry, path_info):
         """Compare an entry and real disk to generate delta information.
@@ -910,7 +911,7 @@ cdef class ProcessEntryC:
                 else:
                     if path is None:
                         path = self.pathjoin(old_dirname, old_basename)
-                    raise errors.BadFileKindError(path, path_info[2])
+                    raise BadFileKindError(path, path_info[2])
             if source_minikind == b'd':
                 if path is None:
                     old_path = path = self.pathjoin(old_dirname, old_basename)
@@ -979,7 +980,7 @@ cdef class ProcessEntryC:
                     else:
                         path_u = utf8_decode(path)
                 source_kind = _minikind_to_kind(source_minikind)
-                return InventoryTreeChange(entry[0][2],
+                return DirstateInventoryChange(entry[0][2],
                        (old_path_u, path_u),
                        content_change,
                        (True, True),
@@ -1012,7 +1013,7 @@ cdef class ProcessEntryC:
                         and S_IXUSR & path_info[3].st_mode)
                 else:
                     target_exec = target_details[3]
-                return InventoryTreeChange(entry[0][2],
+                return DirstateInventoryChange(entry[0][2],
                        (None, utf8_decode(path)),
                        True,
                        (False, True),
@@ -1022,7 +1023,7 @@ cdef class ProcessEntryC:
                        (None, target_exec)), True
             else:
                 # Its a missing file, report it as such.
-                return InventoryTreeChange(entry[0][2],
+                return DirstateInventoryChange(entry[0][2],
                        (None, utf8_decode(path)),
                        False,
                        (False, True),
@@ -1040,7 +1041,7 @@ cdef class ProcessEntryC:
             parent_id = self.state._get_entry(self.source_index, path_utf8=entry[0][0])[0][2]
             if parent_id == entry[0][2]:
                 parent_id = None
-            return InventoryTreeChange(
+            return DirstateInventoryChange(
                    entry[0][2],
                    (utf8_decode(old_path), None),
                    True,
@@ -1094,7 +1095,7 @@ cdef class ProcessEntryC:
         if new_path:
             # Not the root and not a delete: queue up the parents of the path.
             self.search_specific_file_parents.update(
-                [p.encode('utf-8') for p in osutils.parent_directories(new_path)])
+                [p.encode('utf-8') for p in parent_directories(new_path)])
             # Add the root directory which parent_directories does not
             # provide.
             self.search_specific_file_parents.add(b'')
@@ -1205,7 +1206,7 @@ cdef class ProcessEntryC:
                     raise
             else:
                 self.root_dir_info = (b'', self.current_root,
-                    osutils.file_kind_from_stat_mode(root_stat.st_mode), root_stat,
+                    file_kind_from_stat_mode(root_stat.st_mode), root_stat,
                     self.root_abspath)
                 if self.root_dir_info[2] == 'directory':
                     if self.tree._directory_is_tree_reference(
@@ -1238,7 +1239,7 @@ cdef class ProcessEntryC:
                 new_executable = bool(
                     stat.S_ISREG(self.root_dir_info[3].st_mode)
                     and stat.S_IEXEC & self.root_dir_info[3].st_mode)
-                return InventoryTreeChange(
+                return DirstateInventoryChange(
                        None,
                        (None, self.current_root_unicode),
                        True,
@@ -1257,7 +1258,7 @@ cdef class ProcessEntryC:
             if self.root_dir_info and self.root_dir_info[2] == 'tree-reference':
                 self.current_dir_info = None
             else:
-                self.dir_iterator = osutils._walkdirs_utf8(self.root_abspath,
+                self.dir_iterator = _walkdirs_utf8(self.root_abspath,
                     prefix=self.current_root)
                 self.path_index = 0
                 try:
@@ -1350,7 +1351,7 @@ cdef class ProcessEntryC:
                             new_executable = bool(
                                 stat.S_ISREG(current_path_info[3].st_mode)
                                 and stat.S_IEXEC & current_path_info[3].st_mode)
-                            return InventoryTreeChange(
+                            return DirstateInventoryChange(
                                 None,
                                 (None, utf8_decode(current_path_info[0])),
                                 True,
@@ -1516,7 +1517,7 @@ cdef class ProcessEntryC:
                             if changed is not None:
                                 raise AssertionError(
                                     "result is not None: %r" % result)
-                            result = InventoryTreeChange(
+                            result = DirstateInventoryChange(
                                 None,
                                 (None, relpath_unicode),
                                 True,
@@ -1673,7 +1674,7 @@ cdef class ProcessEntryC:
                 raise
         utf8_basename = utf8_path.rsplit(b'/', 1)[-1]
         dir_info = (utf8_path, utf8_basename,
-            osutils.file_kind_from_stat_mode(stat.st_mode), stat,
+            file_kind_from_stat_mode(stat.st_mode), stat,
             abspath)
         if dir_info[2] == 'directory':
             if self.tree._directory_is_tree_reference(

@@ -14,9 +14,9 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
-"""Tests for breezy/generate_ids.py."""
+"""Tests for bzrformats/generate_ids.py."""
 
-from . import TestCase, TestCaseInTempDir, TestCaseWithTransport
+from . import TestCase, TestCaseInTempDir
 
 from .. import generate_ids
 

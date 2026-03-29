@@ -1,17 +1,13 @@
 [package]
-name = "osutils-py"
-version = { workspace = true }
-edition = "2018"
+name = "bzrformats-osutils"
+version = "0.1.0"
+edition = "2021"
 
 [lib]
+name = "_osutils_rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { workspace = true, features = ["extension-module", "chrono" ]}
-breezy-osutils = { path = "../osutils" }
-pyo3-filelike = { workspace = true }
-memchr = "2.7.4"
-
-[target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
-termion = ">=1"
+pyo3 = { version = ">=0.26,<0.28", features = ["extension-module"] }
+osutils = { path = "../osutils-rs" }
+walkdir = "2"

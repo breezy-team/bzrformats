@@ -2,6 +2,7 @@
 
 import atexit
 import difflib
+import logging
 import os
 import re
 import shutil
@@ -16,9 +17,27 @@ except ImportError:
     # Minimal compatibility if testtools is not available
     testtools = None
 
-from breezy import osutils, urlutils
-from breezy import transport as _mod_transport
-from breezy.tests import treeshape
+import importlib
+from urllib.parse import quote as urlquote
+from .. import osutils
+
+
+
+def _try_import(module_name):
+    """Try to import a module, returning it or None if unavailable."""
+    try:
+        return importlib.import_module(module_name)
+    except ImportError:
+        return None
+
+
+def pathname2url(path):
+    """Convert a local pathname to a URL path."""
+    # On Unix, pathname2url is essentially identity with encoding of special chars
+    # but preserving '/'
+    return urlquote(path, safe='/:@')
+
+logger = logging.getLogger("bzrformats.tests")
 
 _unitialized_attr = object()
 """A sentinel needed to act as a default value in a method signature."""
@@ -36,9 +55,6 @@ def _rmtree_temp_dir(path, test_id=None):
 
 class TestCase(testtools.TestCase if testtools else unittest.TestCase):
     """Base class for bzrformats unit tests.
-    
-    This is a minimal version of breezy.tests.TestCase that provides
-    just the functionality needed for bzrformats tests.
     """
 
     def __init__(self, methodName='testMethod'):
@@ -49,14 +65,14 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
         super().setUp()
         self._orig_cwd = os.getcwd()
         # Clear config to avoid external config affecting tests
-        from breezy import config
-        self.overrideAttr(config, "_shared_stores", {})
         # Override HOME to prevent reading user configs
         import tempfile
         self._test_home_dir = tempfile.mkdtemp(prefix='brz-test-home-')
         self.addCleanup(__import__('shutil').rmtree, self._test_home_dir)
         self.overrideEnv('HOME', self._test_home_dir)
         self.overrideEnv('BRZ_HOME', self._test_home_dir)
+        self.overrideEnv('EMAIL', 'jrandom@example.com')
+        self.overrideEnv('BRZ_EMAIL', None)
         
     def tearDown(self):
         try:
@@ -73,7 +89,7 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
         self._cleanups.append((func, args, kwargs))
         
     def overrideAttr(self, obj, attr_name, new=_unitialized_attr):
-        """Overrides an object attribute restoring it after the test (copied from breezy.tests)."""
+        """Overrides an object attribute restoring it after the test."""
         # The actual value is captured by the call below
         value = getattr(obj, attr_name, _unitialized_attr)
         if value is _unitialized_attr:
@@ -202,18 +218,8 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
             raise AssertionError(f'{s!r} does not end with {suffix!r}')
     
     def log(self, *args):
-        """Log a message (copied from breezy.tests)."""
-        from breezy import trace
-        trace.mutter(*args)
-    
-    def requireFeature(self, feature):
-        """This test requires a specific feature is available (copied from breezy.tests).
-        
-        :raises UnavailableFeature: When feature is not available.
-        """
-        from breezy.tests import UnavailableFeature
-        if not feature.available():
-            raise UnavailableFeature(feature)
+        """Log a message."""
+        logger.debug(*args)
     
     def assertSubset(self, sublist, superlist):
         """Assert that every entry in sublist is present in superlist."""
@@ -223,11 +229,18 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
     
     def knownFailure(self, reason):
         """Mark test as a known failure."""
-        from breezy.tests import KnownFailure
-        raise KnownFailure(reason)
-    
+        raise expectedFailure(reason)
+
+    def requireFeature(self, feature):
+        """This test requires a specific feature is available.
+
+        :raises unittest.SkipTest: When feature is not available.
+        """
+        if not feature.available():
+            self.skipTest(f'Feature {feature.feature_name()} not available')
+
     def assertPathExists(self, path):
-        """Fail unless path or paths, which may be abs or relative, exist (copied from breezy.tests)."""
+        """Fail unless path or paths, which may be abs or relative, exist."""
         if not isinstance(path, (bytes, str)):
             for p in path:
                 if not os.path.exists(p):
@@ -236,8 +249,18 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
             if not os.path.exists(path):
                 self.fail(f'path {path} does not exist')
     
+    def assertPathDoesNotExist(self, path):
+        """Fail if path or paths, which may be abs or relative, exist."""
+        if not isinstance(path, (bytes, str)):
+            for p in path:
+                if os.path.exists(p):
+                    self.fail(f'path {p} exists')
+        else:
+            if os.path.exists(path):
+                self.fail(f'path {path} exists')
+
     def assertFileEqual(self, content, path):
-        """Fail if path does not contain 'content' (copied from breezy.tests)."""
+        """Fail if path does not contain 'content'."""
         self.assertPathExists(path)
         
         mode = "r" + ("b" if isinstance(content, bytes) else "")
@@ -246,7 +269,7 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
         self.assertEqualDiff(content, s)
     
     def assertListRaises(self, excClass, func, *args, **kwargs):
-        """Fail unless excClass is raised when the iterator from func is used (copied from breezy.tests).
+        """Fail unless excClass is raised when the iterator from func is used.
         
         Many functions can return generators this makes sure
         to wrap them in a list() call to make sure the whole generator
@@ -264,7 +287,7 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
             raise self.failureException(f"{excName} not raised")
     
     def time(self, callable, *args, **kwargs):
-        """Run callable and return result (simplified version of breezy.tests time method)."""
+        """Run callable and return result."""
         # Simplified version - just run the callable without profiling
         return callable(*args, **kwargs)
 
@@ -272,7 +295,7 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
 class TestCaseInTempDir(TestCase):
     """Test case that runs in a temporary directory.
     
-    This is a minimal version of breezy's TestCaseInTempDir.
+    This is a minimal version of brz's TestCaseInTempDir.
     """
     
     TEST_ROOT = None
@@ -286,7 +309,7 @@ class TestCaseInTempDir(TestCase):
     def _make_test_root(self):
         """Create the top-level test directory if needed."""
         if TestCaseInTempDir.TEST_ROOT is None:
-            root = osutils.realpath(tempfile.mkdtemp(prefix='testbzrformats-', suffix='.tmp'))
+            root = os.path.realpath(tempfile.mkdtemp(prefix='testbzrformats-', suffix='.tmp'))
             TestCaseInTempDir.TEST_ROOT = root
             atexit.register(_rmtree_temp_dir, root)
             
@@ -318,182 +341,61 @@ class TestCaseInTempDir(TestCase):
     
     def build_tree(self, shape, line_endings='binary', transport=None):
         """Build a test tree according to a pattern.
-        
+
         shape is a sequence of file specifications. If the final
         character is '/', a directory is created.
         """
-        if transport is None:
-            transport = _mod_transport.get_transport_from_path('.')
-            
         for name in shape:
             if isinstance(name, tuple):
                 name, content = name
             else:
                 content = None
-                
+
             if name.endswith('/'):
-                transport.mkdir(urlutils.escape(name[:-1]))
+                os.makedirs(name, exist_ok=True)
             else:
+                dirname = os.path.dirname(name)
+                if dirname:
+                    os.makedirs(dirname, exist_ok=True)
                 if content is None:
                     content = f"contents of {name}\n"
                 if isinstance(content, str):
                     if line_endings == 'native':
                         content = content.replace('\n', os.linesep)
                     content = content.encode('utf-8')
-                transport.put_bytes_non_atomic(urlutils.escape(name), content)
-    
-    build_tree_contents = staticmethod(treeshape.build_tree_contents)
+                with open(name, 'wb') as f:
+                    f.write(content)
+
+    @staticmethod
+    def build_tree_contents(shape):
+        """Build test files with specific contents."""
+        for entry in shape:
+            if len(entry) == 2:
+                name, content = entry
+            else:
+                name = entry[0]
+                content = None
+            if name.endswith('/'):
+                os.makedirs(name, exist_ok=True)
+            else:
+                dirname = os.path.dirname(name)
+                if dirname:
+                    os.makedirs(dirname, exist_ok=True)
+                if content is None:
+                    content = b""
+                if isinstance(content, str):
+                    content = content.encode('utf-8')
+                with open(name, 'wb') as f:
+                    f.write(content)
 
 
-class TestCaseWithTransport(TestCaseInTempDir):
-    """Test case that provides transport access.
-    
-    This is a minimal version of breezy's TestCaseWithTransport.
-    """
-    
-    def __init__(self, methodName='runTest'):
-        super().__init__(methodName)
-        # Set up transport factory like breezy's implementation
-        from breezy.tests import test_server
-        self.vfs_transport_factory = test_server.LocalURLServer
-        self.transport_server = None
-        self.transport_readonly_server = None
-        self.__vfs_server = None
-    
-    def setUp(self):
-        super().setUp()
-        self._transport = None
-        
-    def get_vfs_only_server(self):
-        """Get the VFS server for this test."""
-        if self.__vfs_server is None:
-            self.__vfs_server = self.vfs_transport_factory()
-            self.start_server(self.__vfs_server)
-        return self.__vfs_server
-
-    def start_server(self, transport_server, backing_server=None):
-        """Start transport_server for this test."""
-        if backing_server is None:
-            transport_server.start_server()
-        else:
-            transport_server.start_server(backing_server)
-        self.addCleanup(transport_server.stop_server)
-        
-    def get_transport(self, relpath=None):
-        """Return a writeable transport.
-
-        This transport is for the test scratch space relative to
-        "self._test_root"
-
-        :param relpath: a path relative to the base url.
-        """
-        t = _mod_transport.get_transport_from_url(self.get_url(relpath))
-        self.assertFalse(t.is_readonly())
-        return t
-        
-    def get_url(self, relpath=None):
-        """Get a URL for the test directory."""
-        base = urlutils.local_path_to_url(self.test_dir) + '/'
-        if relpath:
-            base += urlutils.escape(relpath)
-        return base
-        
-    def assertIsDirectory(self, relpath, transport=None):
-        """Assert that relpath is a directory."""
-        if transport is None:
-            transport = self.get_transport()
-        try:
-            mode = transport.stat(relpath).st_mode
-        except _mod_transport.NoSuchFile:
-            self.fail(f'path {relpath} is not a directory; no such file')
-        if not stat.S_ISDIR(mode):
-            self.fail(f'path {relpath} is not a directory; has mode {mode:#o}')
-    
-    def make_branch_builder(self, relpath, format=None):
-        """Create a branch builder (copied from breezy.tests)."""
-        branch = self.make_branch(relpath, format=format)
-        from breezy.tests import branchbuilder
-        return branchbuilder.BranchBuilder(branch=branch)
-    
-    def make_branch(self, relpath, format=None, name=None):
-        """Create a branch on the transport at relpath (copied from breezy.tests)."""
-        repo = self.make_repository(relpath, format=format)
-        return repo.controldir.create_branch(append_revisions_only=False, name=name)
-    
-    def make_repository(self, relpath, shared=None, format=None):
-        """Create a repository on our default transport at relpath (copied from breezy.tests)."""
-        made_control = self.make_controldir(relpath, format=format)
-        return made_control.create_repository(shared=shared)
-    
-    def make_controldir(self, relpath, format=None):
-        """Create a controldir on our default transport at relpath (copied from breezy.tests)."""
-        try:
-            # might be a relative or absolute path
-            maybe_a_url = self.get_url(relpath)
-            segments = maybe_a_url.rsplit("/", 1)
-            t = _mod_transport.get_transport(maybe_a_url)
-            if len(segments) > 1 and segments[-1] not in ("", "."):
-                t.ensure_base()
-            format = self.resolve_format(format)
-            return format.initialize_on_transport(t)
-        except errors.UninitializableFormat as err:
-            raise TestSkipped(f"Format {format} is not initializable.") from err
-    
-    def resolve_format(self, format):
-        """Resolve an object to a ControlDir format object (copied from breezy.tests)."""
-        if format is None:
-            format = self.get_default_format()
-        if isinstance(format, str):
-            from breezy import controldir
-            format = controldir.format_registry.make_controldir(format)
-        return format
-    
-    def get_default_format(self):
-        """Get the default format (copied from breezy.tests)."""
-        return "default"
-    
-    def make_branch_and_tree(self, relpath, format=None):
-        """Create a branch on the transport and a tree locally (copied from breezy.tests)."""
-        from breezy import errors
-        
-        format = self.resolve_format(format=format)
-        if not format.supports_workingtrees:
-            b = self.make_branch(relpath + ".branch", format=format)
-            return b.create_checkout(relpath, lightweight=True)
-        b = self.make_branch(relpath, format=format)
-        try:
-            return b.controldir.create_workingtree()
-        except errors.NotLocalUrl:
-            # We can only make working trees locally at the moment.  If the
-            # transport can't support them, then we keep the non-disk-backed
-            # branch and create a local checkout.
-            return b.create_checkout(relpath, lightweight=True)
-    
-    def make_branch_and_memory_tree(self, relpath, format=None):
-        """Create a branch on the default transport and a MemoryTree for it (copied from breezy.tests)."""
-        b = self.make_branch(relpath, format=format)
-        return b.create_memorytree()
-    
-    def check_file_contents(self, filename, expect):
-        """Check contents of a file (copied from breezy.tests)."""
-        self.log(f"check contents of file {filename}")
-        with open(filename, "rb") as f:
-            contents = f.read()
-        if contents != expect:
-            self.log(f"expected: {expect!r}")
-            self.log(f"actually: {contents!r}")
-            self.fail(f"contents of {filename} not as expected")
 
 
 # Import TestSkipped from unittest
 TestSkipped = unittest.SkipTest
 
-# Import features from breezy.tests for compatibility
-from breezy.tests import features
 # Import testscenarios for scenario testing
 import testscenarios as scenarios
-# Import transport for compatibility
-from breezy import transport
 
 
 class TestNotApplicable(TestSkipped):
@@ -503,126 +405,39 @@ class TestNotApplicable(TestSkipped):
 
 class TestCaseWithMemoryTransport(TestCase):
     """TestCase with a MemoryTransport for testing.
-    
-    This is a minimal version for bzrformats tests.
+
+    Uses bzrformats' own MemoryTransport. Each test gets a fresh
+    transport namespace based on the test ID.
     """
-    
-    TEST_ROOT = None
-    
-    def __init__(self, methodName='runTest'):
-        super().__init__(methodName)
-        # Set up transport factory like breezy's implementation
-        from breezy.transport import memory
-        self.vfs_transport_factory = memory.MemoryServer
-        self.transport_server = None
-        self.transport_readonly_server = None
-        self.__vfs_server = None
-        self.__server = None
-    
+
     def setUp(self):
         super().setUp()
-        self._make_test_root()
-        
-    def _make_test_root(self):
-        if TestCaseWithMemoryTransport.TEST_ROOT is None:
-            # For memory transport, we don't need a real directory
-            TestCaseWithMemoryTransport.TEST_ROOT = "memory:///"
-            
-    def get_vfs_only_server(self):
-        """Get the VFS server for this test."""
-        if self.__vfs_server is None:
-            from breezy.transport import memory
-            self.__vfs_server = memory.MemoryServer()
-            self.start_server(self.__vfs_server)
-        return self.__vfs_server
+        from ..transport import MemoryTransport
+        self._memory_transport = MemoryTransport(
+            url=f"memory:///{self.id()}/"
+        )
 
-    def get_server(self):
-        """Get the read/write server instance."""
-        if self.__server is None:
-            if self.transport_server is None or self.transport_server is self.vfs_transport_factory:
-                self.__server = self.get_vfs_only_server()
-            else:
-                # bring up a decorated means of access to the vfs only server.
-                self.__server = self.transport_server()
-                self.start_server(self.__server, self.get_vfs_only_server())
-        return self.__server
-
-    def start_server(self, transport_server, backing_server=None):
-        """Start transport_server for this test."""
-        if backing_server is None:
-            transport_server.start_server()
-        else:
-            transport_server.start_server(backing_server)
-        self.addCleanup(transport_server.stop_server)
-        
     def get_transport(self, relpath=None):
         """Get the transport for this test case."""
-        t = _mod_transport.get_transport_from_url(self.get_url(relpath))
-        self.assertFalse(t.is_readonly())
+        if relpath is None or relpath == ".":
+            return self._memory_transport
+        t = self._memory_transport.clone(relpath)
+        t.ensure_base()
         return t
-        
+
     def get_url(self, relpath=None):
         """Get a URL for the memory transport."""
-        base = self.get_server().get_url()
-        return self._adjust_url(base, relpath)
-        
-    def _adjust_url(self, base, relpath):
-        """Get a URL (or maybe a path) with relpath appended."""
-        if relpath is not None and relpath != ".":
-            if not base.endswith("/"):
-                base = base + "/"
-            # XXX: Really base should be a url; we did after all call
-            # get_url()!  But sometimes it's just a path (from
-            # LocalAbspathServer), and it'd be wrong to append urlescaped data
-            # to a non-escaped local path.
-            if base.startswith("./") or base.startswith("/"):
-                base += relpath
-            else:
-                base += urlutils.escape(relpath)
-        return base
-    
-    def make_branch_builder(self, relpath, format=None):
-        """Create a branch builder (copied from breezy.tests)."""
-        branch = self.make_branch(relpath, format=format)
-        from breezy.tests import branchbuilder
-        return branchbuilder.BranchBuilder(branch=branch)
-    
-    def make_branch(self, relpath, format=None, name=None):
-        """Create a branch on the transport at relpath (copied from breezy.tests)."""
-        repo = self.make_repository(relpath, format=format)
-        return repo.controldir.create_branch(append_revisions_only=False, name=name)
-    
-    def make_repository(self, relpath, shared=None, format=None):
-        """Create a repository on our default transport at relpath (copied from breezy.tests)."""
-        made_control = self.make_controldir(relpath, format=format)
-        return made_control.create_repository(shared=shared)
-    
-    def make_controldir(self, relpath, format=None):
-        """Create a controldir on our default transport at relpath (copied from breezy.tests)."""
-        try:
-            # might be a relative or absolute path
-            maybe_a_url = self.get_url(relpath)
-            segments = maybe_a_url.rsplit("/", 1)
-            t = _mod_transport.get_transport(maybe_a_url)
-            if len(segments) > 1 and segments[-1] not in ("", "."):
-                t.ensure_base()
-            format = self.resolve_format(format)
-            return format.initialize_on_transport(t)
-        except errors.UninitializableFormat as err:
-            raise TestSkipped(f"Format {format} is not initializable.") from err
-    
-    def resolve_format(self, format):
-        """Resolve an object to a ControlDir format object (copied from breezy.tests)."""
-        if format is None:
-            format = self.get_default_format()
-        if isinstance(format, str):
-            from breezy import controldir
-            format = controldir.format_registry.make_controldir(format)
-        return format
-    
-    def get_default_format(self):
-        """Get the default format (copied from breezy.tests)."""
-        return "default"
+        if relpath is None or relpath == ".":
+            return self._memory_transport.base
+        return self._memory_transport.abspath(relpath)
+
+    def check_file_contents(self, filename, expect):
+        """Check contents of a file on the transport."""
+        contents = self.get_transport().get_bytes(filename)
+        if contents != expect:
+            self.log(f"expected: {expect!r}")
+            self.log(f"actually: {contents!r}")
+            self.fail(f"contents of {filename} not as expected")
 
 
 def load_tests(loader, basic_tests, pattern):

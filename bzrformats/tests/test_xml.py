@@ -16,7 +16,7 @@
 
 from io import BytesIO
 
-import breezy.osutils
+from .. import osutils
 import bzrformats.xml5
 from ..revision import Revision
 from . import TestCase
@@ -238,7 +238,7 @@ class TestSerializer(TestCase):
     def test_unpack_basis_inventory_5(self):
         """Unpack canned new-style inventory."""
         inv = bzrformats.xml5.inventory_serializer_v5.read_inventory_from_lines(
-            breezy.osutils.split_lines(_basis_inv_v5)
+            osutils.split_lines(_basis_inv_v5)
         )
         eq = self.assertEqual
         eq(len(inv), 4)
@@ -251,25 +251,25 @@ class TestSerializer(TestCase):
 
     def test_unpack_inventory_5a(self):
         inv = bzrformats.xml5.inventory_serializer_v5.read_inventory_from_lines(
-            breezy.osutils.split_lines(_inventory_v5a), revision_id=b"test-rev-id"
+            osutils.split_lines(_inventory_v5a), revision_id=b"test-rev-id"
         )
         self.assertEqual(b"test-rev-id", inv.root.revision)
 
     def test_unpack_inventory_5b(self):
         inv = bzrformats.xml5.inventory_serializer_v5.read_inventory_from_lines(
-            breezy.osutils.split_lines(_inventory_v5b), revision_id=b"test-rev-id"
+            osutils.split_lines(_inventory_v5b), revision_id=b"test-rev-id"
         )
         self.assertEqual(b"a-rev-id", inv.root.revision)
 
     def test_repack_inventory_5(self):
         inv = bzrformats.xml5.inventory_serializer_v5.read_inventory_from_lines(
-            breezy.osutils.split_lines(_committed_inv_v5)
+            osutils.split_lines(_committed_inv_v5)
         )
         outp = BytesIO()
         bzrformats.xml5.inventory_serializer_v5.write_inventory(inv, outp)
         self.assertEqualDiff(_expected_inv_v5, outp.getvalue())
         inv2 = bzrformats.xml5.inventory_serializer_v5.read_inventory_from_lines(
-            breezy.osutils.split_lines(outp.getvalue())
+            osutils.split_lines(outp.getvalue())
         )
         self.assertEqual(inv, inv2)
 
@@ -401,12 +401,12 @@ class TestSerializer(TestCase):
         self.assertRaises(
             serializer.UnexpectedInventoryFormat,
             s_v7.read_inventory_from_lines,
-            breezy.osutils.split_lines(_expected_inv_v5),
+            osutils.split_lines(_expected_inv_v5),
         )
         self.assertRaises(
             serializer.UnexpectedInventoryFormat,
             s_v6.read_inventory_from_lines,
-            breezy.osutils.split_lines(_expected_inv_v7),
+            osutils.split_lines(_expected_inv_v7),
         )
 
     def test_tree_reference(self):
@@ -485,7 +485,7 @@ class TestSerializer(TestCase):
 
         # ie.revision should either be None or a utf-8 revision id
         inv = si_v5.read_inventory_from_lines(
-            breezy.osutils.split_lines(_inventory_utf8_v5)
+            osutils.split_lines(_inventory_utf8_v5)
         )
         rev_id_1 = "erik@b\xe5gfors-01".encode()
         rev_id_2 = "erik@b\xe5gfors-02".encode()

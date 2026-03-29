@@ -16,9 +16,9 @@
 
 """Tests for VersionedFile classes."""
 
-from breezy import errors
-from vcsgraph import multiparent
+from .. import multiparent
 
+from .. import errors
 from . import TestCase, TestCaseWithMemoryTransport
 from .. import groupcompress, versionedfile
 

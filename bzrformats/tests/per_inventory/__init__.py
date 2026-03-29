@@ -16,30 +16,31 @@
 
 """Tests for different inventory implementations."""
 
-from breezy import tests
+from testscenarios import load_tests_apply_scenarios
+
 from bzrformats import groupcompress
+from bzrformats.inventory import CHKInventory, Inventory
+from .. import TestCaseWithMemoryTransport
+
+
+def _inv_to_chk_inv(test, inv):
+    """CHKInventory needs a backing VF, so we create one."""
+    factory = groupcompress.make_pack_factory(True, True, 1)
+    trans = test.get_transport("chk-inv")
+    trans.ensure_base()
+    vf = factory(trans)
+    chk_inv = CHKInventory.from_inventory(
+        vf, inv, maximum_size=100, search_key_name=b"hash-255-way"
+    )
+    return chk_inv
 
 
 def load_tests(loader, basic_tests, pattern):
-    """Generate suite containing all parameterized tests."""
-    modules_to_test = [
-        "bzrformats.tests.per_inventory.basics",
-    ]
-    from ...inventory import CHKInventory, Inventory
+    suite = loader.loadTestsFromName("bzrformats.tests.per_inventory.basics")
+    return load_tests_apply_scenarios(loader, suite, pattern)
 
-    def inv_to_chk_inv(test, inv):
-        """CHKInventory needs a backing VF, so we create one."""
-        factory = groupcompress.make_pack_factory(True, True, 1)
-        trans = test.get_transport("chk-inv")
-        trans.ensure_base()
-        vf = factory(trans)
-        # We intentionally use a non-standard maximum_size, so that we are more
-        # likely to trigger splits, and get increased test coverage.
-        chk_inv = CHKInventory.from_inventory(
-            vf, inv, maximum_size=100, search_key_name=b"hash-255-way"
-        )
-        return chk_inv
 
+class TestCaseWithInventory(TestCaseWithMemoryTransport):
     scenarios = [
         (
             "Inventory",
@@ -49,20 +50,13 @@ def load_tests(loader, basic_tests, pattern):
             "CHKInventory",
             {
                 "_inventory_class": CHKInventory,
-                "_inv_to_test_inv": inv_to_chk_inv,
+                "_inv_to_test_inv": _inv_to_chk_inv,
             },
         ),
     ]
-    # add the tests for the sub modules
-    submod_tests = loader.suiteClass()
-    for module_name in modules_to_test:
-        submod_tests.addTest(loader.loadTestsFromName(module_name))
-    return tests.multiply_tests(submod_tests, scenarios, basic_tests)
 
-
-class TestCaseWithInventory(tests.TestCaseWithMemoryTransport):
-    _inventory_class = None  # set by load_tests
-    _inv_to_test_inv = None  # set by load_tests
+    _inventory_class = None  # set by scenarios
+    _inv_to_test_inv = None  # set by scenarios
 
     def make_test_inventory(self):
         """Return an instance of the Inventory class under test."""

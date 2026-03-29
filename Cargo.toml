@@ -1,58 +1,8 @@
-[package]
-name = "breezy"
-version = { workspace = true }
-authors = [ "Martin Packman <gzlist@googlemail.com>", "Jelmer Vernooij <jelmer@jelmer.uk>"]
-edition = "2021"
-default-run = "brz"
-license = "GPL-2.0-or-later"
-description = "Friendly distributed version control system"
-repository = "https://github.com/breezy-team/breezy"
-homepage = "https://www.breezy-vcs.org/"
-documentation = "https://www.breezy-vcs.org/doc/"
-include = [
-	"src/*.rs",
-	"breezy/main.rs",
-	"README.rst",
-]
-
 [workspace]
-members = ["crates/*", "bzrformats/bazaar-py", "bzrformats/bazaar"]
+members = ["crates/*"]
 
 [workspace.package]
 version = "3.4.0"
-
-[[bin]]
-name = "brz"
-path = "src/main.rs"
-
-[lib]
-
-[features]
-default = ["i18n", "pyo3"]
-i18n = ["dep:gettext"]
-pyo3 = []
-
-[dependencies]
-pyo3 = { workspace = true, features = ["abi3"] }
-gettext = { workspace = true, optional = true }
-log = { workspace = true }
-breezy-osutils = { path = "crates/osutils", version = ">=3.3.4" }
-chrono = { workspace = true }
-bazaar = { path = "bzrformats/bazaar" }
-breezy-graph = { path = "crates/graph" }
-percent-encoding = "2"
-url = { workspace = true }
-regex = "1"
-inventory = "0.3"
-lazy_static = "1.4"
-once_cell = "1"
-textwrap = ">=0.13"
-serde_yaml = "0.9"
-serde = { version = "1", features = ["derive"]}
-encoding = "0.2.33"
-
-[target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["fs"] }
 
 [workspace.dependencies]
 nix = ">=0.26"

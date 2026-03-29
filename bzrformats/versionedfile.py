@@ -24,26 +24,22 @@ from io import BytesIO
 from typing import Any
 from zlib import adler32
 
-from breezy import errors, revision, urlutils
-from vcsgraph import multiparent
+from urllib.parse import quote, unquote
+from . import revision
+from . import multiparent
 from vcsgraph import graph as _mod_graph
-from breezy import transport as _mod_transport
+from vcsgraph import known_graph as _mod_known_graph
 
 # Import complex osutils functions that are too difficult to replace
-from breezy.osutils import file_iterator
-from breezy.registry import Registry
+from .osutils import file_iterator
+from .registry import Registry
 from .textmerge import TextMerge
 
-from vcsgraph import (
-    graph as _mod_graph,
-)
-from vcsgraph import (
-    known_graph as _mod_known_graph,
-)
-
-from . import index, osutils
+from . import osutils
 from ._bzr_rs import versionedfile as _versionedfile_rs
-from .errors import BzrFormatsError
+from . import index
+from .errors import BzrFormatsError, ObjectNotLocked, VersionedFileInvalidChecksum, RevisionNotPresent, NoSuchFile
+from .transport import TransportNoSuchFile
 
 FulltextContentFactory = _versionedfile_rs.FulltextContentFactory
 ChunkedContentFactory = _versionedfile_rs.ChunkedContentFactory
@@ -283,7 +279,7 @@ class _MPDiffGenerator:
         #       be tiny
         missing_keys = needed_keys.difference(parent_map)
         if missing_keys:
-            raise errors.RevisionNotPresent(list(missing_keys)[0], self.vf)
+            raise RevisionNotPresent(list(missing_keys)[0], self.vf)
         # Parents that might be missing. They are allowed to be ghosts, but we
         # should check for them
         refcounts = {}
@@ -364,7 +360,7 @@ class _MPDiffGenerator:
         needed_keys, _refcounts = self._find_needed_keys()
         for record in self.vf.get_record_stream(needed_keys, "topological", True):
             if record.storage_kind == "absent":
-                raise errors.RevisionNotPresent(record.key, self.vf)
+                raise RevisionNotPresent(record.key, self.vf)
             self._process_one_record(record.key, record.get_bytes_as("chunked"))
 
     def compute_diffs(self):
@@ -557,13 +553,13 @@ class VersionedFile:
         """Check that lines being added to a versioned file are not unicode."""
         for line in lines:
             if not isinstance(line, bytes):
-                raise errors.BzrBadParameterUnicode("lines")
+                raise TypeError("lines")
 
     def _check_lines_are_lines(self, lines):
         """Check that the lines really are full lines without inline EOL."""
         for line in lines:
             if b"\n" in line[:-1]:
-                raise errors.BzrBadParameterContainsNewline("lines")
+                raise ValueError("lines contain newlines")
 
     def get_format_signature(self):
         """Get a text description of the data encoding in this file.
@@ -585,7 +581,7 @@ class VersionedFile:
             try:
                 knit_versions.update(parent_map[version_id])
             except KeyError as e:
-                raise errors.RevisionNotPresent(version_id, self) from e
+                raise RevisionNotPresent(version_id, self) from e
         # We need to filter out ghosts, because we can't diff against them.
         knit_versions = set(self.get_parent_map(knit_versions))
         lines = dict(
@@ -605,7 +601,7 @@ class VersionedFile:
                 # parent_map[version_id] was already triggered in the previous
                 # for loop, and lines[p] has the 'if p in knit_versions' check,
                 # so we again won't have a KeyError.
-                raise errors.RevisionNotPresent(version_id, self) from e
+                raise RevisionNotPresent(version_id, self) from e
             if len(parents) > 0:
                 left_parent_blocks = self._extract_blocks(
                     version_id, parents[0], target
@@ -674,7 +670,7 @@ class VersionedFile:
         sha1s = self.get_sha1s(versions)
         for version, _parent_ids, expected_sha1, _mpdiff in records:
             if expected_sha1 != sha1s[version]:
-                raise errors.VersionedFileInvalidChecksum(version)
+                raise VersionedFileInvalidChecksum(version)
 
     def get_text(self, version_id):
         """Return version contents as a text string.
@@ -746,7 +742,7 @@ class VersionedFile:
         try:
             return list(self.get_parent_map([version_id])[version_id])
         except KeyError as e:
-            raise errors.RevisionNotPresent(version_id, self) from e
+            raise RevisionNotPresent(version_id, self) from e
 
     def annotate(self, version_id):
         """Return a list of (version-id, line) tuples for version_id.
@@ -1087,11 +1083,11 @@ class URLEscapeMapper(KeyMapper):
 
     def map(self, key):
         """See KeyMapper.map()."""
-        return urlutils.quote(self._map(key))
+        return quote(self._map(key))
 
     def unmap(self, partition_id):
         """See KeyMapper.unmap()."""
-        return self._unmap(urlutils.unquote(partition_id))
+        return self._unmap(unquote(partition_id))
 
 
 class PrefixMapper(URLEscapeMapper):
@@ -1144,7 +1140,7 @@ class HashEscapedPrefixMapper(HashPrefixMapper):
     def _escape(self, prefix):
         """Turn a key element into a filesystem safe string.
 
-        This is similar to a plain urlutils.quote, except
+        This is similar to a plain urllib.parse.quote, except
         it uses specific safe characters, so that it doesn't
         have to translate a lot of valid file ids.
         """
@@ -1155,8 +1151,8 @@ class HashEscapedPrefixMapper(HashPrefixMapper):
         return "".join(r).encode("ascii")
 
     def _unescape(self, basename):
-        """Escaped names are easily unescaped by urlutils."""
-        return urlutils.unquote(basename)
+        """Escaped names are easily unescaped by urllib.parse.unquote."""
+        return unquote(basename)
 
 
 def make_versioned_files_factory(versioned_file_factory, mapper):
@@ -1186,7 +1182,7 @@ class VersionedFiles:
 
     The keyspace is expressed via simple tuples. Any instance of VersionedFiles
     may have a different length key-size, but that size will be constant for
-    all texts added to or retrieved from it. For instance, breezy uses
+    all texts added to or retrieved from it. For instance, bazaar uses
     instances with a key-size of 2 for storing user files in a repository, with
     the first element the fileid, and the second the version of that file.
 
@@ -1323,7 +1319,7 @@ class VersionedFiles:
                 left_matching_blocks=left_matching_blocks,
             )
             if version_sha1 != expected_sha1:
-                raise errors.VersionedFileInvalidChecksum(version)
+                raise VersionedFileInvalidChecksum(version)
             vf_parents[key] = version_text
 
     def annotate(self, key):
@@ -1370,13 +1366,13 @@ class VersionedFiles:
         """Check that lines being added to a versioned file are not unicode."""
         for line in lines:
             if line.__class__ is not bytes:
-                raise errors.BzrBadParameterUnicode("lines")
+                raise TypeError("lines")
 
     def _check_lines_are_lines(self, lines):
         """Check that the lines really are full lines without inline EOL."""
         for line in lines:
             if b"\n" in line[:-1]:
-                raise errors.BzrBadParameterContainsNewline("lines")
+                raise ValueError("lines contain newlines")
 
     def get_known_graph_ancestry(self, keys):
         """Get a KnownGraph instance with the ancestry of keys."""
@@ -1485,7 +1481,7 @@ class VersionedFiles:
         Returns:
             VersionedFileAnnotator: An annotator instance for this versioned file.
         """
-        from breezy.bzr.annotate import VersionedFileAnnotator
+        from .annotate import VersionedFileAnnotator
 
         return VersionedFileAnnotator(self)
 
@@ -1585,7 +1581,7 @@ class ThunkedVersionedFiles(VersionedFiles):
                     random_id=random_id,
                     check_content=check_content,
                 )
-        except _mod_transport.NoSuchFile:
+        except TransportNoSuchFile:
             # parent directory may be missing, try again.
             self._transport.mkdir(osutils.dirname(path))
             try:
@@ -1656,7 +1652,7 @@ class ThunkedVersionedFiles(VersionedFiles):
 
     def _get_vf(self, path):
         if not self._is_locked():
-            raise errors.ObjectNotLocked(self)
+            raise ObjectNotLocked(self)
         return self._file_factory(
             path, self._transport, create=True, get_scope=lambda: None
         )
@@ -1848,7 +1844,7 @@ class _PlanMergeVersionedFile(VersionedFiles):
         return _PlanMerge._subtract_plans(old_plan, new_plan)
 
     def plan_lca_merge(self, ver_a, ver_b, base=None):
-        from breezy.merge import _PlanLCAMerge
+        from .merge import _PlanLCAMerge
 
         graph = _mod_graph.Graph(self)
         new_plan = _PlanLCAMerge(

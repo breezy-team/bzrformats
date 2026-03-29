@@ -73,13 +73,14 @@ from io import BytesIO
 
 import patiencediff
 
-from breezy import errors
-from breezy import transport as _mod_transport
-from breezy.errors import RevisionAlreadyPresent, RevisionNotPresent
-from breezy.osutils import sha_strings
-from breezy.revision import NULL_REVISION
+from .errors import (
+    OutSideTransaction, ReadOnlyObjectDirtiedError,
+    RevisionAlreadyPresent, RevisionNotPresent, NoSuchFile, BzrFormatsError,
+)
+from .transport import TransportNoSuchFile
+from .osutils import sha_strings
+from .revision import NULL_REVISION
 
-from .errors import BzrFormatsError
 from .versionedfile import (
     AbsentContentFactory,
     ContentFactory,
@@ -386,9 +387,9 @@ class Weave(VersionedFile):
     def _check_write_ok(self):
         """Is the versioned file marked as 'finished' ? Raise if it is."""
         if self._get_scope() != self._scope:
-            raise errors.OutSideTransaction()
+            raise OutSideTransaction()
         if self._access_mode != "w":
-            raise errors.ReadOnlyObjectDirtiedError(self)
+            raise ReadOnlyObjectDirtiedError(self)
 
     def copy(self):
         """Return a deep copy of self.
@@ -1086,7 +1087,7 @@ class WeaveFile(Weave):
         try:
             with self._transport.get(name + WeaveFile.WEAVE_SUFFIX) as f:
                 _read_weave_v5(BytesIO(f.read()), self)
-        except _mod_transport.NoSuchFile:
+        except TransportNoSuchFile:
             if not create:
                 raise
             # new file, save it
@@ -1136,7 +1137,7 @@ class WeaveFile(Weave):
         path = self._weave_name + WeaveFile.WEAVE_SUFFIX
         try:
             self._transport.put_bytes(path, bytes, self._filemode)
-        except _mod_transport.NoSuchFile:
+        except TransportNoSuchFile:
             self._transport.mkdir(os.path.dirname(path))
             self._transport.put_bytes(path, bytes, self._filemode)
 

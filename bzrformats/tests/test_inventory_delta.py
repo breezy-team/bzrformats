@@ -21,8 +21,8 @@ See doc/developer/inventory.txt for more information.
 
 from io import BytesIO
 
-from breezy import osutils
-from breezy.revision import NULL_REVISION
+from .. import osutils
+from ..revision import NULL_REVISION
 from . import TestCase
 from bzrformats import inventory, inventory_delta
 from bzrformats.inventory import Inventory, _make_delta

@@ -29,13 +29,12 @@ import re
 from bisect import bisect_right
 from io import BytesIO
 
-from breezy import debug
-from breezy import revision as _mod_revision
-from breezy import transport as _mod_transport
-
-from .errors import BzrFormatsError
+from .errors import BzrFormatsError, NoSuchFile
+from .transport import TransportNoSuchFile
+from . import revision as _mod_revision
 
 logger = logging.getLogger("bzrformats.index")
+evil_logger = logging.getLogger("bzrformats.evil")
 
 _HEADER_READV = (0, 200)
 _OPTION_KEY_ELEMENTS = b"key_elements="
@@ -441,7 +440,7 @@ class GraphIndex:
     def __init__(self, transport, name, size, unlimited_cache=False, offset=0):
         """Open an index called name on transport.
 
-        :param transport: A breezy.transport.Transport.
+        :param transport: A Transport.
         :param name: A path to provide to transport API calls.
         :param size: The size of the index in bytes. This is used for bisection
             logic to perform partial index reads. While the size could be
@@ -514,8 +513,7 @@ class GraphIndex:
         if self._nodes is not None:
             # We already did this
             return
-        if debug.debug_flag_enabled("index"):
-            logger.debug("Reading entire index %s", self._transport.abspath(self._name))
+        logger.debug("Reading entire index %s", self._transport.abspath(self._name))
         if stream is None:
             stream = self._transport.get(self._name)
             if self._base_offset != 0 or not hasattr(stream, "readline"):
@@ -601,8 +599,7 @@ class GraphIndex:
             There is no defined order for the result iteration - it will be in
             the most efficient order for the index.
         """
-        if debug.debug_flag_enabled("evil"):
-            logger.debug("iter_all_entries scales with size of history.")
+        evil_logger.debug("iter_all_entries scales with size of history.")
         if self._nodes is None:
             self._buffer_all()
         if self.node_ref_lists:
@@ -828,7 +825,7 @@ class GraphIndex:
 
         :param location_keys: A list of location(byte offset), key tuples.
         :return: A list of (location_key, result) tuples as expected by
-            breezy.bisect_multi.bisect_multi_bytes.
+            bzrformats.bisect_multi.bisect_multi_bytes.
         """
         # Possible improvements:
         #  - only bisect lookup each key once
@@ -1387,7 +1384,7 @@ class CombinedGraphIndex:
                             yield node
                             seen_keys.add(node[1])
                 return
-            except _mod_transport.NoSuchFile as e:
+            except TransportNoSuchFile as e:
                 if not self._try_reload(e):
                     raise
 
@@ -1417,7 +1414,7 @@ class CombinedGraphIndex:
                     if index_hit:
                         hit_indices.append(index)
                 break
-            except _mod_transport.NoSuchFile as e:
+            except TransportNoSuchFile as e:
                 if not self._try_reload(e):
                     raise
         self._move_to_front(hit_indices)
@@ -1460,7 +1457,7 @@ class CombinedGraphIndex:
                     if index_hit:
                         hit_indices.append(index)
                 break
-            except _mod_transport.NoSuchFile as e:
+            except TransportNoSuchFile as e:
                 if not self._try_reload(e):
                     raise
         self._move_to_front(hit_indices)
@@ -1489,8 +1486,8 @@ class CombinedGraphIndex:
 
         Returns a list of names corresponding to the hit_indices param.
         """
-        indices_info = zip(self._index_names, self._indices, strict=False)
-        if debug.debug_flag_enabled("index"):
+        indices_info = zip(self._index_names, self._indices)
+        if logger.isEnabledFor(logging.DEBUG):
             indices_info = list(indices_info)
             logger.debug(
                 "CombinedGraphIndex reordering: currently %r, promoting %r",
@@ -1518,7 +1515,7 @@ class CombinedGraphIndex:
 
         self._indices = new_hit_indices + unhit_indices
         self._index_names = hit_names + unhit_names
-        if debug.debug_flag_enabled("index"):
+        if logger.isEnabledFor(logging.DEBUG):
             logger.debug("CombinedGraphIndex reordered: %r", self._indices)
         return hit_names
 
@@ -1611,7 +1608,7 @@ class CombinedGraphIndex:
         while True:
             try:
                 return sum((index.key_count() for index in self._indices), 0)
-            except _mod_transport.NoSuchFile as e:
+            except TransportNoSuchFile as e:
                 if not self._try_reload(e):
                     raise
 
@@ -1646,7 +1643,7 @@ class CombinedGraphIndex:
                 for index in self._indices:
                     index.validate()
                 return
-            except _mod_transport.NoSuchFile as e:
+            except TransportNoSuchFile as e:
                 if not self._try_reload(e):
                     raise
 
@@ -1678,8 +1675,7 @@ class InMemoryGraphIndex(GraphIndexBuilder):
             defined order for the result iteration - it will be in the most
             efficient order for the index (in this case dictionary hash order).
         """
-        if debug.debug_flag_enabled("evil"):
-            logger.debug("iter_all_entries scales with size of history.")
+        evil_logger.debug("iter_all_entries scales with size of history.")
         if self.reference_lists:
             for key, (absent, references, value) in self._nodes.items():
                 if not absent:

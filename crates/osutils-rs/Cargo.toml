@@ -1,0 +1,21 @@
+[package]
+name = "osutils"
+version = "0.1.0"
+edition = "2021"
+description = "Low level OS wrappers for bzrformats"
+license = "GPL-2.0+"
+
+[lib]
+
+[dependencies]
+memchr = "2.7.4"
+rand = "0.9"
+sha1 = "0.10"
+unicode-normalization = "0.1.19"
+pyo3 = { version = ">=0.26,<0.29", optional = true }
+chrono = "0.4"
+lazy_static = "1"
+log = "0.4"
+
+[features]
+pyo3 = ["dep:pyo3"]

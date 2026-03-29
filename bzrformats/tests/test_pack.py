@@ -14,11 +14,11 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
-"""Tests for breezy.pack."""
+"""Tests for bzrformats.pack."""
 
 from io import BytesIO
 
-from . import TestCase, TestCaseInTempDir, TestCaseWithTransport
+from . import TestCase, TestCaseInTempDir, TestCaseWithMemoryTransport
 
 from .. import pack
 
@@ -524,7 +524,7 @@ class TestBytesRecordReader(TestCase):
         self.assertEqual(b"", get_bytes(99))
 
 
-class TestMakeReadvReader(TestCaseWithTransport):
+class TestMakeReadvReader(TestCaseWithMemoryTransport):
     def test_read_skipping_records(self):
         pack_data = BytesIO()
         writer = pack.ContainerWriter(pack_data.write)
@@ -545,7 +545,7 @@ class TestMakeReadvReader(TestCaseWithTransport):
         self.assertEqual([([], b"abc"), ([(b"name2",)], b"ghi")], result)
 
 
-class TestReadvFile(TestCaseWithTransport):
+class TestReadvFile(TestCaseWithMemoryTransport):
     """Tests of the ReadVFile class.
 
     Error cases are deliberately undefined: this code adapts the underlying

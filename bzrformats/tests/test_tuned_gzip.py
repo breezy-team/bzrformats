@@ -20,7 +20,7 @@
 import gzip
 from io import BytesIO
 
-from . import TestCase, TestCaseInTempDir, TestCaseWithTransport
+from . import TestCase, TestCaseInTempDir
 from bzrformats import tuned_gzip
 
 

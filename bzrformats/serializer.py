@@ -16,7 +16,7 @@
 
 """Inventory/revision serialization."""
 
-from breezy import registry
+from . import registry
 
 from .errors import BzrFormatsError
 

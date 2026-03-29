@@ -58,20 +58,20 @@ import operator
 import os
 from io import BytesIO
 
-from breezy import debug, errors, ui
 from . import diff
-from breezy import transport as _mod_transport
-from . import pack_repo
-from breezy.bzr.annotate import VersionedFileAnnotator
-from breezy.errors import InvalidRevisionId, RevisionNotPresent
-from breezy.osutils import sha_string, sha_strings
-from breezy.transport import NoSuchFile
-from bzrformats import pack
 from vcsgraph import tsort
+from . import pack_repo
+from .annotate import VersionedFileAnnotator
+from .errors import (
+    InvalidRevisionId, ObjectNotLocked, ReadOnlyError, ReadOnlyObjectDirtiedError,
+    RevisionAlreadyPresent, RevisionNotPresent, BzrFormatsError, NoSuchFile,
+)
+from .osutils import sha_string, sha_strings
+from .transport import TransportNoSuchFile
+from bzrformats import pack
 
 from . import index as _mod_index
 from . import osutils, tuned_gzip
-from .errors import BzrFormatsError
 from .osutils import contains_whitespace
 from .versionedfile import (
     AbsentContentFactory,
@@ -85,6 +85,7 @@ from .versionedfile import (
     sort_groupcompress,
 )
 
+evil_logger = logging.getLogger("bzrformats.evil")
 logger = logging.getLogger("bzrformats.knit")
 
 # TODO: Split out code specific to this format into an associated object.
@@ -356,7 +357,7 @@ class DeltaAnnotatedToFullText(KnitAdapter):
             self._basis_vf.get_record_stream([compression_parent], "unordered", True)
         )
         if basis_entry.storage_kind == "absent":
-            raise errors.RevisionNotPresent(compression_parent, self._basis_vf)
+            raise RevisionNotPresent(compression_parent, self._basis_vf)
         basis_lines = basis_entry.get_bytes_as("lines")
         # Manually apply the delta because we have one annotated content and
         # one plain.
@@ -429,7 +430,7 @@ class DeltaPlainToFullText(KnitAdapter):
             self._basis_vf.get_record_stream([compression_parent], "unordered", True)
         )
         if basis_entry.storage_kind == "absent":
-            raise errors.RevisionNotPresent(compression_parent, self._basis_vf)
+            raise RevisionNotPresent(compression_parent, self._basis_vf)
         basis_lines = basis_entry.get_bytes_as("lines")
         basis_content = PlainKnitContent(basis_lines, compression_parent)
         # Manually apply the delta because we have one annotated content and
@@ -620,7 +621,7 @@ class LazyKnitContentFactory(ContentFactory):
         if storage_kind in ("chunked", "lines"):
             chunks = self._generator._get_one_work(self.key).text()
             return iter(chunks)
-        raise errors.UnavailableRepresentation(
+        raise UnavailableRepresentation(
             self.key, storage_kind, self.storage_kind
         )
 
@@ -1262,7 +1263,7 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
             stored during insertion.
         :param reload_func: An function that can be called if we think we need
             to reload the pack listing and try again. See
-            'breezy.bzr.pack_repo.AggregateIndex' for the signature.
+            'bzrformats.pack_repo.AggregateIndex' for the signature.
         """
         self._index = index
         self._access = data_access
@@ -1623,7 +1624,7 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
                 component_data[key] = self._build_details_to_components(details)
             missing = current_components.difference(build_details)
             if missing and not allow_missing:
-                raise errors.RevisionNotPresent(missing.pop(), self)
+                raise RevisionNotPresent(missing.pop(), self)
         return component_data
 
     def _get_content(self, key, parent_texts=None):
@@ -2138,7 +2139,7 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
                     adapter_key = record.storage_kind, "lines"
                     adapter = get_adapter(adapter_key)
                     lines = adapter.get_bytes(record, "lines")
-                with contextlib.suppress(errors.RevisionAlreadyPresent):
+                with contextlib.suppress(RevisionAlreadyPresent):
                     self.add_lines(record.key, parents, lines)
             # Add any records whose basis parent is now available.
             if not buffered:
@@ -2199,7 +2200,10 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
         :return: An iterator over (line, key).
         """
         if pb is None:
-            pb = ui.ui_factory.nested_progress_bar()
+            class _NullProgressBar:
+                def update(self, *args): pass
+                def finished(self): pass
+            pb = _NullProgressBar()
         keys = set(keys)
         total = len(keys)
         done = False
@@ -2470,8 +2474,7 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
 
     def keys(self):
         """See VersionedFiles.keys."""
-        if debug.debug_flag_enabled("evil"):
-            logger.debug("keys scales with size of history")
+        evil_logger.debug("keys scales with size of history")
         sources = [self._index] + self._immediate_fallback_vfs
         result = set()
         for source in sources:
@@ -2893,7 +2896,7 @@ class _KndxIndex:
             # It might be nice to get the edge of the records. But keys isn't
             # _wrong_.
             keys = sorted(record[0] for record in records)
-            raise errors.RevisionNotPresent(keys, self)
+            raise RevisionNotPresent(keys, self)
         paths = {}
         for record in records:
             key = record[0]
@@ -2979,24 +2982,24 @@ class _KndxIndex:
         if line == b"":
             # An empty file can actually be treated as though the file doesn't
             # exist yet.
-            raise _mod_transport.NoSuchFile(self)
+            raise NoSuchFile(self)
         if line != self.HEADER:
             raise KnitHeaderError(badline=line, filename=self)
 
     def _check_read(self):
         if not self._is_locked():
-            raise errors.ObjectNotLocked(self)
+            raise ObjectNotLocked(self)
         if self._get_scope() != self._scope:
             self._reset_cache()
 
     def _check_write_ok(self):
         """Assert if not writes are permitted."""
         if not self._is_locked():
-            raise errors.ObjectNotLocked(self)
+            raise ObjectNotLocked(self)
         if self._get_scope() != self._scope:
             self._reset_cache()
         if self._mode != "w":
-            raise errors.ReadOnlyObjectDirtiedError(self)
+            raise ReadOnlyObjectDirtiedError(self)
 
     def get_build_details(self, keys):
         """Get the method, index_memo and compression parent for keys.
@@ -3168,7 +3171,7 @@ class _KndxIndex:
                     del self._cache
                     del self._filename
                     del self._history
-                except NoSuchFile:
+                except TransportNoSuchFile:
                     self._kndx_cache[prefix] = ({}, [])
                     if isinstance(self._mapper, ConstantMapper):
                         # preserve behaviour for revisions.kndx etc.
@@ -3283,7 +3286,7 @@ class _KnitGraphIndex:
     ):
         """Construct a KnitGraphIndex on a graph_index.
 
-        :param graph_index: An implementation of breezy.index.GraphIndex.
+        :param graph_index: An implementation of bzrformts.index.GraphIndex.
         :param is_locked: A callback to check whether the object should answer
             queries.
         :param deltas: Allow delta-compressed records.
@@ -3337,7 +3340,7 @@ class _KnitGraphIndex:
             texts inside records) as compression parents.
         """
         if not self._add_callback:
-            raise errors.ReadOnlyError(self)
+            raise ReadOnlyError(self)
         # we hope there are no repositories with inconsistent parentage
         # anymore.
 
@@ -3447,12 +3450,12 @@ class _KnitGraphIndex:
     def _check_read(self):
         """Raise if reads are not permitted."""
         if not self._is_locked():
-            raise errors.ObjectNotLocked(self)
+            raise ObjectNotLocked(self)
 
     def _check_write_ok(self):
         """Assert if writes are not permitted."""
         if not self._is_locked():
-            raise errors.ObjectNotLocked(self)
+            raise ObjectNotLocked(self)
 
     def _compression_parent(self, an_entry):
         # return the key that an_entry is compressed against, or None
@@ -3656,7 +3659,7 @@ class _KnitKeyAccess:
         path = self._mapper.map(key)
         try:
             base = self._transport.append_bytes(path + ".knit", b"".join(raw_data))
-        except _mod_transport.NoSuchFile:
+        except TransportNoSuchFile:
             self._transport.mkdir(osutils.dirname(path))
             base = self._transport.append_bytes(path + ".knit", b"".join(raw_data))
         # if base == 0:
@@ -3821,7 +3824,7 @@ class _KnitAnnotator(VersionedFileAnnotator):
                             [p for p in parent_keys if p not in self._all_build_details]
                         )
                     else:
-                        raise errors.RevisionNotPresent(key, self._vf)
+                        raise RevisionNotPresent(key, self._vf)
         # Generally we will want to read the records in reverse order, because
         # we find the parent nodes after the children
         records.reverse()

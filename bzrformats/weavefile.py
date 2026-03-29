@@ -119,17 +119,17 @@ def _read_weave_v5(f, w):
 
     This is only to be used by read_weave and WeaveFile.__init__.
     """
-    #  200   0   2075.5080   1084.0360   breezy.weavefile:104(_read_weave_v5)
+    #  200   0   2075.5080   1084.0360   bzrformats.weavefile:104(_read_weave_v5)
     # +60412 0    366.5900    366.5900   +<method 'readline' of 'file' objects>
     # +59982 0    320.5280    320.5280   +<method 'startswith' of 'str' objects>
     # +59363 0    297.8080    297.8080   +<method 'append' of 'list' objects>
     # replace readline call with iter over all lines ->
     # safe because we already suck on memory.
-    #  200   0   1492.7170    802.6220   breezy.weavefile:104(_read_weave_v5)
+    #  200   0   1492.7170    802.6220   bzrformats.weavefile:104(_read_weave_v5)
     # +59982 0    329.9100    329.9100   +<method 'startswith' of 'str' objects>
     # +59363 0    320.2980    320.2980   +<method 'append' of 'list' objects>
     # replaced startswith with slice lookups:
-    #  200   0    851.7250    501.1120   breezy.weavefile:104(_read_weave_v5)
+    #  200   0    851.7250    501.1120   bzrformats.weavefile:104(_read_weave_v5)
     # +59363 0    311.8780    311.8780   +<method 'append' of 'list' objects>
     # +200   0     30.2500     30.2500   +<method 'readlines' of 'file' objects>
 

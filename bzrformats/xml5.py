@@ -16,7 +16,7 @@
 
 """XML serialization format version 5 for inventories."""
 
-from breezy import errors
+from .errors import BzrFormatsError
 
 from . import inventory, xml6
 from ._bzr_rs import revision_serializer_v5  # noqa: F401
@@ -41,7 +41,7 @@ class InventorySerializer_v5(xml6.InventorySerializer_v6):
 
         format = elt.get("format")
         if format is not None and format != "5":
-            raise errors.BzrError(f"invalid format version {format!r} on inventory")
+            raise BzrFormatsError(f"invalid format version {format!r} on inventory")
         data_revision_id = elt.get("revision_id")
         if data_revision_id is not None:
             revision_id = data_revision_id.encode("utf-8")

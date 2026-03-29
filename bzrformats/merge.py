@@ -18,11 +18,13 @@
 
 import patiencediff
 
-from breezy import errors
-from breezy import graph as _mod_graph
-from breezy import revision as _mod_revision
-from breezy import trace
+from vcsgraph import graph as _mod_graph
+from . import revision as _mod_revision
+import logging
+
+logger = logging.getLogger(__name__)
 from vcsgraph.tsort import merge_sort
+from .errors import RevisionNotPresent
 from . import weave
 
 class _PlanMergeBase:
@@ -58,7 +60,7 @@ class _PlanMergeBase:
         result = {}
         for record in self.vf.get_record_stream(keys, "unordered", True):
             if record.storage_kind == "absent":
-                raise errors.RevisionNotPresent(record.key, self.vf)
+                raise RevisionNotPresent(record.key, self.vf)
             result[record.key[-1]] = record.get_bytes_as("lines")
         return result
 
@@ -186,7 +188,7 @@ class _PlanMerge(_PlanMergeBase):
             # Ideally we would know that before we get this far
             self._head_key = heads.pop()
             other = b_rev if self._head_key == self.a_key else a_rev
-            trace.mutter(
+            logger.debug(
                 "found dominating revision for %s\n%s > %s",
                 self.vf,
                 self._head_key[-1],
@@ -228,7 +230,7 @@ class _PlanMerge(_PlanMergeBase):
             elif len(next_lcas) > 2:
                 # More than 2 lca's, fall back to grabbing all nodes between
                 # this and the unique lca.
-                trace.mutter(
+                logger.debug(
                     "More than 2 LCAs, falling back to all nodes for: %s, %s\n=> %s",
                     self.a_key,
                     self.b_key,

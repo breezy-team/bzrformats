@@ -24,7 +24,7 @@ In this module the interesting classes are:
 
 __all__ = ["InventoryDeltaSerializer"]
 
-from breezy.revision import RevisionID
+from .revision import RevisionID
 
 from ._bzr_rs import inventory as _inventory_delta_rs
 

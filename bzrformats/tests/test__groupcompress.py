@@ -18,12 +18,13 @@
 
 import sys
 
-from . import TestCase, TestCaseInTempDir, TestCaseWithTransport
-from breezy.tests import features
-from breezy.tests.scenarios import load_tests_apply_scenarios
+from . import TestCase, TestCaseInTempDir, _try_import
+from testscenarios import load_tests_apply_scenarios
 
 from .. import groupcompress
 from .._bzr_rs import groupcompress as _groupcompress_rs
+
+_compiled_groupcompress_module = _try_import("bzrformats._groupcompress_pyx")
 
 
 def module_scenarios():
@@ -48,9 +49,10 @@ def two_way_scenarios():
 load_tests = load_tests_apply_scenarios
 
 
-compiled_groupcompress_feature = features.ModuleAvailableFeature(
-    "bzrformats._groupcompress_pyx"
-)
+try:
+    from bzrformats import _groupcompress_pyx as _groupcompress_cython
+except ImportError:
+    _groupcompress_cython = None
 
 _text1 = b"""\
 This is a bit
@@ -253,8 +255,9 @@ class TestDeltaIndex(TestCase):
         # This test isn't multiplied, because we only have DeltaIndex for the
         # compiled form
         # We call this here, because _test_needs_features happens after setUp
-        self.requireFeature(compiled_groupcompress_feature)
-        self._gc_module = compiled_groupcompress_feature.module
+        if _groupcompress_cython is None:
+            self.skipTest("Cython _groupcompress module not available")
+        self._gc_module = _groupcompress_cython
 
     def test_repr(self):
         di = self._gc_module.DeltaIndex(b"test text\n")

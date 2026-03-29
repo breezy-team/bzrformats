@@ -172,7 +172,7 @@ def add_cython_extension(module_name, libraries=None, extra_source=None):
     with a warning.
 
     Args:
-        module_name (str): The python path to the module (e.g., 'breezy.foo').
+        module_name (str): The python path to the module (e.g., 'bzrformats.foo').
             This determines the .pyx and .c file paths to use.
         libraries (list, optional): List of libraries to link against.
             Defaults to None.
@@ -225,7 +225,6 @@ if sys.platform == "win32":
     add_cython_extension("bzrformats._dirstate_helpers_pyx", libraries=["Ws2_32"])
 else:
     add_cython_extension("bzrformats._dirstate_helpers_pyx")
-    add_cython_extension("breezy._readdir_pyx")
 add_cython_extension("bzrformats._btree_serializer_pyx")
 
 
@@ -236,75 +235,23 @@ if unavailable_files:
     print("")
 
 
-if "editable_wheel" not in sys.argv:
-    command_classes["build_scripts"] = brz_build_scripts
-
-
-# ad-hoc for easy_install
-DATA_FILES = []
-if (
-    "bdist_egg" not in sys.argv
-    and "bdist_wheel" not in sys.argv
-    and "editable_wheel" not in sys.argv
-):
-    # generate and install brz.1 only with plain install, not the
-    # easy_install one
-    build.sub_commands.append(("build_man", lambda _: True))
-    DATA_FILES = [("man/man1", ["brz.1", "breezy/git/git-remote-bzr.1"])]
 
 import site
 
 site.ENABLE_USER_SITE = "--user" in sys.argv
 
 rust_extensions = [
-    RustExtension("breezy._cmd_rs", "crates/cmd-py/Cargo.toml", binding=Binding.PyO3),
     RustExtension(
-        "breezy._osutils_rs", "crates/osutils-py/Cargo.toml", binding=Binding.PyO3
+        "bzrformats._bzr_rs", "crates/bazaar-py/Cargo.toml", binding=Binding.PyO3
     ),
     RustExtension(
-        "breezy._transport_rs", "crates/transport-py/Cargo.toml", binding=Binding.PyO3
+        "bzrformats._osutils_rs", "crates/osutils-py/Cargo.toml", binding=Binding.PyO3
     ),
-    RustExtension(
-        "breezy._patch_rs", "crates/patch-py/Cargo.toml", binding=Binding.PyO3
-    ),
-    RustExtension(
-        "breezy.zlib_util", "crates/zlib-util-py/Cargo.toml", binding=Binding.PyO3
-    ),
-    RustExtension(
-        "breezy._transport_rs", "crates/transport-py/Cargo.toml", binding=Binding.PyO3
-    ),
-    RustExtension(
-        "breezy._urlutils_rs", "crates/urlutils-py/Cargo.toml", binding=Binding.PyO3
-    ),
-    RustExtension(
-        "bzrformats._bzr_rs", "bzrformats/bazaar-py/Cargo.toml", binding=Binding.PyO3
-    ),
-    RustExtension("breezy._git_rs", "crates/git-py/Cargo.toml", binding=Binding.PyO3),
 ]
 entry_points = {}
 
-if (
-    os.environ.get("CIBUILDWHEEL", "0") == "0"
-    and "__pypy__" not in sys.builtin_module_names
-    and sys.platform != "win32"
-):
-    rust_extensions.append(RustExtension("brz", binding=Binding.Exec, strip=Strip.All))
-else:
-    # Fall back to python main on cibuildwheels, since it doesn't provide
-    # -lpython3.7 to link binaries against
-
-    # also, disable it for PyPy. See https://foss.heptapod.net/pypy/pypy/-/issues/3286
-    entry_points.setdefault("console_scripts", []).append("brz=breezy.__main__:main")
-
 # std setup
 setup(
-    scripts=[  # TODO(jelmer): Only install the git scripts if
-        # Dulwich was found.
-        "breezy/git/git-remote-bzr",
-        "breezy/git/bzr-receive-pack",
-        "breezy/git/bzr-upload-pack",
-    ],
-    data_files=DATA_FILES,
     cmdclass=command_classes,
     ext_modules=ext_modules,
     entry_points=entry_points,
