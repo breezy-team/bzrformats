@@ -44,7 +44,6 @@ fn parent_directories(path: &str) -> PyResult<Vec<String>> {
 #[pyfunction]
 fn walkdirs_utf8(top: &str) -> PyResult<Vec<(String, Vec<(String, String, u64, String)>)>> {
     use std::fs;
-    use std::os::unix::fs::MetadataExt;
 
     let mut results = Vec::new();
     let walk = walkdir::WalkDir::new(top).follow_links(false);

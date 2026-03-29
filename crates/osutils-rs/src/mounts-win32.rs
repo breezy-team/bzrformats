@@ -47,3 +47,16 @@ pub fn get_fs_type<P: AsRef<Path>>(path: P) -> Option<String> {
         _ => fs_type,
     })
 }
+
+pub fn supports_symlinks<P: AsRef<Path>>(path: P) -> Option<bool> {
+    let fs_type = get_fs_type(path)?;
+    match fs_type.as_str() {
+        "ntfs" => Some(true),
+        "vfat" => Some(false),
+        _ => Some(false),
+    }
+}
+
+pub fn supports_posix_readonly() -> bool {
+    false
+}
