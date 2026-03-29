@@ -1,13 +1,13 @@
 use crate::filters::{ContentFilter, ContentFilterProvider, ContentFilterStack};
 use osutils::sha::sha_string;
 use log::{debug, info};
-use nix::sys::stat::SFlag;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, Metadata, Permissions};
 use std::io;
 use std::io::prelude::*;
 use std::io::BufReader;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +23,27 @@ use tempfile::NamedTempFile;
 /// again: nonexistent, file type, size, etc
 
 const CACHE_HEADER: &[u8] = b"### bzr hashcache v5\n";
+
+enum FileKind {
+    Regular,
+    Symlink,
+    Other,
+}
+
+fn file_kind(path: &Path) -> FileKind {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.is_symlink() {
+                FileKind::Symlink
+            } else if meta.is_file() {
+                FileKind::Regular
+            } else {
+                FileKind::Other
+            }
+        }
+        Err(_) => FileKind::Other,
+    }
+}
 
 /// Cache for looking up file SHA-1.
 ///
@@ -67,6 +88,7 @@ pub struct Fingerprint {
     pub mode: u32,
 }
 
+#[cfg(unix)]
 impl From<Metadata> for Fingerprint {
     fn from(meta: Metadata) -> Fingerprint {
         Fingerprint {
@@ -76,6 +98,33 @@ impl From<Metadata> for Fingerprint {
             ino: meta.ino(),
             dev: meta.dev(),
             mode: meta.mode(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl From<Metadata> for Fingerprint {
+    fn from(meta: Metadata) -> Fingerprint {
+        use std::os::windows::fs::MetadataExt;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let ctime = meta
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Fingerprint {
+            size: meta.file_size(),
+            mtime,
+            ctime,
+            ino: 0,
+            dev: 0,
+            mode: 0,
         }
     }
 }
@@ -203,8 +252,8 @@ impl HashCache {
         } else {
             self.miss_count += 1;
 
-            match SFlag::from_bits_truncate(file_fp.mode as nix::libc::mode_t) {
-                SFlag::S_IFREG => {
+            match file_kind(&abspath) {
+                FileKind::Regular => {
                     let filters: Box<dyn ContentFilter> =
                         if let Some(filter_provider) = self.filter_provider.as_ref() {
                             filter_provider(path, file_fp.ctime as u64)
@@ -242,7 +291,7 @@ impl HashCache {
 
                     Ok(digest)
                 }
-                SFlag::S_IFLNK => {
+                FileKind::Symlink => {
                     let target = fs::read_link(&abspath)?;
                     let digest = sha_string(target.to_string_lossy().as_bytes());
                     self.cache

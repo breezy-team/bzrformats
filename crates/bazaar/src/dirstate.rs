@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::fs::Metadata;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -104,6 +105,7 @@ pub fn bisect_path_right(paths: &[&Path], path: &Path) -> usize {
     lo
 }
 
+#[cfg(unix)]
 pub fn pack_stat_metadata(metadata: &Metadata) -> String {
     pack_stat(
         metadata.len(),
@@ -122,6 +124,28 @@ pub fn pack_stat_metadata(metadata: &Metadata) -> String {
         metadata.dev(),
         metadata.ino(),
         metadata.mode(),
+    )
+}
+
+#[cfg(windows)]
+pub fn pack_stat_metadata(metadata: &Metadata) -> String {
+    pack_stat(
+        metadata.len(),
+        metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        metadata
+            .created()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        0,
+        0,
+        0,
     )
 }
 
