@@ -27,6 +27,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -U "setuptools>=60" cython setuptools-rust
           pip install ".[dev]"
+          python setup.py build_ext -i
       - name: Run tests
         run: |
           python -m subunit.run bzrformats.tests.test_suite | subunit2pyunit
