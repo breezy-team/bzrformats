@@ -1,6 +1,7 @@
 #! /usr/bin/env python3
 
-"""Installation script for brz.
+"""Installation script for bzrformats.
+
 Run it with
  './setup.py install', or
  './setup.py --help' for more options.
@@ -17,26 +18,17 @@ except ModuleNotFoundError as e:
     sys.exit(1)
 
 try:
-    from setuptools_rust import Binding, RustExtension, Strip
+    from setuptools_rust import Binding, RustExtension
 except ModuleNotFoundError as e:
     sys.stderr.write(f"[ERROR] Please install setuptools_rust ({e})\n")
     sys.exit(1)
 
 from setuptools import setup
-from setuptools.command.build import build
 
 try:
     from packaging.version import Version
 except ImportError:
     from distutils.version import LooseVersion as Version
-
-try:
-    from setuptools_gettext import build_mo  # noqa: F401
-except ImportError:
-    sys.stderr.write(
-        "[ERROR] Please install setuptools_gettext to build translations.\n"
-    )
-    sys.exit(1)
 
 from distutils.command.build_scripts import build_scripts
 
@@ -233,7 +225,6 @@ if unavailable_files:
     print("   {}".format("\n  ".join(unavailable_files)))
     print("The python versions will be used instead.")
     print("")
-
 
 
 import site

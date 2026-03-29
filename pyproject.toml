@@ -2,7 +2,6 @@
 requires = [
     "setuptools>=60",
     "setuptools-rust",
-    "setuptools-gettext>=0.1.4",
     "cython>=0.29",
 ]
 build-backend = "setuptools.build_meta"
@@ -11,7 +10,7 @@ build-backend = "setuptools.build_meta"
 name = "bzrformats"
 maintainers = [{name = "Breezy Developers", email = "team@breezy-vcs.org"}]
 description = "Bazaar formats"
-readme = "README.rst"
+readme = "README.md"
 license = "GPL-2.0-or-later"
 classifiers = [
     "Development Status :: 6 - Mature",
@@ -29,7 +28,7 @@ requires-python = ">=3.10,<3.15"
 dependencies = [
     "catalogus",
 ]
-dynamic = ["version", "scripts"]
+dynamic = ["version"]
 
 [project.urls]
 Homepage = "https://www.breezy-vcs.org/"
@@ -58,7 +57,7 @@ version = {attr = "bzrformats.__version__"}
 ignore_missing_imports = true
 
 [tool.ruff]
-extend-exclude = ["lib", "bin"]
+extend-exclude = []
 
 [tool.ruff.lint]
 select = [
@@ -101,10 +100,6 @@ ignore = [
     "N818",  # Naming convention violation: invalid argument name
     "N999",  # Naming convention violation: invalid module name
 
-    "S602",  # subprocess with shell=True
-    "S603",  # check for execution of untrusted input
-    "S105",  # "hardcoded password"; false positives on "pwd"
-    "S106",  # "hardcoded password"; false positives on "pwd"
     "S110",  # "consider logging exception"
 
     "S317",  # use defusedxml
@@ -122,8 +117,7 @@ ignore = [
     "SIM114", # Combine `if` branches using logical `or` operator
     "SIM115", # Use context handler for opening files
 
-    # This is unsafe for breezy, where several objects (e.g. VersionedFiles)
-    # have a keys() method but no __iter__
+    # Some objects (e.g. VersionedFiles) have a keys() method but no __iter__
     "SIM118", # Use `key in dict` instead of `key in dict.keys()`
     "UP031",  # Use format-specifier instead of `str.format` call
     "UP032",  # Use f-string instead of `format` call; f-strings break gettext
