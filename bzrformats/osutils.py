@@ -253,6 +253,13 @@ def file_iterator(file_obj, chunk_size=65536):
         yield chunk
 
 
+def normalizes_filenames():
+    """Check if the filesystem normalizes filenames (e.g. Mac OS X)."""
+    from . import _osutils_rs
+
+    return _osutils_rs.normalizes_filenames()
+
+
 def rand_chars(length):
     """Generate a string of random characters."""
     from . import _osutils_rs
