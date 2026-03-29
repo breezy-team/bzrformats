@@ -310,6 +310,7 @@ class Pack:
         return self.name + ".pack"
 
     def get_revision_count(self):
+        """Return the number of revisions in this pack."""
         return self.revision_index.key_count()
 
     def index_name(self, index_type, name):
@@ -351,11 +352,13 @@ class Pack:
         setattr(self, index_type + "_index", index)
 
     def __lt__(self, other):
+        """Compare packs by identity for ordering."""
         if not isinstance(other, Pack):
             raise TypeError(other)
         return id(self) < id(other)
 
     def __hash__(self):
+        """Return hash based on index objects."""
         return hash(
             (
                 type(self),
@@ -407,12 +410,15 @@ class ExistingPack(Pack):
             raise AssertionError()
 
     def __eq__(self, other):
+        """Check equality by comparing all attributes."""
         return self.__dict__ == other.__dict__
 
     def __ne__(self, other):
+        """Check inequality."""
         return not self.__eq__(other)
 
     def __repr__(self):
+        """Return string representation."""
         return "<{}.{} object at 0x{:x}, {}, {}".format(
             self.__class__.__module__,
             self.__class__.__name__,
@@ -422,10 +428,13 @@ class ExistingPack(Pack):
         )
 
     def __hash__(self):
+        """Return hash based on type and name."""
         return hash((type(self), self.name))
 
 
 class ResumedPack(ExistingPack):
+    """A pack being resumed from an interrupted upload."""
+
     def __init__(
         self,
         name,
@@ -471,6 +480,7 @@ class ResumedPack(ExistingPack):
         # XXX: perhaps check that the .pack file exists?
 
     def access_tuple(self):
+        """Return the transport and file name for accessing the pack data."""
         if self._state == "finished":
             return Pack.access_tuple(self)
         elif self._state == "resumed":
@@ -479,6 +489,7 @@ class ResumedPack(ExistingPack):
             raise AssertionError(self._state)
 
     def abort(self):
+        """Abort the resumed pack, deleting its files."""
         self.upload_transport.delete(self.file_name())
         indices = [
             self.revision_index,
@@ -492,6 +503,7 @@ class ResumedPack(ExistingPack):
             index._transport.delete(index._name)
 
     def finish(self):
+        """Finish the resumed pack, moving files into place."""
         self._check_references()
         index_types = ["revision", "inventory", "text", "signature"]
         if self.chk_index is not None:
@@ -652,6 +664,7 @@ class NewPack(Pack):
         )
 
     def finish_content(self):
+        """Finalize the pack content and compute the content hash name."""
         if self.name is not None:
             return
         self._writer.end()
@@ -731,6 +744,7 @@ class NewPack(Pack):
         return index._external_references()
 
     def set_write_cache_size(self, size):
+        """Set the write cache size in bytes."""
         self._cache_limit = size
 
     def _write_index(self, index_type, index, label, suspend=False):

@@ -32,6 +32,7 @@ class ReadLock:
     """
 
     def __init__(self, filename):
+        """Acquire a shared read lock on *filename*."""
         self.filename = filename
         self.f = open(filename, "rb")
         try:
@@ -74,6 +75,7 @@ class WriteLock:
     """
 
     def __init__(self, filename):
+        """Acquire an exclusive write lock on *filename*."""
         self.filename = filename
         try:
             self.f = open(filename, "rb+")
@@ -110,16 +112,20 @@ class LogicalLockResult:
     """
 
     def __init__(self, unlock, token=None):
+        """Initialize with an unlock callable and optional token."""
         self.unlock = unlock
         self.token = token
 
     def __repr__(self):
+        """Return string representation."""
         return f"LogicalLockResult({self.unlock})"
 
     def __enter__(self):
+        """Enter context manager."""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager, releasing the lock."""
         try:
             self.unlock()
         except BaseException:

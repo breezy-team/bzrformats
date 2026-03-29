@@ -29,19 +29,19 @@ class TestShaFunctions(TestCase):
     def test_sha_string_bytes(self):
         """Test sha_string with bytes input."""
         result = osutils.sha_string(b"hello world")
-        expected = hashlib.sha1(b"hello world").hexdigest().encode("ascii")
+        expected = hashlib.sha1(b"hello world").hexdigest().encode("ascii")  # noqa: S324
         self.assertEqual(expected, result)
 
     def test_sha_string_unicode(self):
         """Test sha_string with unicode input."""
         result = osutils.sha_string("hello world")
-        expected = hashlib.sha1(b"hello world").hexdigest().encode("ascii")
+        expected = hashlib.sha1(b"hello world").hexdigest().encode("ascii")  # noqa: S324
         self.assertEqual(expected, result)
 
     def test_sha_strings(self):
         """Test sha_strings with mixed input."""
         result = osutils.sha_strings([b"hello", " ", "world"])
-        sha = hashlib.sha1()
+        sha = hashlib.sha1()  # noqa: S324
         sha.update(b"hello")
         sha.update(b" ")
         sha.update(b"world")

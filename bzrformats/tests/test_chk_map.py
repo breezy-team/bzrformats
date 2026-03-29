@@ -35,7 +35,10 @@ from . import TestCase, TestCaseWithMemoryTransport
 
 
 class TestDeserialiseLeafNode(TestCase):
+    """Tests for Deserialise Leaf Node."""
+
     def assertDeserialiseErrors(self, text):
+        """Assert DeserialiseErrors."""
         self.assertRaises(
             (ValueError, IndexError),
             _deserialise_leaf_node,
@@ -44,6 +47,7 @@ class TestDeserialiseLeafNode(TestCase):
         )
 
     def test_raises_on_non_leaf(self):
+        """Test raises on non leaf."""
         self.assertDeserialiseErrors(b"")
         self.assertDeserialiseErrors(b"short\n")
         self.assertDeserialiseErrors(b"chknotleaf:\n")
@@ -55,6 +59,7 @@ class TestDeserialiseLeafNode(TestCase):
         self.assertDeserialiseErrors(b"chkleaf:\n10\n256\n10\n")
 
     def test_deserialise_empty(self):
+        """Test deserialise empty."""
         node = _deserialise_leaf_node(
             b"chkleaf:\n10\n1\n0\n\n",
             (b"sha1:1234",),
@@ -67,6 +72,7 @@ class TestDeserialiseLeafNode(TestCase):
         self.assertIs(None, node._common_serialised_prefix)
 
     def test_deserialise_items(self):
+        """Test deserialise items."""
         node = _deserialise_leaf_node(
             b"chkleaf:\n0\n1\n2\n\nfoo bar\x001\nbaz\nquux\x001\nblarh\n",
             (b"sha1:1234",),
@@ -78,6 +84,7 @@ class TestDeserialiseLeafNode(TestCase):
         )
 
     def test_deserialise_item_with_null_width_1(self):
+        """Test deserialise item with null width 1."""
         node = _deserialise_leaf_node(
             b"chkleaf:\n0\n1\n2\n\nfoo\x001\nbar\x00baz\nquux\x001\nblarh\n",
             (b"sha1:1234",),
@@ -89,6 +96,7 @@ class TestDeserialiseLeafNode(TestCase):
         )
 
     def test_deserialise_item_with_null_width_2(self):
+        """Test deserialise item with null width 2."""
         node = _deserialise_leaf_node(
             b"chkleaf:\n0\n2\n2\n\nfoo\x001\x001\nbar\x00baz\nquux\x00\x001\nblarh\n",
             (b"sha1:1234",),
@@ -100,6 +108,7 @@ class TestDeserialiseLeafNode(TestCase):
         )
 
     def test_iteritems_selected_one_of_two_items(self):
+        """Test iteritems selected one of two items."""
         node = _deserialise_leaf_node(
             b"chkleaf:\n0\n1\n2\n\nfoo bar\x001\nbaz\nquux\x001\nblarh\n",
             (b"sha1:1234",),
@@ -111,6 +120,7 @@ class TestDeserialiseLeafNode(TestCase):
         )
 
     def test_deserialise_item_with_common_prefix(self):
+        """Test deserialise item with common prefix."""
         node = _deserialise_leaf_node(
             b"chkleaf:\n0\n2\n2\nfoo\x00\n1\x001\nbar\x00baz\n2\x001\nblarh\n",
             (b"sha1:1234",),
@@ -124,6 +134,7 @@ class TestDeserialiseLeafNode(TestCase):
         self.assertEqual(b"foo\x00", node._common_serialised_prefix)
 
     def test_deserialise_multi_line(self):
+        """Test deserialise multi line."""
         node = _deserialise_leaf_node(
             b"chkleaf:\n0\n2\n2\nfoo\x00\n1\x002\nbar\nbaz\n2\x002\nblarh\n\n",
             (b"sha1:1234",),
@@ -140,11 +151,13 @@ class TestDeserialiseLeafNode(TestCase):
         self.assertEqual(b"foo\x00", node._common_serialised_prefix)
 
     def test_key_after_map(self):
+        """Test key after map."""
         node = _deserialise_leaf_node(b"chkleaf:\n10\n1\n0\n\n", (b"sha1:1234",))
         node.map(None, (b"foo bar",), b"baz quux")
         self.assertEqual(None, node.key())
 
     def test_key_after_unmap(self):
+        """Test key after unmap."""
         node = _deserialise_leaf_node(
             b"chkleaf:\n0\n1\n2\n\nfoo bar\x001\nbaz\nquux\x001\nblarh\n",
             (b"sha1:1234",),
@@ -154,7 +167,10 @@ class TestDeserialiseLeafNode(TestCase):
 
 
 class TestDeserialiseInternalNode(TestCase):
+    """Tests for Deserialise Internal Node."""
+
     def assertDeserialiseErrors(self, text):
+        """Assert DeserialiseErrors."""
         self.assertRaises(
             (ValueError, IndexError),
             _deserialise_internal_node,
@@ -163,6 +179,7 @@ class TestDeserialiseInternalNode(TestCase):
         )
 
     def test_raises_on_non_internal(self):
+        """Test raises on non internal."""
         self.assertDeserialiseErrors(b"")
         self.assertDeserialiseErrors(b"short\n")
         self.assertDeserialiseErrors(b"chknotnode:\n")
@@ -176,6 +193,7 @@ class TestDeserialiseInternalNode(TestCase):
         self.assertDeserialiseErrors(b"chknode:\n10\n256\n0\n1\nfo")
 
     def test_deserialise_one(self):
+        """Test deserialise one."""
         node = _deserialise_internal_node(
             b"chknode:\n10\n1\n1\n\na\x00sha1:abcd\n",
             (b"sha1:1234",),
@@ -188,6 +206,7 @@ class TestDeserialiseInternalNode(TestCase):
         self.assertEqual({b"a": (b"sha1:abcd",)}, node._items)
 
     def test_deserialise_with_prefix(self):
+        """Test deserialise with prefix."""
         node = _deserialise_internal_node(
             b"chknode:\n10\n1\n1\npref\na\x00sha1:abcd\n",
             (b"sha1:1234",),
@@ -211,6 +230,7 @@ class TestDeserialiseInternalNode(TestCase):
         self.assertEqual({b"pref": (b"sha1:abcd",)}, node._items)
 
     def test_deserialise_pref_with_null(self):
+        """Test deserialise pref with null."""
         node = _deserialise_internal_node(
             b"chknode:\n10\n1\n1\npref\x00fo\n\x00sha1:abcd\n",
             (b"sha1:1234",),
@@ -223,6 +243,7 @@ class TestDeserialiseInternalNode(TestCase):
         self.assertEqual({b"pref\x00fo": (b"sha1:abcd",)}, node._items)
 
     def test_deserialise_with_null_pref(self):
+        """Test deserialise with null pref."""
         node = _deserialise_internal_node(
             b"chknode:\n10\n1\n1\npref\x00fo\n\x00\x00sha1:abcd\n",
             (b"sha1:1234",),
@@ -236,7 +257,10 @@ class TestDeserialiseInternalNode(TestCase):
 
 
 class TestNode(TestCase):
+    """Tests for Node."""
+
     def assertCommonPrefix(self, expected_common, prefix, key):
+        """Assert CommonPrefix."""
         common = common_prefix_pair(prefix, key)
         self.assertLessEqual(len(common), len(prefix))
         self.assertLessEqual(len(common), len(key))
@@ -245,25 +269,33 @@ class TestNode(TestCase):
         self.assertEqual(expected_common, common)
 
     def test_common_prefix(self):
+        """Test common prefix."""
         self.assertCommonPrefix(b"beg", b"beg", b"begin")
 
     def test_no_common_prefix(self):
+        """Test no common prefix."""
         self.assertCommonPrefix(b"", b"begin", b"end")
 
     def test_equal(self):
+        """Test equal."""
         self.assertCommonPrefix(b"begin", b"begin", b"begin")
 
     def test_not_a_prefix(self):
+        """Test not a prefix."""
         self.assertCommonPrefix(b"b", b"begin", b"b")
 
     def test_empty(self):
+        """Test empty."""
         self.assertCommonPrefix(b"", b"", b"end")
         self.assertCommonPrefix(b"", b"begin", b"")
         self.assertCommonPrefix(b"", b"", b"")
 
 
 class TestCaseWithStore(TestCaseWithMemoryTransport):
+    """Tests for Store."""
+
     def get_chk_bytes(self):
+        """Get chk bytes."""
         # This creates a standalone CHK store.
         factory = groupcompress.make_pack_factory(False, False, 1)
         self.chk_bytes = factory(self.get_transport())
@@ -297,6 +329,7 @@ class TestCaseWithStore(TestCaseWithMemoryTransport):
         return chkmap
 
     def read_bytes(self, chk_bytes, key):
+        """Read bytes."""
         stream = chk_bytes.get_record_stream([key], "unordered", True)
         record = next(stream)
         if record.storage_kind == "absent":
@@ -304,16 +337,21 @@ class TestCaseWithStore(TestCaseWithMemoryTransport):
         return record.get_bytes_as("fulltext")
 
     def to_dict(self, node, *args):
+        """To dict."""
         return dict(node.iteritems(*args))
 
 
 class TestCaseWithExampleMaps(TestCaseWithStore):
+    """Tests for Example Maps."""
+
     def get_chk_bytes(self):
+        """Get chk bytes."""
         if getattr(self, "_chk_bytes", None) is None:
             self._chk_bytes = super().get_chk_bytes()
         return self._chk_bytes
 
     def get_map(self, a_dict, maximum_size=100, search_key_func=None):
+        """Get map."""
         c_map = self._get_map(
             a_dict,
             maximum_size=maximum_size,
@@ -323,6 +361,7 @@ class TestCaseWithExampleMaps(TestCaseWithStore):
         return c_map
 
     def make_root_only_map(self, search_key_func=None):
+        """Make root only map."""
         return self.get_map(
             {
                 (b"aaa",): b"initial aaa content",
@@ -332,6 +371,7 @@ class TestCaseWithExampleMaps(TestCaseWithStore):
         )
 
     def make_root_only_aaa_ddd_map(self, search_key_func=None):
+        """Make root only aaa ddd map."""
         return self.get_map(
             {
                 (b"aaa",): b"initial aaa content",
@@ -341,6 +381,7 @@ class TestCaseWithExampleMaps(TestCaseWithStore):
         )
 
     def make_one_deep_map(self, search_key_func=None):
+        """Make one deep map."""
         # Same as root_only_map, except it forces an InternalNode at the root
         return self.get_map(
             {
@@ -353,6 +394,7 @@ class TestCaseWithExampleMaps(TestCaseWithStore):
         )
 
     def make_two_deep_map(self, search_key_func=None):
+        """Make two deep map."""
         # Carefully chosen so that it creates a 2-deep map for both
         # _search_key_plain and for _search_key_16
         # Also so that things line up with make_one_deep_two_prefix_map
@@ -407,6 +449,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
     """Actual tests for the provided examples."""
 
     def test_root_only_map_plain(self):
+        """Test root only map plain."""
         c_map = self.make_root_only_map()
         self.assertEqualDiff(
             "'' LeafNode\n"
@@ -416,6 +459,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
         )
 
     def test_root_only_map_16(self):
+        """Test root only map 16."""
         c_map = self.make_root_only_map(search_key_func=chk_map._search_key_16)
         self.assertEqualDiff(
             "'' LeafNode\n"
@@ -425,6 +469,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
         )
 
     def test_one_deep_map_plain(self):
+        """Test one deep map plain."""
         c_map = self.make_one_deep_map()
         self.assertEqualDiff(
             "'' InternalNode\n"
@@ -439,6 +484,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
         )
 
     def test_one_deep_map_16(self):
+        """Test one deep map 16."""
         c_map = self.make_one_deep_map(search_key_func=chk_map._search_key_16)
         self.assertEqualDiff(
             "'' InternalNode\n"
@@ -453,6 +499,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
         )
 
     def test_root_only_aaa_ddd_plain(self):
+        """Test root only aaa ddd plain."""
         c_map = self.make_root_only_aaa_ddd_map()
         self.assertEqualDiff(
             "'' LeafNode\n"
@@ -462,6 +509,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
         )
 
     def test_root_only_aaa_ddd_16(self):
+        """Test root only aaa ddd 16."""
         c_map = self.make_root_only_aaa_ddd_map(search_key_func=chk_map._search_key_16)
         # We use 'aaa' and 'ddd' because they happen to map to 'F' when using
         # _search_key_16
@@ -473,6 +521,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
         )
 
     def test_two_deep_map_plain(self):
+        """Test two deep map plain."""
         c_map = self.make_two_deep_map()
         self.assertEqualDiff(
             "'' InternalNode\n"
@@ -496,6 +545,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
         )
 
     def test_two_deep_map_16(self):
+        """Test two deep map 16."""
         c_map = self.make_two_deep_map(search_key_func=chk_map._search_key_16)
         self.assertEqualDiff(
             "'' InternalNode\n"
@@ -521,6 +571,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
         )
 
     def test_one_deep_two_prefix_map_plain(self):
+        """Test one deep two prefix map plain."""
         c_map = self.make_one_deep_two_prefix_map()
         self.assertEqualDiff(
             "'' InternalNode\n"
@@ -534,6 +585,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
         )
 
     def test_one_deep_two_prefix_map_16(self):
+        """Test one deep two prefix map 16."""
         c_map = self.make_one_deep_two_prefix_map(
             search_key_func=chk_map._search_key_16
         )
@@ -551,6 +603,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
         )
 
     def test_one_deep_one_prefix_map_plain(self):
+        """Test one deep one prefix map plain."""
         c_map = self.make_one_deep_one_prefix_map()
         self.assertEqualDiff(
             "'' InternalNode\n"
@@ -564,6 +617,7 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
         )
 
     def test_one_deep_one_prefix_map_16(self):
+        """Test one deep one prefix map 16."""
         c_map = self.make_one_deep_one_prefix_map(
             search_key_func=chk_map._search_key_16
         )
@@ -580,7 +634,10 @@ class TestTestCaseWithExampleMaps(TestCaseWithExampleMaps):
 
 
 class TestMap(TestCaseWithStore):
+    """Tests for Map."""
+
     def assertHasABMap(self, chk_bytes):
+        """Assert HasABMap."""
         ab_leaf_bytes = b"chkleaf:\n0\n1\n1\na\n\x001\nb\n"
         ab_sha1 = osutils.sha_string(ab_leaf_bytes)
         self.assertEqual(b"90986195696b177c8895d48fdb4b7f2366f798a0", ab_sha1)
@@ -589,6 +646,7 @@ class TestMap(TestCaseWithStore):
         return root_key
 
     def assertHasEmptyMap(self, chk_bytes):
+        """Assert HasEmptyMap."""
         empty_leaf_bytes = b"chkleaf:\n0\n1\n0\n\n"
         empty_sha1 = osutils.sha_string(empty_leaf_bytes)
         self.assertEqual(b"8571e09bf1bcc5b9621ce31b3d4c93d6e9a1ed26", empty_sha1)
@@ -653,6 +711,7 @@ class TestMap(TestCaseWithStore):
         self.assertMapLayoutEqual(map_reverse, chkmap)
 
     def test_assert_map_layout_equal(self):
+        """Test assert map layout equal."""
         store = self.get_chk_bytes()
         map_one = CHKMap(store, None)
         map_one._root_node.set_maximum_size(20)
@@ -675,6 +734,7 @@ class TestMap(TestCaseWithStore):
         self.assertCanonicalForm(map_one)
 
     def test_from_dict_empty(self):
+        """Test from dict empty."""
         chk_bytes = self.get_chk_bytes()
         root_key = CHKMap.from_dict(chk_bytes, {})
         # Check the data was saved and inserted correctly.
@@ -682,6 +742,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual(expected_root_key, root_key)
 
     def test_from_dict_ab(self):
+        """Test from dict ab."""
         chk_bytes = self.get_chk_bytes()
         root_key = CHKMap.from_dict(chk_bytes, {(b"a",): b"b"})
         # Check the data was saved and inserted correctly.
@@ -689,6 +750,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual(expected_root_key, root_key)
 
     def test_apply_empty_ab(self):
+        """Test apply empty ab."""
         # applying a delta (None, "a", "b") to an empty chkmap generates the
         # same map as from_dict_ab.
         chk_bytes = self.get_chk_bytes()
@@ -703,6 +765,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual(new_root, chkmap._root_node._key)
 
     def test_apply_ab_empty(self):
+        """Test apply ab empty."""
         # applying a delta ("a", None, None) to a map with 'a' in it generates
         # an empty map.
         chk_bytes = self.get_chk_bytes()
@@ -717,6 +780,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual(new_root, chkmap._root_node._key)
 
     def test_apply_delete_to_internal_node(self):
+        """Test apply delete to internal node."""
         # applying a delta should be convert an internal root node to a leaf
         # node if the delta shrinks the map enough.
         store = self.get_chk_bytes()
@@ -736,6 +800,7 @@ class TestMap(TestCaseWithStore):
         self.assertIsInstance(chkmap._root_node, LeafNode)
 
     def test_apply_new_keys_must_be_new(self):
+        """Test apply new keys must be new."""
         # applying a delta (None, "a", "b") to a map with 'a' in it generates
         # an error.
         chk_bytes = self.get_chk_bytes()
@@ -749,6 +814,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual(root_key, chkmap._root_node._key)
 
     def test_apply_delta_is_deterministic(self):
+        """Test apply delta is deterministic."""
         chk_bytes = self.get_chk_bytes()
         chkmap1 = CHKMap(chk_bytes, None)
         chkmap1._root_node.set_maximum_size(10)
@@ -779,6 +845,7 @@ class TestMap(TestCaseWithStore):
         self.assertCanonicalForm(chkmap2)
 
     def test_stable_splitting(self):
+        """Test stable splitting."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 2 keys per LeafNode
@@ -824,6 +891,7 @@ class TestMap(TestCaseWithStore):
         self.assertCanonicalForm(chkmap)
 
     def test_map_splits_with_longer_key(self):
+        """Test map splits with longer key."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 1 key per LeafNode
@@ -834,6 +902,7 @@ class TestMap(TestCaseWithStore):
         self.assertIsInstance(chkmap._root_node, InternalNode)
 
     def test_with_linefeed_in_key(self):
+        """Test with linefeed in key."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 1 key per LeafNode
@@ -869,6 +938,7 @@ class TestMap(TestCaseWithStore):
         )
 
     def test_deep_splitting(self):
+        """Test deep splitting."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 2 keys per LeafNode
@@ -962,6 +1032,7 @@ class TestMap(TestCaseWithStore):
         )
 
     def test_map_collapses_if_size_changes(self):
+        """Test map collapses if size changes."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 2 keys per LeafNode
@@ -986,6 +1057,7 @@ class TestMap(TestCaseWithStore):
         self.assertCanonicalForm(chkmap)
 
     def test_map_double_deep_collapses(self):
+        """Test map double deep collapses."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 3 small keys per LeafNode
@@ -1012,6 +1084,7 @@ class TestMap(TestCaseWithStore):
         )
 
     def test_stable_unmap(self):
+        """Test stable unmap."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 2 keys per LeafNode
@@ -1045,6 +1118,7 @@ class TestMap(TestCaseWithStore):
         self.assertCanonicalForm(chkmap)
 
     def test_unmap_double_deep(self):
+        """Test unmap double deep."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 3 keys per LeafNode
@@ -1077,6 +1151,7 @@ class TestMap(TestCaseWithStore):
         )
 
     def test_unmap_double_deep_non_empty_leaf(self):
+        """Test unmap double deep non empty leaf."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 3 keys per LeafNode
@@ -1109,6 +1184,7 @@ class TestMap(TestCaseWithStore):
         )
 
     def test_unmap_with_known_internal_node_doesnt_page(self):
+        """Test unmap with known internal node doesnt page."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 3 keys per LeafNode
@@ -1148,6 +1224,7 @@ class TestMap(TestCaseWithStore):
         self.assertIsInstance(chkmap._root_node._items[b"ab"], tuple)
 
     def test_unmap_without_fitting_doesnt_page_in(self):
+        """Test unmap without fitting doesnt page in."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 2 keys per LeafNode
@@ -1186,6 +1263,7 @@ class TestMap(TestCaseWithStore):
         self.assertIsInstance(chkmap._root_node._items[b"aae"], LeafNode)
 
     def test_unmap_pages_in_if_necessary(self):
+        """Test unmap pages in if necessary."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 2 keys per LeafNode
@@ -1223,6 +1301,7 @@ class TestMap(TestCaseWithStore):
         self.assertIsInstance(chkmap._root_node._items[b"aac"], LeafNode)
 
     def test_unmap_pages_in_from_page_cache(self):
+        """Test unmap pages in from page cache."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 2 keys per LeafNode
@@ -1273,6 +1352,7 @@ class TestMap(TestCaseWithStore):
         self.assertIsInstance(chkmap._root_node._items[b"aac"], LeafNode)
 
     def test_unmap_uses_existing_items(self):
+        """Test unmap uses existing items."""
         store = self.get_chk_bytes()
         chkmap = CHKMap(store, None)
         # Should fit 2 keys per LeafNode
@@ -1305,6 +1385,7 @@ class TestMap(TestCaseWithStore):
         self.assertIsInstance(chkmap._root_node._items[b"aaf"], LeafNode)
 
     def test_iter_changes_empty_ab(self):
+        """Test iter changes empty ab."""
         # Asking for changes between an empty dict to a dict with keys returns
         # all the keys.
         basis = self._get_map({}, maximum_size=10)
@@ -1319,6 +1400,7 @@ class TestMap(TestCaseWithStore):
         )
 
     def test_iter_changes_ab_empty(self):
+        """Test iter changes ab empty."""
         # Asking for changes between a dict with keys to an empty dict returns
         # all the keys.
         basis = self._get_map(
@@ -1331,11 +1413,13 @@ class TestMap(TestCaseWithStore):
         )
 
     def test_iter_changes_empty_empty_is_empty(self):
+        """Test iter changes empty empty is empty."""
         basis = self._get_map({}, maximum_size=10)
         target = self._get_map({}, chk_bytes=basis._store, maximum_size=10)
         self.assertEqual([], sorted(target.iter_changes(basis)))
 
     def test_iter_changes_ab_ab_is_empty(self):
+        """Test iter changes ab ab is empty."""
         basis = self._get_map(
             {(b"a",): b"content here", (b"b",): b"more content"}, maximum_size=10
         )
@@ -1347,6 +1431,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual([], sorted(target.iter_changes(basis)))
 
     def test_iter_changes_ab_ab_nodes_not_loaded(self):
+        """Test iter changes ab ab nodes not loaded."""
         basis = self._get_map(
             {(b"a",): b"content here", (b"b",): b"more content"}, maximum_size=10
         )
@@ -1360,6 +1445,7 @@ class TestMap(TestCaseWithStore):
         self.assertIsInstance(basis._root_node, tuple)
 
     def test_iter_changes_ab_ab_changed_values_shown(self):
+        """Test iter changes ab ab changed values shown."""
         basis = self._get_map(
             {(b"a",): b"content here", (b"b",): b"more content"}, maximum_size=10
         )
@@ -1372,6 +1458,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual([((b"b",), b"more content", b"different content")], result)
 
     def test_iter_changes_mixed_node_length(self):
+        """Test iter changes mixed node length."""
         # When one side has different node lengths than the other, common
         # but different keys still need to be show, and new-and-old included
         # appropriately.
@@ -1404,6 +1491,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual(changes, sorted(target.iter_changes(basis)))
 
     def test_iter_changes_common_pages_not_loaded(self):
+        """Test iter changes common pages not loaded."""
         # aaa - common unaltered
         # aab - common altered
         # b - basis only
@@ -1438,6 +1526,7 @@ class TestMap(TestCaseWithStore):
                 self.fail(f"Found unexpected change: {change}")
 
     def test_iter_changes_unchanged_keys_in_multi_key_leafs_ignored(self):
+        """Test iter changes unchanged keys in multi key leafs ignored."""
         # Within a leaf there are no hash's to exclude keys, make sure multi
         # value leaf nodes are handled well.
         basis_dict = {
@@ -1460,12 +1549,14 @@ class TestMap(TestCaseWithStore):
         self.assertEqual(changes, sorted(target.iter_changes(basis)))
 
     def test_iteritems_empty(self):
+        """Test iteritems empty."""
         chk_bytes = self.get_chk_bytes()
         root_key = CHKMap.from_dict(chk_bytes, {})
         chkmap = CHKMap(chk_bytes, root_key)
         self.assertEqual([], list(chkmap.iteritems()))
 
     def test_iteritems_two_items(self):
+        """Test iteritems two items."""
         chk_bytes = self.get_chk_bytes()
         root_key = CHKMap.from_dict(
             chk_bytes, {(b"a",): b"content here", (b"b",): b"more content"}
@@ -1477,10 +1568,12 @@ class TestMap(TestCaseWithStore):
         )
 
     def test_iteritems_selected_one_of_two_items(self):
+        """Test iteritems selected one of two items."""
         chkmap = self._get_map({(b"a",): b"content here", (b"b",): b"more content"})
         self.assertEqual({(b"a",): b"content here"}, self.to_dict(chkmap, [(b"a",)]))
 
     def test_iteritems_keys_prefixed_by_2_width_nodes(self):
+        """Test iteritems keys prefixed by 2 width nodes."""
         chkmap = self._get_map(
             {
                 (b"a", b"a"): b"content here",
@@ -1499,6 +1592,7 @@ class TestMap(TestCaseWithStore):
         )
 
     def test_iteritems_keys_prefixed_by_2_width_nodes_hashed(self):
+        """Test iteritems keys prefixed by 2 width nodes hashed."""
         search_key_func = chk_map.search_key_registry.get(b"hash-16-way")
         self.assertEqual(b"E8B7BE43\x00E8B7BE43", search_key_func((b"a", b"a")))
         self.assertEqual(b"E8B7BE43\x0071BEEFF9", search_key_func((b"a", b"b")))
@@ -1522,6 +1616,7 @@ class TestMap(TestCaseWithStore):
         )
 
     def test_iteritems_keys_prefixed_by_2_width_one_leaf(self):
+        """Test iteritems keys prefixed by 2 width one leaf."""
         chkmap = self._get_map(
             {
                 (b"a", b"a"): b"content here",
@@ -1539,14 +1634,17 @@ class TestMap(TestCaseWithStore):
         )
 
     def test___len__empty(self):
+        """Test   len  empty."""
         chkmap = self._get_map({})
         self.assertEqual(0, len(chkmap))
 
     def test___len__2(self):
+        """Test   len  2."""
         chkmap = self._get_map({(b"foo",): b"bar", (b"gam",): b"quux"})
         self.assertEqual(2, len(chkmap))
 
     def test_max_size_100_bytes_new(self):
+        """Test max size 100 bytes new."""
         # When there is a 100 byte upper node limit, a tree is formed.
         chkmap = self._get_map(
             {(b"k1" * 50,): b"v1", (b"k2" * 50,): b"v2"}, maximum_size=100
@@ -1588,6 +1686,7 @@ class TestMap(TestCaseWithStore):
         )
 
     def test_init_root_is_LeafNode_new(self):
+        """Test init root is LeafNode new."""
         chk_bytes = self.get_chk_bytes()
         chkmap = CHKMap(chk_bytes, None)
         self.assertIsInstance(chkmap._root_node, LeafNode)
@@ -1595,6 +1694,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual(0, len(chkmap))
 
     def test_init_and_save_new(self):
+        """Test init and save new."""
         chk_bytes = self.get_chk_bytes()
         chkmap = CHKMap(chk_bytes, None)
         key = chkmap._save()
@@ -1602,6 +1702,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual([key], leaf_node.serialise(chk_bytes))
 
     def test_map_first_item_new(self):
+        """Test map first item new."""
         chk_bytes = self.get_chk_bytes()
         chkmap = CHKMap(chk_bytes, None)
         chkmap.map((b"foo,",), b"bar")
@@ -1613,6 +1714,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual([key], leaf_node.serialise(chk_bytes))
 
     def test_unmap_last_item_root_is_leaf_new(self):
+        """Test unmap last item root is leaf new."""
         chkmap = self._get_map({(b"k1" * 50,): b"v1", (b"k2" * 50,): b"v2"})
         chkmap.unmap((b"k1" * 50,))
         chkmap.unmap((b"k2" * 50,))
@@ -1623,6 +1725,7 @@ class TestMap(TestCaseWithStore):
         self.assertEqual([key], leaf_node.serialise(chkmap._store))
 
     def test__dump_tree(self):
+        """Test  dump tree."""
         chkmap = self._get_map(
             {
                 (b"aaa",): b"value1",
@@ -1666,6 +1769,7 @@ class TestMap(TestCaseWithStore):
         )
 
     def test__dump_tree_in_progress(self):
+        """Test  dump tree in progress."""
         chkmap = self._get_map(
             {(b"aaa",): b"value1", (b"aab",): b"value2"}, maximum_size=10
         )
@@ -1706,13 +1810,17 @@ def _test_search_key(key):
 
 
 class TestMapSearchKeys(TestCaseWithStore):
+    """Tests for Map Search Keys."""
+
     def test_default_chk_map_uses_flat_search_key(self):
+        """Test default chk map uses flat search key."""
         chkmap = chk_map.CHKMap(self.get_chk_bytes(), None)
         self.assertEqual(b"1", chkmap._search_key_func((b"1",)))
         self.assertEqual(b"1\x002", chkmap._search_key_func((b"1", b"2")))
         self.assertEqual(b"1\x002\x003", chkmap._search_key_func((b"1", b"2", b"3")))
 
     def test_search_key_is_passed_to_root_node(self):
+        """Test search key is passed to root node."""
         chkmap = chk_map.CHKMap(
             self.get_chk_bytes(), None, search_key_func=_test_search_key
         )
@@ -1725,6 +1833,7 @@ class TestMapSearchKeys(TestCaseWithStore):
         )
 
     def test_search_key_passed_via__ensure_root(self):
+        """Test search key passed via  ensure root."""
         chk_bytes = self.get_chk_bytes()
         chkmap = chk_map.CHKMap(chk_bytes, None, search_key_func=_test_search_key)
         root_key = chkmap._save()
@@ -1735,6 +1844,7 @@ class TestMapSearchKeys(TestCaseWithStore):
         )
 
     def test_search_key_with_internal_node(self):
+        """Test search key with internal node."""
         chk_bytes = self.get_chk_bytes()
         chkmap = chk_map.CHKMap(chk_bytes, None, search_key_func=_test_search_key)
         chkmap._root_node.set_maximum_size(10)
@@ -1765,6 +1875,7 @@ class TestMapSearchKeys(TestCaseWithStore):
         )
 
     def test_search_key_16(self):
+        """Test search key 16."""
         chk_bytes = self.get_chk_bytes()
         chkmap = chk_map.CHKMap(chk_bytes, None, search_key_func=chk_map._search_key_16)
         chkmap._root_node.set_maximum_size(10)
@@ -1799,6 +1910,7 @@ class TestMapSearchKeys(TestCaseWithStore):
         )
 
     def test_search_key_255(self):
+        """Test search key 255."""
         chk_bytes = self.get_chk_bytes()
         chkmap = chk_map.CHKMap(
             chk_bytes, None, search_key_func=chk_map._search_key_255
@@ -1835,6 +1947,7 @@ class TestMapSearchKeys(TestCaseWithStore):
         )
 
     def test_search_key_collisions(self):
+        """Test search key collisions."""
         chkmap = chk_map.CHKMap(
             self.get_chk_bytes(), None, search_key_func=_search_key_single
         )
@@ -1851,27 +1964,34 @@ class TestMapSearchKeys(TestCaseWithStore):
 
 
 class TestLeafNode(TestCaseWithStore):
+    """Tests for Leaf Node."""
+
     def test_current_size_empty(self):
+        """Test current size empty."""
         node = LeafNode()
         self.assertEqual(16, node._current_size())
 
     def test_current_size_size_changed(self):
+        """Test current size size changed."""
         node = LeafNode()
         node.set_maximum_size(10)
         self.assertEqual(17, node._current_size())
 
     def test_current_size_width_changed(self):
+        """Test current size width changed."""
         node = LeafNode()
         node._key_width = 10
         self.assertEqual(17, node._current_size())
 
     def test_current_size_items(self):
+        """Test current size items."""
         node = LeafNode()
         base_size = node._current_size()
         node.map(None, (b"foo bar",), b"baz")
         self.assertEqual(base_size + 14, node._current_size())
 
     def test_deserialise_empty(self):
+        """Test deserialise empty."""
         node = LeafNode.deserialise(b"chkleaf:\n10\n1\n0\n\n", (b"sha1:1234",))
         self.assertEqual(0, len(node))
         self.assertEqual(10, node.maximum_size)
@@ -1880,6 +2000,7 @@ class TestLeafNode(TestCaseWithStore):
         self.assertIs(None, node._common_serialised_prefix)
 
     def test_deserialise_items(self):
+        """Test deserialise items."""
         node = LeafNode.deserialise(
             b"chkleaf:\n0\n1\n2\n\nfoo bar\x001\nbaz\nquux\x001\nblarh\n",
             (b"sha1:1234",),
@@ -1891,6 +2012,7 @@ class TestLeafNode(TestCaseWithStore):
         )
 
     def test_deserialise_item_with_null_width_1(self):
+        """Test deserialise item with null width 1."""
         node = LeafNode.deserialise(
             b"chkleaf:\n0\n1\n2\n\nfoo\x001\nbar\x00baz\nquux\x001\nblarh\n",
             (b"sha1:1234",),
@@ -1902,6 +2024,7 @@ class TestLeafNode(TestCaseWithStore):
         )
 
     def test_deserialise_item_with_null_width_2(self):
+        """Test deserialise item with null width 2."""
         node = LeafNode.deserialise(
             b"chkleaf:\n0\n2\n2\n\nfoo\x001\x001\nbar\x00baz\nquux\x00\x001\nblarh\n",
             (b"sha1:1234",),
@@ -1913,6 +2036,7 @@ class TestLeafNode(TestCaseWithStore):
         )
 
     def test_iteritems_selected_one_of_two_items(self):
+        """Test iteritems selected one of two items."""
         node = LeafNode.deserialise(
             b"chkleaf:\n0\n1\n2\n\nfoo bar\x001\nbaz\nquux\x001\nblarh\n",
             (b"sha1:1234",),
@@ -1924,6 +2048,7 @@ class TestLeafNode(TestCaseWithStore):
         )
 
     def test_deserialise_item_with_common_prefix(self):
+        """Test deserialise item with common prefix."""
         node = LeafNode.deserialise(
             b"chkleaf:\n0\n2\n2\nfoo\x00\n1\x001\nbar\x00baz\n2\x001\nblarh\n",
             (b"sha1:1234",),
@@ -1937,6 +2062,7 @@ class TestLeafNode(TestCaseWithStore):
         self.assertEqual(b"foo\x00", node._common_serialised_prefix)
 
     def test_deserialise_multi_line(self):
+        """Test deserialise multi line."""
         node = LeafNode.deserialise(
             b"chkleaf:\n0\n2\n2\nfoo\x00\n1\x002\nbar\nbaz\n2\x002\nblarh\n\n",
             (b"sha1:1234",),
@@ -1953,15 +2079,18 @@ class TestLeafNode(TestCaseWithStore):
         self.assertEqual(b"foo\x00", node._common_serialised_prefix)
 
     def test_key_new(self):
+        """Test key new."""
         node = LeafNode()
         self.assertEqual(None, node.key())
 
     def test_key_after_map(self):
+        """Test key after map."""
         node = LeafNode.deserialise(b"chkleaf:\n10\n1\n0\n\n", (b"sha1:1234",))
         node.map(None, (b"foo bar",), b"baz quux")
         self.assertEqual(None, node.key())
 
     def test_key_after_unmap(self):
+        """Test key after unmap."""
         node = LeafNode.deserialise(
             b"chkleaf:\n0\n1\n2\n\nfoo bar\x001\nbaz\nquux\x001\nblarh\n",
             (b"sha1:1234",),
@@ -1970,6 +2099,7 @@ class TestLeafNode(TestCaseWithStore):
         self.assertEqual(None, node.key())
 
     def test_map_exceeding_max_size_only_entry_new(self):
+        """Test map exceeding max size only entry new."""
         node = LeafNode()
         node.set_maximum_size(10)
         result = node.map(None, (b"foo bar",), b"baz quux")
@@ -1977,6 +2107,7 @@ class TestLeafNode(TestCaseWithStore):
         self.assertLess(10, node._current_size())
 
     def test_map_exceeding_max_size_second_entry_early_difference_new(self):
+        """Test map exceeding max size second entry early difference new."""
         node = LeafNode()
         node.set_maximum_size(10)
         node.map(None, (b"foo bar",), b"baz quux")
@@ -1996,6 +2127,7 @@ class TestLeafNode(TestCaseWithStore):
         self.assertEqual(1, node._key_width)
 
     def test_map_first(self):
+        """Test map first."""
         node = LeafNode()
         result = node.map(None, (b"foo bar",), b"baz quux")
         self.assertEqual((b"foo bar", [(b"", node)]), result)
@@ -2003,6 +2135,7 @@ class TestLeafNode(TestCaseWithStore):
         self.assertEqual(1, len(node))
 
     def test_map_second(self):
+        """Test map second."""
         node = LeafNode()
         node.map(None, (b"foo bar",), b"baz quux")
         result = node.map(None, (b"bingo",), b"bango")
@@ -2014,6 +2147,7 @@ class TestLeafNode(TestCaseWithStore):
         self.assertEqual(2, len(node))
 
     def test_map_replacement(self):
+        """Test map replacement."""
         node = LeafNode()
         node.map(None, (b"foo bar",), b"baz quux")
         result = node.map(None, (b"foo bar",), b"bango")
@@ -2022,6 +2156,7 @@ class TestLeafNode(TestCaseWithStore):
         self.assertEqual(1, len(node))
 
     def test_serialise_empty(self):
+        """Test serialise empty."""
         store = self.get_chk_bytes()
         node = LeafNode()
         node.set_maximum_size(10)
@@ -2033,6 +2168,7 @@ class TestLeafNode(TestCaseWithStore):
         self.assertEqual(expected_key, node.key())
 
     def test_serialise_items(self):
+        """Test serialise items."""
         store = self.get_chk_bytes()
         node = LeafNode()
         node.set_maximum_size(10)
@@ -2047,19 +2183,23 @@ class TestLeafNode(TestCaseWithStore):
         self.assertEqual(expected_key, node.key())
 
     def test_unique_serialised_prefix_empty_new(self):
+        """Test unique serialised prefix empty new."""
         node = LeafNode()
         self.assertIs(None, node._compute_search_prefix())
 
     def test_unique_serialised_prefix_one_item_new(self):
+        """Test unique serialised prefix one item new."""
         node = LeafNode()
         node.map(None, (b"foo bar", b"baz"), b"baz quux")
         self.assertEqual(b"foo bar\x00baz", node._compute_search_prefix())
 
     def test_unmap_missing(self):
+        """Test unmap missing."""
         node = LeafNode()
         self.assertRaises(KeyError, node.unmap, None, (b"foo bar",))
 
     def test_unmap_present(self):
+        """Test unmap present."""
         node = LeafNode()
         node.map(None, (b"foo bar",), b"baz quux")
         result = node.unmap(None, (b"foo bar",))
@@ -2068,6 +2208,7 @@ class TestLeafNode(TestCaseWithStore):
         self.assertEqual(0, len(node))
 
     def test_map_maintains_common_prefixes(self):
+        """Test map maintains common prefixes."""
         node = LeafNode()
         node._key_width = 2
         node.map(None, (b"foo bar", b"baz"), b"baz quux")
@@ -2087,6 +2228,7 @@ class TestLeafNode(TestCaseWithStore):
         self.assertEqual(b"", node._common_serialised_prefix)
 
     def test_unmap_maintains_common_prefixes(self):
+        """Test unmap maintains common prefixes."""
         node = LeafNode()
         node._key_width = 2
         node.map(None, (b"foo bar", b"baz"), b"baz quux")
@@ -2110,7 +2252,10 @@ class TestLeafNode(TestCaseWithStore):
 
 
 class TestInternalNode(TestCaseWithStore):
+    """Tests for Internal Node."""
+
     def test_add_node_empty_new(self):
+        """Test add node empty new."""
         node = InternalNode(b"fo")
         child = LeafNode()
         child.set_maximum_size(100)
@@ -2139,6 +2284,7 @@ class TestInternalNode(TestCaseWithStore):
         self.assertEqual(3, node._node_width)
 
     def test_add_node_resets_key_new(self):
+        """Test add node resets key new."""
         node = InternalNode(b"fo")
         child = LeafNode()
         child.set_maximum_size(100)
@@ -2156,6 +2302,7 @@ class TestInternalNode(TestCaseWithStore):
     #    def test_add_node_one_oversized_second_splits_errors(self):
 
     def test__iter_nodes_no_key_filter(self):
+        """Test  iter nodes no key filter."""
         node = InternalNode(b"")
         child = LeafNode()
         child.set_maximum_size(100)
@@ -2170,6 +2317,7 @@ class TestInternalNode(TestCaseWithStore):
             self.assertEqual(None, node_key_filter)
 
     def test__iter_nodes_splits_key_filter(self):
+        """Test  iter nodes splits key filter."""
         node = InternalNode(b"")
         child = LeafNode()
         child.set_maximum_size(100)
@@ -2189,6 +2337,7 @@ class TestInternalNode(TestCaseWithStore):
             self.assertEqual(1, len(node_key_filter))
 
     def test__iter_nodes_with_multiple_matches(self):
+        """Test  iter nodes with multiple matches."""
         node = InternalNode(b"")
         child = LeafNode()
         child.set_maximum_size(100)
@@ -2210,6 +2359,7 @@ class TestInternalNode(TestCaseWithStore):
             self.assertEqual(2, len(node_key_filter))
 
     def make_fo_fa_node(self):
+        """Make fo fa node."""
         node = InternalNode(b"f")
         child = LeafNode()
         child.set_maximum_size(100)
@@ -2224,6 +2374,7 @@ class TestInternalNode(TestCaseWithStore):
         return node
 
     def test__iter_nodes_single_entry(self):
+        """Test  iter nodes single entry."""
         node = self.make_fo_fa_node()
         key_filter = [(b"foo",)]
         nodes = list(node._iter_nodes(None, key_filter=key_filter))
@@ -2231,12 +2382,14 @@ class TestInternalNode(TestCaseWithStore):
         self.assertEqual(key_filter, nodes[0][1])
 
     def test__iter_nodes_single_entry_misses(self):
+        """Test  iter nodes single entry misses."""
         node = self.make_fo_fa_node()
         key_filter = [(b"bar",)]
         nodes = list(node._iter_nodes(None, key_filter=key_filter))
         self.assertEqual(0, len(nodes))
 
     def test__iter_nodes_mixed_key_width(self):
+        """Test  iter nodes mixed key width."""
         node = self.make_fo_fa_node()
         key_filter = [(b"foo", b"bar"), (b"foo",), (b"fo",), (b"b",)]
         nodes = list(node._iter_nodes(None, key_filter=key_filter))
@@ -2246,12 +2399,14 @@ class TestInternalNode(TestCaseWithStore):
         self.assertEqual(sorted(matches), sorted(nodes[0][1]))
 
     def test__iter_nodes_match_all(self):
+        """Test  iter nodes match all."""
         node = self.make_fo_fa_node()
         key_filter = [(b"foo", b"bar"), (b"foo",), (b"fo",), (b"f",)]
         nodes = list(node._iter_nodes(None, key_filter=key_filter))
         self.assertEqual(2, len(nodes))
 
     def test__iter_nodes_fixed_widths_and_misses(self):
+        """Test  iter nodes fixed widths and misses."""
         node = self.make_fo_fa_node()
         # foo and faa should both match one child, baz should miss
         key_filter = [(b"foo",), (b"faa",), (b"baz",)]
@@ -2261,10 +2416,12 @@ class TestInternalNode(TestCaseWithStore):
             self.assertEqual(1, len(matches))
 
     def test_iteritems_empty_new(self):
+        """Test iteritems empty new."""
         node = InternalNode()
         self.assertEqual([], sorted(node.iteritems(None)))
 
     def test_iteritems_two_children(self):
+        """Test iteritems two children."""
         node = InternalNode()
         leaf1 = LeafNode()
         leaf1.map(None, (b"foo bar",), b"quux")
@@ -2278,6 +2435,7 @@ class TestInternalNode(TestCaseWithStore):
         )
 
     def test_iteritems_two_children_partial(self):
+        """Test iteritems two children partial."""
         node = InternalNode()
         leaf1 = LeafNode()
         leaf1.map(None, (b"foo bar",), b"quux")
@@ -2294,6 +2452,7 @@ class TestInternalNode(TestCaseWithStore):
         )
 
     def test_iteritems_two_children_with_hash(self):
+        """Test iteritems two children with hash."""
         search_key_func = chk_map.search_key_registry.get(b"hash-255-way")
         node = InternalNode(search_key_func=search_key_func)
         leaf1 = LeafNode(search_key_func=search_key_func)
@@ -2335,10 +2494,12 @@ class TestInternalNode(TestCaseWithStore):
         )
 
     def test_iteritems_partial_empty(self):
+        """Test iteritems partial empty."""
         node = InternalNode()
         self.assertEqual([], sorted(node.iteritems([(b"missing",)])))
 
     def test_map_to_new_child_new(self):
+        """Test map to new child new."""
         chkmap = self._get_map({(b"k1",): b"foo", (b"k2",): b"bar"}, maximum_size=10)
         chkmap._ensure_root()
         node = chkmap._root_node
@@ -2372,6 +2533,7 @@ class TestInternalNode(TestCaseWithStore):
         self.assertEqual([child_key, keys[1]], keys)
 
     def test_map_to_child_child_splits_new(self):
+        """Test map to child child splits new."""
         chkmap = self._get_map({(b"k1",): b"foo", (b"k22",): b"bar"}, maximum_size=10)
         # Check for the canonical root value for this tree:
         self.assertEqualDiff(
@@ -2436,6 +2598,7 @@ class TestInternalNode(TestCaseWithStore):
         )
 
     def test__search_prefix_filter_with_hash(self):
+        """Test  search prefix filter with hash."""
         search_key_func = chk_map.search_key_registry.get(b"hash-16-way")
         node = InternalNode(search_key_func=search_key_func)
         node._key_width = 2
@@ -2448,6 +2611,7 @@ class TestInternalNode(TestCaseWithStore):
         )
 
     def test_unmap_k23_from_k1_k22_k23_gives_k1_k22_tree_new(self):
+        """Test unmap k23 from k1 k22 k23 gives k1 k22 tree new."""
         chkmap = self._get_map(
             {(b"k1",): b"foo", (b"k22",): b"bar", (b"k23",): b"quux"}, maximum_size=10
         )
@@ -2492,6 +2656,7 @@ class TestInternalNode(TestCaseWithStore):
         )
 
     def test_unmap_k1_from_k1_k22_k23_gives_k22_k23_tree_new(self):
+        """Test unmap k1 from k1 k22 k23 gives k22 k23 tree new."""
         chkmap = self._get_map(
             {(b"k1",): b"foo", (b"k22",): b"bar", (b"k23",): b"quux"}, maximum_size=10
         )
@@ -2572,7 +2737,10 @@ class TestInternalNode(TestCaseWithStore):
 
 
 class TestCHKMapDifference(TestCaseWithExampleMaps):
+    """Tests for CHKMap Difference."""
+
     def get_difference(self, new_roots, old_roots, search_key_func=None):
+        """Get difference."""
         if search_key_func is None:
             search_key_func = chk_map._search_key_plain
         return chk_map.CHKMapDifference(
@@ -2580,6 +2748,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         )
 
     def test__init__(self):
+        """Test  init  ."""
         c_map = self.make_root_only_map()
         key1 = c_map.key()
         c_map.map((b"aaa",), b"new aaa content")
@@ -2590,6 +2759,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual([], diff._new_queue)
 
     def help__read_all_roots(self, search_key_func):
+        """Help  read all roots."""
         c_map = self.make_root_only_map(search_key_func=search_key_func)
         key1 = c_map.key()
         c_map.map((b"aaa",), b"new aaa content")
@@ -2606,12 +2776,15 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual([], diff._old_queue)
 
     def test__read_all_roots_plain(self):
+        """Test  read all roots plain."""
         self.help__read_all_roots(search_key_func=chk_map._search_key_plain)
 
     def test__read_all_roots_16(self):
+        """Test  read all roots 16."""
         self.help__read_all_roots(search_key_func=chk_map._search_key_16)
 
     def test__read_all_roots_skips_known_old(self):
+        """Test  read all roots skips known old."""
         c_map = self.make_one_deep_map(chk_map._search_key_plain)
         key1 = c_map.key()
         c_map2 = self.make_root_only_map(chk_map._search_key_plain)
@@ -2623,6 +2796,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual([], root_results)
 
     def test__read_all_roots_prepares_queues(self):
+        """Test  read all roots prepares queues."""
         c_map = self.make_one_deep_map(chk_map._search_key_plain)
         key1 = c_map.key()
         c_map._dump_tree()  # load everything
@@ -2640,6 +2814,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual([key1_a], diff._old_queue)
 
     def test__read_all_roots_multi_new_prepares_queues(self):
+        """Test  read all roots multi new prepares queues."""
         c_map = self.make_one_deep_map(chk_map._search_key_plain)
         key1 = c_map.key()
         c_map._dump_tree()  # load everything
@@ -2664,6 +2839,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual({key1_a, key1_c}, set(diff._old_queue))
 
     def test__read_all_roots_different_depths(self):
+        """Test  read all roots different depths."""
         c_map = self.make_two_deep_map(chk_map._search_key_plain)
         c_map._dump_tree()  # load everything
         key1 = c_map.key()
@@ -2695,6 +2871,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual([], diff._new_item_queue)
 
     def test__read_all_roots_different_depths_16(self):
+        """Test  read all roots different depths 16."""
         c_map = self.make_two_deep_map(chk_map._search_key_16)
         c_map._dump_tree()  # load everything
         key1 = c_map.key()
@@ -2734,6 +2911,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual([], diff._new_item_queue)
 
     def test__read_all_roots_mixed_depth(self):
+        """Test  read all roots mixed depth."""
         c_map = self.make_one_deep_two_prefix_map(chk_map._search_key_plain)
         c_map._dump_tree()  # load everything
         key1 = c_map.key()
@@ -2770,6 +2948,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual([], diff._new_item_queue)
 
     def test__read_all_roots_yields_extra_deep_records(self):
+        """Test  read all roots yields extra deep records."""
         # This is slightly controversial, as we will yield a chk page that we
         # might later on find out could be filtered out. (If a root node is
         # referenced deeper in the old set.)
@@ -2812,6 +2991,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         )
 
     def test__read_all_roots_multiple_targets(self):
+        """Test  read all roots multiple targets."""
         c_map = self.make_root_only_map()
         key1 = c_map.key()
         c_map = self.make_one_deep_map()
@@ -2832,6 +3012,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual([], diff._new_item_queue)
 
     def test__read_all_roots_no_old(self):
+        """Test  read all roots no old."""
         # This is the 'initial branch' case. With nothing in the old
         # set, we can just queue up all root nodes into interesting queue, and
         # then have them fast-path flushed via _flush_new_queue
@@ -2854,6 +3035,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual([], diff._new_item_queue)
 
     def test__read_all_roots_no_old_16(self):
+        """Test  read all roots no old 16."""
         c_map = self.make_two_deep_map(chk_map._search_key_16)
         key1 = c_map.key()
         diff = self.get_difference([key1], [], chk_map._search_key_16)
@@ -2873,6 +3055,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual([], diff._new_item_queue)
 
     def test__read_all_roots_multiple_old(self):
+        """Test  read all roots multiple old."""
         c_map = self.make_two_deep_map()
         key1 = c_map.key()
         c_map._dump_tree()  # load everything
@@ -2893,6 +3076,7 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
         self.assertEqual([], diff._new_item_queue)
 
     def test__process_next_old_batched_no_dupes(self):
+        """Test  process next old batched no dupes."""
         c_map = self.make_two_deep_map()
         key1 = c_map.key()
         c_map._dump_tree()  # load everything
@@ -2925,7 +3109,10 @@ class TestCHKMapDifference(TestCaseWithExampleMaps):
 
 
 class TestIterInterestingNodes(TestCaseWithExampleMaps):
+    """Tests for Iter Interesting Nodes."""
+
     def get_map_key(self, a_dict, maximum_size=10):
+        """Get map key."""
         c_map = self.get_map(a_dict, maximum_size=maximum_size)
         return c_map.key()
 
@@ -2952,20 +3139,24 @@ class TestIterInterestingNodes(TestCaseWithExampleMaps):
         self.assertEqual(sorted(items), sorted(all_items))
 
     def test_empty_to_one_keys(self):
+        """Test empty to one keys."""
         target = self.get_map_key({(b"a",): b"content"})
         self.assertIterInteresting([target], [((b"a",), b"content")], [target], [])
 
     def test_none_to_one_key(self):
+        """Test none to one key."""
         basis = self.get_map_key({})
         target = self.get_map_key({(b"a",): b"content"})
         self.assertIterInteresting([target], [((b"a",), b"content")], [target], [basis])
 
     def test_one_to_none_key(self):
+        """Test one to none key."""
         basis = self.get_map_key({(b"a",): b"content"})
         target = self.get_map_key({})
         self.assertIterInteresting([target], [], [target], [basis])
 
     def test_common_pages(self):
+        """Test common pages."""
         basis = self.get_map_key(
             {
                 (b"a",): b"content",
@@ -2998,6 +3189,7 @@ class TestIterInterestingNodes(TestCaseWithExampleMaps):
         )
 
     def test_common_sub_page(self):
+        """Test common sub page."""
         basis = self.get_map_key(
             {
                 (b"aaa",): b"common",
@@ -3033,6 +3225,7 @@ class TestIterInterestingNodes(TestCaseWithExampleMaps):
         )
 
     def test_common_leaf(self):
+        """Test common leaf."""
         basis = self.get_map_key({})
         target1 = self.get_map_key({(b"aaa",): b"common"})
         target2 = self.get_map_key(
@@ -3100,6 +3293,7 @@ class TestIterInterestingNodes(TestCaseWithExampleMaps):
         self.assertIterInteresting([target1], [], [target1], [target3])
 
     def test_multiple_maps(self):
+        """Test multiple maps."""
         basis1 = self.get_map_key(
             {
                 (b"aaa",): b"common",
@@ -3167,6 +3361,7 @@ class TestIterInterestingNodes(TestCaseWithExampleMaps):
         )
 
     def test_multiple_maps_overlapping_common_new(self):
+        """Test multiple maps overlapping common new."""
         # Test that when a node found through the interesting_keys iteration
         # for *some roots* and also via the old keys iteration, that
         # it is still scanned for old refs and items, because its
@@ -3247,6 +3442,7 @@ class TestIterInterestingNodes(TestCaseWithExampleMaps):
         )
 
     def test_multiple_maps_similar(self):
+        """Test multiple maps similar."""
         # We want to have a depth=2 tree, with multiple entries in each leaf
         # node
         basis = self.get_map_key(
@@ -3325,14 +3521,19 @@ class TestIterInterestingNodes(TestCaseWithExampleMaps):
 
 
 class TestSearchKeys(TestCase):
+    """Tests for Search Keys."""
+
     def assertSearchKey16(self, expected, key):
+        """Assert SearchKey16."""
         self.assertEqual(expected, _search_key_16(key))
 
     def assertSearchKey255(self, expected, key):
+        """Assert SearchKey255."""
         actual = _search_key_255(key)
         self.assertEqual(expected, actual, f"actual: {actual!r}")
 
     def test_simple_16(self):
+        """Test simple 16."""
         self.assertSearchKey16(
             b"8C736521",
             (b"foo",),
@@ -3345,6 +3546,7 @@ class TestSearchKeys(TestCase):
         )
 
     def test_simple_255(self):
+        """Test simple 255."""
         self.assertSearchKey255(
             b"\x8cse!",
             (b"foo",),
@@ -3356,6 +3558,7 @@ class TestSearchKeys(TestCase):
         self.assertSearchKey255(b"\xfdm\x93_\x00P_\x1bL", (b"<", b"V"))
 
     def test_255_does_not_include_newline(self):
+        """Test 255 does not include newline."""
         # When mapping via _search_key_255, we should never have the '\n'
         # character, but all other 255 values should be present
         chars_used = set()
@@ -3368,16 +3571,21 @@ class TestSearchKeys(TestCase):
 
 
 class Test_BytesToTextKey(TestCase):
+    """Tests for _bytes_to_text_key."""
+
     def assertBytesToTextKey(self, key, bytes):
+        """Assert BytesToTextKey."""
         self.assertEqual(key, _bytes_to_text_key(bytes))
 
     def assertBytesToTextKeyRaises(self, bytes):
+        """Assert BytesToTextKeyRaises."""
         # These are invalid bytes, and we want to make sure the code under test
         # raises an exception rather than segfaults, etc. We don't particularly
         # care what exception.
         self.assertRaises((ValueError, IndexError), _bytes_to_text_key, bytes)
 
     def test_file(self):
+        """Test file."""
         self.assertBytesToTextKey(
             (b"file-id", b"revision-id"),
             b"file: file-id\nparent-id\nname\nrevision-id\n"
@@ -3385,27 +3593,33 @@ class Test_BytesToTextKey(TestCase):
         )
 
     def test_invalid_no_kind(self):
+        """Test invalid no kind."""
         self.assertBytesToTextKeyRaises(
             b"file  file-id\nparent-id\nname\nrevision-id\n"
             b"da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN"
         )
 
     def test_invalid_no_space(self):
+        """Test invalid no space."""
         self.assertBytesToTextKeyRaises(
             b"file:file-id\nparent-id\nname\nrevision-id\n"
             b"da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN"
         )
 
     def test_invalid_too_short_file_id(self):
+        """Test invalid too short file id."""
         self.assertBytesToTextKeyRaises(b"file:file-id")
 
     def test_invalid_too_short_parent_id(self):
+        """Test invalid too short parent id."""
         self.assertBytesToTextKeyRaises(b"file:file-id\nparent-id")
 
     def test_invalid_too_short_name(self):
+        """Test invalid too short name."""
         self.assertBytesToTextKeyRaises(b"file:file-id\nparent-id\nname")
 
     def test_dir(self):
+        """Test dir."""
         self.assertBytesToTextKey(
             (b"dir-id", b"revision-id"), b"dir: dir-id\nparent-id\nname\nrevision-id"
         )

@@ -23,7 +23,10 @@ from . import TestCaseWithMemoryTransport
 
 
 class TestPlanMerge(TestCaseWithMemoryTransport):
+    """Tests for _PlanMerge and plan_merge/plan_lca_merge functionality."""
+
     def setUp(self):
+        """Set up versioned file infrastructure for merge tests."""
         super().setUp()
         mapper = versionedfile.PrefixMapper()
         factory = knit.make_file_factory(True, mapper)
@@ -32,35 +35,42 @@ class TestPlanMerge(TestCaseWithMemoryTransport):
         self.plan_merge_vf.fallback_versionedfiles.append(self.vf)
 
     def add_version(self, key, parents, text):
+        """Add a version to the backing versioned file."""
         self.vf.add_lines(key, parents, [bytes([c]) + b"\n" for c in bytearray(text)])
 
     def add_rev(self, prefix, revision_id, parents, text):
+        """Add a revision to the versioned file using a prefix/revision_id key."""
         self.add_version((prefix, revision_id), [(prefix, p) for p in parents], text)
 
     def add_uncommitted_version(self, key, parents, text):
+        """Add an uncommitted version directly to the plan merge versioned file."""
         self.plan_merge_vf.add_lines(
             key, parents, [bytes([c]) + b"\n" for c in bytearray(text)]
         )
 
     def setup_plan_merge(self):
+        """Set up a standard 3-revision merge scenario and return a _PlanMerge."""
         self.add_rev(b"root", b"A", [], b"abc")
         self.add_rev(b"root", b"B", [b"A"], b"acehg")
         self.add_rev(b"root", b"C", [b"A"], b"fabg")
         return _PlanMerge(b"B", b"C", self.plan_merge_vf, (b"root",))
 
     def setup_plan_merge_uncommitted(self):
+        """Set up a merge scenario with uncommitted versions and return a _PlanMerge."""
         self.add_version((b"root", b"A"), [], b"abc")
         self.add_uncommitted_version((b"root", b"B:"), [(b"root", b"A")], b"acehg")
         self.add_uncommitted_version((b"root", b"C:"), [(b"root", b"A")], b"fabg")
         return _PlanMerge(b"B:", b"C:", self.plan_merge_vf, (b"root",))
 
     def test_base_from_plan(self):
+        """Test that base_from_plan reconstructs the common base text."""
         self.setup_plan_merge()
         plan = self.plan_merge_vf.plan_merge(b"B", b"C")
         pwm = versionedfile.PlanWeaveMerge(plan)
         self.assertEqual([b"a\n", b"b\n", b"c\n"], pwm.base_from_plan())
 
     def test_unique_lines(self):
+        """Test that _unique_lines identifies lines unique to each revision."""
         plan = self.setup_plan_merge()
         self.assertEqual(
             plan._unique_lines(plan._get_matching_blocks(b"B", b"C")),
@@ -68,6 +78,7 @@ class TestPlanMerge(TestCaseWithMemoryTransport):
         )
 
     def test_plan_merge(self):
+        """Test that plan_merge produces the correct sequence of merge operations."""
         self.setup_plan_merge()
         plan = self.plan_merge_vf.plan_merge(b"B", b"C")
         self.assertEqual(

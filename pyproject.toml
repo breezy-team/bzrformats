@@ -135,3 +135,12 @@ archs = ["auto", "aarch64"]
 [tool.cibuildwheel.macos]
 
 [tool.cibuildwheel.windows]
+
+[tool.ruff.lint.extend-per-file-ignores]
+# Ignore docstring requirements for test files
+"bzrformats/tests/**/*.py" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
+"bzrformats/*/tests/**/*.py" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
+"bzrformats/**/test_*.py" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
+"bzrformats/**/*_test.py" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
+
+

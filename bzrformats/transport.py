@@ -210,6 +210,7 @@ class MemoryTransport:
     """
 
     def __init__(self, url="memory:///", _files=None, _dirs=None):
+        """Initialize MemoryTransport, optionally sharing an existing store."""
         if not url.endswith("/"):
             url += "/"
         self.base = url
@@ -360,6 +361,7 @@ class MemoryTransport:
         self._dirs.add(parent)
 
     def __repr__(self):
+        """Return string representation."""
         return f"MemoryTransport({self.base!r})"
 
 
@@ -372,6 +374,7 @@ class TracingTransport:
     """
 
     def __init__(self, inner):
+        """Initialize with the transport to wrap."""
         self._inner = inner
         self._activity = []
 
@@ -381,27 +384,33 @@ class TracingTransport:
 
     @property
     def base(self):
+        """Return the base URL of the inner transport."""
         return self._inner.base
 
     # -- traced methods (match breezy's TransportTraceDecorator format) --
 
     def get(self, relpath):
+        """Get file contents, recording the operation."""
         self._activity.append(("get", relpath))
         return self._inner.get(relpath)
 
     def get_bytes(self, relpath):
+        """Get file bytes, recording the operation."""
         self._activity.append(("get", relpath))
         return self._inner.get_bytes(relpath)
 
     def put_bytes(self, relpath, raw_bytes, mode=None):
+        """Put bytes, recording the operation."""
         self._activity.append(("put_bytes", relpath, len(raw_bytes), mode))
         return self._inner.put_bytes(relpath, raw_bytes, mode)
 
     def mkdir(self, relpath, mode=None):
+        """Create a directory, recording the operation."""
         self._activity.append(("mkdir", relpath, mode))
         return self._inner.mkdir(relpath, mode)
 
     def readv(self, relpath, offsets, adjust_for_latency=False, upper_limit=None):
+        """Read multiple ranges, recording the operation."""
         self._activity.append(
             ("readv", relpath, list(offsets), adjust_for_latency, upper_limit)
         )
@@ -415,13 +424,17 @@ class TracingTransport:
     # -- non-traced pass-through for common methods --
 
     def put_file(self, relpath, f, mode=None):
+        """Write a file to the inner transport."""
         return self._inner.put_file(relpath, f, mode)
 
     def clone(self, relpath=None):
+        """Clone this tracing transport."""
         return TracingTransport(self._inner.clone(relpath))
 
     def recommended_page_size(self):
+        """Return the recommended page size from the inner transport."""
         return self._inner.recommended_page_size()
 
     def __repr__(self):
+        """Return string representation."""
         return f"TracingTransport({self._inner!r})"

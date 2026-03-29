@@ -86,6 +86,7 @@ class BzrFormatsError(Exception):
     __str__ = _format
 
     def __repr__(self):
+        """Return a string representation of this error."""
         return f"{self.__class__.__name__}({self!s})"
 
     def _get_format_string(self):
@@ -93,68 +94,91 @@ class BzrFormatsError(Exception):
         return getattr(self, "_fmt", None)
 
     def __eq__(self, other):
+        """Return True if this error equals other."""
         if self.__class__ is not other.__class__:
             return NotImplemented
         return self.__dict__ == other.__dict__
 
     def __hash__(self):
+        """Return a hash based on object identity."""
         return id(self)
 
 
 class UnexpectedInventoryFormat(BzrFormatsError):
+    """Unexpected inventory format encountered."""
+
     _fmt = "Unexpected inventory format: %(msg)s"
 
     def __init__(self, msg):
+        """Initialize with the unexpected format message."""
         super().__init__()
         self.msg = msg
 
 
 class UnsupportedInventoryKind(BzrFormatsError):
+    """Unsupported inventory kind encountered."""
+
     _fmt = "Unsupported inventory kind: %(kind)s"
 
     def __init__(self, kind):
+        """Initialize with the unsupported kind."""
         super().__init__()
         self.kind = kind
 
 
 class KnitCorrupt(BzrFormatsError):
+    """A knit file is corrupt."""
+
     _fmt = "Knit %(knit)s corrupt: %(how)s"
 
     def __init__(self, knit, how):
+        """Initialize with the knit and corruption description."""
         super().__init__()
         self.knit = knit
         self.how = how
 
 
 class KnitDataStreamIncompatible(BzrFormatsError):
+    """Cannot insert knit data stream due to incompatibility."""
+
     _fmt = "Cannot insert knit data stream for %(key)s: %(msg)s"
 
     def __init__(self, key, msg):
+        """Initialize with the key and incompatibility message."""
         super().__init__()
         self.key = key
         self.msg = msg
 
 
 class KnitDataStreamUnknown(BzrFormatsError):
+    """Unknown knit data stream type."""
+
     _fmt = "Unknown knit data stream for %(key)s"
 
     def __init__(self, key):
+        """Initialize with the key of the unknown stream."""
         super().__init__()
         self.key = key
 
 
 class KnitHeaderError(BzrFormatsError):
+    """A knit file has an invalid header."""
+
     _fmt = "Knit header error: %(badline)r"
 
     def __init__(self, badline):
+        """Initialize with the bad header line."""
         super().__init__()
         self.badline = badline
 
 
 class DirstateCorrupt(BzrFormatsError):
+    """The dirstate file appears to be corrupt."""
+
     _fmt = "The dirstate file (%(state)s) appears to be corrupt: %(msg)s"
 
     def __init__(self, state, msg):
+        """Initialize with the state file path and corruption message."""
         super().__init__()
         self.state = state
         self.msg = msg
@@ -162,68 +186,92 @@ class DirstateCorrupt(BzrFormatsError):
 
 # Index errors
 class BadIndexFormatSignature(BzrFormatsError):
+    """Value is not an index of the expected type."""
+
     _fmt = "%(value)s is not an index of type %(_type)s."
 
     def __init__(self, value, _type):
+        """Initialize."""
         super().__init__()
         self.value = value
         self._type = _type
 
 
 class BadIndexData(BzrFormatsError):
+    """Error in data for an index."""
+
     _fmt = "Error in data for index %(value)s."
 
     def __init__(self, value):
+        """Initialize."""
         super().__init__()
         self.value = value
 
 
 class BadIndexDuplicateKey(BzrFormatsError):
+    """A key is already present in the index."""
+
     _fmt = "The key '%(key)s' is already in index '%(index)s'."
 
     def __init__(self, key, index):
+        """Initialize."""
         super().__init__()
         self.key = key
         self.index = index
 
 
 class BadIndexKey(BzrFormatsError):
+    """A key is not valid for an index."""
+
     _fmt = "The key '%(key)s' is not a valid key."
 
     def __init__(self, key):
+        """Initialize."""
         super().__init__()
         self.key = key
 
 
 class BadIndexOptions(BzrFormatsError):
+    """Could not parse options for an index."""
+
     _fmt = "Could not parse options for index %(value)s."
 
     def __init__(self, value):
+        """Initialize."""
         super().__init__()
         self.value = value
 
 
 class BadIndexValue(BzrFormatsError):
+    """A value is not valid for an index."""
+
     _fmt = "The value '%(value)s' is not a valid value."
 
     def __init__(self, value):
+        """Initialize."""
         super().__init__()
         self.value = value
 
 
 # Inventory errors
 class InvalidEntryName(BzrFormatsError):
+    """Invalid entry name."""
+
     _fmt = "Invalid entry name: %(name)s"
 
     def __init__(self, name):
+        """Initialize."""
         super().__init__()
         self.name = name
 
 
 class DuplicateFileId(BzrFormatsError):
+    """File ID already exists in inventory."""
+
     _fmt = "File id {%(file_id)s} already exists in inventory as %(entry)s"
 
     def __init__(self, file_id, entry):
+        """Initialize."""
         super().__init__()
         self.file_id = file_id
         self.entry = entry
@@ -231,9 +279,12 @@ class DuplicateFileId(BzrFormatsError):
 
 # Groupcompress errors
 class DecompressCorruption(BzrFormatsError):
+    """Corruption while decompressing repository file."""
+
     _fmt = "Corruption while decompressing repository file%(orig_error)s"
 
     def __init__(self, orig_error=""):
+        """Initialize."""
         if orig_error:
             self.orig_error = f", {orig_error}"
         else:
@@ -313,12 +364,15 @@ class InvalidRevisionId(BzrFormatsError):
 
 
 class UnavailableRepresentation(BzrFormatsError):
+    """Requested representation encoding is not available for a key."""
+
     _fmt = (
         "The encoding '%(wanted)s' is not available for key %(key)s which "
         "is encoded as '%(native)s'."
     )
 
     def __init__(self, key, wanted, native):
+        """Initialize."""
         super().__init__()
         self.wanted = wanted
         self.native = native
@@ -326,53 +380,73 @@ class UnavailableRepresentation(BzrFormatsError):
 
 
 class ExistingContent(BzrFormatsError):
+    """The content being inserted is already present."""
+
     _fmt = "The content being inserted is already present."
 
 
 # Weave errors
 class WeaveError(BzrFormatsError):
+    """Error in processing weave."""
+
     _fmt = "Error in processing weave"
 
 
 class WeaveRevisionAlreadyPresent(WeaveError):
+    """Revision already present in weave."""
+
     _fmt = "Revision {%(revision_id)s} already present in weave"
 
     def __init__(self, revision_id):
+        """Initialize."""
         super().__init__()
         self.revision_id = revision_id
 
 
 class WeaveRevisionNotPresent(WeaveError):
+    """Revision not present in weave."""
+
     _fmt = "Revision {%(revision_id)s} not present in weave"
 
     def __init__(self, revision_id):
+        """Initialize."""
         super().__init__()
         self.revision_id = revision_id
 
 
 class WeaveFormatError(WeaveError):
+    """Weave invariant violated."""
+
     _fmt = "Weave invariant violated: %(what)s"
 
     def __init__(self, what):
+        """Initialize."""
         super().__init__()
         self.what = what
 
 
 class WeaveParentMismatch(WeaveError):
+    """Parents are mismatched between two revisions."""
+
     _fmt = "Parents are mismatched between two revisions. %(message)s"
 
 
 class WeaveInvalidChecksum(WeaveError):
+    """Text did not match its checksum in the weave."""
+
     _fmt = "Text did not match it's checksum: %(message)s"
 
 
 class WeaveTextDiffers(WeaveError):
+    """Weaves differ on text content for a revision."""
+
     _fmt = (
         "Weaves differ on text content. Revision:"
         " {%(revision_id)s}, %(weave_a)s, %(weave_b)s"
     )
 
     def __init__(self, revision_id, weave_a, weave_b):
+        """Initialize."""
         super().__init__()
         self.revision_id = revision_id
         self.weave_a = weave_a
@@ -381,9 +455,12 @@ class WeaveTextDiffers(WeaveError):
 
 # Serializer errors
 class BadInventoryFormat(BzrFormatsError):
+    """Inventory XML has an unexpected root tag."""
+
     _fmt = "Root tag is %(tag)r"
 
     def __init__(self, tag):
+        """Initialize."""
         super().__init__()
         self.tag = tag
 
@@ -394,6 +471,7 @@ class ReservedId(BzrFormatsError):
     _fmt = "Reserved revision-id {%(revision_id)s}"
 
     def __init__(self, revision_id):
+        """Initialize."""
         super().__init__()
         self.revision_id = revision_id
 
@@ -426,6 +504,7 @@ class PathError(BzrFormatsError):
     _fmt = "Path error: %(path)r%(extra)s"
 
     def __init__(self, path, extra=None):
+        """Initialize."""
         super().__init__()
         self.path = path
         if extra:
@@ -500,70 +579,96 @@ class InternalBzrFormatsError(BzrFormatsError):
 
 
 class BzrCheckError(InternalBzrFormatsError):
+    """Internal check failed."""
+
     _fmt = "Internal check failed: %(msg)s"
 
     def __init__(self, msg):
+        """Initialize."""
         super().__init__()
         self.msg = msg
 
 
 class LockError(BzrFormatsError):
+    """Base class for lock-related errors."""
+
     _fmt = "Lock error: %(msg)s"
 
     internal_error = False
 
 
 class ObjectNotLocked(LockError):
+    """Object is not locked."""
+
     _fmt = "%(obj)r is not locked"
 
     def __init__(self, obj):
+        """Initialize."""
         super().__init__()
         self.obj = obj
 
 
 class ReadOnlyError(LockError):
+    """A write attempt was made in a read-only transaction."""
+
     _fmt = "A write attempt was made in a read only transaction on %(obj)s"
 
     def __init__(self, obj):
+        """Initialize."""
         super().__init__()
         self.obj = obj
 
 
 class ReadOnlyObjectDirtiedError(ReadOnlyError):
+    """Cannot change object in a read-only transaction."""
+
     _fmt = "Cannot change object %(obj)r in read only transaction"
 
 
 class OutSideTransaction(BzrFormatsError):
+    """Operation attempted after the transaction finished."""
+
     _fmt = (
         "A transaction related operation was attempted after the transaction finished."
     )
 
 
 class LockContention(LockError):
+    """Could not acquire lock."""
+
     _fmt = 'Could not acquire lock "%(lock)s": %(msg)s'
 
     def __init__(self, lock, msg=""):
+        """Initialize."""
         super().__init__()
         self.lock = lock
         self.msg = msg
 
 
 class LockNotHeld(LockError):
+    """Lock is not held."""
+
     _fmt = "Lock not held: %(lock)s"
 
     def __init__(self, lock):
+        """Initialize."""
         super().__init__()
         self.lock = lock
 
 
 class InvalidNormalization(PathError):
+    """Path is not unicode normalized."""
+
     _fmt = 'Path "%(path)s" is not unicode normalized'
 
 
 class AlreadyVersionedError(BzrFormatsError):
+    """Path is already versioned."""
+
     _fmt = "%(context_info)s%(path)s is already versioned."
 
     def __init__(self, path, context_info=None):
+        """Initialize."""
         super().__init__()
         self.path = path
         if context_info is None:
@@ -573,9 +678,12 @@ class AlreadyVersionedError(BzrFormatsError):
 
 
 class NotVersionedError(BzrFormatsError):
+    """Path is not versioned."""
+
     _fmt = "%(context_info)s%(path)s is not versioned."
 
     def __init__(self, path, context_info=""):
+        """Initialize."""
         super().__init__()
         self.path = path
         if context_info:
@@ -585,9 +693,12 @@ class NotVersionedError(BzrFormatsError):
 
 
 class NoSuchRevision(InternalBzrFormatsError):
+    """Branch has no such revision."""
+
     _fmt = "%(branch)s has no revision %(revision)s"
 
     def __init__(self, branch, revision):
+        """Initialize."""
         super().__init__()
         self.branch = branch
         self.revision = revision

@@ -332,15 +332,18 @@ class DirstateInventoryChange:
         self.copied = copied
 
     def meta_modified(self):
+        """Return true if the meta data has been modified."""
         if self.versioned == (True, True):
             return self.executable[0] != self.executable[1]
         return False
 
     def is_reparented(self):
+        """Return whether the entry has been moved to a different parent."""
         return self.parent_id[0] != self.parent_id[1]
 
     @property
     def renamed(self):
+        """Return true if the entry has been renamed."""
         return (
             not self.copied
             and None not in self.name
@@ -349,6 +352,7 @@ class DirstateInventoryChange:
         )
 
     def discard_new(self):
+        """Return a copy of this delta with the new side discarded."""
         return self.__class__(
             self.file_id,
             (self.path[0], None),
@@ -375,12 +379,15 @@ class DirstateInventoryChange:
         )
 
     def __repr__(self):
+        """Return string representation."""
         return f"{self.__class__.__name__}{self._as_tuple()!r}"
 
     def __getitem__(self, index):
+        """Return item at index."""
         return self._as_tuple()[index]
 
     def __eq__(self, other):
+        """Check equality."""
         if hasattr(other, "_as_tuple"):
             return self._as_tuple() == other._as_tuple()
         if isinstance(other, tuple):

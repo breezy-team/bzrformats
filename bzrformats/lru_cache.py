@@ -354,6 +354,7 @@ class FIFOCache(dict):
     """A cache that evicts the oldest entries first (first-in, first-out)."""
 
     def __init__(self, max_cache=100, after_cleanup_count=None):
+        """Initialize the FIFO cache with a maximum size."""
         dict.__init__(self)
         self._max_cache = max_cache
         if after_cleanup_count is None:
@@ -364,13 +365,16 @@ class FIFOCache(dict):
         self._queue = deque()
 
     def __setitem__(self, key, value):
+        """Set an item, evicting old entries if necessary."""
         self.add(key, value)
 
     def __delitem__(self, key):
+        """Delete an item from the cache."""
         self._queue.remove(key)
         self._remove(key)
 
     def add(self, key, value, cleanup=None):
+        """Add a key/value pair, with an optional cleanup callback."""
         if key in self:
             del self[key]
         self._queue.append(key)
@@ -381,13 +385,16 @@ class FIFOCache(dict):
             self.cleanup()
 
     def cache_size(self):
+        """Return the maximum number of entries this cache will hold."""
         return self._max_cache
 
     def cleanup(self):
+        """Evict oldest entries until the cache is within its target size."""
         while len(self) > self._after_cleanup_count:
             self._remove_oldest()
 
     def clear(self):
+        """Remove all entries from the cache."""
         while self:
             self._remove_oldest()
 
@@ -403,6 +410,7 @@ class FIFOCache(dict):
         self._remove(key)
 
     def resize(self, max_cache, after_cleanup_count=None):
+        """Resize the cache to hold at most *max_cache* entries."""
         self._max_cache = max_cache
         if after_cleanup_count is None:
             self._after_cleanup_count = max_cache * 8 // 10
@@ -412,6 +420,7 @@ class FIFOCache(dict):
             self.cleanup()
 
     def setdefault(self, key, defaultval=None):
+        """Return the value for *key*, setting it to *defaultval* if missing."""
         if key in self:
             return self[key]
         self[key] = defaultval

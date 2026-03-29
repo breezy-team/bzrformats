@@ -56,7 +56,7 @@ def _rmtree_temp_dir(path, test_id=None):
 class TestCase(testtools.TestCase if testtools else unittest.TestCase):
     """Base class for bzrformats unit tests."""
 
-    def __init__(self, methodName="testMethod"):
+    def __init__(self, methodName="testMethod"):  # noqa: N803
         super().__init__(methodName)
         self._cleanups = []
 
@@ -240,7 +240,7 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
             s = f.read()
         self.assertEqualDiff(content, s)
 
-    def assertListRaises(self, excClass, func, *args, **kwargs):
+    def assertListRaises(self, excClass, func, *args, **kwargs):  # noqa: N803
         """Fail unless excClass is raised when the iterator from func is used.
 
         Many functions can return generators this makes sure

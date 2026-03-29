@@ -92,11 +92,13 @@ class TestDeserialization(TestCase):
     """Test InventoryDeltaSerializer.parse_text_bytes."""
 
     def test_parse_no_bytes(self):
+        """Test that parsing an empty bytes list raises an error."""
         deserializer = inventory_delta.InventoryDeltaDeserializer()
         err = self.assertRaises(InventoryDeltaError, deserializer.parse_text_bytes, [])
         self.assertContainsRe(str(err), "inventory delta is empty")
 
     def test_parse_bad_format(self):
+        """Test that an unknown format string raises an error."""
         deserializer = inventory_delta.InventoryDeltaDeserializer()
         err = self.assertRaises(
             InventoryDeltaError, deserializer.parse_text_bytes, [b"format: foo\n"]
@@ -104,6 +106,7 @@ class TestDeserialization(TestCase):
         self.assertContainsRe(str(err), "unknown format")
 
     def test_parse_no_parent(self):
+        """Test that a missing parent marker raises an error."""
         deserializer = inventory_delta.InventoryDeltaDeserializer()
         err = self.assertRaises(
             InventoryDeltaError,

@@ -363,6 +363,7 @@ class UnicodeDirReader(DirReader):
     __slots__ = ["_utf8_encode"]
 
     def __init__(self):
+        """Initialize the UTF-8 directory reader."""
         import codecs
 
         self._utf8_encode = codecs.getencoder("utf8")
@@ -471,6 +472,7 @@ class IterableFile:
     """
 
     def __init__(self, iterable):
+        """Initialize with an iterable of byte chunks."""
         self._iter = iter(iterable)
         self._buf = b""
 
@@ -513,6 +515,7 @@ class IterableFile:
         return lines
 
     def __iter__(self):
+        """Iterate over lines."""
         while True:
             line = self.readline()
             if not line:
