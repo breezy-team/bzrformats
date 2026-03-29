@@ -12,7 +12,7 @@ compression, and data structure functionality for Bazaar version control formats
 # Python version 2.0 is (2, 0, 0, 'final', 0)."  Additionally we use a
 # releaselevel of 'dev' for unreleased under-development code.
 
-version_info = (3, 4, 0, "final", 0)
+version_info = (3, 4, 1, "dev", 0)
 
 
 def _format_version_tuple(version_info):
