@@ -209,9 +209,6 @@ def add_cython_extension(module_name, libraries=None, extra_source=None):
     )
 
 
-add_cython_extension(
-    "bzrformats._groupcompress_pyx", extra_source=["bzrformats/diff-delta.c"]
-)
 
 
 if unavailable_files:

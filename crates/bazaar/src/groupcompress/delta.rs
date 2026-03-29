@@ -309,10 +309,13 @@ pub fn write_insert_instruction<W: Write>(
     mut writer: W,
     data: &[u8],
 ) -> Result<usize, std::io::Error> {
-    assert!(data.len() <= 0x7F);
-    writer.write_u8(data.len() as u8)?;
-    writer.write_all(data)?;
-    Ok(data.len() + 1)
+    let mut total = 0;
+    for chunk in data.chunks(0x7F) {
+        writer.write_u8(chunk.len() as u8)?;
+        writer.write_all(chunk)?;
+        total += chunk.len() + 1;
+    }
+    Ok(total)
 }
 
 #[derive(Debug, PartialEq, Eq)]
