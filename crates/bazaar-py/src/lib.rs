@@ -8,6 +8,7 @@ use pyo3::types::{PyBytes, PyString};
 use pyo3_filelike::PyBinaryFile;
 use std::collections::HashMap;
 
+mod btree_serializer;
 mod chk_map;
 mod dirstate;
 mod groupcompress;
@@ -535,6 +536,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let versionedfilem = versionedfile::_versionedfile_rs(py)?;
     m.add_submodule(&versionedfilem)?;
 
+    let btree_serializerm = btree_serializer::_btree_serializer_rs(py)?;
+    m.add_submodule(&btree_serializerm)?;
+
     // PyO3 submodule hack for proper import support
     let sys = py.import("sys")?;
     let modules = sys.getattr("modules")?;
@@ -550,6 +554,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.chk_map", module_name), &chk_mapm)?;
     modules.set_item(format!("{}.smart", module_name), &smartm)?;
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
+    modules.set_item(format!("{}.btree_serializer", module_name), &btree_serializerm)?;
 
     Ok(())
 }

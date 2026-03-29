@@ -27,20 +27,21 @@ from .. import btree_index, lru_cache, osutils
 from .. import index as _mod_index
 from ..lru_cache import FIFOCache
 from ..transport import MemoryTransport, TracingTransport
-from . import TestCase, TestCaseWithMemoryTransport, _try_import
+from . import TestCase, TestCaseWithMemoryTransport
 
 load_tests = load_tests_apply_scenarios
 
 
-_compiled_btreeparser_module = _try_import("bzrformats._btree_serializer_pyx")
+from .._bzr_rs import btree_serializer as _rust_btreeparser_module
 
 
 def btreeparser_scenarios():
     import bzrformats._btree_serializer_py as py_module
 
-    scenarios = [("python", {"parse_btree": py_module})]
-    if _compiled_btreeparser_module is not None:
-        scenarios.append(("C", {"parse_btree": _compiled_btreeparser_module}))
+    scenarios = [
+        ("python", {"parse_btree": py_module}),
+        ("rust", {"parse_btree": _rust_btreeparser_module}),
+    ]
     return scenarios
 
 
@@ -1444,10 +1445,8 @@ class TestBTreeNodes(BTreeTestCase):
 
 class TestCompiledBtree(TestCase):
     def test_exists(self):
-        # This is just to let the user know if they don't have the feature
-        # available
-        if _compiled_btreeparser_module is None:
-            self.skipTest("bzrformats._btree_serializer_pyx not available")
+        # Verify the Rust btree serializer module is available
+        import bzrformats._bzr_rs.btree_serializer  # noqa: F401
 
 
 class TestMultiBisectRight(TestCase):

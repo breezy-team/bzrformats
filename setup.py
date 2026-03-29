@@ -217,7 +217,6 @@ if sys.platform == "win32":
     add_cython_extension("bzrformats._dirstate_helpers_pyx", libraries=["Ws2_32"])
 else:
     add_cython_extension("bzrformats._dirstate_helpers_pyx")
-add_cython_extension("bzrformats._btree_serializer_pyx")
 
 
 if unavailable_files:
