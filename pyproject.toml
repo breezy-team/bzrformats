@@ -27,6 +27,8 @@ classifiers = [
 requires-python = ">=3.10,<3.15"
 dependencies = [
     "catalogus",
+    "patiencediff",
+    "vcsgraph",
 ]
 version = "3.4.0.dev0"
 
@@ -36,6 +38,11 @@ Download = "https://launchpad.net/brz/+download"
 Repository = "https://github.com/breezy-team/bzrformats"
 
 [project.optional-dependencies]
+dev = [
+    "testtools",
+    "testscenarios",
+    "python-subunit",
+]
 
 [tool.setuptools]
 zip-safe = false

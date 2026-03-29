@@ -26,11 +26,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -U "setuptools>=60" cython setuptools-rust
-          pip install catalogus
-          python3 setup.py build_ext -i
+          pip install ".[dev]"
       - name: Run tests
         run: |
-          python -m pip install testtools testscenarios subunit
           python -m subunit.run bzrformats.tests.test_suite | subunit2pyunit
         env:
           PYTHONHASHSEED: random
