@@ -22,19 +22,12 @@ import os
 from testscenarios import load_tests_apply_scenarios
 
 from .. import _dirstate_helpers_py, dirstate
+from .._bzr_rs import dirstate as _dirstate_rs
 from . import TestCase
 
 load_tests = load_tests_apply_scenarios
 
-try:
-    from .. import _dirstate_helpers_pyx as compiled_dirstate_helpers
-except ImportError:
-    compiled_dirstate_helpers = None
-
-
 helper_scenarios = [("dirstate_Python", {"helpers": _dirstate_helpers_py})]
-if compiled_dirstate_helpers is not None:
-    helper_scenarios.append(("dirstate_Pyrex", {"helpers": compiled_dirstate_helpers}))
 
 
 class TestBisectPathMixin:
@@ -506,33 +499,13 @@ class TestLtPathByDirblock(TestCase):
 
 
 class TestUsingCompiledIfAvailable(TestCase):
-    """Check that any compiled functions that are available are the default.
-
-    It is possible to have typos, etc in the import line, such that
-    _dirstate_helpers_pyx is actually available, but the compiled functions are
-    not being used.
-    """
+    """Check that the Rust functions are being used as the default."""
 
     def test__read_dirblocks(self):
-        if compiled_dirstate_helpers is not None:
-            from .._dirstate_helpers_pyx import _read_dirblocks
-        else:
-            from .._dirstate_helpers_py import _read_dirblocks
-        self.assertIs(_read_dirblocks, dirstate._read_dirblocks)
+        self.assertIs(_dirstate_rs._read_dirblocks, dirstate._read_dirblocks)
 
     def test_update_entry(self):
-        if compiled_dirstate_helpers is not None:
-            from .._dirstate_helpers_pyx import update_entry
-        else:
-            from ..dirstate import update_entry
-        self.assertIs(update_entry, dirstate.update_entry)
+        self.assertIs(_dirstate_rs.update_entry, dirstate.update_entry)
 
     def test_process_entry(self):
-        if compiled_dirstate_helpers is not None:
-            from .._dirstate_helpers_pyx import ProcessEntryC
-
-            self.assertIs(ProcessEntryC, dirstate._process_entry)
-        else:
-            from ..dirstate import ProcessEntryPython
-
-            self.assertIs(ProcessEntryPython, dirstate._process_entry)
+        self.assertIs(_dirstate_rs.ProcessEntryC, dirstate._process_entry)

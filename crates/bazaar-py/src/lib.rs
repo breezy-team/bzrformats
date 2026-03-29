@@ -11,6 +11,7 @@ use std::collections::HashMap;
 mod btree_serializer;
 mod chk_map;
 mod dirstate;
+mod dirstate_helpers;
 mod groupcompress;
 mod inventory;
 mod knit;
