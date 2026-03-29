@@ -920,6 +920,21 @@ class LowLevelKnitIndexTests_c(LowLevelKnitIndexTests):
         return _load_data_c
 
 
+class LowLevelKnitIndexTests_rs(LowLevelKnitIndexTests):
+    def setUp(self):
+        super().setUp()
+        try:
+            from .._bzr_rs.knit import _load_data_c  # noqa: F401
+        except (ModuleNotFoundError, ImportError):
+            self.skipTest("bzrformats._bzr_rs.knit not available")
+
+    @property
+    def _load_data(self):
+        from .._bzr_rs.knit import _load_data_c
+
+        return _load_data_c
+
+
 class Test_KnitAnnotator(TestCaseWithMemoryTransport):
     def make_annotator(self):
         factory = knit.make_pack_factory(True, True, 1)

@@ -4031,8 +4031,4 @@ class _KnitAnnotator(VersionedFileAnnotator):
                     to_process.extend(self._process_pending(key))
 
 
-try:
-    from ._knit_load_data_pyx import _load_data_c as _load_data
-except ModuleNotFoundError as e:
-    osutils.failed_to_load_extension(e)
-    from ._knit_load_data_py import _load_data_py as _load_data
+from ._bzr_rs.knit import _load_data_c as _load_data
