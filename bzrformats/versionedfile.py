@@ -22,23 +22,25 @@ import os
 from copy import copy
 from io import BytesIO
 from typing import Any
+from urllib.parse import quote, unquote
 from zlib import adler32
 
-from urllib.parse import quote, unquote
-from . import revision
-from . import multiparent
 from vcsgraph import graph as _mod_graph
 from vcsgraph import known_graph as _mod_known_graph
+
+from . import index, multiparent, osutils, revision
+from ._bzr_rs import versionedfile as _versionedfile_rs
+from .errors import (
+    BzrFormatsError,
+    ObjectNotLocked,
+    RevisionNotPresent,
+    VersionedFileInvalidChecksum,
+)
 
 # Import complex osutils functions that are too difficult to replace
 from .osutils import file_iterator
 from .registry import Registry
 from .textmerge import TextMerge
-
-from . import osutils
-from ._bzr_rs import versionedfile as _versionedfile_rs
-from . import index
-from .errors import BzrFormatsError, ObjectNotLocked, VersionedFileInvalidChecksum, RevisionNotPresent, NoSuchFile
 from .transport import TransportNoSuchFile
 
 FulltextContentFactory = _versionedfile_rs.FulltextContentFactory

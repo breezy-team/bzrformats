@@ -16,10 +16,9 @@
 
 """Tests for maps built on a CHK versionedfiles facility."""
 
-from bzrformats.errors import InconsistentDeltaDelta
 from bzrformats import osutils
+from bzrformats.errors import InconsistentDeltaDelta
 
-from . import TestCase, TestCaseWithMemoryTransport
 from .. import chk_map, groupcompress
 from ..chk_map import (
     CHKMap,
@@ -32,6 +31,7 @@ from ..chk_map import (
     _search_key_255,
     common_prefix_pair,
 )
+from . import TestCase, TestCaseWithMemoryTransport
 
 
 class TestDeserialiseLeafNode(TestCase):

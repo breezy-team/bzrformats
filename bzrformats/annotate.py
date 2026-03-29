@@ -22,8 +22,6 @@ from vcsgraph import (
     known_graph as _mod_known_graph,
 )
 
-from vcsgraph import graph as _mod_graph
-
 from . import errors, osutils
 
 if TYPE_CHECKING:

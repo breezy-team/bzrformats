@@ -26,31 +26,23 @@ import itertools
 from gzip import GzipFile
 from io import BytesIO
 
-from vcsgraph import graph as _mod_graph
+from testscenarios import load_tests_apply_scenarios
 from vcsgraph import known_graph as _mod_known_graph
 
-from ..transport import TransportNoSuchFile
-from ..inventory import Inventory, InventoryDirectory
 from bzrformats import osutils
-from ..errors import RevisionNotPresent
-from ..revision import Revision
 from bzrformats.errors import (
-    OutSideTransaction, ReadOnlyError, ReadOnlyObjectDirtiedError,
-    ReservedId, RevisionAlreadyPresent,
+    OutSideTransaction,
+    ReadOnlyError,
+    ReservedId,
+    RevisionAlreadyPresent,
 )
-from . import (
-    TestCase,
-    TestCaseWithMemoryTransport,
-    TestNotApplicable,
-    TestSkipped,
-)
-from testscenarios import load_tests_apply_scenarios
-from ..transport import MemoryTransport
 
 from .. import groupcompress
 from .. import knit as _mod_knit
 from .. import versionedfile as versionedfile
+from ..errors import RevisionNotPresent
 from ..knit import cleanup_pack_knit, make_file_factory, make_pack_factory
+from ..transport import MemoryTransport, TransportNoSuchFile
 from ..versionedfile import (
     ChunkedContentFactory,
     ConstantMapper,
@@ -63,6 +55,12 @@ from ..versionedfile import (
 )
 from ..weave import WeaveFile, WeaveInvalidChecksum
 from ..weavefile import write_weave
+from . import (
+    TestCase,
+    TestCaseWithMemoryTransport,
+    TestNotApplicable,
+    TestSkipped,
+)
 
 load_tests = load_tests_apply_scenarios
 
@@ -295,9 +293,7 @@ class VersionedFileTestMixIn:
     def test_inline_newline_throws(self):
         # \r characters are not permitted in lines being added
         vf = self.get_file()
-        self.assertRaises(
-            ValueError, vf.add_lines, b"a", [], [b"a\n\n"]
-        )
+        self.assertRaises(ValueError, vf.add_lines, b"a", [], [b"a\n\n"])
         self.assertRaises(
             (ValueError, NotImplementedError),
             vf.add_lines_with_ghosts,
@@ -312,9 +308,7 @@ class VersionedFileTestMixIn:
 
     def test_add_reserved(self):
         vf = self.get_file()
-        self.assertRaises(
-            ReservedId, vf.add_lines, b"a:", [], [b"a\n", b"b\n", b"c\n"]
-        )
+        self.assertRaises(ReservedId, vf.add_lines, b"a:", [], [b"a\n", b"b\n", b"c\n"])
 
     def test_add_lines_nostoresha(self):
         """When nostore_sha is supplied using old content raises."""
@@ -598,9 +592,7 @@ class VersionedFileTestMixIn:
         f = self.get_file()
         self._transaction = "after"
         self.assertRaises(OutSideTransaction, f.add_lines, b"", [], [])
-        self.assertRaises(
-            OutSideTransaction, f.add_lines_with_ghosts, b"", [], []
-        )
+        self.assertRaises(OutSideTransaction, f.add_lines_with_ghosts, b"", [], [])
 
     def test_copy_to(self):
         f = self.get_file()
@@ -821,9 +813,7 @@ class VersionedFileTestMixIn:
         vf = factory("id", t, 0o777, create=True, access_mode="w")
         vf = factory("id", t, access_mode="r")
         self.assertRaises(ReadOnlyError, vf.add_lines, b"base", [], [])
-        self.assertRaises(
-            ReadOnlyError, vf.add_lines_with_ghosts, b"base", [], []
-        )
+        self.assertRaises(ReadOnlyError, vf.add_lines_with_ghosts, b"base", [], [])
 
     def test_get_sha1s(self):
         # check the sha1 data is available
@@ -977,8 +967,6 @@ class TestPlanMergeVersionedFile(TestCaseWithMemoryTransport):
         self.assertEqual(b"c", get_record(b"C").get_bytes_as("fulltext"))
         self.assertEqual(b"e", get_record(b"E:").get_bytes_as("fulltext"))
         self.assertEqual("absent", get_record(b"F").storage_kind)
-
-
 
 
 class MergeCasesMixin:
@@ -1700,8 +1688,11 @@ class TestVersionedFiles(TestCaseWithMemoryTransport):
         """A progress bar can be supplied because check can be a generator."""
 
         class _DummyProgressBar:
-            def update(self, *args): pass
-            def finished(self): pass
+            def update(self, *args):
+                pass
+
+            def finished(self):
+                pass
 
         pb = _DummyProgressBar()
         files = self.get_versionedfiles()
@@ -2755,9 +2746,7 @@ class TestVersionedFiles(TestCaseWithMemoryTransport):
             self.assertEqual({self.get_simple_key(b"left")}, set(missing_bases))
             self.assertEqual(set(keys), set(files.get_parent_map(keys)))
         else:
-            self.assertRaises(
-                RevisionNotPresent, files.insert_record_stream, entries
-            )
+            self.assertRaises(RevisionNotPresent, files.insert_record_stream, entries)
             files.check()
 
     def test_insert_record_stream_delta_missing_basis_can_be_added_later(self):
@@ -3045,5 +3034,3 @@ class VirtualVersionedFilesTests(TestCase):
         self.assertEqual(
             sorted([(b"FOO", b"A"), (b"BAR", b"A"), (b"HEY", b"B")]), sorted(it)
         )
-
-

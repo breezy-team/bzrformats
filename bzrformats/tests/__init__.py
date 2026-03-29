@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import shutil
-import stat
 import sys
 import tempfile
 import unittest
@@ -19,8 +18,8 @@ except ImportError:
 
 import importlib
 from urllib.parse import quote as urlquote
-from .. import osutils
 
+from .. import osutils
 
 
 def _try_import(module_name):
@@ -35,7 +34,8 @@ def pathname2url(path):
     """Convert a local pathname to a URL path."""
     # On Unix, pathname2url is essentially identity with encoding of special chars
     # but preserving '/'
-    return urlquote(path, safe='/:@')
+    return urlquote(path, safe="/:@")
+
 
 logger = logging.getLogger("bzrformats.tests")
 
@@ -54,26 +54,26 @@ def _rmtree_temp_dir(path, test_id=None):
 
 
 class TestCase(testtools.TestCase if testtools else unittest.TestCase):
-    """Base class for bzrformats unit tests.
-    """
+    """Base class for bzrformats unit tests."""
 
-    def __init__(self, methodName='testMethod'):
+    def __init__(self, methodName="testMethod"):
         super().__init__(methodName)
         self._cleanups = []
-        
+
     def setUp(self):
         super().setUp()
         self._orig_cwd = os.getcwd()
         # Clear config to avoid external config affecting tests
         # Override HOME to prevent reading user configs
         import tempfile
-        self._test_home_dir = tempfile.mkdtemp(prefix='brz-test-home-')
-        self.addCleanup(__import__('shutil').rmtree, self._test_home_dir)
-        self.overrideEnv('HOME', self._test_home_dir)
-        self.overrideEnv('BRZ_HOME', self._test_home_dir)
-        self.overrideEnv('EMAIL', 'jrandom@example.com')
-        self.overrideEnv('BRZ_EMAIL', None)
-        
+
+        self._test_home_dir = tempfile.mkdtemp(prefix="brz-test-home-")
+        self.addCleanup(__import__("shutil").rmtree, self._test_home_dir)
+        self.overrideEnv("HOME", self._test_home_dir)
+        self.overrideEnv("BRZ_HOME", self._test_home_dir)
+        self.overrideEnv("EMAIL", "jrandom@example.com")
+        self.overrideEnv("BRZ_EMAIL", None)
+
     def tearDown(self):
         try:
             # Run any registered cleanup functions
@@ -83,11 +83,11 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
         finally:
             os.chdir(self._orig_cwd)
             super().tearDown()
-    
+
     def addCleanup(self, func, *args, **kwargs):
         """Register a function to be called during tearDown."""
         self._cleanups.append((func, args, kwargs))
-        
+
     def overrideAttr(self, obj, attr_name, new=_unitialized_attr):
         """Overrides an object attribute restoring it after the test."""
         # The actual value is captured by the call below
@@ -102,7 +102,7 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
         if new is not _unitialized_attr:
             setattr(obj, attr_name, new)
         return value
-        
+
     def overrideEnv(self, name, new_value):
         """Override an environment variable, restoring it during tearDown."""
         old_value = os.environ.get(name)
@@ -111,59 +111,58 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
                 del os.environ[name]
         else:
             os.environ[name] = new_value
-        
+
         def restore():
             if old_value is None:
                 if name in os.environ:
                     del os.environ[name]
             else:
                 os.environ[name] = old_value
-                
+
         self.addCleanup(restore)
-    
+
     def assertEqualDiff(self, a, b, message=None):
         """Assert two texts are equal, if not raise an exception showing diffs."""
         if a == b:
             return
         if message is None:
             message = "texts not equal:\n"
-        if a + '\n' == b:
+        if a + "\n" == b:
             message = "first string is missing a final newline.\n"
-        if a == b + '\n':
+        if a == b + "\n":
             message = "second string is missing a final newline.\n"
-        
+
         # Create a diff
         diff = difflib.unified_diff(
-            a.splitlines(True),
-            b.splitlines(True),
-            'expected',
-            'actual'
+            a.splitlines(True), b.splitlines(True), "expected", "actual"
         )
-        raise AssertionError(message + ''.join(diff))
-    
+        raise AssertionError(message + "".join(diff))
+
     def assertContainsRe(self, haystack, needle_re, flags=0):
         """Assert that haystack contains something matching a regular expression."""
         if not re.search(needle_re, haystack, flags):
             raise AssertionError(f'pattern "{needle_re}" not found in "{haystack}"')
-    
+
     def assertNotContainsRe(self, haystack, needle_re, flags=0):
         """Assert that haystack does not match a regular expression."""
         if re.search(needle_re, haystack, flags):
             raise AssertionError(f'pattern "{needle_re}" found in "{haystack}"')
-    
+
     def assertStartsWith(self, s, prefix):
         if not s.startswith(prefix):
-            raise AssertionError(f'string {s!r} does not start with {prefix!r}')
-    
+            raise AssertionError(f"string {s!r} does not start with {prefix!r}")
+
     def assertEndsWith(self, s, suffix):
         if not s.endswith(suffix):
-            raise AssertionError(f'string {s!r} does not end with {suffix!r}')
-            
+            raise AssertionError(f"string {s!r} does not end with {suffix!r}")
+
     def assertLength(self, expected_length, obj_with_len):
         """Assert that obj_with_len is of length expected_length."""
         actual_length = len(obj_with_len)
         if actual_length != expected_length:
-            self.fail(f'Incorrect length: wanted {expected_length}, got {actual_length} for {obj_with_len!r}')
+            self.fail(
+                f"Incorrect length: wanted {expected_length}, got {actual_length} for {obj_with_len!r}"
+            )
 
     def assertIs(self, left, right, message=None):
         """Assert that left is right."""
@@ -171,62 +170,35 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
             if message is not None:
                 raise AssertionError(message)
             else:
-                raise AssertionError(f'{left!r} is not {right!r}.')
-                
+                raise AssertionError(f"{left!r} is not {right!r}.")
+
     def assertIsNot(self, left, right, message=None):
         """Assert that left is not right."""
         if left is right:
             if message is not None:
                 raise AssertionError(message)
             else:
-                raise AssertionError(f'{left!r} is {right!r}.')
+                raise AssertionError(f"{left!r} is {right!r}.")
 
     def assertIsInstance(self, obj, klass, msg=None):
         """Assert that obj is an instance of klass."""
         if not isinstance(obj, klass):
             if msg is None:
-                msg = f'{obj!r} is not an instance of {klass}'
+                msg = f"{obj!r} is not an instance of {klass}"
             raise AssertionError(msg)
-            
-    # Standard assertion methods are inherited from unittest.TestCase
-    
-    def assertEqualDiff(self, expected, actual):
-        """Assert that expected equals actual, showing a diff if they differ."""
-        if expected != actual:
-            # Create a simple diff
-            expected_lines = expected.splitlines(keepends=True)
-            actual_lines = actual.splitlines(keepends=True)
-            diff = list(difflib.unified_diff(expected_lines, actual_lines,
-                                           fromfile='expected', tofile='actual'))
-            diff_text = ''.join(diff)
-            raise AssertionError(f'Texts differ:\n{diff_text}')
 
-    def assertContainsRe(self, text, pattern):
-        """Assert that text contains a match for the regular expression pattern."""
-        import re
-        if not re.search(pattern, text):
-            raise AssertionError(f'Pattern {pattern!r} not found in {text!r}')
-    
-    def assertStartsWith(self, s, prefix):
-        """Assert that s starts with prefix."""
-        if not s.startswith(prefix):
-            raise AssertionError(f'{s!r} does not start with {prefix!r}')
-
-    def assertEndsWith(self, s, suffix):
-        """Assert that s ends with suffix."""
-        if not s.endswith(suffix):
-            raise AssertionError(f'{s!r} does not end with {suffix!r}')
-    
     def log(self, *args):
         """Log a message."""
         logger.debug(*args)
-    
+
     def assertSubset(self, sublist, superlist):
         """Assert that every entry in sublist is present in superlist."""
         missing = set(sublist) - set(superlist)
         if missing:
-            raise AssertionError(f"Missing elements {missing!r}: {sublist!r} not a subset of {superlist!r}")
-    
+            raise AssertionError(
+                f"Missing elements {missing!r}: {sublist!r} not a subset of {superlist!r}"
+            )
+
     def knownFailure(self, reason):
         """Mark test as a known failure."""
         raise expectedFailure(reason)
@@ -237,40 +209,40 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
         :raises unittest.SkipTest: When feature is not available.
         """
         if not feature.available():
-            self.skipTest(f'Feature {feature.feature_name()} not available')
+            self.skipTest(f"Feature {feature.feature_name()} not available")
 
     def assertPathExists(self, path):
         """Fail unless path or paths, which may be abs or relative, exist."""
         if not isinstance(path, (bytes, str)):
             for p in path:
                 if not os.path.exists(p):
-                    self.fail(f'path {p} does not exist')
+                    self.fail(f"path {p} does not exist")
         else:
             if not os.path.exists(path):
-                self.fail(f'path {path} does not exist')
-    
+                self.fail(f"path {path} does not exist")
+
     def assertPathDoesNotExist(self, path):
         """Fail if path or paths, which may be abs or relative, exist."""
         if not isinstance(path, (bytes, str)):
             for p in path:
                 if os.path.exists(p):
-                    self.fail(f'path {p} exists')
+                    self.fail(f"path {p} exists")
         else:
             if os.path.exists(path):
-                self.fail(f'path {path} exists')
+                self.fail(f"path {path} exists")
 
     def assertFileEqual(self, content, path):
         """Fail if path does not contain 'content'."""
         self.assertPathExists(path)
-        
+
         mode = "r" + ("b" if isinstance(content, bytes) else "")
         with open(path, mode) as f:
             s = f.read()
         self.assertEqualDiff(content, s)
-    
+
     def assertListRaises(self, excClass, func, *args, **kwargs):
         """Fail unless excClass is raised when the iterator from func is used.
-        
+
         Many functions can return generators this makes sure
         to wrap them in a list() call to make sure the whole generator
         is run, and that the proper exception is raised.
@@ -285,7 +257,7 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
             else:
                 excName = str(excClass)
             raise self.failureException(f"{excName} not raised")
-    
+
     def time(self, callable, *args, **kwargs):
         """Run callable and return result."""
         # Simplified version - just run the callable without profiling
@@ -294,37 +266,39 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
 
 class TestCaseInTempDir(TestCase):
     """Test case that runs in a temporary directory.
-    
+
     This is a minimal version of brz's TestCaseInTempDir.
     """
-    
+
     TEST_ROOT = None
-    
+
     def setUp(self):
         super().setUp()
         self._make_test_root()
         self.addCleanup(os.chdir, os.getcwd())
         self.makeAndChdirToTestDir()
-        
+
     def _make_test_root(self):
         """Create the top-level test directory if needed."""
         if TestCaseInTempDir.TEST_ROOT is None:
-            root = os.path.realpath(tempfile.mkdtemp(prefix='testbzrformats-', suffix='.tmp'))
+            root = os.path.realpath(
+                tempfile.mkdtemp(prefix="testbzrformats-", suffix=".tmp")
+            )
             TestCaseInTempDir.TEST_ROOT = root
             atexit.register(_rmtree_temp_dir, root)
-            
+
     def makeAndChdirToTestDir(self):
         """Create a temporary directory for this test and chdir to it."""
         # Create test directory name based on test id
         test_name = self.id()
-        if sys.platform in ('win32', 'cygwin'):
-            test_name = re.sub('[<>*=+",:;_/\\-]', '_', test_name)
+        if sys.platform in ("win32", "cygwin"):
+            test_name = re.sub('[<>*=+",:;_/\\-]', "_", test_name)
             test_name = test_name[-30:]  # Windows path length limits
         else:
-            test_name = re.sub('[/]', '_', test_name)
-            
+            test_name = re.sub("[/]", "_", test_name)
+
         base_dir = os.path.join(TestCaseInTempDir.TEST_ROOT, test_name)
-        
+
         # Find a unique directory name
         test_dir = base_dir
         for i in range(100):
@@ -332,14 +306,16 @@ class TestCaseInTempDir(TestCase):
                 break
             test_dir = f"{base_dir}_{i}"
         else:
-            raise RuntimeError(f"Could not create unique test directory for {test_name}")
-            
+            raise RuntimeError(
+                f"Could not create unique test directory for {test_name}"
+            )
+
         os.makedirs(test_dir)
         self.test_dir = test_dir
         self.addCleanup(_rmtree_temp_dir, test_dir, test_id=self.id())
         os.chdir(test_dir)
-    
-    def build_tree(self, shape, line_endings='binary', transport=None):
+
+    def build_tree(self, shape, line_endings="binary", transport=None):
         """Build a test tree according to a pattern.
 
         shape is a sequence of file specifications. If the final
@@ -351,7 +327,7 @@ class TestCaseInTempDir(TestCase):
             else:
                 content = None
 
-            if name.endswith('/'):
+            if name.endswith("/"):
                 os.makedirs(name, exist_ok=True)
             else:
                 dirname = os.path.dirname(name)
@@ -360,10 +336,10 @@ class TestCaseInTempDir(TestCase):
                 if content is None:
                     content = f"contents of {name}\n"
                 if isinstance(content, str):
-                    if line_endings == 'native':
-                        content = content.replace('\n', os.linesep)
-                    content = content.encode('utf-8')
-                with open(name, 'wb') as f:
+                    if line_endings == "native":
+                        content = content.replace("\n", os.linesep)
+                    content = content.encode("utf-8")
+                with open(name, "wb") as f:
                     f.write(content)
 
     @staticmethod
@@ -375,7 +351,7 @@ class TestCaseInTempDir(TestCase):
             else:
                 name = entry[0]
                 content = None
-            if name.endswith('/'):
+            if name.endswith("/"):
                 os.makedirs(name, exist_ok=True)
             else:
                 dirname = os.path.dirname(name)
@@ -384,22 +360,18 @@ class TestCaseInTempDir(TestCase):
                 if content is None:
                     content = b""
                 if isinstance(content, str):
-                    content = content.encode('utf-8')
-                with open(name, 'wb') as f:
+                    content = content.encode("utf-8")
+                with open(name, "wb") as f:
                     f.write(content)
-
-
 
 
 # Import TestSkipped from unittest
 TestSkipped = unittest.SkipTest
 
-# Import testscenarios for scenario testing
-import testscenarios as scenarios
-
 
 class TestNotApplicable(TestSkipped):
     """Skip a test because it is not applicable to the current configuration."""
+
     pass
 
 
@@ -413,9 +385,8 @@ class TestCaseWithMemoryTransport(TestCase):
     def setUp(self):
         super().setUp()
         from ..transport import MemoryTransport
-        self._memory_transport = MemoryTransport(
-            url=f"memory:///{self.id()}/"
-        )
+
+        self._memory_transport = MemoryTransport(url=f"memory:///{self.id()}/")
 
     def get_transport(self, relpath=None):
         """Get the transport for this test case."""
@@ -499,7 +470,7 @@ def load_tests(loader, basic_tests, pattern):
 def test_suite():
     """Return the test suite for bzrformats (for backwards compatibility)."""
     loader = unittest.TestLoader()
-    basic_tests = loader.loadTestsFromModule(__import__(__name__, fromlist=['']))
+    basic_tests = loader.loadTestsFromModule(__import__(__name__, fromlist=[""]))
     return load_tests(loader, basic_tests, None)
 
 

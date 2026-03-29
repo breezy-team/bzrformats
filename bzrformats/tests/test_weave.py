@@ -24,12 +24,11 @@
 from io import BytesIO
 from pprint import pformat
 
-from . import TestCase, TestCaseInTempDir
 from ..errors import ReservedId, RevisionAlreadyPresent, RevisionNotPresent
-
 from ..osutils import sha_string
 from ..weave import Weave, WeaveFormatError, WeaveInvalidChecksum
 from ..weavefile import read_weave, write_weave
+from . import TestCase, TestCaseInTempDir
 
 # texts for use in testing
 TEXT_0 = [b"Hello world"]

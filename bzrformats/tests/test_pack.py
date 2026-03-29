@@ -18,9 +18,8 @@
 
 from io import BytesIO
 
-from . import TestCase, TestCaseInTempDir, TestCaseWithMemoryTransport
-
 from .. import pack
+from . import TestCase, TestCaseWithMemoryTransport
 
 
 class TestContainerSerialiser(TestCase):

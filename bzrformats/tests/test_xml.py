@@ -16,12 +16,13 @@
 
 from io import BytesIO
 
-from .. import osutils
 import bzrformats.xml5
-from ..revision import Revision
-from . import TestCase
 from bzrformats import inventory, serializer, xml6, xml7, xml8
 from bzrformats.inventory import Inventory
+
+from .. import osutils
+from ..revision import Revision
+from . import TestCase
 
 _revision_v5 = b"""<revision committer="Martin Pool &lt;mbp@sourcefrog.net&gt;"
     inventory_sha1="e79c31c1deb64c163cf660fdedd476dd579ffd41"
@@ -484,9 +485,7 @@ class TestSerializer(TestCase):
         self.assertIsInstance(rev.message, str)
 
         # ie.revision should either be None or a utf-8 revision id
-        inv = si_v5.read_inventory_from_lines(
-            osutils.split_lines(_inventory_utf8_v5)
-        )
+        inv = si_v5.read_inventory_from_lines(osutils.split_lines(_inventory_utf8_v5))
         rev_id_1 = "erik@b\xe5gfors-01".encode()
         rev_id_2 = "erik@b\xe5gfors-02".encode()
         fid_root = "TRE\xe9_ROOT".encode()

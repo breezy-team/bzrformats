@@ -23,15 +23,9 @@ import shutil
 import sys
 import unicodedata
 
-from ._osutils_rs import (
-    normalizes_filenames,
-    supports_symlinks,
-)
-
 
 def split(path):
-    """Split a pathname into directory and basename parts.
-    """
+    """Split a pathname into directory and basename parts."""
     if isinstance(path, bytes):
         return os.path.split(path)
     else:
@@ -42,8 +36,7 @@ def split(path):
 
 
 def pathjoin(*args):
-    """Join paths together.
-    """
+    """Join paths together."""
     if not args:
         return b"" if isinstance(args[0], bytes) else ""
 
@@ -72,8 +65,7 @@ def pumpfile(from_file, to_file, buffer_size=65536):
 
 
 def chunks_to_lines(chunks):
-    """Convert chunks to lines.
-    """
+    """Convert chunks to lines."""
     if not chunks:
         return []
 
@@ -123,14 +115,12 @@ def normalized_filename(filename):
 
 
 def failed_to_load_extension(exception):
-    """Log a message about a failed extension load.
-    """
+    """Log a message about a failed extension load."""
     logging.debug("Failed to load extension: %s", exception)
 
 
 def fdatasync(fileno):
-    """Flush file contents to disk, not metadata.
-    """
+    """Flush file contents to disk, not metadata."""
     try:
         os.fdatasync(fileno)
     except AttributeError:
@@ -140,8 +130,7 @@ def fdatasync(fileno):
 
 
 def splitpath(path):
-    """Split a path into a list of components.
-    """
+    """Split a path into a list of components."""
     if isinstance(path, bytes):
         if path.startswith(b"/"):
             path = path[1:]
@@ -157,8 +146,7 @@ def splitpath(path):
 
 
 def file_kind_from_stat_mode(mode):
-    """Return the file kind based on the stat mode.
-    """
+    """Return the file kind based on the stat mode."""
     import stat
 
     if stat.S_ISREG(mode):
@@ -180,8 +168,7 @@ def file_kind_from_stat_mode(mode):
 
 
 def contains_whitespace(s):
-    """Return True if the string contains whitespace characters.
-    """
+    """Return True if the string contains whitespace characters."""
     # Check for common whitespace characters
     if isinstance(s, bytes):
         return any(c in s for c in b" \t\n\r\v\f")
@@ -190,8 +177,7 @@ def contains_whitespace(s):
 
 
 def sha_strings(strings):
-    """Return the sha1 of concatenated strings.
-    """
+    """Return the sha1 of concatenated strings."""
     sha = hashlib.sha1()  # noqa: S324
     for string in strings:
         if isinstance(string, str):
@@ -202,8 +188,7 @@ def sha_strings(strings):
 
 
 def sha_string(string):
-    """Return the sha1 of a single string.
-    """
+    """Return the sha1 of a single string."""
     if isinstance(string, str):
         # Convert unicode strings to bytes using UTF-8
         string = string.encode("utf-8")
@@ -213,8 +198,7 @@ def sha_string(string):
 
 
 def sha_file(file_obj):
-    """Return the sha1 of a file.
-    """
+    """Return the sha1 of a file."""
     sha = hashlib.sha1()  # noqa: S324
     while True:
         chunk = file_obj.read(65536)
@@ -225,8 +209,7 @@ def sha_file(file_obj):
 
 
 def dirname(path):
-    """Return the directory part of a path.
-    """
+    """Return the directory part of a path."""
     if isinstance(path, bytes):
         return os.path.dirname(path)
     else:
@@ -237,8 +220,7 @@ def dirname(path):
 
 
 def basename(path):
-    """Return the basename part of a path.
-    """
+    """Return the basename part of a path."""
     if isinstance(path, bytes):
         return os.path.basename(path)
     else:
@@ -249,8 +231,7 @@ def basename(path):
 
 
 def chunks_to_lines_iter(chunks_iter):
-    """Convert an iterator of chunks to an iterator of lines.
-    """
+    """Convert an iterator of chunks to an iterator of lines."""
     buffer = b""
     for chunk in chunks_iter:
         buffer += chunk
@@ -264,8 +245,7 @@ def chunks_to_lines_iter(chunks_iter):
 
 
 def file_iterator(file_obj, chunk_size=65536):
-    """Iterate over the contents of a file in chunks.
-    """
+    """Iterate over the contents of a file in chunks."""
     while True:
         chunk = file_obj.read(chunk_size)
         if not chunk:
@@ -274,9 +254,9 @@ def file_iterator(file_obj, chunk_size=65536):
 
 
 def rand_chars(length):
-    """Generate a string of random characters.
-    """
+    """Generate a string of random characters."""
     from . import _osutils_rs
+
     return _osutils_rs.rand_chars(length)
 
 
@@ -353,9 +333,6 @@ def _walkdirs_utf8(top, prefix="", fs_enc=None):
         path-from-top might be unicode or utf8, but it is the correct path to
         pass to os functions to affect the file in question. (such as os.lstat)
     """
-    import codecs
-    import sys
-
     global _selected_dir_reader
     if _selected_dir_reader is None:
         if fs_enc is None:
@@ -387,6 +364,7 @@ class UnicodeDirReader(DirReader):
 
     def __init__(self):
         import codecs
+
         self._utf8_encode = codecs.getencoder("utf8")
 
     def top_prefix_to_starting_dir(self, top, prefix=""):
@@ -435,16 +413,16 @@ def is_inside(dir, fname):
     """
     # Normalize to use bytes for comparison
     if isinstance(dir, str):
-        dir = dir.encode('utf-8')
+        dir = dir.encode("utf-8")
     if isinstance(fname, str):
-        fname = fname.encode('utf-8')
+        fname = fname.encode("utf-8")
 
     if dir == fname:
         return True
 
     # Ensure trailing slash for proper comparison
-    if dir != b'':
-        dir = dir.rstrip(b'/') + b'/'
+    if dir != b"":
+        dir = dir.rstrip(b"/") + b"/"
 
     return fname.startswith(dir)
 
@@ -456,10 +434,7 @@ def is_inside_any(dir_list, fname):
     :param fname: File path to check
     :return: True if fname is inside any directory in dir_list
     """
-    for dir in dir_list:
-        if is_inside(dir, fname):
-            return True
-    return False
+    return any(is_inside(dir, fname) for dir in dir_list)
 
 
 def parent_directories(filename):
@@ -469,13 +444,14 @@ def parent_directories(filename):
     :return: List of parent directory paths
     """
     from . import _osutils_rs
+
     if isinstance(filename, bytes):
-        filename = filename.decode('utf-8')
+        filename = filename.decode("utf-8")
     return _osutils_rs.parent_directories(filename)
 
 
 def split_lines(text):
-    """Split text into lines, keeping line endings.
+    r"""Split text into lines, keeping line endings.
 
     Args:
         text: bytes to split
@@ -484,6 +460,7 @@ def split_lines(text):
         List of byte strings, each ending with \\n where appropriate
     """
     from . import _osutils_rs
+
     return _osutils_rs.split_lines(text)
 
 
@@ -511,7 +488,7 @@ class IterableFile:
         return result
 
     def readline(self):
-        """Read one line (up to and including ``\\n``)."""
+        r"""Read one line (up to and including ``\\n``)."""
         while b"\n" not in self._buf:
             try:
                 self._buf += next(self._iter)

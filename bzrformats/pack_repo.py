@@ -17,15 +17,15 @@
 """Pack repository objects."""
 
 import hashlib
+import logging
 import sys
 import time
 
-import logging
-
 logger = logging.getLogger(__name__)
 
-from . import btree_index, pack as _mod_pack
-from .errors import BzrCheckError, BzrFormatsError, NoSuchFile
+from . import btree_index
+from . import pack as _mod_pack
+from .errors import BzrCheckError, BzrFormatsError
 from .transport import TransportNoSuchFile
 
 
@@ -573,6 +573,7 @@ class NewPack(Pack):
         self._cache_limit = 0
         # the temporary pack file name.
         from .osutils import rand_chars
+
         self.random_name = rand_chars(20) + upload_suffix
         # when was this pack started ?
         self.start_time = time.time()

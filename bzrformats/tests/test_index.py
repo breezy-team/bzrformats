@@ -16,11 +16,9 @@
 
 """Tests for indices."""
 
-from . import TestCase, TestCaseInTempDir, TestCaseWithMemoryTransport
-from ..transport import TracingTransport
-from ..transport import TransportNoSuchFile
-
 from .. import index as _mod_index
+from ..transport import TracingTransport, TransportNoSuchFile
+from . import TestCase, TestCaseWithMemoryTransport
 
 
 class ErrorTests(TestCase):
@@ -1652,15 +1650,11 @@ class TestCombinedGraphIndex(TestCaseWithMemoryTransport):
     def test_iter_entries_prefix_no_reload(self):
         index, _reload_counter = self.make_combined_index_with_missing()
         index._reload_func = None
-        self.assertListRaises(
-            TransportNoSuchFile, index.iter_entries_prefix, [(b"1",)]
-        )
+        self.assertListRaises(TransportNoSuchFile, index.iter_entries_prefix, [(b"1",)])
 
     def test_iter_entries_prefix_reloads_and_fails(self):
         index, _reload_counter = self.make_combined_index_with_missing(["1", "2", "3"])
-        self.assertListRaises(
-            TransportNoSuchFile, index.iter_entries_prefix, [(b"1",)]
-        )
+        self.assertListRaises(TransportNoSuchFile, index.iter_entries_prefix, [(b"1",)])
 
     def make_index_with_simple_nodes(self, name, num_nodes=1):
         """Make an index named after 'name', with keys named after 'name' too.

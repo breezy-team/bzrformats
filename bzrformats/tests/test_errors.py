@@ -22,12 +22,12 @@ from . import TestCase
 
 class TestNoSuchFile(TestCase):
     """Test NoSuchFile error."""
-    
+
     def test_no_such_file_str(self):
         """Test string representation of NoSuchFile."""
         err = errors.NoSuchFile("/path/to/missing/file")
         self.assertEqual("No such file: '/path/to/missing/file'", str(err))
-    
+
     def test_no_such_file_with_extra(self):
         """Test NoSuchFile with extra information."""
         err = errors.NoSuchFile("/path/to/file", "additional info")
@@ -36,12 +36,12 @@ class TestNoSuchFile(TestCase):
 
 class TestPathError(TestCase):
     """Test PathError base class."""
-    
+
     def test_path_error_str(self):
         """Test string representation of PathError."""
         err = errors.PathError("/some/path")
         self.assertEqual("Path error: '/some/path'", str(err))
-    
+
     def test_path_error_with_extra(self):
         """Test PathError with extra information."""
         err = errors.PathError("/some/path", "extra details")
@@ -50,7 +50,7 @@ class TestPathError(TestCase):
 
 class TestReservedId(TestCase):
     """Test ReservedId error."""
-    
+
     def test_reserved_id_str(self):
         """Test string representation of ReservedId."""
         err = errors.ReservedId(b"null:")
@@ -59,27 +59,27 @@ class TestReservedId(TestCase):
 
 class TestRevisionNotPresent(TestCase):
     """Test RevisionNotPresent error."""
-    
+
     def test_revision_not_present_str(self):
         """Test string representation of RevisionNotPresent."""
         err = errors.RevisionNotPresent(b"rev-123", b"file-456")
-        expected = 'Revision {b\'rev-123\'} not present in "b\'file-456\'".'
+        expected = "Revision {b'rev-123'} not present in \"b'file-456'\"."
         self.assertEqual(expected, str(err))
 
 
 class TestRevisionAlreadyPresent(TestCase):
     """Test RevisionAlreadyPresent error."""
-    
+
     def test_revision_already_present_str(self):
         """Test string representation of RevisionAlreadyPresent."""
         err = errors.RevisionAlreadyPresent(b"rev-123", b"file-456")
-        expected = 'Revision {b\'rev-123\'} already present in "b\'file-456\'".'
+        expected = "Revision {b'rev-123'} already present in \"b'file-456'\"."
         self.assertEqual(expected, str(err))
 
 
 class TestInvalidRevisionId(TestCase):
     """Test InvalidRevisionId error."""
-    
+
     def test_invalid_revision_id_str(self):
         """Test string representation of InvalidRevisionId."""
         err = errors.InvalidRevisionId(b"bad-rev", "mybranch")
@@ -93,8 +93,11 @@ class TestNoSuchId(TestCase):
     def test_no_such_id_str(self):
         """Test string representation of NoSuchId."""
         from bzrformats.inventory import NoSuchId
+
         err = NoSuchId("tree-object", b"file-id-123")
-        expected = 'The file id "b\'file-id-123\'" is not present in the tree tree-object.'
+        expected = (
+            "The file id \"b'file-id-123'\" is not present in the tree tree-object."
+        )
         self.assertEqual(expected, str(err))
 
 
@@ -112,9 +115,11 @@ class TestInconsistentDelta(TestCase):
 def test_suite():
     """Return the test suite for error tests."""
     import unittest
+
     return unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import unittest
+
     unittest.main()

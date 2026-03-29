@@ -17,9 +17,8 @@
 # Author: Aaron Bentley <aaron.bentley@utoronto.ca>
 """Tests for text merging functionality."""
 
-from . import TestCase
-
 from ..textmerge import Merge2
+from . import TestCase
 
 
 class TestMerge2(TestCase):

@@ -16,9 +16,8 @@
 
 """Tests for bzrformats/generate_ids.py."""
 
-from . import TestCase, TestCaseInTempDir
-
 from .. import generate_ids
+from . import TestCase
 
 
 class TestFileIds(TestCase):

@@ -153,7 +153,7 @@ def get_utf8_or_ascii(a_str):
         return a_str
 
 
-from ._bzr_rs import encode_and_escape, escape_invalid_chars  # noqa: F401
+from ._bzr_rs import encode_and_escape, escape_invalid_chars
 
 
 def unpack_inventory_entry(

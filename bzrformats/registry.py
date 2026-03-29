@@ -2,7 +2,7 @@
 
 from catalogus.registry import Registry, _ObjectGetter
 
-__all__ = ["Registry", "FormatRegistry", "_ObjectGetter"]
+__all__ = ["FormatRegistry", "Registry", "_ObjectGetter"]
 
 
 # FormatRegistry is not available in catalogus, so we define it here

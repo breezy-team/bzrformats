@@ -20,13 +20,12 @@
 import binascii
 import bisect
 
-from . import TestCase, TestCaseInTempDir, _try_import
+from . import TestCase, _try_import
 
 _compiled_btreeparser_module = _try_import("bzrformats._btree_serializer_pyx")
 
 
 class TestBtreeSerializer(TestCase):
-
     def setUp(self):
         super().setUp()
         if _compiled_btreeparser_module is None:

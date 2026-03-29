@@ -24,9 +24,8 @@ In this module the interesting classes are:
 
 __all__ = ["InventoryDeltaSerializer"]
 
-from .revision import RevisionID
-
 from ._bzr_rs import inventory as _inventory_delta_rs
+from .revision import RevisionID
 
 InventoryDeltaError = _inventory_delta_rs.InventoryDeltaError
 IncompatibleInventoryDelta = _inventory_delta_rs.IncompatibleInventoryDelta

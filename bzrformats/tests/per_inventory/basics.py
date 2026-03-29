@@ -19,10 +19,9 @@
 # NOTE: Don't import Inventory here, to make sure that we don't accidentally
 # hardcode that when we should be using self.make_inventory
 
-from bzrformats import osutils
+from bzrformats import inventory, osutils
 from bzrformats.errors import InconsistentDelta
 from bzrformats.inventory import NoSuchId
-from bzrformats import inventory
 from bzrformats.tests.per_inventory import TestCaseWithInventory
 
 from ...inventory import InventoryFile, InventoryLink

@@ -16,15 +16,19 @@
 
 """Minimal progress bar protocol for bzrformats."""
 
-from typing import Optional, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 @runtime_checkable
 class ProgressBar(Protocol):
     """Protocol for progress reporting."""
 
-    def update(self, msg: Optional[str] = None, current: Optional[int] = None,
-               total: Optional[int] = None) -> None:
+    def update(
+        self,
+        msg: str | None = None,
+        current: int | None = None,
+        total: int | None = None,
+    ) -> None:
         """Report progress.
 
         :param msg: Description of the current step.

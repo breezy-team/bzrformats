@@ -20,13 +20,17 @@ import logging
 import time
 import zlib
 
-from .errors import InvalidRevisionId, ObjectNotLocked, ReadOnlyError
-from .lru_cache import LRUSizeCache
-
 from . import osutils
 from ._bzr_rs import groupcompress as _groupcompress_rs
 from .btree_index import BTreeBuilder
-from .errors import BzrFormatsError, RevisionNotPresent
+from .errors import (
+    BzrFormatsError,
+    InvalidRevisionId,
+    ObjectNotLocked,
+    ReadOnlyError,
+    RevisionNotPresent,
+)
+from .lru_cache import LRUSizeCache
 from .osutils import sha_strings
 from .versionedfile import (
     AbsentContentFactory,

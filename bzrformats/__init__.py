@@ -85,5 +85,6 @@ __all__ = [
 
 
 from . import _bzr_rs
+
 rio = _bzr_rs.rio
 hashcache = _bzr_rs.hashcache

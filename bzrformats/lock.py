@@ -21,7 +21,6 @@ within the same process can share a lock on the same file.
 """
 
 import fcntl
-import os
 
 from .errors import LockContention
 
@@ -39,7 +38,7 @@ class ReadLock:
             fcntl.lockf(self.f, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             self.f.close()
-            raise LockContention(filename)
+            raise LockContention(filename) from None
         except OSError:
             self.f.close()
             raise
@@ -84,7 +83,7 @@ class WriteLock:
             fcntl.lockf(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             self.f.close()
-            raise LockContention(filename)
+            raise LockContention(filename) from None
         except OSError:
             self.f.close()
             raise

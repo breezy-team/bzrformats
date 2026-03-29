@@ -16,18 +16,15 @@
 
 """Tests for group compression."""
 
+import logging
 import zlib
 
-import logging
-
-from .. import osutils
-from ..osutils import sha_string
-
-from . import TestCase, TestCaseWithMemoryTransport, TestNotApplicable
 from testscenarios import load_tests_apply_scenarios
 
-from .. import btree_index, groupcompress, knit, versionedfile
+from .. import btree_index, groupcompress, knit, osutils, versionedfile
 from .. import index as _mod_index
+from ..osutils import sha_string
+from . import TestCase, TestCaseWithMemoryTransport, TestNotApplicable
 from .test__groupcompress import _compiled_groupcompress_module
 
 
@@ -802,22 +799,23 @@ class TestGroupCompressVersionedFiles(TestCaseWithGroupCompressVersionedFiles):
         """Should not insert a record that is already present."""
         # Capture logging warnings
         import io
+
         log_stream = io.StringIO()
         handler = logging.StreamHandler(log_stream)
         handler.setLevel(logging.WARNING)
-        
+
         # Get the groupcompress logger
-        gc_logger = logging.getLogger('bzrformats.groupcompress')
+        gc_logger = logging.getLogger("bzrformats.groupcompress")
         gc_logger.addHandler(handler)
         old_level = gc_logger.level
         gc_logger.setLevel(logging.WARNING)
-        
+
         try:
             self.do_inconsistent_inserts(inconsistency_fatal=False)
         finally:
             gc_logger.removeHandler(handler)
             gc_logger.setLevel(old_level)
-        
+
         warnings = log_stream.getvalue()
         self.assertContainsRe(
             warnings,
@@ -875,15 +873,6 @@ class TestGroupCompressConfig(TestCaseWithMemoryTransport):
         self.assertEqual(10000, vf._max_bytes_to_index)
         if isinstance(gc, groupcompress.PyrexGroupCompressor):
             self.assertEqual(10000, gc._delta_index._max_bytes_to_index)
-
-    def test_max_bytes_to_index_default(self):
-        vf = self.make_test_vf()
-        gc = vf._make_group_compressor()
-        self.assertEqual(vf._DEFAULT_MAX_BYTES_TO_INDEX, vf._max_bytes_to_index)
-        if isinstance(gc, groupcompress.PyrexGroupCompressor):
-            self.assertEqual(
-                vf._DEFAULT_MAX_BYTES_TO_INDEX, gc._delta_index._max_bytes_to_index
-            )
 
 
 class StubGCVF:

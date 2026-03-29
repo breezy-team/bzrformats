@@ -21,12 +21,13 @@ See doc/developer/inventory.txt for more information.
 
 from io import BytesIO
 
-from .. import osutils
-from ..revision import NULL_REVISION
-from . import TestCase
 from bzrformats import inventory, inventory_delta
 from bzrformats.inventory import Inventory, _make_delta
 from bzrformats.inventory_delta import InventoryDelta, InventoryDeltaError
+
+from .. import osutils
+from ..revision import NULL_REVISION
+from . import TestCase
 
 ### DO NOT REFLOW THESE TEXTS. NEW LINES ARE SIGNIFICANT. ###
 empty_lines = b"""format: bzr inventory delta v1 (bzr 1.14)

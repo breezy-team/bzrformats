@@ -15,8 +15,8 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
 
-from . import TestCase
 from ..revision import Revision
+from . import TestCase
 
 
 class TestRevisionMethods(TestCase):

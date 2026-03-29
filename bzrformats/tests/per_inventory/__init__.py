@@ -20,6 +20,7 @@ from testscenarios import load_tests_apply_scenarios
 
 from bzrformats import groupcompress
 from bzrformats.inventory import CHKInventory, Inventory
+
 from .. import TestCaseWithMemoryTransport
 
 

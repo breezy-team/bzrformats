@@ -37,6 +37,7 @@ class NoSuchFile(PathError):
 # Use this in except clauses when the transport may be either implementation.
 try:
     from breezy.transport import NoSuchFile as _BreezyNoSuchFile
+
     TransportNoSuchFile = (NoSuchFile, _BreezyNoSuchFile)
 except ImportError:
     TransportNoSuchFile = NoSuchFile
@@ -70,8 +71,7 @@ class Transport(Protocol):
         """Write a file from a file-like object, returning bytes written."""
         ...
 
-    def put_file_non_atomic(self, relpath: str, f, mode=None,
-                            create_parent_dir=False):
+    def put_file_non_atomic(self, relpath: str, f, mode=None, create_parent_dir=False):
         """Put a file-like object at a location."""
         ...
 
@@ -115,7 +115,7 @@ class Transport(Protocol):
         """Return the full URL for the given relative path."""
         ...
 
-    def clone(self, relpath: str = None):
+    def clone(self, relpath: str | None = None):
         """Return a new transport pointing at a sub-directory."""
         ...
 
@@ -240,9 +240,7 @@ class MemoryTransport:
         """Return a new transport rooted at *relpath*."""
         if relpath is None:
             return MemoryTransport(self.base, self._files, self._dirs)
-        return MemoryTransport(
-            self.abspath(relpath), self._files, self._dirs
-        )
+        return MemoryTransport(self.abspath(relpath), self._files, self._dirs)
 
     def abspath(self, relpath):
         """Return the full ``memory://`` URL for *relpath*."""
@@ -259,7 +257,7 @@ class MemoryTransport:
         try:
             return BytesIO(self._files[path])
         except KeyError:
-            raise NoSuchFile(relpath)
+            raise NoSuchFile(relpath) from None
 
     def get_bytes(self, relpath):
         """Return the raw bytes of *relpath*."""
@@ -267,7 +265,7 @@ class MemoryTransport:
         try:
             return self._files[path]
         except KeyError:
-            raise NoSuchFile(relpath)
+            raise NoSuchFile(relpath) from None
 
     def put_bytes(self, relpath, raw_bytes, mode=None):
         """Store *raw_bytes* at *relpath*."""
@@ -279,8 +277,7 @@ class MemoryTransport:
         self._files[self._abspath(relpath)] = data
         return len(data)
 
-    def put_file_non_atomic(self, relpath, f, mode=None,
-                            create_parent_dir=False):
+    def put_file_non_atomic(self, relpath, f, mode=None, create_parent_dir=False):
         """Write *f* to *relpath*, creating parent dirs if requested."""
         if create_parent_dir:
             self._ensure_parent(relpath)
@@ -300,10 +297,10 @@ class MemoryTransport:
         offsets = list(offsets)
         if adjust_for_latency and offsets:
             offsets = _sort_expand_and_combine(
-                offsets, upper_limit or len(file_data),
-                self.recommended_page_size())
+                offsets, upper_limit or len(file_data), self.recommended_page_size()
+            )
         for offset, length in offsets:
-            yield offset, file_data[offset:offset + length]
+            yield offset, file_data[offset : offset + length]
 
     def open_write_stream(self, relpath, mode=None):
         """Return a writable stream; data is stored on close."""
@@ -322,7 +319,7 @@ class MemoryTransport:
         try:
             del self._files[path]
         except KeyError:
-            raise NoSuchFile(relpath)
+            raise NoSuchFile(relpath) from None
 
     def move(self, rel_from, rel_to):
         """Move (rename) a file from *rel_from* to *rel_to*."""
@@ -331,7 +328,7 @@ class MemoryTransport:
         try:
             self._files[path_to] = self._files.pop(path_from)
         except KeyError:
-            raise NoSuchFile(rel_from)
+            raise NoSuchFile(rel_from) from None
 
     def stat(self, relpath):
         """Return a stat-like object for *relpath*."""
@@ -347,7 +344,7 @@ class MemoryTransport:
         prefix = self._path().rstrip("/") + "/"
         for path in sorted(self._files):
             if path.startswith(prefix):
-                yield path[len(prefix):]
+                yield path[len(prefix) :]
 
     def ensure_base(self):
         """Ensure the base directory exists."""
@@ -406,10 +403,14 @@ class TracingTransport:
 
     def readv(self, relpath, offsets, adjust_for_latency=False, upper_limit=None):
         self._activity.append(
-            ("readv", relpath, list(offsets), adjust_for_latency, upper_limit))
+            ("readv", relpath, list(offsets), adjust_for_latency, upper_limit)
+        )
         return self._inner.readv(
-            relpath, offsets, adjust_for_latency=adjust_for_latency,
-            upper_limit=upper_limit)
+            relpath,
+            offsets,
+            adjust_for_latency=adjust_for_latency,
+            upper_limit=upper_limit,
+        )
 
     # -- non-traced pass-through for common methods --
 

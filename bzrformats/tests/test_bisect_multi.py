@@ -16,8 +16,8 @@
 
 """Tests for bisect_multi."""
 
-from . import TestCase
 from ..bisect_multi import bisect_multi_bytes
+from . import TestCase
 
 
 class TestBisectMultiBytes(TestCase):

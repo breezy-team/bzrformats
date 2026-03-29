@@ -16,10 +16,9 @@
 
 """XML serialization format version 5 for inventories."""
 
-from .errors import BzrFormatsError
-
 from . import inventory, xml6
 from ._bzr_rs import revision_serializer_v5  # noqa: F401
+from .errors import BzrFormatsError
 from .xml_serializer import encode_and_escape, get_utf8_or_ascii, unpack_inventory_entry
 
 

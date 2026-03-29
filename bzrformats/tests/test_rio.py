@@ -25,11 +25,10 @@ but this depends on the transport.
 import re
 from tempfile import TemporaryFile
 
-from ..osutils import IterableFile
-from . import TestCase
-
 from .. import rio as _mod_rio
+from ..osutils import IterableFile
 from ..rio_patch import read_patch_stanza, to_patch_lines
+from . import TestCase
 
 
 def rio_file(stanzas):

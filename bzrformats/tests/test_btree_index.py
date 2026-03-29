@@ -21,14 +21,13 @@ import pprint
 import time
 import zlib
 
-from .. import lru_cache, osutils
-from ..transport import MemoryTransport, TracingTransport
-from ..lru_cache import FIFOCache
-from . import TestCase, TestCaseWithMemoryTransport, _try_import
 from testscenarios import load_tests_apply_scenarios
 
-from .. import btree_index
+from .. import btree_index, lru_cache, osutils
 from .. import index as _mod_index
+from ..lru_cache import FIFOCache
+from ..transport import MemoryTransport, TracingTransport
+from . import TestCase, TestCaseWithMemoryTransport, _try_import
 
 load_tests = load_tests_apply_scenarios
 
@@ -1214,7 +1213,9 @@ class TestBTreeIndex(BTreeTestCase):
         for i in range(400):
             rev_id = (
                 "{}-{}-{}".format(
-                    email, time.strftime('%Y%m%d%H%M%S', time.gmtime(start_time + i)), osutils.rand_chars(16)
+                    email,
+                    time.strftime("%Y%m%d%H%M%S", time.gmtime(start_time + i)),
+                    osutils.rand_chars(16),
                 )
             ).encode("ascii")
             rev_key = (rev_id,)
@@ -1498,9 +1499,7 @@ class TestExpandOffsets(TestCase):
         This doesn't actually create anything on disk, it just primes a
         BTreeGraphIndex with the recommended information.
         """
-        index = btree_index.BTreeGraphIndex(
-            MemoryTransport(), "test-index", size=size
-        )
+        index = btree_index.BTreeGraphIndex(MemoryTransport(), "test-index", size=size)
         if recommended_pages is not None:
             index._recommended_pages = recommended_pages
         return index

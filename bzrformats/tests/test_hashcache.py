@@ -18,9 +18,9 @@ import os
 import time
 
 from bzrformats import osutils
-from . import TestCaseInTempDir
 
 from .. import hashcache
+from . import TestCaseInTempDir
 
 sha1 = osutils.sha_string
 

@@ -23,12 +23,10 @@ import tempfile
 import zlib
 from io import BytesIO
 
-from . import lru_cache
-from .lru_cache import FIFOCache
-
-from . import chunk_writer, osutils
+from . import chunk_writer, lru_cache, osutils
 from . import index as _mod_index
 from .index import _OPTION_KEY_ELEMENTS, _OPTION_LEN, _OPTION_NODE_REFS
+from .lru_cache import FIFOCache
 
 _BTSIGNATURE = b"B+Tree Graph Index 2\n"
 _OPTION_ROW_LENGTHS = b"row_lengths="
@@ -188,10 +186,12 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
             (new_backing_file, size, backing_pos) = self._spill_mem_keys_and_combine()
         else:
             new_backing_file, size = self._spill_mem_keys_without_combining()
+
         # The transport isn't used because we override _file directly below
         class _DummyTransport:
             def recommended_page_size(self):
                 return 4096
+
         new_backing = BTreeGraphIndex(_DummyTransport(), "<temp>", size)
         # GC will clean up the file
         new_backing._file = new_backing_file
@@ -748,7 +748,7 @@ class BTreeGraphIndex:
         pages fit in that length.
         """
         recommended_read = self._transport.recommended_page_size()
-        recommended_pages = int(math.ceil(recommended_read / _PAGE_SIZE))
+        recommended_pages = math.ceil(recommended_read / _PAGE_SIZE)
         return recommended_pages
 
     def _compute_total_pages_in_index(self):
@@ -767,7 +767,7 @@ class BTreeGraphIndex:
             return self._row_offsets[-1]
         # This is the number of pages as defined by the size of the index. They
         # should be indentical.
-        total_pages = int(math.ceil(self._size / _PAGE_SIZE))
+        total_pages = math.ceil(self._size / _PAGE_SIZE)
         return total_pages
 
     def _expand_offsets(self, offsets):

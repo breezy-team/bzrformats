@@ -19,9 +19,8 @@
 
 import zlib
 
-from . import TestCase
-
 from .. import chunk_writer
+from . import TestCase
 
 
 class TestWriter(TestCase):

@@ -388,8 +388,6 @@ class BadInventoryFormat(BzrFormatsError):
         self.tag = tag
 
 
-
-
 class ReservedId(BzrFormatsError):
     """A revision ID that is reserved for internal use was encountered."""
 
@@ -536,7 +534,9 @@ class ReadOnlyObjectDirtiedError(ReadOnlyError):
 
 
 class OutSideTransaction(BzrFormatsError):
-    _fmt = "A transaction related operation was attempted after the transaction finished."
+    _fmt = (
+        "A transaction related operation was attempted after the transaction finished."
+    )
 
 
 class LockContention(LockError):

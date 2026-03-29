@@ -17,7 +17,6 @@
 """Inventory/revision serialization."""
 
 from . import registry
-
 from .errors import BzrFormatsError
 
 

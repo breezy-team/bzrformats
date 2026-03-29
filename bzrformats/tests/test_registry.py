@@ -317,7 +317,8 @@ class TestRegistryWithDirs(TestCaseInTempDir):
         a_registry = registry.Registry()
         a_registry.register_lazy("foo", "bzrformats.revision", "Revision")
         a_registry.register_lazy("bar", "bzrformats.revision", "NULL_REVISION")
-        from bzrformats.revision import Revision, NULL_REVISION
+        from bzrformats.revision import NULL_REVISION, Revision
+
         self.assertEqual(Revision, a_registry.get("foo"))
         self.assertEqual(NULL_REVISION, a_registry.get("bar"))
 
@@ -370,7 +371,9 @@ class TestRegistryWithDirs(TestCaseInTempDir):
     def test_lazy_import_get_module(self):
         a_registry = registry.Registry()
         a_registry.register_lazy("obj", "bzrformats.tests.test_registry", "object1")
-        self.assertEqual("bzrformats.tests.test_registry", a_registry._get_module("obj"))
+        self.assertEqual(
+            "bzrformats.tests.test_registry", a_registry._get_module("obj")
+        )
 
     def test_normal_get_module(self):
         class AThing:
@@ -378,4 +381,6 @@ class TestRegistryWithDirs(TestCaseInTempDir):
 
         a_registry = registry.Registry()
         a_registry.register("obj", AThing())
-        self.assertEqual("bzrformats.tests.test_registry", a_registry._get_module("obj"))
+        self.assertEqual(
+            "bzrformats.tests.test_registry", a_registry._get_module("obj")
+        )

@@ -18,11 +18,11 @@
 
 import sys
 
-from . import TestCase, TestCaseInTempDir, _try_import
 from testscenarios import load_tests_apply_scenarios
 
 from .. import groupcompress
 from .._bzr_rs import groupcompress as _groupcompress_rs
+from . import TestCase, _try_import
 
 _compiled_groupcompress_module = _try_import("bzrformats._groupcompress_pyx")
 

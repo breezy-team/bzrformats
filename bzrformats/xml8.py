@@ -23,7 +23,6 @@ file ID lookups.
 
 import logging
 import re
-from typing import Optional
 
 from ._bzr_rs import revision_serializer_v8  # noqa: F401
 from .xml_serializer import (

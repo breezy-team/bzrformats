@@ -29,9 +29,9 @@ import re
 from bisect import bisect_right
 from io import BytesIO
 
-from .errors import BzrFormatsError, NoSuchFile
-from .transport import TransportNoSuchFile
 from . import revision as _mod_revision
+from .errors import BzrFormatsError
+from .transport import TransportNoSuchFile
 
 logger = logging.getLogger("bzrformats.index")
 evil_logger = logging.getLogger("bzrformats.evil")
@@ -1486,7 +1486,7 @@ class CombinedGraphIndex:
 
         Returns a list of names corresponding to the hit_indices param.
         """
-        indices_info = zip(self._index_names, self._indices)
+        indices_info = zip(self._index_names, self._indices, strict=False)
         if logger.isEnabledFor(logging.DEBUG):
             indices_info = list(indices_info)
             logger.debug(

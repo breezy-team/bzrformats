@@ -16,16 +16,19 @@
 
 """Plan merge implementation for versioned files."""
 
-import patiencediff
-
-from vcsgraph import graph as _mod_graph
-from . import revision as _mod_revision
 import logging
+
+import patiencediff
+from vcsgraph import graph as _mod_graph
+
+from . import revision as _mod_revision
 
 logger = logging.getLogger(__name__)
 from vcsgraph.tsort import merge_sort
-from .errors import RevisionNotPresent
+
 from . import weave
+from .errors import RevisionNotPresent
+
 
 class _PlanMergeBase:
     def __init__(self, a_rev, b_rev, vf, key_prefix):

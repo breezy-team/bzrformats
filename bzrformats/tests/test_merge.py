@@ -16,9 +16,11 @@
 
 """Tests for merge implementations."""
 
-from . import TestCase, TestCaseWithMemoryTransport
 from bzrformats import knit, versionedfile
 from bzrformats.merge import _PlanMerge
+
+from . import TestCaseWithMemoryTransport
+
 
 class TestPlanMerge(TestCaseWithMemoryTransport):
     def setUp(self):
@@ -762,5 +764,3 @@ class TestPlanMerge(TestCaseWithMemoryTransport):
             ],
             list(plan),
         )
-
-

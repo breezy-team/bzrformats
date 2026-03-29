@@ -65,6 +65,7 @@ class NoSuchId(BzrFormatsError):
         self.tree = tree
         self.file_id = file_id
 
+
 FileId = bytes
 InventoryEntry = _mod_inventory_rs.InventoryEntry
 InventoryFile = _mod_inventory_rs.InventoryFile

@@ -74,13 +74,15 @@ from io import BytesIO
 import patiencediff
 
 from .errors import (
-    OutSideTransaction, ReadOnlyObjectDirtiedError,
-    RevisionAlreadyPresent, RevisionNotPresent, NoSuchFile, BzrFormatsError,
+    BzrFormatsError,
+    OutSideTransaction,
+    ReadOnlyObjectDirtiedError,
+    RevisionAlreadyPresent,
+    RevisionNotPresent,
 )
-from .transport import TransportNoSuchFile
 from .osutils import sha_strings
 from .revision import NULL_REVISION
-
+from .transport import TransportNoSuchFile
 from .versionedfile import (
     AbsentContentFactory,
     ContentFactory,
@@ -93,6 +95,7 @@ from .versionedfile import (
 from .weavefile import _read_weave_v5, write_weave_v5
 
 logger = logging.getLogger("bzrformats.weave")
+
 
 class WeaveError(BzrFormatsError):
     """Base class for weave-related errors."""

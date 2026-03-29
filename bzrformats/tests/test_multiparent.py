@@ -17,6 +17,7 @@
 import patiencediff
 
 from bzrformats import tests
+
 from .. import multiparent
 from . import TestCase
 

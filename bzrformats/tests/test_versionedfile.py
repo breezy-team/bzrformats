@@ -16,11 +16,8 @@
 
 """Tests for VersionedFile classes."""
 
-from .. import multiparent
-
-from .. import errors
+from .. import errors, groupcompress, multiparent, versionedfile
 from . import TestCase, TestCaseWithMemoryTransport
-from .. import groupcompress, versionedfile
 
 
 class Test_MPDiffGenerator(TestCaseWithMemoryTransport):

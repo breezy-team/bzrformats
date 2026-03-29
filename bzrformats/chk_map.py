@@ -42,12 +42,10 @@ import threading
 from collections.abc import Callable, Generator, Iterator
 from typing import Union
 
-from . import lru_cache
+from . import lru_cache, osutils
+from ._bzr_rs import chk_map as _chk_map_rs
 from .errors import NoSuchRevision
 from .registry import Registry
-
-from . import osutils
-from ._bzr_rs import chk_map as _chk_map_rs
 
 logger = logging.getLogger("bzrformats.chk_map")
 
@@ -248,6 +246,7 @@ class CHKMap:
         existing_new = list(self.iteritems(key_filter=new_items))
         if existing_new:
             from .errors import InconsistentDeltaDelta
+
             raise InconsistentDeltaDelta(
                 delta, f"New items are already in the map {existing_new!r}."
             )

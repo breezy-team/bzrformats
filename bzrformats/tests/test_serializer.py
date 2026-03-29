@@ -17,10 +17,10 @@
 
 """Tests for the revision/inventory Serializers."""
 
-from . import TestCase
 from bzrformats import chk_serializer, xml5, xml6, xml7, xml8
 
 from .. import serializer
+from . import TestCase
 
 
 class TestSerializer(TestCase):

@@ -21,11 +21,12 @@ import bisect
 import os
 import struct
 
-from bzrformats import osutils
-from . import TestCase, TestCaseInTempDir, dir_reader_scenarios
 from testscenarios import load_tests_apply_scenarios
 
+from bzrformats import osutils
+
 from .. import dirstate, inventory
+from . import TestCase, TestCaseInTempDir, dir_reader_scenarios
 
 # TODO:
 # TESTS to write:
@@ -236,7 +237,6 @@ class TestCaseWithDirState:
             self.assertEqual(expected_result[1], list(state._iter_entries()))
         finally:
             state.unlock()
-
 
 
 class TestDirStateInitialize(TestCaseWithDirState, TestCaseInTempDir):
@@ -672,7 +672,11 @@ class InstrumentedDirState(dirstate.DirState):
     """An DirState with instrumented sha1 functionality."""
 
     def __init__(
-        self, path, sha1_provider, worth_saving_limit=0, use_filesystem_for_exec=True,
+        self,
+        path,
+        sha1_provider,
+        worth_saving_limit=0,
+        use_filesystem_for_exec=True,
         fdatasync=False,
     ):
         super().__init__(

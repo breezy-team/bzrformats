@@ -15,11 +15,8 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
 
-from bzrformats import errors as bzrformats_errors, revision
-from bzrformats import osutils
-from . import TestCase, TestCaseWithMemoryTransport
-from bzrformats import chk_map, groupcompress, inventory
-from bzrformats.inventory import NoSuchId
+from bzrformats import chk_map, groupcompress, inventory, osutils
+from bzrformats import errors as bzrformats_errors
 from bzrformats.inventory import (
     ROOT_ID,
     CHKInventory,
@@ -29,6 +26,7 @@ from bzrformats.inventory import (
     InventoryDirectory,
     InventoryEntry,
     InventoryFile,
+    NoSuchId,
     TreeReference,
     _chk_inventory_bytes_to_entry,
     _chk_inventory_entry_to_bytes,
@@ -36,6 +34,7 @@ from bzrformats.inventory import (
 )
 
 from ..inventory_delta import InventoryDelta
+from . import TestCase, TestCaseWithMemoryTransport
 
 
 class TestInventoryUpdates(TestCase):
@@ -98,6 +97,7 @@ class TestInventoryUpdates(TestCase):
         inv = inventory.Inventory(b"tree-root")
         inv.add(InventoryFile(b"a-id", "\u1234", b"tree-root"))
         from bzrformats.errors import AlreadyVersionedError
+
         e = self.assertRaises(
             AlreadyVersionedError,
             inv.add,

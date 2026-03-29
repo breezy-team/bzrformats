@@ -229,15 +229,19 @@ import sys
 import time
 from stat import S_IEXEC
 
-from . import lock
-
-from . import inventory, osutils
-from .osutils import _walkdirs_utf8, is_inside, is_inside_any, parent_directories
+from . import inventory, lock, osutils
 from .errors import (
-    BadFileKindError, BzrFormatsError, InconsistentDelta, InconsistentDeltaDelta,
-    InvalidNormalization, LockContention, LockNotHeld, NotVersionedError,
+    BadFileKindError,
+    BzrFormatsError,
+    InconsistentDelta,
+    InconsistentDeltaDelta,
+    InvalidNormalization,
+    LockContention,
+    LockNotHeld,
+    NotVersionedError,
     ObjectNotLocked,
 )
+from .osutils import _walkdirs_utf8, is_inside, is_inside_any, parent_directories
 
 logger = logging.getLogger("bzrformats.dirstate")
 evil_logger = logging.getLogger("bzrformats.evil")
@@ -377,7 +381,7 @@ class DirstateInventoryChange:
         return self._as_tuple()[index]
 
     def __eq__(self, other):
-        if hasattr(other, '_as_tuple'):
+        if hasattr(other, "_as_tuple"):
             return self._as_tuple() == other._as_tuple()
         if isinstance(other, tuple):
             return self._as_tuple() == other
@@ -444,7 +448,11 @@ class DirState:
     HEADER_FORMAT_3 = b"#bazaar dirstate flat format 3\n"
 
     def __init__(
-        self, path, sha1_provider, worth_saving_limit=0, use_filesystem_for_exec=True,
+        self,
+        path,
+        sha1_provider,
+        worth_saving_limit=0,
+        use_filesystem_for_exec=True,
         fdatasync=False,
     ):
         """Create a  DirState object.
@@ -1492,9 +1500,7 @@ class DirState:
             # _get_entry raises BzrError when a request is inconsistent; we
             # want such errors to be shown as InconsistentDelta - and that
             # fits the behaviour we trigger.
-            raise InconsistentDeltaDelta(
-                delta, f"error from _get_entry. {e}"
-            ) from e
+            raise InconsistentDeltaDelta(delta, f"error from _get_entry. {e}") from e
 
     def _apply_removals(self, removals):
         for file_id, path in sorted(removals, reverse=True, key=operator.itemgetter(1)):
@@ -1611,12 +1617,12 @@ class DirState:
             else:
                 if inv_entry is None:
                     self._raise_invalid(new_path, file_id, "new_path with no entry")
-                new_path_utf8 = new_path.encode('utf-8')
+                new_path_utf8 = new_path.encode("utf-8")
                 # note the parent for validation
                 dirname_utf8, basename_utf8 = osutils.split(new_path_utf8)
                 if basename_utf8:
                     parents.add((dirname_utf8, inv_entry.parent_id))
-            old_path_utf8 = None if old_path is None else old_path.encode('utf-8')
+            old_path_utf8 = None if old_path is None else old_path.encode("utf-8")
             if old_path is None:
                 adds.append(
                     (None, new_path_utf8, file_id, inv_to_entry(inv_entry), True)
@@ -1699,9 +1705,7 @@ class DirState:
             # _get_entry raises BzrError when a request is inconsistent; we
             # want such errors to be shown as InconsistentDelta - and that
             # fits the behaviour we trigger.
-            raise InconsistentDeltaDelta(
-                delta, f"error from _get_entry. {e}"
-            ) from e
+            raise InconsistentDeltaDelta(delta, f"error from _get_entry. {e}") from e
 
         self._mark_modified(header_modified=True)
         self._id_index = None

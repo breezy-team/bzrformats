@@ -58,21 +58,25 @@ import operator
 import os
 from io import BytesIO
 
-from . import diff
 from vcsgraph import tsort
-from . import pack_repo
-from .annotate import VersionedFileAnnotator
-from .errors import (
-    InvalidRevisionId, ObjectNotLocked, ReadOnlyError, ReadOnlyObjectDirtiedError,
-    RevisionAlreadyPresent, RevisionNotPresent, BzrFormatsError, NoSuchFile,
-)
-from .osutils import sha_string, sha_strings
-from .transport import TransportNoSuchFile
+
 from bzrformats import pack
 
+from . import diff, osutils, pack_repo, tuned_gzip
 from . import index as _mod_index
-from . import osutils, tuned_gzip
-from .osutils import contains_whitespace
+from .annotate import VersionedFileAnnotator
+from .errors import (
+    BzrFormatsError,
+    InvalidRevisionId,
+    NoSuchFile,
+    ObjectNotLocked,
+    ReadOnlyError,
+    ReadOnlyObjectDirtiedError,
+    RevisionAlreadyPresent,
+    RevisionNotPresent,
+)
+from .osutils import contains_whitespace, sha_string, sha_strings
+from .transport import TransportNoSuchFile
 from .versionedfile import (
     AbsentContentFactory,
     ConstantMapper,
@@ -621,9 +625,7 @@ class LazyKnitContentFactory(ContentFactory):
         if storage_kind in ("chunked", "lines"):
             chunks = self._generator._get_one_work(self.key).text()
             return iter(chunks)
-        raise UnavailableRepresentation(
-            self.key, storage_kind, self.storage_kind
-        )
+        raise UnavailableRepresentation(self.key, storage_kind, self.storage_kind)
 
 
 def knit_delta_closure_to_records(storage_kind, bytes, line_end):
@@ -2200,9 +2202,14 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
         :return: An iterator over (line, key).
         """
         if pb is None:
+
             class _NullProgressBar:
-                def update(self, *args): pass
-                def finished(self): pass
+                def update(self, *args):
+                    pass
+
+                def finished(self):
+                    pass
+
             pb = _NullProgressBar()
         keys = set(keys)
         total = len(keys)

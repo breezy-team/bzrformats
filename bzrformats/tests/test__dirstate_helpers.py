@@ -19,10 +19,10 @@
 import bisect
 import os
 
-from . import TestCase
 from testscenarios import load_tests_apply_scenarios
 
 from .. import _dirstate_helpers_py, dirstate
+from . import TestCase
 
 load_tests = load_tests_apply_scenarios
 
@@ -30,13 +30,11 @@ try:
     from .. import _dirstate_helpers_pyx as compiled_dirstate_helpers
 except ImportError:
     compiled_dirstate_helpers = None
-    
+
 
 helper_scenarios = [("dirstate_Python", {"helpers": _dirstate_helpers_py})]
 if compiled_dirstate_helpers is not None:
-    helper_scenarios.append(
-        ("dirstate_Pyrex", {"helpers": compiled_dirstate_helpers})
-    )
+    helper_scenarios.append(("dirstate_Pyrex", {"helpers": compiled_dirstate_helpers}))
 
 
 class TestBisectPathMixin:

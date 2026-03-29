@@ -21,19 +21,10 @@ from io import BytesIO
 
 from patiencediff import PatienceSequenceMatcher
 
-from .. import multiparent, pack_repo
-
 from bzrformats import osutils
 from bzrformats.errors import ReadOnlyError
-from ..transport import NoSuchFile as _NoSuchFile, TransportNoSuchFile
-from . import (
-    TestCase,
-    TestCaseWithMemoryTransport,
-    TestNotApplicable,
-)
-from . import _try_import
 
-from .. import knit, pack
+from .. import knit, multiparent, pack_repo
 from ..index import *  # noqa: F403
 from ..knit import (
     AnnotatedKnitContent,
@@ -51,11 +42,18 @@ from ..knit import (
     _VFContentMapGenerator,
     make_file_factory,
 )
+from ..transport import NoSuchFile as _NoSuchFile
 from ..versionedfile import (
     AbsentContentFactory,
     ConstantMapper,
     RecordingVersionedFilesDecorator,
     network_bytes_to_kind_and_offset,
+)
+from . import (
+    TestCase,
+    TestCaseWithMemoryTransport,
+    TestNotApplicable,
+    _try_import,
 )
 
 _compiled_knit_module = _try_import("bzrformats._knit_load_data_pyx")
@@ -910,7 +908,6 @@ class LowLevelKnitIndexTests(TestCase):
 
 
 class LowLevelKnitIndexTests_c(LowLevelKnitIndexTests):
-
     def setUp(self):
         super().setUp()
         if _compiled_knit_module is None:
