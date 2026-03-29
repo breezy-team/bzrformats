@@ -28,7 +28,7 @@ requires-python = ">=3.10,<3.15"
 dependencies = [
     "catalogus",
 ]
-dynamic = ["version"]
+version = "3.4.0.dev0"
 
 [project.urls]
 Homepage = "https://www.breezy-vcs.org/"
@@ -50,8 +50,6 @@ bzrformats = [
     "py.typed",
 ]
 
-[tool.setuptools.dynamic]
-version = {attr = "bzrformats.__version__"}
 
 [tool.mypy]
 ignore_missing_imports = true
