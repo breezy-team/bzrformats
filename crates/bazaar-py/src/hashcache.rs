@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::fs::Permissions;
 use std::io::Error;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -134,7 +135,12 @@ impl HashCache {
             hashcache: Box::new(bazaar::hashcache::HashCache::new(
                 Path::new(root),
                 Path::new(cache_file_name),
-                mode.map(Permissions::from_mode),
+                {
+                    #[cfg(unix)]
+                    { mode.map(Permissions::from_mode) }
+                    #[cfg(not(unix))]
+                    { let _ = mode; None }
+                },
                 content_filter_provider.map(content_filter_to_fn),
             )),
         }

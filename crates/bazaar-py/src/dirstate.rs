@@ -6,14 +6,26 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use pyo3::wrap_pyfunction;
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 // TODO(jelmer): Shared pyo3 utils?
 fn extract_path(object: &Bound<PyAny>) -> PyResult<PathBuf> {
     if let Ok(path) = object.extract::<Vec<u8>>() {
-        Ok(PathBuf::from(OsString::from_vec(path)))
+        #[cfg(unix)]
+        {
+            Ok(PathBuf::from(OsString::from_vec(path)))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(PathBuf::from(
+                String::from_utf8(path)
+                    .map_err(|e| PyTypeError::new_err(e.to_string()))?,
+            ))
+        }
     } else if let Ok(path) = object.extract::<PathBuf>() {
         Ok(path)
     } else {
@@ -239,9 +251,16 @@ impl StatResult {
         Ok(since_epoch.as_secs())
     }
 
+    #[cfg(unix)]
     #[getter]
     fn st_mode(&self) -> PyResult<u32> {
         Ok(self.metadata.permissions().mode())
+    }
+
+    #[cfg(not(unix))]
+    #[getter]
+    fn st_mode(&self) -> PyResult<u32> {
+        Ok(0)
     }
 
     #[cfg(unix)]
