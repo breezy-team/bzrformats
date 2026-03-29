@@ -1,6 +1,6 @@
 [build-system]
 requires = [
-    "setuptools>=60",
+    "setuptools>=77",
     "setuptools-rust",
     "cython>=0.29",
 ]
