@@ -17,5 +17,8 @@ chrono = "0.4"
 lazy_static = "1"
 log = "0.4"
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["fileapi", "minwindef", "winnt"] }
+
 [features]
 pyo3 = ["dep:pyo3"]
