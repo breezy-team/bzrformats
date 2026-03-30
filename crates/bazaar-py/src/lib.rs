@@ -13,6 +13,7 @@ mod chk_map;
 mod dirstate;
 mod groupcompress;
 mod inventory;
+mod knit;
 mod smart;
 mod versionedfile;
 
@@ -530,6 +531,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let chk_mapm = chk_map::_chk_map_rs(py)?;
     m.add_submodule(&chk_mapm)?;
 
+    let knitm = knit::_knit_rs(py)?;
+    m.add_submodule(&knitm)?;
+
     let smartm = smart::_smart_rs(py)?;
     m.add_submodule(&smartm)?;
 
@@ -552,6 +556,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.dirstate", module_name), &dirstatem)?;
     modules.set_item(format!("{}.groupcompress", module_name), &groupcompressm)?;
     modules.set_item(format!("{}.chk_map", module_name), &chk_mapm)?;
+    modules.set_item(format!("{}.knit", module_name), &knitm)?;
     modules.set_item(format!("{}.smart", module_name), &smartm)?;
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
     modules.set_item(format!("{}.btree_serializer", module_name), &btree_serializerm)?;
