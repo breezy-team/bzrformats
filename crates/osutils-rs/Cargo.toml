@@ -12,7 +12,7 @@ memchr = "2.7.4"
 rand = "0.9"
 sha1 = "0.10"
 unicode-normalization = "0.1.19"
-pyo3 = { version = ">=0.26,<0.29", optional = true }
+pyo3 = { version = ">=0.26, <0.29", optional = true }
 chrono = "0.4"
 lazy_static = "1"
 log = "0.4"
