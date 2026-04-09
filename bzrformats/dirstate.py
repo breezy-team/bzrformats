@@ -4564,18 +4564,6 @@ IdIndex = _dirstate_rs.IdIndex
 _inv_entry_to_details = _dirstate_rs.inv_entry_to_details
 _get_output_lines = _dirstate_rs.get_output_lines
 
-# Try to load the compiled form if possible
-try:
-    from ._dirstate_helpers_pyx import ProcessEntryC as _process_entry  # noqa: N813
-    from ._dirstate_helpers_pyx import _read_dirblocks
-    from ._dirstate_helpers_pyx import update_entry as update_entry
-except ModuleNotFoundError as e:
-    osutils.failed_to_load_extension(e)
-    from ._dirstate_helpers_py import _read_dirblocks
-
-    # FIXME: It would be nice to be able to track moved lines so that the
-    # corresponding python code can be moved to the _dirstate_helpers_py
-    # module. I don't want to break the history for this important piece of
-    # code so I left the code here -- vila 20090622
-    update_entry = py_update_entry
-    _process_entry = ProcessEntryPython
+_read_dirblocks = _dirstate_rs._read_dirblocks
+update_entry = _dirstate_rs.update_entry
+_process_entry = _dirstate_rs.ProcessEntryC

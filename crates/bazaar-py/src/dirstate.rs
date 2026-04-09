@@ -22,8 +22,7 @@ fn extract_path(object: &Bound<PyAny>) -> PyResult<PathBuf> {
         #[cfg(not(unix))]
         {
             Ok(PathBuf::from(
-                String::from_utf8(path)
-                    .map_err(|e| PyTypeError::new_err(e.to_string()))?,
+                String::from_utf8(path).map_err(|e| PyTypeError::new_err(e.to_string()))?,
             ))
         }
     } else if let Ok(path) = object.extract::<PathBuf>() {
@@ -471,6 +470,9 @@ pub fn _dirstate_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<IdIndex>()?;
     m.add_wrapped(wrap_pyfunction!(inv_entry_to_details))?;
     m.add_wrapped(wrap_pyfunction!(get_output_lines))?;
+
+    // Register dirstate helper functions (_read_dirblocks, update_entry, ProcessEntryC)
+    crate::dirstate_helpers::register(&m)?;
 
     Ok(m)
 }

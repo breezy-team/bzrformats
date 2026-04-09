@@ -212,10 +212,6 @@ def add_cython_extension(module_name, libraries=None, extra_source=None):
 add_cython_extension(
     "bzrformats._groupcompress_pyx", extra_source=["bzrformats/diff-delta.c"]
 )
-if sys.platform == "win32":
-    add_cython_extension("bzrformats._dirstate_helpers_pyx", libraries=["Ws2_32"])
-else:
-    add_cython_extension("bzrformats._dirstate_helpers_pyx")
 
 
 if unavailable_files:
