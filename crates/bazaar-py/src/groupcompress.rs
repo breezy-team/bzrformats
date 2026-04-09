@@ -430,6 +430,15 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(rabin_hash))?;
     m.add_class::<LinesDeltaIndex>()?;
     m.add_class::<TraditionalGroupCompressor>()?;
+    m.add_class::<crate::groupcompress_delta::DeltaIndex>()?;
+    m.add_function(wrap_pyfunction!(
+        crate::groupcompress_delta::_rabin_hash,
+        &m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::groupcompress_delta::make_delta,
+        &m
+    )?)?;
     m.add(
         "NULL_SHA1",
         pyo3::types::PyBytes::new(py, &bazaar::groupcompress::NULL_SHA1),

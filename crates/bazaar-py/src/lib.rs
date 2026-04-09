@@ -13,6 +13,7 @@ mod chk_map;
 mod dirstate;
 mod dirstate_helpers;
 mod groupcompress;
+mod groupcompress_delta;
 mod inventory;
 mod knit;
 mod smart;

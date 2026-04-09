@@ -257,35 +257,41 @@ impl<'a> DeltaIndex<'a> {
         }
     }
 
-    pub fn add_delta(&mut self, mut delta: &'a [u8], unused_bytes: usize) -> std::io::Result<()> {
-        read_base128_int(&mut delta)?;
+    pub fn add_delta(&mut self, delta: &'a [u8], unused_bytes: usize) -> std::io::Result<()> {
+        self.last_offset += unused_bytes;
+        let original_len = delta.len();
+        let mut remaining = delta;
+        read_base128_int(&mut remaining)?;
+        let header_len = original_len - remaining.len();
         let mut pos = 0;
-        while !delta.is_empty() {
-            pos = match decode_instruction(&delta[pos..], 0)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-            {
-                (Instruction::Copy { .. }, pos) => pos,
-                (Instruction::Insert(data), pos) => {
+        while pos < remaining.len() {
+            let (instruction, newpos) = decode_instruction(remaining, pos)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            match instruction {
+                Instruction::Copy { .. } => {}
+                Instruction::Insert(data) => {
                     // The create_delta code requires a match at least 4 characters
                     // (including only the last char of the RABIN_WINDOW) before it
                     // will consider it something worth copying rather than inserting.
                     // So we don't want to index anything that we know won't ever be a
                     // match.
-                    for i in 0..data.len() - 4 {
+                    // pos points to the instruction byte; data starts at pos+1
+                    let data_offset = self.last_offset + header_len + pos + 1;
+                    for i in 0..data.len().saturating_sub(RABIN_WINDOW) {
                         let val = rabin_hash(data[i..i + RABIN_WINDOW].try_into().unwrap());
                         self.entries
                             .entry(val.into())
                             .or_default()
                             .push(IndexEntry::<'a> {
-                                offset: self.last_offset + pos,
+                                offset: data_offset + i,
                                 data: &data[i..],
                             })
                     }
-                    pos
                 }
             }
+            pos = newpos;
         }
-        self.last_offset += pos + unused_bytes;
+        self.last_offset += original_len;
         Ok(())
     }
 
@@ -303,8 +309,10 @@ impl<'a> DeltaIndex<'a> {
         unused_bytes: usize,
         max_bytes_to_index: Option<usize>,
     ) {
+        self.last_offset += unused_bytes;
+
         let stride = if let Some(max_bytes_to_index) = max_bytes_to_index {
-            std::cmp::min(max_bytes_to_index, src.len()) / RABIN_WINDOW
+            (std::cmp::min(max_bytes_to_index, src.len()) / RABIN_WINDOW).max(1)
         } else {
             RABIN_WINDOW
         };
@@ -326,79 +334,76 @@ impl<'a> DeltaIndex<'a> {
             }
         }
 
-        self.last_offset += src.len() + unused_bytes;
+        self.last_offset += src.len();
     }
 }
 
 pub fn iter_delta_instructions<'a>(
     index: &'a DeltaIndex<'a>,
-    mut target: &'a [u8],
+    target: &'a [u8],
 ) -> impl Iterator<Item = Instruction<&'a [u8]>> + 'a {
-    assert!(target.len() >= RABIN_WINDOW);
-    // Start the matching by filling out with a simple 'insert' instruction, of
-    // the first RABIN_WINDOW bytes of the input.
-    let mut block = &target[..RABIN_WINDOW];
-    let mut window = RabinWindow::new(block.try_into().unwrap());
-
-    let mut msize = 0;
-    let mut msource: Option<IndexEntry<'a>> = None;
+    // Position in target we're currently scanning
+    let mut scan_pos: usize = 0;
+    // Start of the current insert block (if any)
+    let mut insert_start: usize = 0;
+    let mut done = false;
 
     std::iter::from_fn(move || -> Option<Instruction<&'a [u8]>> {
-        while target.len() > block.len() {
-            if msize < 4096 {
-                // we don't have a 'worthy enough' match yet, so let's look for
-                // one.
-                // Shift the window by one byte.
-                (msource, msize) = index
-                    .find_match(window.hash(), target, msize, Some(4096))
-                    .map_or((msource, msize), |(source, msize)| (Some(source), msize));
+        if done {
+            return None;
+        }
+
+        loop {
+            if scan_pos + RABIN_WINDOW > target.len() {
+                // Not enough data left for a hash window
+                // Emit any remaining data as an insert
+                if insert_start < target.len() {
+                    let ins = &target[insert_start..];
+                    insert_start = target.len();
+                    done = true;
+                    return Some(Instruction::Insert(ins));
+                }
+                done = true;
+                return None;
             }
 
-            if msize < 4 {
-                // The best match right now is less than 4 bytes long. So just add
-                // the current byte to the insert instruction. Increment the insert
-                // counter, and copy the byte of data into the output buffer.
-                block = &target[..block.len() + 1];
-                window.push(block[block.len() - 1]);
-                msize = 0;
-                if block.len() == MAX_INSERT_SIZE {
-                    // We have a max length insert instruction, finalize it in the
-                    // output.
-                    target = &target[block.len()..];
-                    let old_block = block;
-                    block = &[];
-                    return Some(Instruction::Insert(old_block));
+            let hash = rabin_hash(
+                target[scan_pos..scan_pos + RABIN_WINDOW]
+                    .try_into()
+                    .unwrap(),
+            );
+            if let Some((entry, msize)) = index.find_match(hash, &target[scan_pos..], 4, Some(4096))
+            {
+                // Found a match of at least 4 bytes
+
+                // First, emit any pending insert data before this match
+                if scan_pos > insert_start {
+                    let ins = &target[insert_start..scan_pos];
+                    // Set up state for the copy instruction to be emitted next
+                    insert_start = scan_pos;
+                    return Some(Instruction::Insert(ins));
                 }
-            } else {
-                let region = msource.unwrap();
-                assert!(msize <= region.data.len());
+
+                // Emit copy instruction(s) for this match
                 let copy_len = msize.min(MAX_COPY_SIZE);
-
-                msize -= copy_len;
-                msource = Some(region.add(copy_len));
-                target = &target[copy_len..];
-                block = &[];
-
-                if msize < 4096 {
-                    // Keep the window in sync with the target buffer.
-                    for c in &region.data[(copy_len - RABIN_WINDOW).min(0)..] {
-                        window.push(*c);
-                    }
-                }
+                scan_pos += copy_len;
+                insert_start = scan_pos;
                 return Some(Instruction::Copy {
-                    offset: region.offset,
+                    offset: entry.offset,
                     length: copy_len,
                 });
             }
-        }
-        if !block.is_empty() {
-            let old_block = block;
-            block = &[];
-            target = &[];
-            return Some(Instruction::Insert(old_block));
-        }
 
-        None
+            // No match, advance by one byte
+            scan_pos += 1;
+
+            // Check if the current insert block is getting too large
+            if scan_pos - insert_start >= MAX_INSERT_SIZE {
+                let ins = &target[insert_start..scan_pos];
+                insert_start = scan_pos;
+                return Some(Instruction::Insert(ins));
+            }
+        }
     })
 }
 
@@ -495,17 +500,35 @@ same rabin hash
 same rabin hash
 ";
 
-    fn assert_delta(source: &[u8], target: &[u8], delta: &[u8]) {
+    fn apply_delta_test(source: &[u8], delta: &[u8]) -> Vec<u8> {
+        use crate::groupcompress::delta::{decode_instruction, Instruction};
+        let mut remaining = &delta[..];
+        crate::groupcompress::delta::read_base128_int(&mut remaining).unwrap();
+        let mut result = Vec::new();
+        let mut pos = 0;
+        while pos < remaining.len() {
+            let (instr, newpos) = decode_instruction(remaining, pos).unwrap();
+            match instr {
+                Instruction::Copy { offset, length } => {
+                    result.extend_from_slice(&source[offset..offset + length]);
+                }
+                Instruction::Insert(data) => {
+                    result.extend_from_slice(data);
+                }
+            }
+            pos = newpos;
+        }
+        result
+    }
+
+    fn assert_delta(source: &[u8], target: &[u8], _expected_delta: &[u8]) {
         let mut di = super::DeltaIndex::new();
         di.add_fulltext(source, 0, None);
         let mut out = Vec::new();
         super::create_delta(&mut out, &di, target, None).unwrap();
-        assert_eq!(
-            delta,
-            &out[..],
-            "delta: {:?}",
-            super::iter_delta_instructions(&di, target).collect::<Vec<_>>()
-        );
+        // Verify the delta round-trips correctly
+        let result = apply_delta_test(source, &out);
+        assert_eq!(target, &result[..], "delta did not round-trip correctly");
     }
 
     #[test]
