@@ -1,6 +1,7 @@
 use bazaar::knit::{
-    lower_fulltext, lower_line_delta_annotated, parse_fulltext, parse_line_delta_annotated,
-    parse_line_delta_plain, AnnotatedLine, DeltaHunk, KnitError,
+    lower_fulltext, lower_line_delta_annotated, lower_line_delta_raw, parse_fulltext,
+    parse_line_delta_annotated, parse_line_delta_plain, parse_line_delta_raw, AnnotatedLine,
+    DeltaHunk, KnitError,
 };
 use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
@@ -295,6 +296,60 @@ fn lower_line_delta_rs<'py>(
     PyList::new(py, items)
 }
 
+/// Parse an unannotated line-delta into `[(start, end, count, [lines]), ...]`.
+/// Mirrors `KnitPlainFactory.parse_line_delta`.
+#[pyfunction]
+fn parse_line_delta_raw_rs<'py>(
+    py: Python<'py>,
+    lines: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let owned = extract_byte_lines(&lines)?;
+    let hunks = parse_line_delta_raw(&as_slices(&owned)).map_err(knit_err_to_py)?;
+    let items: Vec<Bound<PyTuple>> = hunks
+        .iter()
+        .map(|h| {
+            let content_list: Vec<Bound<PyBytes>> =
+                h.lines.iter().map(|t| PyBytes::new(py, t)).collect();
+            PyTuple::new(
+                py,
+                [
+                    h.start.into_pyobject(py)?.into_any(),
+                    h.end.into_pyobject(py)?.into_any(),
+                    h.count.into_pyobject(py)?.into_any(),
+                    PyList::new(py, content_list)?.into_any(),
+                ],
+            )
+        })
+        .collect::<PyResult<_>>()?;
+    PyList::new(py, items)
+}
+
+/// Serialize an unannotated line-delta back to bytes. Mirrors
+/// `KnitPlainFactory.lower_line_delta`.
+#[pyfunction]
+fn lower_line_delta_raw_rs<'py>(
+    py: Python<'py>,
+    delta: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut hunks: Vec<DeltaHunk<Vec<u8>>> = Vec::new();
+    for hunk in delta.try_iter()? {
+        let tup = hunk?;
+        let start: usize = tup.get_item(0)?.extract()?;
+        let end: usize = tup.get_item(1)?.extract()?;
+        let count: usize = tup.get_item(2)?.extract()?;
+        let hunk_lines = extract_byte_lines(&tup.get_item(3)?)?;
+        hunks.push(DeltaHunk {
+            start,
+            end,
+            count,
+            lines: hunk_lines,
+        });
+    }
+    let out = lower_line_delta_raw(&hunks);
+    let items: Vec<Bound<PyBytes>> = out.iter().map(|b| PyBytes::new(py, b)).collect();
+    PyList::new(py, items)
+}
+
 fn extract_annotated_lines(obj: &Bound<PyAny>) -> PyResult<Vec<AnnotatedLine>> {
     let mut out = Vec::new();
     for item in obj.try_iter()? {
@@ -394,6 +449,8 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(parse_line_delta_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(lower_fulltext_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(lower_line_delta_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(parse_line_delta_raw_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(lower_line_delta_raw_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(get_line_delta_blocks_rs, &m)?)?;
     Ok(m)
 }

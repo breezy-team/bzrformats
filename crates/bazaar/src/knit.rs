@@ -128,6 +128,43 @@ pub fn lower_line_delta_annotated(delta: &[DeltaHunk<AnnotatedLine>]) -> Vec<Vec
     out
 }
 
+/// Parse an unannotated (raw) line-delta body: `start,end,count\n` headers
+/// followed by `count` raw text lines each. Mirrors
+/// `KnitPlainFactory.parse_line_delta`.
+pub fn parse_line_delta_raw(lines: &[&[u8]]) -> Result<Vec<DeltaHunk<Vec<u8>>>, KnitError> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let (start, end, count) = parse_delta_header(lines[i])?;
+        i += 1;
+        if i + count > lines.len() {
+            return Err(KnitError::TruncatedDelta);
+        }
+        let hunk_lines: Vec<Vec<u8>> = lines[i..i + count].iter().map(|l| l.to_vec()).collect();
+        i += count;
+        out.push(DeltaHunk {
+            start,
+            end,
+            count,
+            lines: hunk_lines,
+        });
+    }
+    Ok(out)
+}
+
+/// Serialize an unannotated line-delta back to bytes. Mirrors
+/// `KnitPlainFactory.lower_line_delta`.
+pub fn lower_line_delta_raw(delta: &[DeltaHunk<Vec<u8>>]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for hunk in delta {
+        out.push(format!("{},{},{}\n", hunk.start, hunk.end, hunk.count).into_bytes());
+        for line in &hunk.lines {
+            out.push(line.clone());
+        }
+    }
+    out
+}
+
 /// Yield matching blocks from a knit delta walk, preserving the historical
 /// last-line EOL-sensitivity quirk described in `get_line_delta_blocks`.
 ///
@@ -307,6 +344,37 @@ mod tests {
             ]
         );
         let parsed = parse_line_delta_annotated(&refs(&bytes)).unwrap();
+        assert_eq!(parsed, delta);
+    }
+
+    #[test]
+    fn delta_raw_round_trip() {
+        let delta = vec![
+            DeltaHunk {
+                start: 0,
+                end: 0,
+                count: 2,
+                lines: vec![b"one\n".to_vec(), b"two\n".to_vec()],
+            },
+            DeltaHunk {
+                start: 4,
+                end: 5,
+                count: 1,
+                lines: vec![b"three\n".to_vec()],
+            },
+        ];
+        let bytes = lower_line_delta_raw(&delta);
+        assert_eq!(
+            bytes,
+            vec![
+                b"0,0,2\n".to_vec(),
+                b"one\n".to_vec(),
+                b"two\n".to_vec(),
+                b"4,5,1\n".to_vec(),
+                b"three\n".to_vec(),
+            ]
+        );
+        let parsed = parse_line_delta_raw(&refs(&bytes)).unwrap();
         assert_eq!(parsed, delta);
     }
 

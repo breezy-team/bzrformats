@@ -1008,14 +1008,7 @@ class KnitPlainFactory(_KnitFactory):
         Yields:
             Tuples of (start, end, count, lines) for each delta operation.
         """
-        cur = 0
-        num_lines = len(lines)
-        while cur < num_lines:
-            header = lines[cur]
-            cur += 1
-            start, end, c = (int(n) for n in header.split(b","))
-            yield start, end, c, lines[cur : cur + c]
-            cur += c
+        yield from _knit_rs.parse_line_delta_raw_rs(lines)
 
     def parse_line_delta(self, lines, version_id):
         """Parse line delta records into a list of delta operations.
@@ -1027,7 +1020,7 @@ class KnitPlainFactory(_KnitFactory):
         Returns:
             A list of (start, end, count, lines) tuples.
         """
-        return list(self.parse_line_delta_iter(lines, version_id))
+        return _knit_rs.parse_line_delta_raw_rs(lines)
 
     def get_fulltext_content(self, lines):
         """Extract just the content lines from a fulltext."""
@@ -1066,11 +1059,7 @@ class KnitPlainFactory(_KnitFactory):
         Returns:
             A list of serialized delta lines.
         """
-        out = []
-        for start, end, c, lines in delta:
-            out.append(b"%d,%d,%d\n" % (start, end, c))
-            out.extend(lines)
-        return out
+        return _knit_rs.lower_line_delta_raw_rs(delta)
 
     def annotate(self, knit, key):
         """Get annotated lines for a given key using a KnitAnnotator.
