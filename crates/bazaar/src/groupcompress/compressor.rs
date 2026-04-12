@@ -534,7 +534,10 @@ mod tests {
         assert_eq!(start, 0);
         assert_eq!(end, 0);
         assert_eq!(kind, "fulltext");
-        assert_eq!(sha.as_bytes(), crate::groupcompress::NULL_SHA1.as_slice());
+        assert_eq!(
+            sha.as_bytes(),
+            crate::groupcompress::NULL_SHA1.as_slice()
+        );
         assert_eq!(gc.endpoint(), 0);
         assert!(gc.labels_deltas().is_empty());
     }
@@ -619,8 +622,7 @@ mod tests {
         // earlier records can still be reconstructed after later additions.
         let mut gc = RabinGroupCompressor::new(None);
         let base = b"common prefix that is long enough to be worth indexing\nshared\n";
-        let derived =
-            b"common prefix that is long enough to be worth indexing\nshared\nplus more\n";
+        let derived = b"common prefix that is long enough to be worth indexing\nshared\nplus more\n";
         gc.compress(
             &key(&[b"base"]),
             &[base.as_slice()],
@@ -771,7 +773,8 @@ mod tests {
         // Two records sharing a long common prefix should let the second be
         // line-delta encoded against the first.
         let mut gc = TraditionalGroupCompressor::new();
-        let base = b"shared line one\nshared line two\nshared line three\nshared line four\n";
+        let base =
+            b"shared line one\nshared line two\nshared line three\nshared line four\n";
         let derived =
             b"shared line one\nshared line two\nshared line three\nshared line four\nplus extra\n";
         gc.compress(
@@ -812,7 +815,10 @@ mod tests {
         assert_eq!(start, 0);
         assert_eq!(end, 0);
         assert_eq!(kind, "fulltext");
-        assert_eq!(sha.as_bytes(), crate::groupcompress::NULL_SHA1.as_slice());
+        assert_eq!(
+            sha.as_bytes(),
+            crate::groupcompress::NULL_SHA1.as_slice()
+        );
     }
 
     #[test]
