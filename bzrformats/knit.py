@@ -2961,12 +2961,7 @@ class _KndxIndex:
         raise NotImplementedError(self.get_missing_compression_parents)
 
     def _cache_key(self, key, options, pos, size, parent_keys):
-        """Cache a version record in the history array and index cache.
-
-        This is inlined into _load_data for performance. KEEP IN SYNC.
-        (It saves 60ms, 25% of the __init__ overhead on local 4000 record
-         indexes).
-        """
+        """Cache a version record in the history array and index cache."""
         prefix = key[:-1]
         version_id = key[-1]
         # last-element only for compatibilty with the C load_data.

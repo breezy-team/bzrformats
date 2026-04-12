@@ -16,18 +16,9 @@ except ImportError:
     # Minimal compatibility if testtools is not available
     testtools = None
 
-import importlib
 from urllib.parse import quote as urlquote
 
 from .. import osutils
-
-
-def _try_import(module_name):
-    """Try to import a module, returning it or None if unavailable."""
-    try:
-        return importlib.import_module(module_name)
-    except ImportError:
-        return None
 
 
 def pathname2url(path):

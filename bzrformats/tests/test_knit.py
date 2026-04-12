@@ -53,10 +53,7 @@ from . import (
     TestCase,
     TestCaseWithMemoryTransport,
     TestNotApplicable,
-    _try_import,
 )
-
-_compiled_knit_module = _try_import("bzrformats._knit_load_data_pyx")
 
 
 class ErrorTests(TestCase):
@@ -494,15 +491,8 @@ class LowLevelKnitDataTests(TestCase):
 
 
 class LowLevelKnitIndexTests(TestCase):
-    @property
-    def _load_data(self):
-        from .._knit_load_data_py import _load_data_py
-
-        return _load_data_py
-
     def get_knit_index(self, transport, name, mode):
         mapper = ConstantMapper(name)
-        self.overrideAttr(knit, "_load_data", self._load_data)
 
         def allow_writes():
             return "w" in mode
@@ -905,34 +895,6 @@ class LowLevelKnitIndexTests(TestCase):
         )
         index = self.get_knit_index(transport, "filename", "r")
         self.assertEqual({(b"a",), (b"c",)}, index.keys())
-
-
-class LowLevelKnitIndexTests_c(LowLevelKnitIndexTests):
-    def setUp(self):
-        super().setUp()
-        if _compiled_knit_module is None:
-            self.skipTest("bzrformats._knit_load_data_pyx not available")
-
-    @property
-    def _load_data(self):
-        from .._knit_load_data_pyx import _load_data_c
-
-        return _load_data_c
-
-
-class LowLevelKnitIndexTests_rs(LowLevelKnitIndexTests):
-    def setUp(self):
-        super().setUp()
-        try:
-            from .._bzr_rs.knit import _load_data_c  # noqa: F401
-        except (ModuleNotFoundError, ImportError):
-            self.skipTest("bzrformats._bzr_rs.knit not available")
-
-    @property
-    def _load_data(self):
-        from .._bzr_rs.knit import _load_data_c
-
-        return _load_data_c
 
 
 class Test_KnitAnnotator(TestCaseWithMemoryTransport):

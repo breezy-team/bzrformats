@@ -21,28 +21,12 @@ import pprint
 import time
 import zlib
 
-from testscenarios import load_tests_apply_scenarios
-
 from .. import btree_index, lru_cache, osutils
 from .. import index as _mod_index
+from .._bzr_rs import btree_serializer as _btree_serializer
 from ..lru_cache import FIFOCache
 from ..transport import MemoryTransport, TracingTransport
 from . import TestCase, TestCaseWithMemoryTransport
-
-load_tests = load_tests_apply_scenarios
-
-
-from .._bzr_rs import btree_serializer as _rust_btreeparser_module
-
-
-def btreeparser_scenarios():
-    import bzrformats._btree_serializer_py as py_module
-
-    scenarios = [
-        ("python", {"parse_btree": py_module}),
-        ("rust", {"parse_btree": _rust_btreeparser_module}),
-    ]
-    return scenarios
 
 
 class BTreeTestCase(TestCaseWithMemoryTransport):
@@ -1305,12 +1289,6 @@ class TestBTreeIndex(BTreeTestCase):
 
 
 class TestBTreeNodes(BTreeTestCase):
-    scenarios = btreeparser_scenarios()
-
-    def setUp(self):
-        super().setUp()
-        self.overrideAttr(btree_index, "_btree_serializer", self.parse_btree)
-
     def test_LeafNode_1_0(self):
         node_bytes = (
             b"type=leaf\n"
@@ -1388,7 +1366,7 @@ class TestBTreeNodes(BTreeTestCase):
         self.assertEqual(1, node.offset)
 
     def assertFlattened(self, expected, key, value, refs):
-        flat_key, flat_line = self.parse_btree._flatten_node(
+        flat_key, flat_line = _btree_serializer._flatten_node(
             (None, key, value, refs), bool(refs)
         )
         self.assertEqual(b"\x00".join(key), flat_key)
