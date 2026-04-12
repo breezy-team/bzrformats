@@ -724,28 +724,7 @@ class KnitContent:
     @staticmethod
     def get_line_delta_blocks(knit_delta, source, target):
         """Extract SequenceMatcher.get_matching_blocks() from a knit delta."""
-        target_len = len(target)
-        s_pos = 0
-        t_pos = 0
-        for s_begin, s_end, t_len, _new_text in knit_delta:
-            true_n = s_begin - s_pos
-            n = true_n
-            if n > 0:
-                # knit deltas do not provide reliable info about whether the
-                # last line of a file matches, due to eol handling.
-                if source[s_pos + n - 1] != target[t_pos + n - 1]:
-                    n -= 1
-                if n > 0:
-                    yield s_pos, t_pos, n
-            t_pos += t_len + true_n
-            s_pos = s_end
-        n = target_len - t_pos
-        if n > 0:
-            if source[s_pos + n - 1] != target[t_pos + n - 1]:
-                n -= 1
-            if n > 0:
-                yield s_pos, t_pos, n
-        yield s_pos + (target_len - t_pos), target_len, 0
+        yield from _knit_rs.get_line_delta_blocks_rs(knit_delta, source, target)
 
 
 class AnnotatedKnitContent(KnitContent):
@@ -918,12 +897,7 @@ class KnitAnnotateFactory(_KnitFactory):
         internal representation is of the format:
         (revid, plaintext)
         """
-        # TODO: jam 20070209 The tests expect this to be returned as tuples,
-        #       but the code itself doesn't really depend on that.
-        #       Figure out a way to not require the overhead of turning the
-        #       list back into tuples.
-        lines = (tuple(line.split(b" ", 1)) for line in content)
-        return AnnotatedKnitContent(lines)
+        return AnnotatedKnitContent(_knit_rs.parse_fulltext_rs(content))
 
     def parse_line_delta(self, lines, version_id, plain=False):
         r"""Convert a line based delta into internal representation.
@@ -939,29 +913,7 @@ class KnitAnnotateFactory(_KnitFactory):
             list without annotations, not as a list of (origin, content) tuples, i.e.
             (start, end, count, [1..count newline])
         """
-        result = []
-        lines = iter(lines)
-
-        cache = {}
-
-        def cache_and_return(line):
-            origin, text = line.split(b" ", 1)
-            return cache.setdefault(origin, origin), text
-
-        # walk through the lines parsing.
-        # Note that the plain test is explicitly pulled out of the
-        # loop to minimise any performance impact
-        if plain:
-            for header in lines:
-                start, end, count = (int(n) for n in header.split(b","))
-                contents = [next(lines).split(b" ", 1)[1] for _ in range(count)]
-                result.append((start, end, count, contents))
-        else:
-            for header in lines:
-                start, end, count = (int(n) for n in header.split(b","))
-                contents = [tuple(next(lines).split(b" ", 1)) for _ in range(count)]
-                result.append((start, end, count, contents))
-        return result
+        return _knit_rs.parse_line_delta_rs(lines, plain=plain)
 
     def get_fulltext_content(self, lines):
         """Extract just the content lines from a fulltext."""
@@ -986,20 +938,14 @@ class KnitAnnotateFactory(_KnitFactory):
 
         see parse_fulltext which this inverts.
         """
-        return [b"%s %s" % (o, t) for o, t in content._lines]
+        return _knit_rs.lower_fulltext_rs(content._lines)
 
     def lower_line_delta(self, delta):
         """Convert a delta into a serializable form.
 
         See parse_line_delta which this inverts.
         """
-        # TODO: jam 20070209 We only do the caching thing to make sure that
-        #       the origin is a valid utf-8 line, eventually we could remove it
-        out = []
-        for start, end, c, lines in delta:
-            out.append(b"%d,%d,%d\n" % (start, end, c))
-            out.extend(origin + b" " + text for origin, text in lines)
-        return out
+        return _knit_rs.lower_line_delta_rs(delta)
 
     def annotate(self, knit, key):
         """Get annotated lines for a given key.
@@ -1062,14 +1008,7 @@ class KnitPlainFactory(_KnitFactory):
         Yields:
             Tuples of (start, end, count, lines) for each delta operation.
         """
-        cur = 0
-        num_lines = len(lines)
-        while cur < num_lines:
-            header = lines[cur]
-            cur += 1
-            start, end, c = (int(n) for n in header.split(b","))
-            yield start, end, c, lines[cur : cur + c]
-            cur += c
+        yield from _knit_rs.parse_line_delta_raw_rs(lines)
 
     def parse_line_delta(self, lines, version_id):
         """Parse line delta records into a list of delta operations.
@@ -1081,7 +1020,7 @@ class KnitPlainFactory(_KnitFactory):
         Returns:
             A list of (start, end, count, lines) tuples.
         """
-        return list(self.parse_line_delta_iter(lines, version_id))
+        return _knit_rs.parse_line_delta_raw_rs(lines)
 
     def get_fulltext_content(self, lines):
         """Extract just the content lines from a fulltext."""
@@ -1120,11 +1059,7 @@ class KnitPlainFactory(_KnitFactory):
         Returns:
             A list of serialized delta lines.
         """
-        out = []
-        for start, end, c, lines in delta:
-            out.append(b"%d,%d,%d\n" % (start, end, c))
-            out.extend(lines)
-        return out
+        return _knit_rs.lower_line_delta_raw_rs(delta)
 
     def annotate(self, knit, key):
         """Get annotated lines for a given key using a KnitAnnotator.
@@ -4026,4 +3961,5 @@ class _KnitAnnotator(VersionedFileAnnotator):
                     to_process.extend(self._process_pending(key))
 
 
+from ._bzr_rs import knit as _knit_rs
 from ._bzr_rs.knit import _load_data_c as _load_data

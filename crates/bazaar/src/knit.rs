@@ -128,6 +128,43 @@ pub fn lower_line_delta_annotated(delta: &[DeltaHunk<AnnotatedLine>]) -> Vec<Vec
     out
 }
 
+/// Parse an unannotated (raw) line-delta body: `start,end,count\n` headers
+/// followed by `count` raw text lines each. Mirrors
+/// `KnitPlainFactory.parse_line_delta`.
+pub fn parse_line_delta_raw(lines: &[&[u8]]) -> Result<Vec<DeltaHunk<Vec<u8>>>, KnitError> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let (start, end, count) = parse_delta_header(lines[i])?;
+        i += 1;
+        if i + count > lines.len() {
+            return Err(KnitError::TruncatedDelta);
+        }
+        let hunk_lines: Vec<Vec<u8>> = lines[i..i + count].iter().map(|l| l.to_vec()).collect();
+        i += count;
+        out.push(DeltaHunk {
+            start,
+            end,
+            count,
+            lines: hunk_lines,
+        });
+    }
+    Ok(out)
+}
+
+/// Serialize an unannotated line-delta back to bytes. Mirrors
+/// `KnitPlainFactory.lower_line_delta`.
+pub fn lower_line_delta_raw(delta: &[DeltaHunk<Vec<u8>>]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for hunk in delta {
+        out.push(format!("{},{},{}\n", hunk.start, hunk.end, hunk.count).into_bytes());
+        for line in &hunk.lines {
+            out.push(line.clone());
+        }
+    }
+    out
+}
+
 /// Yield matching blocks from a knit delta walk, preserving the historical
 /// last-line EOL-sensitivity quirk described in `get_line_delta_blocks`.
 ///
@@ -311,6 +348,37 @@ mod tests {
     }
 
     #[test]
+    fn delta_raw_round_trip() {
+        let delta = vec![
+            DeltaHunk {
+                start: 0,
+                end: 0,
+                count: 2,
+                lines: vec![b"one\n".to_vec(), b"two\n".to_vec()],
+            },
+            DeltaHunk {
+                start: 4,
+                end: 5,
+                count: 1,
+                lines: vec![b"three\n".to_vec()],
+            },
+        ];
+        let bytes = lower_line_delta_raw(&delta);
+        assert_eq!(
+            bytes,
+            vec![
+                b"0,0,2\n".to_vec(),
+                b"one\n".to_vec(),
+                b"two\n".to_vec(),
+                b"4,5,1\n".to_vec(),
+                b"three\n".to_vec(),
+            ]
+        );
+        let parsed = parse_line_delta_raw(&refs(&bytes)).unwrap();
+        assert_eq!(parsed, delta);
+    }
+
+    #[test]
     fn delta_plain_strips_origin() {
         let bytes: Vec<Vec<u8>> = vec![
             b"0,1,2\n".to_vec(),
@@ -366,6 +434,31 @@ mod tests {
         let delta: Vec<(usize, usize, usize)> = vec![];
         let blocks = get_line_delta_blocks(&delta, &refs(&source), &refs(&target));
         assert_eq!(blocks, vec![(0, 0, 3), (3, 3, 0)]);
+    }
+
+    #[test]
+    fn line_delta_blocks_noeol_shrinks_trailing_run() {
+        // Mirrors test_knit.test_get_line_delta_blocks_noeol: when the last
+        // "matching" line pair actually differs only in its trailing \n,
+        // the block extractor must shave one line off the run. Here the
+        // source has `c` without newline, the target has `c\n`, and the
+        // delta flags the final line as modified. The naive extraction
+        // would claim `(0, 0, 3)` as a match; the eol quirk drops it to
+        // `(0, 0, 2)`.
+        let source: Vec<Vec<u8>> = vec![b"a\n".to_vec(), b"b\n".to_vec(), b"c".to_vec()];
+        let target: Vec<Vec<u8>> = vec![
+            b"a\n".to_vec(),
+            b"b\n".to_vec(),
+            b"c\n".to_vec(),
+            b"d\n".to_vec(),
+        ];
+        // A single hunk that replaces line 2 (the final 'c'-without-newline)
+        // with 2 new lines.
+        let delta = vec![(2usize, 3usize, 2usize)];
+        let blocks = get_line_delta_blocks(&delta, &refs(&source), &refs(&target));
+        // The leading run that looked like 2 matches is actually 1 because
+        // the (c, c\n) pair fails the equality check.
+        assert_eq!(blocks, vec![(0, 0, 2), (3, 4, 0)]);
     }
 
     #[test]

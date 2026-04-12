@@ -385,6 +385,47 @@ mod tests {
     }
 
     #[test]
+    fn three_way_merge_extract() {
+        // Mirrors test_weave.test_multi_line_merge. The weave shape is
+        // captured from a real `Weave` instance (not hand-crafted) so the
+        // test exercises the exact nesting of insertions and deletions
+        // that `_add` produces for a three-way merge.
+        let weave = vec![
+            ctl(Instruction::InsertOpen, 0),
+            line(b"header"),
+            ctl(Instruction::InsertClose, 0),
+            ctl(Instruction::InsertOpen, 1),
+            line(b""),
+            line(b"line from 1"),
+            ctl(Instruction::InsertClose, 1),
+            ctl(Instruction::InsertOpen, 2),
+            ctl(Instruction::DeleteOpen, 3),
+            line(b""),
+            ctl(Instruction::DeleteClose, 3),
+            ctl(Instruction::InsertOpen, 3),
+            line(b"fixup line"),
+            ctl(Instruction::InsertClose, 3),
+            line(b"line from 2"),
+            ctl(Instruction::DeleteOpen, 3),
+            line(b"more from 2"),
+            ctl(Instruction::InsertClose, 2),
+            ctl(Instruction::DeleteClose, 3),
+        ];
+        let got = extract(&weave, &set(&[0, 1, 2, 3])).unwrap();
+        let pairs: Vec<(usize, &[u8])> = got.iter().map(|e| (e.origin, e.text)).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (0, b"header".as_slice()),
+                (1, b""),
+                (1, b"line from 1"),
+                (3, b"fixup line"),
+                (2, b"line from 2"),
+            ]
+        );
+    }
+
+    #[test]
     fn walk_internal_unclosed_insertion_errors() {
         let weave = vec![ctl(Instruction::InsertOpen, 0), line(b"x\n")];
         assert_eq!(

@@ -321,6 +321,79 @@ fn parse_c_header(line: &[u8]) -> Result<(usize, usize, usize, usize), ParseErro
     Ok((parent, parent_pos, child_pos, num_lines))
 }
 
+/// Topologically sort `versions` given a `parents` mapping.
+///
+/// Port of `multiparent._topo_iter`. `parents[v]` is either `Some(parents)`
+/// or `None` for a "parentless" sentinel (treated as having no parents).
+/// Keys in `parents` not present in `versions` are ignored when counting
+/// pending predecessors. Returns versions in an order where every version
+/// appears after its parents that are also in the input set.
+///
+/// Input ordering of `versions` is used as a tiebreaker so the output is
+/// deterministic. Duplicate entries in `versions` are emitted only once.
+pub fn topo_iter<K>(
+    parents: &std::collections::HashMap<K, Option<Vec<K>>>,
+    versions: &[K],
+) -> Vec<K>
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    let mut version_order: Vec<K> = Vec::with_capacity(versions.len());
+    let mut version_set: std::collections::HashSet<K> = std::collections::HashSet::new();
+    for v in versions {
+        if version_set.insert(v.clone()) {
+            version_order.push(v.clone());
+        }
+    }
+
+    let mut seen: std::collections::HashSet<K> = std::collections::HashSet::new();
+    let mut descendants: std::collections::HashMap<K, Vec<K>> = std::collections::HashMap::new();
+
+    let pending_count = |v: &K, seen: &std::collections::HashSet<K>| -> usize {
+        match parents.get(v) {
+            Some(Some(ps)) => ps
+                .iter()
+                .filter(|p| version_set.contains(*p) && !seen.contains(*p))
+                .count(),
+            _ => 0,
+        }
+    };
+
+    for v in &version_order {
+        if let Some(Some(ps)) = parents.get(v) {
+            for p in ps {
+                descendants.entry(p.clone()).or_default().push(v.clone());
+            }
+        }
+    }
+
+    let mut cur: Vec<K> = version_order
+        .iter()
+        .filter(|v| pending_count(v, &seen) == 0)
+        .cloned()
+        .collect();
+
+    let mut out: Vec<K> = Vec::new();
+    while !cur.is_empty() {
+        let mut next: Vec<K> = Vec::new();
+        for v in &cur {
+            if seen.contains(v) {
+                continue;
+            }
+            if pending_count(v, &seen) != 0 {
+                continue;
+            }
+            if let Some(ds) = descendants.get(v) {
+                next.extend(ds.iter().cloned());
+            }
+            out.push(v.clone());
+            seen.insert(v.clone());
+        }
+        cur = next;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +408,25 @@ mod tests {
         assert_eq!(
             mp.to_patch(),
             vec![b"i 1\n".to_vec(), b"a\n".to_vec(), b"\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn empty_new_text_to_patch() {
+        // Mirrors test_multiparent.TestNewText.test_to_patch empty case.
+        let mp = MultiParent::with_hunks(vec![Hunk::NewText(vec![])]);
+        assert_eq!(mp.to_patch(), vec![b"i 0\n".to_vec(), b"\n".to_vec()]);
+    }
+
+    #[test]
+    fn new_text_line_without_trailing_newline_to_patch() {
+        // Mirrors test_multiparent.TestNewText.test_to_patch `[b"a"]` case —
+        // `to_patch` must emit the bare `b"\n"` separator regardless of
+        // whether the final payload line itself ends in `\n`.
+        let mp = MultiParent::with_hunks(vec![Hunk::NewText(lines(&[b"a"]))]);
+        assert_eq!(
+            mp.to_patch(),
+            vec![b"i 1\n".to_vec(), b"a".to_vec(), b"\n".to_vec()]
         );
     }
 
@@ -527,6 +619,101 @@ mod tests {
             MultiParent::from_patch(b"x nonsense\n"),
             Err(ParseError::UnexpectedChar(b'x'))
         );
+    }
+
+    fn topo_parents(
+        entries: &[(&str, Option<&[&str]>)],
+    ) -> std::collections::HashMap<String, Option<Vec<String>>> {
+        entries
+            .iter()
+            .map(|(k, ps)| {
+                (
+                    (*k).to_string(),
+                    ps.map(|ps| ps.iter().map(|p| (*p).to_string()).collect()),
+                )
+            })
+            .collect()
+    }
+
+    fn topo_versions(vs: &[&str]) -> Vec<String> {
+        vs.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn topo_iter_linear_chain() {
+        // a <- b <- c <- d, fed in insertion order.
+        let parents = topo_parents(&[
+            ("a", Some(&[])),
+            ("b", Some(&["a"])),
+            ("c", Some(&["b"])),
+            ("d", Some(&["c"])),
+        ]);
+        let versions = topo_versions(&["a", "b", "c", "d"]);
+        assert_eq!(topo_iter(&parents, &versions), versions);
+    }
+
+    #[test]
+    fn topo_iter_orders_parents_before_children_when_input_is_shuffled() {
+        // Same diamond shape, shuffled input. Tiebreakers come from the
+        // order in which descendants were registered while walking
+        // `version_order`, so the exact sequence is deterministic and
+        // matches the Python `_topo_iter` implementation.
+        let parents = topo_parents(&[
+            ("a", Some(&[])),
+            ("b", Some(&["a"])),
+            ("c", Some(&["a"])),
+            ("d", Some(&["b", "c"])),
+        ]);
+        let got = topo_iter(&parents, &topo_versions(&["d", "c", "b", "a"]));
+        assert_eq!(got, topo_versions(&["a", "c", "b", "d"]));
+    }
+
+    #[test]
+    fn topo_iter_parentless_sentinel_is_treated_as_root() {
+        // A `None` entry (parentless sentinel) is yielded without waiting
+        // on anything, mirroring the Python special case.
+        let parents = topo_parents(&[("a", None), ("b", Some(&["a"]))]);
+        let got = topo_iter(&parents, &topo_versions(&["b", "a"]));
+        assert_eq!(got, topo_versions(&["a", "b"]));
+    }
+
+    #[test]
+    fn topo_iter_ignores_parents_outside_input_set() {
+        // If a parent isn't in the version set, it doesn't count as
+        // pending — the child can be yielded immediately.
+        let parents = topo_parents(&[("x", Some(&["not-in-set"])), ("y", Some(&["x"]))]);
+        let got = topo_iter(&parents, &topo_versions(&["x", "y"]));
+        assert_eq!(got, topo_versions(&["x", "y"]));
+    }
+
+    #[test]
+    fn topo_iter_empty_input() {
+        let parents: std::collections::HashMap<String, Option<Vec<String>>> =
+            std::collections::HashMap::new();
+        let got = topo_iter(&parents, &[] as &[String]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn topo_iter_deduplicates_input() {
+        // Duplicate versions in the input list produce a single output
+        // entry, matching the "seen" bookkeeping.
+        let parents = topo_parents(&[("a", Some(&[])), ("b", Some(&["a"]))]);
+        let got = topo_iter(&parents, &topo_versions(&["a", "b", "a", "b"]));
+        assert_eq!(got, topo_versions(&["a", "b"]));
+    }
+
+    #[test]
+    fn topo_iter_diamond() {
+        // a -> b, a -> c, b+c -> d
+        let parents = topo_parents(&[
+            ("a", Some(&[])),
+            ("b", Some(&["a"])),
+            ("c", Some(&["a"])),
+            ("d", Some(&["b", "c"])),
+        ]);
+        let got = topo_iter(&parents, &topo_versions(&["a", "b", "c", "d"]));
+        assert_eq!(got, topo_versions(&["a", "b", "c", "d"]));
     }
 
     #[test]
