@@ -641,6 +641,208 @@ mod tests {
     }
 
     #[test]
+    fn serialize_empty_index_two_element_keys() {
+        // Mirrors test_index.test_build_index_empty_two_element_keys.
+        let out = serialize_graph_index(&[], 0, 2).unwrap();
+        assert_eq!(
+            out,
+            b"Bazaar Graph Index 1\nnode_ref_lists=0\nkey_elements=2\nlen=0\n\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_empty_index_one_reference_list() {
+        // Mirrors test_index.test_build_index_one_reference_list_empty.
+        let out = serialize_graph_index(&[], 1, 1).unwrap();
+        assert_eq!(
+            out,
+            b"Bazaar Graph Index 1\nnode_ref_lists=1\nkey_elements=1\nlen=0\n\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_empty_index_two_reference_lists() {
+        // Mirrors test_index.test_build_index_two_reference_list_empty.
+        let out = serialize_graph_index(&[], 2, 1).unwrap();
+        assert_eq!(
+            out,
+            b"Bazaar Graph Index 1\nnode_ref_lists=2\nkey_elements=1\nlen=0\n\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_empty_value_node() {
+        // Mirrors test_index.test_add_node_empty_value.
+        let nodes = vec![node(&[b"akey"], false, vec![], b"")];
+        let out = serialize_graph_index(&nodes, 0, 1).unwrap();
+        assert_eq!(
+            out,
+            b"Bazaar Graph Index 1\nnode_ref_lists=0\nkey_elements=1\nlen=1\nakey\x00\x00\x00\n\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_sorts_three_nodes_byte_exact() {
+        // Mirrors test_index.test_build_index_nodes_sorted.
+        let nodes = vec![
+            node(&[b"2002"], false, vec![], b"data"),
+            node(&[b"2000"], false, vec![], b"data"),
+            node(&[b"2001"], false, vec![], b"data"),
+        ];
+        let out = serialize_graph_index(&nodes, 0, 1).unwrap();
+        assert_eq!(
+            out,
+            b"Bazaar Graph Index 1\nnode_ref_lists=0\nkey_elements=1\nlen=3\n\
+              2000\x00\x00\x00data\n\
+              2001\x00\x00\x00data\n\
+              2002\x00\x00\x00data\n\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_sorts_two_element_keys_lexicographically() {
+        // Mirrors test_index.test_build_index_2_element_key_nodes_sorted
+        // — verifies both elements are used for comparison.
+        let mut nodes = Vec::new();
+        for first in &[b"2002", b"2000", b"2001"] {
+            for second in &[b"2002", b"2000", b"2001"] {
+                nodes.push(node(&[*first, *second], false, vec![], b"data"));
+            }
+        }
+        let out = serialize_graph_index(&nodes, 0, 2).unwrap();
+        let expected: Vec<u8> = [
+            b"Bazaar Graph Index 1\nnode_ref_lists=0\nkey_elements=2\nlen=9\n".as_slice(),
+            b"2000\x002000\x00\x00\x00data\n",
+            b"2000\x002001\x00\x00\x00data\n",
+            b"2000\x002002\x00\x00\x00data\n",
+            b"2001\x002000\x00\x00\x00data\n",
+            b"2001\x002001\x00\x00\x00data\n",
+            b"2001\x002002\x00\x00\x00data\n",
+            b"2002\x002000\x00\x00\x00data\n",
+            b"2002\x002001\x00\x00\x00data\n",
+            b"2002\x002002\x00\x00\x00data\n",
+            b"\n",
+        ]
+        .concat();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn serialize_single_node_with_empty_ref_list_of_one() {
+        // Mirrors test_index.test_build_index_reference_lists_are_included_one.
+        let nodes = vec![node(&[b"key"], false, vec![vec![]], b"data")];
+        let out = serialize_graph_index(&nodes, 1, 1).unwrap();
+        assert_eq!(
+            out,
+            b"Bazaar Graph Index 1\nnode_ref_lists=1\nkey_elements=1\nlen=1\nkey\x00\x00\x00data\n\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_single_node_with_empty_ref_lists_of_two() {
+        // Mirrors test_index.test_build_index_reference_lists_are_included_two.
+        // The `\t` separator between the two empty ref lists is the key
+        // byte this test pins down.
+        let nodes = vec![node(&[b"key"], false, vec![vec![], vec![]], b"data")];
+        let out = serialize_graph_index(&nodes, 2, 1).unwrap();
+        assert_eq!(
+            out,
+            b"Bazaar Graph Index 1\nnode_ref_lists=2\nkey_elements=1\nlen=1\nkey\x00\x00\t\x00data\n\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_ref_list_with_two_element_keys() {
+        // Mirrors test_index.test_build_index_reference_lists_with_2_element_keys.
+        let nodes = vec![node(&[b"key", b"key2"], false, vec![vec![]], b"data")];
+        let out = serialize_graph_index(&nodes, 1, 2).unwrap();
+        assert_eq!(
+            out,
+            b"Bazaar Graph Index 1\nnode_ref_lists=1\nkey_elements=2\nlen=1\nkey\x00key2\x00\x00\x00data\n\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_cr_delimits_multiple_refs_in_one_list() {
+        // Mirrors test_index.test_node_references_are_cr_delimited.
+        // The `077\r094` separator is the diagnostic byte sequence.
+        let nodes = vec![
+            node(&[b"reference"], false, vec![vec![]], b"data"),
+            node(&[b"reference2"], false, vec![vec![]], b"data"),
+            node(
+                &[b"key"],
+                false,
+                vec![vec![key(&[b"reference"]), key(&[b"reference2"])]],
+                b"data",
+            ),
+        ];
+        let out = serialize_graph_index(&nodes, 1, 1).unwrap();
+        assert_eq!(
+            out,
+            b"Bazaar Graph Index 1\nnode_ref_lists=1\nkey_elements=1\nlen=3\n\
+              key\x00\x00077\r094\x00data\n\
+              reference\x00\x00\x00data\n\
+              reference2\x00\x00\x00data\n\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_tab_delimits_multiple_reference_lists() {
+        // Mirrors test_index.test_multiple_reference_lists_are_tab_delimited.
+        // Same reference appears in both lists to verify both ref lists
+        // share the address table.
+        let nodes = vec![
+            node(&[b"keference"], false, vec![vec![], vec![]], b"data"),
+            node(
+                &[b"rey"],
+                false,
+                vec![vec![key(&[b"keference"])], vec![key(&[b"keference"])]],
+                b"data",
+            ),
+        ];
+        let out = serialize_graph_index(&nodes, 2, 1).unwrap();
+        assert_eq!(
+            out,
+            b"Bazaar Graph Index 1\nnode_ref_lists=2\nkey_elements=1\nlen=2\n\
+              keference\x00\x00\t\x00data\n\
+              rey\x00\x0059\t59\x00data\n\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_absent_record_has_no_reference_overhead() {
+        // Mirrors test_index.test_absent_has_no_reference_overhead.
+        // Verifies offset math stays correct when absent records are
+        // interleaved with present ones.
+        let nodes = vec![
+            node(&[b"aail"], true, vec![], b""),
+            node(
+                &[b"parent"],
+                false,
+                vec![vec![key(&[b"aail"]), key(&[b"zther"])], vec![]],
+                b"",
+            ),
+            node(&[b"zther"], true, vec![], b""),
+        ];
+        let out = serialize_graph_index(&nodes, 2, 1).unwrap();
+        assert_eq!(
+            out,
+            b"Bazaar Graph Index 1\nnode_ref_lists=2\nkey_elements=1\nlen=1\n\
+              aail\x00a\x00\x00\n\
+              parent\x00\x0059\r84\t\x00\n\
+              zther\x00a\x00\x00\n\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
     fn serialize_sorts_nodes_by_key() {
         let nodes = vec![
             node(&[b"c"], false, vec![], b"3"),
