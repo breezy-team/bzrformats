@@ -2,10 +2,57 @@ use bazaar::groupcompress::compressor::GroupCompressor;
 use bazaar::versionedfile::Key;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict, PyTuple};
 use pyo3::wrap_pyfunction;
 use std::borrow::Cow;
 use std::convert::TryInto;
+
+fn extract_key_segments(obj: &Bound<PyAny>) -> PyResult<Vec<Vec<u8>>> {
+    let tuple = obj.cast::<PyTuple>().map_err(|_| {
+        PyValueError::new_err("sort_gc_optimal keys and parents must be tuples of bytes")
+    })?;
+    let mut out = Vec::with_capacity(tuple.len());
+    for item in tuple.iter() {
+        let b = item.cast::<PyBytes>().map_err(|_| {
+            PyValueError::new_err("sort_gc_optimal keys must contain only bytes")
+        })?;
+        out.push(b.as_bytes().to_vec());
+    }
+    Ok(out)
+}
+
+/// Sort and group the keys in `parent_map` into groupcompress order.
+///
+/// Returns a list of keys in reverse-topological order, grouped by the
+/// first segment of each key. Single-segment keys share an empty prefix.
+#[pyfunction]
+fn sort_gc_optimal<'py>(
+    py: Python<'py>,
+    parent_map: &Bound<'py, PyDict>,
+) -> PyResult<Vec<Bound<'py, PyTuple>>> {
+    let mut input = Vec::with_capacity(parent_map.len());
+    for (key, value) in parent_map.iter() {
+        let k = extract_key_segments(&key)?;
+        let parents_tuple = value.cast::<PyTuple>().map_err(|_| {
+            PyValueError::new_err("sort_gc_optimal values must be tuples of keys")
+        })?;
+        let mut parents = Vec::with_capacity(parents_tuple.len());
+        for parent in parents_tuple.iter() {
+            parents.push(extract_key_segments(&parent)?);
+        }
+        input.push((k, parents));
+    }
+    let sorted = bazaar::groupcompress::sort::sort_gc_optimal(input);
+    sorted
+        .into_iter()
+        .map(|segments| {
+            PyTuple::new(
+                py,
+                segments.into_iter().map(|s| PyBytes::new(py, &s)),
+            )
+        })
+        .collect()
+}
 
 #[pyfunction]
 fn encode_base128_int(py: Python, value: u128) -> PyResult<Bound<PyBytes>> {
@@ -428,6 +475,7 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(make_line_delta))?;
     m.add_wrapped(wrap_pyfunction!(make_rabin_delta))?;
     m.add_wrapped(wrap_pyfunction!(rabin_hash))?;
+    m.add_function(wrap_pyfunction!(sort_gc_optimal, &m)?)?;
     m.add_class::<LinesDeltaIndex>()?;
     m.add_class::<TraditionalGroupCompressor>()?;
     m.add_class::<crate::groupcompress_delta::DeltaIndex>()?;

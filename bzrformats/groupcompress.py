@@ -68,30 +68,7 @@ def as_tuples(obj):
     return tuple(result)
 
 
-def sort_gc_optimal(parent_map):
-    """Sort and group the keys in parent_map into groupcompress order.
-
-    groupcompress is defined (currently) as reverse-topological order, grouped
-    by the key prefix.
-
-    :return: A sorted-list of keys
-    """
-    import vcsgraph.tsort as tsort
-
-    # groupcompress ordering is approximately reverse topological,
-    # properly grouped by file-id.
-    per_prefix_map = {}
-    for key, value in parent_map.items():
-        prefix = b"" if isinstance(key, bytes) or len(key) == 1 else key[0]
-        try:
-            per_prefix_map[prefix][key] = value
-        except KeyError:
-            per_prefix_map[prefix] = {key: value}
-
-    present_keys = []
-    for prefix in sorted(per_prefix_map):
-        present_keys.extend(reversed(tsort.topo_sort(per_prefix_map[prefix])))
-    return present_keys
+from ._bzr_rs.groupcompress import sort_gc_optimal
 
 
 class DecompressCorruption(BzrFormatsError):

@@ -73,6 +73,7 @@ dependencies = [
  "regex",
  "sha1",
  "tempfile",
+ "vcs-graph",
  "xmltree",
  "xz2",
 ]
@@ -955,6 +956,15 @@ name = "unindent"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7264e107f553ccae879d21fbea1d6724ac785e8c3bfc762137959b5802826ef3"
+
+[[package]]
+name = "vcs-graph"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "424d02df8a281d041691212ac502539d1b4ad90360388e4360f88fb95337012f"
+dependencies = [
+ "lazy_static",
+]
 
 [[package]]
 name = "version_check"
