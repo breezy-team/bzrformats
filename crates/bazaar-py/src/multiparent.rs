@@ -1,7 +1,8 @@
-use bazaar::multiparent::{Hunk, MultiParent, ParseError};
+use bazaar::multiparent::{self, Hunk, MultiParent, ParseError};
 use pyo3::exceptions::{PyAssertionError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyBytes, PyDict, PyList, PySet, PyTuple};
+use pyo3::types::{PyAnyMethods, PyBytes, PyDict, PyList, PyTuple};
+use std::collections::HashMap;
 
 /// Convert the Python hunks list into Rust hunks, borrowing the bytes out of
 /// `NewText.lines` and reading integer fields off `ParentText` instances.
@@ -102,97 +103,84 @@ fn parse_patch<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyList>
     PyList::new(py, out)
 }
 
-/// Topologically sort `versions` given a `parents` mapping.
-///
-/// `parents[v]` is either an iterable of parent keys or `None` for a
-/// "parentless" sentinel (treated as having no parents). Keys may be any
-/// hashable Python objects. Returns versions in an order where every version
-/// appears after its parents that are present in the input set.
+/// A hashable Python object whose `Hash` and `Eq` defer to Python. The
+/// interpreter lock is assumed to be held whenever these methods run, since
+/// they may execute arbitrary Python code.
+struct PyHashable(Py<PyAny>);
+
+impl PyHashable {
+    fn new(obj: Bound<'_, PyAny>) -> PyResult<Self> {
+        // Fail fast if the value isn't actually hashable.
+        obj.hash()?;
+        Ok(Self(obj.unbind()))
+    }
+
+    fn bind<'py>(&'py self, py: Python<'py>) -> Bound<'py, PyAny> {
+        self.0.bind(py).clone()
+    }
+}
+
+impl Clone for PyHashable {
+    fn clone(&self) -> Self {
+        Python::attach(|py| Self(self.0.clone_ref(py)))
+    }
+}
+
+impl std::hash::Hash for PyHashable {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Python::attach(|py| {
+            // hash() was validated in `new`, so this cannot fail for a
+            // properly constructed PyHashable — but if it somehow does
+            // (e.g. a __hash__ method that started raising), fall back to
+            // 0 and let the equality check reject false positives.
+            let h = self.0.bind(py).hash().unwrap_or(0);
+            h.hash(state);
+        })
+    }
+}
+
+impl PartialEq for PyHashable {
+    fn eq(&self, other: &Self) -> bool {
+        Python::attach(|py| self.0.bind(py).eq(other.0.bind(py)).unwrap_or(false))
+    }
+}
+
+impl Eq for PyHashable {}
+
+/// Topologically sort `versions` given a `parents` mapping. Delegates to the
+/// generic [`multiparent::topo_iter`] in the pure-Rust crate. Keys may be any
+/// hashable Python objects; `parents[v]` is either an iterable of parent
+/// keys or `None` for a parentless sentinel.
 #[pyfunction]
 fn topo_iter<'py>(
     py: Python<'py>,
     parents: Bound<'py, PyDict>,
     versions: Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyList>> {
-    let versions_set = PySet::empty(py)?;
-    let versions_order = PyList::empty(py);
+    let mut versions_rust: Vec<PyHashable> = Vec::new();
     for v in versions.try_iter()? {
-        let v = v?;
-        if !versions_set.contains(&v)? {
-            versions_set.add(&v)?;
-            versions_order.append(&v)?;
-        }
+        versions_rust.push(PyHashable::new(v?)?);
     }
 
-    let seen = PySet::empty(py)?;
-    let descendants = PyDict::new(py);
-
-    let pending_count = |v: &Bound<'py, PyAny>| -> PyResult<usize> {
-        let ps = parents.get_item(v)?.ok_or_else(|| {
-            pyo3::exceptions::PyKeyError::new_err("version missing from parents map")
-        })?;
-        if ps.is_none() {
-            return Ok(0);
-        }
-        let mut count = 0usize;
-        for p in ps.try_iter()? {
-            let p = p?;
-            if versions_set.contains(&p)? && !seen.contains(&p)? {
-                count += 1;
+    let mut parents_rust: HashMap<PyHashable, Option<Vec<PyHashable>>> = HashMap::new();
+    for (key, value) in parents.iter() {
+        let k = PyHashable::new(key)?;
+        let v = if value.is_none() {
+            None
+        } else {
+            let mut ps = Vec::new();
+            for p in value.try_iter()? {
+                ps.push(PyHashable::new(p?)?);
             }
-        }
-        Ok(count)
-    };
-
-    for v in versions_order.iter() {
-        let ps = parents.get_item(&v)?.ok_or_else(|| {
-            pyo3::exceptions::PyKeyError::new_err("version missing from parents map")
-        })?;
-        if ps.is_none() {
-            continue;
-        }
-        for p in ps.try_iter()? {
-            let p = p?;
-            let existing = descendants.get_item(&p)?;
-            match existing {
-                Some(list) => {
-                    list.cast::<PyList>()?.append(&v)?;
-                }
-                None => {
-                    let list = PyList::empty(py);
-                    list.append(&v)?;
-                    descendants.set_item(&p, list)?;
-                }
-            }
-        }
+            Some(ps)
+        };
+        parents_rust.insert(k, v);
     }
 
-    let mut cur: Vec<Bound<'py, PyAny>> = Vec::new();
-    for v in versions_order.iter() {
-        if pending_count(&v)? == 0 {
-            cur.push(v);
-        }
-    }
-
+    let ordered = multiparent::topo_iter(&parents_rust, &versions_rust);
     let out = PyList::empty(py);
-    while !cur.is_empty() {
-        let mut next: Vec<Bound<'py, PyAny>> = Vec::new();
-        for v in &cur {
-            if seen.contains(v)? {
-                continue;
-            }
-            if pending_count(v)? != 0 {
-                continue;
-            }
-            if let Some(ds) = descendants.get_item(v)? {
-                for d in ds.cast::<PyList>()?.iter() {
-                    next.push(d);
-                }
-            }
-            out.append(v)?;
-            seen.add(v)?;
-        }
-        cur = next;
+    for item in ordered {
+        out.append(item.bind(py))?;
     }
     Ok(out)
 }
