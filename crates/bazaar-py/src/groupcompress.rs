@@ -13,9 +13,9 @@ fn extract_key_segments(obj: &Bound<PyAny>) -> PyResult<Vec<Vec<u8>>> {
     })?;
     let mut out = Vec::with_capacity(tuple.len());
     for item in tuple.iter() {
-        let b = item.cast::<PyBytes>().map_err(|_| {
-            PyValueError::new_err("sort_gc_optimal keys must contain only bytes")
-        })?;
+        let b = item
+            .cast::<PyBytes>()
+            .map_err(|_| PyValueError::new_err("sort_gc_optimal keys must contain only bytes"))?;
         out.push(b.as_bytes().to_vec());
     }
     Ok(out)
@@ -33,9 +33,9 @@ fn sort_gc_optimal<'py>(
     let mut input = Vec::with_capacity(parent_map.len());
     for (key, value) in parent_map.iter() {
         let k = extract_key_segments(&key)?;
-        let parents_tuple = value.cast::<PyTuple>().map_err(|_| {
-            PyValueError::new_err("sort_gc_optimal values must be tuples of keys")
-        })?;
+        let parents_tuple = value
+            .cast::<PyTuple>()
+            .map_err(|_| PyValueError::new_err("sort_gc_optimal values must be tuples of keys"))?;
         let mut parents = Vec::with_capacity(parents_tuple.len());
         for parent in parents_tuple.iter() {
             parents.push(extract_key_segments(&parent)?);
@@ -45,12 +45,7 @@ fn sort_gc_optimal<'py>(
     let sorted = bazaar::groupcompress::sort::sort_gc_optimal(input);
     sorted
         .into_iter()
-        .map(|segments| {
-            PyTuple::new(
-                py,
-                segments.into_iter().map(|s| PyBytes::new(py, &s)),
-            )
-        })
+        .map(|segments| PyTuple::new(py, segments.into_iter().map(|s| PyBytes::new(py, &s))))
         .collect()
 }
 

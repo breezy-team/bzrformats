@@ -1,91 +1,8 @@
-use bazaar::groupcompress::rabin_delta;
+use bazaar::groupcompress::rabin_delta::{self, OwningDeltaIndex};
 use pyo3::exceptions::{PyMemoryError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::convert::TryInto;
-
-/// An owning DeltaIndex that keeps source data alive and wraps the Rust rabin DeltaIndex.
-///
-/// Because the Rust DeltaIndex borrows from source data, we need to keep the source data
-/// alive for the lifetime of the index. We store Vec<u8> source data and use unsafe to
-/// create a DeltaIndex that borrows from it. This is safe because:
-/// 1. The sources Vec is never modified (only appended to)
-/// 2. Vec<u8> data pointers are stable as long as the Vec itself isn't reallocated
-/// 3. We rebuild the index when sources are added
-struct OwningDeltaIndex {
-    sources: Vec<Vec<u8>>,
-    source_offset: usize,
-    max_bytes_to_index: Option<usize>,
-    /// Track whether each source was added as fulltext or delta, and its unadded_bytes
-    source_kinds: Vec<SourceKind>,
-}
-
-#[derive(Clone)]
-enum SourceKind {
-    Fulltext { unadded_bytes: usize },
-    Delta { unadded_bytes: usize },
-}
-
-impl OwningDeltaIndex {
-    fn new(max_bytes_to_index: Option<usize>) -> Self {
-        Self {
-            sources: Vec::new(),
-            source_offset: 0,
-            max_bytes_to_index,
-            source_kinds: Vec::new(),
-        }
-    }
-
-    fn add_source(&mut self, source: Vec<u8>, unadded_bytes: usize) {
-        self.source_offset += unadded_bytes;
-        self.source_offset += source.len();
-        self.source_kinds
-            .push(SourceKind::Fulltext { unadded_bytes });
-        self.sources.push(source);
-    }
-
-    fn add_delta_source(&mut self, delta: Vec<u8>, unadded_bytes: usize) -> Result<(), String> {
-        self.source_offset += unadded_bytes;
-        self.source_offset += delta.len();
-        self.source_kinds.push(SourceKind::Delta { unadded_bytes });
-        self.sources.push(delta);
-        Ok(())
-    }
-
-    fn make_delta(&self, target: &[u8], max_delta_size: usize) -> Result<Option<Vec<u8>>, String> {
-        if self.sources.is_empty() {
-            return Ok(None);
-        }
-
-        // Build the index from all sources
-        let mut index = rabin_delta::DeltaIndex::new();
-        for (i, source) in self.sources.iter().enumerate() {
-            match &self.source_kinds[i] {
-                SourceKind::Fulltext { unadded_bytes } => {
-                    index.add_fulltext(source, *unadded_bytes, self.max_bytes_to_index);
-                }
-                SourceKind::Delta { unadded_bytes } => {
-                    index
-                        .add_delta(source, *unadded_bytes)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-        }
-
-        let max_delta_size = if max_delta_size == 0 {
-            None
-        } else {
-            Some(max_delta_size)
-        };
-
-        let mut out = Vec::new();
-        match rabin_delta::create_delta(&mut out, &index, target, max_delta_size) {
-            Ok(()) => Ok(Some(out)),
-            Err(rabin_delta::DeltaError::DeltaTooLarge) => Ok(None),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-}
 
 #[pyclass(unsendable)]
 pub struct DeltaIndex {
@@ -113,18 +30,18 @@ impl DeltaIndex {
     fn __repr__(&self) -> String {
         format!(
             "DeltaIndex({}, {})",
-            self.inner.sources.len(),
-            self.inner.source_offset
+            self.inner.num_sources(),
+            self.inner.source_offset()
         )
     }
 
     fn __sizeof__(&self) -> usize {
         let mut size = std::mem::size_of::<Self>();
-        for source in &self.inner.sources {
+        for source in self.inner.sources() {
             size += source.len();
         }
         // Rough estimate for the index overhead
-        size += self.inner.sources.len() * std::mem::size_of::<Vec<u8>>();
+        size += self.inner.num_sources() * std::mem::size_of::<Vec<u8>>();
         size
     }
 
@@ -132,7 +49,7 @@ impl DeltaIndex {
     fn _sources<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         Ok(self
             .inner
-            .sources
+            .sources()
             .iter()
             .map(|s| PyBytes::new(py, s))
             .collect())
@@ -140,12 +57,12 @@ impl DeltaIndex {
 
     #[getter]
     fn _source_offset(&self) -> usize {
-        self.inner.source_offset
+        self.inner.source_offset()
     }
 
     #[setter]
     fn set_source_offset(&mut self, value: usize) {
-        self.inner.source_offset = value;
+        self.inner.set_source_offset(value);
     }
 
     #[getter]
@@ -155,20 +72,21 @@ impl DeltaIndex {
 
     #[getter]
     fn _max_bytes_to_index(&self) -> usize {
-        self.inner.max_bytes_to_index.unwrap_or(0)
+        self.inner.max_bytes_to_index().unwrap_or(0)
     }
 
     #[setter]
     fn set_max_bytes_to_index(&mut self, value: usize) {
-        self.inner.max_bytes_to_index = if value == 0 { None } else { Some(value) };
+        self.inner
+            .set_max_bytes_to_index(if value == 0 { None } else { Some(value) });
     }
 
     fn _has_index(&self) -> bool {
-        !self.inner.sources.is_empty()
+        !self.inner.is_empty()
     }
 
     fn add_source(&mut self, source: &[u8], unadded_bytes: usize) -> PyResult<()> {
-        if self.inner.sources.len() >= 65000 {
+        if self.inner.num_sources() >= 65000 {
             return Err(PyMemoryError::new_err("too many sources for DeltaIndex"));
         }
         self.inner.add_source(source.to_vec(), unadded_bytes);
@@ -176,7 +94,7 @@ impl DeltaIndex {
     }
 
     fn add_delta_source(&mut self, delta: &[u8], unadded_bytes: usize) -> PyResult<()> {
-        if self.inner.sources.len() >= 65000 {
+        if self.inner.num_sources() >= 65000 {
             return Err(PyMemoryError::new_err("too many sources for DeltaIndex"));
         }
         self.inner

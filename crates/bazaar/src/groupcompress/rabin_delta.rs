@@ -449,6 +449,120 @@ pub fn make_delta(source_bytes: &[u8], target_bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+#[derive(Clone)]
+enum SourceKind {
+    Fulltext { unadded_bytes: usize },
+    Delta { unadded_bytes: usize },
+}
+
+/// A `DeltaIndex` that owns its source buffers across calls.
+///
+/// The underlying `DeltaIndex<'a>` borrows from source slices, which makes it
+/// awkward to reuse an instance when new sources are added. `OwningDeltaIndex`
+/// sidesteps this by storing sources as owned `Vec<u8>` and rebuilding a fresh
+/// `DeltaIndex` for every `make_delta` call. No unsafe, no self-referential
+/// borrows — the name refers to retaining the source buffers, not to lifetime
+/// trickery.
+pub struct OwningDeltaIndex {
+    sources: Vec<Vec<u8>>,
+    source_offset: usize,
+    max_bytes_to_index: Option<usize>,
+    source_kinds: Vec<SourceKind>,
+}
+
+impl OwningDeltaIndex {
+    pub fn new(max_bytes_to_index: Option<usize>) -> Self {
+        Self {
+            sources: Vec::new(),
+            source_offset: 0,
+            max_bytes_to_index,
+            source_kinds: Vec::new(),
+        }
+    }
+
+    pub fn num_sources(&self) -> usize {
+        self.sources.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+
+    pub fn sources(&self) -> &[Vec<u8>] {
+        &self.sources
+    }
+
+    pub fn source_offset(&self) -> usize {
+        self.source_offset
+    }
+
+    pub fn set_source_offset(&mut self, value: usize) {
+        self.source_offset = value;
+    }
+
+    pub fn max_bytes_to_index(&self) -> Option<usize> {
+        self.max_bytes_to_index
+    }
+
+    pub fn set_max_bytes_to_index(&mut self, value: Option<usize>) {
+        self.max_bytes_to_index = value;
+    }
+
+    pub fn add_source(&mut self, source: Vec<u8>, unadded_bytes: usize) {
+        self.source_offset += unadded_bytes;
+        self.source_offset += source.len();
+        self.source_kinds
+            .push(SourceKind::Fulltext { unadded_bytes });
+        self.sources.push(source);
+    }
+
+    pub fn add_delta_source(&mut self, delta: Vec<u8>, unadded_bytes: usize) -> Result<(), String> {
+        self.source_offset += unadded_bytes;
+        self.source_offset += delta.len();
+        self.source_kinds.push(SourceKind::Delta { unadded_bytes });
+        self.sources.push(delta);
+        Ok(())
+    }
+
+    pub fn make_delta(
+        &self,
+        target: &[u8],
+        max_delta_size: usize,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if self.sources.is_empty() {
+            return Ok(None);
+        }
+
+        // Build a fresh index from all sources.
+        let mut index = DeltaIndex::new();
+        for (i, source) in self.sources.iter().enumerate() {
+            match &self.source_kinds[i] {
+                SourceKind::Fulltext { unadded_bytes } => {
+                    index.add_fulltext(source, *unadded_bytes, self.max_bytes_to_index);
+                }
+                SourceKind::Delta { unadded_bytes } => {
+                    index
+                        .add_delta(source, *unadded_bytes)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+
+        let max_delta_size = if max_delta_size == 0 {
+            None
+        } else {
+            Some(max_delta_size)
+        };
+
+        let mut out = Vec::new();
+        match create_delta(&mut out, &index, target, max_delta_size) {
+            Ok(()) => Ok(Some(out)),
+            Err(DeltaError::DeltaTooLarge) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     const TEXT1: &[u8] = b"This is a bit
@@ -563,5 +677,38 @@ same rabin hash
             .concat()
             .as_slice(),
         )
+    }
+
+    #[test]
+    fn owning_index_empty_returns_none() {
+        let idx = super::OwningDeltaIndex::new(None);
+        assert!(idx.is_empty());
+        assert_eq!(idx.num_sources(), 0);
+        assert_eq!(idx.source_offset(), 0);
+        assert_eq!(idx.make_delta(b"anything", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn owning_index_round_trip() {
+        let mut idx = super::OwningDeltaIndex::new(None);
+        idx.add_source(TEXT1.to_vec(), 0);
+        assert_eq!(idx.num_sources(), 1);
+        assert_eq!(idx.source_offset(), TEXT1.len());
+
+        // A target identical to the source should produce a delta that
+        // applies cleanly back to TEXT1.
+        let delta = idx.make_delta(TEXT1, 0).unwrap().expect("delta produced");
+        let reconstructed = super::super::delta::apply_delta(TEXT1, &delta).unwrap();
+        assert_eq!(reconstructed.as_slice(), TEXT1);
+    }
+
+    #[test]
+    fn owning_index_max_bytes_to_index_setter() {
+        let mut idx = super::OwningDeltaIndex::new(Some(1024));
+        assert_eq!(idx.max_bytes_to_index(), Some(1024));
+        idx.set_max_bytes_to_index(None);
+        assert_eq!(idx.max_bytes_to_index(), None);
+        idx.set_max_bytes_to_index(Some(2048));
+        assert_eq!(idx.max_bytes_to_index(), Some(2048));
     }
 }
