@@ -20,6 +20,7 @@ pub mod revision;
 pub mod rio;
 pub mod serializer;
 pub mod smart;
+pub mod textmerge;
 pub mod versionedfile;
 pub mod xml_serializer;
 

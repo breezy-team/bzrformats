@@ -137,9 +137,14 @@ impl HashCache {
                 Path::new(cache_file_name),
                 {
                     #[cfg(unix)]
-                    { mode.map(Permissions::from_mode) }
+                    {
+                        mode.map(Permissions::from_mode)
+                    }
                     #[cfg(not(unix))]
-                    { let _ = mode; None }
+                    {
+                        let _ = mode;
+                        None
+                    }
                 },
                 content_filter_provider.map(content_filter_to_fn),
             )),

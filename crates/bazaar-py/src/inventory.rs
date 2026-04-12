@@ -35,7 +35,11 @@ create_exception!(
     IncompatibleInventoryDelta,
     BzrFormatsError
 );
-create_exception!(bzrformats.inventory_delta, InventoryDeltaError, BzrFormatsError);
+create_exception!(
+    bzrformats.inventory_delta,
+    InventoryDeltaError,
+    BzrFormatsError
+);
 
 fn kind_from_str(kind: &str) -> Option<Kind> {
     match kind {

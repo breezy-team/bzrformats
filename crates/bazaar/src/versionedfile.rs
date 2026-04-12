@@ -396,10 +396,8 @@ impl ContentFactory for FulltextContentFactory {
         'a: 'b,
     {
         Box::new(
-            osutils::chunks_to_lines(std::iter::once(Ok::<_, std::io::Error>(
-                &self.fulltext,
-            )))
-            .map(|v| v.unwrap()),
+            osutils::chunks_to_lines(std::iter::once(Ok::<_, std::io::Error>(&self.fulltext)))
+                .map(|v| v.unwrap()),
         )
     }
 

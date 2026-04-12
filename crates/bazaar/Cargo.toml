@@ -21,7 +21,7 @@ xmltree = "0.12"
 sha1 = "0.10"
 tempfile = "3"
 log = "0.4"
-pyo3 = { version = ">=0.17", optional = true }
+pyo3 = { version = ">=0.26,<0.29", optional = true }
 crc32fast = "1.2.0"
 base64 = "0.22.1"
 maplit = "1.0.2"
@@ -30,6 +30,7 @@ byteorder = "1.5.0"
 lru = "0.13.0"
 flate2 = "1.0.28"
 xz2 = "0.1.7"
+patiencediff = { version = "0.2.1", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs"] }

@@ -68,6 +68,7 @@ dependencies = [
  "maplit",
  "nix",
  "osutils",
+ "patiencediff",
  "pyo3",
  "regex",
  "sha1",
@@ -552,6 +553,12 @@ dependencies = [
  "unicode-normalization",
  "winapi",
 ]
+
+[[package]]
+name = "patiencediff"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c707262dd66fabcb1b2b79f2d65e2a1f8abb7e31005e882504c99680e009225"
 
 [[package]]
 name = "pkg-config"

@@ -286,7 +286,7 @@ fn _parse_leaf_lines(
 #[pyclass(unsendable)]
 struct GCCHKSHA1LeafNode {
     records: Vec<GcChkSha1Record>,
-    last_key: Option<PyObject>,
+    last_key: Option<Py<PyAny>>,
     last_record_idx: Option<usize>,
     /// Number of bits to shift to get to the interesting byte.
     /// 24 means the very first byte changes across all keys.
