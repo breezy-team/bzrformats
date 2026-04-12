@@ -14,20 +14,14 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
-"""Tests for the compiled dirstate helpers."""
+"""Tests for the dirstate helpers."""
 
 import bisect
 import os
 
-from testscenarios import load_tests_apply_scenarios
-
-from .. import _dirstate_helpers_py, dirstate
+from .. import dirstate
 from .._bzr_rs import dirstate as _dirstate_rs
 from . import TestCase
-
-load_tests = load_tests_apply_scenarios
-
-helper_scenarios = [("dirstate_Python", {"helpers": _dirstate_helpers_py})]
 
 
 class TestBisectPathMixin:
