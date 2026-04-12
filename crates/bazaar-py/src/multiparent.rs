@@ -1,7 +1,7 @@
 use bazaar::multiparent::{Hunk, MultiParent, ParseError};
 use pyo3::exceptions::{PyAssertionError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyTuple};
+use pyo3::types::{PyAnyMethods, PyBytes, PyDict, PyList, PySet, PyTuple};
 
 /// Convert the Python hunks list into Rust hunks, borrowing the bytes out of
 /// `NewText.lines` and reading integer fields off `ParentText` instances.
@@ -102,11 +102,107 @@ fn parse_patch<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyList>
     PyList::new(py, out)
 }
 
+/// Topologically sort `versions` given a `parents` mapping.
+///
+/// `parents[v]` is either an iterable of parent keys or `None` for a
+/// "parentless" sentinel (treated as having no parents). Keys may be any
+/// hashable Python objects. Returns versions in an order where every version
+/// appears after its parents that are present in the input set.
+#[pyfunction]
+fn topo_iter<'py>(
+    py: Python<'py>,
+    parents: Bound<'py, PyDict>,
+    versions: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let versions_set = PySet::empty(py)?;
+    let versions_order = PyList::empty(py);
+    for v in versions.try_iter()? {
+        let v = v?;
+        if !versions_set.contains(&v)? {
+            versions_set.add(&v)?;
+            versions_order.append(&v)?;
+        }
+    }
+
+    let seen = PySet::empty(py)?;
+    let descendants = PyDict::new(py);
+
+    let pending_count = |v: &Bound<'py, PyAny>| -> PyResult<usize> {
+        let ps = parents.get_item(v)?.ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err("version missing from parents map")
+        })?;
+        if ps.is_none() {
+            return Ok(0);
+        }
+        let mut count = 0usize;
+        for p in ps.try_iter()? {
+            let p = p?;
+            if versions_set.contains(&p)? && !seen.contains(&p)? {
+                count += 1;
+            }
+        }
+        Ok(count)
+    };
+
+    for v in versions_order.iter() {
+        let ps = parents.get_item(&v)?.ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err("version missing from parents map")
+        })?;
+        if ps.is_none() {
+            continue;
+        }
+        for p in ps.try_iter()? {
+            let p = p?;
+            let existing = descendants.get_item(&p)?;
+            match existing {
+                Some(list) => {
+                    list.cast::<PyList>()?.append(&v)?;
+                }
+                None => {
+                    let list = PyList::empty(py);
+                    list.append(&v)?;
+                    descendants.set_item(&p, list)?;
+                }
+            }
+        }
+    }
+
+    let mut cur: Vec<Bound<'py, PyAny>> = Vec::new();
+    for v in versions_order.iter() {
+        if pending_count(&v)? == 0 {
+            cur.push(v);
+        }
+    }
+
+    let out = PyList::empty(py);
+    while !cur.is_empty() {
+        let mut next: Vec<Bound<'py, PyAny>> = Vec::new();
+        for v in &cur {
+            if seen.contains(v)? {
+                continue;
+            }
+            if pending_count(v)? != 0 {
+                continue;
+            }
+            if let Some(ds) = descendants.get_item(v)? {
+                for d in ds.cast::<PyList>()?.iter() {
+                    next.push(d);
+                }
+            }
+            out.append(v)?;
+            seen.add(v)?;
+        }
+        cur = next;
+    }
+    Ok(out)
+}
+
 pub fn _multiparent_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "multiparent")?;
     m.add_function(wrap_pyfunction!(to_patch, &m)?)?;
     m.add_function(wrap_pyfunction!(num_lines, &m)?)?;
     m.add_function(wrap_pyfunction!(is_snapshot, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_patch, &m)?)?;
+    m.add_function(wrap_pyfunction!(topo_iter, &m)?)?;
     Ok(m)
 }
