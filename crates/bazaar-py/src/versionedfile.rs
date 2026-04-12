@@ -65,6 +65,36 @@ impl AbstractContentFactory {
         }
     }
 
+    fn iter_bytes_as(&self, py: Python, storage_kind: &str) -> PyResult<Py<PyAny>> {
+        if self.0.storage_kind() == "absent" {
+            return Err(UnavailableRepresentation::new_err(
+                "Absent content has no bytes".to_string(),
+            ));
+        }
+        match storage_kind {
+            "lines" => Ok(self
+                .0
+                .to_lines()
+                .map(|b| PyBytes::new(py, b.as_ref()))
+                .map(|b| b.unbind().into())
+                .collect::<Vec<Py<PyAny>>>()
+                .into_pyobject(py)?
+                .unbind()),
+            "chunked" => Ok(self
+                .0
+                .to_chunks()
+                .map(|b| PyBytes::new(py, b.as_ref()))
+                .map(|b| b.unbind().into())
+                .collect::<Vec<Py<PyAny>>>()
+                .into_pyobject(py)?
+                .unbind()),
+            _ => Err(UnavailableRepresentation::new_err(format!(
+                "Unsupported storage kind: {}",
+                storage_kind
+            ))),
+        }
+    }
+
     fn map_key(&mut self, py: Python, cb: Py<PyAny>) -> PyResult<()> {
         self.0
             .map_key(&|k| cb.call1(py, (k,)).unwrap().extract::<Key>(py).unwrap());
