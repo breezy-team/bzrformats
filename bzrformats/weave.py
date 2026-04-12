@@ -73,6 +73,7 @@ from io import BytesIO
 
 import patiencediff
 
+from ._bzr_rs import weave as _weave_rs
 from .errors import (
     BzrFormatsError,
     OutSideTransaction,
@@ -687,14 +688,7 @@ class Weave(VersionedFile):
 
     def _inclusions(self, versions):
         """Return set of all ancestors of given version(s)."""
-        if not len(versions):
-            return set()
-        i = set(versions)
-        for v in range(max(versions), 0, -1):
-            if v in i:
-                # include all its parents
-                i.update(self._parents[v])
-        return i
+        return _weave_rs.inclusions(self._parents, versions)
 
     def get_ancestry(self, version_ids, topo_sorted=True):
         """See VersionedFile.get_ancestry."""
@@ -745,31 +739,18 @@ class Weave(VersionedFile):
 
     def _walk_internal(self, version_ids=None):
         """Helper method for weave actions."""
-        istack = []
-        dset = set()
-
-        for lineno, l in enumerate(self._weave):
-            if isinstance(l, tuple):
-                c, v = l
-                if c == b"{":
-                    istack.append(self._names[v])
-                elif c == b"}":
-                    istack.pop()
-                elif c == b"[":
-                    dset.add(self._names[v])
-                elif c == b"]":
-                    dset.remove(self._names[v])
-                else:
-                    raise WeaveFormatError(f"unexpected instruction {v!r}")
-            else:
-                yield lineno, istack[-1], frozenset(dset), l
-
-        if istack:
-            raise WeaveFormatError(
-                "unclosed insertion blocks at end of weave: {}".format(istack)
+        try:
+            walked = _weave_rs.walk_internal(self._weave)
+        except ValueError as e:
+            raise WeaveFormatError(str(e)) from e
+        names = self._names
+        for lineno, insert_idx, deletes, line in walked:
+            yield (
+                lineno,
+                names[insert_idx],
+                frozenset(names[d] for d in deletes),
+                line,
             )
-        if dset:
-            raise WeaveFormatError(f"unclosed deletion blocks at end of weave: {dset}")
 
     def plan_merge(self, ver_a, ver_b):
         """Return pseudo-annotation indicating how the two versions merge.
@@ -827,70 +808,12 @@ class Weave(VersionedFile):
         for i in versions:
             if not isinstance(i, int):
                 raise ValueError(i)
-
-        included = self._inclusions(versions)
-
-        istack = []
-        iset = set()
-        dset = set()
-
-        isactive = None
-
-        result = []
-
-        # wow.
-        #  449       0   4474.6820   2356.5590   bzrformats.weave:556(_extract)
-        #  +285282   0   1676.8040   1676.8040   +<isinstance>
-        # 1.6 seconds in 'isinstance'.
-        # changing the first isinstance:
-        #  449       0   2814.2660   1577.1760   bzrformats.weave:556(_extract)
-        #  +140414   0    762.8050    762.8050   +<isinstance>
-        # note that the inline time actually dropped (less function calls)
-        # and total processing time was halved.
-        # we're still spending ~1/4 of the method in isinstance though.
-        # so lets hard code the acceptable string classes we expect:
-        #  449       0   1202.9420    786.2930   bzrformats.weave:556(_extract)
-        # +71352     0    377.5560    377.5560   +<method 'append' of 'list'
-        #                                          objects>
-        # yay, down to ~1/4 the initial extract time, and our inline time
-        # has shrunk again, with isinstance no longer dominating.
-        # tweaking the stack inclusion test to use a set gives:
-        #  449       0   1122.8030    713.0080   bzrformats.weave:556(_extract)
-        # +71352     0    354.9980    354.9980   +<method 'append' of 'list'
-        #                                          objects>
-        # - a 5% win, or possibly just noise. However with large istacks that
-        # 'in' test could dominate, so I'm leaving this change in place - when
-        # its fast enough to consider profiling big datasets we can review.
-
-        for lineno, l in enumerate(self._weave):
-            if isinstance(l, tuple):
-                c, v = l
-                isactive = None
-                if c == b"{":
-                    istack.append(v)
-                    iset.add(v)
-                elif c == b"}":
-                    iset.remove(istack.pop())
-                elif c == b"[":
-                    if v in included:
-                        dset.add(v)
-                elif c == b"]":
-                    if v in included:
-                        dset.remove(v)
-                else:
-                    raise AssertionError()
-            else:
-                if isactive is None:
-                    isactive = (not dset) and istack and (istack[-1] in included)
-                if isactive:
-                    result.append((istack[-1], lineno, l))
-        if istack:
-            raise WeaveFormatError(
-                "unclosed insertion blocks at end of weave: {}".format(istack)
+        try:
+            return _weave_rs.extract(
+                self._weave, _weave_rs.inclusions(self._parents, versions)
             )
-        if dset:
-            raise WeaveFormatError(f"unclosed deletion blocks at end of weave: {dset}")
-        return result
+        except ValueError as e:
+            raise WeaveFormatError(str(e)) from e
 
     def _maybe_lookup(self, name_or_index):
         """Convert possible symbolic name to index, or pass through indexes.

@@ -15,7 +15,9 @@ pub mod groupcompress;
 pub mod hashcache;
 pub mod inventory;
 pub mod inventory_delta;
+pub mod knit;
 pub mod multiparent;
+pub mod pack;
 pub mod repository;
 pub mod revision;
 pub mod rio;
@@ -23,6 +25,7 @@ pub mod serializer;
 pub mod smart;
 pub mod textmerge;
 pub mod versionedfile;
+pub mod weave;
 pub mod xml_serializer;
 
 #[cfg(feature = "pyo3")]
