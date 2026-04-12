@@ -112,48 +112,21 @@ def _deserialise_leaf_node(data, key, search_key_func=None):
     :param key: The key that the serialised node has.
     """
     result = LeafNode(search_key_func=search_key_func)
-    # Splitlines can split on '\r' so don't use it, split('\n') adds an
-    # extra '' if the bytes ends in a final newline.
-    lines = data.split(b"\n")
-    trailing = lines.pop()
-    if trailing != b"":
-        raise AssertionError(f"We did not have a final newline for {key}")
-    items = {}
-    if lines[0] != b"chkleaf:":
-        raise ValueError(f"not a serialised leaf node: {bytes!r}")
-    maximum_size = int(lines[1])
-    width = int(lines[2])
-    length = int(lines[3])
-    prefix = lines[4]
-    pos = 5
-    while pos < len(lines):
-        line = prefix + lines[pos]
-        elements = line.split(b"\x00")
-        pos += 1
-        if len(elements) != width + 1:
-            raise AssertionError(
-                "Incorrect number of elements (%d vs %d) for: %r"
-                % (len(elements), width + 1, line)
-            )
-        num_value_lines = int(elements[-1])
-        value_lines = lines[pos : pos + num_value_lines]
-        pos += num_value_lines
-        value = b"\n".join(value_lines)
-        items[tuple(elements[:-1])] = value
-    if len(items) != length:
-        raise AssertionError(
-            "item count (%d) mismatch for key %s, bytes %r" % (length, key, bytes)
-        )
+    (
+        maximum_size,
+        width,
+        length,
+        prefix,
+        raw_items,
+        raw_size,
+    ) = _chk_map_rs._deserialise_leaf_node(data)
+    items = dict(raw_items)
     result._items = items
     result._len = length
     result._maximum_size = maximum_size
     result._key = key
     result._key_width = width
-    result._raw_size = (
-        sum(map(len, lines[5:]))  # the length of the suffix
-        + (length) * (len(prefix))
-        + (len(lines) - 5)
-    )
+    result._raw_size = raw_size
     if not items:
         result._search_prefix = None
         result._common_serialised_prefix = None
@@ -167,26 +140,15 @@ def _deserialise_leaf_node(data, key, search_key_func=None):
 
 def _deserialise_internal_node(data, key, search_key_func=None):
     result = InternalNode(search_key_func=search_key_func)
-    # Splitlines can split on '\r' so don't use it, remove the extra ''
-    # from the result of split('\n') because we should have a trailing
-    # newline
-    lines = data.split(b"\n")
-    if lines[-1] != b"":
-        raise ValueError("last line must be ''")
-    lines.pop(-1)
-    items = {}
-    if lines[0] != b"chknode:":
-        raise ValueError(f"not a serialised internal node: {bytes!r}")
-    maximum_size = int(lines[1])
-    width = int(lines[2])
-    length = int(lines[3])
-    common_prefix = lines[4]
-    for line in lines[5:]:
-        line = common_prefix + line
-        prefix, flat_key = line.rsplit(b"\x00", 1)
-        items[prefix] = (flat_key,)
-    if len(items) == 0:
-        raise AssertionError(f"We didn't find any item for {key}")
+    (
+        maximum_size,
+        width,
+        length,
+        common_prefix,
+        raw_items,
+        node_width,
+    ) = _chk_map_rs._deserialise_internal_node(data)
+    items = {prefix: (flat_key,) for prefix, flat_key in raw_items}
     result._items = items
     result._len = length
     result._maximum_size = maximum_size
@@ -195,7 +157,7 @@ def _deserialise_internal_node(data, key, search_key_func=None):
     # XXX: InternalNodes don't really care about their size, and this will
     #      change if we add prefix compression
     result._raw_size = None  # len(bytes)
-    result._node_width = len(prefix)
+    result._node_width = node_width
     result._search_prefix = common_prefix
     return result
 
