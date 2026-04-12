@@ -21,6 +21,9 @@ pub enum BTreeIndexError {
     /// An option line was missing, in the wrong order, or had a non-decimal
     /// value.
     BadOptions,
+    /// An internal node's body was too short — missing the type line, the
+    /// offset line, or an integer that couldn't be parsed.
+    BadInternalNode,
 }
 
 impl std::fmt::Display for BTreeIndexError {
@@ -28,6 +31,7 @@ impl std::fmt::Display for BTreeIndexError {
         match self {
             BTreeIndexError::BadSignature => write!(f, "bad btree index format signature"),
             BTreeIndexError::BadOptions => write!(f, "bad btree index options"),
+            BTreeIndexError::BadInternalNode => write!(f, "bad btree internal node"),
         }
     }
 }
@@ -84,6 +88,47 @@ pub fn parse_btree_header(data: &[u8]) -> Result<BTreeHeader, BTreeIndexError> {
         row_lengths,
         header_end,
     })
+}
+
+/// Parsed contents of an internal-node page body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalNode {
+    /// The page-index offset at which the child leaves for this node begin.
+    pub offset: usize,
+    /// Key tuples acting as split points between children.
+    pub keys: Vec<Vec<Vec<u8>>>,
+}
+
+/// Parse the body bytes of an internal B+Tree node. Mirrors
+/// `_InternalNode.__init__`/`_parse_lines`: first line is a type marker,
+/// second line is `offset=<int>`, subsequent non-empty lines are key
+/// tuples joined by `\x00`, terminated by the first empty line.
+pub fn parse_internal_node(body: &[u8]) -> Result<InternalNode, BTreeIndexError> {
+    let mut lines = body.split(|&b| b == b'\n');
+    let _type_line = lines.next().ok_or(BTreeIndexError::BadInternalNode)?;
+    let offset_line = lines.next().ok_or(BTreeIndexError::BadInternalNode)?;
+    // Python hardcodes `lines[1][7:]` — the `offset=` prefix is 7 bytes.
+    // Preserve that quirk (no explicit prefix check) so we round-trip any
+    // input the Python parser would accept, with the same ValueError
+    // semantics if the rest isn't a decimal integer.
+    if offset_line.len() < 7 {
+        return Err(BTreeIndexError::BadInternalNode);
+    }
+    let offset = std::str::from_utf8(&offset_line[7..])
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .ok_or(BTreeIndexError::BadInternalNode)?;
+
+    let mut keys: Vec<Vec<Vec<u8>>> = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let parts: Vec<Vec<u8>> = line.split(|&b| b == b'\x00').map(|p| p.to_vec()).collect();
+        keys.push(parts);
+    }
+
+    Ok(InternalNode { offset, keys })
 }
 
 fn parse_usize_option(line: &[u8], prefix: &[u8]) -> Result<usize, BTreeIndexError> {
@@ -207,5 +252,67 @@ mod tests {
         // The computed `header_end` should equal the total data length
         // (there's no trailing data after the row_lengths newline here).
         assert_eq!(h.header_end, data.len());
+    }
+
+    fn key(parts: &[&[u8]]) -> Vec<Vec<u8>> {
+        parts.iter().map(|p| p.to_vec()).collect()
+    }
+
+    #[test]
+    fn parse_internal_node_basic() {
+        // Mirrors the cross-checked Python output for the same body.
+        let body = b"type=internal\noffset=42\nkey1\none\x00two\nkey3\n";
+        let n = parse_internal_node(body).unwrap();
+        assert_eq!(n.offset, 42);
+        assert_eq!(
+            n.keys,
+            vec![key(&[b"key1"]), key(&[b"one", b"two"]), key(&[b"key3"])]
+        );
+    }
+
+    #[test]
+    fn parse_internal_node_stops_at_first_empty_line() {
+        // Content after the first empty line (explicit terminator) is
+        // silently dropped, matching the Python `break` behavior.
+        let body = b"type=internal\noffset=0\nalpha\n\nGARBAGE\nmore\n";
+        let n = parse_internal_node(body).unwrap();
+        assert_eq!(n.offset, 0);
+        assert_eq!(n.keys, vec![key(&[b"alpha"])]);
+    }
+
+    #[test]
+    fn parse_internal_node_no_keys() {
+        let body = b"type=internal\noffset=7\n";
+        let n = parse_internal_node(body).unwrap();
+        assert_eq!(n.offset, 7);
+        assert!(n.keys.is_empty());
+    }
+
+    #[test]
+    fn parse_internal_node_rejects_missing_offset_line() {
+        let body = b"type=internal\n";
+        assert_eq!(
+            parse_internal_node(body),
+            Err(BTreeIndexError::BadInternalNode)
+        );
+    }
+
+    #[test]
+    fn parse_internal_node_rejects_short_offset_line() {
+        // `offset=` is 7 bytes; anything shorter can't even be the prefix.
+        let body = b"type=internal\nabc\n";
+        assert_eq!(
+            parse_internal_node(body),
+            Err(BTreeIndexError::BadInternalNode)
+        );
+    }
+
+    #[test]
+    fn parse_internal_node_rejects_non_decimal_offset() {
+        let body = b"type=internal\noffset=nope\n";
+        assert_eq!(
+            parse_internal_node(body),
+            Err(BTreeIndexError::BadInternalNode)
+        );
     }
 }
