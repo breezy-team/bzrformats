@@ -461,7 +461,7 @@ class BaseVersionedFile:
         """Return revisions sorted by how much they reduce build complexity."""
         could_avoid = {}
         referenced_by = {}
-        for version_id in topo_iter(self):
+        for version_id in _topo_iter(self._parents, list(self.versions())):
             could_avoid[version_id] = set()
             if version_id not in self._snapshots:
                 for parent_id in self._parents[version_id]:
@@ -478,10 +478,11 @@ class BaseVersionedFile:
             )
             selected = available_versions.pop()
             ranking.append(selected)
-            for version_id in referenced_by[selected]:
+            selected_refs = referenced_by.get(selected, set())
+            for version_id in selected_refs:
                 could_avoid[version_id].difference_update(could_avoid[selected])
             for version_id in could_avoid[selected]:
-                referenced_by[version_id].difference_update(referenced_by[selected])
+                referenced_by[version_id].difference_update(selected_refs)
         return ranking
 
     def clear_cache(self):
