@@ -30,7 +30,7 @@ dependencies = [
     "patiencediff",
     "vcsgraph",
 ]
-version = "3.4.1.dev0"
+version = "3.4.1"
 
 [project.urls]
 Homepage = "https://www.breezy-vcs.org/"
