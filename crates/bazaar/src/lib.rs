@@ -23,6 +23,7 @@ pub mod serializer;
 pub mod smart;
 pub mod textmerge;
 pub mod versionedfile;
+pub mod weave;
 pub mod xml_serializer;
 
 #[cfg(feature = "pyo3")]
