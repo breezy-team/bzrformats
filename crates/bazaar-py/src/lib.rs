@@ -8,6 +8,7 @@ use pyo3::types::{PyBytes, PyString};
 use pyo3_filelike::PyBinaryFile;
 use std::collections::HashMap;
 
+mod btree_index;
 mod btree_serializer;
 mod chk_map;
 mod dirstate;
@@ -559,6 +560,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let indexm = index::_index_rs(py)?;
     m.add_submodule(&indexm)?;
 
+    let btree_indexm = btree_index::_btree_index_rs(py)?;
+    m.add_submodule(&btree_indexm)?;
+
     let versionedfilem = versionedfile::_versionedfile_rs(py)?;
     m.add_submodule(&versionedfilem)?;
 
@@ -585,6 +589,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.weave", module_name), &weavem)?;
     modules.set_item(format!("{}.pack", module_name), &packm)?;
     modules.set_item(format!("{}.index", module_name), &indexm)?;
+    modules.set_item(format!("{}.btree_index", module_name), &btree_indexm)?;
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
     modules.set_item(
         format!("{}.btree_serializer", module_name),

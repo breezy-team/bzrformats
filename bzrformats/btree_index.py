@@ -628,17 +628,7 @@ class _InternalNode:
 
     def __init__(self, bytes):
         """Parse bytes to create an internal node object."""
-        # splitlines mangles the \r delimiters.. don't use it.
-        self.keys = self._parse_lines(bytes.split(b"\n"))
-
-    def _parse_lines(self, lines):
-        nodes = []
-        self.offset = int(lines[1][7:])
-        for line in lines[2:]:
-            if line == b"":
-                break
-            nodes.append(tuple(line.split(b"\0")))
-        return nodes
+        self.offset, self.keys = _btree_index_rs.parse_internal_node(bytes)
 
 
 class BTreeGraphIndex:
@@ -1433,46 +1423,21 @@ class BTreeGraphIndex:
         :return: An offset, data tuple such as readv yields, for the unparsed
             data. (which may be of length 0).
         """
-        signature = bytes[0 : len(self._signature())]
-        if not signature == self._signature():
-            raise _mod_index.BadIndexFormatSignature(self._name, BTreeGraphIndex)
-        lines = bytes[len(self._signature()) :].splitlines()
-        options_line = lines[0]
-        if not options_line.startswith(_OPTION_NODE_REFS):
-            raise _mod_index.BadIndexOptions(self)
         try:
-            self.node_ref_lists = int(options_line[len(_OPTION_NODE_REFS) :])
-        except ValueError as e:
-            raise _mod_index.BadIndexOptions(self) from e
-        options_line = lines[1]
-        if not options_line.startswith(_OPTION_KEY_ELEMENTS):
-            raise _mod_index.BadIndexOptions(self)
-        try:
-            self._key_length = int(options_line[len(_OPTION_KEY_ELEMENTS) :])
-        except ValueError as e:
-            raise _mod_index.BadIndexOptions(self) from e
-        options_line = lines[2]
-        if not options_line.startswith(_OPTION_LEN):
-            raise _mod_index.BadIndexOptions(self)
-        try:
-            self._key_count = int(options_line[len(_OPTION_LEN) :])
-        except ValueError as e:
-            raise _mod_index.BadIndexOptions(self) from e
-        options_line = lines[3]
-        if not options_line.startswith(_OPTION_ROW_LENGTHS):
-            raise _mod_index.BadIndexOptions(self)
-        try:
-            self._row_lengths = [
-                int(length)
-                for length in options_line[len(_OPTION_ROW_LENGTHS) :].split(b",")
-                if length
-            ]
-        except ValueError as e:
-            raise _mod_index.BadIndexOptions(self) from e
+            (
+                self.node_ref_lists,
+                self._key_length,
+                self._key_count,
+                self._row_lengths,
+                header_end,
+            ) = _btree_index_rs.parse_btree_header(bytes)
+        except _mod_index.BadIndexFormatSignature:
+            raise _mod_index.BadIndexFormatSignature(
+                self._name, BTreeGraphIndex
+            ) from None
+        except _mod_index.BadIndexOptions:
+            raise _mod_index.BadIndexOptions(self) from None
         self._compute_row_offsets()
-
-        # calculate the bytes we have processed
-        header_end = len(signature) + sum(map(len, lines[0:4])) + 4
         return header_end, bytes[header_end:]
 
     def _read_nodes(self, nodes):
@@ -1569,6 +1534,7 @@ class BTreeGraphIndex:
 
 _gcchk_factory = _LeafNode
 
+from ._bzr_rs import btree_index as _btree_index_rs
 from ._bzr_rs import btree_serializer as _btree_serializer
 
 _gcchk_factory = _btree_serializer._parse_into_chk  # type: ignore
