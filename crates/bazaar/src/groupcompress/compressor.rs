@@ -518,4 +518,225 @@ mod tests {
         assert_eq!(gc.chunks(), chunks_after_first.as_slice());
         assert_eq!(gc.endpoint(), endpoint_after_first);
     }
+
+    #[test]
+    fn rabin_compressor_empty_input_returns_null_sha() {
+        // Empty records short-circuit through the trait default and produce
+        // (NULL_SHA1, 0, 0, "fulltext") without touching the delta index.
+        let mut gc = RabinGroupCompressor::new(None);
+        let (sha, start, end, kind) = gc
+            .compress(&key(&[b"empty"]), &[], 0, None, None, None)
+            .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 0);
+        assert_eq!(kind, "fulltext");
+        assert_eq!(
+            sha.as_bytes(),
+            crate::groupcompress::NULL_SHA1.as_slice()
+        );
+        assert_eq!(gc.endpoint(), 0);
+        assert!(gc.labels_deltas().is_empty());
+    }
+
+    #[test]
+    fn rabin_compressor_empty_input_with_matching_nostore_raises() {
+        let mut gc = RabinGroupCompressor::new(None);
+        let null_sha = String::from_utf8(crate::groupcompress::NULL_SHA1.clone()).unwrap();
+        let err = gc
+            .compress(&key(&[b"empty"]), &[], 0, None, Some(null_sha), None)
+            .unwrap_err();
+        assert!(matches!(err, Error::ExistingContent(_)));
+    }
+
+    #[test]
+    fn rabin_compressor_nostore_sha_match_raises_existing_content() {
+        let mut gc = RabinGroupCompressor::new(None);
+        let text = b"some content that we want to deduplicate\n";
+        let actual_sha = osutils::sha::sha_chunks(&[text.as_slice()]);
+        let err = gc
+            .compress(
+                &key(&[b"label"]),
+                &[text.as_slice()],
+                text.len(),
+                None,
+                Some(actual_sha),
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::ExistingContent(_)));
+        // Nothing was added.
+        assert_eq!(gc.endpoint(), 0);
+        assert!(gc.labels_deltas().is_empty());
+    }
+
+    #[test]
+    fn rabin_compressor_expected_sha_passthrough() {
+        // When expected_sha is supplied, the trait skips computing the sha
+        // and uses the caller's value as the returned sha.
+        let mut gc = RabinGroupCompressor::new(None);
+        let text = b"a small fulltext\n";
+        let claimed_sha = "deadbeef".to_string();
+        let (sha, _, _, _) = gc
+            .compress(
+                &key(&[b"label"]),
+                &[text.as_slice()],
+                text.len(),
+                Some(claimed_sha.clone()),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(sha, claimed_sha);
+    }
+
+    #[test]
+    fn rabin_compressor_content_addressed_key_substitution() {
+        // A ContentAddressed key has its sha appended as the last segment.
+        let mut gc = RabinGroupCompressor::new(None);
+        let text = b"content-addressed body\n";
+        let key = Key::ContentAddressed(vec![b"prefix".to_vec()]);
+        let (sha, _, _, _) = gc
+            .compress(&key, &[text.as_slice()], text.len(), None, None, None)
+            .unwrap();
+        let expected_sha = osutils::sha::sha_chunks(&[text.as_slice()]);
+        assert_eq!(sha, expected_sha);
+
+        // The recorded label_deltas key is the prefix plus "sha1:..." segment.
+        let stored_key = vec![
+            b"prefix".to_vec(),
+            format!("sha1:{}", expected_sha).into_bytes(),
+        ];
+        assert!(gc.labels_deltas().contains_key(&stored_key));
+        let (data, _) = gc.extract(&stored_key).unwrap();
+        assert_eq!(data, vec![text.to_vec()]);
+    }
+
+    #[test]
+    fn rabin_compressor_extract_after_intermediate_delta() {
+        // Add fulltext, delta, then extract the fulltext: this exercises
+        // chunk-slice indexing across multiple records and verifies that
+        // earlier records can still be reconstructed after later additions.
+        let mut gc = RabinGroupCompressor::new(None);
+        let base = b"common prefix that is long enough to be worth indexing\nshared\n";
+        let derived = b"common prefix that is long enough to be worth indexing\nshared\nplus more\n";
+        gc.compress(
+            &key(&[b"base"]),
+            &[base.as_slice()],
+            base.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        gc.compress(
+            &key(&[b"derived"]),
+            &[derived.as_slice()],
+            derived.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (data, _) = gc.extract(&vec![b"base".to_vec()]).unwrap();
+        assert_eq!(data, vec![base.to_vec()]);
+        let (data, _) = gc.extract(&vec![b"derived".to_vec()]).unwrap();
+        assert_eq!(data, vec![derived.to_vec()]);
+    }
+
+    #[test]
+    fn rabin_compressor_flush_without_last_drops_final_record() {
+        let mut gc = RabinGroupCompressor::new(None);
+        gc.compress(
+            &key(&[b"a"]),
+            &[b"first record\n".as_slice()],
+            13,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let endpoint_after_first = gc.endpoint();
+        gc.compress(
+            &key(&[b"b"]),
+            &[b"second record\n".as_slice()],
+            14,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (chunks, endpoint) = gc.flush_without_last();
+        assert_eq!(endpoint, endpoint_after_first);
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(total, endpoint_after_first);
+    }
+
+    #[test]
+    fn rabin_compressor_input_chunks_can_be_split() {
+        // A record that arrives as multiple input chunks should serialize to
+        // the same byte stream as if it had arrived as one slice. The chunk
+        // *vector* may be segmented differently — what matters is that the
+        // concatenated bytes and the endpoint are identical.
+        let mut single = RabinGroupCompressor::new(None);
+        let one_shot = b"hello world\nthis is a single slice\n";
+        single
+            .compress(
+                &key(&[b"k"]),
+                &[one_shot.as_slice()],
+                one_shot.len(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let mut multi = RabinGroupCompressor::new(None);
+        let parts: &[&[u8]] = &[b"hello world\n", b"this is a single slice\n"];
+        let total_len: usize = parts.iter().map(|p| p.len()).sum();
+        multi
+            .compress(&key(&[b"k"]), parts, total_len, None, None, None)
+            .unwrap();
+
+        assert_eq!(single.chunks().concat(), multi.chunks().concat());
+        assert_eq!(single.endpoint(), multi.endpoint());
+
+        // And the records extract to the same content either way.
+        let stored_key = vec![b"k".to_vec()];
+        let (single_data, _) = single.extract(&stored_key).unwrap();
+        let (multi_data, _) = multi.extract(&stored_key).unwrap();
+        assert_eq!(single_data.concat(), multi_data.concat());
+    }
+
+    #[test]
+    fn rabin_compressor_ratio_zero_for_empty_compressor() {
+        let gc = RabinGroupCompressor::new(None);
+        assert_eq!(gc.ratio(), 0.0);
+    }
+
+    #[test]
+    fn rabin_compressor_ratio_above_one_after_compression() {
+        let mut gc = RabinGroupCompressor::new(None);
+        // Two near-identical records should compress well, leaving a ratio
+        // significantly above 1.0 (input bytes much larger than output).
+        let text = b"the same long line repeated for compression\n".repeat(8);
+        gc.compress(
+            &key(&[b"a"]),
+            &[text.as_slice()],
+            text.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        gc.compress(
+            &key(&[b"b"]),
+            &[text.as_slice()],
+            text.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(gc.ratio() > 1.0);
+    }
 }
