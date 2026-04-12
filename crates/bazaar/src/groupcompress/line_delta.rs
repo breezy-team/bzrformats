@@ -442,8 +442,7 @@ mod tests {
         // single copy instruction covering the whole buffer.
         let src = b"line one\nline two\nline three\n".to_vec();
         let delta: Vec<_> = super::make_delta(&src, b"line one\nline two\nline three\n").collect();
-        let reconstructed =
-            super::super::delta::apply_delta(&src, &delta.concat()).unwrap();
+        let reconstructed = super::super::delta::apply_delta(&src, &delta.concat()).unwrap();
         assert_eq!(reconstructed, src);
     }
 
@@ -453,8 +452,7 @@ mod tests {
         let src = b"shared line one\nshared line two\n".to_vec();
         let target = b"new leading\nshared line one\nshared line two\n";
         let delta: Vec<_> = super::make_delta(&src, target).collect();
-        let reconstructed =
-            super::super::delta::apply_delta(&src, &delta.concat()).unwrap();
+        let reconstructed = super::super::delta::apply_delta(&src, &delta.concat()).unwrap();
         assert_eq!(reconstructed.as_slice(), target);
     }
 
@@ -469,8 +467,7 @@ mod tests {
         let idx = LinesDeltaIndex::new(lines_of(b"a\nb\nc\n"));
         let target = b"a\nb\nc\n";
         let target_lines = cow_lines(target);
-        let (out_lines, index_flags) =
-            idx.make_delta(target_lines.as_slice(), target.len(), None);
+        let (out_lines, index_flags) = idx.make_delta(target_lines.as_slice(), target.len(), None);
         assert!(out_lines.len() >= 3);
         assert_eq!(index_flags.len(), out_lines.len());
         assert_eq!(&index_flags[..3], &[false, false, false]);

@@ -898,8 +898,7 @@ mod tests {
 
         let mut gc = RabinGroupCompressor::new(None);
         let base = b"shared content that is long enough for rabin matching\nmore shared\n";
-        let derived =
-            b"shared content that is long enough for rabin matching\nmore shared\nplus\n";
+        let derived = b"shared content that is long enough for rabin matching\nmore shared\nplus\n";
         gc.compress(
             &Key::Fixed(vec![b"base".to_vec()]),
             &[base.as_slice()],
@@ -926,7 +925,10 @@ mod tests {
         assert_eq!(dump.len(), 2);
         match &dump[0] {
             DumpInfo::Fulltext { length, text: None } => assert_eq!(*length, base.len()),
-            _ => panic!("expected Fulltext(None) for first record, got {:?}", match_kind(&dump[0])),
+            _ => panic!(
+                "expected Fulltext(None) for first record, got {:?}",
+                match_kind(&dump[0])
+            ),
         }
         match &dump[1] {
             DumpInfo::Delta {
@@ -998,8 +1000,7 @@ mod tests {
         // cached content so the next ensure_content produces the new body.
         let replacement_body: Vec<u8> = b"replacement body bytes\n".repeat(20);
         let replacement_record = make_fulltext_record(&replacement_body);
-        let mut encoder =
-            ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&replacement_record).unwrap();
         let z_replacement = encoder.finish().unwrap();
 
@@ -1008,7 +1009,10 @@ mod tests {
         parsed.set_z_content_length(z_replacement.len());
         parsed.set_content_length(replacement_record.len());
 
-        assert!(parsed.content().is_none(), "cached content should be cleared");
+        assert!(
+            parsed.content().is_none(),
+            "cached content should be cleared"
+        );
         parsed.ensure_content(None);
         assert_eq!(parsed.content(), Some(replacement_record.as_slice()));
     }
