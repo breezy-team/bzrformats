@@ -22,6 +22,11 @@ import zlib
 
 from . import osutils
 from ._bzr_rs import groupcompress as _groupcompress_rs
+from ._bzr_rs.groupcompress import (
+    GroupCompressBlock,
+    RabinGroupCompressor,
+    sort_gc_optimal,
+)
 from .btree_index import BTreeBuilder
 from .errors import (
     BzrFormatsError,
@@ -68,9 +73,6 @@ def as_tuples(obj):
     return tuple(result)
 
 
-from ._bzr_rs.groupcompress import sort_gc_optimal
-
-
 class DecompressCorruption(BzrFormatsError):
     """Exception raised when repository file decompression fails."""
 
@@ -87,9 +89,6 @@ class DecompressCorruption(BzrFormatsError):
         else:
             self.orig_error = ""
         super().__init__()
-
-
-from ._bzr_rs.groupcompress import GroupCompressBlock
 
 
 class _LazyGroupCompressFactory:
@@ -515,9 +514,6 @@ def network_block_to_records(storage_kind, bytes, line_end):
         raise ValueError(f"Unknown storage kind: {storage_kind}")
     manager = _LazyGroupContentManager.from_bytes(bytes)
     return manager.get_record_stream()
-
-
-from ._bzr_rs.groupcompress import RabinGroupCompressor
 
 
 def make_pack_factory(graph, delta, keylength, inconsistency_fatal=True):
