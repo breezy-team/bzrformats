@@ -30,6 +30,7 @@ from bisect import bisect_right
 from io import BytesIO
 
 from . import revision as _mod_revision
+from ._bzr_rs import index as _index_rs
 from .errors import BzrFormatsError
 from .transport import TransportNoSuchFile
 
@@ -295,95 +296,11 @@ class GraphIndexBuilder:
         :returns: cBytesIO holding the full context of the index as it
         should be written to disk.
         """
-        lines = [_SIGNATURE]
-        lines.append(b"%s%d\n" % (_OPTION_NODE_REFS, self.reference_lists))
-        lines.append(b"%s%d\n" % (_OPTION_KEY_ELEMENTS, self._key_length))
-        key_count = len(self._nodes) - len(self._absent_keys)
-        lines.append(b"%s%d\n" % (_OPTION_LEN, key_count))
-        prefix_length = sum(len(x) for x in lines)
-        # references are byte offsets. To avoid having to do nasty
-        # polynomial work to resolve offsets (references to later in the
-        # file cannot be determined until all the inbetween references have
-        # been calculated too) we pad the offsets with 0's to make them be
-        # of consistent length. Using binary offsets would break the trivial
-        # file parsing.
-        # to calculate the width of zero's needed we do three passes:
-        # one to gather all the non-reference data and the number of references.
-        # one to pad all the data with reference-length and determine entry
-        # addresses.
-        # One to serialise.
-
-        # forward sorted by key. In future we may consider topological sorting,
-        # at the cost of table scans for direct lookup, or a second index for
-        # direct lookup
-        nodes = sorted(self._nodes.items())
-        # if we do not prepass, we don't know how long it will be up front.
-        expected_bytes = None
-        # we only need to pre-pass if we have reference lists at all.
-        if self.reference_lists:
-            key_offset_info = []
-            non_ref_bytes = prefix_length
-            total_references = 0
-            # TODO use simple multiplication for the constants in this loop.
-            for key, (absent, references, value) in nodes:
-                # record the offset known *so far* for this key:
-                # the non reference bytes to date, and the total references to
-                # date - saves reaccumulating on the second pass
-                key_offset_info.append((key, non_ref_bytes, total_references))
-                # key is literal, value is literal, there are 3 null's, 1 NL
-                # key is variable length tuple, \x00 between elements
-                non_ref_bytes += sum(len(element) for element in key)
-                if self._key_length > 1:
-                    non_ref_bytes += self._key_length - 1
-                # value is literal bytes, there are 3 null's, 1 NL.
-                non_ref_bytes += len(value) + 3 + 1
-                # one byte for absent if set.
-                if absent:
-                    non_ref_bytes += 1
-                elif self.reference_lists:
-                    # (ref_lists -1) tabs
-                    non_ref_bytes += self.reference_lists - 1
-                    # (ref-1 cr's per ref_list)
-                    for ref_list in references:
-                        # how many references across the whole file?
-                        total_references += len(ref_list)
-                        # accrue reference separators
-                        if ref_list:
-                            non_ref_bytes += len(ref_list) - 1
-            # how many digits are needed to represent the total byte count?
-            digits = 1
-            possible_total_bytes = non_ref_bytes + total_references * digits
-            while 10**digits < possible_total_bytes:
-                digits += 1
-                possible_total_bytes = non_ref_bytes + total_references * digits
-            expected_bytes = possible_total_bytes + 1  # terminating newline
-            # resolve key addresses.
-            key_addresses = {}
-            for key, non_ref_bytes, total_references in key_offset_info:
-                key_addresses[key] = non_ref_bytes + total_references * digits
-            # serialise
-            format_string = b"%%0%dd" % digits
-        for key, (absent, references, value) in nodes:
-            flattened_references = []
-            for ref_list in references:
-                ref_addresses = []
-                for reference in ref_list:
-                    ref_addresses.append(format_string % key_addresses[reference])
-                flattened_references.append(b"\r".join(ref_addresses))
-            string_key = b"\x00".join(key)
-            lines.append(
-                b"%s\x00%s\x00%s\x00%s\n"
-                % (string_key, absent, b"\t".join(flattened_references), value)
+        return BytesIO(
+            _index_rs.serialize_graph_index(
+                self._nodes, self.reference_lists, self._key_length
             )
-        lines.append(b"\n")
-        result = BytesIO(b"".join(lines))
-        if expected_bytes and len(result.getvalue()) != expected_bytes:
-            raise errors.BzrError(
-                "Failed index creation. Internal error:"
-                " mismatched output length and expected length: %d %d"
-                % (len(result.getvalue()), expected_bytes)
-            )
-        return result
+        )
 
     def set_optimize(self, for_size=None, combine_backing_indices=None):
         """Change how the builder tries to optimize the result.
@@ -974,39 +891,20 @@ class GraphIndex:
         :return: An offset, data tuple such as readv yields, for the unparsed
             data. (which may length 0).
         """
-        signature = bytes[0 : len(self._signature())]
-        if not signature == self._signature():
-            raise BadIndexFormatSignature(self._name, GraphIndex)
-        lines = bytes[len(self._signature()) :].splitlines()
-        options_line = lines[0]
-        if not options_line.startswith(_OPTION_NODE_REFS):
-            raise BadIndexOptions(self)
         try:
-            self.node_ref_lists = int(options_line[len(_OPTION_NODE_REFS) :])
-        except ValueError as e:
-            raise BadIndexOptions(self) from e
-        options_line = lines[1]
-        if not options_line.startswith(_OPTION_KEY_ELEMENTS):
-            raise BadIndexOptions(self)
-        try:
-            self._key_length = int(options_line[len(_OPTION_KEY_ELEMENTS) :])
-        except ValueError as e:
-            raise BadIndexOptions(self) from e
-        options_line = lines[2]
-        if not options_line.startswith(_OPTION_LEN):
-            raise BadIndexOptions(self)
-        try:
-            self._key_count = int(options_line[len(_OPTION_LEN) :])
-        except ValueError as e:
-            raise BadIndexOptions(self) from e
-        # calculate the bytes we have processed
-        header_end = len(signature) + len(lines[0]) + len(lines[1]) + len(lines[2]) + 3
+            node_ref_lists, key_length, key_count, header_end = _index_rs.parse_header(
+                bytes
+            )
+        except BadIndexFormatSignature:
+            raise BadIndexFormatSignature(self._name, GraphIndex) from None
+        except BadIndexOptions:
+            raise BadIndexOptions(self) from None
+        self.node_ref_lists = node_ref_lists
+        self._key_length = key_length
+        self._key_count = key_count
         self._parsed_bytes(0, (), header_end, ())
-        # setup parsing state
         self._expected_elements = 3 + self._key_length
-        # raw data keyed by offset
         self._keys_by_offset = {}
-        # keys with the value and node references
         self._bisect_nodes = {}
         return header_end, bytes[header_end:]
 
@@ -1142,40 +1040,11 @@ class GraphIndex:
         return offset + len(trimmed_data), last_segment
 
     def _parse_lines(self, lines, pos):
-        key = None
-        first_key = None
-        trailers = 0
-        nodes = []
-        for line in lines:
-            if line == b"":
-                # must be at the end
-                if self._size and not (self._size == pos + 1):
-                    raise AssertionError(f"{self._size} {pos}")
-                trailers += 1
-                continue
-            elements = line.split(b"\0")
-            if len(elements) != self._expected_elements:
-                raise BadIndexData(self)
-            # keys are tuples. Each element is a string that may occur many
-            # times, so we intern them to save space. AB, RC, 200807
-            key = tuple(elements[: self._key_length])
-            if first_key is None:
-                first_key = key
-            absent, references, value = elements[-3:]
-            ref_lists = []
-            for ref_string in references.split(b"\t"):
-                ref_lists.append(
-                    tuple([int(ref) for ref in ref_string.split(b"\r") if ref])
-                )
-            ref_lists = tuple(ref_lists)
-            self._keys_by_offset[pos] = (key, absent, ref_lists, value)
-            pos += len(line) + 1  # +1 for the \n
-            if absent:
-                continue
-            node_value = (value, ref_lists) if self.node_ref_lists else value
-            nodes.append((key, node_value))
-            # print "parsed ", key
-        return first_key, key, nodes, trailers
+        first_key, last_key, nodes, trailers, keys_by_offset = _index_rs.parse_lines(
+            lines, pos, self._key_length, self.node_ref_lists
+        )
+        self._keys_by_offset.update(keys_by_offset)
+        return first_key, last_key, nodes, trailers
 
     def _parsed_bytes(self, start, start_key, end, end_key):
         """Mark the bytes from start to end as parsed.
