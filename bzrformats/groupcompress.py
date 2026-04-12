@@ -869,7 +869,7 @@ def network_block_to_records(storage_kind, bytes, line_end):
     return manager.get_record_stream()
 
 
-class PyrexGroupCompressor:
+class RabinGroupCompressor:
     """Produce a serialised group of compressed texts.
 
     It contains code very similar to SequenceMatcher because of having a similar
@@ -2312,4 +2312,4 @@ encode_base128_int = groupcompress.encode_base128_int
 
 from ._bzr_rs.groupcompress import DeltaIndex
 
-GroupCompressor = PyrexGroupCompressor  # type: ignore
+GroupCompressor = RabinGroupCompressor
