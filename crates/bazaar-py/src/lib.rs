@@ -20,6 +20,7 @@ mod multiparent;
 mod smart;
 mod textmerge;
 mod versionedfile;
+mod weave;
 
 import_exception!(bzrformats.errors, ReservedId);
 
@@ -547,6 +548,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let multiparentm = multiparent::_multiparent_rs(py)?;
     m.add_submodule(&multiparentm)?;
 
+    let weavem = weave::_weave_rs(py)?;
+    m.add_submodule(&weavem)?;
+
     let versionedfilem = versionedfile::_versionedfile_rs(py)?;
     m.add_submodule(&versionedfilem)?;
 
@@ -570,6 +574,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.smart", module_name), &smartm)?;
     modules.set_item(format!("{}.textmerge", module_name), &textmergem)?;
     modules.set_item(format!("{}.multiparent", module_name), &multiparentm)?;
+    modules.set_item(format!("{}.weave", module_name), &weavem)?;
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
     modules.set_item(
         format!("{}.btree_serializer", module_name),
