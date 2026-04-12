@@ -171,6 +171,46 @@ impl GroupCompressBlock {
         self.content_length
     }
 
+    pub fn z_content_length(&self) -> Option<usize> {
+        self.z_content_length
+    }
+
+    /// Whether a streaming decompressor is currently attached. Mirrors the
+    /// Python class's `_z_content_decompressor is not None` probe; there is
+    /// no way to inspect the decompressor directly, only its presence.
+    pub fn has_z_content_decompressor(&self) -> bool {
+        self.z_content_decompressor.is_some()
+    }
+
+    pub fn compressor(&self) -> Option<CompressorKind> {
+        self.compressor
+    }
+
+    /// Replace the compressor kind. Clears the content cache so the next
+    /// `ensure_content` call rebuilds via the right decoder.
+    pub fn set_compressor(&mut self, kind: CompressorKind) {
+        self.compressor = Some(kind);
+        self.content = None;
+        self.z_content_decompressor = None;
+    }
+
+    /// Replace the compressed-content chunks wholesale. The caller is
+    /// responsible for also calling `set_z_content_length` and
+    /// `set_compressor` so the block can decompress the bytes later.
+    pub fn set_z_content_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+        self.z_content_chunks = Some(chunks);
+        self.content = None;
+        self.z_content_decompressor = None;
+    }
+
+    pub fn set_z_content_length(&mut self, length: usize) {
+        self.z_content_length = Some(length);
+    }
+
+    pub fn set_content_length(&mut self, length: usize) {
+        self.content_length = Some(length);
+    }
+
     /// Make sure that content has been expanded enough.
     ///
     /// # Arguments
@@ -345,8 +385,8 @@ impl GroupCompressBlock {
         match read_item(&mut record)? {
             GroupCompressItem::Fulltext(data) => Ok(vec![data]),
             GroupCompressItem::Delta(delta) => {
-                let reconstructed = apply_delta(content, delta.as_slice())
-                    .map_err(Error::InvalidData)?;
+                let reconstructed =
+                    apply_delta(content, delta.as_slice()).map_err(Error::InvalidData)?;
                 Ok(vec![reconstructed])
             }
         }
@@ -543,7 +583,10 @@ mod tests {
 
     #[test]
     fn compressor_kind_header_round_trip() {
-        assert_eq!(CompressorKind::from_header(GCB_HEADER), Some(CompressorKind::Zlib));
+        assert_eq!(
+            CompressorKind::from_header(GCB_HEADER),
+            Some(CompressorKind::Zlib)
+        );
         assert_eq!(
             CompressorKind::from_header(GCB_LZ_HEADER),
             Some(CompressorKind::Lzma)
@@ -566,6 +609,37 @@ mod tests {
         // — content_length and z_content_length are both None at this point.
         let b = GroupCompressBlock::new();
         assert_eq!(b.len(), 0);
+    }
+
+    #[test]
+    fn manually_initialised_block_decompresses() {
+        // Mirror the Python test pattern that sets z_content_chunks,
+        // z_content_length, compressor, and content_length directly, then
+        // calls ensure_content. This exercises the setter path used by the
+        // PyO3 bindings.
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let body: Vec<u8> = b"partial decomp target content\n".repeat(50);
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        let z_content = encoder.finish().unwrap();
+
+        let mut b = GroupCompressBlock::new();
+        b.set_z_content_chunks(vec![z_content.clone()]);
+        b.set_z_content_length(z_content.len());
+        b.set_compressor(CompressorKind::Zlib);
+        b.set_content_length(body.len());
+
+        // Content is not populated yet.
+        assert!(b.content().is_none());
+        // Partial decompression reveals at least the requested bytes.
+        b.ensure_content(Some(100));
+        assert!(b.content().unwrap().len() >= 100);
+        assert_eq!(&b.content().unwrap()[..100], &body[..100]);
+        // Full decompression recovers the whole body.
+        b.ensure_content(None);
+        assert_eq!(b.content(), Some(body.as_slice()));
     }
 
     #[test]
@@ -751,7 +825,10 @@ mod tests {
         assert_eq!(dump.len(), 1);
         match &dump[0] {
             DumpInfo::Fulltext(Some(text)) => assert_eq!(text.as_slice(), body),
-            _ => panic!("expected Fulltext with text, got {:?}", matches!(dump[0], DumpInfo::Fulltext(_))),
+            _ => panic!(
+                "expected Fulltext with text, got {:?}",
+                matches!(dump[0], DumpInfo::Fulltext(_))
+            ),
         }
     }
 }

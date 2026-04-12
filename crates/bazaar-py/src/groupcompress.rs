@@ -210,6 +210,54 @@ impl GroupCompressBlock {
         self.0.content_length()
     }
 
+    #[setter]
+    fn set__content_length(&mut self, value: usize) {
+        self.0.set_content_length(value);
+    }
+
+    #[getter]
+    fn _z_content_length(&self) -> Option<usize> {
+        self.0.z_content_length()
+    }
+
+    #[setter]
+    fn set__z_content_length(&mut self, value: usize) {
+        self.0.set_z_content_length(value);
+    }
+
+    #[setter]
+    fn set__z_content_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+        self.0.set_z_content_chunks(chunks);
+    }
+
+    /// Test probe: `None` before a streaming decompressor has been created
+    /// (or after full content has been realised directly), otherwise
+    /// `True`. Matches the Python class's `_z_content_decompressor` attr.
+    #[getter]
+    fn _z_content_decompressor(&self) -> Option<bool> {
+        if self.0.has_z_content_decompressor() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    #[setter]
+    fn set__compressor_name(&mut self, name: &str) -> PyResult<()> {
+        let kind = match name {
+            "zlib" => bazaar::groupcompress::block::CompressorKind::Zlib,
+            "lzma" => bazaar::groupcompress::block::CompressorKind::Lzma,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown compressor: {}",
+                    other
+                )));
+            }
+        };
+        self.0.set_compressor(kind);
+        Ok(())
+    }
+
     #[classmethod]
     fn from_bytes(_type: &pyo3::Bound<pyo3::types::PyType>, data: &[u8]) -> PyResult<Self> {
         let ret = bazaar::groupcompress::block::GroupCompressBlock::from_bytes(data);
@@ -221,16 +269,20 @@ impl GroupCompressBlock {
         Ok(Self(ret.unwrap()))
     }
 
+    #[pyo3(signature = (key, start, end, sha1 = None))]
     fn extract<'a>(
         &mut self,
         py: Python<'a>,
-        _key: Py<PyAny>,
-        offset: usize,
-        length: usize,
+        key: Py<PyAny>,
+        start: usize,
+        end: usize,
+        sha1: Option<Py<PyAny>>,
     ) -> PyResult<Vec<Bound<'a, PyBytes>>> {
+        let _ = key;
+        let _ = sha1;
         let chunks = self
             .0
-            .extract(offset, length)
+            .extract(start, end)
             .map_err(|e| PyValueError::new_err(format!("Error during extract: {:?}", e)))?;
         Ok(chunks
             .into_iter()
@@ -240,6 +292,11 @@ impl GroupCompressBlock {
 
     fn set_chunked_content(&mut self, data: Vec<Vec<u8>>, length: usize) -> PyResult<()> {
         self.0.set_chunked_content(data.as_slice(), length);
+        Ok(())
+    }
+
+    fn set_content(&mut self, content: &[u8]) -> PyResult<()> {
+        self.0.set_content(content);
         Ok(())
     }
 
@@ -652,6 +709,7 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(make_rabin_delta))?;
     m.add_wrapped(wrap_pyfunction!(rabin_hash))?;
     m.add_function(wrap_pyfunction!(sort_gc_optimal, &m)?)?;
+    m.add_class::<GroupCompressBlock>()?;
     m.add_class::<LinesDeltaIndex>()?;
     m.add_class::<TraditionalGroupCompressor>()?;
     m.add_class::<RabinGroupCompressor>()?;
