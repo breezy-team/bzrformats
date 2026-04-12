@@ -351,6 +351,76 @@ pub fn read_weave_v5(data: &[u8]) -> Result<WeaveFile, WeaveFileError> {
     Ok(out)
 }
 
+/// Serialize a [`WeaveFile`] to the v5 on-disk byte format. Mirrors
+/// `bzrformats.weavefile.write_weave_v5`.
+pub fn write_weave_v5(wf: &WeaveFile) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(WEAVE_V5_FORMAT);
+
+    for version in 0..wf.parents.len() {
+        let parents = &wf.parents[version];
+        if parents.is_empty() {
+            out.extend_from_slice(b"i\n");
+        } else {
+            out.extend_from_slice(b"i ");
+            for (i, &p) in parents.iter().enumerate() {
+                if i > 0 {
+                    out.push(b' ');
+                }
+                out.extend_from_slice(p.to_string().as_bytes());
+            }
+            out.push(b'\n');
+        }
+        out.extend_from_slice(b"1 ");
+        out.extend_from_slice(&wf.sha1s[version]);
+        out.push(b'\n');
+        out.extend_from_slice(b"n ");
+        out.extend_from_slice(&wf.names[version]);
+        out.push(b'\n');
+        out.push(b'\n');
+    }
+
+    out.extend_from_slice(b"w\n");
+
+    for entry in &wf.weave {
+        match entry {
+            WeaveEntry::Control { op, version } => match op {
+                Instruction::InsertClose => out.extend_from_slice(b"}\n"),
+                Instruction::InsertOpen => {
+                    out.extend_from_slice(b"{ ");
+                    out.extend_from_slice(version.to_string().as_bytes());
+                    out.push(b'\n');
+                }
+                Instruction::DeleteOpen => {
+                    out.extend_from_slice(b"[ ");
+                    out.extend_from_slice(version.to_string().as_bytes());
+                    out.push(b'\n');
+                }
+                Instruction::DeleteClose => {
+                    out.extend_from_slice(b"] ");
+                    out.extend_from_slice(version.to_string().as_bytes());
+                    out.push(b'\n');
+                }
+            },
+            WeaveEntry::Line(line) => {
+                if line.is_empty() {
+                    out.extend_from_slice(b", \n");
+                } else if line.last() == Some(&b'\n') {
+                    out.extend_from_slice(b". ");
+                    out.extend_from_slice(line);
+                } else {
+                    out.extend_from_slice(b", ");
+                    out.extend_from_slice(line);
+                    out.push(b'\n');
+                }
+            }
+        }
+    }
+
+    out.extend_from_slice(b"W\n");
+    out
+}
+
 /// Split `data` on `\n`, keeping the newline at the end of each line except
 /// the last. Mirrors Python's `readlines()` semantics.
 fn split_with_newlines(data: &[u8]) -> Vec<&[u8]> {
@@ -715,6 +785,88 @@ mod tests {
     fn read_weave_v5_rejects_truncated_after_header() {
         let err = read_weave_v5(WEAVE_V5_FORMAT).unwrap_err();
         assert_eq!(err, WeaveFileError::UnexpectedEof);
+    }
+
+    fn sample_weave_file() -> WeaveFile {
+        WeaveFile {
+            parents: vec![vec![], vec![0], vec![0, 1]],
+            sha1s: vec![
+                b"1111111111111111111111111111111111111111".to_vec(),
+                b"2222222222222222222222222222222222222222".to_vec(),
+                b"3333333333333333333333333333333333333333".to_vec(),
+            ],
+            names: vec![b"text0".to_vec(), b"text1".to_vec(), b"merge".to_vec()],
+            weave: vec![
+                WeaveEntry::Control {
+                    op: Instruction::InsertOpen,
+                    version: 0,
+                },
+                WeaveEntry::Line(b"hello\n".to_vec()),
+                WeaveEntry::Line(b"no-eol".to_vec()),
+                WeaveEntry::Control {
+                    op: Instruction::InsertClose,
+                    version: 0,
+                },
+                WeaveEntry::Control {
+                    op: Instruction::DeleteOpen,
+                    version: 1,
+                },
+                WeaveEntry::Line(b"".to_vec()),
+                WeaveEntry::Control {
+                    op: Instruction::DeleteClose,
+                    version: 1,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn write_weave_v5_shape() {
+        let expected: Vec<u8> = [
+            b"# bzr weave file v5\n".as_slice(),
+            b"i\n1 1111111111111111111111111111111111111111\nn text0\n\n",
+            b"i 0\n1 2222222222222222222222222222222222222222\nn text1\n\n",
+            b"i 0 1\n1 3333333333333333333333333333333333333333\nn merge\n\n",
+            b"w\n",
+            b"{ 0\n. hello\n, no-eol\n}\n",
+            b"[ 1\n, \n] 1\n",
+            b"W\n",
+        ]
+        .concat();
+        assert_eq!(write_weave_v5(&sample_weave_file()), expected);
+    }
+
+    #[test]
+    fn weave_file_round_trip() {
+        let wf = sample_weave_file();
+        let bytes = write_weave_v5(&wf);
+        let parsed = read_weave_v5(&bytes).unwrap();
+        assert_eq!(parsed, wf);
+    }
+
+    #[test]
+    fn weave_file_round_trip_minimal() {
+        let wf = WeaveFile {
+            parents: vec![vec![]],
+            sha1s: vec![b"a".to_vec()],
+            names: vec![b"v0".to_vec()],
+            weave: vec![],
+        };
+        let bytes = write_weave_v5(&wf);
+        assert_eq!(read_weave_v5(&bytes).unwrap(), wf);
+    }
+
+    #[test]
+    fn weave_file_round_trip_empty_weave_body() {
+        // No instructions and no literal lines — just metadata then `w\nW\n`.
+        let wf = WeaveFile {
+            parents: vec![vec![], vec![0]],
+            sha1s: vec![b"x".to_vec(), b"y".to_vec()],
+            names: vec![b"a".to_vec(), b"b".to_vec()],
+            weave: vec![],
+        };
+        let bytes = write_weave_v5(&wf);
+        assert_eq!(read_weave_v5(&bytes).unwrap(), wf);
     }
 
     #[test]
