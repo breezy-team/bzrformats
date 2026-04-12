@@ -242,7 +242,11 @@ impl GroupCompressBlock {
         // This is the maximum number of bytes this object will reference if
         // everything is decompressed. However, if we decompress less than
         // everything... (this would cause some problems for LRUSizeCache)
-        self.content_length.unwrap() + self.z_content_length.unwrap()
+        //
+        // Either field may be `None` on a freshly-constructed block or after
+        // set_content before to_chunks has been called — treat those as 0
+        // rather than panicking, matching the Python class.
+        self.content_length.unwrap_or(0) + self.z_content_length.unwrap_or(0)
     }
 
     pub fn parse_bytes(&mut self, mut data: &[u8]) -> Result<(), Error> {
@@ -557,6 +561,24 @@ mod tests {
     }
 
     #[test]
+    fn new_block_len_is_zero() {
+        // A freshly constructed block must report length 0 without panicking
+        // — content_length and z_content_length are both None at this point.
+        let b = GroupCompressBlock::new();
+        assert_eq!(b.len(), 0);
+    }
+
+    #[test]
+    fn len_after_set_content_reports_content_length() {
+        let body = b"abc\n";
+        let mut b = GroupCompressBlock::new();
+        b.set_content(body);
+        // z_content_length is still None until to_bytes/to_chunks builds it,
+        // so len() should at least not panic and should reflect the content.
+        assert!(b.len() >= body.len());
+    }
+
+    #[test]
     fn set_content_round_trip_via_to_bytes_and_from_bytes() {
         let body = b"hello world\nthis is a single fulltext\n";
         let record = make_fulltext_record(body);
@@ -664,6 +686,29 @@ mod tests {
         assert_eq!(dump.len(), 2);
         assert!(matches!(dump[0], DumpInfo::Fulltext(None)));
         assert!(matches!(dump[1], DumpInfo::Fulltext(None)));
+    }
+
+    #[test]
+    fn ensure_content_is_idempotent() {
+        // Calling ensure_content twice with the same limit must be a no-op
+        // on the second call — the early-return path when content.len() is
+        // already at the requested size.
+        let body: Vec<u8> = b"some compressible content\n".repeat(200);
+        let record = make_fulltext_record(&body);
+
+        let mut src = GroupCompressBlock::new();
+        src.set_content(&record);
+        let raw = src.to_bytes();
+
+        let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
+        parsed.ensure_content(None);
+        let first = parsed.content().unwrap().to_vec();
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content().unwrap(), first.as_slice());
+
+        // And a partial request below the current length is likewise a no-op.
+        parsed.ensure_content(Some(10));
+        assert_eq!(parsed.content().unwrap(), first.as_slice());
     }
 
     #[test]
