@@ -40,7 +40,6 @@ from .osutils import sha_strings
 from .versionedfile import (
     AbsentContentFactory,
     ChunkedContentFactory,
-    ExistingContent,
     UnavailableRepresentation,
     VersionedFilesWithFallbacks,
     _KeyRefs,
@@ -1759,6 +1758,5 @@ decode_base128_int = groupcompress.decode_base128_int
 decode_copy_instruction = groupcompress.decode_copy_instruction
 encode_base128_int = groupcompress.encode_base128_int
 
-from ._bzr_rs.groupcompress import DeltaIndex
 
 GroupCompressor = RabinGroupCompressor

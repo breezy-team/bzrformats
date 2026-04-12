@@ -24,7 +24,7 @@ from testscenarios import load_tests_apply_scenarios
 from .. import btree_index, groupcompress, knit, osutils, versionedfile
 from .. import index as _mod_index
 from ..osutils import sha_string
-from . import TestCase, TestCaseWithMemoryTransport, TestNotApplicable
+from . import TestCase, TestCaseWithMemoryTransport
 
 
 def group_compress_implementation_scenarios():
@@ -826,9 +826,7 @@ class TestGroupCompressConfig(TestCaseWithMemoryTransport):
         vf = self.make_test_vf()
         gc = vf._make_group_compressor()
         self.assertEqual(vf._DEFAULT_MAX_BYTES_TO_INDEX, vf._max_bytes_to_index)
-        self.assertEqual(
-            vf._DEFAULT_MAX_BYTES_TO_INDEX, gc._max_bytes_to_index
-        )
+        self.assertEqual(vf._DEFAULT_MAX_BYTES_TO_INDEX, gc._max_bytes_to_index)
 
     def test_max_bytes_to_index_set_directly(self):
         vf = self.make_test_vf()
