@@ -1,11 +1,53 @@
 //! Weave storage core algorithms.
 //!
-//! Port of the pure-logic core of `bzrformats/weave.py`. A weave is a single
+//! Port of the pure-logic core of `bzrformats/weave.py` plus the v5 on-disk
+//! format reader/writer from `bzrformats/weavefile.py`. A weave is a single
 //! flat sequence of [`WeaveEntry`] items: literal lines plus bracketed
 //! insertion/deletion instructions. This module implements the annotation
-//! walk (`extract`) against that representation. The Python class still
+//! walk (`extract`) against that representation, plus [`read_weave_v5`]
+//! and [`write_weave_v5`] for the on-disk format. The Python class still
 //! owns I/O, parent/name bookkeeping, and the higher-level VersionedFile
 //! surface.
+
+/// Magic header for the v5 weave file format.
+pub const WEAVE_V5_FORMAT: &[u8] = b"# bzr weave file v5\n";
+
+/// A deserialized weave file: per-version metadata plus the flat weave
+/// instruction/line stream.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WeaveFile {
+    pub parents: Vec<Vec<usize>>,
+    pub sha1s: Vec<Vec<u8>>,
+    pub names: Vec<Vec<u8>>,
+    pub weave: Vec<WeaveEntry>,
+}
+
+/// Errors from reading a v5 weave file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WeaveFileError {
+    /// The file was empty or its first line wasn't the magic header.
+    BadHeader(Vec<u8>),
+    /// The file ended mid-record.
+    UnexpectedEof,
+    /// A header or body line didn't match any known form.
+    UnexpectedLine(Vec<u8>),
+    /// A numeric field (parent index, instruction version) couldn't be
+    /// parsed as a decimal integer.
+    InvalidInteger(Vec<u8>),
+}
+
+impl std::fmt::Display for WeaveFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WeaveFileError::BadHeader(l) => write!(f, "invalid weave file header: {:?}", l),
+            WeaveFileError::UnexpectedEof => write!(f, "unexpected end of weave file"),
+            WeaveFileError::UnexpectedLine(l) => write!(f, "unexpected line {:?}", l),
+            WeaveFileError::InvalidInteger(s) => write!(f, "not a valid integer: {:?}", s),
+        }
+    }
+}
+
+impl std::error::Error for WeaveFileError {}
 
 /// Instruction bracket kind in a weave entry stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +262,197 @@ pub fn walk_internal(weave: &[WeaveEntry]) -> Result<Vec<WalkLine<'_>>, WeaveErr
     Ok(result)
 }
 
+/// Parse a v5 weave file from its raw bytes. Mirrors
+/// `bzrformats.weavefile._read_weave_v5`.
+pub fn read_weave_v5(data: &[u8]) -> Result<WeaveFile, WeaveFileError> {
+    let lines = split_with_newlines(data);
+    let mut iter = lines.into_iter();
+
+    let first = iter.next().ok_or(WeaveFileError::UnexpectedEof)?;
+    if first != WEAVE_V5_FORMAT {
+        return Err(WeaveFileError::BadHeader(first.to_vec()));
+    }
+
+    let mut out = WeaveFile::default();
+
+    // Per-version metadata: `i[ parents...]`, `1 sha1`, `n name`, blank.
+    loop {
+        let line = iter.next().ok_or(WeaveFileError::UnexpectedEof)?;
+        if line == b"w\n" {
+            break;
+        }
+        if line.first() == Some(&b'i') {
+            // `b"i\n"` is no-parents; `b"i <int>( <int>)*\n"` is a parent list.
+            let ps = if line.len() > 2 {
+                let trimmed = trim_trailing_newline(&line[2..]);
+                let mut result = Vec::new();
+                for part in trimmed.split(|&b| b == b' ') {
+                    result.push(parse_usize(part)?);
+                }
+                result
+            } else {
+                Vec::new()
+            };
+            out.parents.push(ps);
+
+            let sha1_line = iter.next().ok_or(WeaveFileError::UnexpectedEof)?;
+            out.sha1s
+                .push(trim_trailing_newline(&sha1_line[2..]).to_vec());
+
+            let name_line = iter.next().ok_or(WeaveFileError::UnexpectedEof)?;
+            out.names
+                .push(trim_trailing_newline(&name_line[2..]).to_vec());
+
+            // Consume the trailing blank line between records.
+            iter.next().ok_or(WeaveFileError::UnexpectedEof)?;
+        } else {
+            return Err(WeaveFileError::UnexpectedLine(line.to_vec()));
+        }
+    }
+
+    // Body: weave entries terminated by `W\n`.
+    loop {
+        let line = iter.next().ok_or(WeaveFileError::UnexpectedEof)?;
+        if line == b"W\n" {
+            break;
+        }
+        if line.starts_with(b". ") {
+            // Literal line that includes its trailing newline.
+            out.weave.push(WeaveEntry::Line(line[2..].to_vec()));
+        } else if line.starts_with(b", ") {
+            // Literal line that doesn't end in a newline — strip the wrapper.
+            out.weave
+                .push(WeaveEntry::Line(trim_trailing_newline(&line[2..]).to_vec()));
+        } else if line == b"}\n" {
+            out.weave.push(WeaveEntry::Control {
+                op: Instruction::InsertClose,
+                version: 0,
+            });
+        } else {
+            let tag = *line
+                .first()
+                .ok_or_else(|| WeaveFileError::UnexpectedLine(line.to_vec()))?;
+            let op = match tag {
+                b'{' => Instruction::InsertOpen,
+                b'[' => Instruction::DeleteOpen,
+                b']' => Instruction::DeleteClose,
+                _ => return Err(WeaveFileError::UnexpectedLine(line.to_vec())),
+            };
+            // The version number is ASCII digits after `"X "` up to the
+            // trailing `\n`.
+            if line.len() < 3 || line[1] != b' ' {
+                return Err(WeaveFileError::UnexpectedLine(line.to_vec()));
+            }
+            let version = parse_usize(trim_trailing_newline(&line[2..]))?;
+            out.weave.push(WeaveEntry::Control { op, version });
+        }
+    }
+
+    Ok(out)
+}
+
+/// Serialize a [`WeaveFile`] to the v5 on-disk byte format. Mirrors
+/// `bzrformats.weavefile.write_weave_v5`.
+pub fn write_weave_v5(wf: &WeaveFile) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(WEAVE_V5_FORMAT);
+
+    for version in 0..wf.parents.len() {
+        let parents = &wf.parents[version];
+        if parents.is_empty() {
+            out.extend_from_slice(b"i\n");
+        } else {
+            out.extend_from_slice(b"i ");
+            for (i, &p) in parents.iter().enumerate() {
+                if i > 0 {
+                    out.push(b' ');
+                }
+                out.extend_from_slice(p.to_string().as_bytes());
+            }
+            out.push(b'\n');
+        }
+        out.extend_from_slice(b"1 ");
+        out.extend_from_slice(&wf.sha1s[version]);
+        out.push(b'\n');
+        out.extend_from_slice(b"n ");
+        out.extend_from_slice(&wf.names[version]);
+        out.push(b'\n');
+        out.push(b'\n');
+    }
+
+    out.extend_from_slice(b"w\n");
+
+    for entry in &wf.weave {
+        match entry {
+            WeaveEntry::Control { op, version } => match op {
+                Instruction::InsertClose => out.extend_from_slice(b"}\n"),
+                Instruction::InsertOpen => {
+                    out.extend_from_slice(b"{ ");
+                    out.extend_from_slice(version.to_string().as_bytes());
+                    out.push(b'\n');
+                }
+                Instruction::DeleteOpen => {
+                    out.extend_from_slice(b"[ ");
+                    out.extend_from_slice(version.to_string().as_bytes());
+                    out.push(b'\n');
+                }
+                Instruction::DeleteClose => {
+                    out.extend_from_slice(b"] ");
+                    out.extend_from_slice(version.to_string().as_bytes());
+                    out.push(b'\n');
+                }
+            },
+            WeaveEntry::Line(line) => {
+                if line.is_empty() {
+                    out.extend_from_slice(b", \n");
+                } else if line.last() == Some(&b'\n') {
+                    out.extend_from_slice(b". ");
+                    out.extend_from_slice(line);
+                } else {
+                    out.extend_from_slice(b", ");
+                    out.extend_from_slice(line);
+                    out.push(b'\n');
+                }
+            }
+        }
+    }
+
+    out.extend_from_slice(b"W\n");
+    out
+}
+
+/// Split `data` on `\n`, keeping the newline at the end of each line except
+/// the last. Mirrors Python's `readlines()` semantics.
+fn split_with_newlines(data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b == b'\n' {
+            out.push(&data[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < data.len() {
+        out.push(&data[start..]);
+    }
+    out
+}
+
+fn trim_trailing_newline(line: &[u8]) -> &[u8] {
+    if line.last() == Some(&b'\n') {
+        &line[..line.len() - 1]
+    } else {
+        line
+    }
+}
+
+fn parse_usize(bytes: &[u8]) -> Result<usize, WeaveFileError> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .ok_or_else(|| WeaveFileError::InvalidInteger(bytes.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +656,217 @@ mod tests {
                 (2, b"line from 2"),
             ]
         );
+    }
+
+    #[test]
+    fn read_weave_v5_minimal() {
+        // One version, no parents, one literal line.
+        let mut data = WEAVE_V5_FORMAT.to_vec();
+        data.extend_from_slice(b"i\n1 0000000000000000000000000000000000000000\nn text0\n\n");
+        data.extend_from_slice(b"w\n");
+        data.extend_from_slice(b"{ 0\n. hello\n}\n");
+        data.extend_from_slice(b"W\n");
+
+        let wf = read_weave_v5(&data).unwrap();
+        assert_eq!(wf.parents, vec![Vec::<usize>::new()]);
+        assert_eq!(
+            wf.sha1s,
+            vec![b"0000000000000000000000000000000000000000".to_vec()]
+        );
+        assert_eq!(wf.names, vec![b"text0".to_vec()]);
+        assert_eq!(
+            wf.weave,
+            vec![
+                WeaveEntry::Control {
+                    op: Instruction::InsertOpen,
+                    version: 0,
+                },
+                WeaveEntry::Line(b"hello\n".to_vec()),
+                WeaveEntry::Control {
+                    op: Instruction::InsertClose,
+                    version: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn read_weave_v5_with_parents_and_no_eol_line() {
+        // Two versions: the second has parent 0, and the body contains a
+        // `", "` line (no trailing newline) plus a deletion bracket.
+        let mut data = WEAVE_V5_FORMAT.to_vec();
+        data.extend_from_slice(b"i\n1 aaa\nn text0\n\n");
+        data.extend_from_slice(b"i 0\n1 bbb\nn text1\n\n");
+        data.extend_from_slice(b"w\n");
+        data.extend_from_slice(b"{ 0\n. line\n, noeol\n}\n");
+        data.extend_from_slice(b"[ 1\n, gone\n] 1\n");
+        data.extend_from_slice(b"W\n");
+
+        let wf = read_weave_v5(&data).unwrap();
+        assert_eq!(wf.parents, vec![Vec::<usize>::new(), vec![0]]);
+        assert_eq!(wf.sha1s, vec![b"aaa".to_vec(), b"bbb".to_vec()]);
+        assert_eq!(wf.names, vec![b"text0".to_vec(), b"text1".to_vec()]);
+        assert_eq!(
+            wf.weave,
+            vec![
+                WeaveEntry::Control {
+                    op: Instruction::InsertOpen,
+                    version: 0,
+                },
+                WeaveEntry::Line(b"line\n".to_vec()),
+                WeaveEntry::Line(b"noeol".to_vec()),
+                WeaveEntry::Control {
+                    op: Instruction::InsertClose,
+                    version: 0,
+                },
+                WeaveEntry::Control {
+                    op: Instruction::DeleteOpen,
+                    version: 1,
+                },
+                WeaveEntry::Line(b"gone".to_vec()),
+                WeaveEntry::Control {
+                    op: Instruction::DeleteClose,
+                    version: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn read_weave_v5_multiple_parents_on_one_version() {
+        // Version 2 has parents [0, 1].
+        let mut data = WEAVE_V5_FORMAT.to_vec();
+        data.extend_from_slice(b"i\n1 a\nn v0\n\n");
+        data.extend_from_slice(b"i 0\n1 b\nn v1\n\n");
+        data.extend_from_slice(b"i 0 1\n1 c\nn v2\n\n");
+        data.extend_from_slice(b"w\nW\n");
+
+        let wf = read_weave_v5(&data).unwrap();
+        assert_eq!(wf.parents, vec![vec![], vec![0], vec![0, 1]]);
+        assert_eq!(wf.weave, Vec::<WeaveEntry>::new());
+    }
+
+    #[test]
+    fn read_weave_v5_empty_line_roundtrips_to_empty_bytes() {
+        // The `", "` form with an empty payload represents an empty line.
+        let mut data = WEAVE_V5_FORMAT.to_vec();
+        data.extend_from_slice(b"i\n1 a\nn v0\n\n");
+        data.extend_from_slice(b"w\n{ 0\n, \n}\nW\n");
+
+        let wf = read_weave_v5(&data).unwrap();
+        assert_eq!(
+            wf.weave,
+            vec![
+                WeaveEntry::Control {
+                    op: Instruction::InsertOpen,
+                    version: 0,
+                },
+                WeaveEntry::Line(b"".to_vec()),
+                WeaveEntry::Control {
+                    op: Instruction::InsertClose,
+                    version: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn read_weave_v5_rejects_bad_header() {
+        let err = read_weave_v5(b"not-a-weave\n").unwrap_err();
+        assert!(matches!(err, WeaveFileError::BadHeader(_)));
+    }
+
+    #[test]
+    fn read_weave_v5_rejects_empty_input() {
+        assert_eq!(read_weave_v5(b""), Err(WeaveFileError::UnexpectedEof));
+    }
+
+    #[test]
+    fn read_weave_v5_rejects_truncated_after_header() {
+        let err = read_weave_v5(WEAVE_V5_FORMAT).unwrap_err();
+        assert_eq!(err, WeaveFileError::UnexpectedEof);
+    }
+
+    fn sample_weave_file() -> WeaveFile {
+        WeaveFile {
+            parents: vec![vec![], vec![0], vec![0, 1]],
+            sha1s: vec![
+                b"1111111111111111111111111111111111111111".to_vec(),
+                b"2222222222222222222222222222222222222222".to_vec(),
+                b"3333333333333333333333333333333333333333".to_vec(),
+            ],
+            names: vec![b"text0".to_vec(), b"text1".to_vec(), b"merge".to_vec()],
+            weave: vec![
+                WeaveEntry::Control {
+                    op: Instruction::InsertOpen,
+                    version: 0,
+                },
+                WeaveEntry::Line(b"hello\n".to_vec()),
+                WeaveEntry::Line(b"no-eol".to_vec()),
+                WeaveEntry::Control {
+                    op: Instruction::InsertClose,
+                    version: 0,
+                },
+                WeaveEntry::Control {
+                    op: Instruction::DeleteOpen,
+                    version: 1,
+                },
+                WeaveEntry::Line(b"".to_vec()),
+                WeaveEntry::Control {
+                    op: Instruction::DeleteClose,
+                    version: 1,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn write_weave_v5_shape() {
+        let expected: Vec<u8> = [
+            b"# bzr weave file v5\n".as_slice(),
+            b"i\n1 1111111111111111111111111111111111111111\nn text0\n\n",
+            b"i 0\n1 2222222222222222222222222222222222222222\nn text1\n\n",
+            b"i 0 1\n1 3333333333333333333333333333333333333333\nn merge\n\n",
+            b"w\n",
+            b"{ 0\n. hello\n, no-eol\n}\n",
+            b"[ 1\n, \n] 1\n",
+            b"W\n",
+        ]
+        .concat();
+        assert_eq!(write_weave_v5(&sample_weave_file()), expected);
+    }
+
+    #[test]
+    fn weave_file_round_trip() {
+        let wf = sample_weave_file();
+        let bytes = write_weave_v5(&wf);
+        let parsed = read_weave_v5(&bytes).unwrap();
+        assert_eq!(parsed, wf);
+    }
+
+    #[test]
+    fn weave_file_round_trip_minimal() {
+        let wf = WeaveFile {
+            parents: vec![vec![]],
+            sha1s: vec![b"a".to_vec()],
+            names: vec![b"v0".to_vec()],
+            weave: vec![],
+        };
+        let bytes = write_weave_v5(&wf);
+        assert_eq!(read_weave_v5(&bytes).unwrap(), wf);
+    }
+
+    #[test]
+    fn weave_file_round_trip_empty_weave_body() {
+        // No instructions and no literal lines — just metadata then `w\nW\n`.
+        let wf = WeaveFile {
+            parents: vec![vec![], vec![0]],
+            sha1s: vec![b"x".to_vec(), b"y".to_vec()],
+            names: vec![b"a".to_vec(), b"b".to_vec()],
+            weave: vec![],
+        };
+        let bytes = write_weave_v5(&wf);
+        assert_eq!(read_weave_v5(&bytes).unwrap(), wf);
     }
 
     #[test]

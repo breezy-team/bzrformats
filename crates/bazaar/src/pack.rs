@@ -525,6 +525,23 @@ mod tests {
     }
 
     #[test]
+    fn parser_multiple_empty_records_at_once() {
+        // Mirrors test_pack.test_multiple_empty_records_at_once. Two
+        // zero-body records fed in one chunk must both drain — the
+        // progress check needs to account for state transitions, not
+        // just buffer shrinkage, since an empty body consumes no bytes.
+        let data = make_container(&[(&[&[b"name1"]], b""), (&[&[b"name2"]], b"")]);
+        let mut p = ContainerPushParser::new();
+        p.accept_bytes(&data).unwrap();
+        let records = p.read_pending_records(None);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].1, b"");
+        assert_eq!(records[1].1, b"");
+        assert_eq!(records[0].0, vec![vec![b"name1".to_vec()]]);
+        assert_eq!(records[1].0, vec![vec![b"name2".to_vec()]]);
+    }
+
+    #[test]
     fn parser_accept_empty_bytes_is_a_noop() {
         // Mirrors test_accept_nothing: feeding an empty slice shouldn't
         // crash or advance state.

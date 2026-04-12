@@ -5,6 +5,7 @@ use std::fmt::{Debug, Error, Formatter};
 pub const DEFAULT_CHUNK_SIZE: usize = 4096;
 
 pub mod bencode_serializer;
+pub mod btree_index;
 pub mod chk_inventory;
 pub mod chk_map;
 pub mod dirstate;
@@ -13,6 +14,7 @@ pub mod gen_ids;
 pub mod globbing;
 pub mod groupcompress;
 pub mod hashcache;
+pub mod index;
 pub mod inventory;
 pub mod inventory_delta;
 pub mod knit;
