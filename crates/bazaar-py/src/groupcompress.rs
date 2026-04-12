@@ -598,6 +598,27 @@ fn max_bytes_from_settings(settings: Option<&Bound<PyAny>>) -> PyResult<Option<u
     Ok(if v == 0 { None } else { Some(v) })
 }
 
+impl RabinGroupCompressor {
+    /// Construct a `GroupCompressBlock` Py wrapper around the compressed
+    /// chunks produced by a flush. Factored out so `flush` and
+    /// `flush_without_last` share the plumbing.
+    fn build_block<'a>(
+        py: Python<'a>,
+        chunks: Vec<Vec<u8>>,
+        endpoint: usize,
+    ) -> PyResult<Bound<'a, GroupCompressBlock>> {
+        let mut inner = bazaar::groupcompress::block::GroupCompressBlock::new();
+        inner.set_chunked_content(&chunks, endpoint);
+        Bound::new(
+            py,
+            GroupCompressBlock {
+                inner,
+                z_content_cache: None,
+            },
+        )
+    }
+}
+
 #[pymethods]
 impl RabinGroupCompressor {
     #[new]
@@ -690,39 +711,27 @@ impl RabinGroupCompressor {
         }
     }
 
-    fn flush<'a>(&mut self, py: Python<'a>) -> PyResult<(Vec<Bound<'a, PyBytes>>, usize)> {
+    /// Finish this group, returning a GroupCompressBlock containing the
+    /// compressed chunks.
+    fn flush<'a>(&mut self, py: Python<'a>) -> PyResult<Bound<'a, GroupCompressBlock>> {
         use bazaar::groupcompress::compressor::GroupCompressor;
-        if let Some(c) = self.0.take() {
-            let (chunks, endpoint) = c.flush();
-            Ok((
-                chunks
-                    .into_iter()
-                    .map(|x| PyBytes::new(py, x.as_ref()))
-                    .collect(),
-                endpoint,
-            ))
-        } else {
-            Err(PyRuntimeError::new_err("Compressor is already finalized"))
-        }
+        let Some(c) = self.0.take() else {
+            return Err(PyRuntimeError::new_err("Compressor is already finalized"));
+        };
+        let (chunks, endpoint) = c.flush();
+        Self::build_block(py, chunks, endpoint)
     }
 
     fn flush_without_last<'a>(
         &mut self,
         py: Python<'a>,
-    ) -> PyResult<(Vec<Bound<'a, PyBytes>>, usize)> {
+    ) -> PyResult<Bound<'a, GroupCompressBlock>> {
         use bazaar::groupcompress::compressor::GroupCompressor;
-        if let Some(c) = self.0.take() {
-            let (chunks, endpoint) = c.flush_without_last();
-            Ok((
-                chunks
-                    .into_iter()
-                    .map(|x| PyBytes::new(py, x.as_ref()))
-                    .collect(),
-                endpoint,
-            ))
-        } else {
-            Err(PyRuntimeError::new_err("Compressor is already finalized"))
-        }
+        let Some(c) = self.0.take() else {
+            return Err(PyRuntimeError::new_err("Compressor is already finalized"));
+        };
+        let (chunks, endpoint) = c.flush_without_last();
+        Self::build_block(py, chunks, endpoint)
     }
 
     #[pyo3(signature = (key, chunks, length, expected_sha = None, nostore_sha = None, soft = None))]
