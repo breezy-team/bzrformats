@@ -737,7 +737,10 @@ same rabin hash
         assert_eq!(idx.source_offset(), header_len + TEXT1.len());
 
         idx.add_source(TEXT2.to_vec(), header_len);
-        assert_eq!(idx.source_offset(), 2 * (header_len + TEXT1.len()) - TEXT1.len() + TEXT2.len());
+        assert_eq!(
+            idx.source_offset(),
+            2 * (header_len + TEXT1.len()) - TEXT1.len() + TEXT2.len()
+        );
     }
 
     #[test]
@@ -756,7 +759,10 @@ same rabin hash
         // mini-header length and the delta payload.
         let header_len = 4;
         idx.add_delta_source(delta.clone(), header_len).unwrap();
-        assert_eq!(idx.source_offset(), initial_offset + header_len + delta.len());
+        assert_eq!(
+            idx.source_offset(),
+            initial_offset + header_len + delta.len()
+        );
         assert_eq!(idx.num_sources(), 2);
         assert!(!idx.is_empty());
 
@@ -777,8 +783,7 @@ same rabin hash
 
         let delta = idx.make_delta(TEXT3, 0).unwrap().expect("delta");
         let basis = [TEXT1, TEXT3].concat();
-        let reconstructed =
-            super::super::delta::apply_delta(&basis, &delta).unwrap();
+        let reconstructed = super::super::delta::apply_delta(&basis, &delta).unwrap();
         assert_eq!(reconstructed.as_slice(), TEXT3);
     }
 
