@@ -21,6 +21,7 @@ import os
 from io import BytesIO
 
 from . import errors
+from ._bzr_rs import multiparent as _multiparent_rs
 
 
 def topo_iter_keys(vf, keys=None):
@@ -40,32 +41,7 @@ def topo_iter(vf, versions=None):
 
 
 def _topo_iter(parents, versions):
-    seen = set()
-    descendants = {}
-
-    def pending_parents(version):
-        if parents[version] is None:
-            return []
-        return [v for v in parents[version] if v in versions and v not in seen]
-
-    for version_id in versions:
-        if parents[version_id] is None:
-            # parentless
-            continue
-        for parent_id in parents[version_id]:
-            descendants.setdefault(parent_id, []).append(version_id)
-    cur = [v for v in versions if len(pending_parents(v)) == 0]
-    while len(cur) > 0:
-        next = []
-        for version_id in cur:
-            if version_id in seen:
-                continue
-            if len(pending_parents(version_id)) != 0:
-                continue
-            next.extend(descendants.get(version_id, []))
-            yield version_id
-            seen.add(version_id)
-        cur = next
+    return iter(_multiparent_rs.topo_iter(parents, versions))
 
 
 class MultiParent:
@@ -183,12 +159,11 @@ class MultiParent:
 
     def to_patch(self):
         """Yield text lines for a patch."""
-        for hunk in self.hunks:
-            yield from hunk.to_patch()
+        yield from _multiparent_rs.to_patch(self.hunks)
 
     def patch_len(self):
         """Return the length of the patch."""
-        return len(b"".join(self.to_patch()))
+        return sum(len(chunk) for chunk in _multiparent_rs.to_patch(self.hunks))
 
     def zipped_patch_len(self):
         """Return the length of the gzipped patch."""
@@ -197,35 +172,13 @@ class MultiParent:
     @classmethod
     def from_patch(cls, text):
         """Create a MultiParent from its string form."""
-        return cls._from_patch(BytesIO(text))
-
-    @staticmethod
-    def _from_patch(lines):
-        r"""This is private because it is essential to split lines on \n only."""
-        line_iter = iter(lines)
         hunks = []
-        cur_line = None
-        while True:
-            try:
-                cur_line = next(line_iter)
-            except StopIteration:
-                break
-            first_char = cur_line[0:1]
-            if first_char == b"i":
-                num_lines = int(cur_line.split(b" ")[1])
-                hunk_lines = [next(line_iter) for _ in range(num_lines)]
-                hunk_lines[-1] = hunk_lines[-1][:-1]
-                hunks.append(NewText(hunk_lines))
-            elif first_char == b"\n":
-                hunks[-1].lines[-1] += b"\n"
+        for kind, payload in _multiparent_rs.parse_patch(bytes(text)):
+            if kind == b"n":
+                hunks.append(NewText(payload))
             else:
-                if not (first_char == b"c"):
-                    raise AssertionError(first_char)
-                parent, parent_pos, child_pos, num_lines = (
-                    int(v) for v in cur_line.split(b" ")[1:]
-                )
-                hunks.append(ParentText(parent, parent_pos, child_pos, num_lines))
-        return MultiParent(hunks)
+                hunks.append(ParentText(*payload))
+        return cls(hunks)
 
     def range_iterator(self):
         """Iterate through the hunks, with range indicated.
@@ -251,18 +204,11 @@ class MultiParent:
 
     def num_lines(self):
         """The number of lines in the output text."""
-        extra_n = 0
-        for hunk in reversed(self.hunks):
-            if isinstance(hunk, ParentText):
-                return hunk.child_pos + hunk.num_lines + extra_n
-            extra_n += len(hunk.lines)
-        return extra_n
+        return _multiparent_rs.num_lines(self.hunks)
 
     def is_snapshot(self):
         """Return true of this hunk is effectively a fulltext."""
-        if len(self.hunks) != 1:
-            return False
-        return isinstance(self.hunks[0], NewText)
+        return _multiparent_rs.is_snapshot(self.hunks)
 
 
 class NewText:
@@ -515,7 +461,7 @@ class BaseVersionedFile:
         """Return revisions sorted by how much they reduce build complexity."""
         could_avoid = {}
         referenced_by = {}
-        for version_id in topo_iter(self):
+        for version_id in _topo_iter(self._parents, list(self.versions())):
             could_avoid[version_id] = set()
             if version_id not in self._snapshots:
                 for parent_id in self._parents[version_id]:
@@ -532,10 +478,11 @@ class BaseVersionedFile:
             )
             selected = available_versions.pop()
             ranking.append(selected)
-            for version_id in referenced_by[selected]:
+            selected_refs = referenced_by.get(selected, set())
+            for version_id in selected_refs:
                 could_avoid[version_id].difference_update(could_avoid[selected])
             for version_id in could_avoid[selected]:
-                referenced_by[version_id].difference_update(referenced_by[selected])
+                referenced_by[version_id].difference_update(selected_refs)
         return ranking
 
     def clear_cache(self):

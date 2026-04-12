@@ -261,6 +261,15 @@ class TestVersionedFile(TestCase):
             [b"a\n", b"b\n", b"e\n", b"f\n"], self.reconstruct_version(vf, b"rev-c")
         )
 
+    def test_get_build_ranking(self):
+        vf = self.make_vf()
+        self.assertEqual({b"rev-a", b"rev-b", b"rev-c"}, set(vf.get_build_ranking()))
+
+    def test_get_build_ranking_single_version(self):
+        vf = multiparent.MultiMemoryVersionedFile()
+        self.add_version(vf, b"a", b"rev-a", [])
+        self.assertEqual([b"rev-a"], vf.get_build_ranking())
+
     def test_reordered(self):
         """Check for a corner case that requires re-starting the cursor."""
         vf = multiparent.MultiMemoryVersionedFile()

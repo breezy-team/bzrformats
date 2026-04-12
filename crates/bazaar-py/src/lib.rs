@@ -16,6 +16,7 @@ mod groupcompress;
 mod groupcompress_delta;
 mod inventory;
 mod knit;
+mod multiparent;
 mod smart;
 mod textmerge;
 mod versionedfile;
@@ -543,6 +544,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let textmergem = textmerge::_textmerge_rs(py)?;
     m.add_submodule(&textmergem)?;
 
+    let multiparentm = multiparent::_multiparent_rs(py)?;
+    m.add_submodule(&multiparentm)?;
+
     let versionedfilem = versionedfile::_versionedfile_rs(py)?;
     m.add_submodule(&versionedfilem)?;
 
@@ -565,6 +569,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.knit", module_name), &knitm)?;
     modules.set_item(format!("{}.smart", module_name), &smartm)?;
     modules.set_item(format!("{}.textmerge", module_name), &textmergem)?;
+    modules.set_item(format!("{}.multiparent", module_name), &multiparentm)?;
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
     modules.set_item(
         format!("{}.btree_serializer", module_name),
