@@ -51,6 +51,16 @@ pub enum IndexError {
     /// The final byte length didn't match the pre-pass estimate — indicates
     /// a logic bug in the serializer.
     LengthMismatch { expected: usize, actual: usize },
+    /// The file didn't start with the magic signature.
+    BadSignature,
+    /// An option line was missing, in the wrong order, or had a non-decimal
+    /// value.
+    BadOptions,
+    /// A node line had a wrong number of `\x00`-separated fields.
+    BadLineData,
+    /// A node line referenced a byte offset that couldn't be parsed as an
+    /// integer.
+    BadReferenceOffset(Vec<u8>),
 }
 
 impl std::fmt::Display for IndexError {
@@ -64,11 +74,169 @@ impl std::fmt::Display for IndexError {
                 "mismatched output length and expected length: {} {}",
                 actual, expected
             ),
+            IndexError::BadSignature => write!(f, "bad index format signature"),
+            IndexError::BadOptions => write!(f, "bad index options"),
+            IndexError::BadLineData => write!(f, "bad index line data"),
+            IndexError::BadReferenceOffset(s) => {
+                write!(f, "bad reference offset: {:?}", s)
+            }
         }
     }
 }
 
 impl std::error::Error for IndexError {}
+
+/// Metadata extracted from a graph index header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexHeader {
+    pub node_ref_lists: usize,
+    pub key_length: usize,
+    pub key_count: usize,
+    /// Byte offset of the first node line after the header.
+    pub header_end: usize,
+}
+
+/// Parse the graph index file header from the start of `data`. Returns the
+/// parsed metadata along with the offset at which the first node line
+/// begins. The caller handles the rest of the stream.
+pub fn parse_header(data: &[u8]) -> Result<IndexHeader, IndexError> {
+    if !data.starts_with(SIGNATURE) {
+        return Err(IndexError::BadSignature);
+    }
+    let after_sig = &data[SIGNATURE.len()..];
+    let mut option_lines: [&[u8]; 3] = [b"", b"", b""];
+    let mut offset = 0usize;
+    for slot in option_lines.iter_mut() {
+        let nl = after_sig[offset..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or(IndexError::BadOptions)?;
+        *slot = &after_sig[offset..offset + nl];
+        offset += nl + 1;
+    }
+
+    let node_ref_lists = parse_option(option_lines[0], OPTION_NODE_REFS)?;
+    let key_length = parse_option(option_lines[1], OPTION_KEY_ELEMENTS)?;
+    let key_count = parse_option(option_lines[2], OPTION_LEN)?;
+
+    let header_end =
+        SIGNATURE.len() + option_lines[0].len() + option_lines[1].len() + option_lines[2].len() + 3;
+
+    Ok(IndexHeader {
+        node_ref_lists,
+        key_length,
+        key_count,
+        header_end,
+    })
+}
+
+fn parse_option(line: &[u8], prefix: &[u8]) -> Result<usize, IndexError> {
+    if !line.starts_with(prefix) {
+        return Err(IndexError::BadOptions);
+    }
+    std::str::from_utf8(&line[prefix.len()..])
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .ok_or(IndexError::BadOptions)
+}
+
+/// A tuple key — each element is a bytestring, elements joined by `\x00`
+/// on disk.
+pub type IndexKey = Vec<Vec<u8>>;
+
+/// One parsed node line, before reference offsets are resolved to real
+/// keys by higher-level code. Mirrors the raw tuple stored in
+/// `GraphIndex._keys_by_offset` on the Python side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawNode {
+    pub key: IndexKey,
+    pub absent: bool,
+    /// Reference lists of raw byte offsets pointing at other key lines.
+    pub ref_offsets: Vec<Vec<u64>>,
+    pub value: Vec<u8>,
+}
+
+/// One parsed present (non-absent) node as returned by [`parse_lines`]:
+/// key tuple, value bytes, and the raw offset reference lists.
+pub type ParsedNode = (IndexKey, Vec<u8>, Vec<Vec<u64>>);
+
+/// The result of parsing a batch of node lines, matching the tuple
+/// `GraphIndex._parse_lines` returns plus the `_keys_by_offset` side-table.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ParsedLines {
+    pub first_key: Option<IndexKey>,
+    pub last_key: Option<IndexKey>,
+    /// Present (non-absent) nodes in the order they appeared.
+    pub nodes: Vec<ParsedNode>,
+    /// Per-offset raw records, including absent nodes.
+    pub keys_by_offset: Vec<(u64, RawNode)>,
+    /// Count of empty (trailer) lines seen.
+    pub trailers: usize,
+}
+
+/// Parse a batch of `\n`-stripped node lines starting at `start_pos`.
+/// `key_length` must match the value from the header. Mirrors
+/// `GraphIndex._parse_lines`.
+pub fn parse_lines(
+    lines: &[&[u8]],
+    start_pos: u64,
+    key_length: usize,
+) -> Result<ParsedLines, IndexError> {
+    let expected_elements = 3 + key_length;
+    let mut out = ParsedLines::default();
+    let mut pos = start_pos;
+    for line in lines {
+        if line.is_empty() {
+            out.trailers += 1;
+            continue;
+        }
+        let elements: Vec<&[u8]> = line.split(|&b| b == b'\x00').collect();
+        if elements.len() != expected_elements {
+            return Err(IndexError::BadLineData);
+        }
+        let key: Vec<Vec<u8>> = elements[..key_length].iter().map(|e| e.to_vec()).collect();
+        if out.first_key.is_none() {
+            out.first_key = Some(key.clone());
+        }
+        out.last_key = Some(key.clone());
+
+        let absent_field = elements[elements.len() - 3];
+        let references_field = elements[elements.len() - 2];
+        let value_field = elements[elements.len() - 1];
+        let absent = absent_field == b"a";
+
+        let mut ref_lists: Vec<Vec<u64>> = Vec::new();
+        for ref_string in references_field.split(|&b| b == b'\t') {
+            let mut list = Vec::new();
+            for piece in ref_string.split(|&b| b == b'\r') {
+                if piece.is_empty() {
+                    continue;
+                }
+                let parsed = std::str::from_utf8(piece)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or_else(|| IndexError::BadReferenceOffset(piece.to_vec()))?;
+                list.push(parsed);
+            }
+            ref_lists.push(list);
+        }
+
+        let raw = RawNode {
+            key: key.clone(),
+            absent,
+            ref_offsets: ref_lists.clone(),
+            value: value_field.to_vec(),
+        };
+        out.keys_by_offset.push((pos, raw));
+        pos += line.len() as u64 + 1; // +1 for the stripped newline
+
+        if absent {
+            continue;
+        }
+        out.nodes.push((key, value_field.to_vec(), ref_lists));
+    }
+    Ok(out)
+}
 
 /// Serialize a set of nodes into the format-1 graph-index byte stream.
 ///
@@ -333,6 +501,143 @@ mod tests {
         assert!(out
             .windows(b"key001\x00\x00060\x00value001\n".len())
             .any(|w| w == b"key001\x00\x00060\x00value001\n"));
+    }
+
+    #[test]
+    fn parse_header_minimal_index() {
+        let data = b"Bazaar Graph Index 1\nnode_ref_lists=0\nkey_elements=1\nlen=0\n\n";
+        let h = parse_header(data).unwrap();
+        assert_eq!(h.node_ref_lists, 0);
+        assert_eq!(h.key_length, 1);
+        assert_eq!(h.key_count, 0);
+        // Header bytes end right after the `len=0\n` line.
+        assert_eq!(h.header_end, 59);
+    }
+
+    #[test]
+    fn parse_header_non_zero_values() {
+        let data = b"Bazaar Graph Index 1\nnode_ref_lists=2\nkey_elements=3\nlen=42\n";
+        let h = parse_header(data).unwrap();
+        assert_eq!(h.node_ref_lists, 2);
+        assert_eq!(h.key_length, 3);
+        assert_eq!(h.key_count, 42);
+    }
+
+    #[test]
+    fn parse_header_rejects_bad_signature() {
+        assert_eq!(
+            parse_header(b"not an index\n"),
+            Err(IndexError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn parse_header_rejects_missing_option() {
+        let data = b"Bazaar Graph Index 1\nwrong_option=1\nkey_elements=1\nlen=0\n\n";
+        assert_eq!(parse_header(data), Err(IndexError::BadOptions));
+    }
+
+    #[test]
+    fn parse_header_rejects_non_decimal_option() {
+        let data = b"Bazaar Graph Index 1\nnode_ref_lists=abc\nkey_elements=1\nlen=0\n\n";
+        assert_eq!(parse_header(data), Err(IndexError::BadOptions));
+    }
+
+    #[test]
+    fn parse_lines_single_node_no_refs() {
+        let line: &[u8] = b"a\x00\x00\x00val";
+        let lines = vec![line, b""];
+        let parsed = parse_lines(&lines, 100, 1).unwrap();
+        assert_eq!(parsed.first_key, Some(key(&[b"a"])));
+        assert_eq!(parsed.last_key, Some(key(&[b"a"])));
+        assert_eq!(parsed.trailers, 1);
+        assert_eq!(parsed.nodes.len(), 1);
+        let (k, v, refs) = &parsed.nodes[0];
+        assert_eq!(k, &key(&[b"a"]));
+        assert_eq!(v, b"val");
+        // `_parse_lines` always pushes at least one reference list per node,
+        // even when there are no ref lists declared — Python yields `(())`.
+        assert_eq!(refs, &vec![Vec::<u64>::new()]);
+    }
+
+    #[test]
+    fn parse_lines_tracks_offsets() {
+        // Two lines starting at pos=0; the second should land at len+1.
+        let line_a: &[u8] = b"a\x00\x00\x00val1";
+        let line_b: &[u8] = b"b\x00\x0000\x00val2";
+        let lines = vec![line_a, line_b];
+        let parsed = parse_lines(&lines, 0, 1).unwrap();
+        assert_eq!(parsed.keys_by_offset.len(), 2);
+        assert_eq!(parsed.keys_by_offset[0].0, 0);
+        assert_eq!(parsed.keys_by_offset[1].0, line_a.len() as u64 + 1);
+    }
+
+    #[test]
+    fn parse_lines_absent_node_not_in_output_but_in_offset_map() {
+        let line: &[u8] = b"ghost\x00a\x00\x00";
+        let parsed = parse_lines(&[line], 50, 1).unwrap();
+        assert!(parsed.nodes.is_empty());
+        assert_eq!(parsed.keys_by_offset.len(), 1);
+        assert!(parsed.keys_by_offset[0].1.absent);
+        assert_eq!(parsed.keys_by_offset[0].1.key, key(&[b"ghost"]));
+    }
+
+    #[test]
+    fn parse_lines_references() {
+        // Two reference lists separated by \t, offsets separated by \r.
+        let line: &[u8] = b"k\x00\x00100\r200\t300\x00val";
+        let parsed = parse_lines(&[line], 0, 1).unwrap();
+        let refs = &parsed.nodes[0].2;
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0], vec![100u64, 200]);
+        assert_eq!(refs[1], vec![300u64]);
+    }
+
+    #[test]
+    fn parse_lines_bad_field_count_errors() {
+        let line: &[u8] = b"k\x00\x00val"; // 3 fields, expected 4 for key_length=1
+        assert_eq!(parse_lines(&[line], 0, 1), Err(IndexError::BadLineData));
+    }
+
+    #[test]
+    fn parse_lines_bad_reference_offset_errors() {
+        let line: &[u8] = b"k\x00\x00notnumeric\x00val";
+        assert!(matches!(
+            parse_lines(&[line], 0, 1),
+            Err(IndexError::BadReferenceOffset(_))
+        ));
+    }
+
+    #[test]
+    fn round_trip_serialize_then_parse() {
+        // Two-node index with a cross-reference. Serialize, then parse the
+        // header and body back and verify we recover the same shape.
+        let nodes = vec![
+            node(&[b"a"], false, vec![vec![]], b"val1"),
+            node(&[b"b"], false, vec![vec![key(&[b"a"])]], b"val2"),
+        ];
+        let bytes = serialize_graph_index(&nodes, 1, 1).unwrap();
+        let header = parse_header(&bytes).unwrap();
+        assert_eq!(header.node_ref_lists, 1);
+        assert_eq!(header.key_length, 1);
+        assert_eq!(header.key_count, 2);
+
+        // The body is everything from header_end onwards; split on \n and
+        // feed the resulting lines (sans trailing newlines) to parse_lines.
+        let body = &bytes[header.header_end..];
+        let body_lines: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
+        // The final split produces an empty trailing element; drop if
+        // caller wants to feed it in. Here we leave it to exercise the
+        // trailer counter.
+        let parsed = parse_lines(&body_lines, header.header_end as u64, 1).unwrap();
+        assert_eq!(parsed.nodes.len(), 2);
+        assert_eq!(parsed.nodes[0].0, key(&[b"a"]));
+        assert_eq!(parsed.nodes[1].0, key(&[b"b"]));
+        // The reference from `b` points at the byte offset of `a`'s line,
+        // which is exactly header_end (the first body byte).
+        assert_eq!(parsed.nodes[1].2, vec![vec![header.header_end as u64]]);
+        // There's one trailing blank line (the final `\n\n` plus split).
+        assert!(parsed.trailers >= 1);
     }
 
     #[test]
