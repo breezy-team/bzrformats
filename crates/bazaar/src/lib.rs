@@ -13,6 +13,7 @@ pub mod gen_ids;
 pub mod globbing;
 pub mod groupcompress;
 pub mod hashcache;
+pub mod index;
 pub mod inventory;
 pub mod inventory_delta;
 pub mod knit;
