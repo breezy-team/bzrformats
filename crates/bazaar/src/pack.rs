@@ -473,6 +473,79 @@ mod tests {
     }
 
     #[test]
+    fn parser_record_with_no_name() {
+        // Mirrors test_pack.test_record_with_no_name: an empty name list.
+        let data = make_container(&[(&[], b"aaaaa")]);
+        let mut p = ContainerPushParser::new();
+        p.accept_bytes(&data).unwrap();
+        let records = p.read_pending_records(None);
+        assert_eq!(records.len(), 1);
+        let (names, body) = &records[0];
+        assert!(names.is_empty());
+        assert_eq!(body, b"aaaaa");
+    }
+
+    #[test]
+    fn parser_two_separate_names() {
+        // Mirrors test_multiple_records_at_once: two records each with a
+        // single single-part name.
+        let data = make_container(&[(&[&[b"name1"]], b"body1"), (&[&[b"name2"]], b"body2")]);
+        let mut p = ContainerPushParser::new();
+        p.accept_bytes(&data).unwrap();
+        let records = p.read_pending_records(None);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, vec![vec![b"name1".to_vec()]]);
+        assert_eq!(records[1].0, vec![vec![b"name2".to_vec()]]);
+    }
+
+    #[test]
+    fn parser_multiple_names_on_one_record() {
+        // Mirrors test_record_with_two_names: one record, two separate
+        // single-part names.
+        let data = make_container(&[(&[&[b"n1"], &[b"n2"]], b"xy")]);
+        let mut p = ContainerPushParser::new();
+        p.accept_bytes(&data).unwrap();
+        let records = p.read_pending_records(None);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].0,
+            vec![vec![b"n1".to_vec()], vec![b"n2".to_vec()]]
+        );
+    }
+
+    #[test]
+    fn parser_incomplete_record_drains_nothing() {
+        // Mirrors test_incomplete_record: feed only a header, no body;
+        // no records should be ready to drain.
+        let mut data = begin();
+        data.extend_from_slice(b"B5\nname\n\n");
+        let mut p = ContainerPushParser::new();
+        p.accept_bytes(&data).unwrap();
+        assert!(p.read_pending_records(None).is_empty());
+    }
+
+    #[test]
+    fn parser_accept_empty_bytes_is_a_noop() {
+        // Mirrors test_accept_nothing: feeding an empty slice shouldn't
+        // crash or advance state.
+        let mut p = ContainerPushParser::new();
+        p.accept_bytes(b"").unwrap();
+        assert!(p.read_pending_records(None).is_empty());
+        assert!(!p.finished());
+    }
+
+    #[test]
+    fn parser_rejects_whitespace_in_name() {
+        // Mirrors test_read_invalid_name_whitespace: a name containing a
+        // space fails validation during parsing.
+        let mut data = begin();
+        data.extend_from_slice(b"B5\nbad name\n\nhello");
+        let mut p = ContainerPushParser::new();
+        let err = p.accept_bytes(&data).unwrap_err();
+        assert!(matches!(err, PackError::InvalidName(_)));
+    }
+
+    #[test]
     fn parser_read_size_hint_covers_large_body() {
         let body = vec![0u8; 100_000];
         let data = make_container(&[(&[&[b"big"]], &body)]);

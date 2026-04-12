@@ -339,6 +339,25 @@ mod tests {
     }
 
     #[test]
+    fn empty_new_text_to_patch() {
+        // Mirrors test_multiparent.TestNewText.test_to_patch empty case.
+        let mp = MultiParent::with_hunks(vec![Hunk::NewText(vec![])]);
+        assert_eq!(mp.to_patch(), vec![b"i 0\n".to_vec(), b"\n".to_vec()]);
+    }
+
+    #[test]
+    fn new_text_line_without_trailing_newline_to_patch() {
+        // Mirrors test_multiparent.TestNewText.test_to_patch `[b"a"]` case —
+        // `to_patch` must emit the bare `b"\n"` separator regardless of
+        // whether the final payload line itself ends in `\n`.
+        let mp = MultiParent::with_hunks(vec![Hunk::NewText(lines(&[b"a"]))]);
+        assert_eq!(
+            mp.to_patch(),
+            vec![b"i 1\n".to_vec(), b"a".to_vec(), b"\n".to_vec()]
+        );
+    }
+
+    #[test]
     fn mixed_to_patch() {
         let mp = MultiParent::with_hunks(vec![
             Hunk::NewText(lines(&[b"a\n"])),

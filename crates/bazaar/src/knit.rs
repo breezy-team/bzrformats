@@ -437,6 +437,31 @@ mod tests {
     }
 
     #[test]
+    fn line_delta_blocks_noeol_shrinks_trailing_run() {
+        // Mirrors test_knit.test_get_line_delta_blocks_noeol: when the last
+        // "matching" line pair actually differs only in its trailing \n,
+        // the block extractor must shave one line off the run. Here the
+        // source has `c` without newline, the target has `c\n`, and the
+        // delta flags the final line as modified. The naive extraction
+        // would claim `(0, 0, 3)` as a match; the eol quirk drops it to
+        // `(0, 0, 2)`.
+        let source: Vec<Vec<u8>> = vec![b"a\n".to_vec(), b"b\n".to_vec(), b"c".to_vec()];
+        let target: Vec<Vec<u8>> = vec![
+            b"a\n".to_vec(),
+            b"b\n".to_vec(),
+            b"c\n".to_vec(),
+            b"d\n".to_vec(),
+        ];
+        // A single hunk that replaces line 2 (the final 'c'-without-newline)
+        // with 2 new lines.
+        let delta = vec![(2usize, 3usize, 2usize)];
+        let blocks = get_line_delta_blocks(&delta, &refs(&source), &refs(&target));
+        // The leading run that looked like 2 matches is actually 1 because
+        // the (c, c\n) pair fails the equality check.
+        assert_eq!(blocks, vec![(0, 0, 2), (3, 4, 0)]);
+    }
+
+    #[test]
     fn line_delta_blocks_replace_middle_line() {
         // source: a b c, target: a X c — a single-line replacement.
         let source = lines_with_nl(b"a\nb\nc\n");
