@@ -121,7 +121,11 @@ pub struct TraditionalGroupCompressor {
 
 impl GroupCompressor for TraditionalGroupCompressor {
     fn ratio(&self) -> f32 {
-        self.input_bytes as f32 / self.endpoint as f32
+        if self.endpoint == 0 {
+            0.0
+        } else {
+            self.input_bytes as f32 / self.endpoint as f32
+        }
     }
 
     fn flush(self) -> (Vec<Vec<u8>>, usize) {
@@ -718,6 +722,151 @@ mod tests {
         let mut gc = RabinGroupCompressor::new(None);
         // Two near-identical records should compress well, leaving a ratio
         // significantly above 1.0 (input bytes much larger than output).
+        let text = b"the same long line repeated for compression\n".repeat(8);
+        gc.compress(
+            &key(&[b"a"]),
+            &[text.as_slice()],
+            text.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        gc.compress(
+            &key(&[b"b"]),
+            &[text.as_slice()],
+            text.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(gc.ratio() > 1.0);
+    }
+
+    #[test]
+    fn traditional_compressor_round_trips_fulltext() {
+        let mut gc = TraditionalGroupCompressor::new();
+        let text = b"hello world\nthis is a line-based fulltext\n";
+        let (sha, start, end, kind) = gc
+            .compress(
+                &key(&[b"label"]),
+                &[text.as_slice()],
+                text.len(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(kind, "fulltext");
+        assert!(end > start);
+        assert!(!sha.is_empty());
+
+        let stored_key: Vec<Vec<u8>> = vec![b"label".to_vec()];
+        let (data, data_sha) = gc.extract(&stored_key).unwrap();
+        assert_eq!(data.concat(), text.to_vec());
+        assert_eq!(data_sha, sha);
+    }
+
+    #[test]
+    fn traditional_compressor_round_trips_delta() {
+        // Two records sharing a long common prefix should let the second be
+        // line-delta encoded against the first.
+        let mut gc = TraditionalGroupCompressor::new();
+        let base =
+            b"shared line one\nshared line two\nshared line three\nshared line four\n";
+        let derived =
+            b"shared line one\nshared line two\nshared line three\nshared line four\nplus extra\n";
+        gc.compress(
+            &key(&[b"base"]),
+            &[base.as_slice()],
+            base.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (_sha, _start, _end, kind) = gc
+            .compress(
+                &key(&[b"derived"]),
+                &[derived.as_slice()],
+                derived.len(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(kind, "delta");
+
+        let (data, _) = gc.extract(&vec![b"derived".to_vec()]).unwrap();
+        assert_eq!(data.concat(), derived.to_vec());
+        // And the earlier fulltext must still extract correctly after the
+        // delta has been appended.
+        let (base_data, _) = gc.extract(&vec![b"base".to_vec()]).unwrap();
+        assert_eq!(base_data.concat(), base.to_vec());
+    }
+
+    #[test]
+    fn traditional_compressor_empty_input_returns_null_sha() {
+        let mut gc = TraditionalGroupCompressor::new();
+        let (sha, start, end, kind) = gc
+            .compress(&key(&[b"empty"]), &[], 0, None, None, None)
+            .unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 0);
+        assert_eq!(kind, "fulltext");
+        assert_eq!(
+            sha.as_bytes(),
+            crate::groupcompress::NULL_SHA1.as_slice()
+        );
+    }
+
+    #[test]
+    fn traditional_compressor_nostore_sha_match_raises_existing_content() {
+        let mut gc = TraditionalGroupCompressor::new();
+        let text = b"some line-delta content\n";
+        let actual_sha = osutils::sha::sha_chunks(&[text.as_slice()]);
+        let err = gc
+            .compress(
+                &key(&[b"label"]),
+                &[text.as_slice()],
+                text.len(),
+                None,
+                Some(actual_sha),
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::ExistingContent(_)));
+        assert_eq!(gc.endpoint(), 0);
+    }
+
+    #[test]
+    fn traditional_compressor_content_addressed_key_substitution() {
+        let mut gc = TraditionalGroupCompressor::new();
+        let text = b"content-addressed body\n";
+        let key = Key::ContentAddressed(vec![b"prefix".to_vec()]);
+        let (sha, _, _, _) = gc
+            .compress(&key, &[text.as_slice()], text.len(), None, None, None)
+            .unwrap();
+        let expected_sha = osutils::sha::sha_chunks(&[text.as_slice()]);
+        assert_eq!(sha, expected_sha);
+        let stored_key = vec![
+            b"prefix".to_vec(),
+            format!("sha1:{}", expected_sha).into_bytes(),
+        ];
+        let (data, _) = gc.extract(&stored_key).unwrap();
+        assert_eq!(data.concat(), text.to_vec());
+    }
+
+    #[test]
+    fn traditional_compressor_ratio_zero_for_empty_compressor() {
+        let gc = TraditionalGroupCompressor::new();
+        assert_eq!(gc.ratio(), 0.0);
+    }
+
+    #[test]
+    fn traditional_compressor_ratio_above_one_after_compression() {
+        let mut gc = TraditionalGroupCompressor::new();
         let text = b"the same long line repeated for compression\n".repeat(8);
         gc.compress(
             &key(&[b"a"]),
