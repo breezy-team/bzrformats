@@ -136,6 +136,90 @@ pub fn extract<'a>(
     Ok(result)
 }
 
+/// Compute the set of ancestor version indices of `versions`, inclusive.
+///
+/// Mirrors `Weave._inclusions`: starts with the input set and, for each
+/// version from `max..=1` that is in the set, unions in its immediate
+/// parents from `parents_by_version`. Version 0 is treated as a root and
+/// its parent list is never expanded — this matches the Python off-by-one
+/// (`range(max(versions), 0, -1)`).
+pub fn inclusions(
+    parents_by_version: &[Vec<usize>],
+    versions: &[usize],
+) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    if versions.is_empty() {
+        return out;
+    }
+    out.extend(versions.iter().copied());
+    let max_v = *versions.iter().max().expect("non-empty");
+    for v in (1..=max_v).rev() {
+        if out.contains(&v) {
+            if let Some(ps) = parents_by_version.get(v) {
+                out.extend(ps.iter().copied());
+            }
+        }
+    }
+    out
+}
+
+/// One yielded item from [`walk_internal`]: the absolute line number, the
+/// innermost open insertion version, the set of active deletion versions,
+/// and a borrow of the line bytes. Matches `Weave._walk_internal` but with
+/// indices rather than resolved names.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WalkLine<'a> {
+    pub lineno: usize,
+    pub insert: usize,
+    pub deletes: Vec<usize>,
+    pub text: &'a [u8],
+}
+
+/// Walk `weave` yielding every literal line along with its open-insertion
+/// version and the current deletion set. Unlike [`extract`], this doesn't
+/// filter on an `included` set — callers decide what to do with each line.
+pub fn walk_internal(weave: &[WeaveEntry]) -> Result<Vec<WalkLine<'_>>, WeaveError> {
+    let mut istack: Vec<usize> = Vec::new();
+    let mut dset: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut result = Vec::new();
+
+    for (lineno, entry) in weave.iter().enumerate() {
+        match entry {
+            WeaveEntry::Control { op, version } => match op {
+                Instruction::InsertOpen => istack.push(*version),
+                Instruction::InsertClose => {
+                    istack.pop().ok_or(WeaveError::UnmatchedInsertClose)?;
+                }
+                Instruction::DeleteOpen => {
+                    dset.insert(*version);
+                }
+                Instruction::DeleteClose => {
+                    if !dset.remove(version) {
+                        return Err(WeaveError::UnmatchedDeleteClose(*version));
+                    }
+                }
+            },
+            WeaveEntry::Line(text) => {
+                let insert = *istack.last().expect("line outside any insertion block");
+                result.push(WalkLine {
+                    lineno,
+                    insert,
+                    deletes: dset.iter().copied().collect(),
+                    text,
+                });
+            }
+        }
+    }
+
+    if !istack.is_empty() {
+        return Err(WeaveError::UnclosedInsertions(istack));
+    }
+    if !dset.is_empty() {
+        return Err(WeaveError::UnclosedDeletions(dset.into_iter().collect()));
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +332,67 @@ mod tests {
 
     /// An inactive insertion's lines aren't emitted even if a deletion
     /// is also open inside them.
+    #[test]
+    fn inclusions_empty_input() {
+        assert!(inclusions(&[vec![]], &[]).is_empty());
+    }
+
+    #[test]
+    fn inclusions_linear_chain() {
+        // 0 <- 1 <- 2 <- 3
+        let parents = vec![vec![], vec![0], vec![1], vec![2]];
+        let got = inclusions(&parents, &[3]);
+        assert_eq!(got, set(&[0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn inclusions_version_zero_root_is_not_expanded() {
+        // Verify the Python off-by-one: version 0's parents slot is
+        // never consulted. Put a nonsense sentinel parent there and
+        // make sure it doesn't leak into the result.
+        let parents = vec![vec![999], vec![0]];
+        let got = inclusions(&parents, &[1]);
+        assert_eq!(got, set(&[0, 1]));
+    }
+
+    #[test]
+    fn inclusions_merges_converge() {
+        // 0 -- 1 -- 3
+        //  \-- 2 --/
+        let parents = vec![vec![], vec![0], vec![0], vec![1, 2]];
+        let got = inclusions(&parents, &[3]);
+        assert_eq!(got, set(&[0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn walk_internal_reports_deletes() {
+        let weave = vec![
+            ctl(Instruction::InsertOpen, 0),
+            line(b"a\n"),
+            ctl(Instruction::DeleteOpen, 1),
+            line(b"b\n"),
+            ctl(Instruction::DeleteClose, 1),
+            ctl(Instruction::InsertClose, 0),
+        ];
+        let got = walk_internal(&weave).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].text, b"a\n");
+        assert_eq!(got[0].insert, 0);
+        assert!(got[0].deletes.is_empty());
+        assert_eq!(got[1].text, b"b\n");
+        assert_eq!(got[1].insert, 0);
+        assert_eq!(got[1].deletes, vec![1]);
+    }
+
+    #[test]
+    fn walk_internal_unclosed_insertion_errors() {
+        let weave = vec![ctl(Instruction::InsertOpen, 0), line(b"x\n")];
+        assert_eq!(
+            walk_internal(&weave),
+            Err(WeaveError::UnclosedInsertions(vec![0]))
+        );
+    }
+
     #[test]
     fn inactive_insertion_blocks_lines() {
         let weave = vec![
