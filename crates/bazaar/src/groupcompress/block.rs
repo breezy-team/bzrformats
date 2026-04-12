@@ -888,4 +888,148 @@ mod tests {
             _ => panic!("expected Fulltext with text"),
         }
     }
+
+    #[test]
+    fn dump_reports_delta_records_with_instructions() {
+        // Build a real fulltext+delta pair by driving a RabinGroupCompressor,
+        // push the result into a block, and exercise dump() on the delta.
+        use crate::groupcompress::compressor::{GroupCompressor, RabinGroupCompressor};
+        use crate::versionedfile::Key;
+
+        let mut gc = RabinGroupCompressor::new(None);
+        let base = b"shared content that is long enough for rabin matching\nmore shared\n";
+        let derived =
+            b"shared content that is long enough for rabin matching\nmore shared\nplus\n";
+        gc.compress(
+            &Key::Fixed(vec![b"base".to_vec()]),
+            &[base.as_slice()],
+            base.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        gc.compress(
+            &Key::Fixed(vec![b"derived".to_vec()]),
+            &[derived.as_slice()],
+            derived.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (chunks, endpoint) = gc.flush();
+
+        let mut b = GroupCompressBlock::new();
+        b.set_chunked_content(&chunks, endpoint);
+        let dump = b.dump(None).unwrap();
+        assert_eq!(dump.len(), 2);
+        match &dump[0] {
+            DumpInfo::Fulltext { length, text: None } => assert_eq!(*length, base.len()),
+            _ => panic!("expected Fulltext(None) for first record, got {:?}", match_kind(&dump[0])),
+        }
+        match &dump[1] {
+            DumpInfo::Delta {
+                decomp_length,
+                instructions,
+                ..
+            } => {
+                assert_eq!(*decomp_length, derived.len());
+                assert!(!instructions.is_empty());
+                // At least one Copy for the shared prefix, and at least one
+                // Insert for the "plus\n" tail.
+                let (copies, inserts): (usize, usize) =
+                    instructions.iter().fold((0, 0), |(c, i), inst| match inst {
+                        DeltaInfo::Copy { .. } => (c + 1, i),
+                        DeltaInfo::Insert { .. } => (c, i + 1),
+                    });
+                assert!(copies >= 1, "delta should contain at least one copy");
+                assert!(inserts >= 1, "delta should contain at least one insert");
+            }
+            _ => panic!("expected Delta for second record"),
+        }
+    }
+
+    fn match_kind(info: &DumpInfo) -> &'static str {
+        match info {
+            DumpInfo::Fulltext { .. } => "Fulltext",
+            DumpInfo::Delta { .. } => "Delta",
+        }
+    }
+
+    #[test]
+    fn z_content_length_reflects_setter() {
+        let mut b = GroupCompressBlock::new();
+        assert_eq!(b.z_content_length(), None);
+        b.set_z_content_length(1234);
+        assert_eq!(b.z_content_length(), Some(1234));
+    }
+
+    #[test]
+    fn compressor_getter_and_setter_round_trip() {
+        let mut b = GroupCompressBlock::new();
+        assert_eq!(b.compressor(), None);
+        b.set_compressor(CompressorKind::Zlib);
+        assert_eq!(b.compressor(), Some(CompressorKind::Zlib));
+        b.set_compressor(CompressorKind::Lzma);
+        assert_eq!(b.compressor(), Some(CompressorKind::Lzma));
+    }
+
+    #[test]
+    fn set_z_content_chunks_clears_cached_content() {
+        // Setting new compressed chunks must invalidate any previously
+        // decompressed content — otherwise stale content would leak across
+        // a re-initialisation.
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let body: Vec<u8> = b"the original body bytes\n".repeat(20);
+        let rec = make_fulltext_record(&body);
+        let mut src = GroupCompressBlock::new();
+        src.set_content(&rec);
+        src.to_bytes(); // force z_content population
+
+        let mut parsed = GroupCompressBlock::from_bytes(src.to_bytes().as_slice()).unwrap();
+        parsed.ensure_content(None);
+        assert!(parsed.content().is_some());
+
+        // Now rebuild a fresh z_content for a different body and plug it in
+        // via the low-level setters. set_z_content_chunks must clear the
+        // cached content so the next ensure_content produces the new body.
+        let replacement_body: Vec<u8> = b"replacement body bytes\n".repeat(20);
+        let replacement_record = make_fulltext_record(&replacement_body);
+        let mut encoder =
+            ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&replacement_record).unwrap();
+        let z_replacement = encoder.finish().unwrap();
+
+        parsed.set_compressor(CompressorKind::Zlib);
+        parsed.set_z_content_chunks(vec![z_replacement.clone()]);
+        parsed.set_z_content_length(z_replacement.len());
+        parsed.set_content_length(replacement_record.len());
+
+        assert!(parsed.content().is_none(), "cached content should be cleared");
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content(), Some(replacement_record.as_slice()));
+    }
+
+    #[test]
+    fn lzma_round_trip_via_to_chunks_from_bytes() {
+        // Build a block, serialise with the Lzma compressor, and round-trip
+        // through from_bytes. Exercises the xz2 encode/decode path for
+        // CompressorKind::Lzma.
+        let body: Vec<u8> = b"a bit of compressible lzma-bound text\n".repeat(40);
+        let record = make_fulltext_record(&body);
+
+        let mut src = GroupCompressBlock::new();
+        src.set_content(&record);
+        let (_total_len, chunks) = src.to_chunks(Some(CompressorKind::Lzma));
+        let bytes: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        assert!(bytes.starts_with(GCB_LZ_HEADER));
+
+        let mut parsed = GroupCompressBlock::from_bytes(bytes.as_slice()).unwrap();
+        assert_eq!(parsed.compressor(), Some(CompressorKind::Lzma));
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content(), Some(record.as_slice()));
+    }
 }
