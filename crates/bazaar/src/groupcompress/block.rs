@@ -10,7 +10,7 @@ const GCB_HEADER: &[u8] = b"gcb1z\n";
 /// Group Compress Block v1 Lzma
 const GCB_LZ_HEADER: &[u8] = b"gcb1l\n";
 
-#[derive(PartialEq, Eq, Default, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
 pub enum CompressorKind {
     #[default]
     Zlib,
@@ -515,4 +515,163 @@ pub enum DeltaInfo {
 pub enum DumpInfo {
     Fulltext(Option<Vec<u8>>),
     Delta(usize, Vec<DeltaInfo>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::groupcompress::delta::write_base128_int;
+
+    /// Build a valid "fulltext" record payload as it would be stored inside
+    /// the block's content stream: `b"f"` + base128 length + raw bytes.
+    fn make_fulltext_record(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'f'];
+        write_base128_int(&mut out, body.len() as u128).unwrap();
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn compressor_kind_header_round_trip() {
+        assert_eq!(CompressorKind::from_header(GCB_HEADER), Some(CompressorKind::Zlib));
+        assert_eq!(
+            CompressorKind::from_header(GCB_LZ_HEADER),
+            Some(CompressorKind::Lzma)
+        );
+        assert_eq!(CompressorKind::from_header(b"xxxxxx"), None);
+        assert_eq!(CompressorKind::Zlib.header(), GCB_HEADER);
+        assert_eq!(CompressorKind::Lzma.header(), GCB_LZ_HEADER);
+    }
+
+    #[test]
+    fn new_block_has_no_content() {
+        let b = GroupCompressBlock::new();
+        assert!(b.content().is_none());
+        assert!(b.content_length().is_none());
+    }
+
+    #[test]
+    fn set_content_round_trip_via_to_bytes_and_from_bytes() {
+        let body = b"hello world\nthis is a single fulltext\n";
+        let record = make_fulltext_record(body);
+
+        let mut b = GroupCompressBlock::new();
+        b.set_content(&record);
+        let raw = b.to_bytes();
+
+        // The serialized block should start with the zlib header by default.
+        assert!(raw.starts_with(GCB_HEADER));
+
+        // Reading it back should recover the same record payload.
+        let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
+        assert_eq!(parsed.content_length(), Some(record.len()));
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content(), Some(record.as_slice()));
+    }
+
+    #[test]
+    fn set_chunked_content_matches_set_content_on_the_wire() {
+        let part1: Vec<u8> = b"hello world\n".to_vec();
+        let part2: Vec<u8> = b"more content\n".to_vec();
+        let total_len = part1.len() + part2.len();
+
+        let mut chunked = GroupCompressBlock::new();
+        chunked.set_chunked_content(&[part1.clone(), part2.clone()], total_len);
+        let chunked_bytes = chunked.to_bytes();
+
+        let mut flat = GroupCompressBlock::new();
+        let mut combined = part1.clone();
+        combined.extend_from_slice(&part2);
+        flat.set_content(&combined);
+        let flat_bytes = flat.to_bytes();
+
+        assert_eq!(chunked_bytes, flat_bytes);
+    }
+
+    #[test]
+    fn ensure_content_full_decompression_recovers_original() {
+        // A larger body so that streaming decompression is not a no-op.
+        let body: Vec<u8> = b"line of reasonably compressible text\n".repeat(200);
+        let record = make_fulltext_record(&body);
+
+        let mut src = GroupCompressBlock::new();
+        src.set_content(&record);
+        let raw = src.to_bytes();
+
+        let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
+        assert!(parsed.content().is_none());
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content(), Some(record.as_slice()));
+    }
+
+    #[test]
+    fn ensure_content_partial_then_full() {
+        // Request fewer bytes than the full content, then request the rest.
+        // After the second call, we must have the whole content and it must
+        // match byte-for-byte.
+        let body: Vec<u8> = b"compressible line\n".repeat(100);
+        let record = make_fulltext_record(&body);
+
+        let mut src = GroupCompressBlock::new();
+        src.set_content(&record);
+        let raw = src.to_bytes();
+
+        let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
+        parsed.ensure_content(Some(50));
+        assert!(parsed.content().unwrap().len() >= 50);
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content(), Some(record.as_slice()));
+    }
+
+    #[test]
+    fn to_chunks_produces_header_then_lengths_then_payload() {
+        let body = b"some body text\n";
+        let record = make_fulltext_record(body);
+        let mut b = GroupCompressBlock::new();
+        b.set_content(&record);
+        let (total_len, chunks) = b.to_chunks(None);
+
+        // First chunk must be the header, second the base-10 lengths line.
+        assert_eq!(chunks[0].as_ref(), GCB_HEADER);
+        let lengths = std::str::from_utf8(chunks[1].as_ref()).unwrap();
+        let mut iter = lengths.trim_end().split('\n');
+        let z_len: usize = iter.next().unwrap().parse().unwrap();
+        let u_len: usize = iter.next().unwrap().parse().unwrap();
+        assert_eq!(u_len, record.len());
+        // And the z-length must match the sum of the payload chunks.
+        let payload_len: usize = chunks[2..].iter().map(|c| c.len()).sum();
+        assert_eq!(payload_len, z_len);
+        // Total length equals sum of chunks.
+        assert_eq!(total_len, chunks.iter().map(|c| c.len()).sum::<usize>());
+    }
+
+    #[test]
+    fn dump_reports_fulltext_records_without_text_by_default() {
+        let body_a = b"first body\n";
+        let body_b = b"second body\n";
+        let mut content = make_fulltext_record(body_a);
+        content.extend(make_fulltext_record(body_b));
+
+        let mut b = GroupCompressBlock::new();
+        b.set_content(&content);
+        let dump = b.dump(None).unwrap();
+        assert_eq!(dump.len(), 2);
+        assert!(matches!(dump[0], DumpInfo::Fulltext(None)));
+        assert!(matches!(dump[1], DumpInfo::Fulltext(None)));
+    }
+
+    #[test]
+    fn dump_with_include_text_returns_payload() {
+        let body = b"included body\n";
+        let content = make_fulltext_record(body);
+
+        let mut b = GroupCompressBlock::new();
+        b.set_content(&content);
+        let dump = b.dump(Some(true)).unwrap();
+        assert_eq!(dump.len(), 1);
+        match &dump[0] {
+            DumpInfo::Fulltext(Some(text)) => assert_eq!(text.as_slice(), body),
+            _ => panic!("expected Fulltext with text, got {:?}", matches!(dump[0], DumpInfo::Fulltext(_))),
+        }
+    }
 }
