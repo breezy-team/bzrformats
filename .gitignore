@@ -29,3 +29,4 @@ doc/developers/_build/
 doc/developers/Makefile
 doc/developers/make.bat
 .inquest
+bzrformats.egg-info/
