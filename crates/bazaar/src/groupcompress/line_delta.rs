@@ -394,3 +394,85 @@ pub fn make_delta<'a>(
         .0
         .into_iter()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines_of(s: &'static [u8]) -> Vec<Vec<u8>> {
+        osutils::split_lines(s).map(|c| c.into_owned()).collect()
+    }
+
+    fn cow_lines(s: &'static [u8]) -> Vec<Cow<'static, [u8]>> {
+        osutils::split_lines(s).collect()
+    }
+
+    #[test]
+    fn new_empty_index_is_empty() {
+        let idx = LinesDeltaIndex::new(vec![]);
+        assert!(idx.lines().is_empty());
+        assert_eq!(idx.endpoint(), 0);
+    }
+
+    #[test]
+    fn new_populates_lines_and_endpoint() {
+        let idx = LinesDeltaIndex::new(lines_of(b"a\nb\nc\n"));
+        assert_eq!(idx.lines().len(), 3);
+        assert_eq!(idx.endpoint(), 6);
+        // Each indexed line can be looked up by its content.
+        assert!(idx.get_matches(b"a\n").is_some());
+        assert!(idx.get_matches(b"missing\n").is_none());
+    }
+
+    #[test]
+    fn extend_lines_with_matching_flags_controls_indexing() {
+        let mut idx = LinesDeltaIndex::new(vec![]);
+        idx.extend_lines(&lines_of(b"indexed\nskipped\n"), &[true, false]);
+        assert_eq!(idx.lines().len(), 2);
+        assert!(idx.get_matches(b"indexed\n").is_some());
+        // The skipped line is still stored — only its hash is left out of
+        // the match table.
+        assert!(idx.get_matches(b"skipped\n").is_none());
+        assert_eq!(idx.endpoint(), b"indexed\nskipped\n".len());
+    }
+
+    #[test]
+    fn make_delta_identity_produces_copy_only() {
+        // Delta from a source to itself should compress to nothing but a
+        // single copy instruction covering the whole buffer.
+        let src = b"line one\nline two\nline three\n".to_vec();
+        let delta: Vec<_> = super::make_delta(&src, b"line one\nline two\nline three\n").collect();
+        let reconstructed =
+            super::super::delta::apply_delta(&src, &delta.concat()).unwrap();
+        assert_eq!(reconstructed, src);
+    }
+
+    #[test]
+    fn make_delta_insert_then_copy_round_trips() {
+        // Delta with a new leading line followed by matching tail.
+        let src = b"shared line one\nshared line two\n".to_vec();
+        let target = b"new leading\nshared line one\nshared line two\n";
+        let delta: Vec<_> = super::make_delta(&src, target).collect();
+        let reconstructed =
+            super::super::delta::apply_delta(&src, &delta.concat()).unwrap();
+        assert_eq!(reconstructed.as_slice(), target);
+    }
+
+    #[test]
+    fn make_delta_method_returns_out_lines_and_index_flags() {
+        // Drive LinesDeltaIndex::make_delta directly and verify it returns
+        // the expected shape: a vector of output lines and a parallel
+        // vector of index flags. The first three output slots are reserved
+        // placeholders (type byte, type length, base128 decomp length) that
+        // the compressor fills in later, and the first three index flags
+        // are all false.
+        let idx = LinesDeltaIndex::new(lines_of(b"a\nb\nc\n"));
+        let target = b"a\nb\nc\n";
+        let target_lines = cow_lines(target);
+        let (out_lines, index_flags) =
+            idx.make_delta(target_lines.as_slice(), target.len(), None);
+        assert!(out_lines.len() >= 3);
+        assert_eq!(index_flags.len(), out_lines.len());
+        assert_eq!(&index_flags[..3], &[false, false, false]);
+    }
+}

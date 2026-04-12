@@ -2,10 +2,52 @@ use bazaar::groupcompress::compressor::GroupCompressor;
 use bazaar::versionedfile::Key;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict, PyTuple};
 use pyo3::wrap_pyfunction;
 use std::borrow::Cow;
 use std::convert::TryInto;
+
+fn extract_key_segments(obj: &Bound<PyAny>) -> PyResult<Vec<Vec<u8>>> {
+    let tuple = obj.cast::<PyTuple>().map_err(|_| {
+        PyValueError::new_err("sort_gc_optimal keys and parents must be tuples of bytes")
+    })?;
+    let mut out = Vec::with_capacity(tuple.len());
+    for item in tuple.iter() {
+        let b = item
+            .cast::<PyBytes>()
+            .map_err(|_| PyValueError::new_err("sort_gc_optimal keys must contain only bytes"))?;
+        out.push(b.as_bytes().to_vec());
+    }
+    Ok(out)
+}
+
+/// Sort and group the keys in `parent_map` into groupcompress order.
+///
+/// Returns a list of keys in reverse-topological order, grouped by the
+/// first segment of each key. Single-segment keys share an empty prefix.
+#[pyfunction]
+fn sort_gc_optimal<'py>(
+    py: Python<'py>,
+    parent_map: &Bound<'py, PyDict>,
+) -> PyResult<Vec<Bound<'py, PyTuple>>> {
+    let mut input = Vec::with_capacity(parent_map.len());
+    for (key, value) in parent_map.iter() {
+        let k = extract_key_segments(&key)?;
+        let parents_tuple = value
+            .cast::<PyTuple>()
+            .map_err(|_| PyValueError::new_err("sort_gc_optimal values must be tuples of keys"))?;
+        let mut parents = Vec::with_capacity(parents_tuple.len());
+        for parent in parents_tuple.iter() {
+            parents.push(extract_key_segments(&parent)?);
+        }
+        input.push((k, parents));
+    }
+    let sorted = bazaar::groupcompress::sort::sort_gc_optimal(input);
+    sorted
+        .into_iter()
+        .map(|segments| PyTuple::new(py, segments.into_iter().map(|s| PyBytes::new(py, &s))))
+        .collect()
+}
 
 #[pyfunction]
 fn encode_base128_int(py: Python, value: u128) -> PyResult<Bound<PyBytes>> {
@@ -138,34 +180,104 @@ impl LinesDeltaIndex {
 }
 
 #[pyclass(unsendable)]
-struct GroupCompressBlock(bazaar::groupcompress::block::GroupCompressBlock);
+struct GroupCompressBlock {
+    inner: bazaar::groupcompress::block::GroupCompressBlock,
+    /// Cached PyBytes for `_z_content`. Matches Python's semantics where
+    /// `b"".join((x,))` returns `x` itself — tests do `assertIs` against
+    /// the same block accessed twice.
+    z_content_cache: Option<Py<PyBytes>>,
+}
+
+impl GroupCompressBlock {
+    fn invalidate_cache(&mut self) {
+        self.z_content_cache = None;
+    }
+}
 
 #[pymethods]
 impl GroupCompressBlock {
     #[new]
     fn new() -> Self {
-        Self(bazaar::groupcompress::block::GroupCompressBlock::new())
+        Self {
+            inner: bazaar::groupcompress::block::GroupCompressBlock::new(),
+            z_content_cache: None,
+        }
     }
 
     fn __len__(&self) -> usize {
-        self.0.len()
+        self.inner.len()
     }
 
     #[getter]
     fn _z_content<'a>(&mut self, py: Python<'a>) -> PyResult<Bound<'a, PyBytes>> {
-        let ret = self.0.z_content();
-        Ok(PyBytes::new(py, &ret))
+        if let Some(cached) = &self.z_content_cache {
+            return Ok(cached.bind(py).clone());
+        }
+        let ret = self.inner.z_content();
+        let bound = PyBytes::new(py, &ret);
+        self.z_content_cache = Some(bound.clone().unbind());
+        Ok(bound)
     }
 
     #[getter]
     fn _content<'a>(&mut self, py: Python<'a>) -> PyResult<Option<Bound<'a, PyBytes>>> {
-        let ret = self.0.content();
+        let ret = self.inner.content();
         Ok(ret.map(|x| PyBytes::new(py, x)))
     }
 
     #[getter]
     fn _content_length(&self) -> Option<usize> {
-        self.0.content_length()
+        self.inner.content_length()
+    }
+
+    #[setter]
+    fn set__content_length(&mut self, value: usize) {
+        self.inner.set_content_length(value);
+    }
+
+    #[getter]
+    fn _z_content_length(&self) -> Option<usize> {
+        self.inner.z_content_length()
+    }
+
+    #[setter]
+    fn set__z_content_length(&mut self, value: usize) {
+        self.inner.set_z_content_length(value);
+    }
+
+    #[setter]
+    fn set__z_content_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+        self.inner.set_z_content_chunks(chunks);
+        self.invalidate_cache();
+    }
+
+    /// Test probe: `None` before a streaming decompressor has been created
+    /// (or after full content has been realised directly), otherwise
+    /// `True`. Matches the Python class's `_z_content_decompressor` attr.
+    #[getter]
+    fn _z_content_decompressor(&self) -> Option<bool> {
+        if self.inner.has_z_content_decompressor() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    #[setter]
+    fn set__compressor_name(&mut self, name: &str) -> PyResult<()> {
+        let kind = match name {
+            "zlib" => bazaar::groupcompress::block::CompressorKind::Zlib,
+            "lzma" => bazaar::groupcompress::block::CompressorKind::Lzma,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown compressor: {}",
+                    other
+                )));
+            }
+        };
+        self.inner.set_compressor(kind);
+        self.invalidate_cache();
+        Ok(())
     }
 
     #[classmethod]
@@ -176,19 +288,26 @@ impl GroupCompressBlock {
                 "Invalid block",
             ));
         }
-        Ok(Self(ret.unwrap()))
+        Ok(Self {
+            inner: ret.unwrap(),
+            z_content_cache: None,
+        })
     }
 
+    #[pyo3(signature = (key, start, end, sha1 = None))]
     fn extract<'a>(
         &mut self,
         py: Python<'a>,
-        _key: Py<PyAny>,
-        offset: usize,
-        length: usize,
+        key: Py<PyAny>,
+        start: usize,
+        end: usize,
+        sha1: Option<Py<PyAny>>,
     ) -> PyResult<Vec<Bound<'a, PyBytes>>> {
+        let _ = key;
+        let _ = sha1;
         let chunks = self
-            .0
-            .extract(offset, length)
+            .inner
+            .extract(start, end)
             .map_err(|e| PyValueError::new_err(format!("Error during extract: {:?}", e)))?;
         Ok(chunks
             .into_iter()
@@ -197,7 +316,14 @@ impl GroupCompressBlock {
     }
 
     fn set_chunked_content(&mut self, data: Vec<Vec<u8>>, length: usize) -> PyResult<()> {
-        self.0.set_chunked_content(data.as_slice(), length);
+        self.inner.set_chunked_content(data.as_slice(), length);
+        self.invalidate_cache();
+        Ok(())
+    }
+
+    fn set_content(&mut self, content: &[u8]) -> PyResult<()> {
+        self.inner.set_content(content);
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -207,7 +333,10 @@ impl GroupCompressBlock {
         py: Python<'a>,
         kind: Option<bazaar::groupcompress::block::CompressorKind>,
     ) -> (usize, Vec<Bound<'a, PyBytes>>) {
-        let (size, chunks) = self.0.to_chunks(kind);
+        // to_chunks may rebuild z_content_chunks internally; invalidate the
+        // cached PyBytes so the next _z_content call picks up fresh bytes.
+        self.invalidate_cache();
+        let (size, chunks) = self.inner.to_chunks(kind);
 
         let chunks = chunks
             .into_iter()
@@ -218,68 +347,109 @@ impl GroupCompressBlock {
     }
 
     fn to_bytes<'a>(&mut self, py: Python<'a>) -> PyResult<Bound<'a, PyBytes>> {
-        let ret = self.0.to_bytes();
+        self.invalidate_cache();
+        let ret = self.inner.to_bytes();
         Ok(PyBytes::new(py, &ret))
     }
 
     #[pyo3(signature = (size = None))]
     fn _ensure_content(&mut self, size: Option<usize>) -> PyResult<()> {
-        self.0.ensure_content(size);
+        self.inner.ensure_content(size);
         Ok(())
     }
 
     #[pyo3(signature = (include_text = None))]
-    fn _dump(&mut self, py: Python, include_text: Option<bool>) -> PyResult<Py<PyAny>> {
+    fn _dump<'a>(
+        &mut self,
+        py: Python<'a>,
+        include_text: Option<bool>,
+    ) -> PyResult<Bound<'a, pyo3::types::PyList>> {
+        use bazaar::groupcompress::block::{DeltaInfo, DumpInfo};
+        use pyo3::types::{PyList, PyTuple};
+
         let ret = self
-            .0
+            .inner
             .dump(include_text)
             .map_err(|e| PyValueError::new_err(format!("Error during dump: {:?}", e)))?;
 
-        Ok(ret
+        let items: Vec<Bound<PyAny>> = ret
             .into_iter()
-            .map(|x| match x {
-                bazaar::groupcompress::block::DumpInfo::Fulltext(text) => (
-                    PyBytes::new(py, b"f"),
-                    0usize,
-                    text.map(|x| PyBytes::new(py, x.as_ref()).unbind().into()),
-                ),
-                bazaar::groupcompress::block::DumpInfo::Delta(decomp_len, info) => (
-                    PyBytes::new(py, b"d"),
-                    decomp_len,
-                    Some(
-                        info.into_iter()
-                            .map(|x| match x {
-                                bazaar::groupcompress::block::DeltaInfo::Copy(
-                                    offset,
-                                    len,
-                                    text,
-                                ) => (
-                                    offset,
-                                    len,
-                                    text.map(|x| PyBytes::new(py, x.as_ref()).unbind()),
-                                )
-                                    .into_pyobject(py)
-                                    .unwrap()
-                                    .unbind(),
-                                bazaar::groupcompress::block::DeltaInfo::Insert(len, data) => (
-                                    0usize,
-                                    len,
-                                    data.map(|x| PyBytes::new(py, x.as_slice()).unbind()),
-                                )
-                                    .into_pyobject(py)
-                                    .unwrap()
-                                    .unbind(),
+            .map(|info| -> PyResult<Bound<PyAny>> {
+                match info {
+                    DumpInfo::Fulltext { length, text } => {
+                        // (b"f", length) or (b"f", length, text) when include_text.
+                        let kind = PyBytes::new(py, b"f").into_any();
+                        let tuple = if let Some(text) = text {
+                            PyTuple::new(
+                                py,
+                                [
+                                    kind,
+                                    length.into_pyobject(py)?.into_any(),
+                                    PyBytes::new(py, &text).into_any(),
+                                ],
+                            )?
+                        } else {
+                            PyTuple::new(py, [kind, length.into_pyobject(py)?.into_any()])?
+                        };
+                        Ok(tuple.into_any())
+                    }
+                    DumpInfo::Delta {
+                        delta_length,
+                        decomp_length,
+                        instructions,
+                    } => {
+                        // (b"d", delta_length, decomp_length, [insts]) where each inst is
+                        // (b"c", offset, length) or (b"i", length, text).
+                        let inst_items: Vec<Bound<PyAny>> = instructions
+                            .into_iter()
+                            .map(|inst| -> PyResult<Bound<PyAny>> {
+                                let tuple = match inst {
+                                    DeltaInfo::Copy {
+                                        offset,
+                                        length,
+                                        text: _,
+                                    } => PyTuple::new(
+                                        py,
+                                        [
+                                            PyBytes::new(py, b"c").into_any(),
+                                            offset.into_pyobject(py)?.into_any(),
+                                            length.into_pyobject(py)?.into_any(),
+                                        ],
+                                    )?,
+                                    DeltaInfo::Insert { length, text } => {
+                                        let payload = match text {
+                                            Some(t) => PyBytes::new(py, &t),
+                                            None => PyBytes::new(py, b""),
+                                        };
+                                        PyTuple::new(
+                                            py,
+                                            [
+                                                PyBytes::new(py, b"i").into_any(),
+                                                length.into_pyobject(py)?.into_any(),
+                                                payload.into_any(),
+                                            ],
+                                        )?
+                                    }
+                                };
+                                Ok(tuple.into_any())
                             })
-                            .collect::<Vec<_>>()
-                            .into_pyobject(py)
-                            .unwrap()
-                            .unbind(),
-                    ),
-                ),
+                            .collect::<PyResult<_>>()?;
+                        let inst_list = PyList::new(py, inst_items)?;
+                        let tuple = PyTuple::new(
+                            py,
+                            [
+                                PyBytes::new(py, b"d").into_any(),
+                                delta_length.into_pyobject(py)?.into_any(),
+                                decomp_length.into_pyobject(py)?.into_any(),
+                                inst_list.into_any(),
+                            ],
+                        )?;
+                        Ok(tuple.into_any())
+                    }
+                }
             })
-            .collect::<Vec<_>>()
-            .into_pyobject(py)?
-            .unbind())
+            .collect::<PyResult<_>>()?;
+        PyList::new(py, items)
     }
 }
 
@@ -408,6 +578,196 @@ impl TraditionalGroupCompressor {
     }
 }
 
+#[pyclass]
+struct RabinGroupCompressor(Option<bazaar::groupcompress::compressor::RabinGroupCompressor>);
+
+fn max_bytes_from_settings(settings: Option<&Bound<PyAny>>) -> PyResult<Option<usize>> {
+    let Some(settings) = settings else {
+        return Ok(None);
+    };
+    if settings.is_none() {
+        return Ok(None);
+    }
+    let dict = settings.cast::<pyo3::types::PyDict>().map_err(|_| {
+        PyValueError::new_err("RabinGroupCompressor settings must be a dict or None")
+    })?;
+    let Some(value) = dict.get_item("max_bytes_to_index")? else {
+        return Ok(None);
+    };
+    let v: usize = value.extract()?;
+    Ok(if v == 0 { None } else { Some(v) })
+}
+
+impl RabinGroupCompressor {
+    /// Construct a `GroupCompressBlock` Py wrapper around the compressed
+    /// chunks produced by a flush. Factored out so `flush` and
+    /// `flush_without_last` share the plumbing.
+    fn build_block<'a>(
+        py: Python<'a>,
+        chunks: Vec<Vec<u8>>,
+        endpoint: usize,
+    ) -> PyResult<Bound<'a, GroupCompressBlock>> {
+        let mut inner = bazaar::groupcompress::block::GroupCompressBlock::new();
+        inner.set_chunked_content(&chunks, endpoint);
+        Bound::new(
+            py,
+            GroupCompressBlock {
+                inner,
+                z_content_cache: None,
+            },
+        )
+    }
+}
+
+#[pymethods]
+impl RabinGroupCompressor {
+    #[new]
+    #[pyo3(signature = (settings = None))]
+    fn new(settings: Option<&Bound<PyAny>>) -> PyResult<Self> {
+        let max_bytes_to_index = max_bytes_from_settings(settings)?;
+        Ok(Self(Some(
+            bazaar::groupcompress::compressor::RabinGroupCompressor::new(max_bytes_to_index),
+        )))
+    }
+
+    #[getter]
+    fn chunks<'a>(&self, py: Python<'a>) -> PyResult<Vec<Bound<'a, PyBytes>>> {
+        if let Some(c) = self.0.as_ref() {
+            Ok(c.chunks()
+                .iter()
+                .map(|x| PyBytes::new(py, x.as_ref()))
+                .collect())
+        } else {
+            Err(PyRuntimeError::new_err("Compressor is already finalized"))
+        }
+    }
+
+    #[getter]
+    fn endpoint(&self) -> PyResult<usize> {
+        if let Some(c) = self.0.as_ref() {
+            Ok(c.endpoint())
+        } else {
+            Err(PyRuntimeError::new_err("Compressor is already finalized"))
+        }
+    }
+
+    #[getter]
+    fn input_bytes(&self) -> PyResult<usize> {
+        if let Some(c) = self.0.as_ref() {
+            Ok(c.input_bytes())
+        } else {
+            Err(PyRuntimeError::new_err("Compressor is already finalized"))
+        }
+    }
+
+    /// Test probe: read the underlying delta-index byte budget.
+    #[getter]
+    fn _max_bytes_to_index(&self) -> PyResult<usize> {
+        if let Some(c) = self.0.as_ref() {
+            Ok(c.max_bytes_to_index().unwrap_or(0))
+        } else {
+            Err(PyRuntimeError::new_err("Compressor is already finalized"))
+        }
+    }
+
+    /// Map of key tuple → (start_byte, start_chunk, end_byte, end_chunk).
+    #[getter]
+    fn labels_deltas<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, pyo3::types::PyDict>> {
+        let Some(c) = self.0.as_ref() else {
+            return Err(PyRuntimeError::new_err("Compressor is already finalized"));
+        };
+        let dict = pyo3::types::PyDict::new(py);
+        for (k, &(sb, sc, eb, ec)) in c.labels_deltas() {
+            let key_tuple =
+                pyo3::types::PyTuple::new(py, k.iter().map(|seg| PyBytes::new(py, seg)))?;
+            dict.set_item(key_tuple, (sb, sc, eb, ec))?;
+        }
+        Ok(dict)
+    }
+
+    fn ratio(&self) -> PyResult<f32> {
+        if let Some(c) = self.0.as_ref() {
+            Ok(c.ratio())
+        } else {
+            Err(PyRuntimeError::new_err("Compressor is already finalized"))
+        }
+    }
+
+    fn extract<'a>(
+        &self,
+        py: Python<'a>,
+        key: Vec<Vec<u8>>,
+    ) -> PyResult<(Vec<Bound<'a, PyBytes>>, Bound<'a, PyBytes>)> {
+        if let Some(c) = self.0.as_ref() {
+            let (data, hash) = c
+                .extract(&key)
+                .map_err(|e| PyValueError::new_err(format!("Error during extract: {:?}", e)))?;
+            Ok((
+                data.iter().map(|x| PyBytes::new(py, x.as_ref())).collect(),
+                PyBytes::new(py, hash.as_bytes()),
+            ))
+        } else {
+            Err(PyRuntimeError::new_err("Compressor is already finalized"))
+        }
+    }
+
+    /// Finish this group, returning a GroupCompressBlock containing the
+    /// compressed chunks.
+    fn flush<'a>(&mut self, py: Python<'a>) -> PyResult<Bound<'a, GroupCompressBlock>> {
+        use bazaar::groupcompress::compressor::GroupCompressor;
+        let Some(c) = self.0.take() else {
+            return Err(PyRuntimeError::new_err("Compressor is already finalized"));
+        };
+        let (chunks, endpoint) = c.flush();
+        Self::build_block(py, chunks, endpoint)
+    }
+
+    fn flush_without_last<'a>(
+        &mut self,
+        py: Python<'a>,
+    ) -> PyResult<Bound<'a, GroupCompressBlock>> {
+        use bazaar::groupcompress::compressor::GroupCompressor;
+        let Some(c) = self.0.take() else {
+            return Err(PyRuntimeError::new_err("Compressor is already finalized"));
+        };
+        let (chunks, endpoint) = c.flush_without_last();
+        Self::build_block(py, chunks, endpoint)
+    }
+
+    #[pyo3(signature = (key, chunks, length, expected_sha = None, nostore_sha = None, soft = None))]
+    fn compress<'a>(
+        &mut self,
+        py: Python<'a>,
+        key: Key,
+        chunks: Vec<Vec<u8>>,
+        length: usize,
+        expected_sha: Option<Vec<u8>>,
+        nostore_sha: Option<Vec<u8>>,
+        soft: Option<bool>,
+    ) -> PyResult<(Bound<'a, PyBytes>, usize, usize, &'a str)> {
+        use bazaar::groupcompress::compressor::GroupCompressor;
+        let chunks_l = chunks.iter().map(|x| x.as_slice()).collect::<Vec<_>>();
+        let expected_sha = expected_sha
+            .map(|b| String::from_utf8(b).map_err(|e| PyValueError::new_err(e.to_string())))
+            .transpose()?;
+        let nostore_sha = nostore_sha
+            .map(|b| String::from_utf8(b).map_err(|e| PyValueError::new_err(e.to_string())))
+            .transpose()?;
+        let Some(c) = self.0.as_mut() else {
+            return Err(PyRuntimeError::new_err("Compressor is already finalized"));
+        };
+        let (hash, size, chunks, kind) = c.compress(
+            &key,
+            chunks_l.as_slice(),
+            length,
+            expected_sha,
+            nostore_sha,
+            soft,
+        )?;
+        Ok((PyBytes::new(py, hash.as_ref()), size, chunks, kind))
+    }
+}
+
 #[pyfunction]
 fn rabin_hash(data: Vec<u8>) -> PyResult<u32> {
     Ok(bazaar::groupcompress::rabin_delta::rabin_hash(
@@ -428,8 +788,11 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(make_line_delta))?;
     m.add_wrapped(wrap_pyfunction!(make_rabin_delta))?;
     m.add_wrapped(wrap_pyfunction!(rabin_hash))?;
+    m.add_function(wrap_pyfunction!(sort_gc_optimal, &m)?)?;
+    m.add_class::<GroupCompressBlock>()?;
     m.add_class::<LinesDeltaIndex>()?;
     m.add_class::<TraditionalGroupCompressor>()?;
+    m.add_class::<RabinGroupCompressor>()?;
     m.add_class::<crate::groupcompress_delta::DeltaIndex>()?;
     m.add_function(wrap_pyfunction!(
         crate::groupcompress_delta::_rabin_hash,

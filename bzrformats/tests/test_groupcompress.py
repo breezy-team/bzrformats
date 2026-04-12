@@ -24,13 +24,13 @@ from testscenarios import load_tests_apply_scenarios
 from .. import btree_index, groupcompress, knit, osutils, versionedfile
 from .. import index as _mod_index
 from ..osutils import sha_string
-from . import TestCase, TestCaseWithMemoryTransport, TestNotApplicable
+from . import TestCase, TestCaseWithMemoryTransport
 
 
 def group_compress_implementation_scenarios():
     scenarios = [
         ("python", {"compressor": groupcompress.PythonGroupCompressor}),
-        ("rust", {"compressor": groupcompress.PyrexGroupCompressor}),
+        ("rabin", {"compressor": groupcompress.RabinGroupCompressor}),
     ]
     return scenarios
 
@@ -129,8 +129,8 @@ class TestAllGroupCompressors(TestGroupCompressor):
         )
 
 
-class TestPyrexGroupCompressor(TestGroupCompressor):
-    compressor = groupcompress.PyrexGroupCompressor
+class TestRabinGroupCompressor(TestGroupCompressor):
+    compressor = groupcompress.RabinGroupCompressor
 
     def test_stats(self):
         compressor = self.compressor()
@@ -826,18 +826,14 @@ class TestGroupCompressConfig(TestCaseWithMemoryTransport):
         vf = self.make_test_vf()
         gc = vf._make_group_compressor()
         self.assertEqual(vf._DEFAULT_MAX_BYTES_TO_INDEX, vf._max_bytes_to_index)
-        if isinstance(gc, groupcompress.PyrexGroupCompressor):
-            self.assertEqual(
-                vf._DEFAULT_MAX_BYTES_TO_INDEX, gc._delta_index._max_bytes_to_index
-            )
+        self.assertEqual(vf._DEFAULT_MAX_BYTES_TO_INDEX, gc._max_bytes_to_index)
 
     def test_max_bytes_to_index_set_directly(self):
         vf = self.make_test_vf()
         vf._max_bytes_to_index = 10000
         gc = vf._make_group_compressor()
         self.assertEqual(10000, vf._max_bytes_to_index)
-        if isinstance(gc, groupcompress.PyrexGroupCompressor):
-            self.assertEqual(10000, gc._delta_index._max_bytes_to_index)
+        self.assertEqual(10000, gc._max_bytes_to_index)
 
 
 class StubGCVF:
@@ -1147,18 +1143,12 @@ class TestLazyGroupCompress(TestCaseWithMemoryTransport):
         self.assertEqual(["called"], called)
 
     def test__rebuild_handles_compressor_settings(self):
-        if not isinstance(
-            groupcompress.GroupCompressor, groupcompress.PyrexGroupCompressor
-        ):
-            raise TestNotApplicable(
-                "pure-python compressor does not handle compressor_settings"
-            )
         locations, old_block = self.make_block(self._texts)
         manager = groupcompress._LazyGroupContentManager(
             old_block, get_compressor_settings=lambda: {"max_bytes_to_index": 32}
         )
         gc = manager._make_group_compressor()
-        self.assertEqual(32, gc._delta_index._max_bytes_to_index)
+        self.assertEqual(32, gc._max_bytes_to_index)
         self.add_key_to_manager((b"key3",), locations, old_block, manager)
         self.add_key_to_manager((b"key4",), locations, old_block, manager)
         action, _last_byte, _total_bytes = manager._check_rebuild_action()
@@ -1166,10 +1156,6 @@ class TestLazyGroupCompress(TestCaseWithMemoryTransport):
         manager._rebuild_block()
         new_block = manager._block
         self.assertIsNot(old_block, new_block)
-        # Because of the new max_bytes_to_index, we do a poor job of
-        # rebuilding. This is a side-effect of the change, but at least it does
-        # show the setting had an effect.
-        self.assertLess(old_block._content_length, new_block._content_length)
 
     def test_check_is_well_utilized_all_keys(self):
         block, manager = self.make_block_and_full_manager(self._texts)

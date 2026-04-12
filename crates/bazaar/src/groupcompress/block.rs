@@ -10,7 +10,7 @@ const GCB_HEADER: &[u8] = b"gcb1z\n";
 /// Group Compress Block v1 Lzma
 const GCB_LZ_HEADER: &[u8] = b"gcb1l\n";
 
-#[derive(PartialEq, Eq, Default, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
 pub enum CompressorKind {
     #[default]
     Zlib,
@@ -171,6 +171,46 @@ impl GroupCompressBlock {
         self.content_length
     }
 
+    pub fn z_content_length(&self) -> Option<usize> {
+        self.z_content_length
+    }
+
+    /// Whether a streaming decompressor is currently attached. Mirrors the
+    /// Python class's `_z_content_decompressor is not None` probe; there is
+    /// no way to inspect the decompressor directly, only its presence.
+    pub fn has_z_content_decompressor(&self) -> bool {
+        self.z_content_decompressor.is_some()
+    }
+
+    pub fn compressor(&self) -> Option<CompressorKind> {
+        self.compressor
+    }
+
+    /// Replace the compressor kind. Clears the content cache so the next
+    /// `ensure_content` call rebuilds via the right decoder.
+    pub fn set_compressor(&mut self, kind: CompressorKind) {
+        self.compressor = Some(kind);
+        self.content = None;
+        self.z_content_decompressor = None;
+    }
+
+    /// Replace the compressed-content chunks wholesale. The caller is
+    /// responsible for also calling `set_z_content_length` and
+    /// `set_compressor` so the block can decompress the bytes later.
+    pub fn set_z_content_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+        self.z_content_chunks = Some(chunks);
+        self.content = None;
+        self.z_content_decompressor = None;
+    }
+
+    pub fn set_z_content_length(&mut self, length: usize) {
+        self.z_content_length = Some(length);
+    }
+
+    pub fn set_content_length(&mut self, length: usize) {
+        self.content_length = Some(length);
+    }
+
     /// Make sure that content has been expanded enough.
     ///
     /// # Arguments
@@ -223,6 +263,12 @@ impl GroupCompressBlock {
         }
 
         if self.content.as_ref().unwrap().len() >= num_bytes {
+            // Already decompressed enough. If we're actually at the end of
+            // the content, drop the streaming decompressor so it can be
+            // garbage-collected.
+            if self.content.as_ref().unwrap().len() >= self.content_length.unwrap_or(0) {
+                self.z_content_decompressor = None;
+            }
             return;
         }
 
@@ -235,6 +281,13 @@ impl GroupCompressBlock {
             .read_exact(&mut buf)
             .unwrap();
         self.content.as_mut().unwrap().extend(buf);
+
+        // If we've now pulled out the whole thing, drop the streaming
+        // decompressor — Python asserts `_z_content_decompressor is None`
+        // after full content has been drained.
+        if self.content.as_ref().unwrap().len() >= self.content_length.unwrap_or(0) {
+            self.z_content_decompressor = None;
+        }
     }
 
     #[allow(clippy::len_without_is_empty)]
@@ -242,7 +295,11 @@ impl GroupCompressBlock {
         // This is the maximum number of bytes this object will reference if
         // everything is decompressed. However, if we decompress less than
         // everything... (this would cause some problems for LRUSizeCache)
-        self.content_length.unwrap() + self.z_content_length.unwrap()
+        //
+        // Either field may be `None` on a freshly-constructed block or after
+        // set_content before to_chunks has been called — treat those as 0
+        // rather than panicking, matching the Python class.
+        self.content_length.unwrap_or(0) + self.z_content_length.unwrap_or(0)
     }
 
     pub fn parse_bytes(&mut self, mut data: &[u8]) -> Result<(), Error> {
@@ -316,29 +373,35 @@ impl GroupCompressBlock {
         Ok(out)
     }
 
-    /// Extract the text for a specific key.
+    /// Extract the text for a record stored at `content[start..end]`.
     ///
-    /// # Arguments
-    /// * `key` - The label used for this content
-    /// * `sha1` - TODO (should we validate only when sha1 is supplied?)
-    ///
-    /// # Returns
-    /// The bytes for the content
+    /// Fulltext records are returned directly. Delta records are applied
+    /// against the whole block content as the basis, matching the format's
+    /// "delta against preceding records in this group" semantics.
     pub fn extract(&mut self, start: usize, end: usize) -> Result<Vec<Vec<u8>>, Error> {
         if start == 0 && end == 0 {
             return Ok(vec![]);
         }
         self.ensure_content(Some(end));
 
-        let mut content = self.content.as_ref().unwrap().as_slice();
-
-        match read_item(&mut content)? {
+        let content = self.content.as_ref().unwrap();
+        if end > content.len() || start >= end {
+            return Err(Error::InvalidData(format!(
+                "extract range {}..{} out of bounds for content of length {}",
+                start,
+                end,
+                content.len()
+            )));
+        }
+        // Read the type byte and base-128 length starting at `start`, not 0.
+        let mut record = &content[start..end];
+        match read_item(&mut record)? {
             GroupCompressItem::Fulltext(data) => Ok(vec![data]),
-            GroupCompressItem::Delta(text) => Ok(vec![apply_delta(
-                self.content.as_ref().unwrap(),
-                text.as_slice(),
-            )
-            .unwrap()]),
+            GroupCompressItem::Delta(delta) => {
+                let reconstructed =
+                    apply_delta(content, delta.as_slice()).map_err(Error::InvalidData)?;
+                Ok(vec![reconstructed])
+            }
         }
     }
 
@@ -401,6 +464,11 @@ impl GroupCompressBlock {
     }
 
     /// Create the byte stream as a series of 'chunks'.
+    ///
+    /// The first chunk is the magic header concatenated with the two
+    /// base-10 length lines — the Python test suite asserts this as a
+    /// single fixed-size chunk because there is "no compelling reason to
+    /// split it up". The remaining chunks are the compressed payload.
     pub fn to_chunks(
         &mut self,
         compressor_kind: Option<CompressorKind>,
@@ -408,16 +476,17 @@ impl GroupCompressBlock {
         let compressor_kind = compressor_kind.unwrap_or_default();
         self.create_z_content(compressor_kind);
 
-        let lengths = format!(
-            "{}\n{}\n",
-            self.z_content_length.unwrap(),
-            self.content_length.unwrap()
+        let mut header_chunk = compressor_kind.header().to_vec();
+        header_chunk.extend_from_slice(
+            format!(
+                "{}\n{}\n",
+                self.z_content_length.unwrap(),
+                self.content_length.unwrap()
+            )
+            .as_bytes(),
         );
 
-        let mut chunks = vec![
-            Cow::Borrowed(compressor_kind.header()),
-            Cow::Owned(lengths.as_bytes().to_vec()),
-        ];
+        let mut chunks: Vec<Cow<'_, [u8]>> = vec![Cow::Owned(header_chunk)];
         chunks.extend(
             self.z_content_chunks
                 .as_ref()
@@ -438,13 +507,15 @@ impl GroupCompressBlock {
     /// Take this block, and spit out a human-readable structure.
     ///
     /// # Arguments
-    /// * `include_text`: Inserts also include text bits, chose whether you want this displayed in
-    /// the dump or not.
+    /// * `include_text`: when `true`, fulltext records carry their payload
+    ///   and delta inserts/copies carry the matched bytes.
     ///
     /// # Returns
-    /// A dump of the given block. The layout is something like: [('f', length), ('d',
-    /// delta_length, text_length, [delta_info])]
-    /// delta_info := [('i', num_bytes, text), ('c', offset, num_bytes), ...]
+    /// A dump of the given block. The layout matches the historical
+    /// Python `_dump` format: a list of `DumpInfo::Fulltext { length, text }`
+    /// or `DumpInfo::Delta { delta_length, decomp_length, instructions }`,
+    /// where each `DeltaInfo` is `Copy { offset, length, text }` or
+    /// `Insert { length, text }`.
     pub fn dump(&mut self, include_text: Option<bool>) -> Result<Vec<DumpInfo>, Error> {
         let include_text = include_text.unwrap_or(false);
         self.ensure_content(None);
@@ -453,16 +524,16 @@ impl GroupCompressBlock {
         while !content.is_empty() {
             match read_item(&mut content)? {
                 GroupCompressItem::Fulltext(text) => {
-                    // Fulltext
-                    if include_text {
-                        result.push(DumpInfo::Fulltext(Some(text)));
-                    } else {
-                        result.push(DumpInfo::Fulltext(None));
-                    }
+                    let length = text.len();
+                    result.push(DumpInfo::Fulltext {
+                        length,
+                        text: if include_text { Some(text) } else { None },
+                    });
                 }
                 GroupCompressItem::Delta(delta_content) => {
+                    let delta_length = delta_content.len();
                     let mut delta_info = vec![];
-                    // The first entry in a delta is the decompressed length
+                    // The first entry in a delta is the decompressed length.
                     let mut delta_slice = delta_content.as_slice();
                     let decomp_len = read_base128_int(&mut delta_slice).unwrap();
                     let mut measured_len = 0;
@@ -470,16 +541,16 @@ impl GroupCompressBlock {
                         match read_instruction(&mut delta_slice)? {
                             Instruction::Insert(text) => {
                                 measured_len += text.len();
-                                delta_info.push(DeltaInfo::Insert(
-                                    text.len(),
-                                    if include_text { Some(text) } else { None },
-                                ));
+                                delta_info.push(DeltaInfo::Insert {
+                                    length: text.len(),
+                                    text: if include_text { Some(text) } else { None },
+                                });
                             }
                             Instruction::r#Copy { offset, length } => {
-                                delta_info.push(DeltaInfo::Copy(
+                                delta_info.push(DeltaInfo::Copy {
                                     offset,
                                     length,
-                                    if include_text {
+                                    text: if include_text {
                                         Some(
                                             self.content.as_ref().unwrap()[offset..offset + length]
                                                 .to_vec(),
@@ -487,7 +558,7 @@ impl GroupCompressBlock {
                                     } else {
                                         None
                                     },
-                                ));
+                                });
                                 measured_len += length;
                             }
                         }
@@ -498,7 +569,11 @@ impl GroupCompressBlock {
                             decomp_len, measured_len
                         )));
                     }
-                    result.push(DumpInfo::Delta(decomp_len as usize, delta_info));
+                    result.push(DumpInfo::Delta {
+                        delta_length,
+                        decomp_length: decomp_len as usize,
+                        instructions: delta_info,
+                    });
                 }
             }
         }
@@ -508,11 +583,453 @@ impl GroupCompressBlock {
 }
 
 pub enum DeltaInfo {
-    Insert(usize, Option<Vec<u8>>),
-    Copy(usize, usize, Option<Vec<u8>>),
+    Insert {
+        length: usize,
+        text: Option<Vec<u8>>,
+    },
+    Copy {
+        offset: usize,
+        length: usize,
+        text: Option<Vec<u8>>,
+    },
 }
 
 pub enum DumpInfo {
-    Fulltext(Option<Vec<u8>>),
-    Delta(usize, Vec<DeltaInfo>),
+    Fulltext {
+        length: usize,
+        text: Option<Vec<u8>>,
+    },
+    Delta {
+        delta_length: usize,
+        decomp_length: usize,
+        instructions: Vec<DeltaInfo>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::groupcompress::delta::write_base128_int;
+
+    /// Build a valid "fulltext" record payload as it would be stored inside
+    /// the block's content stream: `b"f"` + base128 length + raw bytes.
+    fn make_fulltext_record(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'f'];
+        write_base128_int(&mut out, body.len() as u128).unwrap();
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn compressor_kind_header_round_trip() {
+        assert_eq!(
+            CompressorKind::from_header(GCB_HEADER),
+            Some(CompressorKind::Zlib)
+        );
+        assert_eq!(
+            CompressorKind::from_header(GCB_LZ_HEADER),
+            Some(CompressorKind::Lzma)
+        );
+        assert_eq!(CompressorKind::from_header(b"xxxxxx"), None);
+        assert_eq!(CompressorKind::Zlib.header(), GCB_HEADER);
+        assert_eq!(CompressorKind::Lzma.header(), GCB_LZ_HEADER);
+    }
+
+    #[test]
+    fn new_block_has_no_content() {
+        let b = GroupCompressBlock::new();
+        assert!(b.content().is_none());
+        assert!(b.content_length().is_none());
+    }
+
+    #[test]
+    fn new_block_len_is_zero() {
+        // A freshly constructed block must report length 0 without panicking
+        // — content_length and z_content_length are both None at this point.
+        let b = GroupCompressBlock::new();
+        assert_eq!(b.len(), 0);
+    }
+
+    #[test]
+    fn manually_initialised_block_decompresses() {
+        // Mirror the Python test pattern that sets z_content_chunks,
+        // z_content_length, compressor, and content_length directly, then
+        // calls ensure_content. This exercises the setter path used by the
+        // PyO3 bindings.
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let body: Vec<u8> = b"partial decomp target content\n".repeat(50);
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        let z_content = encoder.finish().unwrap();
+
+        let mut b = GroupCompressBlock::new();
+        b.set_z_content_chunks(vec![z_content.clone()]);
+        b.set_z_content_length(z_content.len());
+        b.set_compressor(CompressorKind::Zlib);
+        b.set_content_length(body.len());
+
+        // Content is not populated yet.
+        assert!(b.content().is_none());
+        // Partial decompression reveals at least the requested bytes.
+        b.ensure_content(Some(100));
+        assert!(b.content().unwrap().len() >= 100);
+        assert_eq!(&b.content().unwrap()[..100], &body[..100]);
+        // Full decompression recovers the whole body.
+        b.ensure_content(None);
+        assert_eq!(b.content(), Some(body.as_slice()));
+    }
+
+    #[test]
+    fn len_after_set_content_reports_content_length() {
+        let body = b"abc\n";
+        let mut b = GroupCompressBlock::new();
+        b.set_content(body);
+        // z_content_length is still None until to_bytes/to_chunks builds it,
+        // so len() should at least not panic and should reflect the content.
+        assert!(b.len() >= body.len());
+    }
+
+    #[test]
+    fn set_content_round_trip_via_to_bytes_and_from_bytes() {
+        let body = b"hello world\nthis is a single fulltext\n";
+        let record = make_fulltext_record(body);
+
+        let mut b = GroupCompressBlock::new();
+        b.set_content(&record);
+        let raw = b.to_bytes();
+
+        // The serialized block should start with the zlib header by default.
+        assert!(raw.starts_with(GCB_HEADER));
+
+        // Reading it back should recover the same record payload.
+        let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
+        assert_eq!(parsed.content_length(), Some(record.len()));
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content(), Some(record.as_slice()));
+    }
+
+    #[test]
+    fn set_chunked_content_matches_set_content_on_the_wire() {
+        let part1: Vec<u8> = b"hello world\n".to_vec();
+        let part2: Vec<u8> = b"more content\n".to_vec();
+        let total_len = part1.len() + part2.len();
+
+        let mut chunked = GroupCompressBlock::new();
+        chunked.set_chunked_content(&[part1.clone(), part2.clone()], total_len);
+        let chunked_bytes = chunked.to_bytes();
+
+        let mut flat = GroupCompressBlock::new();
+        let mut combined = part1.clone();
+        combined.extend_from_slice(&part2);
+        flat.set_content(&combined);
+        let flat_bytes = flat.to_bytes();
+
+        assert_eq!(chunked_bytes, flat_bytes);
+    }
+
+    #[test]
+    fn ensure_content_full_decompression_recovers_original() {
+        // A larger body so that streaming decompression is not a no-op.
+        let body: Vec<u8> = b"line of reasonably compressible text\n".repeat(200);
+        let record = make_fulltext_record(&body);
+
+        let mut src = GroupCompressBlock::new();
+        src.set_content(&record);
+        let raw = src.to_bytes();
+
+        let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
+        assert!(parsed.content().is_none());
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content(), Some(record.as_slice()));
+    }
+
+    #[test]
+    fn ensure_content_partial_then_full() {
+        // Request fewer bytes than the full content, then request the rest.
+        // After the second call, we must have the whole content and it must
+        // match byte-for-byte.
+        let body: Vec<u8> = b"compressible line\n".repeat(100);
+        let record = make_fulltext_record(&body);
+
+        let mut src = GroupCompressBlock::new();
+        src.set_content(&record);
+        let raw = src.to_bytes();
+
+        let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
+        parsed.ensure_content(Some(50));
+        assert!(parsed.content().unwrap().len() >= 50);
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content(), Some(record.as_slice()));
+    }
+
+    #[test]
+    fn to_chunks_produces_header_plus_lengths_chunk_then_payload() {
+        // The first chunk is the magic header byte string followed by the
+        // two base-10 length lines. The remaining chunks are the compressed
+        // payload.
+        let body = b"some body text\n";
+        let record = make_fulltext_record(body);
+        let mut b = GroupCompressBlock::new();
+        b.set_content(&record);
+        let (total_len, chunks) = b.to_chunks(None);
+
+        assert!(chunks[0].starts_with(GCB_HEADER));
+        let tail = std::str::from_utf8(&chunks[0][GCB_HEADER.len()..]).unwrap();
+        let mut iter = tail.trim_end().split('\n');
+        let z_len: usize = iter.next().unwrap().parse().unwrap();
+        let u_len: usize = iter.next().unwrap().parse().unwrap();
+        assert_eq!(u_len, record.len());
+        let payload_len: usize = chunks[1..].iter().map(|c| c.len()).sum();
+        assert_eq!(payload_len, z_len);
+        assert_eq!(total_len, chunks.iter().map(|c| c.len()).sum::<usize>());
+    }
+
+    #[test]
+    fn dump_reports_fulltext_records_without_text_by_default() {
+        let body_a = b"first body\n";
+        let body_b = b"second body\n";
+        let mut content = make_fulltext_record(body_a);
+        content.extend(make_fulltext_record(body_b));
+
+        let mut b = GroupCompressBlock::new();
+        b.set_content(&content);
+        let dump = b.dump(None).unwrap();
+        assert_eq!(dump.len(), 2);
+        assert!(matches!(dump[0], DumpInfo::Fulltext { text: None, .. }));
+        assert!(matches!(dump[1], DumpInfo::Fulltext { text: None, .. }));
+    }
+
+    #[test]
+    fn ensure_content_drops_decompressor_on_full_drain() {
+        // Once all bytes have been pulled through the streaming decompressor
+        // we drop it — mirroring the Python test assertion
+        // `assertIs(None, block._z_content_decompressor)`.
+        let body: Vec<u8> = b"ensurable content here\n".repeat(100);
+        let record = make_fulltext_record(&body);
+
+        let mut src = GroupCompressBlock::new();
+        src.set_content(&record);
+        let raw = src.to_bytes();
+
+        let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
+        parsed.ensure_content(Some(50));
+        assert!(parsed.has_z_content_decompressor());
+        parsed.ensure_content(None);
+        assert!(!parsed.has_z_content_decompressor());
+    }
+
+    #[test]
+    fn ensure_content_is_idempotent() {
+        // Calling ensure_content twice with the same limit must be a no-op
+        // on the second call — the early-return path when content.len() is
+        // already at the requested size.
+        let body: Vec<u8> = b"some compressible content\n".repeat(200);
+        let record = make_fulltext_record(&body);
+
+        let mut src = GroupCompressBlock::new();
+        src.set_content(&record);
+        let raw = src.to_bytes();
+
+        let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
+        parsed.ensure_content(None);
+        let first = parsed.content().unwrap().to_vec();
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content().unwrap(), first.as_slice());
+
+        // And a partial request below the current length is likewise a no-op.
+        parsed.ensure_content(Some(10));
+        assert_eq!(parsed.content().unwrap(), first.as_slice());
+    }
+
+    #[test]
+    fn extract_reads_record_at_given_start_offset() {
+        // Two fulltext records back-to-back. Extracting the second must read
+        // from its actual start offset in the decompressed content, not from
+        // byte 0.
+        let body_a = b"first body\n";
+        let body_b = b"second body\n";
+        let rec_a = make_fulltext_record(body_a);
+        let rec_b = make_fulltext_record(body_b);
+        let mut content = rec_a.clone();
+        content.extend_from_slice(&rec_b);
+
+        let mut b = GroupCompressBlock::new();
+        b.set_content(&content);
+
+        // Extract record A from its byte range.
+        let start_a = 0;
+        let end_a = rec_a.len();
+        let out_a = b.extract(start_a, end_a).unwrap();
+        assert_eq!(out_a, vec![body_a.to_vec()]);
+
+        // Extract record B from its byte range — this is the one that
+        // exercises the offset-aware path.
+        let start_b = rec_a.len();
+        let end_b = content.len();
+        let out_b = b.extract(start_b, end_b).unwrap();
+        assert_eq!(out_b, vec![body_b.to_vec()]);
+    }
+
+    #[test]
+    fn dump_with_include_text_returns_payload() {
+        let body = b"included body\n";
+        let content = make_fulltext_record(body);
+
+        let mut b = GroupCompressBlock::new();
+        b.set_content(&content);
+        let dump = b.dump(Some(true)).unwrap();
+        assert_eq!(dump.len(), 1);
+        match &dump[0] {
+            DumpInfo::Fulltext {
+                text: Some(text), ..
+            } => assert_eq!(text.as_slice(), body),
+            _ => panic!("expected Fulltext with text"),
+        }
+    }
+
+    #[test]
+    fn dump_reports_delta_records_with_instructions() {
+        // Build a real fulltext+delta pair by driving a RabinGroupCompressor,
+        // push the result into a block, and exercise dump() on the delta.
+        use crate::groupcompress::compressor::{GroupCompressor, RabinGroupCompressor};
+        use crate::versionedfile::Key;
+
+        let mut gc = RabinGroupCompressor::new(None);
+        let base = b"shared content that is long enough for rabin matching\nmore shared\n";
+        let derived =
+            b"shared content that is long enough for rabin matching\nmore shared\nplus\n";
+        gc.compress(
+            &Key::Fixed(vec![b"base".to_vec()]),
+            &[base.as_slice()],
+            base.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        gc.compress(
+            &Key::Fixed(vec![b"derived".to_vec()]),
+            &[derived.as_slice()],
+            derived.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (chunks, endpoint) = gc.flush();
+
+        let mut b = GroupCompressBlock::new();
+        b.set_chunked_content(&chunks, endpoint);
+        let dump = b.dump(None).unwrap();
+        assert_eq!(dump.len(), 2);
+        match &dump[0] {
+            DumpInfo::Fulltext { length, text: None } => assert_eq!(*length, base.len()),
+            _ => panic!("expected Fulltext(None) for first record, got {:?}", match_kind(&dump[0])),
+        }
+        match &dump[1] {
+            DumpInfo::Delta {
+                decomp_length,
+                instructions,
+                ..
+            } => {
+                assert_eq!(*decomp_length, derived.len());
+                assert!(!instructions.is_empty());
+                // At least one Copy for the shared prefix, and at least one
+                // Insert for the "plus\n" tail.
+                let (copies, inserts): (usize, usize) =
+                    instructions.iter().fold((0, 0), |(c, i), inst| match inst {
+                        DeltaInfo::Copy { .. } => (c + 1, i),
+                        DeltaInfo::Insert { .. } => (c, i + 1),
+                    });
+                assert!(copies >= 1, "delta should contain at least one copy");
+                assert!(inserts >= 1, "delta should contain at least one insert");
+            }
+            _ => panic!("expected Delta for second record"),
+        }
+    }
+
+    fn match_kind(info: &DumpInfo) -> &'static str {
+        match info {
+            DumpInfo::Fulltext { .. } => "Fulltext",
+            DumpInfo::Delta { .. } => "Delta",
+        }
+    }
+
+    #[test]
+    fn z_content_length_reflects_setter() {
+        let mut b = GroupCompressBlock::new();
+        assert_eq!(b.z_content_length(), None);
+        b.set_z_content_length(1234);
+        assert_eq!(b.z_content_length(), Some(1234));
+    }
+
+    #[test]
+    fn compressor_getter_and_setter_round_trip() {
+        let mut b = GroupCompressBlock::new();
+        assert_eq!(b.compressor(), None);
+        b.set_compressor(CompressorKind::Zlib);
+        assert_eq!(b.compressor(), Some(CompressorKind::Zlib));
+        b.set_compressor(CompressorKind::Lzma);
+        assert_eq!(b.compressor(), Some(CompressorKind::Lzma));
+    }
+
+    #[test]
+    fn set_z_content_chunks_clears_cached_content() {
+        // Setting new compressed chunks must invalidate any previously
+        // decompressed content — otherwise stale content would leak across
+        // a re-initialisation.
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let body: Vec<u8> = b"the original body bytes\n".repeat(20);
+        let rec = make_fulltext_record(&body);
+        let mut src = GroupCompressBlock::new();
+        src.set_content(&rec);
+        src.to_bytes(); // force z_content population
+
+        let mut parsed = GroupCompressBlock::from_bytes(src.to_bytes().as_slice()).unwrap();
+        parsed.ensure_content(None);
+        assert!(parsed.content().is_some());
+
+        // Now rebuild a fresh z_content for a different body and plug it in
+        // via the low-level setters. set_z_content_chunks must clear the
+        // cached content so the next ensure_content produces the new body.
+        let replacement_body: Vec<u8> = b"replacement body bytes\n".repeat(20);
+        let replacement_record = make_fulltext_record(&replacement_body);
+        let mut encoder =
+            ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&replacement_record).unwrap();
+        let z_replacement = encoder.finish().unwrap();
+
+        parsed.set_compressor(CompressorKind::Zlib);
+        parsed.set_z_content_chunks(vec![z_replacement.clone()]);
+        parsed.set_z_content_length(z_replacement.len());
+        parsed.set_content_length(replacement_record.len());
+
+        assert!(parsed.content().is_none(), "cached content should be cleared");
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content(), Some(replacement_record.as_slice()));
+    }
+
+    #[test]
+    fn lzma_round_trip_via_to_chunks_from_bytes() {
+        // Build a block, serialise with the Lzma compressor, and round-trip
+        // through from_bytes. Exercises the xz2 encode/decode path for
+        // CompressorKind::Lzma.
+        let body: Vec<u8> = b"a bit of compressible lzma-bound text\n".repeat(40);
+        let record = make_fulltext_record(&body);
+
+        let mut src = GroupCompressBlock::new();
+        src.set_content(&record);
+        let (_total_len, chunks) = src.to_chunks(Some(CompressorKind::Lzma));
+        let bytes: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        assert!(bytes.starts_with(GCB_LZ_HEADER));
+
+        let mut parsed = GroupCompressBlock::from_bytes(bytes.as_slice()).unwrap();
+        assert_eq!(parsed.compressor(), Some(CompressorKind::Lzma));
+        parsed.ensure_content(None);
+        assert_eq!(parsed.content(), Some(record.as_slice()));
+    }
 }
