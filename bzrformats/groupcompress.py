@@ -846,40 +846,23 @@ def network_block_to_records(storage_kind, bytes, line_end):
     return manager.get_record_stream()
 
 
+from ._bzr_rs.groupcompress import RabinGroupCompressor as _RustRabinGroupCompressor
+
+
 class RabinGroupCompressor:
-    """Produce a serialised group of compressed texts.
+    """Produce a serialised group of compressed texts using rabin deltas.
 
-    It contains code very similar to SequenceMatcher because of having a similar
-    task. However some key differences apply:
-
-    * there is no junk, we want a minimal edit not a human readable diff.
-    * we don't filter very common lines (because we don't know where a good
-      range will start, and after the first text we want to be emitting minmal
-      edits only.
-    * we chain the left side, not the right side
-    * we incrementally update the adjacency matrix as new lines are provided.
-    * we look for matches in all of the left side, so the routine which does
-      the analagous task of find_longest_match does not need to filter on the
-      left side.
+    Thin Python wrapper around the Rust ``RabinGroupCompressor``. The
+    business logic (delta-index management, label tracking, mini-header
+    framing) lives in the Rust implementation; this class just packages
+    the flushed chunks into a ``GroupCompressBlock`` so the rest of the
+    Python machinery (``_LazyGroupContentManager``) keeps working.
     """
 
-    chunks: list[bytes]
-
     def __init__(self, settings=None):
-        """Create a GroupCompressor."""
-        self._last = None
-        self.endpoint = 0
-        self.input_bytes = 0
-        self.labels_deltas = {}
-        self._delta_index = None  # Set by the children
+        self._inner = _RustRabinGroupCompressor(settings)
         self._block = GroupCompressBlock()
-        if settings is None:
-            self._settings = {}
-        else:
-            self._settings = settings
-        self.chunks = []
-        max_bytes_to_index = self._settings.get("max_bytes_to_index", 0)
-        self._delta_index = DeltaIndex(max_bytes_to_index=max_bytes_to_index)
+        self._settings = {} if settings is None else settings
 
     def compress(self, key, chunks, length, expected_sha, nostore_sha=None, soft=False):
         """Compress lines with label key.
@@ -900,148 +883,50 @@ class RabinGroupCompressor:
 
         :return: The sha1 of lines, the start and end offsets in the delta, and
             the type ('fulltext' or 'delta').
-
-        :seealso VersionedFiles.add_lines:
         """
-        if length == 0:  # empty, like a dir entry, etc
-            if nostore_sha == _null_sha1:
-                raise ExistingContent()
-            return _null_sha1, 0, 0, "fulltext"
-        # we assume someone knew what they were doing when they passed it in
-        sha1 = expected_sha if expected_sha is not None else sha_strings(chunks)
-        if nostore_sha is not None and sha1 == nostore_sha:
-            raise ExistingContent()
-        if key[-1] is None:
-            key = key[:-1] + (b"sha1:" + sha1,)
-
-        start, end, type = self._compress(key, chunks, length, length / 2, soft)
-        return sha1, start, end, type
-
-    def _compress(self, key, chunks, input_len, max_delta_size, soft=False):
-        """See _CommonGroupCompressor._compress."""
-        # By having action/label/sha1/len, we can parse the group if the index
-        # was ever destroyed, we have the key in 'label', we know the final
-        # bytes are valid from sha1, and we know where to find the end of this
-        # record because of 'len'. (the delta record itself will store the
-        # total length for the expanded record)
-        # 'len: %d\n' costs approximately 1% increase in total data
-        # Having the labels at all costs us 9-10% increase, 38% increase for
-        # inventory pages, and 5.8% increase for text pages
-        # new_chunks = ['label:%s\nsha1:%s\n' % (label, sha1)]
-        if self._delta_index._source_offset != self.endpoint:
-            raise AssertionError(
-                "_source_offset != endpoint"
-                " somehow the DeltaIndex got out of sync with"
-                " the output lines"
-            )
-        bytes = b"".join(chunks)
-        delta = self._delta_index.make_delta(bytes, max_delta_size)
-        if delta is None:
-            type = "fulltext"
-            enc_length = encode_base128_int(input_len)
-            len_mini_header = 1 + len(enc_length)
-            self._delta_index.add_source(bytes, len_mini_header)
-            new_chunks = [b"f", enc_length] + chunks
-        else:
-            type = "delta"
-            enc_length = encode_base128_int(len(delta))
-            len_mini_header = 1 + len(enc_length)
-            new_chunks = [b"d", enc_length, delta]
-            self._delta_index.add_delta_source(delta, len_mini_header)
-        # Before insertion
-        start = self.endpoint
-        chunk_start = len(self.chunks)
-        # Now output these bytes
-        self._output_chunks(new_chunks)
-        self.input_bytes += input_len
-        chunk_end = len(self.chunks)
-        self.labels_deltas[key] = (start, chunk_start, self.endpoint, chunk_end)
-        if not self._delta_index._source_offset == self.endpoint:
-            raise AssertionError(
-                "the delta index is out of sync"
-                f"with the output lines {self._delta_index._source_offset} != {self.endpoint}"
-            )
-        return start, self.endpoint, type
-
-    def _output_chunks(self, new_chunks):
-        """Output some chunks.
-
-        :param new_chunks: The chunks to output.
-        """
-        self._last = (len(self.chunks), self.endpoint)
-        endpoint = self.endpoint
-        self.chunks.extend(new_chunks)
-        endpoint += sum(map(len, new_chunks))
-        self.endpoint = endpoint
+        return self._inner.compress(
+            key, chunks, length, expected_sha, nostore_sha, soft
+        )
 
     def extract(self, key):
-        """Extract a key previously added to the compressor.
+        return self._inner.extract(key)
 
-        :param key: The key to extract.
-        :return: An iterable over chunks and the sha1.
-        """
-        (_start_byte, start_chunk, _end_byte, end_chunk) = self.labels_deltas[key]
-        delta_chunks = self.chunks[start_chunk:end_chunk]
-        stored_bytes = b"".join(delta_chunks)
-        kind = stored_bytes[:1]
-        if kind == b"f":
-            fulltext_len, offset = decode_base128_int(stored_bytes[1:10])
-            data_len = fulltext_len + 1 + offset
-            if data_len != len(stored_bytes):
-                raise ValueError(
-                    "Index claimed fulltext len, but stored bytes"
-                    f" claim {len(stored_bytes)} != {data_len}"
-                )
-            data = [stored_bytes[offset + 1 :]]
-        else:
-            if kind != b"d":
-                raise ValueError(f"Unknown content kind, bytes claim {kind}")
-            # XXX: This is inefficient at best
-            source = b"".join(self.chunks[:start_chunk])
-            delta_len, offset = decode_base128_int(stored_bytes[1:10])
-            data_len = delta_len + 1 + offset
-            if data_len != len(stored_bytes):
-                raise ValueError(
-                    "Index claimed delta len, but stored bytes"
-                    f" claim {len(stored_bytes)} != {data_len}"
-                )
-            data = [apply_delta(source, stored_bytes[offset + 1 :])]
-        data_sha1 = sha_strings(data)
-        return data, data_sha1
+    def ratio(self):
+        return self._inner.ratio()
+
+    @property
+    def chunks(self):
+        return self._inner.chunks
+
+    @property
+    def endpoint(self):
+        return self._inner.endpoint
+
+    @property
+    def input_bytes(self):
+        return self._inner.input_bytes
+
+    @property
+    def _max_bytes_to_index(self):
+        return self._inner._max_bytes_to_index
+
+    @property
+    def labels_deltas(self):
+        return self._inner.labels_deltas
 
     def flush(self):
         """Finish this group, creating a formatted stream.
 
-        After calling this, the compressor should no longer be used
+        After calling this, the compressor should no longer be used.
         """
-        self._block.set_chunked_content(self.chunks, self.endpoint)
-        self._delta_index = None
-        self.chunks = None
+        chunks, endpoint = self._inner.flush()
+        self._block.set_chunked_content(chunks, endpoint)
         return self._block
 
     def flush_without_last(self):
-        """Flush the buffer after removing the last item.
-
-        Returns:
-            The flushed group compress block.
-        """
-        self._pop_last()
-        return self.flush()
-
-    def _pop_last(self):
-        """Call this if you want to 'revoke' the last compression.
-
-        After this, the data structures will be rolled back, but you cannot do
-        more compression.
-        """
-        self._delta_index = None
-        del self.chunks[self._last[0] :]
-        self.endpoint = self._last[1]
-        self._last = None
-
-    def ratio(self):
-        """Return the overall compression ratio."""
-        return float(self.input_bytes) / float(self.endpoint)
+        chunks, endpoint = self._inner.flush_without_last()
+        self._block.set_chunked_content(chunks, endpoint)
+        return self._block
 
 
 def make_pack_factory(graph, delta, keylength, inconsistency_fatal=True):

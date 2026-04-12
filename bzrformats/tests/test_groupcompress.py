@@ -827,7 +827,7 @@ class TestGroupCompressConfig(TestCaseWithMemoryTransport):
         gc = vf._make_group_compressor()
         self.assertEqual(vf._DEFAULT_MAX_BYTES_TO_INDEX, vf._max_bytes_to_index)
         self.assertEqual(
-            vf._DEFAULT_MAX_BYTES_TO_INDEX, gc._delta_index._max_bytes_to_index
+            vf._DEFAULT_MAX_BYTES_TO_INDEX, gc._max_bytes_to_index
         )
 
     def test_max_bytes_to_index_set_directly(self):
@@ -835,7 +835,7 @@ class TestGroupCompressConfig(TestCaseWithMemoryTransport):
         vf._max_bytes_to_index = 10000
         gc = vf._make_group_compressor()
         self.assertEqual(10000, vf._max_bytes_to_index)
-        self.assertEqual(10000, gc._delta_index._max_bytes_to_index)
+        self.assertEqual(10000, gc._max_bytes_to_index)
 
 
 class StubGCVF:
@@ -1150,7 +1150,7 @@ class TestLazyGroupCompress(TestCaseWithMemoryTransport):
             old_block, get_compressor_settings=lambda: {"max_bytes_to_index": 32}
         )
         gc = manager._make_group_compressor()
-        self.assertEqual(32, gc._delta_index._max_bytes_to_index)
+        self.assertEqual(32, gc._max_bytes_to_index)
         self.add_key_to_manager((b"key3",), locations, old_block, manager)
         self.add_key_to_manager((b"key4",), locations, old_block, manager)
         action, _last_byte, _total_bytes = manager._check_rebuild_action()

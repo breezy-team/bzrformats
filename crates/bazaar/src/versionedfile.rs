@@ -23,7 +23,7 @@ impl From<std::io::Error> for Error {
 impl From<Error> for pyo3::PyErr {
     fn from(e: Error) -> pyo3::PyErr {
         pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
-        pyo3::import_exception!(bzrformats.errors, ExistingContent);
+        pyo3::import_exception!(bzrformats.versionedfile, ExistingContent);
         match e {
             Error::VersionNotPresent(key) => {
                 RevisionNotPresent::new_err(format!("Version not present: {:?}", key))
@@ -40,7 +40,7 @@ impl From<Error> for pyo3::PyErr {
 impl From<pyo3::PyErr> for Error {
     fn from(e: pyo3::PyErr) -> Error {
         pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
-        pyo3::import_exception!(bzrformats.errors, ExistingContent);
+        pyo3::import_exception!(bzrformats.versionedfile, ExistingContent);
         pyo3::Python::attach(|py| {
             if e.is_instance_of::<RevisionNotPresent>(py) {
                 Error::VersionNotPresent(
