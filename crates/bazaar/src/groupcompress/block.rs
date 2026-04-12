@@ -316,29 +316,35 @@ impl GroupCompressBlock {
         Ok(out)
     }
 
-    /// Extract the text for a specific key.
+    /// Extract the text for a record stored at `content[start..end]`.
     ///
-    /// # Arguments
-    /// * `key` - The label used for this content
-    /// * `sha1` - TODO (should we validate only when sha1 is supplied?)
-    ///
-    /// # Returns
-    /// The bytes for the content
+    /// Fulltext records are returned directly. Delta records are applied
+    /// against the whole block content as the basis, matching the format's
+    /// "delta against preceding records in this group" semantics.
     pub fn extract(&mut self, start: usize, end: usize) -> Result<Vec<Vec<u8>>, Error> {
         if start == 0 && end == 0 {
             return Ok(vec![]);
         }
         self.ensure_content(Some(end));
 
-        let mut content = self.content.as_ref().unwrap().as_slice();
-
-        match read_item(&mut content)? {
+        let content = self.content.as_ref().unwrap();
+        if end > content.len() || start >= end {
+            return Err(Error::InvalidData(format!(
+                "extract range {}..{} out of bounds for content of length {}",
+                start,
+                end,
+                content.len()
+            )));
+        }
+        // Read the type byte and base-128 length starting at `start`, not 0.
+        let mut record = &content[start..end];
+        match read_item(&mut record)? {
             GroupCompressItem::Fulltext(data) => Ok(vec![data]),
-            GroupCompressItem::Delta(text) => Ok(vec![apply_delta(
-                self.content.as_ref().unwrap(),
-                text.as_slice(),
-            )
-            .unwrap()]),
+            GroupCompressItem::Delta(delta) => {
+                let reconstructed = apply_delta(content, delta.as_slice())
+                    .map_err(Error::InvalidData)?;
+                Ok(vec![reconstructed])
+            }
         }
     }
 
@@ -658,6 +664,35 @@ mod tests {
         assert_eq!(dump.len(), 2);
         assert!(matches!(dump[0], DumpInfo::Fulltext(None)));
         assert!(matches!(dump[1], DumpInfo::Fulltext(None)));
+    }
+
+    #[test]
+    fn extract_reads_record_at_given_start_offset() {
+        // Two fulltext records back-to-back. Extracting the second must read
+        // from its actual start offset in the decompressed content, not from
+        // byte 0.
+        let body_a = b"first body\n";
+        let body_b = b"second body\n";
+        let rec_a = make_fulltext_record(body_a);
+        let rec_b = make_fulltext_record(body_b);
+        let mut content = rec_a.clone();
+        content.extend_from_slice(&rec_b);
+
+        let mut b = GroupCompressBlock::new();
+        b.set_content(&content);
+
+        // Extract record A from its byte range.
+        let start_a = 0;
+        let end_a = rec_a.len();
+        let out_a = b.extract(start_a, end_a).unwrap();
+        assert_eq!(out_a, vec![body_a.to_vec()]);
+
+        // Extract record B from its byte range — this is the one that
+        // exercises the offset-aware path.
+        let start_b = rec_a.len();
+        let end_b = content.len();
+        let out_b = b.extract(start_b, end_b).unwrap();
+        assert_eq!(out_b, vec![body_b.to_vec()]);
     }
 
     #[test]
