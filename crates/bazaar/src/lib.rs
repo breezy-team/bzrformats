@@ -15,6 +15,7 @@ pub mod groupcompress;
 pub mod hashcache;
 pub mod inventory;
 pub mod inventory_delta;
+pub mod knit;
 pub mod multiparent;
 pub mod pack;
 pub mod repository;
