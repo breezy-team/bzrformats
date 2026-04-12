@@ -1,6 +1,6 @@
-use osutils::rand_chars;
 use lazy_regex::regex;
 use lazy_static::lazy_static;
+use osutils::rand_chars;
 use regex::bytes::Regex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -119,9 +119,7 @@ pub fn gen_revision_id(username: &str, timestamp: Option<u64>) -> Vec<u8> {
     });
     [
         user_or_email,
-        osutils::time::compact_date(timestamp)
-            .as_bytes()
-            .to_vec(),
+        osutils::time::compact_date(timestamp).as_bytes().to_vec(),
         unique_chunk,
     ]
     .join(&b'-')

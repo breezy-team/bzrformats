@@ -109,17 +109,3 @@ class TestInconsistentDelta(TestCase):
             "reason: reason for foo",
             str(err),
         )
-
-
-# Add test module discovery
-def test_suite():
-    """Return the test suite for error tests."""
-    import unittest
-
-    return unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])
-
-
-if __name__ == "__main__":
-    import unittest
-
-    unittest.main()

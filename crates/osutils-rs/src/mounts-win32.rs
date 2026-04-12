@@ -34,7 +34,11 @@ fn _get_fs_type(drive: &str) -> Option<String> {
 }
 
 pub fn get_fs_type<P: AsRef<Path>>(path: P) -> Option<String> {
-    let drive = path.as_ref().parent().and_then(|p| p.to_str()).unwrap_or_default();
+    let drive = path
+        .as_ref()
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or_default();
     let drive = if drive.contains(':') {
         drive
     } else {

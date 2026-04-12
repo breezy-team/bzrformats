@@ -24,10 +24,15 @@ and resolution. It supports structured merge information representation and
 various merge strategies.
 """
 
+from ._bzr_rs.textmerge import Merge2
+
+__all__ = ["Merge2", "TextMerge"]
+
 
 class TextMerge:
-    """Base class for text-mergers
-    Subclasses must implement _merge_struct.
+    """Base class for text-mergers.
+
+    Subclasses must implement ``_merge_struct``.
 
     Many methods produce or consume structured merge information.
     This is an iterable of tuples of lists of lines.
@@ -35,27 +40,22 @@ class TextMerge:
     represents is conflicted.
 
     Unconflicted region tuples have length 1.
-    Conflicted region tuples have length 2 or 3.  Index 1 is text_a, e.g. THIS.
+    Conflicted region tuples have length 2 or 3.  Index 0 is text_a, e.g. THIS.
     Index 1 is text_b, e.g. OTHER.  Index 2 is optional.  If present, it
     represents BASE.
     """
 
-    # TODO: Show some version information (e.g. author, date) on conflicted
-    # regions.
-    A_MARKER = b"<<<<<<< \n"
-    B_MARKER = b">>>>>>> \n"
-    SPLIT_MARKER = b"=======\n"
+    A_MARKER = Merge2.A_MARKER
+    B_MARKER = Merge2.B_MARKER
+    SPLIT_MARKER = Merge2.SPLIT_MARKER
 
     def __init__(self, a_marker=A_MARKER, b_marker=B_MARKER, split_marker=SPLIT_MARKER):
         r"""Initialize a TextMerge instance with conflict markers.
 
         Args:
             a_marker: Marker for the start of conflicted region A (THIS).
-                Defaults to "<<<<<<< \n".
             b_marker: Marker for the end of conflicted region B (OTHER).
-                Defaults to ">>>>>>> \n".
             split_marker: Marker separating conflicted regions A and B.
-                Defaults to "=======\n".
         """
         self.a_marker = a_marker
         self.b_marker = b_marker
@@ -63,6 +63,7 @@ class TextMerge:
 
     def _merge_struct(self):
         """Return structured merge info.  Must be implemented by subclasses.
+
         See TextMerge docstring for details on the format.
         """
         raise NotImplementedError("_merge_struct is abstract")
@@ -88,8 +89,9 @@ class TextMerge:
                 yield group
 
     def merge_lines(self, reprocess=False):
-        """Produce an iterable of lines, suitable for writing to a file
-        Returns a tuple of (line iterable, conflict indicator)
+        """Produce an iterable of lines, suitable for writing to a file.
+
+        Returns a tuple of (line iterable, conflict indicator).
         If reprocess is True, a two-way merge will be performed on the
         intermediate structure, to reduce conflict regions.
         """
@@ -109,67 +111,4 @@ class TextMerge:
         else:
             return struct_iter
 
-    @staticmethod
-    def reprocess_struct(struct_iter):
-        """Perform a two-way merge on structural merge info.
-        This reduces the size of conflict regions, but breaks the connection
-        between the BASE text and the conflict region.
-
-        This process may split a single conflict region into several smaller
-        ones, but will not introduce new conflicts.
-        """
-        for group in struct_iter:
-            if len(group) == 1:
-                yield group
-            else:
-                yield from Merge2(group[0], group[1]).merge_struct()
-
-
-class Merge2(TextMerge):
-    """Two-way merge.
-    In a two way merge, common regions are shown as unconflicting, and uncommon
-    regions produce conflicts.
-    """
-
-    def __init__(
-        self,
-        lines_a,
-        lines_b,
-        a_marker=TextMerge.A_MARKER,
-        b_marker=TextMerge.B_MARKER,
-        split_marker=TextMerge.SPLIT_MARKER,
-    ):
-        """Initialize a two-way merge operation.
-
-        Args:
-            lines_a: Sequence of lines from the first text (THIS).
-            lines_b: Sequence of lines from the second text (OTHER).
-            a_marker: Marker for the start of conflicted region A.
-                Defaults to TextMerge.A_MARKER.
-            b_marker: Marker for the end of conflicted region B.
-                Defaults to TextMerge.B_MARKER.
-            split_marker: Marker separating conflicted regions A and B.
-                Defaults to TextMerge.SPLIT_MARKER.
-        """
-        TextMerge.__init__(self, a_marker, b_marker, split_marker)
-        self.lines_a = lines_a
-        self.lines_b = lines_b
-
-    def _merge_struct(self):
-        """Return structured merge info.
-        See TextMerge docstring.
-        """
-        import patiencediff
-
-        sm = patiencediff.PatienceSequenceMatcher(None, self.lines_a, self.lines_b)
-        pos_a = 0
-        pos_b = 0
-        for ai, bi, l in sm.get_matching_blocks():
-            # non-matching lines
-            yield (self.lines_a[pos_a:ai], self.lines_b[pos_b:bi])
-            # matching lines
-            yield (self.lines_a[ai : ai + l],)
-            pos_a = ai + l
-            pos_b = bi + l
-        # final non-matching lines
-        yield (self.lines_a[pos_a:-1], self.lines_b[pos_b:-1])
+    reprocess_struct = staticmethod(Merge2.reprocess_struct)

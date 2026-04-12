@@ -279,17 +279,3 @@ class TestFileKindFromStatMode(TestCase):
 
         mode = stat.S_IFBLK | 0o666
         self.assertEqual("block", osutils.file_kind_from_stat_mode(mode))
-
-
-# Add test module discovery
-def test_suite():
-    """Return the test suite for osutils tests."""
-    import unittest
-
-    return unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])
-
-
-if __name__ == "__main__":
-    import unittest
-
-    unittest.main()

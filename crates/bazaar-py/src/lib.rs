@@ -17,6 +17,7 @@ mod groupcompress_delta;
 mod inventory;
 mod knit;
 mod smart;
+mod textmerge;
 mod versionedfile;
 
 import_exception!(bzrformats.errors, ReservedId);
@@ -539,6 +540,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let smartm = smart::_smart_rs(py)?;
     m.add_submodule(&smartm)?;
 
+    let textmergem = textmerge::_textmerge_rs(py)?;
+    m.add_submodule(&textmergem)?;
+
     let versionedfilem = versionedfile::_versionedfile_rs(py)?;
     m.add_submodule(&versionedfilem)?;
 
@@ -560,8 +564,12 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.chk_map", module_name), &chk_mapm)?;
     modules.set_item(format!("{}.knit", module_name), &knitm)?;
     modules.set_item(format!("{}.smart", module_name), &smartm)?;
+    modules.set_item(format!("{}.textmerge", module_name), &textmergem)?;
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
-    modules.set_item(format!("{}.btree_serializer", module_name), &btree_serializerm)?;
+    modules.set_item(
+        format!("{}.btree_serializer", module_name),
+        &btree_serializerm,
+    )?;
 
     Ok(())
 }
