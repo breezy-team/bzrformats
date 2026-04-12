@@ -21,6 +21,7 @@ import os
 from io import BytesIO
 
 from . import errors
+from ._bzr_rs import multiparent as _multiparent_rs
 
 
 def topo_iter_keys(vf, keys=None):
@@ -183,12 +184,11 @@ class MultiParent:
 
     def to_patch(self):
         """Yield text lines for a patch."""
-        for hunk in self.hunks:
-            yield from hunk.to_patch()
+        yield from _multiparent_rs.to_patch(self.hunks)
 
     def patch_len(self):
         """Return the length of the patch."""
-        return len(b"".join(self.to_patch()))
+        return sum(len(chunk) for chunk in _multiparent_rs.to_patch(self.hunks))
 
     def zipped_patch_len(self):
         """Return the length of the gzipped patch."""
@@ -197,35 +197,13 @@ class MultiParent:
     @classmethod
     def from_patch(cls, text):
         """Create a MultiParent from its string form."""
-        return cls._from_patch(BytesIO(text))
-
-    @staticmethod
-    def _from_patch(lines):
-        r"""This is private because it is essential to split lines on \n only."""
-        line_iter = iter(lines)
         hunks = []
-        cur_line = None
-        while True:
-            try:
-                cur_line = next(line_iter)
-            except StopIteration:
-                break
-            first_char = cur_line[0:1]
-            if first_char == b"i":
-                num_lines = int(cur_line.split(b" ")[1])
-                hunk_lines = [next(line_iter) for _ in range(num_lines)]
-                hunk_lines[-1] = hunk_lines[-1][:-1]
-                hunks.append(NewText(hunk_lines))
-            elif first_char == b"\n":
-                hunks[-1].lines[-1] += b"\n"
+        for kind, payload in _multiparent_rs.parse_patch(bytes(text)):
+            if kind == b"n":
+                hunks.append(NewText(payload))
             else:
-                if not (first_char == b"c"):
-                    raise AssertionError(first_char)
-                parent, parent_pos, child_pos, num_lines = (
-                    int(v) for v in cur_line.split(b" ")[1:]
-                )
-                hunks.append(ParentText(parent, parent_pos, child_pos, num_lines))
-        return MultiParent(hunks)
+                hunks.append(ParentText(*payload))
+        return cls(hunks)
 
     def range_iterator(self):
         """Iterate through the hunks, with range indicated.
@@ -251,18 +229,11 @@ class MultiParent:
 
     def num_lines(self):
         """The number of lines in the output text."""
-        extra_n = 0
-        for hunk in reversed(self.hunks):
-            if isinstance(hunk, ParentText):
-                return hunk.child_pos + hunk.num_lines + extra_n
-            extra_n += len(hunk.lines)
-        return extra_n
+        return _multiparent_rs.num_lines(self.hunks)
 
     def is_snapshot(self):
         """Return true of this hunk is effectively a fulltext."""
-        if len(self.hunks) != 1:
-            return False
-        return isinstance(self.hunks[0], NewText)
+        return _multiparent_rs.is_snapshot(self.hunks)
 
 
 class NewText:
