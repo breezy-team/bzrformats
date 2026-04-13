@@ -1198,7 +1198,10 @@ impl MutableInventory {
 
         match ie {
             Entry::Directory { ref file_id, .. } | Entry::Root { ref file_id, .. } => {
-                self.children.insert(file_id.clone(), HashMap::new());
+                // Preserve any existing children map so that delete+add of
+                // the same directory id (a metadata replace) doesn't orphan
+                // children that still reference it as parent.
+                self.children.entry(file_id.clone()).or_default();
             }
             _ => {}
         }
@@ -1736,5 +1739,42 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(d, Entry::Directory { .. }));
+    }
+
+    #[test]
+    fn delete_then_readd_directory_preserves_children() {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        let dir_id = FileId::from(b"dir-id".to_vec());
+        inv.add(Entry::directory(
+            dir_id.clone(),
+            "dir".to_string(),
+            root_id(),
+            None,
+        ))
+        .unwrap();
+        let file_id = FileId::from(b"file-id".to_vec());
+        inv.add(Entry::file(
+            file_id.clone(),
+            "file".to_string(),
+            dir_id.clone(),
+            None,
+            Some(b"sha".to_vec()),
+            Some(1),
+            Some(false),
+            None,
+        ))
+        .unwrap();
+        inv.delete(&dir_id).unwrap();
+        inv.add(Entry::directory(
+            dir_id.clone(),
+            "dir".to_string(),
+            root_id(),
+            None,
+        ))
+        .unwrap();
+        let children = inv.get_children(&dir_id).expect("children map present");
+        assert_eq!(children.len(), 1);
+        assert!(children.contains_key("file"));
     }
 }
