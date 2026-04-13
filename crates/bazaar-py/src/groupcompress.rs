@@ -768,6 +768,46 @@ impl RabinGroupCompressor {
     }
 }
 
+/// Parse the outer wire framing of a groupcompress block.
+///
+/// Returns `(block_bytes, factories)` where `factories` is a list of
+/// `(key_tuple, parents_tuple_or_none, start, end)` tuples in record order.
+#[pyfunction]
+fn parse_wire_header<'py>(
+    py: Python<'py>,
+    bytes: &'py [u8],
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, pyo3::types::PyList>)> {
+    let frame = bazaar::groupcompress::wire::parse_wire(bytes)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let block_bytes = PyBytes::new(py, frame.block_bytes);
+    let mut entries: Vec<Bound<PyTuple>> = Vec::with_capacity(frame.factories.len());
+    for factory in frame.factories {
+        let key = PyTuple::new(py, factory.key.iter().map(|s| PyBytes::new(py, s)))?;
+        let parents: Bound<PyAny> = match factory.parents {
+            None => py.None().into_bound(py),
+            Some(parents) => PyTuple::new(
+                py,
+                parents
+                    .iter()
+                    .map(|p| PyTuple::new(py, p.iter().map(|s| PyBytes::new(py, s))).unwrap()),
+            )?
+            .into_any(),
+        };
+        let entry = PyTuple::new(
+            py,
+            [
+                key.into_any(),
+                parents,
+                factory.start.into_pyobject(py)?.into_any(),
+                factory.end.into_pyobject(py)?.into_any(),
+            ],
+        )?;
+        entries.push(entry);
+    }
+    let list = pyo3::types::PyList::new(py, entries)?;
+    Ok((block_bytes, list))
+}
+
 #[pyfunction]
 fn rabin_hash(data: Vec<u8>) -> PyResult<u32> {
     Ok(bazaar::groupcompress::rabin_delta::rabin_hash(
@@ -789,6 +829,7 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(make_rabin_delta))?;
     m.add_wrapped(wrap_pyfunction!(rabin_hash))?;
     m.add_function(wrap_pyfunction!(sort_gc_optimal, &m)?)?;
+    m.add_function(wrap_pyfunction!(parse_wire_header, &m)?)?;
     m.add_class::<GroupCompressBlock>()?;
     m.add_class::<LinesDeltaIndex>()?;
     m.add_class::<TraditionalGroupCompressor>()?;

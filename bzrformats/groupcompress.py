@@ -443,57 +443,12 @@ class _LazyGroupContentManager:
 
     @classmethod
     def from_bytes(cls, bytes):
-        # TODO: This does extra string copying, probably better to do it a
-        #       different way. At a minimum this creates 2 copies of the
-        #       compressed content
-        (storage_kind, z_header_len, header_len, block_len, rest) = bytes.split(
-            b"\n", 4
-        )
+        block_bytes, factories = _groupcompress_rs.parse_wire_header(bytes)
         del bytes
-        if storage_kind != b"groupcompress-block":
-            raise ValueError(f"Unknown storage kind: {storage_kind}")
-        z_header_len = int(z_header_len)
-        if len(rest) < z_header_len:
-            raise ValueError("Compressed header len shorter than all bytes")
-        z_header = rest[:z_header_len]
-        header_len = int(header_len)
-        header = zlib.decompress(z_header)
-        if len(header) != header_len:
-            raise ValueError("invalid length for decompressed bytes")
-        del z_header
-        block_len = int(block_len)
-        if len(rest) != z_header_len + block_len:
-            raise ValueError("Invalid length for block")
-        block_bytes = rest[z_header_len:]
-        del rest
-        # So now we have a valid GCB, we just need to parse the factories that
-        # were sent to us
-        header_lines = header.split(b"\n")
-        del header
-        last = header_lines.pop()
-        if last != b"":
-            raise ValueError("header lines did not end with a trailing newline")
-        if len(header_lines) % 4 != 0:
-            raise ValueError("The header was not an even multiple of 4 lines")
         block = GroupCompressBlock.from_bytes(block_bytes)
         del block_bytes
         result = cls(block)
-        for start in range(0, len(header_lines), 4):
-            # intern()?
-            key = tuple(header_lines[start].split(b"\x00"))
-            parents_line = header_lines[start + 1]
-            if parents_line == b"None:":
-                parents = None
-            else:
-                parents = tuple(
-                    [
-                        tuple(segment.split(b"\x00"))
-                        for segment in parents_line.split(b"\t")
-                        if segment
-                    ]
-                )
-            start_offset = int(header_lines[start + 2])
-            end_offset = int(header_lines[start + 3])
+        for key, parents, start_offset, end_offset in factories:
             result.add_factory(key, parents, start_offset, end_offset)
         return result
 
