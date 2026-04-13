@@ -502,6 +502,25 @@ fn parse_record_unchecked_rs<'py>(
     Ok((header, list))
 }
 
+/// Decompress only enough of a knit record to parse its header. Returns
+/// `(method, version_id, count, digest)` without validating the line count
+/// or end marker — `_KnitData._read_records_iter_raw` relies on this
+/// leniency.
+#[pyfunction]
+fn parse_record_header_only_rs<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyTuple>> {
+    let rec = bazaar::knit::parse_record_header_only(data)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    PyTuple::new(
+        py,
+        [
+            PyBytes::new(py, &rec.method).into_any(),
+            PyBytes::new(py, &rec.version_id).into_any(),
+            PyBytes::new(py, rec.count.to_string().as_bytes()).into_any(),
+            PyBytes::new(py, &rec.digest).into_any(),
+        ],
+    )
+}
+
 /// Serialize a knit record: build the header, assemble header + payload +
 /// end-marker chunks, and gzip-compress them. Returns
 /// `(compressed_len, compressed_chunks)`. Raises `ValueError` if
@@ -544,5 +563,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(parse_network_record_header_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_record_unchecked_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(record_to_data_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(parse_record_header_only_rs, &m)?)?;
     Ok(m)
 }

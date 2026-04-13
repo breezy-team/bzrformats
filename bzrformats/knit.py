@@ -52,7 +52,6 @@ in the deltas to provide line annotation
 """
 
 import contextlib
-import gzip
 import logging
 import operator
 import os
@@ -1969,8 +1968,7 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
                 # Check that the ID in the header of the raw knit bytes matches
                 # the record metadata.
                 raw_data = record._raw_record
-                df, _rec = self._parse_record_header(record.key, raw_data)
-                df.close()
+                self._parse_record_header(record.key, raw_data)
             buffered = False
             parents = record.parents
             if record.storage_kind in delta_types:
@@ -2261,20 +2259,18 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
         return record_contents, rec[3]
 
     def _parse_record_header(self, key, raw_data):
-        """Parse a record header for consistency.
+        """Parse and validate a record's header.
 
-        :return: the header and the decompressor stream.
-                 as (stream, header_record)
+        :return: the parsed header tuple (method, version_id, count, digest).
         """
-        df = gzip.GzipFile(mode="rb", fileobj=BytesIO(raw_data))
         try:
-            # Current serialise
-            rec = self._check_header(key, df.readline())
-        except Exception as e:
+            rec = _knit_rs.parse_record_header_only_rs(raw_data)
+        except ValueError as e:
             raise KnitCorrupt(
-                self, f"While reading {{{key}}} got {e.__class__.__name__}({e!s})"
+                self, f"While reading {{{key}}} got ValueError({e!s})"
             ) from e
-        return df, rec
+        self._check_header_version(rec, key[-1])
+        return rec
 
     def _parse_record_unchecked(self, data):
         try:
@@ -2323,8 +2319,7 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
         for key, data in self._read_records_iter_unchecked(records):
             # validate the header (note that we can only use the suffix in
             # current knit records).
-            df, rec = self._parse_record_header(key, data)
-            df.close()
+            rec = self._parse_record_header(key, data)
             yield key, data, rec[3]
 
     def _read_records_iter_unchecked(self, records):

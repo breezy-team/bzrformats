@@ -510,6 +510,54 @@ pub fn parse_record_unchecked(
     ))
 }
 
+/// Gzip-decode just enough of a knit record to parse its header line.
+///
+/// Used by `_KnitData._parse_record_header`, which needs only the header
+/// fields and intentionally does not validate line counts or the end marker
+/// (see `test_too_many_lines` / `test_not_enough_lines`).
+pub fn parse_record_header_only(data: &[u8]) -> Result<RecordHeader, ParseRecordError> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let mut decoder = GzDecoder::new(data);
+    let mut header_buf = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    loop {
+        match decoder.read(&mut byte).map_err(ParseRecordError::Gzip)? {
+            0 => break,
+            _ => {
+                header_buf.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+        }
+    }
+    if header_buf.is_empty() {
+        return Err(ParseRecordError::Empty);
+    }
+    let header_trimmed = header_buf
+        .strip_suffix(b"\n")
+        .unwrap_or(header_buf.as_slice());
+    let fields: Vec<&[u8]> = header_trimmed.split(|&b| b == b' ').collect();
+    if fields.len() != 4 {
+        return Err(ParseRecordError::HeaderFields(header_buf.clone()));
+    }
+    let method = fields[0].to_vec();
+    let version_id = fields[1].to_vec();
+    let count: usize = std::str::from_utf8(fields[2])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ParseRecordError::HeaderCount(header_buf.clone()))?;
+    let digest = fields[3].to_vec();
+    Ok(RecordHeader {
+        method,
+        version_id,
+        count,
+        digest,
+    })
+}
+
 /// Error returned by [`record_to_data`] when the body payload is malformed.
 #[derive(Debug)]
 pub enum RecordToDataError {
@@ -884,6 +932,26 @@ mod tests {
                 actual: 1
             }
         ));
+    }
+
+    #[test]
+    fn parse_record_header_only_ignores_line_count_mismatch() {
+        // Record claims 2 body lines but only ships 1. parse_record_unchecked
+        // would reject this; parse_record_header_only must accept it so
+        // `_KnitData._read_records_iter_raw` stays lenient as the Python
+        // tests require.
+        let header = b"version rev-id-1 2 DIGEST\n".to_vec();
+        let body = b"foo\n".to_vec();
+        let end = b"end rev-id-1\n".to_vec();
+        let chunks: Vec<&[u8]> = vec![&header, &body, &end];
+        let gz = crate::tuned_gzip::chunks_to_gzip(chunks.into_iter());
+        let raw: Vec<u8> = gz.into_iter().flatten().collect();
+
+        assert!(parse_record_unchecked(&raw).is_err());
+        let rec = parse_record_header_only(&raw).unwrap();
+        assert_eq!(rec.version_id, b"rev-id-1");
+        assert_eq!(rec.count, 2);
+        assert_eq!(rec.digest, b"DIGEST");
     }
 
     #[test]
