@@ -636,80 +636,35 @@ fn build_knit_delta_closure_wire_rs<'py>(
         Vec<u8>,
     )>,
 ) -> Bound<'py, PyBytes> {
-    // Own all the reference-backed data in local vectors so the builder
-    // sees `&[...]` slices that outlive the call.
-    let emit_refs_owned: Vec<Vec<&[u8]>> = emit_keys
+    // With KnitDeltaClosureRecord now generic over Seg: AsRef<[u8]>, we can
+    // use Vec<u8> directly as the segment type and only need one level of
+    // slice shells (for each record's parent list, since the struct field
+    // is `&[&[Seg]]`).
+    let parent_slices: Vec<Option<Vec<&[Vec<u8>]>>> = records
         .iter()
-        .map(|k| k.iter().map(|v| v.as_slice()).collect())
-        .collect();
-    let emit_refs: Vec<&[&[u8]]> = emit_refs_owned.iter().map(|k| k.as_slice()).collect();
-
-    struct OwnedRecord {
-        key: Vec<Vec<u8>>,
-        parents: Option<Vec<Vec<Vec<u8>>>>,
-        method: String,
-        noeol: bool,
-        next: Option<Vec<Vec<u8>>>,
-        record_bytes: Vec<u8>,
-    }
-    let owned: Vec<OwnedRecord> = records
-        .into_iter()
-        .map(|(k, p, m, n, nx, rb)| OwnedRecord {
-            key: k,
-            parents: p,
-            method: m,
-            noeol: n,
-            next: nx,
-            record_bytes: rb,
-        })
-        .collect();
-
-    // Build two levels of &slice shells: one for each record's parents and
-    // `next`, one for the top-level record list.
-    let per_record_key_refs: Vec<Vec<&[u8]>> = owned
-        .iter()
-        .map(|r| r.key.iter().map(|v| v.as_slice()).collect())
-        .collect();
-    let per_record_next_refs: Vec<Option<Vec<&[u8]>>> = owned
-        .iter()
-        .map(|r| {
-            r.next
+        .map(|(_, parents, ..)| {
+            parents
                 .as_ref()
-                .map(|n| n.iter().map(|v| v.as_slice()).collect())
-        })
-        .collect();
-    let per_record_parent_outer: Vec<Option<Vec<Vec<&[u8]>>>> = owned
-        .iter()
-        .map(|r| {
-            r.parents.as_ref().map(|ps| {
-                ps.iter()
-                    .map(|p| p.iter().map(|v| v.as_slice()).collect())
-                    .collect()
-            })
-        })
-        .collect();
-    let per_record_parent_slices: Vec<Option<Vec<&[&[u8]]>>> = per_record_parent_outer
-        .iter()
-        .map(|o| {
-            o.as_ref()
                 .map(|ps| ps.iter().map(|p| p.as_slice()).collect())
         })
         .collect();
 
-    let record_refs: Vec<bazaar::knit::KnitDeltaClosureRecord<'_>> = owned
+    let record_refs: Vec<bazaar::knit::KnitDeltaClosureRecord<'_, Vec<u8>>> = records
         .iter()
-        .enumerate()
-        .map(|(i, r)| bazaar::knit::KnitDeltaClosureRecord {
-            key: per_record_key_refs[i].as_slice(),
-            parents: per_record_parent_slices[i].as_deref(),
-            method: r.method.as_bytes(),
-            noeol: r.noeol,
-            next: per_record_next_refs[i].as_deref(),
-            record_bytes: r.record_bytes.as_slice(),
+        .zip(parent_slices.iter())
+        .map(|((key, _, method, noeol, next, record_bytes), parents)| {
+            bazaar::knit::KnitDeltaClosureRecord {
+                key: key.as_slice(),
+                parents: parents.as_deref(),
+                method: method.as_bytes(),
+                noeol: *noeol,
+                next: next.as_deref(),
+                record_bytes: record_bytes.as_slice(),
+            }
         })
         .collect();
 
-    let out = bazaar::knit::build_knit_delta_closure_wire(annotated, &emit_refs, &record_refs);
+    let out = bazaar::knit::build_knit_delta_closure_wire(annotated, &emit_keys, &record_refs);
     PyBytes::new(py, &out)
 }
 

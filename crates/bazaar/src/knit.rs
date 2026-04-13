@@ -478,14 +478,19 @@ where
 /// One entry of the `_raw_record_map` table that
 /// [`build_knit_delta_closure_wire`] consumes.
 ///
+/// Generic over `Seg: AsRef<[u8]>` so callers can populate the struct with
+/// either owned `Vec<u8>` segments or borrowed `&[u8]` slices — whichever
+/// shape matches where the data lives. The inner containers are plain
+/// slices; wrap them in `&Vec<Seg>` or `&[Seg]` at the call site.
+///
 /// `parents` is `None` for the literal `None:` parents line (the Python side
 /// distinguishes this via `global_map.get(key)` returning `None`).
-pub struct KnitDeltaClosureRecord<'a> {
-    pub key: &'a [&'a [u8]],
-    pub parents: Option<&'a [&'a [&'a [u8]]]>,
+pub struct KnitDeltaClosureRecord<'a, Seg: AsRef<[u8]>> {
+    pub key: &'a [Seg],
+    pub parents: Option<&'a [&'a [Seg]]>,
     pub method: &'a [u8],
     pub noeol: bool,
-    pub next: Option<&'a [&'a [u8]]>,
+    pub next: Option<&'a [Seg]>,
     pub record_bytes: &'a [u8],
 }
 
@@ -496,11 +501,19 @@ pub struct KnitDeltaClosureRecord<'a> {
 /// `annotated` flag line, `\t`-joined emit keys line, then a run of records
 /// each carrying `key / parents / method / noeol flag / next / byte count /
 /// record body`.
-pub fn build_knit_delta_closure_wire(
+///
+/// `EK` is any key container for the emit-keys list (e.g. `Vec<Seg>` or
+/// `&[Seg]`), and `Seg` is the byte-segment type shared by keys, parent
+/// keys, and the `next` link inside each record.
+pub fn build_knit_delta_closure_wire<EK, Seg>(
     annotated: bool,
-    emit_keys: &[&[&[u8]]],
-    records: &[KnitDeltaClosureRecord<'_>],
-) -> Vec<u8> {
+    emit_keys: &[EK],
+    records: &[KnitDeltaClosureRecord<'_, Seg>],
+) -> Vec<u8>
+where
+    EK: AsRef<[Seg]>,
+    Seg: AsRef<[u8]>,
+{
     let body_estimate: usize = records.iter().map(|r| r.record_bytes.len() + 64).sum();
     let mut out = Vec::with_capacity(64 + body_estimate);
     out.extend_from_slice(b"knit-delta-closure\n");
@@ -512,7 +525,7 @@ pub fn build_knit_delta_closure_wire(
         if i > 0 {
             out.push(b'\t');
         }
-        write_joined_key(&mut out, key);
+        write_joined_key(&mut out, key.as_ref());
     }
     out.push(b'\n');
     for rec in records {
