@@ -873,6 +873,17 @@ fn build_wire_prefix<'py>(
     Ok(PyBytes::new(py, &prefix))
 }
 
+/// Parse a `_GCGraphIndex` node value into its four position integers.
+///
+/// Returns `(start, stop, basis_end, delta_end)`. The Python original is
+/// `_GCGraphIndex._node_to_position`.
+#[pyfunction]
+fn parse_node_position(value: &[u8]) -> PyResult<(u64, u64, u64, u64)> {
+    let pos = bazaar::groupcompress::manager::parse_node_position(value)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((pos.start, pos.stop, pos.basis_end, pos.delta_end))
+}
+
 /// Decide whether a block should be repacked.
 ///
 /// `factories` is an iterable of `(start, end)` tuples and `content_length`
@@ -950,6 +961,7 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(check_rebuild_action, &m)?)?;
     m.add_function(wrap_pyfunction!(check_is_well_utilized, &m)?)?;
     m.add_function(wrap_pyfunction!(build_wire_prefix, &m)?)?;
+    m.add_function(wrap_pyfunction!(parse_node_position, &m)?)?;
     m.add_class::<GroupCompressBlock>()?;
     m.add_class::<LinesDeltaIndex>()?;
     m.add_class::<TraditionalGroupCompressor>()?;

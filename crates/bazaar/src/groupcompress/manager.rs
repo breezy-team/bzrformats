@@ -1,4 +1,5 @@
-//! Pure-logic heuristics from `_LazyGroupContentManager`.
+//! Pure-logic heuristics from `_LazyGroupContentManager` and
+//! `_GCGraphIndex`.
 //!
 //! These functions decide whether a groupcompress block needs repacking and
 //! whether it is "well utilized" enough to leave alone. The corresponding
@@ -103,6 +104,63 @@ pub fn check_is_well_utilized<P: PartialEq>(
     false
 }
 
+/// Decoded `_GCGraphIndex._node_to_position` value: `start stop basis_end delta_end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodePosition {
+    pub start: u64,
+    pub stop: u64,
+    pub basis_end: u64,
+    pub delta_end: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NodePositionError {
+    /// The value did not contain at least four space-separated integers.
+    NotEnoughFields,
+    /// One of the four integers could not be parsed.
+    InvalidInteger,
+}
+
+impl std::fmt::Display for NodePositionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodePositionError::NotEnoughFields => {
+                write!(f, "node position needs four space-separated integers")
+            }
+            NodePositionError::InvalidInteger => {
+                write!(f, "node position field is not a valid integer")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NodePositionError {}
+
+/// Parse a `_GCGraphIndex` node value into its four position integers.
+///
+/// The node value is `b"start stop basis_end delta_end"` (any extra
+/// whitespace-separated fields are ignored, mirroring Python's
+/// `node[2].split(b" ")[:4]` behaviour).
+pub fn parse_node_position(value: &[u8]) -> Result<NodePosition, NodePositionError> {
+    let mut parts = value.split(|&b| b == b' ');
+    let start = parts.next().ok_or(NodePositionError::NotEnoughFields)?;
+    let stop = parts.next().ok_or(NodePositionError::NotEnoughFields)?;
+    let basis_end = parts.next().ok_or(NodePositionError::NotEnoughFields)?;
+    let delta_end = parts.next().ok_or(NodePositionError::NotEnoughFields)?;
+    let parse = |b: &[u8]| -> Result<u64, NodePositionError> {
+        std::str::from_utf8(b)
+            .map_err(|_| NodePositionError::InvalidInteger)?
+            .parse()
+            .map_err(|_| NodePositionError::InvalidInteger)
+    };
+    Ok(NodePosition {
+        start: parse(start)?,
+        stop: parse(stop)?,
+        basis_end: parse(basis_end)?,
+        delta_end: parse(delta_end)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +243,36 @@ mod tests {
         let factories: Vec<((usize, usize), &[u8])> =
             vec![((0, size / 2), b"file-a"), ((size / 2, size), b"file-b")];
         assert!(check_is_well_utilized(&factories, size, &settings));
+    }
+
+    #[test]
+    fn parse_node_position_decodes_four_fields() {
+        let pos = parse_node_position(b"10 20 30 40").unwrap();
+        assert_eq!(
+            pos,
+            NodePosition {
+                start: 10,
+                stop: 20,
+                basis_end: 30,
+                delta_end: 40,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_node_position_rejects_short_input() {
+        assert_eq!(
+            parse_node_position(b"10 20 30"),
+            Err(NodePositionError::NotEnoughFields)
+        );
+    }
+
+    #[test]
+    fn parse_node_position_rejects_non_integer() {
+        assert_eq!(
+            parse_node_position(b"10 20 nope 40"),
+            Err(NodePositionError::InvalidInteger)
+        );
     }
 
     #[test]

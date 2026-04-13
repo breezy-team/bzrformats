@@ -1549,23 +1549,15 @@ class _GCGraphIndex:
 
     def _node_to_position(self, node):
         """Convert an index value to position details."""
-        bits = node[2].split(b" ")
-        # It would be nice not to read the entire gzip.
+        start, stop, basis_end, delta_end = _groupcompress_rs.parse_node_position(
+            node[2]
+        )
         # start and stop are put into _int_cache because they are very common.
         # They define the 'group' that an entry is in, and many groups can have
-        # thousands of objects.
-        # Branching Launchpad, for example, saves ~600k integers, at 12 bytes
-        # each, or about 7MB. Note that it might be even more when you consider
-        # how PyInt is allocated in separate slabs. And you can't return a slab
-        # to the OS if even 1 int on it is in use. Note though that Python uses
-        # a LIFO when re-using PyInt slots, which might cause more
-        # fragmentation.
-        start = int(bits[0])
+        # thousands of objects. Branching Launchpad, for example, saves ~600k
+        # integers, at 12 bytes each, or about 7MB.
         start = self._int_cache.setdefault(start, start)
-        stop = int(bits[1])
         stop = self._int_cache.setdefault(stop, stop)
-        basis_end = int(bits[2])
-        delta_end = int(bits[3])
         # We can't use tuple here, because node[0] is a BTreeGraphIndex
         # instance...
         return (node[0], start, stop, basis_end, delta_end)
