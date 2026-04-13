@@ -9,8 +9,8 @@
 
 use flate2::{Compress, Compression, FlushCompress, Status};
 
-const REPACK_OPTS_FOR_SPEED: (u32, u32) = (0, 8);
-const REPACK_OPTS_FOR_SIZE: (u32, u32) = (20, 0);
+pub const REPACK_OPTS_FOR_SPEED: (u32, u32) = (0, 8);
+pub const REPACK_OPTS_FOR_SIZE: (u32, u32) = (20, 0);
 
 /// Result returned by [`ChunkWriter::finish`].
 #[derive(Debug)]
