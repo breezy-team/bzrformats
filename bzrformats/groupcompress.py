@@ -1014,67 +1014,7 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
         return result
 
 
-class _GCBuildDetails:
-    """A blob of data about the build details.
-
-    This stores the minimal data, which then allows compatibility with the old
-    api, without taking as much memory.
-    """
-
-    __slots__ = (
-        "_basis_end",
-        "_delta_end",
-        "_group_end",
-        "_group_start",
-        "_index",
-        "_parents",
-    )
-
-    method = "group"
-    compression_parent = None
-
-    def __init__(self, parents, position_info):
-        self._parents = parents
-        (
-            self._index,
-            self._group_start,
-            self._group_end,
-            self._basis_end,
-            self._delta_end,
-        ) = position_info
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}({self.index_memo}, {self._parents})"
-
-    @property
-    def index_memo(self):
-        return (
-            self._index,
-            self._group_start,
-            self._group_end,
-            self._basis_end,
-            self._delta_end,
-        )
-
-    @property
-    def record_details(self):
-        return (self.method, None)
-
-    def __getitem__(self, offset):
-        """Compatibility thunk to act like a tuple."""
-        if offset == 0:
-            return self.index_memo
-        elif offset == 1:
-            return self.compression_parent  # Always None
-        elif offset == 2:
-            return self._parents
-        elif offset == 3:
-            return self.record_details
-        else:
-            raise IndexError("offset out of range")
-
-    def __len__(self):
-        return 4
+from ._bzr_rs.groupcompress import GCBuildDetails as _GCBuildDetails
 
 
 class _GCGraphIndex:

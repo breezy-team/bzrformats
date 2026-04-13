@@ -1880,6 +1880,103 @@ fn unavailable_representation(
     Ok(PyErr::from_value(exc))
 }
 
+/// Rust-backed `_GCBuildDetails`.
+///
+/// A tuple-like record holding a parent key list plus a 5-tuple index memo
+/// `(index, group_start, group_end, basis_end, delta_end)`. `compression_parent`
+/// is always `None` and `method` is always `"group"`, so `__getitem__` exposes
+/// the 4-tuple `(index_memo, None, parents, ("group", None))`.
+#[pyclass(
+    unsendable,
+    name = "GCBuildDetails",
+    module = "bzrformats._bzr_rs.groupcompress"
+)]
+struct GCBuildDetails {
+    parents: Py<PyAny>,
+    index: Py<PyAny>,
+    group_start: u64,
+    group_end: u64,
+    basis_end: u64,
+    delta_end: u64,
+}
+
+#[pymethods]
+impl GCBuildDetails {
+    #[new]
+    fn new(parents: Py<PyAny>, position_info: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let tup: (Py<PyAny>, u64, u64, u64, u64) = position_info.extract()?;
+        Ok(Self {
+            parents,
+            index: tup.0,
+            group_start: tup.1,
+            group_end: tup.2,
+            basis_end: tup.3,
+            delta_end: tup.4,
+        })
+    }
+
+    #[classattr]
+    fn method(py: Python<'_>) -> Py<PyAny> {
+        pyo3::types::PyString::new(py, "group").into_any().unbind()
+    }
+
+    #[classattr]
+    fn compression_parent(py: Python<'_>) -> Py<PyAny> {
+        py.None()
+    }
+
+    #[getter]
+    fn index_memo<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            [
+                self.index.clone_ref(py).into_bound(py),
+                self.group_start.into_pyobject(py)?.into_any(),
+                self.group_end.into_pyobject(py)?.into_any(),
+                self.basis_end.into_pyobject(py)?.into_any(),
+                self.delta_end.into_pyobject(py)?.into_any(),
+            ],
+        )
+    }
+
+    #[getter]
+    fn record_details<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            [
+                pyo3::types::PyString::new(py, "group").into_any(),
+                py.None().into_bound(py),
+            ],
+        )
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let memo = self.index_memo(py)?;
+        let parents = self.parents.bind(py);
+        Ok(format!(
+            "_GCBuildDetails({}, {})",
+            memo.repr()?.to_str()?,
+            parents.repr()?.to_str()?
+        ))
+    }
+
+    fn __len__(&self) -> usize {
+        4
+    }
+
+    fn __getitem__<'py>(&self, py: Python<'py>, offset: isize) -> PyResult<Bound<'py, PyAny>> {
+        match offset {
+            0 => Ok(self.index_memo(py)?.into_any()),
+            1 => Ok(py.None().into_bound(py)),
+            2 => Ok(self.parents.clone_ref(py).into_bound(py)),
+            3 => Ok(self.record_details(py)?.into_any()),
+            _ => Err(pyo3::exceptions::PyIndexError::new_err(
+                "offset out of range",
+            )),
+        }
+    }
+}
+
 pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "groupcompress")?;
     m.add_wrapped(wrap_pyfunction!(encode_base128_int))?;
@@ -1904,6 +2001,7 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<LazyGroupContentManager>()?;
     m.add_class::<LazyGroupCompressFactory>()?;
     m.add_class::<RecordStreamIter>()?;
+    m.add_class::<GCBuildDetails>()?;
     m.add_class::<crate::groupcompress_delta::DeltaIndex>()?;
     m.add_function(wrap_pyfunction!(
         crate::groupcompress_delta::_rabin_hash,
