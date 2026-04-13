@@ -2196,15 +2196,7 @@ class NoDupeAddLinesDecorator:
         return getattr(self._store, name)
 
 
-def network_bytes_to_kind_and_offset(network_bytes):
-    """Strip of a record kind from the front of network_bytes.
-
-    :param network_bytes: The bytes of a record.
-    :return: A tuple (storage_kind, offset_of_remaining_bytes)
-    """
-    line_end = network_bytes.find(b"\n")
-    storage_kind = network_bytes[:line_end].decode("ascii")
-    return storage_kind, line_end + 1
+network_bytes_to_kind_and_offset = _versionedfile_rs.network_bytes_to_kind_and_offset
 
 
 class NetworkRecordStream:
