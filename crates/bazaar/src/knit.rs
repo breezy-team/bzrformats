@@ -373,39 +373,48 @@ pub fn parse_network_record_header(
 /// kind line, the `\x00`-joined key, the `\t`-separated parent list (or
 /// `None:` when `parents` is `None`), the noeol flag byte, and the raw
 /// record body.
-pub fn build_network_record(
-    storage_kind: &[u8],
-    key: &[&[u8]],
-    parents: Option<&[&[&[u8]]]>,
-    noeol: bool,
-    raw_record: &[u8],
-) -> Vec<u8> {
-    let key_bytes_len: usize =
-        key.iter().map(|p| p.len()).sum::<usize>() + key.len().saturating_sub(1);
-    let parents_len: usize = match parents {
-        None => 5, // "None:"
-        Some(list) => {
-            let mut n = list.len().saturating_sub(1); // separating tabs
-            for p in list {
-                n += p.iter().map(|seg| seg.len()).sum::<usize>() + p.len().saturating_sub(1);
-            }
-            n
-        }
-    };
-    let mut out =
-        Vec::with_capacity(storage_kind.len() + key_bytes_len + parents_len + raw_record.len() + 4);
+/// Typed sentinel for passing `None` as the parents argument of
+/// [`build_network_record`] without having to spell out a turbofish. The
+/// types `&[u8]` / `&[&[u8]]` here are inert — the option is always `None`
+/// — but they're concrete enough to pin the generic parameters.
+pub const NO_PARENTS: Option<&[&[&[u8]]]> = None;
 
-    out.extend_from_slice(storage_kind);
-    out.push(b'\n');
-
+/// Write a `\x00`-joined knit key into `out`.
+fn write_joined_key<Seg: AsRef<[u8]>>(out: &mut Vec<u8>, key: &[Seg]) {
     for (i, segment) in key.iter().enumerate() {
         if i > 0 {
             out.push(b'\x00');
         }
-        out.extend_from_slice(segment);
+        out.extend_from_slice(segment.as_ref());
     }
-    out.push(b'\n');
+}
 
+/// Serialize a knit network record, inverse of [`parse_network_record_header`].
+///
+/// Mirrors `KnitContentFactory._create_network_bytes`: writes the storage
+/// kind line, the `\x00`-joined key, the `\t`-separated parent list (or
+/// `None:` when `parents` is `None`), the noeol flag byte, and the raw
+/// record body.
+///
+/// The generic bounds let callers pass slices of `Vec<u8>`, `&[u8]`, or any
+/// other byte-segment type — only `parents` still needs a slice-of-slices
+/// shape because the parent list is itself a list of keys.
+pub fn build_network_record<Seg, PK>(
+    storage_kind: &[u8],
+    key: &[Seg],
+    parents: Option<&[PK]>,
+    noeol: bool,
+    raw_record: &[u8],
+) -> Vec<u8>
+where
+    Seg: AsRef<[u8]>,
+    PK: AsRef<[Seg]>,
+{
+    let mut out = Vec::with_capacity(storage_kind.len() + raw_record.len() + 32);
+    out.extend_from_slice(storage_kind);
+    out.push(b'\n');
+    write_joined_key(&mut out, key);
+    out.push(b'\n');
     match parents {
         None => out.extend_from_slice(b"None:"),
         Some(list) => {
@@ -413,17 +422,11 @@ pub fn build_network_record(
                 if i > 0 {
                     out.push(b'\t');
                 }
-                for (j, segment) in parent.iter().enumerate() {
-                    if j > 0 {
-                        out.push(b'\x00');
-                    }
-                    out.extend_from_slice(segment);
-                }
+                write_joined_key(&mut out, parent.as_ref());
             }
         }
     }
     out.push(b'\n');
-
     out.push(if noeol { b'N' } else { b' ' });
     out.extend_from_slice(raw_record);
     out
@@ -434,26 +437,38 @@ pub fn build_network_record(
 ///
 /// Mirrors `KnitVersionedFiles._split_by_prefix`: single-segment keys land
 /// under the empty-bytes prefix, everything else under `key[0]`.
+///
+/// Returns `(buckets, prefix_order)` where each bucket holds a borrowed
+/// slice of the original keys and the prefix byte slice itself is also a
+/// borrow (either an empty slice or a reference to the first segment of
+/// the first key that landed in the bucket). Preserves the input order
+/// both globally (in `prefix_order`) and within each bucket.
 #[allow(clippy::type_complexity)]
-pub fn split_keys_by_prefix<'a>(
-    keys: &'a [Vec<Vec<u8>>],
-) -> (Vec<(Vec<u8>, Vec<&'a [Vec<u8>]>)>, Vec<Vec<u8>>) {
+pub fn split_keys_by_prefix<'a, K, Seg>(
+    keys: &'a [K],
+) -> (Vec<(&'a [u8], Vec<&'a K>)>, Vec<&'a [u8]>)
+where
+    K: AsRef<[Seg]> + 'a,
+    Seg: AsRef<[u8]> + 'a,
+{
     use std::collections::HashMap;
-    let mut buckets: Vec<(Vec<u8>, Vec<&'a [Vec<u8>]>)> = Vec::new();
-    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
-    let mut prefix_order: Vec<Vec<u8>> = Vec::new();
+    const EMPTY: &[u8] = b"";
+    let mut buckets: Vec<(&'a [u8], Vec<&'a K>)> = Vec::new();
+    let mut index: HashMap<&'a [u8], usize> = HashMap::new();
+    let mut prefix_order: Vec<&'a [u8]> = Vec::new();
     for key in keys {
-        let prefix: Vec<u8> = if key.len() == 1 {
-            Vec::new()
+        let segments: &'a [Seg] = key.as_ref();
+        let prefix: &'a [u8] = if segments.len() == 1 {
+            EMPTY
         } else {
-            key[0].clone()
+            segments[0].as_ref()
         };
-        match index.get(&prefix) {
-            Some(&i) => buckets[i].1.push(key.as_slice()),
+        match index.get(prefix) {
+            Some(&i) => buckets[i].1.push(key),
             None => {
-                index.insert(prefix.clone(), buckets.len());
-                prefix_order.push(prefix.clone());
-                buckets.push((prefix, vec![key.as_slice()]));
+                index.insert(prefix, buckets.len());
+                prefix_order.push(prefix);
+                buckets.push((prefix, vec![key]));
             }
         }
     }
@@ -472,29 +487,6 @@ pub struct KnitDeltaClosureRecord<'a> {
     pub noeol: bool,
     pub next: Option<&'a [&'a [u8]]>,
     pub record_bytes: &'a [u8],
-}
-
-fn write_key_joined(out: &mut Vec<u8>, key: &[&[u8]]) {
-    for (i, seg) in key.iter().enumerate() {
-        if i > 0 {
-            out.push(b'\x00');
-        }
-        out.extend_from_slice(seg);
-    }
-}
-
-fn write_parents_line(out: &mut Vec<u8>, parents: Option<&[&[&[u8]]]>) {
-    match parents {
-        None => out.extend_from_slice(b"None:"),
-        Some(list) => {
-            for (i, p) in list.iter().enumerate() {
-                if i > 0 {
-                    out.push(b'\t');
-                }
-                write_key_joined(out, p);
-            }
-        }
-    }
 }
 
 /// Serialize a `knit-delta-closure` wire record.
@@ -520,20 +512,30 @@ pub fn build_knit_delta_closure_wire(
         if i > 0 {
             out.push(b'\t');
         }
-        write_key_joined(&mut out, key);
+        write_joined_key(&mut out, key);
     }
     out.push(b'\n');
     for rec in records {
-        write_key_joined(&mut out, rec.key);
+        write_joined_key(&mut out, rec.key);
         out.push(b'\n');
-        write_parents_line(&mut out, rec.parents);
+        match rec.parents {
+            None => out.extend_from_slice(b"None:"),
+            Some(list) => {
+                for (i, parent) in list.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b'\t');
+                    }
+                    write_joined_key(&mut out, parent);
+                }
+            }
+        }
         out.push(b'\n');
         out.extend_from_slice(rec.method);
         out.push(b'\n');
         out.push(if rec.noeol { b'T' } else { b'F' });
         out.push(b'\n');
         if let Some(next) = rec.next {
-            write_key_joined(&mut out, next);
+            write_joined_key(&mut out, next);
         }
         out.push(b'\n');
         out.extend_from_slice(rec.record_bytes.len().to_string().as_bytes());
@@ -546,12 +548,36 @@ pub fn build_knit_delta_closure_wire(
 /// Fields of a parsed knit record header: `(method, version_id, count, digest)`.
 ///
 /// Mirrors the 4-tuple returned by `_KnitData._split_header`, but typed.
+/// Prefer [`RecordHeaderRef`] for borrowing parsers that can tie their output
+/// to the lifetime of the source buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordHeader {
     pub method: Vec<u8>,
     pub version_id: Vec<u8>,
     pub count: usize,
     pub digest: Vec<u8>,
+}
+
+/// Borrowing counterpart to [`RecordHeader`]: the four byte-slice fields all
+/// alias a single source buffer (typically the gunzipped record body), so no
+/// allocations are needed when the caller already owns that buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordHeaderRef<'a> {
+    pub method: &'a [u8],
+    pub version_id: &'a [u8],
+    pub count: usize,
+    pub digest: &'a [u8],
+}
+
+impl RecordHeaderRef<'_> {
+    pub fn to_owned(&self) -> RecordHeader {
+        RecordHeader {
+            method: self.method.to_vec(),
+            version_id: self.version_id.to_vec(),
+            count: self.count,
+            digest: self.digest.to_vec(),
+        }
+    }
 }
 
 /// Errors from `parse_record_unchecked`.
@@ -594,6 +620,31 @@ impl std::fmt::Display for ParseRecordError {
 
 impl std::error::Error for ParseRecordError {}
 
+/// Parse a knit header line (`version <id> <count> <digest>`), either with
+/// or without the trailing newline. Borrows the input: all four fields in
+/// the returned `RecordHeaderRef` are slices of `line`.
+///
+/// The whole line (including any newline the caller passed in) is threaded
+/// into the `HeaderFields` / `HeaderCount` error variants so diagnostics
+/// match the original input.
+pub fn parse_header_line(line: &[u8]) -> Result<RecordHeaderRef<'_>, ParseRecordError> {
+    let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
+    let fields: Vec<&[u8]> = trimmed.split(|&b| b == b' ').collect();
+    if fields.len() != 4 {
+        return Err(ParseRecordError::HeaderFields(line.to_vec()));
+    }
+    let count: usize = std::str::from_utf8(fields[2])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ParseRecordError::HeaderCount(line.to_vec()))?;
+    Ok(RecordHeaderRef {
+        method: fields[0],
+        version_id: fields[1],
+        count,
+        digest: fields[3],
+    })
+}
+
 /// Split a gunzipped record body into `\n`-terminated lines, matching
 /// `BytesIO(data).readlines()` semantics (trailing-newline-inclusive, and a
 /// final unterminated tail is kept as its own line).
@@ -618,9 +669,10 @@ fn split_readlines(data: &[u8]) -> Vec<Vec<u8>> {
 /// removed). Mirrors `_KnitData._parse_record_unchecked`: gzip decode, pull
 /// off the `version <id> <count> <digest>` header, verify the line count,
 /// verify the trailing `end <id>\n` marker.
-pub fn parse_record_unchecked(
-    data: &[u8],
-) -> Result<(RecordHeader, Vec<Vec<u8>>), ParseRecordError> {
+/// Gunzip a knit record, returning its decompressed body. Thin convenience
+/// so callers can own the buffer and then run the borrowing parsers below
+/// without paying for a second allocation.
+pub fn decode_record_gz(data: &[u8]) -> Result<Vec<u8>, ParseRecordError> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -629,44 +681,97 @@ pub fn parse_record_unchecked(
     decoder
         .read_to_end(&mut decompressed)
         .map_err(ParseRecordError::Gzip)?;
+    Ok(decompressed)
+}
 
+/// Split a gunzipped knit record body into borrowed lines (trailing-newline
+/// included, final unterminated tail kept). Same semantics as the Python
+/// `BytesIO(data).readlines()` call this replaces, but without allocating
+/// a `Vec<u8>` per line.
+pub fn readlines(data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b == b'\n' {
+            out.push(&data[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < data.len() {
+        out.push(&data[start..]);
+    }
+    out
+}
+
+/// Parse an already-decompressed knit record body into its header and body
+/// lines, borrowing from `decompressed`. Inverse of [`record_to_data`]
+/// composed with [`decode_record_gz`]. Validates line count and the `end`
+/// marker like [`parse_record_unchecked`], and returns slices into
+/// `decompressed` so no per-line allocation is needed.
+pub fn parse_record_body_unchecked(
+    decompressed: &[u8],
+) -> Result<(RecordHeaderRef<'_>, Vec<&[u8]>), ParseRecordError> {
+    let mut lines = readlines(decompressed);
+    if lines.is_empty() {
+        return Err(ParseRecordError::Empty);
+    }
+    let header_line = lines.remove(0);
+    let header = parse_header_line(header_line)?;
+
+    if lines.is_empty() {
+        return Err(ParseRecordError::LineCount {
+            declared: header.count,
+            actual: 0,
+        });
+    }
+    let last_line = lines.pop().unwrap();
+    if lines.len() != header.count {
+        return Err(ParseRecordError::LineCount {
+            declared: header.count,
+            actual: lines.len(),
+        });
+    }
+    let mut expected_end = b"end ".to_vec();
+    expected_end.extend_from_slice(header.version_id);
+    expected_end.push(b'\n');
+    if last_line != expected_end.as_slice() {
+        return Err(ParseRecordError::BadEndMarker {
+            expected: expected_end,
+            actual: last_line.to_vec(),
+        });
+    }
+    Ok((header, lines))
+}
+
+/// Owning convenience wrapper around [`decode_record_gz`] +
+/// [`parse_record_body_unchecked`]. Retained for call-sites (notably the
+/// pyo3 binding) that need an owned result.
+pub fn parse_record_unchecked(
+    data: &[u8],
+) -> Result<(RecordHeader, Vec<Vec<u8>>), ParseRecordError> {
+    let decompressed = decode_record_gz(data)?;
     let mut lines = split_readlines(&decompressed);
     if lines.is_empty() {
         return Err(ParseRecordError::Empty);
     }
     let header_line = lines.remove(0);
-    // Strip trailing \n for field splitting but keep the original around for
-    // error messages.
-    let header_trimmed = header_line
-        .strip_suffix(b"\n")
-        .unwrap_or(header_line.as_slice());
-    let fields: Vec<&[u8]> = header_trimmed.split(|&b| b == b' ').collect();
-    if fields.len() != 4 {
-        return Err(ParseRecordError::HeaderFields(header_line.clone()));
-    }
-    let method = fields[0].to_vec();
-    let version_id = fields[1].to_vec();
-    let count: usize = std::str::from_utf8(fields[2])
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| ParseRecordError::HeaderCount(header_line.clone()))?;
-    let digest = fields[3].to_vec();
+    let header = parse_header_line(&header_line)?.to_owned();
 
     if lines.is_empty() {
         return Err(ParseRecordError::LineCount {
-            declared: count,
+            declared: header.count,
             actual: 0,
         });
     }
     let last_line = lines.pop().unwrap();
-    if lines.len() != count {
+    if lines.len() != header.count {
         return Err(ParseRecordError::LineCount {
-            declared: count,
+            declared: header.count,
             actual: lines.len(),
         });
     }
     let mut expected_end = b"end ".to_vec();
-    expected_end.extend_from_slice(&version_id);
+    expected_end.extend_from_slice(&header.version_id);
     expected_end.push(b'\n');
     if last_line != expected_end {
         return Err(ParseRecordError::BadEndMarker {
@@ -675,15 +780,7 @@ pub fn parse_record_unchecked(
         });
     }
 
-    Ok((
-        RecordHeader {
-            method,
-            version_id,
-            count,
-            digest,
-        },
-        lines,
-    ))
+    Ok((header, lines))
 }
 
 /// Gzip-decode just enough of a knit record to parse its header line.
@@ -712,26 +809,7 @@ pub fn parse_record_header_only(data: &[u8]) -> Result<RecordHeader, ParseRecord
     if header_buf.is_empty() {
         return Err(ParseRecordError::Empty);
     }
-    let header_trimmed = header_buf
-        .strip_suffix(b"\n")
-        .unwrap_or(header_buf.as_slice());
-    let fields: Vec<&[u8]> = header_trimmed.split(|&b| b == b' ').collect();
-    if fields.len() != 4 {
-        return Err(ParseRecordError::HeaderFields(header_buf.clone()));
-    }
-    let method = fields[0].to_vec();
-    let version_id = fields[1].to_vec();
-    let count: usize = std::str::from_utf8(fields[2])
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| ParseRecordError::HeaderCount(header_buf.clone()))?;
-    let digest = fields[3].to_vec();
-    Ok(RecordHeader {
-        method,
-        version_id,
-        count,
-        digest,
-    })
+    Ok(parse_header_line(&header_buf)?.to_owned())
 }
 
 /// Error returned by [`record_to_data`] when the body payload is malformed.
@@ -1137,7 +1215,7 @@ mod tests {
     #[test]
     fn build_network_record_round_trips_none_parents() {
         let key: &[&[u8]] = &[b"file-id", b"rev"];
-        let raw = build_network_record(b"knit-ft-gz", key, None, true, b"DATA");
+        let raw = build_network_record(b"knit-ft-gz", key, NO_PARENTS, true, b"DATA");
         let line_end = b"knit-ft-gz\n".len();
         let parsed = parse_network_record_header(&raw, line_end).unwrap();
         assert_eq!(parsed.key, vec![&b"file-id"[..], &b"rev"[..]]);
@@ -1163,7 +1241,7 @@ mod tests {
     #[test]
     fn build_network_record_single_key_segment() {
         let key: &[&[u8]] = &[b"only"];
-        let raw = build_network_record(b"knit-ft-gz", key, None, true, b"X");
+        let raw = build_network_record(b"knit-ft-gz", key, NO_PARENTS, true, b"X");
         // Reconstruct by hand to pin the on-wire format.
         assert_eq!(raw, b"knit-ft-gz\nonly\nNone:\nNX".to_vec());
     }
@@ -1260,6 +1338,29 @@ mod tests {
         assert_eq!(rec.version_id, b"rev-id-1");
         assert_eq!(rec.count, 2);
         assert_eq!(rec.digest, b"DIGEST");
+    }
+
+    #[test]
+    fn parse_record_body_unchecked_borrows_from_buffer() {
+        // Build the decompressed form by hand so we can show the returned
+        // slices alias the caller-owned buffer — no per-line allocation.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"version rev-x 2 DIG\n");
+        body.extend_from_slice(b"alpha\n");
+        body.extend_from_slice(b"beta\n");
+        body.extend_from_slice(b"end rev-x\n");
+        let (header, lines) = parse_record_body_unchecked(&body).unwrap();
+        assert_eq!(header.method, b"version");
+        assert_eq!(header.version_id, b"rev-x");
+        assert_eq!(header.count, 2);
+        assert_eq!(header.digest, b"DIG");
+        assert_eq!(lines, vec![&b"alpha\n"[..], &b"beta\n"[..]]);
+        // Prove the returned slices actually borrow from `body`.
+        let body_range = body.as_ptr_range();
+        for line in &lines {
+            let start = line.as_ptr();
+            assert!(start >= body_range.start && start < body_range.end);
+        }
     }
 
     #[test]

@@ -515,19 +515,10 @@ fn build_network_record_rs<'py>(
     noeol: bool,
     raw_record: &[u8],
 ) -> Bound<'py, PyBytes> {
-    let key_refs: Vec<&[u8]> = key.iter().map(|v| v.as_slice()).collect();
-    let parent_vecs: Option<Vec<Vec<&[u8]>>> = parents.as_ref().map(|ps| {
-        ps.iter()
-            .map(|p| p.iter().map(|v| v.as_slice()).collect())
-            .collect()
-    });
-    let parent_refs: Option<Vec<&[&[u8]]>> = parent_vecs
-        .as_ref()
-        .map(|ps| ps.iter().map(|p| p.as_slice()).collect());
     let out = bazaar::knit::build_network_record(
         storage_kind.as_bytes(),
-        &key_refs,
-        parent_refs.as_deref(),
+        &key,
+        parents.as_deref(),
         noeol,
         raw_record,
     );
