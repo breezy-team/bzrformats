@@ -313,3 +313,131 @@ impl RevisionSerializer for BEncodeRevisionSerializer1 {
 
 #[allow(dead_code)]
 const BENCODE_REVISION_SERIALIZER_V1: BEncodeRevisionSerializer1 = BEncodeRevisionSerializer1 {};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const WORKING_REVISION_BENCODE1: &[u8] = b"l\
+l6:formati10ee\
+l9:committer54:Canonical.com Patch Queue Manager <pqm@pqm.ubuntu.com>e\
+l8:timezonei3600ee\
+l10:propertiesd11:branch-nick6:+trunkee\
+l9:timestamp14:1242300770.844e\
+l11:revision-id50:pqm@pqm.ubuntu.com-20090514113250-jntkkpminfn3e0tze\
+l10:parent-ids\
+l\
+50:pqm@pqm.ubuntu.com-20090514104039-kggemn7lrretzpvc\
+48:jelmer@samba.org-20090510012654-jp9ufxquekaokbeo\
+ee\
+l14:inventory-sha140:4a2c7fb50e077699242cf6eb16a61779c7b680a7e\
+l7:message35:(Jelmer) Move dpush to InterBranch.e\
+e";
+
+    const WORKING_REVISION_BENCODE1_NO_TIMEZONE: &[u8] = b"l\
+l6:formati10ee\
+l9:committer54:Canonical.com Patch Queue Manager <pqm@pqm.ubuntu.com>e\
+l9:timestamp14:1242300770.844e\
+l10:propertiesd11:branch-nick6:+trunkee\
+l11:revision-id50:pqm@pqm.ubuntu.com-20090514113250-jntkkpminfn3e0tze\
+l10:parent-ids\
+l\
+50:pqm@pqm.ubuntu.com-20090514104039-kggemn7lrretzpvc\
+48:jelmer@samba.org-20090510012654-jp9ufxquekaokbeo\
+ee\
+l14:inventory-sha140:4a2c7fb50e077699242cf6eb16a61779c7b680a7e\
+l7:message35:(Jelmer) Move dpush to InterBranch.e\
+e";
+
+    fn ser() -> BEncodeRevisionSerializer1 {
+        BEncodeRevisionSerializer1
+    }
+
+    #[test]
+    fn test_unpack_revision() {
+        let rev = ser()
+            .read_revision_from_string(WORKING_REVISION_BENCODE1)
+            .unwrap();
+        assert_eq!(
+            rev.committer.as_deref(),
+            Some("Canonical.com Patch Queue Manager <pqm@pqm.ubuntu.com>")
+        );
+        assert_eq!(
+            rev.inventory_sha1.as_deref(),
+            Some(b"4a2c7fb50e077699242cf6eb16a61779c7b680a7".as_slice())
+        );
+        assert_eq!(
+            rev.parent_ids,
+            vec![
+                RevisionId::from(b"pqm@pqm.ubuntu.com-20090514104039-kggemn7lrretzpvc".to_vec()),
+                RevisionId::from(b"jelmer@samba.org-20090510012654-jp9ufxquekaokbeo".to_vec()),
+            ]
+        );
+        assert_eq!(rev.message, "(Jelmer) Move dpush to InterBranch.");
+        assert_eq!(
+            rev.revision_id,
+            RevisionId::from(b"pqm@pqm.ubuntu.com-20090514113250-jntkkpminfn3e0tz".to_vec())
+        );
+        assert_eq!(rev.properties.get("branch-nick").unwrap(), b"+trunk");
+        assert_eq!(rev.timezone, Some(3600));
+    }
+
+    #[test]
+    fn test_written_form_matches() {
+        let s = ser();
+        let rev = s
+            .read_revision_from_string(WORKING_REVISION_BENCODE1)
+            .unwrap();
+        let as_bytes = s.write_revision_to_string(&rev).unwrap();
+        assert_eq!(as_bytes, WORKING_REVISION_BENCODE1);
+    }
+
+    #[test]
+    fn test_unpack_revision_no_timezone() {
+        let rev = ser()
+            .read_revision_from_string(WORKING_REVISION_BENCODE1_NO_TIMEZONE)
+            .unwrap();
+        assert_eq!(rev.timezone, None);
+    }
+
+    fn assert_round_trips(rev: &Revision) {
+        let s = ser();
+        let bytes = s.write_revision_to_string(rev).unwrap();
+        let round_tripped = s.read_revision_from_string(&bytes).unwrap();
+        assert_eq!(&round_tripped, rev);
+    }
+
+    #[test]
+    fn test_roundtrips_non_ascii() {
+        let mut props: HashMap<String, Vec<u8>> = HashMap::new();
+        // keep properties empty to match Python test
+        props.clear();
+        let rev = Revision::new(
+            RevisionId::from(b"revid1".to_vec()),
+            vec![],
+            Some("Erik B\u{e5}gfors".to_string()),
+            "\n\u{e5}me".to_string(),
+            props,
+            Some(b"4a2c7fb50e077699242cf6eb16a61779c7b680a7".to_vec()),
+            1242385452.0,
+            Some(3600),
+        );
+        assert_round_trips(&rev);
+    }
+
+    #[test]
+    fn test_roundtrips_xml_invalid_chars() {
+        let rev = Revision::new(
+            RevisionId::from(b"revid1".to_vec()),
+            vec![],
+            Some("Erik B\u{e5}gfors".to_string()),
+            "\t\u{e000}".to_string(),
+            HashMap::new(),
+            Some(b"4a2c7fb50e077699242cf6eb16a61779c7b680a7".to_vec()),
+            1242385452.0,
+            Some(3600),
+        );
+        assert_round_trips(&rev);
+    }
+}

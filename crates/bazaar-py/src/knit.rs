@@ -1,7 +1,7 @@
 use bazaar::knit::{
     lower_fulltext, lower_line_delta_annotated, lower_line_delta_raw, parse_fulltext,
-    parse_line_delta_annotated, parse_line_delta_plain, parse_line_delta_raw, AnnotatedLine,
-    DeltaHunk, KnitError,
+    parse_line_delta_annotated, parse_line_delta_plain, parse_line_delta_raw,
+    parse_network_record_header, AnnotatedLine, DeltaHunk, KnitError,
 };
 use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
@@ -442,6 +442,35 @@ fn get_line_delta_blocks_rs<'py>(
     PyList::new(py, items)
 }
 
+/// Parse a knit network record header (everything between the storage-kind
+/// line and the raw record body). Returns
+/// `(key_tuple, parents_tuple_or_none, noeol, raw_record_offset)`.
+#[pyfunction]
+fn parse_network_record_header_rs<'py>(
+    py: Python<'py>,
+    bytes: &'py [u8],
+    line_end: usize,
+) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, PyAny>, bool, usize)> {
+    let header = parse_network_record_header(bytes, line_end)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let key = PyTuple::new(py, header.key.iter().map(|s| PyBytes::new(py, s)))?;
+    let parents: Bound<PyAny> = match header.parents {
+        None => py.None().into_bound(py),
+        Some(parents) => PyTuple::new(
+            py,
+            parents
+                .iter()
+                .map(|p| PyTuple::new(py, p.iter().map(|s| PyBytes::new(py, s))).unwrap()),
+        )?
+        .into_any(),
+    };
+    // Compute offset of raw record from the start of the input. This avoids
+    // returning a fresh bytes copy so the Python caller can keep using a
+    // memoryview / slice over the original buffer.
+    let raw_offset = bytes.len() - header.raw_record.len();
+    Ok((key, parents, header.noeol, raw_offset))
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data_c, &m)?)?;
@@ -452,5 +481,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(parse_line_delta_raw_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(lower_line_delta_raw_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(get_line_delta_blocks_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(parse_network_record_header_rs, &m)?)?;
     Ok(m)
 }

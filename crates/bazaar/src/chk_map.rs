@@ -403,8 +403,94 @@ fn test_common_prefix_many() {
 }
 
 #[cfg(test)]
-mod deserialise_tests {
+mod tests {
     use super::*;
+
+    fn key(parts: &[&[u8]]) -> Key {
+        Key::from(parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn search_key_plain_joins_with_nul() {
+        assert_eq!(
+            search_key_plain(&key(&[b"foo", b"bar"])),
+            b"foo\x00bar".to_vec()
+        );
+        assert_eq!(search_key_plain(&key(&[b"only"])), b"only".to_vec());
+    }
+
+    #[test]
+    fn search_key_16_is_uppercase_hex() {
+        // For a single-element key, the result is `{crc32:08X}`.
+        let out = search_key_16(&key(&[b"hello"]));
+        let s = std::str::from_utf8(&out).unwrap();
+        assert_eq!(s.len(), 8);
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+    }
+
+    #[test]
+    fn search_key_16_joins_multi_element_keys_with_nul() {
+        let out = search_key_16(&key(&[b"a", b"b"]));
+        // Two 8-char hex blocks separated by a single \x00.
+        assert_eq!(out.len(), 17);
+        assert_eq!(out[8], b'\x00');
+    }
+
+    #[test]
+    fn search_key_255_uses_raw_be_bytes_with_lf_replaced() {
+        let out = search_key_255(&key(&[b"hello"]));
+        assert_eq!(out.len(), 4);
+        assert!(!out.contains(&b'\n'));
+    }
+
+    #[test]
+    fn search_key_255_replaces_lf_with_underscore() {
+        // The implementation post-processes the raw CRC bytes to replace any
+        // \n byte with `_` so the result can be safely embedded in a node
+        // dump.
+        for input in [b"abc".as_slice(), b"x", b"y"] {
+            let out = search_key_255(&key(&[input]));
+            assert!(!out.contains(&b'\n'));
+        }
+    }
+
+    #[test]
+    fn search_key_255_multi_element_keys_use_nul_separator() {
+        let out = search_key_255(&key(&[b"a", b"b"]));
+        assert_eq!(out.len(), 9);
+        assert_eq!(out[4], b'\x00');
+    }
+
+    #[test]
+    fn bytes_to_text_key_parses_file_record() {
+        let bytes = b"file: file-id\nparent-id\nname\nrevision-id\n\
+da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
+        let (file_id, revision_id) = bytes_to_text_key(bytes).unwrap();
+        assert_eq!(file_id, b"file-id");
+        assert_eq!(revision_id, b"revision-id");
+    }
+
+    #[test]
+    fn bytes_to_text_key_rejects_missing_separator() {
+        // No `: ` between kind and file-id.
+        let bytes = b"file:file-id\nparent-id\nname\nrevision-id\n\
+da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
+        assert!(bytes_to_text_key(bytes).is_err());
+    }
+
+    #[test]
+    fn key_serialize_joins_parts_with_nul() {
+        assert_eq!(key(&[b"foo", b"bar"]).serialize(), b"foo\x00bar".to_vec());
+        assert_eq!(key(&[b"alone"]).serialize(), b"alone".to_vec());
+    }
+
+    #[test]
+    fn key_len_returns_part_count() {
+        assert_eq!(key(&[b"foo", b"bar"]).len(), 2);
+        assert_eq!(key(&[b"a"]).len(), 1);
+    }
 
     // Fixture generated from the real Python serialiser: a leaf with
     // _maximum_size=100, key_width=1, and two items whose keys share

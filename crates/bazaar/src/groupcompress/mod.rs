@@ -2,8 +2,10 @@ pub mod block;
 pub mod compressor;
 pub mod delta;
 pub mod line_delta;
+pub mod manager;
 pub mod rabin_delta;
 pub mod sort;
+pub mod wire;
 use sha1::{Digest as _, Sha1};
 
 lazy_static::lazy_static! {

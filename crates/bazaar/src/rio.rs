@@ -451,6 +451,263 @@ mod tests {
         );
     }
 
+    fn s(tag: &str, value: &str) -> (String, StanzaValue) {
+        (tag.to_string(), StanzaValue::String(value.to_string()))
+    }
+
+    #[test]
+    fn test_valid_tag_extra_cases() {
+        assert!(valid_tag("foo"));
+        assert!(!valid_tag("foo bla"));
+        assert!(valid_tag("3foo423"));
+        assert!(!valid_tag("foo:bla"));
+        assert!(!valid_tag(""));
+        assert!(!valid_tag("\u{b5}"));
+    }
+
+    #[test]
+    fn test_as_dict() {
+        let stanza = Stanza::from_pairs(vec![s("number", "42"), s("name", "fred")]);
+        let dict = stanza.as_dict();
+        assert_eq!(
+            dict.get("number"),
+            Some(&StanzaValue::String("42".to_string()))
+        );
+        assert_eq!(
+            dict.get("name"),
+            Some(&StanzaValue::String("fred".to_string()))
+        );
+        assert_eq!(dict.len(), 2);
+    }
+
+    #[test]
+    fn test_to_file() {
+        let stanza = Stanza::from_pairs(vec![
+            s("a_thing", "something with \"quotes like \\\"this\\\"\""),
+            s("name", "fred"),
+            s("number", "42"),
+        ]);
+        let mut buf = Vec::new();
+        stanza.write(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            b"a_thing: something with \"quotes like \\\"this\\\"\"\nname: fred\nnumber: 42\n",
+        );
+    }
+
+    #[test]
+    fn test_multiline_string_round_trip() {
+        let stanza = Stanza::from_pairs(vec![s(
+            "motto",
+            "war is peace\nfreedom is slavery\nignorance is strength",
+        )]);
+        let mut buf = Vec::new();
+        stanza.write(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            b"motto: war is peace\n\tfreedom is slavery\n\tignorance is strength\n",
+        );
+        let lines = buf
+            .split_inclusive(|b| *b == b'\n')
+            .map(|l| l.to_vec())
+            .collect::<Vec<_>>();
+        let reread = read_stanza(lines.into_iter().map(Ok)).unwrap().unwrap();
+        assert_eq!(reread, stanza);
+    }
+
+    #[test]
+    fn test_repeated_field_round_trip() {
+        let mut stanza = Stanza::new();
+        for (k, v) in [
+            ("a", "10"),
+            ("b", "20"),
+            ("a", "100"),
+            ("b", "200"),
+            ("a", "1000"),
+            ("b", "2000"),
+        ] {
+            stanza
+                .add(k.to_string(), StanzaValue::String(v.to_string()))
+                .unwrap();
+        }
+        let lines: Vec<Vec<u8>> = stanza
+            .to_lines()
+            .into_iter()
+            .map(|l| l.into_bytes())
+            .collect();
+        let reread = read_stanza(lines.into_iter().map(Ok)).unwrap().unwrap();
+        assert_eq!(reread, stanza);
+        let all_a: Vec<&StanzaValue> = stanza.get_all("a");
+        assert_eq!(
+            all_a,
+            vec![
+                &StanzaValue::String("10".to_string()),
+                &StanzaValue::String("100".to_string()),
+                &StanzaValue::String("1000".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_backslash_round_trip() {
+        let stanza = Stanza::from_pairs(vec![s("q", "\\")]);
+        assert_eq!(stanza.to_string(), "q: \\\n");
+        let lines: Vec<Vec<u8>> = stanza
+            .to_lines()
+            .into_iter()
+            .map(|l| l.into_bytes())
+            .collect();
+        let reread = read_stanza(lines.into_iter().map(Ok)).unwrap().unwrap();
+        assert_eq!(reread, stanza);
+    }
+
+    #[test]
+    fn test_blank_line_round_trip() {
+        let stanza = Stanza::from_pairs(vec![s("none", ""), s("one", "\n"), s("two", "\n\n")]);
+        assert_eq!(stanza.to_string(), "none: \none: \n\t\ntwo: \n\t\n\t\n",);
+        let lines: Vec<Vec<u8>> = stanza
+            .to_lines()
+            .into_iter()
+            .map(|l| l.into_bytes())
+            .collect();
+        let reread = read_stanza(lines.into_iter().map(Ok)).unwrap().unwrap();
+        assert_eq!(reread, stanza);
+    }
+
+    #[test]
+    fn test_whitespace_value_round_trip() {
+        let stanza = Stanza::from_pairs(vec![
+            s("space", " "),
+            s("tabs", "\t\t\t"),
+            s("combo", "\n\t\t\n"),
+        ]);
+        let lines: Vec<Vec<u8>> = stanza
+            .to_lines()
+            .into_iter()
+            .map(|l| l.into_bytes())
+            .collect();
+        let reread = read_stanza(lines.into_iter().map(Ok)).unwrap().unwrap();
+        assert_eq!(reread, stanza);
+    }
+
+    #[test]
+    fn test_read_empty_iter_returns_none() {
+        let empty: Vec<Vec<u8>> = vec![];
+        let result = read_stanza(empty.into_iter().map(Ok)).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_read_single_blank_line_returns_none() {
+        let lines: Vec<Vec<u8>> = vec![b"".to_vec()];
+        let result = read_stanza(lines.into_iter().map(Ok)).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_read_nul_byte_raises() {
+        let lines: Vec<Vec<u8>> = vec![b"\0".to_vec()];
+        let result = read_stanza(lines.into_iter().map(Ok));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_nul_bytes_raises() {
+        let lines: Vec<Vec<u8>> = vec![vec![0u8; 100]];
+        let result = read_stanza(lines.into_iter().map(Ok));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_write_empty_stanza_yields_no_lines() {
+        let stanza = Stanza::new();
+        assert!(stanza.to_lines().is_empty());
+    }
+
+    #[test]
+    fn test_rio_unicode_value_round_trip() {
+        // \u{30aa} = KATAKANA LETTER O
+        let stanza = Stanza::from_pairs(vec![s("foo", "\u{30aa}")]);
+        assert_eq!(
+            stanza.get("foo"),
+            Some(&StanzaValue::String("\u{30aa}".to_string()))
+        );
+        let lines: Vec<Vec<u8>> = stanza
+            .to_lines()
+            .into_iter()
+            .map(|l| l.into_bytes())
+            .collect();
+        assert_eq!(lines, vec![format!("foo: \u{30aa}\n").into_bytes()]);
+        let reread = read_stanza(lines.into_iter().map(Ok)).unwrap().unwrap();
+        assert_eq!(
+            reread.get("foo"),
+            Some(&StanzaValue::String("\u{30aa}".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_read_simple_key_value() {
+        let lines: Vec<Vec<u8>> = vec![b"foo: bar\n".to_vec(), b"".to_vec()];
+        let stanza = read_stanza(lines.into_iter().map(Ok)).unwrap().unwrap();
+        assert_eq!(stanza, Stanza::from_pairs(vec![s("foo", "bar")]));
+    }
+
+    #[test]
+    fn test_read_multi_line_continuation() {
+        let lines: Vec<Vec<u8>> = vec![b"foo: bar\n".to_vec(), b"\tbla\n".to_vec()];
+        let stanza = read_stanza(lines.into_iter().map(Ok)).unwrap().unwrap();
+        assert_eq!(stanza, Stanza::from_pairs(vec![s("foo", "bar\nbla")]));
+    }
+
+    #[test]
+    fn test_read_repeated_tag() {
+        let lines: Vec<Vec<u8>> = vec![b"foo: bar\n".to_vec(), b"foo: foo\n".to_vec()];
+        let stanza = read_stanza(lines.into_iter().map(Ok)).unwrap().unwrap();
+        let mut expected = Stanza::new();
+        expected
+            .add("foo".to_string(), StanzaValue::String("bar".to_string()))
+            .unwrap();
+        expected
+            .add("foo".to_string(), StanzaValue::String("foo".to_string()))
+            .unwrap();
+        assert_eq!(stanza, expected);
+    }
+
+    #[test]
+    fn test_read_invalid_early_colon_raises() {
+        let lines: Vec<Vec<u8>> = vec![b"f:oo: bar\n".to_vec()];
+        assert!(read_stanza(lines.into_iter().map(Ok)).is_err());
+    }
+
+    #[test]
+    fn test_read_invalid_tag_raises() {
+        let lines: Vec<Vec<u8>> = vec![b"f%oo: bar\n".to_vec()];
+        assert!(read_stanza(lines.into_iter().map(Ok)).is_err());
+    }
+
+    #[test]
+    fn test_read_continuation_without_key_raises() {
+        let lines: Vec<Vec<u8>> = vec![b"\tbar\n".to_vec()];
+        assert!(read_stanza(lines.into_iter().map(Ok)).is_err());
+    }
+
+    #[test]
+    fn test_read_large_value() {
+        let value: String = "bla".repeat(9000);
+        let line = format!("foo: {}\n", value).into_bytes();
+        let lines: Vec<Vec<u8>> = vec![line];
+        let stanza = read_stanza(lines.into_iter().map(Ok)).unwrap().unwrap();
+        assert_eq!(stanza, Stanza::from_pairs(vec![s("foo", value.as_str())]));
+    }
+
+    #[test]
+    fn test_read_non_ascii_char() {
+        let line = "foo: n\u{e5}me\n".as_bytes().to_vec();
+        let lines: Vec<Vec<u8>> = vec![line];
+        let stanza = read_stanza(lines.into_iter().map(Ok)).unwrap().unwrap();
+        assert_eq!(stanza, Stanza::from_pairs(vec![s("foo", "n\u{e5}me")]));
+    }
+
     #[test]
     fn test_read_stanza() {
         let lines = b"number: 42

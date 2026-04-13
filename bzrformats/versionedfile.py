@@ -22,8 +22,6 @@ import os
 from copy import copy
 from io import BytesIO
 from typing import Any
-from urllib.parse import quote, unquote
-from zlib import adler32
 
 from vcsgraph import graph as _mod_graph
 from vcsgraph import known_graph as _mod_known_graph
@@ -1079,17 +1077,10 @@ class ConstantMapper(KeyMapper):
 class URLEscapeMapper(KeyMapper):
     """Base class for use with transport backed storage.
 
-    This provides a map and unmap wrapper that respectively url escape and
-    unescape their outputs and inputs.
+    Subclasses are responsible for url-escaping their `map` output and
+    url-unescaping their `unmap` input; the actual transformations live in
+    the Rust `versionedfile` module.
     """
-
-    def map(self, key):
-        """See KeyMapper.map()."""
-        return quote(self._map(key))
-
-    def unmap(self, partition_id):
-        """See KeyMapper.unmap()."""
-        return self._unmap(unquote(partition_id))
 
 
 class PrefixMapper(URLEscapeMapper):
@@ -1098,13 +1089,13 @@ class PrefixMapper(URLEscapeMapper):
     This mapper is for use with a transport based backend.
     """
 
-    def _map(self, key):
+    def map(self, key):
         """See KeyMapper.map()."""
-        return key[0].decode("utf-8")
+        return _versionedfile_rs.prefix_map(key[0])
 
-    def _unmap(self, partition_id):
+    def unmap(self, partition_id):
         """See KeyMapper.unmap()."""
-        return (partition_id.encode("utf-8"),)
+        return (_versionedfile_rs.prefix_unmap(partition_id),)
 
 
 class HashPrefixMapper(URLEscapeMapper):
@@ -1113,22 +1104,13 @@ class HashPrefixMapper(URLEscapeMapper):
     This mapper is for use with a transport based backend.
     """
 
-    def _map(self, key):
+    def map(self, key):
         """See KeyMapper.map()."""
-        prefix = self._escape(key[0])
-        return f"{adler32(prefix) & 255:02x}/{prefix.decode('utf-8')}"
+        return _versionedfile_rs.hash_prefix_map(key[0])
 
-    def _escape(self, prefix):
-        """No escaping needed here."""
-        return prefix
-
-    def _unmap(self, partition_id):
+    def unmap(self, partition_id):
         """See KeyMapper.unmap()."""
-        return (self._unescape(osutils.basename(partition_id)).encode("utf-8"),)
-
-    def _unescape(self, basename):
-        """No unescaping needed for HashPrefixMapper."""
-        return basename
+        return (_versionedfile_rs.hash_prefix_unmap(partition_id),)
 
 
 class HashEscapedPrefixMapper(HashPrefixMapper):
@@ -1137,24 +1119,13 @@ class HashEscapedPrefixMapper(HashPrefixMapper):
     This mapper is for use with a transport based backend.
     """
 
-    _safe = bytearray(b"abcdefghijklmnopqrstuvwxyz0123456789-_@,.")
+    def map(self, key):
+        """See KeyMapper.map()."""
+        return _versionedfile_rs.hash_escaped_prefix_map(key[0])
 
-    def _escape(self, prefix):
-        """Turn a key element into a filesystem safe string.
-
-        This is similar to a plain urllib.parse.quote, except
-        it uses specific safe characters, so that it doesn't
-        have to translate a lot of valid file ids.
-        """
-        # @ does not get escaped. This is because it is a valid
-        # filesystem character we use all the time, and it looks
-        # a lot better than seeing %40 all the time.
-        r = [((c in self._safe) and chr(c)) or (f"%{c:02x}") for c in bytearray(prefix)]
-        return "".join(r).encode("ascii")
-
-    def _unescape(self, basename):
-        """Escaped names are easily unescaped by urllib.parse.unquote."""
-        return unquote(basename)
+    def unmap(self, partition_id):
+        """See KeyMapper.unmap()."""
+        return (_versionedfile_rs.hash_escaped_prefix_unmap(partition_id),)
 
 
 def make_versioned_files_factory(versioned_file_factory, mapper):
@@ -1941,123 +1912,15 @@ class PlanWeaveMerge(TextMerge):
         self.plan = list(plan)
 
     def _merge_struct(self):
-        lines_a = []
-        lines_b = []
-        ch_a = ch_b = False
+        from ._bzr_rs import textmerge as _textmerge_rs
 
-        def outstanding_struct():
-            if not lines_a and not lines_b:
-                return
-            elif ch_a and not ch_b:
-                # one-sided change:
-                yield (lines_a,)
-            elif ch_b and not ch_a:
-                yield (lines_b,)
-            elif lines_a == lines_b:
-                yield (lines_a,)
-            else:
-                yield (lines_a, lines_b)
-
-        # We previously considered either 'unchanged' or 'killed-both' lines
-        # to be possible places to resynchronize.  However, assuming agreement
-        # on killed-both lines may be too aggressive. -- mbp 20060324
-        for state, line in self.plan:
-            if state == "unchanged":
-                # resync and flush queued conflicts changes if any
-                yield from outstanding_struct()
-                lines_a = []
-                lines_b = []
-                ch_a = ch_b = False
-
-            if state == "unchanged":
-                if line:
-                    yield ([line],)
-            elif state == "killed-a":
-                ch_a = True
-                lines_b.append(line)
-            elif state == "killed-b":
-                ch_b = True
-                lines_a.append(line)
-            elif state == "new-a":
-                ch_a = True
-                lines_a.append(line)
-            elif state == "new-b":
-                ch_b = True
-                lines_b.append(line)
-            elif state == "conflicted-a":
-                ch_b = ch_a = True
-                lines_a.append(line)
-            elif state == "conflicted-b":
-                ch_b = ch_a = True
-                lines_b.append(line)
-            elif state == "killed-both":
-                # This counts as a change, even though there is no associated
-                # line
-                ch_b = ch_a = True
-            else:
-                if state not in ("irrelevant", "ghost-a", "ghost-b", "killed-base"):
-                    raise AssertionError(state)
-        yield from outstanding_struct()
+        return iter(_textmerge_rs.merge_struct_from_plan(self.plan))
 
     def base_from_plan(self):
         """Construct a BASE file from the plan text."""
-        base_lines = []
-        for state, line in self.plan:
-            if state in ("killed-a", "killed-b", "killed-both", "unchanged"):
-                # If unchanged, then this line is straight from base. If a or b
-                # or both killed the line, then it *used* to be in base.
-                base_lines.append(line)
-            else:
-                if state not in (
-                    "killed-base",
-                    "irrelevant",
-                    "ghost-a",
-                    "ghost-b",
-                    "new-a",
-                    "new-b",
-                    "conflicted-a",
-                    "conflicted-b",
-                ):
-                    # killed-base, irrelevant means it doesn't apply
-                    # ghost-a/ghost-b are harder to say for sure, but they
-                    # aren't in the 'inc_c' which means they aren't in the
-                    # shared base of a & b. So we don't include them.  And
-                    # obviously if the line is newly inserted, it isn't in base
+        from ._bzr_rs import textmerge as _textmerge_rs
 
-                    # If 'conflicted-a' or b, then it is new vs one base, but
-                    # old versus another base. However, if we make it present
-                    # in the base, it will be deleted from the target, and it
-                    # seems better to get a line doubled in the merge result,
-                    # rather than have it deleted entirely.
-                    # Example, each node is the 'text' at that point:
-                    #           MN
-                    #          /   \
-                    #        MaN   MbN
-                    #         |  X  |
-                    #        MabN MbaN
-                    #          \   /
-                    #           ???
-                    # There was a criss-cross conflict merge. Both sides
-                    # include the other, but put themselves first.
-                    # Weave marks this as a 'clean' merge, picking OTHER over
-                    # THIS. (Though the details depend on order inserted into
-                    # weave, etc.)
-                    # LCA generates a plan:
-                    # [('unchanged', M),
-                    #  ('conflicted-b', b),
-                    #  ('unchanged', a),
-                    #  ('conflicted-a', b),
-                    #  ('unchanged', N)]
-                    # If you mark 'conflicted-*' as part of BASE, then a 3-way
-                    # merge tool will cleanly generate "MaN" (as BASE vs THIS
-                    # removes one 'b', and BASE vs OTHER removes the other)
-                    # If you include neither, 3-way creates a clean "MbabN" as
-                    # THIS adds one 'b', and OTHER does too.
-                    # It seems that having the line 2 times is better than
-                    # having it omitted. (Easier to manually delete than notice
-                    # it needs to be added.)
-                    raise AssertionError(f"Unknown state: {state}")
-        return base_lines
+        return _textmerge_rs.base_from_plan(self.plan)
 
 
 class WeaveMerge(PlanWeaveMerge):
@@ -2225,15 +2088,7 @@ class NoDupeAddLinesDecorator:
         return getattr(self._store, name)
 
 
-def network_bytes_to_kind_and_offset(network_bytes):
-    """Strip of a record kind from the front of network_bytes.
-
-    :param network_bytes: The bytes of a record.
-    :return: A tuple (storage_kind, offset_of_remaining_bytes)
-    """
-    line_end = network_bytes.find(b"\n")
-    storage_kind = network_bytes[:line_end].decode("ascii")
-    return storage_kind, line_end + 1
+network_bytes_to_kind_and_offset = _versionedfile_rs.network_bytes_to_kind_and_offset
 
 
 class NetworkRecordStream:
@@ -2277,23 +2132,16 @@ def sort_groupcompress(parent_map):
 
     :return: A sorted-list of keys
     """
-    from vcsgraph.tsort import topo_sort
+    from ._bzr_rs import groupcompress as _groupcompress_rs
 
-    # gc-optimal ordering is approximately reverse topological,
-    # properly grouped by file-id.
-    per_prefix_map = {}
-    for item in parent_map.items():
-        key = item[0]
-        prefix = b"" if isinstance(key, bytes) or len(key) == 1 else key[0]
-        try:
-            per_prefix_map[prefix].append(item)
-        except KeyError:
-            per_prefix_map[prefix] = [item]
-
-    present_keys = []
-    for prefix in sorted(per_prefix_map):
-        present_keys.extend(reversed(topo_sort(per_prefix_map[prefix])))
-    return present_keys
+    # The Rust sort_gc_optimal accepts only tuple-shaped keys; wrap bare
+    # bytes keys (used by Weave) into single-element tuples and unwrap on
+    # the way back.
+    bytes_keys = any(isinstance(k, bytes) for k in parent_map)
+    if bytes_keys:
+        wrapped = {(k,): tuple((p,) for p in v) for k, v in parent_map.items()}
+        return [k[0] for k in _groupcompress_rs.sort_gc_optimal(wrapped)]
+    return _groupcompress_rs.sort_gc_optimal(parent_map)
 
 
 class _KeyRefs:
