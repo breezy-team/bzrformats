@@ -32,6 +32,7 @@ flate2 = "1.0.28"
 xz2 = "0.1.7"
 patiencediff = { version = "0.2.1", default-features = false }
 vcs-graph = "3.4.0"
+adler = "1.0.2"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs"] }

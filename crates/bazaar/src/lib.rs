@@ -17,6 +17,7 @@ pub mod hashcache;
 pub mod index;
 pub mod inventory;
 pub mod inventory_delta;
+pub mod key_mapper;
 pub mod knit;
 pub mod multiparent;
 pub mod pack;

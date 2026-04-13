@@ -165,6 +165,39 @@ impl AbsentContentFactory {
 }
 
 #[pyfunction]
+fn prefix_map(prefix: &[u8]) -> String {
+    bazaar::key_mapper::prefix_map(prefix)
+}
+
+#[pyfunction]
+fn prefix_unmap<'py>(py: Python<'py>, partition_id: &str) -> Bound<'py, PyBytes> {
+    PyBytes::new(py, &bazaar::key_mapper::prefix_unmap(partition_id))
+}
+
+#[pyfunction]
+fn hash_prefix_map(prefix: &[u8]) -> String {
+    bazaar::key_mapper::hash_prefix_map(prefix)
+}
+
+#[pyfunction]
+fn hash_prefix_unmap<'py>(py: Python<'py>, partition_id: &str) -> Bound<'py, PyBytes> {
+    PyBytes::new(py, &bazaar::key_mapper::hash_prefix_unmap(partition_id))
+}
+
+#[pyfunction]
+fn hash_escaped_prefix_map(prefix: &[u8]) -> String {
+    bazaar::key_mapper::hash_escaped_prefix_map(prefix)
+}
+
+#[pyfunction]
+fn hash_escaped_prefix_unmap<'py>(py: Python<'py>, partition_id: &str) -> Bound<'py, PyBytes> {
+    PyBytes::new(
+        py,
+        &bazaar::key_mapper::hash_escaped_prefix_unmap(partition_id),
+    )
+}
+
+#[pyfunction]
 fn fulltext_network_to_record<'a>(
     py: Python<'a>,
     _kind: &'a str,
@@ -187,5 +220,11 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<AbsentContentFactory>()?;
     m.add_function(wrap_pyfunction!(record_to_fulltext_bytes, &m)?)?;
     m.add_function(wrap_pyfunction!(fulltext_network_to_record, &m)?)?;
+    m.add_function(wrap_pyfunction!(prefix_map, &m)?)?;
+    m.add_function(wrap_pyfunction!(prefix_unmap, &m)?)?;
+    m.add_function(wrap_pyfunction!(hash_prefix_map, &m)?)?;
+    m.add_function(wrap_pyfunction!(hash_prefix_unmap, &m)?)?;
+    m.add_function(wrap_pyfunction!(hash_escaped_prefix_map, &m)?)?;
+    m.add_function(wrap_pyfunction!(hash_escaped_prefix_unmap, &m)?)?;
     Ok(m)
 }

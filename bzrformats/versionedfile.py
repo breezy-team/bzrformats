@@ -22,8 +22,6 @@ import os
 from copy import copy
 from io import BytesIO
 from typing import Any
-from urllib.parse import quote, unquote
-from zlib import adler32
 
 from vcsgraph import graph as _mod_graph
 from vcsgraph import known_graph as _mod_known_graph
@@ -1079,17 +1077,10 @@ class ConstantMapper(KeyMapper):
 class URLEscapeMapper(KeyMapper):
     """Base class for use with transport backed storage.
 
-    This provides a map and unmap wrapper that respectively url escape and
-    unescape their outputs and inputs.
+    Subclasses are responsible for url-escaping their `map` output and
+    url-unescaping their `unmap` input; the actual transformations live in
+    the Rust `versionedfile` module.
     """
-
-    def map(self, key):
-        """See KeyMapper.map()."""
-        return quote(self._map(key))
-
-    def unmap(self, partition_id):
-        """See KeyMapper.unmap()."""
-        return self._unmap(unquote(partition_id))
 
 
 class PrefixMapper(URLEscapeMapper):
@@ -1098,13 +1089,13 @@ class PrefixMapper(URLEscapeMapper):
     This mapper is for use with a transport based backend.
     """
 
-    def _map(self, key):
+    def map(self, key):
         """See KeyMapper.map()."""
-        return key[0].decode("utf-8")
+        return _versionedfile_rs.prefix_map(key[0])
 
-    def _unmap(self, partition_id):
+    def unmap(self, partition_id):
         """See KeyMapper.unmap()."""
-        return (partition_id.encode("utf-8"),)
+        return (_versionedfile_rs.prefix_unmap(partition_id),)
 
 
 class HashPrefixMapper(URLEscapeMapper):
@@ -1113,22 +1104,13 @@ class HashPrefixMapper(URLEscapeMapper):
     This mapper is for use with a transport based backend.
     """
 
-    def _map(self, key):
+    def map(self, key):
         """See KeyMapper.map()."""
-        prefix = self._escape(key[0])
-        return f"{adler32(prefix) & 255:02x}/{prefix.decode('utf-8')}"
+        return _versionedfile_rs.hash_prefix_map(key[0])
 
-    def _escape(self, prefix):
-        """No escaping needed here."""
-        return prefix
-
-    def _unmap(self, partition_id):
+    def unmap(self, partition_id):
         """See KeyMapper.unmap()."""
-        return (self._unescape(osutils.basename(partition_id)).encode("utf-8"),)
-
-    def _unescape(self, basename):
-        """No unescaping needed for HashPrefixMapper."""
-        return basename
+        return (_versionedfile_rs.hash_prefix_unmap(partition_id),)
 
 
 class HashEscapedPrefixMapper(HashPrefixMapper):
@@ -1137,24 +1119,13 @@ class HashEscapedPrefixMapper(HashPrefixMapper):
     This mapper is for use with a transport based backend.
     """
 
-    _safe = bytearray(b"abcdefghijklmnopqrstuvwxyz0123456789-_@,.")
+    def map(self, key):
+        """See KeyMapper.map()."""
+        return _versionedfile_rs.hash_escaped_prefix_map(key[0])
 
-    def _escape(self, prefix):
-        """Turn a key element into a filesystem safe string.
-
-        This is similar to a plain urllib.parse.quote, except
-        it uses specific safe characters, so that it doesn't
-        have to translate a lot of valid file ids.
-        """
-        # @ does not get escaped. This is because it is a valid
-        # filesystem character we use all the time, and it looks
-        # a lot better than seeing %40 all the time.
-        r = [((c in self._safe) and chr(c)) or (f"%{c:02x}") for c in bytearray(prefix)]
-        return "".join(r).encode("ascii")
-
-    def _unescape(self, basename):
-        """Escaped names are easily unescaped by urllib.parse.unquote."""
-        return unquote(basename)
+    def unmap(self, partition_id):
+        """See KeyMapper.unmap()."""
+        return (_versionedfile_rs.hash_escaped_prefix_unmap(partition_id),)
 
 
 def make_versioned_files_factory(versioned_file_factory, mapper):
