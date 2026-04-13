@@ -2240,23 +2240,16 @@ def sort_groupcompress(parent_map):
 
     :return: A sorted-list of keys
     """
-    from vcsgraph.tsort import topo_sort
+    from ._bzr_rs import groupcompress as _groupcompress_rs
 
-    # gc-optimal ordering is approximately reverse topological,
-    # properly grouped by file-id.
-    per_prefix_map = {}
-    for item in parent_map.items():
-        key = item[0]
-        prefix = b"" if isinstance(key, bytes) or len(key) == 1 else key[0]
-        try:
-            per_prefix_map[prefix].append(item)
-        except KeyError:
-            per_prefix_map[prefix] = [item]
-
-    present_keys = []
-    for prefix in sorted(per_prefix_map):
-        present_keys.extend(reversed(topo_sort(per_prefix_map[prefix])))
-    return present_keys
+    # The Rust sort_gc_optimal accepts only tuple-shaped keys; wrap bare
+    # bytes keys (used by Weave) into single-element tuples and unwrap on
+    # the way back.
+    bytes_keys = any(isinstance(k, bytes) for k in parent_map)
+    if bytes_keys:
+        wrapped = {(k,): tuple((p,) for p in v) for k, v in parent_map.items()}
+        return [k[0] for k in _groupcompress_rs.sort_gc_optimal(wrapped)]
+    return _groupcompress_rs.sort_gc_optimal(parent_map)
 
 
 class _KeyRefs:
