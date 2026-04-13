@@ -629,3 +629,130 @@ pub fn parse_inventory_delta(
         InventoryDelta(result),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split(s: &[u8]) -> Vec<&[u8]> {
+        // Replicates osutils.split_lines: keeps trailing newlines.
+        let mut out = Vec::new();
+        let mut start = 0;
+        for (i, &b) in s.iter().enumerate() {
+            if b == b'\n' {
+                out.push(&s[start..=i]);
+                start = i + 1;
+            }
+        }
+        if start < s.len() {
+            out.push(&s[start..]);
+        }
+        out
+    }
+
+    fn parse(
+        bytes: &[u8],
+    ) -> Result<(RevisionId, RevisionId, bool, bool, InventoryDelta), InventoryDeltaParseError>
+    {
+        let lines = split(bytes);
+        parse_inventory_delta(&lines, None, None)
+    }
+
+    #[test]
+    fn parse_no_bytes_errors() {
+        let err = parse_inventory_delta(&[], None, None).unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("empty")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn parse_bad_format_errors() {
+        let err = parse(b"format: foo\n").unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("unknown format")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn parse_no_parent_marker_errors() {
+        let err = parse(b"format: bzr inventory delta v1 (bzr 1.14)\n").unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("missing parent")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn parse_no_version_marker_errors() {
+        let err = parse(b"format: bzr inventory delta v1 (bzr 1.14)\nparent: null:\n").unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("missing version")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn parse_versioned_root_only_round_trip() {
+        let bytes = b"format: bzr inventory delta v1 (bzr 1.14)\n\
+parent: null:\n\
+version: entry-version\n\
+versioned_root: true\n\
+tree_references: true\n\
+None\x00/\x00an-id\x00\x00a@e\xc3\xa5ample.com--2004\x00dir\n";
+        let (parent, version, versioned_root, tree_refs, delta) = parse(bytes).unwrap();
+        assert_eq!(parent.as_bytes(), b"null:");
+        assert_eq!(version.as_bytes(), b"entry-version");
+        assert!(versioned_root);
+        assert!(tree_refs);
+        assert_eq!(delta.0.len(), 1);
+        let item = &delta.0[0];
+        assert_eq!(item.old_path, None);
+        assert_eq!(item.new_path.as_deref(), Some(""));
+        assert_eq!(item.file_id.as_bytes(), b"an-id");
+    }
+
+    #[test]
+    fn parse_duplicate_file_id_errors() {
+        let bytes = b"format: bzr inventory delta v1 (bzr 1.14)\n\
+parent: null:\n\
+version: null:\n\
+versioned_root: true\n\
+tree_references: true\n\
+None\x00/\x00an-id\x00\x00a@e\xc3\xa5ample.com--2004\x00dir\n\
+None\x00/\x00an-id\x00\x00a@e\xc3\xa5ample.com--2004\x00dir\n";
+        let err = parse(bytes).unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("duplicate file id")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn parse_versioned_root_when_disabled_errors() {
+        let bytes = b"format: bzr inventory delta v1 (bzr 1.14)\n\
+parent: null:\n\
+version: null:\n\
+versioned_root: true\n\
+tree_references: true\n";
+        let lines = split(bytes);
+        let err = parse_inventory_delta(&lines, Some(false), None).unwrap_err();
+        match err {
+            InventoryDeltaParseError::Incompatible(msg) => assert!(msg.contains("versioned_root")),
+            _ => panic!("expected Incompatible"),
+        }
+    }
+
+    #[test]
+    fn parse_last_line_not_empty_errors() {
+        // No trailing newline on the last line.
+        let err = parse(b"format: bzr inventory delta v1 (bzr 1.14)\nparent: null:\nversion: x")
+            .unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("last line")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+}
