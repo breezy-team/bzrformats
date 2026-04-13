@@ -2,18 +2,115 @@
 //!
 //! Port of the pure-logic pieces of `bzrformats/knit.py`: fulltext and
 //! line-delta parse/serialize for the annotated and plain variants, plus
-//! the `get_line_delta_blocks` matching-block extractor. Content
-//! objects, record I/O, and VersionedFile plumbing stay in Python.
+//! the `get_line_delta_blocks` matching-block extractor. Content objects,
+//! record I/O, and VersionedFile plumbing stay in Python.
+//!
+//! # Pure-Rust entry points
+//!
+//! For downstream Rust callers that want to work with knit data without
+//! going through the Python bindings, the relevant pieces are:
+//!
+//! ## Fulltext / line-delta layer
+//!
+//! - [`parse_fulltext`] / [`lower_fulltext`] — round-trip the annotated
+//!   fulltext wire format.
+//! - [`parse_line_delta_annotated`] / [`lower_line_delta_annotated`] —
+//!   annotated line-delta round-trip.
+//! - [`parse_line_delta_plain`] / [`lower_line_delta_plain`] / [`parse_line_delta_raw`]
+//!   / [`lower_line_delta_raw`] — plain (unannotated) variants.
+//! - [`get_line_delta_blocks`] — extract matching `(parent_offset, target_offset, length)`
+//!   blocks from a delta.
+//!
+//! ## On-disk record layer
+//!
+//! - [`decode_record_gz`] — gunzip a `data` payload into a decompressed
+//!   body. Usually followed by one of the borrowing parsers below.
+//! - [`readlines`] — split a decompressed body into borrowed lines (the
+//!   knit wire format keeps `\n` terminators on every line; zero-copy).
+//! - [`parse_header_line`] / [`RecordHeaderRef`] — parse a `version <id>
+//!   <count> <digest>` line into borrowed fields.
+//! - [`parse_record_body_unchecked`] — header + body lines as borrowed
+//!   slices of a caller-owned decompressed buffer. Checks the line count
+//!   and `end` marker.
+//! - [`parse_record_unchecked`] / [`RecordHeader`] — owning wrapper
+//!   around the above for call-sites that need a detached result.
+//! - [`parse_record_header_only`] — lenient header-only variant that does
+//!   not validate the body (used by the raw-read path).
+//! - [`record_to_data`] — the inverse: frame a body into a compressed
+//!   knit record.
+//!
+//! ## Network record layer
+//!
+//! - [`parse_network_record_header`] / [`NetworkRecordHeader`] — parse
+//!   the variable-length header of a `knit-*-gz` network record.
+//! - [`build_network_record`] (with the [`NO_PARENTS`] sentinel for the
+//!   `None`-parents case) — inverse of the above.
+//! - [`KnitDeltaClosureRecord`] / [`build_knit_delta_closure_wire`] —
+//!   serialise a `knit-delta-closure` batch of records for over-the-wire
+//!   streaming.
+//!
+//! ## Supporting helpers
+//!
+//! - [`split_keys_by_prefix`] — order-preserving groupby over a list of
+//!   knit keys. Used by the Python `_split_by_prefix` on the checkout
+//!   batching path.
+//!
+//! All of the above share a single [`KnitError`] enum; functions return
+//! `Result<_, KnitError>` so callers only need one error match-arm set.
 
-/// Errors from parsing knit record bodies.
+/// Unified error type for every fallible operation in this module.
+///
+/// The enum covers four loosely-related families — fulltext / line-delta
+/// parsing, on-disk record parsing, network record header parsing, and
+/// record serialization. They share a single type so callers only need
+/// one `match` arm set; each variant's docstring names the function
+/// family it belongs to.
+///
+/// `KnitError` is `Clone + Eq` so it can participate in test assertions
+/// directly (`assert_eq!(err, KnitError::TruncatedDelta)`). The one
+/// underlying `std::io::Error` path (gzip decompression) is normalised
+/// into a `String` for the same reason: corrupt compressed bodies
+/// reliably produce textual diagnostics and carrying a live `io::Error`
+/// across the enum would poison `Clone + Eq`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KnitError {
+    // --- fulltext / line-delta layer ---
     /// A fulltext or delta line had no space separating origin from text.
     MissingOrigin(Vec<u8>),
     /// A delta header `start,end,count` was malformed.
     BadDeltaHeader(Vec<u8>),
     /// A delta header said N lines but the iterator ran out earlier.
     TruncatedDelta,
+
+    // --- on-disk record layer ---
+    /// Gzip decompression failed. The inner string is the `io::Error`
+    /// message from flate2 / the underlying reader.
+    Gzip(String),
+    /// Record body was empty — no header line at all.
+    EmptyRecord,
+    /// `version <id> <count> <digest>` header had the wrong number of
+    /// space-separated fields.
+    HeaderFields(Vec<u8>),
+    /// `count` field of a header line wasn't a valid integer.
+    HeaderCount(Vec<u8>),
+    /// Line count declared by the header didn't match the body.
+    LineCount { declared: usize, actual: usize },
+    /// The `end <version_id>` trailer didn't match the expected value.
+    BadEndMarker { expected: Vec<u8>, actual: Vec<u8> },
+    /// [`record_to_data`] was given a non-empty body whose last line did
+    /// not end in `\n`.
+    MissingTrailingNewline,
+
+    // --- network record layer ---
+    /// `parse_network_record_header`: the key segment had no `\n`
+    /// terminator.
+    NetworkMissingKeyTerminator,
+    /// `parse_network_record_header`: the parent-list segment had no
+    /// `\n` terminator.
+    NetworkMissingParentsTerminator,
+    /// `parse_network_record_header`: the noeol flag byte was missing
+    /// (input ended before the record body).
+    NetworkMissingNoEolByte,
 }
 
 impl std::fmt::Display for KnitError {
@@ -24,6 +121,38 @@ impl std::fmt::Display for KnitError {
             }
             KnitError::BadDeltaHeader(h) => write!(f, "bad delta header: {:?}", h),
             KnitError::TruncatedDelta => write!(f, "delta truncated: too few lines"),
+            KnitError::Gzip(msg) => write!(f, "corrupt compressed record: {}", msg),
+            KnitError::EmptyRecord => write!(f, "empty knit record"),
+            KnitError::HeaderFields(h) => {
+                write!(f, "unexpected number of elements in record header: {:?}", h)
+            }
+            KnitError::HeaderCount(h) => {
+                write!(f, "record header line count is not an integer: {:?}", h)
+            }
+            KnitError::LineCount { declared, actual } => {
+                write!(
+                    f,
+                    "incorrect number of lines {} != {} in record",
+                    actual, declared
+                )
+            }
+            KnitError::BadEndMarker { expected, actual } => write!(
+                f,
+                "unexpected version end line {:?}, wanted {:?}",
+                actual, expected
+            ),
+            KnitError::MissingTrailingNewline => {
+                write!(f, "corrupt lines value: last line missing trailing newline")
+            }
+            KnitError::NetworkMissingKeyTerminator => {
+                write!(f, "knit network record key missing newline terminator")
+            }
+            KnitError::NetworkMissingParentsTerminator => {
+                write!(f, "knit network record parents missing newline terminator")
+            }
+            KnitError::NetworkMissingNoEolByte => {
+                write!(f, "knit network record missing noeol byte")
+            }
         }
     }
 }
@@ -292,31 +421,6 @@ pub struct NetworkRecordHeader<'a> {
     pub raw_record: &'a [u8],
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum NetworkHeaderError {
-    MissingKeyTerminator,
-    MissingParentsTerminator,
-    MissingNoEolByte,
-}
-
-impl std::fmt::Display for NetworkHeaderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NetworkHeaderError::MissingKeyTerminator => {
-                write!(f, "knit network record key missing newline terminator")
-            }
-            NetworkHeaderError::MissingParentsTerminator => {
-                write!(f, "knit network record parents missing newline terminator")
-            }
-            NetworkHeaderError::MissingNoEolByte => {
-                write!(f, "knit network record missing noeol byte")
-            }
-        }
-    }
-}
-
-impl std::error::Error for NetworkHeaderError {}
-
 /// Parse the variable-length header of a `knit-*-gz` network record.
 ///
 /// `bytes` is the full record and `start` is the offset just past the
@@ -325,12 +429,12 @@ impl std::error::Error for NetworkHeaderError {}
 pub fn parse_network_record_header(
     bytes: &[u8],
     start: usize,
-) -> Result<NetworkRecordHeader<'_>, NetworkHeaderError> {
+) -> Result<NetworkRecordHeader<'_>, KnitError> {
     let key_end = bytes[start..]
         .iter()
         .position(|&b| b == b'\n')
         .map(|i| start + i)
-        .ok_or(NetworkHeaderError::MissingKeyTerminator)?;
+        .ok_or(KnitError::NetworkMissingKeyTerminator)?;
     let key: Vec<&[u8]> = bytes[start..key_end].split(|&b| b == b'\x00').collect();
 
     let parents_start = key_end + 1;
@@ -338,7 +442,7 @@ pub fn parse_network_record_header(
         .iter()
         .position(|&b| b == b'\n')
         .map(|i| parents_start + i)
-        .ok_or(NetworkHeaderError::MissingParentsTerminator)?;
+        .ok_or(KnitError::NetworkMissingParentsTerminator)?;
     let parents_line = &bytes[parents_start..parents_end];
     let parents = if parents_line == b"None:" {
         None
@@ -354,7 +458,7 @@ pub fn parse_network_record_header(
 
     let noeol_pos = parents_end + 1;
     if noeol_pos >= bytes.len() {
-        return Err(NetworkHeaderError::MissingNoEolByte);
+        return Err(KnitError::NetworkMissingNoEolByte);
     }
     let noeol = bytes[noeol_pos] == b'N';
     let raw_record = &bytes[noeol_pos + 1..];
@@ -593,63 +697,23 @@ impl RecordHeaderRef<'_> {
     }
 }
 
-/// Errors from `parse_record_unchecked`.
-#[derive(Debug)]
-pub enum ParseRecordError {
-    Gzip(std::io::Error),
-    Empty,
-    HeaderFields(Vec<u8>),
-    HeaderCount(Vec<u8>),
-    LineCount { declared: usize, actual: usize },
-    BadEndMarker { expected: Vec<u8>, actual: Vec<u8> },
-}
-
-impl std::fmt::Display for ParseRecordError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseRecordError::Gzip(e) => write!(f, "corrupt compressed record: {}", e),
-            ParseRecordError::Empty => write!(f, "empty knit record"),
-            ParseRecordError::HeaderFields(h) => {
-                write!(f, "unexpected number of elements in record header: {:?}", h)
-            }
-            ParseRecordError::HeaderCount(h) => {
-                write!(f, "record header line count is not an integer: {:?}", h)
-            }
-            ParseRecordError::LineCount { declared, actual } => {
-                write!(
-                    f,
-                    "incorrect number of lines {} != {} in record",
-                    actual, declared
-                )
-            }
-            ParseRecordError::BadEndMarker { expected, actual } => write!(
-                f,
-                "unexpected version end line {:?}, wanted {:?}",
-                actual, expected
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ParseRecordError {}
-
 /// Parse a knit header line (`version <id> <count> <digest>`), either with
 /// or without the trailing newline. Borrows the input: all four fields in
 /// the returned `RecordHeaderRef` are slices of `line`.
 ///
 /// The whole line (including any newline the caller passed in) is threaded
-/// into the `HeaderFields` / `HeaderCount` error variants so diagnostics
-/// match the original input.
-pub fn parse_header_line(line: &[u8]) -> Result<RecordHeaderRef<'_>, ParseRecordError> {
+/// into the [`KnitError::HeaderFields`] / [`KnitError::HeaderCount`] variants
+/// so diagnostics match the original input.
+pub fn parse_header_line(line: &[u8]) -> Result<RecordHeaderRef<'_>, KnitError> {
     let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
     let fields: Vec<&[u8]> = trimmed.split(|&b| b == b' ').collect();
     if fields.len() != 4 {
-        return Err(ParseRecordError::HeaderFields(line.to_vec()));
+        return Err(KnitError::HeaderFields(line.to_vec()));
     }
     let count: usize = std::str::from_utf8(fields[2])
         .ok()
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| ParseRecordError::HeaderCount(line.to_vec()))?;
+        .ok_or_else(|| KnitError::HeaderCount(line.to_vec()))?;
     Ok(RecordHeaderRef {
         method: fields[0],
         version_id: fields[1],
@@ -685,7 +749,7 @@ fn split_readlines(data: &[u8]) -> Vec<Vec<u8>> {
 /// Gunzip a knit record, returning its decompressed body. Thin convenience
 /// so callers can own the buffer and then run the borrowing parsers below
 /// without paying for a second allocation.
-pub fn decode_record_gz(data: &[u8]) -> Result<Vec<u8>, ParseRecordError> {
+pub fn decode_record_gz(data: &[u8]) -> Result<Vec<u8>, KnitError> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -693,7 +757,7 @@ pub fn decode_record_gz(data: &[u8]) -> Result<Vec<u8>, ParseRecordError> {
     let mut decompressed = Vec::new();
     decoder
         .read_to_end(&mut decompressed)
-        .map_err(ParseRecordError::Gzip)?;
+        .map_err(|e| KnitError::Gzip(e.to_string()))?;
     Ok(decompressed)
 }
 
@@ -702,18 +766,44 @@ pub fn decode_record_gz(data: &[u8]) -> Result<Vec<u8>, ParseRecordError> {
 /// `BytesIO(data).readlines()` call this replaces, but without allocating
 /// a `Vec<u8>` per line.
 pub fn readlines(data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, &b) in data.iter().enumerate() {
-        if b == b'\n' {
-            out.push(&data[start..=i]);
-            start = i + 1;
+    ReadLines::new(data).collect()
+}
+
+/// Streaming variant of [`readlines`]: yields one borrowed line at a time
+/// so callers working with very large decompressed bodies don't have to
+/// allocate a `Vec<&[u8]>` to index into.
+#[derive(Debug, Clone)]
+pub struct ReadLines<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ReadLines<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for ReadLines<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.data.len() {
+            return None;
+        }
+        let start = self.pos;
+        match self.data[start..].iter().position(|&b| b == b'\n') {
+            Some(off) => {
+                let end = start + off + 1;
+                self.pos = end;
+                Some(&self.data[start..end])
+            }
+            None => {
+                self.pos = self.data.len();
+                Some(&self.data[start..])
+            }
         }
     }
-    if start < data.len() {
-        out.push(&data[start..]);
-    }
-    out
 }
 
 /// Parse an already-decompressed knit record body into its header and body
@@ -723,23 +813,23 @@ pub fn readlines(data: &[u8]) -> Vec<&[u8]> {
 /// `decompressed` so no per-line allocation is needed.
 pub fn parse_record_body_unchecked(
     decompressed: &[u8],
-) -> Result<(RecordHeaderRef<'_>, Vec<&[u8]>), ParseRecordError> {
+) -> Result<(RecordHeaderRef<'_>, Vec<&[u8]>), KnitError> {
     let mut lines = readlines(decompressed);
     if lines.is_empty() {
-        return Err(ParseRecordError::Empty);
+        return Err(KnitError::EmptyRecord);
     }
     let header_line = lines.remove(0);
     let header = parse_header_line(header_line)?;
 
     if lines.is_empty() {
-        return Err(ParseRecordError::LineCount {
+        return Err(KnitError::LineCount {
             declared: header.count,
             actual: 0,
         });
     }
     let last_line = lines.pop().unwrap();
     if lines.len() != header.count {
-        return Err(ParseRecordError::LineCount {
+        return Err(KnitError::LineCount {
             declared: header.count,
             actual: lines.len(),
         });
@@ -748,7 +838,7 @@ pub fn parse_record_body_unchecked(
     expected_end.extend_from_slice(header.version_id);
     expected_end.push(b'\n');
     if last_line != expected_end.as_slice() {
-        return Err(ParseRecordError::BadEndMarker {
+        return Err(KnitError::BadEndMarker {
             expected: expected_end,
             actual: last_line.to_vec(),
         });
@@ -759,26 +849,24 @@ pub fn parse_record_body_unchecked(
 /// Owning convenience wrapper around [`decode_record_gz`] +
 /// [`parse_record_body_unchecked`]. Retained for call-sites (notably the
 /// pyo3 binding) that need an owned result.
-pub fn parse_record_unchecked(
-    data: &[u8],
-) -> Result<(RecordHeader, Vec<Vec<u8>>), ParseRecordError> {
+pub fn parse_record_unchecked(data: &[u8]) -> Result<(RecordHeader, Vec<Vec<u8>>), KnitError> {
     let decompressed = decode_record_gz(data)?;
     let mut lines = split_readlines(&decompressed);
     if lines.is_empty() {
-        return Err(ParseRecordError::Empty);
+        return Err(KnitError::EmptyRecord);
     }
     let header_line = lines.remove(0);
     let header = parse_header_line(&header_line)?.to_owned();
 
     if lines.is_empty() {
-        return Err(ParseRecordError::LineCount {
+        return Err(KnitError::LineCount {
             declared: header.count,
             actual: 0,
         });
     }
     let last_line = lines.pop().unwrap();
     if lines.len() != header.count {
-        return Err(ParseRecordError::LineCount {
+        return Err(KnitError::LineCount {
             declared: header.count,
             actual: lines.len(),
         });
@@ -787,7 +875,7 @@ pub fn parse_record_unchecked(
     expected_end.extend_from_slice(&header.version_id);
     expected_end.push(b'\n');
     if last_line != expected_end {
-        return Err(ParseRecordError::BadEndMarker {
+        return Err(KnitError::BadEndMarker {
             expected: expected_end,
             actual: last_line,
         });
@@ -801,7 +889,7 @@ pub fn parse_record_unchecked(
 /// Used by `_KnitData._parse_record_header`, which needs only the header
 /// fields and intentionally does not validate line counts or the end marker
 /// (see `test_too_many_lines` / `test_not_enough_lines`).
-pub fn parse_record_header_only(data: &[u8]) -> Result<RecordHeader, ParseRecordError> {
+pub fn parse_record_header_only(data: &[u8]) -> Result<RecordHeader, KnitError> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -809,7 +897,10 @@ pub fn parse_record_header_only(data: &[u8]) -> Result<RecordHeader, ParseRecord
     let mut header_buf = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     loop {
-        match decoder.read(&mut byte).map_err(ParseRecordError::Gzip)? {
+        match decoder
+            .read(&mut byte)
+            .map_err(|e| KnitError::Gzip(e.to_string()))?
+        {
             0 => break,
             _ => {
                 header_buf.push(byte[0]);
@@ -820,29 +911,10 @@ pub fn parse_record_header_only(data: &[u8]) -> Result<RecordHeader, ParseRecord
         }
     }
     if header_buf.is_empty() {
-        return Err(ParseRecordError::Empty);
+        return Err(KnitError::EmptyRecord);
     }
     Ok(parse_header_line(&header_buf)?.to_owned())
 }
-
-/// Error returned by [`record_to_data`] when the body payload is malformed.
-#[derive(Debug)]
-pub enum RecordToDataError {
-    /// `lines` was non-empty but its last element didn't end in `\n`.
-    MissingTrailingNewline,
-}
-
-impl std::fmt::Display for RecordToDataError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RecordToDataError::MissingTrailingNewline => {
-                write!(f, "corrupt lines value: last line missing trailing newline")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RecordToDataError {}
 
 /// Serialize a knit record for on-disk storage. Inverse of
 /// [`parse_record_unchecked`]; mirrors `_KnitData._record_to_data`.
@@ -865,12 +937,12 @@ pub fn record_to_data<P>(
     line_count: usize,
     payload: &[P],
     has_trailing_newline: bool,
-) -> Result<(usize, Vec<Vec<u8>>), RecordToDataError>
+) -> Result<(usize, Vec<Vec<u8>>), KnitError>
 where
     P: AsRef<[u8]>,
 {
     if !has_trailing_newline {
-        return Err(RecordToDataError::MissingTrailingNewline);
+        return Err(KnitError::MissingTrailingNewline);
     }
 
     let mut header = Vec::with_capacity(version_id.len() + digest.len() + 16);
@@ -1263,7 +1335,7 @@ mod tests {
     fn network_header_rejects_missing_noeol_byte() {
         let bytes = b"knit-ft-gz\nk\nNone:\n";
         let err = parse_network_record_header(bytes, 11).unwrap_err();
-        assert_eq!(err, NetworkHeaderError::MissingNoEolByte);
+        assert_eq!(err, KnitError::NetworkMissingNoEolByte);
     }
 
     fn build_record(version_id: &[u8], digest: &[u8], body: &[&[u8]]) -> Vec<u8> {
@@ -1324,13 +1396,13 @@ mod tests {
         // the surrounding builder style.
         let _ = &mut header;
         let err = parse_record_unchecked(&raw).unwrap_err();
-        assert!(matches!(
+        assert_eq!(
             err,
-            ParseRecordError::LineCount {
+            KnitError::LineCount {
                 declared: 5,
-                actual: 1
+                actual: 1,
             }
-        ));
+        );
     }
 
     #[test]
@@ -1351,6 +1423,31 @@ mod tests {
         assert_eq!(rec.version_id, b"rev-id-1");
         assert_eq!(rec.count, 2);
         assert_eq!(rec.digest, b"DIGEST");
+    }
+
+    #[test]
+    fn parse_record_unchecked_reports_gzip_errors_as_knit_error() {
+        // Garbage that isn't a gzip stream at all — flate2 raises an
+        // io::Error which we normalise into KnitError::Gzip(String).
+        let err = parse_record_unchecked(b"definitely not gzip").unwrap_err();
+        assert!(matches!(err, KnitError::Gzip(_)));
+        // The Display impl threads through the underlying message.
+        assert!(err.to_string().contains("corrupt compressed record"));
+    }
+
+    #[test]
+    fn readlines_iter_matches_collected_and_handles_unterminated_tail() {
+        let data = b"alpha\nbeta\ngamma";
+        let streamed: Vec<&[u8]> = ReadLines::new(data).collect();
+        assert_eq!(
+            streamed,
+            vec![&b"alpha\n"[..], &b"beta\n"[..], &b"gamma"[..]]
+        );
+        assert_eq!(streamed, readlines(data));
+        // Empty and single-line edge cases.
+        assert!(ReadLines::new(b"").next().is_none());
+        assert_eq!(readlines(b"just-one"), vec![&b"just-one"[..]]);
+        assert_eq!(readlines(b"\n"), vec![&b"\n"[..]]);
     }
 
     #[test]
@@ -1393,7 +1490,7 @@ mod tests {
     fn record_to_data_rejects_missing_trailing_newline() {
         let body: Vec<Vec<u8>> = vec![b"no-newline".to_vec()];
         let err = record_to_data(b"rev", b"DD", 1, &body, false).unwrap_err();
-        assert!(matches!(err, RecordToDataError::MissingTrailingNewline));
+        assert_eq!(err, KnitError::MissingTrailingNewline);
     }
 
     #[test]
@@ -1418,6 +1515,12 @@ mod tests {
         let raw: Vec<u8> = gz.into_iter().flatten().collect();
         let _ = &mut header;
         let err = parse_record_unchecked(&raw).unwrap_err();
-        assert!(matches!(err, ParseRecordError::BadEndMarker { .. }));
+        assert_eq!(
+            err,
+            KnitError::BadEndMarker {
+                expected: b"end rev-y\n".to_vec(),
+                actual: b"end wrong-id\n".to_vec(),
+            }
+        );
     }
 }
