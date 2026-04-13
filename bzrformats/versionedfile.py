@@ -270,31 +270,13 @@ class _MPDiffGenerator:
             refcounts is a dict of {key: num_children} letting us know when we
                 no longer need to cache a given parent text
         """
-        # All the keys and their parents
-        needed_keys = set(self.ordered_keys)
-        parent_map = self.vf.get_parent_map(needed_keys)
+        parent_map = self.vf.get_parent_map(set(self.ordered_keys))
         self.parent_map = parent_map
-        # TODO: Should we be using a different construct here? I think this
-        #       uses difference_update internally, and we expect the result to
-        #       be tiny
-        missing_keys = needed_keys.difference(parent_map)
+        needed_keys, refcounts, just_parents, missing_keys = (
+            _versionedfile_rs.mpdiff_first_pass(self.ordered_keys, parent_map)
+        )
         if missing_keys:
-            raise RevisionNotPresent(list(missing_keys)[0], self.vf)
-        # Parents that might be missing. They are allowed to be ghosts, but we
-        # should check for them
-        refcounts = {}
-        setdefault = refcounts.setdefault
-        just_parents = set()
-        for _child_key, parent_keys in parent_map.items():
-            if not parent_keys:
-                # parent_keys may be None if a given VersionedFile claims to
-                # not support graph operations.
-                continue
-            just_parents.update(parent_keys)
-            needed_keys.update(parent_keys)
-            for p in parent_keys:
-                refcounts[p] = setdefault(p, 0) + 1
-        just_parents.difference_update(parent_map)
+            raise RevisionNotPresent(next(iter(missing_keys)), self.vf)
         # Remove any parents that are actually ghosts from the needed set
         self.present_parents = set(self.vf.get_parent_map(just_parents))
         self.ghost_parents = just_parents.difference(self.present_parents)
