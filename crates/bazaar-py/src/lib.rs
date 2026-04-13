@@ -584,6 +584,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let chunk_writerm = chunk_writer::_chunk_writer_rs(py)?;
     m.add_submodule(&chunk_writerm)?;
 
+    let bisect_multim = bisect_multi::_bisect_multi_rs(py)?;
+    m.add_submodule(&bisect_multim)?;
+
     // PyO3 submodule hack for proper import support
     let sys = py.import("sys")?;
     let modules = sys.getattr("modules")?;
@@ -614,6 +617,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.chunk_writer", module_name), &chunk_writerm)?;
     modules.set_item(format!("{}.tuned_gzip", module_name), &tuned_gzipm)?;
     modules.set_item(format!("{}.chunk_writer", module_name), &chunk_writerm)?;
+    modules.set_item(format!("{}.bisect_multi", module_name), &bisect_multim)?;
 
     Ok(())
 }
