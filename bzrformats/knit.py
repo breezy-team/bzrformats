@@ -1662,17 +1662,7 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
             split_map       A dictionary mapping prefix => keys
             prefix_order    The order that we saw the various prefixes
         """
-        split_by_prefix = {}
-        prefix_order = []
-        for key in keys:
-            prefix = b"" if len(key) == 1 else key[0]
-
-            if prefix in split_by_prefix:
-                split_by_prefix[prefix].append(key)
-            else:
-                split_by_prefix[prefix] = [key]
-                prefix_order.append(prefix)
-        return split_by_prefix, prefix_order
+        return _knit_rs.split_keys_by_prefix_rs([list(k) for k in keys])
 
     def _group_keys_for_io(
         self, keys, non_local_keys, positions, _min_buffer_size=_STREAM_MIN_BUFFER_SIZE

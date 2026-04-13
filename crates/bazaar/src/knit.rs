@@ -429,6 +429,37 @@ pub fn build_network_record(
     out
 }
 
+/// Group keys by their first segment, preserving first-seen order per group
+/// and the global order in which new prefixes appeared.
+///
+/// Mirrors `KnitVersionedFiles._split_by_prefix`: single-segment keys land
+/// under the empty-bytes prefix, everything else under `key[0]`.
+#[allow(clippy::type_complexity)]
+pub fn split_keys_by_prefix<'a>(
+    keys: &'a [Vec<Vec<u8>>],
+) -> (Vec<(Vec<u8>, Vec<&'a [Vec<u8>]>)>, Vec<Vec<u8>>) {
+    use std::collections::HashMap;
+    let mut buckets: Vec<(Vec<u8>, Vec<&'a [Vec<u8>]>)> = Vec::new();
+    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut prefix_order: Vec<Vec<u8>> = Vec::new();
+    for key in keys {
+        let prefix: Vec<u8> = if key.len() == 1 {
+            Vec::new()
+        } else {
+            key[0].clone()
+        };
+        match index.get(&prefix) {
+            Some(&i) => buckets[i].1.push(key.as_slice()),
+            None => {
+                index.insert(prefix.clone(), buckets.len());
+                prefix_order.push(prefix.clone());
+                buckets.push((prefix, vec![key.as_slice()]));
+            }
+        }
+    }
+    (buckets, prefix_order)
+}
+
 /// One entry of the `_raw_record_map` table that
 /// [`build_knit_delta_closure_wire`] consumes.
 ///
@@ -1003,6 +1034,37 @@ mod tests {
         let header = parse_network_record_header(bytes, 11).unwrap();
         assert_eq!(header.parents.unwrap().len(), 0);
         assert_eq!(header.raw_record, b"X");
+    }
+
+    #[test]
+    fn split_keys_by_prefix_preserves_first_seen_order() {
+        let keys: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"file-a".to_vec(), b"rev-1".to_vec()],
+            vec![b"file-b".to_vec(), b"rev-1".to_vec()],
+            vec![b"file-a".to_vec(), b"rev-2".to_vec()],
+            vec![b"lone-rev".to_vec()], // single-segment => empty prefix
+            vec![b"file-b".to_vec(), b"rev-2".to_vec()],
+        ];
+        let (buckets, order) = split_keys_by_prefix(&keys);
+        assert_eq!(
+            order,
+            vec![b"file-a".to_vec(), b"file-b".to_vec(), Vec::<u8>::new()]
+        );
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0].0, b"file-a".to_vec());
+        assert_eq!(buckets[0].1.len(), 2);
+        assert_eq!(buckets[0].1[0], keys[0].as_slice());
+        assert_eq!(buckets[0].1[1], keys[2].as_slice());
+        assert_eq!(buckets[2].0, Vec::<u8>::new());
+        assert_eq!(buckets[2].1, vec![keys[3].as_slice()]);
+    }
+
+    #[test]
+    fn split_keys_by_prefix_empty_input() {
+        let keys: Vec<Vec<Vec<u8>>> = vec![];
+        let (buckets, order) = split_keys_by_prefix(&keys);
+        assert!(buckets.is_empty());
+        assert!(order.is_empty());
     }
 
     #[test]

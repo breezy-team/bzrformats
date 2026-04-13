@@ -534,6 +534,35 @@ fn build_network_record_rs<'py>(
     PyBytes::new(py, &out)
 }
 
+/// Group `keys` by their first segment, preserving first-seen order.
+/// Mirrors `KnitVersionedFiles._split_by_prefix`. Returns
+/// `(split_by_prefix_dict, prefix_order_list)`. Single-segment keys land
+/// under the empty-bytes prefix.
+#[pyfunction]
+fn split_keys_by_prefix_rs<'py>(
+    py: Python<'py>,
+    keys: Vec<Vec<Vec<u8>>>,
+) -> PyResult<(
+    Bound<'py, pyo3::types::PyDict>,
+    Bound<'py, pyo3::types::PyList>,
+)> {
+    let (buckets, prefix_order) = bazaar::knit::split_keys_by_prefix(&keys);
+    let out_dict = pyo3::types::PyDict::new(py);
+    for (prefix, bucket_keys) in &buckets {
+        let list = pyo3::types::PyList::empty(py);
+        for key in bucket_keys {
+            let tuple = PyTuple::new(py, key.iter().map(|seg| PyBytes::new(py, seg)))?;
+            list.append(tuple)?;
+        }
+        out_dict.set_item(PyBytes::new(py, prefix), list)?;
+    }
+    let order_list = pyo3::types::PyList::empty(py);
+    for prefix in &prefix_order {
+        order_list.append(PyBytes::new(py, prefix))?;
+    }
+    Ok((out_dict, order_list))
+}
+
 /// Serialize a knit-delta-closure wire record. Mirrors
 /// `_ContentMapGenerator._wire_bytes`.
 ///
@@ -697,5 +726,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(parse_record_header_only_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;
     Ok(m)
 }
