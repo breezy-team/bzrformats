@@ -502,6 +502,38 @@ fn parse_record_unchecked_rs<'py>(
     Ok((header, list))
 }
 
+/// Serialize a knit network record. Inverse of
+/// `parse_network_record_header_rs`. Mirrors
+/// `KnitContentFactory._create_network_bytes`.
+#[pyfunction]
+#[pyo3(signature = (storage_kind, key, parents, noeol, raw_record))]
+fn build_network_record_rs<'py>(
+    py: Python<'py>,
+    storage_kind: &str,
+    key: Vec<Vec<u8>>,
+    parents: Option<Vec<Vec<Vec<u8>>>>,
+    noeol: bool,
+    raw_record: &[u8],
+) -> Bound<'py, PyBytes> {
+    let key_refs: Vec<&[u8]> = key.iter().map(|v| v.as_slice()).collect();
+    let parent_vecs: Option<Vec<Vec<&[u8]>>> = parents.as_ref().map(|ps| {
+        ps.iter()
+            .map(|p| p.iter().map(|v| v.as_slice()).collect())
+            .collect()
+    });
+    let parent_refs: Option<Vec<&[&[u8]]>> = parent_vecs
+        .as_ref()
+        .map(|ps| ps.iter().map(|p| p.as_slice()).collect());
+    let out = bazaar::knit::build_network_record(
+        storage_kind.as_bytes(),
+        &key_refs,
+        parent_refs.as_deref(),
+        noeol,
+        raw_record,
+    );
+    PyBytes::new(py, &out)
+}
+
 /// Decompress only enough of a knit record to parse its header. Returns
 /// `(method, version_id, count, digest)` without validating the line count
 /// or end marker — `_KnitData._read_records_iter_raw` relies on this
@@ -564,5 +596,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(parse_record_unchecked_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(record_to_data_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_record_header_only_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     Ok(m)
 }

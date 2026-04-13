@@ -367,6 +367,68 @@ pub fn parse_network_record_header(
     })
 }
 
+/// Serialize a knit network record, inverse of [`parse_network_record_header`].
+///
+/// Mirrors `KnitContentFactory._create_network_bytes`: writes the storage
+/// kind line, the `\x00`-joined key, the `\t`-separated parent list (or
+/// `None:` when `parents` is `None`), the noeol flag byte, and the raw
+/// record body.
+pub fn build_network_record(
+    storage_kind: &[u8],
+    key: &[&[u8]],
+    parents: Option<&[&[&[u8]]]>,
+    noeol: bool,
+    raw_record: &[u8],
+) -> Vec<u8> {
+    let key_bytes_len: usize =
+        key.iter().map(|p| p.len()).sum::<usize>() + key.len().saturating_sub(1);
+    let parents_len: usize = match parents {
+        None => 5, // "None:"
+        Some(list) => {
+            let mut n = list.len().saturating_sub(1); // separating tabs
+            for p in list {
+                n += p.iter().map(|seg| seg.len()).sum::<usize>() + p.len().saturating_sub(1);
+            }
+            n
+        }
+    };
+    let mut out =
+        Vec::with_capacity(storage_kind.len() + key_bytes_len + parents_len + raw_record.len() + 4);
+
+    out.extend_from_slice(storage_kind);
+    out.push(b'\n');
+
+    for (i, segment) in key.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\x00');
+        }
+        out.extend_from_slice(segment);
+    }
+    out.push(b'\n');
+
+    match parents {
+        None => out.extend_from_slice(b"None:"),
+        Some(list) => {
+            for (i, parent) in list.iter().enumerate() {
+                if i > 0 {
+                    out.push(b'\t');
+                }
+                for (j, segment) in parent.iter().enumerate() {
+                    if j > 0 {
+                        out.push(b'\x00');
+                    }
+                    out.extend_from_slice(segment);
+                }
+            }
+        }
+    }
+    out.push(b'\n');
+
+    out.push(if noeol { b'N' } else { b' ' });
+    out.extend_from_slice(raw_record);
+    out
+}
+
 /// Fields of a parsed knit record header: `(method, version_id, count, digest)`.
 ///
 /// Mirrors the 4-tuple returned by `_KnitData._split_header`, but typed.
@@ -858,6 +920,40 @@ mod tests {
         let header = parse_network_record_header(bytes, 11).unwrap();
         assert_eq!(header.parents.unwrap().len(), 0);
         assert_eq!(header.raw_record, b"X");
+    }
+
+    #[test]
+    fn build_network_record_round_trips_none_parents() {
+        let key: &[&[u8]] = &[b"file-id", b"rev"];
+        let raw = build_network_record(b"knit-ft-gz", key, None, true, b"DATA");
+        let line_end = b"knit-ft-gz\n".len();
+        let parsed = parse_network_record_header(&raw, line_end).unwrap();
+        assert_eq!(parsed.key, vec![&b"file-id"[..], &b"rev"[..]]);
+        assert!(parsed.parents.is_none());
+        assert!(parsed.noeol);
+        assert_eq!(parsed.raw_record, b"DATA");
+    }
+
+    #[test]
+    fn build_network_record_round_trips_with_parents_and_eol() {
+        let key: &[&[u8]] = &[b"f", b"r"];
+        let p1: &[&[u8]] = &[b"f", b"p1"];
+        let p2: &[&[u8]] = &[b"f", b"p2"];
+        let parents: &[&[&[u8]]] = &[p1, p2];
+        let raw = build_network_record(b"knit-delta-gz", key, Some(parents), false, b"BODY");
+        let line_end = b"knit-delta-gz\n".len();
+        let parsed = parse_network_record_header(&raw, line_end).unwrap();
+        assert_eq!(parsed.parents.unwrap().len(), 2);
+        assert!(!parsed.noeol);
+        assert_eq!(parsed.raw_record, b"BODY");
+    }
+
+    #[test]
+    fn build_network_record_single_key_segment() {
+        let key: &[&[u8]] = &[b"only"];
+        let raw = build_network_record(b"knit-ft-gz", key, None, true, b"X");
+        // Reconstruct by hand to pin the on-wire format.
+        assert_eq!(raw, b"knit-ft-gz\nonly\nNone:\nNX".to_vec());
     }
 
     #[test]
