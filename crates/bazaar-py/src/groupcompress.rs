@@ -945,6 +945,929 @@ fn rabin_hash(data: Vec<u8>) -> PyResult<u32> {
     .into())
 }
 
+/// One factory's per-record state inside a [`LazyGroupContentManager`].
+///
+/// Mirrors the public attributes of Python's `_LazyGroupCompressFactory` —
+/// `key`, `parents`, `start`, `end`, optional cached chunks/sha1/size, and
+/// the `_first` flag controlling its `storage_kind`.
+#[derive(Default)]
+struct FactoryState {
+    key: Option<Py<PyTuple>>,
+    parents: Option<Py<PyAny>>,
+    start: u64,
+    end: u64,
+    sha1: Option<Py<PyAny>>,
+    size: Option<usize>,
+    chunks: Option<Vec<Py<PyBytes>>>,
+    first: bool,
+}
+
+/// Rust-backed `_LazyGroupContentManager`.
+///
+/// Holds an inline list of [`FactoryState`]s and a `Py<GroupCompressBlock>`,
+/// so the manager owns the underlying data without a Python-level reference
+/// cycle. Factories are exposed as separate `LazyGroupCompressFactory`
+/// pyclasses on demand; iteration breaks the back-reference exactly the same
+/// way the Python original does.
+#[pyclass(
+    unsendable,
+    name = "LazyGroupContentManager",
+    module = "bzrformats._bzr_rs.groupcompress"
+)]
+struct LazyGroupContentManager {
+    block: Py<GroupCompressBlock>,
+    factories: Vec<FactoryState>,
+    last_byte: u64,
+    get_settings: Option<Py<PyAny>>,
+    compressor_settings: Option<Py<PyAny>>,
+    /// Per-instance override for the well-utilized threshold. Tests poke at
+    /// this directly to force smaller blocks to count as full.
+    full_enough_block_size: usize,
+    full_enough_mixed_block_size: usize,
+    max_cut_fraction: f64,
+}
+
+const DEFAULT_MAX_BYTES_TO_INDEX: usize = 1024 * 1024;
+
+const MAX_CUT_FRACTION: f64 = 0.75;
+const FULL_ENOUGH_BLOCK_SIZE: usize = 3 * 1024 * 1024;
+const FULL_ENOUGH_MIXED_BLOCK_SIZE: usize = 2 * 768 * 1024;
+
+fn default_compressor_settings(py: Python) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("max_bytes_to_index", DEFAULT_MAX_BYTES_TO_INDEX)?;
+    Ok(dict.into_any().unbind())
+}
+
+impl LazyGroupContentManager {
+    fn ensure_compressor_settings(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if let Some(settings) = &self.compressor_settings {
+            return Ok(settings.clone_ref(py));
+        }
+        let settings = if let Some(cb) = &self.get_settings {
+            let result = cb.call0(py)?;
+            if result.is_none(py) {
+                default_compressor_settings(py)?
+            } else {
+                result
+            }
+        } else {
+            default_compressor_settings(py)?
+        };
+        self.compressor_settings = Some(settings.clone_ref(py));
+        Ok(settings)
+    }
+
+    fn factories_for_well_utilized(&self, py: Python<'_>) -> Vec<((usize, usize), Vec<u8>)> {
+        self.factories
+            .iter()
+            .map(|f| {
+                let prefix = if let Some(key) = &f.key {
+                    let key = key.bind(py);
+                    let len = key.len();
+                    if len <= 1 {
+                        Vec::new()
+                    } else {
+                        let mut out = Vec::new();
+                        for i in 0..len - 1 {
+                            if i > 0 {
+                                out.push(b'\x00');
+                            }
+                            if let Ok(item) = key.get_item(i) {
+                                if let Ok(b) = item.cast::<PyBytes>() {
+                                    out.extend_from_slice(b.as_bytes());
+                                }
+                            }
+                        }
+                        out
+                    }
+                } else {
+                    Vec::new()
+                };
+                ((f.start as usize, f.end as usize), prefix)
+            })
+            .collect()
+    }
+
+    fn invoke_check_rebuild(&self) -> PyResult<(Py<PyAny>, usize, usize)> {
+        Python::attach(|py| {
+            let positions: Vec<(usize, usize)> = self
+                .factories
+                .iter()
+                .map(|f| (f.start as usize, f.end as usize))
+                .collect();
+            let block = self.block.borrow(py);
+            let content_length = block
+                .inner
+                .content_length()
+                .ok_or_else(|| PyValueError::new_err("block has no content length"))?;
+            drop(block);
+            let (action, last, total) =
+                bazaar::groupcompress::manager::check_rebuild_action(&positions, content_length);
+            let action_obj: Py<PyAny> = match action {
+                bazaar::groupcompress::manager::RebuildAction::Keep => py.None(),
+                bazaar::groupcompress::manager::RebuildAction::Trim => {
+                    "trim".into_pyobject(py)?.into_any().unbind()
+                }
+                bazaar::groupcompress::manager::RebuildAction::Rebuild => {
+                    "rebuild".into_pyobject(py)?.into_any().unbind()
+                }
+            };
+            Ok((action_obj, last, total))
+        })
+    }
+}
+
+#[pymethods]
+impl LazyGroupContentManager {
+    #[new]
+    #[pyo3(signature = (block, get_compressor_settings = None))]
+    fn new(block: Py<GroupCompressBlock>, get_compressor_settings: Option<Py<PyAny>>) -> Self {
+        Self {
+            block,
+            factories: Vec::new(),
+            last_byte: 0,
+            get_settings: get_compressor_settings,
+            compressor_settings: None,
+            full_enough_block_size: FULL_ENOUGH_BLOCK_SIZE,
+            full_enough_mixed_block_size: FULL_ENOUGH_MIXED_BLOCK_SIZE,
+            max_cut_fraction: MAX_CUT_FRACTION,
+        }
+    }
+
+    #[getter]
+    fn _full_enough_block_size(&self) -> usize {
+        self.full_enough_block_size
+    }
+
+    #[setter]
+    fn set__full_enough_block_size(&mut self, v: usize) {
+        self.full_enough_block_size = v;
+    }
+
+    #[getter]
+    fn _full_enough_mixed_block_size(&self) -> usize {
+        self.full_enough_mixed_block_size
+    }
+
+    #[setter]
+    fn set__full_enough_mixed_block_size(&mut self, v: usize) {
+        self.full_enough_mixed_block_size = v;
+    }
+
+    #[getter]
+    fn _max_cut_fraction(&self) -> f64 {
+        self.max_cut_fraction
+    }
+
+    #[setter]
+    fn set__max_cut_fraction(&mut self, v: f64) {
+        self.max_cut_fraction = v;
+    }
+
+    fn _make_group_compressor(&mut self, py: Python<'_>) -> PyResult<Py<RabinGroupCompressor>> {
+        let settings = self.ensure_compressor_settings(py)?;
+        let settings_bound = settings.into_bound(py);
+        let settings_ref: Option<&Bound<PyAny>> = if settings_bound.is_none() {
+            None
+        } else {
+            Some(&settings_bound)
+        };
+        let inner = RabinGroupCompressor::new(settings_ref)?;
+        Py::new(py, inner)
+    }
+
+    #[getter]
+    fn _block(&self, py: Python<'_>) -> Py<GroupCompressBlock> {
+        self.block.clone_ref(py)
+    }
+
+    /// Test probe: number of registered factories.
+    #[getter]
+    fn _factories<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Vec<Bound<'py, LazyGroupCompressFactory>>> {
+        let n = slf.factories.len();
+        let manager: Py<LazyGroupContentManager> = slf.into();
+        (0..n)
+            .map(|i| {
+                Bound::new(
+                    py,
+                    LazyGroupCompressFactory {
+                        manager: Some(manager.clone_ref(py)),
+                        index: i,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[getter]
+    fn _last_byte(&self) -> u64 {
+        self.last_byte
+    }
+
+    #[getter]
+    fn _compressor_settings(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.compressor_settings.as_ref().map(|s| s.clone_ref(py))
+    }
+
+    fn _get_compressor_settings(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.ensure_compressor_settings(py)
+    }
+
+    fn add_factory(
+        &mut self,
+        py: Python<'_>,
+        key: Py<PyAny>,
+        parents: Py<PyAny>,
+        start: u64,
+        end: u64,
+    ) -> PyResult<()> {
+        let key_tuple = key.bind(py).clone().cast_into::<PyTuple>().map_err(|_| {
+            PyValueError::new_err("LazyGroupContentManager.add_factory: key must be a tuple")
+        })?;
+        let first = self.factories.is_empty();
+        if end > self.last_byte {
+            self.last_byte = end;
+        }
+        self.factories.push(FactoryState {
+            key: Some(key_tuple.unbind()),
+            parents: Some(parents),
+            start,
+            end,
+            sha1: None,
+            size: None,
+            chunks: None,
+            first,
+        });
+        Ok(())
+    }
+
+    /// Iterate the factories. After yielding a factory, its back-reference to
+    /// this manager is cleared (matching the Python original).
+    fn get_record_stream<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, RecordStreamIter>> {
+        let n = slf.factories.len();
+        let manager: Py<LazyGroupContentManager> = slf.into();
+        Bound::new(
+            py,
+            RecordStreamIter {
+                manager: Some(manager),
+                index: 0,
+                len: n,
+            },
+        )
+    }
+
+    fn check_is_well_utilized(&self, py: Python<'_>) -> PyResult<bool> {
+        if self.factories.len() == 1 {
+            return Ok(false);
+        }
+        let factories = self.factories_for_well_utilized(py);
+        let block = self.block.borrow(py);
+        let content_length = block
+            .inner
+            .content_length()
+            .ok_or_else(|| PyValueError::new_err("block has no content length"))?;
+        let settings = bazaar::groupcompress::manager::WellUtilizedSettings {
+            max_cut_fraction: self.max_cut_fraction,
+            full_enough_block_size: self.full_enough_block_size,
+            full_enough_mixed_block_size: self.full_enough_mixed_block_size,
+        };
+        Ok(bazaar::groupcompress::manager::check_is_well_utilized(
+            &factories,
+            content_length,
+            &settings,
+        ))
+    }
+
+    fn _check_rebuild_action<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyAny>, usize, usize)> {
+        let (action, last, total) = self.invoke_check_rebuild()?;
+        Ok((action.into_bound(py), last, total))
+    }
+
+    fn _check_rebuild_block(&mut self, py: Python<'_>) -> PyResult<()> {
+        let (action, last_byte_used, _) = self.invoke_check_rebuild()?;
+        let action_bound = action.into_bound(py);
+        if action_bound.is_none() {
+            return Ok(());
+        }
+        let action_str: String = action_bound.extract()?;
+        match action_str.as_str() {
+            "trim" => self.trim_block(py, last_byte_used),
+            "rebuild" => self.rebuild_block(py),
+            other => Err(PyValueError::new_err(format!(
+                "unknown rebuild action: {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn _rebuild_block(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.rebuild_block(py)
+    }
+
+    fn _trim_block(&mut self, py: Python<'_>, last_byte: usize) -> PyResult<()> {
+        self.trim_block(py, last_byte)
+    }
+
+    /// Build the over-the-wire representation of this manager, repacking the
+    /// underlying block first if `_check_rebuild_block` thinks it's worth it.
+    fn _wire_bytes<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self._check_rebuild_block(py)?;
+        let mut wire_factories = Vec::with_capacity(self.factories.len());
+        for f in &self.factories {
+            let key_tuple = f
+                .key
+                .as_ref()
+                .ok_or_else(|| PyValueError::new_err("factory missing key"))?
+                .bind(py);
+            let key: Vec<Vec<u8>> = key_tuple
+                .iter()
+                .map(|seg| {
+                    seg.cast_into::<PyBytes>()
+                        .map(|b| b.as_bytes().to_vec())
+                        .map_err(|_| PyValueError::new_err("key segments must be bytes"))
+                })
+                .collect::<PyResult<_>>()?;
+            let parents_obj = f
+                .parents
+                .as_ref()
+                .map(|p| p.clone_ref(py).into_bound(py))
+                .unwrap_or_else(|| py.None().into_bound(py));
+            let parents: Option<Vec<Vec<Vec<u8>>>> = if parents_obj.is_none() {
+                None
+            } else {
+                let pt = parents_obj.cast_into::<PyTuple>()?;
+                let mut parents = Vec::with_capacity(pt.len());
+                for parent_obj in pt.iter() {
+                    let parent_tuple = parent_obj.cast_into::<PyTuple>()?;
+                    let parent: Vec<Vec<u8>> = parent_tuple
+                        .iter()
+                        .map(|seg| {
+                            seg.cast_into::<PyBytes>()
+                                .map(|b| b.as_bytes().to_vec())
+                                .map_err(|_| PyValueError::new_err("parent segments must be bytes"))
+                        })
+                        .collect::<PyResult<_>>()?;
+                    parents.push(parent);
+                }
+                Some(parents)
+            };
+            wire_factories.push(bazaar::groupcompress::wire::WireFactory {
+                key,
+                parents,
+                start: f.start,
+                end: f.end,
+            });
+        }
+        let (block_bytes_len, block_chunks) = {
+            let mut block = self.block.borrow_mut(py);
+            block.to_chunks(py, None)
+        };
+        let prefix =
+            bazaar::groupcompress::wire::build_wire_prefix(&wire_factories, block_bytes_len)
+                .map_err(|e| PyValueError::new_err(format!("zlib error: {}", e)))?;
+        // Concatenate prefix + chunks into a single bytes object.
+        let mut out = prefix;
+        for chunk in block_chunks {
+            out.extend_from_slice(chunk.as_bytes());
+        }
+        Ok(PyBytes::new(py, &out))
+    }
+
+    /// Used by `_LazyGroupCompressFactory._extract_bytes` to make sure the
+    /// inner block content has been decompressed up to `_last_byte`.
+    fn _prepare_for_extract(&self, py: Python<'_>) -> PyResult<()> {
+        let mut block = self.block.borrow_mut(py);
+        block.inner.ensure_content(Some(self.last_byte as usize));
+        Ok(())
+    }
+
+    #[classmethod]
+    fn from_bytes<'py>(
+        _cls: &Bound<'py, pyo3::types::PyType>,
+        py: Python<'py>,
+        bytes: &[u8],
+    ) -> PyResult<Bound<'py, LazyGroupContentManager>> {
+        let frame = bazaar::groupcompress::wire::parse_wire(bytes)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let block_inner =
+            bazaar::groupcompress::block::GroupCompressBlock::from_bytes(frame.block_bytes)
+                .map_err(|e| PyValueError::new_err(format!("Invalid block: {:?}", e)))?;
+        let block = Bound::new(
+            py,
+            GroupCompressBlock {
+                inner: block_inner,
+                z_content_cache: None,
+            },
+        )?;
+        let mgr = Bound::new(
+            py,
+            LazyGroupContentManager {
+                block: block.unbind(),
+                factories: Vec::new(),
+                last_byte: 0,
+                get_settings: None,
+                compressor_settings: None,
+                full_enough_block_size: FULL_ENOUGH_BLOCK_SIZE,
+                full_enough_mixed_block_size: FULL_ENOUGH_MIXED_BLOCK_SIZE,
+                max_cut_fraction: MAX_CUT_FRACTION,
+            },
+        )?;
+        {
+            let mut mgr_ref = mgr.borrow_mut();
+            for factory in frame.factories {
+                let key_tuple = PyTuple::new(py, factory.key.iter().map(|s| PyBytes::new(py, s)))?;
+                let parents: Bound<PyAny> = match factory.parents {
+                    None => py.None().into_bound(py),
+                    Some(parents) => PyTuple::new(
+                        py,
+                        parents.iter().map(|p| {
+                            PyTuple::new(py, p.iter().map(|s| PyBytes::new(py, s))).unwrap()
+                        }),
+                    )?
+                    .into_any(),
+                };
+                let first = mgr_ref.factories.is_empty();
+                if factory.end > mgr_ref.last_byte {
+                    mgr_ref.last_byte = factory.end;
+                }
+                mgr_ref.factories.push(FactoryState {
+                    key: Some(key_tuple.unbind()),
+                    parents: Some(parents.unbind()),
+                    start: factory.start,
+                    end: factory.end,
+                    sha1: None,
+                    size: None,
+                    chunks: None,
+                    first,
+                });
+            }
+        }
+        Ok(mgr)
+    }
+}
+
+impl LazyGroupContentManager {
+    fn trim_block(&mut self, py: Python<'_>, last_byte: usize) -> PyResult<()> {
+        let new_block = {
+            let mut block = self.block.borrow_mut(py);
+            block.inner.ensure_content(Some(last_byte));
+            let content = block
+                .inner
+                .content()
+                .ok_or_else(|| PyValueError::new_err("block has no content"))?;
+            let trimmed = content[..last_byte].to_vec();
+            let mut new = bazaar::groupcompress::block::GroupCompressBlock::new();
+            new.set_content(&trimmed);
+            new
+        };
+        self.block = Bound::new(
+            py,
+            GroupCompressBlock {
+                inner: new_block,
+                z_content_cache: None,
+            },
+        )?
+        .unbind();
+        Ok(())
+    }
+
+    fn rebuild_block(&mut self, py: Python<'_>) -> PyResult<()> {
+        // Get the compressor settings (Python side may want to lazily compute
+        // them via a callback) and build a fresh RabinGroupCompressor.
+        let settings_obj = self.ensure_compressor_settings(py)?;
+        let settings_bound = settings_obj.into_bound(py);
+        let settings_ref: Option<&Bound<PyAny>> = if settings_bound.is_none() {
+            None
+        } else {
+            Some(&settings_bound)
+        };
+        let max_bytes_to_index = max_bytes_from_settings(settings_ref)?;
+        let mut compressor =
+            bazaar::groupcompress::compressor::RabinGroupCompressor::new(max_bytes_to_index);
+
+        // Walk every factory in order, extract its current chunks, and feed
+        // them back into the new compressor. Update each factory's start/end
+        // with the new offsets.
+        let mut end_point = 0usize;
+        let factory_count = self.factories.len();
+        for idx in 0..factory_count {
+            let (chunks_owned, chunks_len, key_segments) = {
+                let f = &self.factories[idx];
+                let key_tuple = f
+                    .key
+                    .as_ref()
+                    .ok_or_else(|| PyValueError::new_err("factory missing key"))?
+                    .bind(py);
+                let key_segments: Vec<Vec<u8>> = key_tuple
+                    .iter()
+                    .map(|seg| {
+                        seg.cast_into::<PyBytes>()
+                            .map(|b| b.as_bytes().to_vec())
+                            .map_err(|_| PyValueError::new_err("key segments must be bytes"))
+                    })
+                    .collect::<PyResult<_>>()?;
+                // We need the chunks for this factory. If we have cached
+                // chunks, use them; otherwise extract from the block.
+                let chunks: Vec<Vec<u8>> = if let Some(cached) = &f.chunks {
+                    cached
+                        .iter()
+                        .map(|b| b.bind(py).as_bytes().to_vec())
+                        .collect()
+                } else {
+                    let mut block = self.block.borrow_mut(py);
+                    block
+                        .inner
+                        .extract(f.start as usize, f.end as usize)
+                        .map_err(|e| PyValueError::new_err(format!("extract failed: {:?}", e)))?
+                };
+                let chunks_len: usize = f
+                    .size
+                    .unwrap_or_else(|| chunks.iter().map(|c| c.len()).sum::<usize>());
+                (chunks, chunks_len, key_segments)
+            };
+            let chunk_slices: Vec<&[u8]> = chunks_owned.iter().map(|c| c.as_slice()).collect();
+            let key_obj = bazaar::versionedfile::Key::Fixed(key_segments);
+            use bazaar::groupcompress::compressor::GroupCompressor as _;
+            let (sha1, start_point, new_end_point, _kind) = compressor
+                .compress(&key_obj, &chunk_slices, chunks_len, None, None, None)
+                .map_err(|e| PyValueError::new_err(format!("compress error: {}", e)))?;
+            let f = &mut self.factories[idx];
+            f.sha1 = Some(PyBytes::new(py, sha1.as_bytes()).into_any().unbind());
+            f.start = start_point as u64;
+            f.end = new_end_point as u64;
+            end_point = new_end_point;
+        }
+        self.last_byte = end_point as u64;
+        use bazaar::groupcompress::compressor::GroupCompressor as _;
+        let (chunks, endpoint) = compressor.flush();
+        let mut new_block = bazaar::groupcompress::block::GroupCompressBlock::new();
+        new_block.set_chunked_content(&chunks, endpoint);
+        self.block = Bound::new(
+            py,
+            GroupCompressBlock {
+                inner: new_block,
+                z_content_cache: None,
+            },
+        )?
+        .unbind();
+        Ok(())
+    }
+}
+
+/// Iterator returned by `LazyGroupContentManager.get_record_stream`.
+///
+/// On each `__next__` it yields a fresh [`LazyGroupCompressFactory`] view of
+/// the next slot, then on the *following* call it sets that factory's manager
+/// reference to `None` to break the back-pointer (matching the Python
+/// original's `factory._manager = None` after `yield factory`).
+#[pyclass(unsendable)]
+struct RecordStreamIter {
+    manager: Option<Py<LazyGroupContentManager>>,
+    index: usize,
+    len: usize,
+}
+
+#[pymethods]
+impl RecordStreamIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, LazyGroupCompressFactory>>> {
+        let Some(manager) = slf.manager.as_ref().map(|m| m.clone_ref(py)) else {
+            return Ok(None);
+        };
+        if slf.index >= slf.len {
+            slf.manager = None;
+            return Ok(None);
+        }
+        let idx = slf.index;
+        slf.index += 1;
+        Bound::new(
+            py,
+            LazyGroupCompressFactory {
+                manager: Some(manager),
+                index: idx,
+            },
+        )
+        .map(Some)
+    }
+}
+
+/// Rust-backed `_LazyGroupCompressFactory`.
+///
+/// This is a thin view onto a slot inside [`LazyGroupContentManager`]. It
+/// keeps an optional back-reference to the manager so its `get_bytes_as`
+/// method can extract bytes lazily; the back-reference can be cleared from
+/// Python (mirroring `factory._manager = None`).
+#[pyclass(
+    unsendable,
+    name = "LazyGroupCompressFactory",
+    module = "bzrformats._bzr_rs.groupcompress"
+)]
+struct LazyGroupCompressFactory {
+    manager: Option<Py<LazyGroupContentManager>>,
+    index: usize,
+}
+
+impl LazyGroupCompressFactory {
+    fn with_state<R, F>(&self, py: Python<'_>, f: F) -> PyResult<R>
+    where
+        F: FnOnce(&FactoryState) -> PyResult<R>,
+    {
+        let manager_py = self
+            .manager
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("factory has no manager"))?;
+        let manager = manager_py.borrow(py);
+        let state = manager
+            .factories
+            .get(self.index)
+            .ok_or_else(|| PyValueError::new_err("factory index out of range"))?;
+        f(state)
+    }
+}
+
+#[pymethods]
+impl LazyGroupCompressFactory {
+    #[getter]
+    fn key(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        self.with_state(py, |s| {
+            s.key
+                .as_ref()
+                .map(|k| k.clone_ref(py))
+                .ok_or_else(|| PyValueError::new_err("factory missing key"))
+        })
+    }
+
+    #[getter]
+    fn parents(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.with_state(py, |s| {
+            Ok(s.parents
+                .as_ref()
+                .map(|p| p.clone_ref(py))
+                .unwrap_or_else(|| py.None()))
+        })
+    }
+
+    #[getter]
+    fn _start(&self, py: Python<'_>) -> PyResult<u64> {
+        self.with_state(py, |s| Ok(s.start))
+    }
+
+    #[getter]
+    fn _end(&self, py: Python<'_>) -> PyResult<u64> {
+        self.with_state(py, |s| Ok(s.end))
+    }
+
+    #[getter]
+    fn _first(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with_state(py, |s| Ok(s.first))
+    }
+
+    #[getter]
+    fn sha1(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.with_state(py, |s| {
+            Ok(s.sha1
+                .as_ref()
+                .map(|x| x.clone_ref(py))
+                .unwrap_or_else(|| py.None()))
+        })
+    }
+
+    #[getter]
+    fn size(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.with_state(py, |s| {
+            Ok(s.size
+                .map(|x| x.into_pyobject(py).unwrap().into_any().unbind())
+                .unwrap_or_else(|| py.None()))
+        })
+    }
+
+    #[getter]
+    fn storage_kind(&self, py: Python<'_>) -> PyResult<&'static str> {
+        self.with_state(py, |s| {
+            Ok(if s.first {
+                "groupcompress-block"
+            } else {
+                "groupcompress-block-ref"
+            })
+        })
+    }
+
+    #[getter]
+    fn _manager(&self, py: Python<'_>) -> Option<Py<LazyGroupContentManager>> {
+        self.manager.as_ref().map(|m| m.clone_ref(py))
+    }
+
+    #[setter]
+    fn set__manager(&mut self, value: Option<Py<LazyGroupContentManager>>) {
+        self.manager = value;
+    }
+
+    fn get_bytes_as<'py>(&mut self, py: Python<'py>, storage_kind: &str) -> PyResult<Py<PyAny>> {
+        let manager_py = self
+            .manager
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("factory has no manager"))?
+            .clone_ref(py);
+
+        // Determine our own storage_kind from the cached `_first` flag.
+        let own_kind = {
+            let manager = manager_py.borrow(py);
+            let state = manager
+                .factories
+                .get(self.index)
+                .ok_or_else(|| PyValueError::new_err("factory index out of range"))?;
+            if state.first {
+                "groupcompress-block"
+            } else {
+                "groupcompress-block-ref"
+            }
+        };
+
+        if storage_kind == own_kind {
+            if own_kind == "groupcompress-block" {
+                // First factory → wire bytes for the whole manager.
+                let mut manager = manager_py.borrow_mut(py);
+                let bound = manager._wire_bytes(py)?;
+                return Ok(bound.into_any().unbind());
+            } else {
+                return Ok(PyBytes::new(py, b"").into_any().unbind());
+            }
+        }
+        if !matches!(storage_kind, "fulltext" | "chunked" | "lines") {
+            return Err(unavailable_representation(
+                py,
+                &manager_py,
+                self.index,
+                storage_kind,
+                own_kind,
+            )?);
+        }
+
+        // Make sure the chunks have been extracted.
+        let chunks = self.ensure_chunks(py, &manager_py)?;
+
+        match storage_kind {
+            "fulltext" => {
+                let mut all = Vec::new();
+                for c in &chunks {
+                    all.extend_from_slice(c.bind(py).as_bytes());
+                }
+                Ok(PyBytes::new(py, &all).into_any().unbind())
+            }
+            "chunked" => {
+                let list =
+                    pyo3::types::PyList::new(py, chunks.into_iter().map(|c| c.into_bound(py)))?;
+                Ok(list.into_any().unbind())
+            }
+            "lines" => {
+                // Defer to Python osutils.chunks_to_lines for fidelity.
+                let osutils = py.import("bzrformats.osutils")?;
+                let chunks_list =
+                    pyo3::types::PyList::new(py, chunks.into_iter().map(|c| c.into_bound(py)))?;
+                Ok(osutils
+                    .call_method1("chunks_to_lines", (chunks_list,))?
+                    .unbind())
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn iter_bytes_as<'py>(&mut self, py: Python<'py>, storage_kind: &str) -> PyResult<Py<PyAny>> {
+        let manager_py = self
+            .manager
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("factory has no manager"))?
+            .clone_ref(py);
+        let chunks = self.ensure_chunks(py, &manager_py)?;
+        match storage_kind {
+            "chunked" => {
+                let list =
+                    pyo3::types::PyList::new(py, chunks.into_iter().map(|c| c.into_bound(py)))?;
+                Ok(list.try_iter()?.unbind().into())
+            }
+            "lines" => {
+                let osutils = py.import("bzrformats.osutils")?;
+                let chunks_list =
+                    pyo3::types::PyList::new(py, chunks.into_iter().map(|c| c.into_bound(py)))?;
+                let chunks_iter = chunks_list.try_iter()?;
+                Ok(osutils
+                    .call_method1("chunks_to_lines_iter", (chunks_iter,))?
+                    .unbind())
+            }
+            _ => Err(unavailable_representation(
+                py,
+                &manager_py,
+                self.index,
+                storage_kind,
+                "groupcompress-block",
+            )?),
+        }
+    }
+}
+
+impl LazyGroupCompressFactory {
+    fn ensure_chunks(
+        &self,
+        py: Python<'_>,
+        manager_py: &Py<LazyGroupContentManager>,
+    ) -> PyResult<Vec<Py<PyBytes>>> {
+        // Try the cached chunks first.
+        {
+            let manager = manager_py.borrow(py);
+            let state = manager
+                .factories
+                .get(self.index)
+                .ok_or_else(|| PyValueError::new_err("factory index out of range"))?;
+            if let Some(c) = &state.chunks {
+                return Ok(c.iter().map(|x| x.clone_ref(py)).collect());
+            }
+        }
+        // Extract from the block. _prepare_for_extract first.
+        {
+            let manager = manager_py.borrow(py);
+            manager._prepare_for_extract(py)?;
+        }
+        let chunks = {
+            let manager = manager_py.borrow(py);
+            let state = manager
+                .factories
+                .get(self.index)
+                .ok_or_else(|| PyValueError::new_err("factory index out of range"))?;
+            let start = state.start as usize;
+            let end = state.end as usize;
+            let _ = state;
+            let mut block = manager.block.borrow_mut(py);
+            block
+                .inner
+                .extract(start, end)
+                .map_err(|e| {
+                    let msg = format!("zlib: {:?}", e);
+                    let dc = py
+                        .import("bzrformats.groupcompress")
+                        .and_then(|m| m.getattr("DecompressCorruption"))
+                        .ok();
+                    if let Some(cls) = dc {
+                        let exc = cls.call1((msg.clone(),)).unwrap();
+                        PyErr::from_value(exc)
+                    } else {
+                        PyValueError::new_err(msg)
+                    }
+                })?
+                .into_iter()
+                .map(|c| PyBytes::new(py, &c).unbind())
+                .collect::<Vec<_>>()
+        };
+        // Store back on the state.
+        {
+            let mut manager = manager_py.borrow_mut(py);
+            manager.factories[self.index].chunks =
+                Some(chunks.iter().map(|c| c.clone_ref(py)).collect());
+        }
+        Ok(chunks)
+    }
+}
+
+fn unavailable_representation(
+    py: Python<'_>,
+    manager_py: &Py<LazyGroupContentManager>,
+    index: usize,
+    requested: &str,
+    own_kind: &str,
+) -> PyResult<PyErr> {
+    let key: Py<PyAny> = {
+        let manager = manager_py.borrow(py);
+        let state = manager
+            .factories
+            .get(index)
+            .ok_or_else(|| PyValueError::new_err("factory index out of range"))?;
+        match &state.key {
+            Some(k) => k.clone_ref(py).into_any(),
+            None => py.None(),
+        }
+    };
+    let cls = py
+        .import("bzrformats.versionedfile")?
+        .getattr("UnavailableRepresentation")?;
+    let exc = cls.call1((key, requested, own_kind))?;
+    Ok(PyErr::from_value(exc))
+}
+
 pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "groupcompress")?;
     m.add_wrapped(wrap_pyfunction!(encode_base128_int))?;
@@ -966,6 +1889,9 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<LinesDeltaIndex>()?;
     m.add_class::<TraditionalGroupCompressor>()?;
     m.add_class::<RabinGroupCompressor>()?;
+    m.add_class::<LazyGroupContentManager>()?;
+    m.add_class::<LazyGroupCompressFactory>()?;
+    m.add_class::<RecordStreamIter>()?;
     m.add_class::<crate::groupcompress_delta::DeltaIndex>()?;
     m.add_function(wrap_pyfunction!(
         crate::groupcompress_delta::_rabin_hash,

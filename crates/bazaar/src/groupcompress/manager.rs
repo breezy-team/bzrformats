@@ -161,6 +161,216 @@ pub fn parse_node_position(value: &[u8]) -> Result<NodePosition, NodePositionErr
     })
 }
 
+/// Per-record state held by [`LazyGroupContentManager`].
+///
+/// Mirrors the Python `_LazyGroupCompressFactory` attributes that affect the
+/// state machine: the `(start, end)` byte range inside the underlying block,
+/// an optional cached `sha1`, an optional `size`, optional cached extracted
+/// `chunks`, and the `first` flag which controls the storage-kind reported
+/// to consumers.
+#[derive(Debug, Default, Clone)]
+pub struct FactoryState {
+    pub start: u64,
+    pub end: u64,
+    pub sha1: Option<String>,
+    pub size: Option<usize>,
+    pub chunks: Option<Vec<Vec<u8>>>,
+    pub first: bool,
+}
+
+/// Pure-Rust core of `_LazyGroupContentManager`.
+///
+/// Owns a [`crate::groupcompress::block::GroupCompressBlock`] and an ordered
+/// list of [`FactoryState`] slots. The Python wrapper layers identity-stable
+/// `key`/`parents` storage on top, but the trim/rebuild/extract state machine
+/// lives here.
+pub struct LazyGroupContentManager {
+    block: crate::groupcompress::block::GroupCompressBlock,
+    factories: Vec<FactoryState>,
+    last_byte: u64,
+}
+
+impl LazyGroupContentManager {
+    pub fn new(block: crate::groupcompress::block::GroupCompressBlock) -> Self {
+        Self {
+            block,
+            factories: Vec::new(),
+            last_byte: 0,
+        }
+    }
+
+    pub fn block(&self) -> &crate::groupcompress::block::GroupCompressBlock {
+        &self.block
+    }
+
+    pub fn block_mut(&mut self) -> &mut crate::groupcompress::block::GroupCompressBlock {
+        &mut self.block
+    }
+
+    pub fn into_block(self) -> crate::groupcompress::block::GroupCompressBlock {
+        self.block
+    }
+
+    pub fn replace_block(
+        &mut self,
+        block: crate::groupcompress::block::GroupCompressBlock,
+    ) -> crate::groupcompress::block::GroupCompressBlock {
+        std::mem::replace(&mut self.block, block)
+    }
+
+    pub fn factories(&self) -> &[FactoryState] {
+        &self.factories
+    }
+
+    pub fn factories_mut(&mut self) -> &mut [FactoryState] {
+        &mut self.factories
+    }
+
+    pub fn factory(&self, idx: usize) -> Option<&FactoryState> {
+        self.factories.get(idx)
+    }
+
+    pub fn factory_mut(&mut self, idx: usize) -> Option<&mut FactoryState> {
+        self.factories.get_mut(idx)
+    }
+
+    pub fn last_byte(&self) -> u64 {
+        self.last_byte
+    }
+
+    pub fn set_last_byte(&mut self, value: u64) {
+        self.last_byte = value;
+    }
+
+    /// Append a fresh factory slot. Returns its index. The first factory in a
+    /// manager has `first = true` and consequently a `groupcompress-block`
+    /// storage kind on the wrapper side.
+    pub fn add_factory(&mut self, start: u64, end: u64) -> usize {
+        let first = self.factories.is_empty();
+        if end > self.last_byte {
+            self.last_byte = end;
+        }
+        let idx = self.factories.len();
+        self.factories.push(FactoryState {
+            start,
+            end,
+            sha1: None,
+            size: None,
+            chunks: None,
+            first,
+        });
+        idx
+    }
+
+    /// `_check_rebuild_action` over our own factories and content length.
+    pub fn check_rebuild_action(&self) -> (RebuildAction, usize, usize) {
+        let positions: Vec<(usize, usize)> = self
+            .factories
+            .iter()
+            .map(|f| (f.start as usize, f.end as usize))
+            .collect();
+        let content_length = self.block.content_length().unwrap_or(0);
+        check_rebuild_action(&positions, content_length)
+    }
+
+    /// `_prepare_for_extract`: ensure the block is decompressed up to
+    /// `last_byte`.
+    pub fn prepare_for_extract(&mut self) {
+        self.block.ensure_content(Some(self.last_byte as usize));
+    }
+
+    /// Trim the block down to the first `last_byte` bytes, leaving factory
+    /// offsets unchanged.
+    pub fn trim_block(&mut self, last_byte: usize) -> Result<(), String> {
+        self.block.ensure_content(Some(last_byte));
+        let content = self
+            .block
+            .content()
+            .ok_or_else(|| "block has no content".to_string())?;
+        let trimmed = content[..last_byte].to_vec();
+        let mut new = crate::groupcompress::block::GroupCompressBlock::new();
+        new.set_content(&trimmed);
+        self.block = new;
+        Ok(())
+    }
+
+    /// Extract the chunks for one factory, caching them on the slot.
+    pub fn extract_factory_chunks(&mut self, idx: usize) -> Result<Vec<Vec<u8>>, String> {
+        if let Some(cached) = self.factories.get(idx).and_then(|f| f.chunks.clone()) {
+            return Ok(cached);
+        }
+        let (start, end) = {
+            let f = self
+                .factories
+                .get(idx)
+                .ok_or_else(|| "factory index out of range".to_string())?;
+            (f.start as usize, f.end as usize)
+        };
+        let chunks = self
+            .block
+            .extract(start, end)
+            .map_err(|e| format!("{:?}", e))?;
+        if let Some(f) = self.factories.get_mut(idx) {
+            f.chunks = Some(chunks.clone());
+        }
+        Ok(chunks)
+    }
+
+    /// Walk every factory in order, repacking it into a fresh
+    /// `RabinGroupCompressor`. Factories' `start`/`end`/`sha1` are updated
+    /// in-place to the new offsets, the block is replaced with the freshly
+    /// flushed compressor output, and `last_byte` is updated.
+    ///
+    /// `keys` must hold one entry per factory; the entries are passed through
+    /// to the compressor unchanged so the new block stores the real per-record
+    /// key (which is what the wrapper layer wants for byte-identical
+    /// round-trip with Python).
+    pub fn rebuild_block(
+        &mut self,
+        keys: &[Vec<Vec<u8>>],
+        max_bytes_to_index: Option<usize>,
+    ) -> Result<(), String> {
+        use crate::groupcompress::compressor::{GroupCompressor, RabinGroupCompressor};
+        use crate::versionedfile::Key;
+
+        if keys.len() != self.factories.len() {
+            return Err(format!(
+                "rebuild_block: expected {} keys, got {}",
+                self.factories.len(),
+                keys.len()
+            ));
+        }
+        let mut compressor = RabinGroupCompressor::new(max_bytes_to_index);
+        let mut end_point = 0usize;
+        let factory_count = self.factories.len();
+        for idx in 0..factory_count {
+            let chunks = self.extract_factory_chunks(idx)?;
+            let chunks_len: usize = self
+                .factories
+                .get(idx)
+                .and_then(|f| f.size)
+                .unwrap_or_else(|| chunks.iter().map(|c| c.len()).sum::<usize>());
+            let key = Key::Fixed(keys[idx].clone());
+            let chunk_slices: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+            let (sha1, start_point, new_end_point, _kind) = compressor
+                .compress(&key, &chunk_slices, chunks_len, None, None, None)
+                .map_err(|e| format!("compress error: {:?}", e))?;
+            if let Some(f) = self.factories.get_mut(idx) {
+                f.sha1 = Some(sha1);
+                f.start = start_point as u64;
+                f.end = new_end_point as u64;
+            }
+            end_point = new_end_point;
+        }
+        self.last_byte = end_point as u64;
+        let (chunks, endpoint) = compressor.flush();
+        let mut new_block = crate::groupcompress::block::GroupCompressBlock::new();
+        new_block.set_chunked_content(&chunks, endpoint);
+        self.block = new_block;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +483,105 @@ mod tests {
             parse_node_position(b"10 20 nope 40"),
             Err(NodePositionError::InvalidInteger)
         );
+    }
+
+    fn make_block_with_keys(
+        keys: &[&[u8]],
+    ) -> (
+        crate::groupcompress::block::GroupCompressBlock,
+        Vec<(usize, usize)>,
+    ) {
+        use crate::groupcompress::compressor::{GroupCompressor, RabinGroupCompressor};
+        use crate::versionedfile::Key;
+        let mut compressor = RabinGroupCompressor::new(None);
+        let mut positions = Vec::new();
+        for key_bytes in keys {
+            let chunks: &[&[u8]] = &[*key_bytes];
+            let length = key_bytes.len();
+            let key = Key::Fixed(vec![key_bytes.to_vec()]);
+            let (_sha, start, end, _kind) = compressor
+                .compress(&key, chunks, length, None, None, None)
+                .unwrap();
+            positions.push((start, end));
+        }
+        let (chunks, endpoint) = compressor.flush();
+        let mut block = crate::groupcompress::block::GroupCompressBlock::new();
+        block.set_chunked_content(&chunks, endpoint);
+        (block, positions)
+    }
+
+    #[test]
+    fn add_factory_marks_first_and_updates_last_byte() {
+        let (block, positions) = make_block_with_keys(&[b"hello\n"]);
+        let mut mgr = LazyGroupContentManager::new(block);
+        let idx = mgr.add_factory(positions[0].0 as u64, positions[0].1 as u64);
+        assert_eq!(idx, 0);
+        assert!(mgr.factory(0).unwrap().first);
+        assert_eq!(mgr.last_byte(), positions[0].1 as u64);
+        let idx2 = mgr.add_factory(0, 5);
+        assert!(!mgr.factory(idx2).unwrap().first);
+    }
+
+    #[test]
+    fn extract_factory_chunks_round_trips_payload() {
+        let (block, positions) = make_block_with_keys(&[b"payload\n"]);
+        let mut mgr = LazyGroupContentManager::new(block);
+        mgr.add_factory(positions[0].0 as u64, positions[0].1 as u64);
+        let chunks = mgr.extract_factory_chunks(0).unwrap();
+        let combined: Vec<u8> = chunks.into_iter().flatten().collect();
+        assert_eq!(combined, b"payload\n");
+        // Cached on the slot.
+        assert!(mgr.factory(0).unwrap().chunks.is_some());
+    }
+
+    #[test]
+    fn rebuild_block_round_trips_factory_payloads() {
+        let (block, positions) = make_block_with_keys(&[b"alpha\n", b"beta\n", b"gamma\n"]);
+        let mut mgr = LazyGroupContentManager::new(block);
+        for (start, end) in &positions {
+            mgr.add_factory(*start as u64, *end as u64);
+        }
+        // Pretend only the first two factories survive: drop the last and
+        // rebuild. The new block should still let us extract their content.
+        mgr.factories.pop();
+        let keys: Vec<Vec<Vec<u8>>> = vec![vec![b"alpha-key".to_vec()], vec![b"beta-key".to_vec()]];
+        mgr.rebuild_block(&keys, None).unwrap();
+
+        let alpha = mgr.extract_factory_chunks(0).unwrap();
+        let beta = mgr.extract_factory_chunks(1).unwrap();
+        let alpha_combined: Vec<u8> = alpha.into_iter().flatten().collect();
+        let beta_combined: Vec<u8> = beta.into_iter().flatten().collect();
+        assert_eq!(alpha_combined, b"alpha\n");
+        assert_eq!(beta_combined, b"beta\n");
+    }
+
+    #[test]
+    fn trim_block_preserves_factory_offsets() {
+        let (block, positions) = make_block_with_keys(&[b"first\n", b"second\n"]);
+        let mut mgr = LazyGroupContentManager::new(block);
+        for (start, end) in &positions {
+            mgr.add_factory(*start as u64, *end as u64);
+        }
+        // Trim to just past the first factory. The first factory must still
+        // extract correctly afterwards; the second one is now beyond the
+        // block end and is irrelevant.
+        let trim_to = positions[0].1;
+        mgr.trim_block(trim_to).unwrap();
+        let chunks = mgr.extract_factory_chunks(0).unwrap();
+        let combined: Vec<u8> = chunks.into_iter().flatten().collect();
+        assert_eq!(combined, b"first\n");
+    }
+
+    #[test]
+    fn check_rebuild_action_walks_own_factories() {
+        let (block, positions) = make_block_with_keys(&[b"x", b"y", b"z"]);
+        let mut mgr = LazyGroupContentManager::new(block);
+        for (start, end) in &positions {
+            mgr.add_factory(*start as u64, *end as u64);
+        }
+        // We're using all of the content, so the action should be Keep.
+        let (action, _, _) = mgr.check_rebuild_action();
+        assert_eq!(action, RebuildAction::Keep);
     }
 
     #[test]
