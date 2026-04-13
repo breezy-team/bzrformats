@@ -322,55 +322,13 @@ class _LazyGroupContentManager:
     def _wire_bytes(self):
         """Return a byte stream suitable for transmitting over the wire."""
         self._check_rebuild_block()
-        # The outer block starts with:
-        #   'groupcompress-block\n'
-        #   <length of compressed key info>\n
-        #   <length of uncompressed info>\n
-        #   <length of gc block>\n
-        #   <header bytes>
-        #   <gc-block>
-        lines = [b"groupcompress-block\n"]
-        # The minimal info we need is the key, the start offset, and the
-        # parents. The length and type are encoded in the record itself.
-        # However, passing in the other bits makes it easier.  The list of
-        # keys, and the start offset, the length
-        # 1 line key
-        # 1 line with parents, '' for ()
-        # 1 line for start offset
-        # 1 line for end byte
-        header_lines = []
-        for factory in self._factories:
-            key_bytes = b"\x00".join(factory.key)
-            parents = factory.parents
-            if parents is None:
-                parent_bytes = b"None:"
-            else:
-                parent_bytes = b"\t".join(b"\x00".join(key) for key in parents)
-            record_header = b"%s\n%s\n%d\n%d\n" % (
-                key_bytes,
-                parent_bytes,
-                factory._start,
-                factory._end,
-            )
-            header_lines.append(record_header)
-            # TODO: Can we break the refcycle at this point and set
-            #       factory._manager = None?
-        header_bytes = b"".join(header_lines)
-        del header_lines
-        header_bytes_len = len(header_bytes)
-        z_header_bytes = zlib.compress(header_bytes)
-        del header_bytes
-        z_header_bytes_len = len(z_header_bytes)
+        wire_factories = [
+            (tuple(factory.key), factory.parents, factory._start, factory._end)
+            for factory in self._factories
+        ]
         block_bytes_len, block_chunks = self._block.to_chunks()
-        lines.append(
-            b"%d\n%d\n%d\n" % (z_header_bytes_len, header_bytes_len, block_bytes_len)
-        )
-        lines.append(z_header_bytes)
-        lines.extend(block_chunks)
-        del z_header_bytes, block_chunks
-        # TODO: This is a point where we will double the memory consumption. To
-        #       avoid this, we probably have to switch to a 'chunked' api
-        return b"".join(lines)
+        prefix = _groupcompress_rs.build_wire_prefix(wire_factories, block_bytes_len)
+        return prefix + b"".join(block_chunks)
 
     @classmethod
     def from_bytes(cls, bytes):

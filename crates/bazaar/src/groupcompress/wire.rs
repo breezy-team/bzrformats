@@ -9,7 +9,9 @@
 //! Python original.
 
 use flate2::read::ZlibDecoder;
-use std::io::Read;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use std::io::{Read, Write};
 
 /// One factory record described by the wire header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +107,81 @@ pub fn parse_wire(bytes: &[u8]) -> Result<WireFrame<'_>, Error> {
         factories,
         block_bytes,
     })
+}
+
+/// Build the per-factory header bytes consumed by the wire format.
+///
+/// Each factory contributes four `\n`-terminated lines: the `\x00`-joined key,
+/// the parents (`b"None:"` for absent parents, otherwise tab-separated keys),
+/// the start byte and the end byte.
+pub fn build_header_lines(factories: &[WireFactory]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for factory in factories {
+        // key
+        let mut first = true;
+        for segment in &factory.key {
+            if !first {
+                out.push(b'\x00');
+            }
+            first = false;
+            out.extend_from_slice(segment);
+        }
+        out.push(b'\n');
+        // parents
+        match &factory.parents {
+            None => out.extend_from_slice(b"None:"),
+            Some(parents) => {
+                let mut first_parent = true;
+                for parent in parents {
+                    if !first_parent {
+                        out.push(b'\t');
+                    }
+                    first_parent = false;
+                    let mut first_seg = true;
+                    for seg in parent {
+                        if !first_seg {
+                            out.push(b'\x00');
+                        }
+                        first_seg = false;
+                        out.extend_from_slice(seg);
+                    }
+                }
+            }
+        }
+        out.push(b'\n');
+        // start
+        out.extend_from_slice(format!("{}", factory.start).as_bytes());
+        out.push(b'\n');
+        // end
+        out.extend_from_slice(format!("{}", factory.end).as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Build the framing prefix for the wire format: the storage-kind line, the
+/// three length lines, and the zlib-compressed header bytes.
+///
+/// The caller appends the inner block payload (`block_bytes`) after the
+/// returned prefix to form the complete wire record.
+pub fn build_wire_prefix(
+    factories: &[WireFactory],
+    block_bytes_len: usize,
+) -> std::io::Result<Vec<u8>> {
+    let header = build_header_lines(factories);
+    let header_len = header.len();
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&header)?;
+    let z_header = encoder.finish()?;
+    let z_header_len = z_header.len();
+
+    let mut prefix = Vec::with_capacity(64 + z_header_len);
+    prefix.extend_from_slice(b"groupcompress-block\n");
+    prefix.extend_from_slice(
+        format!("{}\n{}\n{}\n", z_header_len, header_len, block_bytes_len).as_bytes(),
+    );
+    prefix.extend_from_slice(&z_header);
+    Ok(prefix)
 }
 
 fn parse_int(b: &[u8]) -> Result<u64, Error> {
@@ -234,5 +311,74 @@ mod tests {
         let header = b"a\nb\nc\n";
         let wire = build_wire(header, b"");
         assert!(matches!(parse_wire(&wire), Err(Error::NotMultipleOfFour)));
+    }
+
+    #[test]
+    fn build_header_lines_emits_python_format() {
+        let factories = vec![WireFactory {
+            key: vec![b"file-id".to_vec(), b"rev".to_vec()],
+            parents: None,
+            start: 0,
+            end: 42,
+        }];
+        assert_eq!(
+            build_header_lines(&factories),
+            b"file-id\x00rev\nNone:\n0\n42\n"
+        );
+    }
+
+    #[test]
+    fn build_header_lines_emits_multiple_parents_with_tab_separator() {
+        let factories = vec![WireFactory {
+            key: vec![b"k".to_vec()],
+            parents: Some(vec![
+                vec![b"f".to_vec(), b"p1".to_vec()],
+                vec![b"f".to_vec(), b"p2".to_vec()],
+            ]),
+            start: 1,
+            end: 2,
+        }];
+        assert_eq!(
+            build_header_lines(&factories),
+            b"k\nf\x00p1\tf\x00p2\n1\n2\n"
+        );
+    }
+
+    #[test]
+    fn build_header_lines_empty_parents_list_emits_empty_line() {
+        // A `Some(vec![])` round-trips through the parser because the empty
+        // segment from splitting `b""` on `\t` is filtered out.
+        let factories = vec![WireFactory {
+            key: vec![b"k".to_vec()],
+            parents: Some(vec![]),
+            start: 0,
+            end: 1,
+        }];
+        assert_eq!(build_header_lines(&factories), b"k\n\n0\n1\n");
+    }
+
+    #[test]
+    fn build_wire_prefix_round_trips_via_parse_wire() {
+        let factories = vec![
+            WireFactory {
+                key: vec![b"file-a".to_vec(), b"rev1".to_vec()],
+                parents: None,
+                start: 0,
+                end: 32,
+            },
+            WireFactory {
+                key: vec![b"file-b".to_vec(), b"rev2".to_vec()],
+                parents: Some(vec![vec![b"file-a".to_vec(), b"rev1".to_vec()]]),
+                start: 32,
+                end: 96,
+            },
+        ];
+        let block = b"BLOCK_PAYLOAD";
+        let mut wire = build_wire_prefix(&factories, block.len()).unwrap();
+        wire.extend_from_slice(block);
+
+        let frame = parse_wire(&wire).unwrap();
+        assert_eq!(frame.block_bytes, block);
+        assert_eq!(frame.factories, factories);
     }
 }

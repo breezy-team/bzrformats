@@ -808,6 +808,71 @@ fn parse_wire_header<'py>(
     Ok((block_bytes, list))
 }
 
+/// Build the framing prefix for the wire format of a groupcompress block.
+///
+/// `factories` is a list of `(key_tuple, parents_tuple_or_none, start, end)`
+/// tuples and `block_bytes_len` is the length of the inner block payload that
+/// will be appended after the returned prefix.
+#[pyfunction]
+fn build_wire_prefix<'py>(
+    py: Python<'py>,
+    factories: &Bound<'py, pyo3::types::PyList>,
+    block_bytes_len: usize,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let mut wire_factories = Vec::with_capacity(factories.len());
+    for entry in factories.iter() {
+        let tuple = entry.cast_into::<PyTuple>()?;
+        if tuple.len() != 4 {
+            return Err(PyValueError::new_err(
+                "wire factory must be (key, parents, start, end)",
+            ));
+        }
+        let key_tuple = tuple.get_item(0)?.cast_into::<PyTuple>()?;
+        let key: Vec<Vec<u8>> = key_tuple
+            .iter()
+            .map(|seg| {
+                seg.cast_into::<PyBytes>()
+                    .map(|b| b.as_bytes().to_vec())
+                    .map_err(|_| PyValueError::new_err("key segments must be bytes"))
+            })
+            .collect::<PyResult<_>>()?;
+
+        let parents_obj = tuple.get_item(1)?;
+        let parents: Option<Vec<Vec<Vec<u8>>>> = if parents_obj.is_none() {
+            None
+        } else {
+            let parents_tuple = parents_obj.cast_into::<PyTuple>()?;
+            let mut parents = Vec::with_capacity(parents_tuple.len());
+            for parent_obj in parents_tuple.iter() {
+                let parent_tuple = parent_obj.cast_into::<PyTuple>()?;
+                let parent: Vec<Vec<u8>> = parent_tuple
+                    .iter()
+                    .map(|seg| {
+                        seg.cast_into::<PyBytes>()
+                            .map(|b| b.as_bytes().to_vec())
+                            .map_err(|_| PyValueError::new_err("parent segments must be bytes"))
+                    })
+                    .collect::<PyResult<_>>()?;
+                parents.push(parent);
+            }
+            Some(parents)
+        };
+
+        let start: u64 = tuple.get_item(2)?.extract()?;
+        let end: u64 = tuple.get_item(3)?.extract()?;
+        wire_factories.push(bazaar::groupcompress::wire::WireFactory {
+            key,
+            parents,
+            start,
+            end,
+        });
+    }
+
+    let prefix = bazaar::groupcompress::wire::build_wire_prefix(&wire_factories, block_bytes_len)
+        .map_err(|e| PyValueError::new_err(format!("zlib error: {}", e)))?;
+    Ok(PyBytes::new(py, &prefix))
+}
+
 /// Decide whether a block should be repacked.
 ///
 /// `factories` is an iterable of `(start, end)` tuples and `content_length`
@@ -884,6 +949,7 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(parse_wire_header, &m)?)?;
     m.add_function(wrap_pyfunction!(check_rebuild_action, &m)?)?;
     m.add_function(wrap_pyfunction!(check_is_well_utilized, &m)?)?;
+    m.add_function(wrap_pyfunction!(build_wire_prefix, &m)?)?;
     m.add_class::<GroupCompressBlock>()?;
     m.add_class::<LinesDeltaIndex>()?;
     m.add_class::<TraditionalGroupCompressor>()?;
