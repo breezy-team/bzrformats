@@ -11,6 +11,7 @@ use std::collections::HashMap;
 mod btree_index;
 mod btree_serializer;
 mod chk_map;
+mod chunk_writer;
 mod dirstate;
 mod dirstate_helpers;
 mod groupcompress;
@@ -570,6 +571,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let btree_serializerm = btree_serializer::_btree_serializer_rs(py)?;
     m.add_submodule(&btree_serializerm)?;
 
+    let chunk_writerm = chunk_writer::_chunk_writer_rs(py)?;
+    m.add_submodule(&chunk_writerm)?;
+
     let tuned_gzipm = tuned_gzip::_tuned_gzip_rs(py)?;
     m.add_submodule(&tuned_gzipm)?;
 
@@ -599,6 +603,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
         format!("{}.btree_serializer", module_name),
         &btree_serializerm,
     )?;
+    modules.set_item(format!("{}.chunk_writer", module_name), &chunk_writerm)?;
     modules.set_item(format!("{}.tuned_gzip", module_name), &tuned_gzipm)?;
 
     Ok(())
