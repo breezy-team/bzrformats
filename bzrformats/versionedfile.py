@@ -1912,123 +1912,15 @@ class PlanWeaveMerge(TextMerge):
         self.plan = list(plan)
 
     def _merge_struct(self):
-        lines_a = []
-        lines_b = []
-        ch_a = ch_b = False
+        from ._bzr_rs import textmerge as _textmerge_rs
 
-        def outstanding_struct():
-            if not lines_a and not lines_b:
-                return
-            elif ch_a and not ch_b:
-                # one-sided change:
-                yield (lines_a,)
-            elif ch_b and not ch_a:
-                yield (lines_b,)
-            elif lines_a == lines_b:
-                yield (lines_a,)
-            else:
-                yield (lines_a, lines_b)
-
-        # We previously considered either 'unchanged' or 'killed-both' lines
-        # to be possible places to resynchronize.  However, assuming agreement
-        # on killed-both lines may be too aggressive. -- mbp 20060324
-        for state, line in self.plan:
-            if state == "unchanged":
-                # resync and flush queued conflicts changes if any
-                yield from outstanding_struct()
-                lines_a = []
-                lines_b = []
-                ch_a = ch_b = False
-
-            if state == "unchanged":
-                if line:
-                    yield ([line],)
-            elif state == "killed-a":
-                ch_a = True
-                lines_b.append(line)
-            elif state == "killed-b":
-                ch_b = True
-                lines_a.append(line)
-            elif state == "new-a":
-                ch_a = True
-                lines_a.append(line)
-            elif state == "new-b":
-                ch_b = True
-                lines_b.append(line)
-            elif state == "conflicted-a":
-                ch_b = ch_a = True
-                lines_a.append(line)
-            elif state == "conflicted-b":
-                ch_b = ch_a = True
-                lines_b.append(line)
-            elif state == "killed-both":
-                # This counts as a change, even though there is no associated
-                # line
-                ch_b = ch_a = True
-            else:
-                if state not in ("irrelevant", "ghost-a", "ghost-b", "killed-base"):
-                    raise AssertionError(state)
-        yield from outstanding_struct()
+        return iter(_textmerge_rs.merge_struct_from_plan(self.plan))
 
     def base_from_plan(self):
         """Construct a BASE file from the plan text."""
-        base_lines = []
-        for state, line in self.plan:
-            if state in ("killed-a", "killed-b", "killed-both", "unchanged"):
-                # If unchanged, then this line is straight from base. If a or b
-                # or both killed the line, then it *used* to be in base.
-                base_lines.append(line)
-            else:
-                if state not in (
-                    "killed-base",
-                    "irrelevant",
-                    "ghost-a",
-                    "ghost-b",
-                    "new-a",
-                    "new-b",
-                    "conflicted-a",
-                    "conflicted-b",
-                ):
-                    # killed-base, irrelevant means it doesn't apply
-                    # ghost-a/ghost-b are harder to say for sure, but they
-                    # aren't in the 'inc_c' which means they aren't in the
-                    # shared base of a & b. So we don't include them.  And
-                    # obviously if the line is newly inserted, it isn't in base
+        from ._bzr_rs import textmerge as _textmerge_rs
 
-                    # If 'conflicted-a' or b, then it is new vs one base, but
-                    # old versus another base. However, if we make it present
-                    # in the base, it will be deleted from the target, and it
-                    # seems better to get a line doubled in the merge result,
-                    # rather than have it deleted entirely.
-                    # Example, each node is the 'text' at that point:
-                    #           MN
-                    #          /   \
-                    #        MaN   MbN
-                    #         |  X  |
-                    #        MabN MbaN
-                    #          \   /
-                    #           ???
-                    # There was a criss-cross conflict merge. Both sides
-                    # include the other, but put themselves first.
-                    # Weave marks this as a 'clean' merge, picking OTHER over
-                    # THIS. (Though the details depend on order inserted into
-                    # weave, etc.)
-                    # LCA generates a plan:
-                    # [('unchanged', M),
-                    #  ('conflicted-b', b),
-                    #  ('unchanged', a),
-                    #  ('conflicted-a', b),
-                    #  ('unchanged', N)]
-                    # If you mark 'conflicted-*' as part of BASE, then a 3-way
-                    # merge tool will cleanly generate "MaN" (as BASE vs THIS
-                    # removes one 'b', and BASE vs OTHER removes the other)
-                    # If you include neither, 3-way creates a clean "MbabN" as
-                    # THIS adds one 'b', and OTHER does too.
-                    # It seems that having the line 2 times is better than
-                    # having it omitted. (Easier to manually delete than notice
-                    # it needs to be added.)
-                    raise AssertionError(f"Unknown state: {state}")
-        return base_lines
+        return _textmerge_rs.base_from_plan(self.plan)
 
 
 class WeaveMerge(PlanWeaveMerge):
