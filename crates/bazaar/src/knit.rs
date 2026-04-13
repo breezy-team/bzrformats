@@ -510,6 +510,78 @@ pub fn parse_record_unchecked(
     ))
 }
 
+/// Error returned by [`record_to_data`] when the body payload is malformed.
+#[derive(Debug)]
+pub enum RecordToDataError {
+    /// `lines` was non-empty but its last element didn't end in `\n`.
+    MissingTrailingNewline,
+}
+
+impl std::fmt::Display for RecordToDataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecordToDataError::MissingTrailingNewline => {
+                write!(f, "corrupt lines value: last line missing trailing newline")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RecordToDataError {}
+
+/// Serialize a knit record for on-disk storage. Inverse of
+/// [`parse_record_unchecked`]; mirrors `_KnitData._record_to_data`.
+///
+/// Builds the `version <id> <count> <digest>\n` header, the body payload,
+/// and the trailing `end <id>\n` marker, then gzip-compresses via
+/// [`crate::tuned_gzip::chunks_to_gzip`]. Returns
+/// `(compressed_len, compressed_chunks)`.
+///
+/// * `version_id` – the trailing component of the knit key (`key[-1]`).
+/// * `digest` – content sha1 as bytes.
+/// * `line_count` – number of logical lines (`len(lines)` on the caller
+///   side, not `payload.len()`, since payload may be `dense_lines`).
+/// * `payload` – body chunks in order (`dense_lines or lines`).
+/// * `has_trailing_newline` – whether `lines[-1]` ends in `\n`. Pass `true`
+///   for empty inputs.
+pub fn record_to_data<P>(
+    version_id: &[u8],
+    digest: &[u8],
+    line_count: usize,
+    payload: &[P],
+    has_trailing_newline: bool,
+) -> Result<(usize, Vec<Vec<u8>>), RecordToDataError>
+where
+    P: AsRef<[u8]>,
+{
+    if !has_trailing_newline {
+        return Err(RecordToDataError::MissingTrailingNewline);
+    }
+
+    let mut header = Vec::with_capacity(version_id.len() + digest.len() + 16);
+    header.extend_from_slice(b"version ");
+    header.extend_from_slice(version_id);
+    header.extend_from_slice(format!(" {} ", line_count).as_bytes());
+    header.extend_from_slice(digest);
+    header.push(b'\n');
+
+    let mut end = Vec::with_capacity(version_id.len() + 5);
+    end.extend_from_slice(b"end ");
+    end.extend_from_slice(version_id);
+    end.push(b'\n');
+
+    let mut chunks: Vec<&[u8]> = Vec::with_capacity(payload.len() + 2);
+    chunks.push(&header);
+    for p in payload {
+        chunks.push(p.as_ref());
+    }
+    chunks.push(&end);
+
+    let compressed = crate::tuned_gzip::chunks_to_gzip(chunks.into_iter());
+    let total: usize = compressed.iter().map(|c| c.len()).sum();
+    Ok((total, compressed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +884,38 @@ mod tests {
                 actual: 1
             }
         ));
+    }
+
+    #[test]
+    fn record_to_data_round_trip_via_parse() {
+        let body: Vec<Vec<u8>> = vec![b"alpha\n".to_vec(), b"beta\n".to_vec()];
+        let (len, chunks) = record_to_data(b"rev-7", b"DIGEST", body.len(), &body, true).unwrap();
+        let raw: Vec<u8> = chunks.into_iter().flatten().collect();
+        assert_eq!(len, raw.len());
+        let (rec, contents) = parse_record_unchecked(&raw).unwrap();
+        assert_eq!(rec.version_id, b"rev-7");
+        assert_eq!(rec.count, 2);
+        assert_eq!(rec.digest, b"DIGEST");
+        assert_eq!(contents, body);
+    }
+
+    #[test]
+    fn record_to_data_rejects_missing_trailing_newline() {
+        let body: Vec<Vec<u8>> = vec![b"no-newline".to_vec()];
+        let err = record_to_data(b"rev", b"DD", 1, &body, false).unwrap_err();
+        assert!(matches!(err, RecordToDataError::MissingTrailingNewline));
+    }
+
+    #[test]
+    fn record_to_data_empty_body() {
+        // Empty `lines` ⇒ has_trailing_newline is vacuously true in the Python
+        // original, and the resulting record has zero body lines.
+        let empty: Vec<Vec<u8>> = vec![];
+        let (_, chunks) = record_to_data(b"rev-0", b"DD", 0, &empty, true).unwrap();
+        let raw: Vec<u8> = chunks.into_iter().flatten().collect();
+        let (rec, contents) = parse_record_unchecked(&raw).unwrap();
+        assert_eq!(rec.count, 0);
+        assert!(contents.is_empty());
     }
 
     #[test]

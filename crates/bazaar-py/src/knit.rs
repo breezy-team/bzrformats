@@ -502,6 +502,35 @@ fn parse_record_unchecked_rs<'py>(
     Ok((header, list))
 }
 
+/// Serialize a knit record: build the header, assemble header + payload +
+/// end-marker chunks, and gzip-compress them. Returns
+/// `(compressed_len, compressed_chunks)`. Raises `ValueError` if
+/// `has_trailing_newline` is false; the caller rewraps as needed.
+#[pyfunction]
+#[pyo3(signature = (version_id, digest, line_count, payload, has_trailing_newline))]
+fn record_to_data_rs<'py>(
+    py: Python<'py>,
+    version_id: &[u8],
+    digest: &[u8],
+    line_count: usize,
+    payload: Vec<Vec<u8>>,
+    has_trailing_newline: bool,
+) -> PyResult<(usize, Bound<'py, pyo3::types::PyList>)> {
+    let (len, chunks) = bazaar::knit::record_to_data(
+        version_id,
+        digest,
+        line_count,
+        &payload,
+        has_trailing_newline,
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let list = pyo3::types::PyList::empty(py);
+    for c in &chunks {
+        list.append(PyBytes::new(py, c))?;
+    }
+    Ok((len, list))
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data_c, &m)?)?;
@@ -514,5 +543,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(get_line_delta_blocks_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_network_record_header_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_record_unchecked_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(record_to_data_rs, &m)?)?;
     Ok(m)
 }

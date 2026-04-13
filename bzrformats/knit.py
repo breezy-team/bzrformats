@@ -62,7 +62,7 @@ from vcsgraph import tsort
 
 from bzrformats import pack
 
-from . import diff, osutils, pack_repo, tuned_gzip
+from . import diff, osutils, pack_repo
 from . import index as _mod_index
 from .annotate import VersionedFileAnnotator
 from .errors import (
@@ -2358,16 +2358,11 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
             this function spends less time resizing the final string.
         :return: (len, chunked bytestring with compressed data)
         """
-        chunks = [b"version %s %d %s\n" % (key[-1], len(lines), digest)]
-        chunks.extend(dense_lines or lines)
-        chunks.append(b"end " + key[-1] + b"\n")
-        for chunk in chunks:
-            if not isinstance(chunk, bytes):
-                raise AssertionError(f"data must be plain bytes was {type(chunk)}")
-        if lines and not lines[-1].endswith(b"\n"):
-            raise ValueError(f"corrupt lines value {lines!r}")
-        compressed_chunks = tuned_gzip.chunks_to_gzip(chunks)
-        return sum(map(len, compressed_chunks)), compressed_chunks
+        payload = dense_lines or lines
+        has_trailing_newline = not lines or lines[-1].endswith(b"\n")
+        return _knit_rs.record_to_data_rs(
+            key[-1], digest, len(lines), payload, has_trailing_newline
+        )
 
     def _split_header(self, line):
         rec = line.split()
