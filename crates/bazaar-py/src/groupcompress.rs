@@ -1417,23 +1417,70 @@ impl LazyGroupContentManager {
 }
 
 impl LazyGroupContentManager {
-    fn trim_block(&mut self, py: Python<'_>, last_byte: usize) -> PyResult<()> {
-        let new_block = {
-            let mut block = self.block.borrow_mut(py);
-            block.inner.ensure_content(Some(last_byte));
-            let content = block
-                .inner
-                .content()
-                .ok_or_else(|| PyValueError::new_err("block has no content"))?;
-            let trimmed = content[..last_byte].to_vec();
-            let mut new = bazaar::groupcompress::block::GroupCompressBlock::new();
-            new.set_content(&trimmed);
-            new
-        };
+    /// Snapshot the wrapper's per-record state into the pure-Rust
+    /// [`bazaar::groupcompress::manager::FactoryState`] form. The result has
+    /// no Python references and can be passed to the pure-Rust state machine.
+    fn snapshot_factory_states(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Vec<bazaar::groupcompress::manager::FactoryState>> {
+        self.factories
+            .iter()
+            .map(|f| {
+                let chunks = if let Some(cached) = &f.chunks {
+                    Some(
+                        cached
+                            .iter()
+                            .map(|b| b.bind(py).as_bytes().to_vec())
+                            .collect::<Vec<Vec<u8>>>(),
+                    )
+                } else {
+                    None
+                };
+                Ok(bazaar::groupcompress::manager::FactoryState {
+                    start: f.start,
+                    end: f.end,
+                    sha1: None,
+                    size: f.size,
+                    chunks,
+                    first: f.first,
+                })
+            })
+            .collect()
+    }
+
+    /// Snapshot just the per-record key segments (in pure bytes form), used
+    /// to feed [`bazaar::groupcompress::manager::rebuild_block`].
+    fn snapshot_factory_keys(&self, py: Python<'_>) -> PyResult<Vec<Vec<Vec<u8>>>> {
+        self.factories
+            .iter()
+            .map(|f| {
+                let key_tuple = f
+                    .key
+                    .as_ref()
+                    .ok_or_else(|| PyValueError::new_err("factory missing key"))?
+                    .bind(py);
+                key_tuple
+                    .iter()
+                    .map(|seg| {
+                        seg.cast_into::<PyBytes>()
+                            .map(|b| b.as_bytes().to_vec())
+                            .map_err(|_| PyValueError::new_err("key segments must be bytes"))
+                    })
+                    .collect::<PyResult<Vec<Vec<u8>>>>()
+            })
+            .collect()
+    }
+
+    fn install_block(
+        &mut self,
+        py: Python<'_>,
+        block: bazaar::groupcompress::block::GroupCompressBlock,
+    ) -> PyResult<()> {
         self.block = Bound::new(
             py,
             GroupCompressBlock {
-                inner: new_block,
+                inner: block,
                 z_content_cache: None,
             },
         )?
@@ -1441,9 +1488,18 @@ impl LazyGroupContentManager {
         Ok(())
     }
 
+    fn trim_block(&mut self, py: Python<'_>, last_byte: usize) -> PyResult<()> {
+        let new_block = {
+            let mut block = self.block.borrow_mut(py);
+            bazaar::groupcompress::manager::trim_block(&mut block.inner, last_byte)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?
+        };
+        self.install_block(py, new_block)
+    }
+
     fn rebuild_block(&mut self, py: Python<'_>) -> PyResult<()> {
         // Get the compressor settings (Python side may want to lazily compute
-        // them via a callback) and build a fresh RabinGroupCompressor.
+        // them via a callback).
         let settings_obj = self.ensure_compressor_settings(py)?;
         let settings_bound = settings_obj.into_bound(py);
         let settings_ref: Option<&Bound<PyAny>> = if settings_bound.is_none() {
@@ -1452,75 +1508,31 @@ impl LazyGroupContentManager {
             Some(&settings_bound)
         };
         let max_bytes_to_index = max_bytes_from_settings(settings_ref)?;
-        let mut compressor =
-            bazaar::groupcompress::compressor::RabinGroupCompressor::new(max_bytes_to_index);
 
-        // Walk every factory in order, extract its current chunks, and feed
-        // them back into the new compressor. Update each factory's start/end
-        // with the new offsets.
-        let mut end_point = 0usize;
-        let factory_count = self.factories.len();
-        for idx in 0..factory_count {
-            let (chunks_owned, chunks_len, key_segments) = {
-                let f = &self.factories[idx];
-                let key_tuple = f
-                    .key
-                    .as_ref()
-                    .ok_or_else(|| PyValueError::new_err("factory missing key"))?
-                    .bind(py);
-                let key_segments: Vec<Vec<u8>> = key_tuple
-                    .iter()
-                    .map(|seg| {
-                        seg.cast_into::<PyBytes>()
-                            .map(|b| b.as_bytes().to_vec())
-                            .map_err(|_| PyValueError::new_err("key segments must be bytes"))
-                    })
-                    .collect::<PyResult<_>>()?;
-                // We need the chunks for this factory. If we have cached
-                // chunks, use them; otherwise extract from the block.
-                let chunks: Vec<Vec<u8>> = if let Some(cached) = &f.chunks {
-                    cached
-                        .iter()
-                        .map(|b| b.bind(py).as_bytes().to_vec())
-                        .collect()
-                } else {
-                    let mut block = self.block.borrow_mut(py);
-                    block
-                        .inner
-                        .extract(f.start as usize, f.end as usize)
-                        .map_err(|e| PyValueError::new_err(format!("extract failed: {:?}", e)))?
-                };
-                let chunks_len: usize = f
-                    .size
-                    .unwrap_or_else(|| chunks.iter().map(|c| c.len()).sum::<usize>());
-                (chunks, chunks_len, key_segments)
-            };
-            let chunk_slices: Vec<&[u8]> = chunks_owned.iter().map(|c| c.as_slice()).collect();
-            let key_obj = bazaar::versionedfile::Key::Fixed(key_segments);
-            use bazaar::groupcompress::compressor::GroupCompressor as _;
-            let (sha1, start_point, new_end_point, _kind) = compressor
-                .compress(&key_obj, &chunk_slices, chunks_len, None, None, None)
-                .map_err(|e| PyValueError::new_err(format!("compress error: {}", e)))?;
-            let f = &mut self.factories[idx];
-            f.sha1 = Some(PyBytes::new(py, sha1.as_bytes()).into_any().unbind());
-            f.start = start_point as u64;
-            f.end = new_end_point as u64;
-            end_point = new_end_point;
+        let keys = self.snapshot_factory_keys(py)?;
+        let mut states = self.snapshot_factory_states(py)?;
+        let result = {
+            let mut block = self.block.borrow_mut(py);
+            bazaar::groupcompress::manager::rebuild_block(
+                &mut block.inner,
+                &mut states,
+                &keys,
+                max_bytes_to_index,
+            )
+            .map_err(PyValueError::new_err)?
+        };
+        // Write the new offsets/sha1s back into the wrapper's slots.
+        for (slot, state) in self.factories.iter_mut().zip(states.iter()) {
+            slot.start = state.start;
+            slot.end = state.end;
+            slot.sha1 = state
+                .sha1
+                .as_ref()
+                .map(|s| PyBytes::new(py, s.as_bytes()).into_any().unbind());
+            slot.chunks = None;
         }
-        self.last_byte = end_point as u64;
-        use bazaar::groupcompress::compressor::GroupCompressor as _;
-        let (chunks, endpoint) = compressor.flush();
-        let mut new_block = bazaar::groupcompress::block::GroupCompressBlock::new();
-        new_block.set_chunked_content(&chunks, endpoint);
-        self.block = Bound::new(
-            py,
-            GroupCompressBlock {
-                inner: new_block,
-                z_content_cache: None,
-            },
-        )?
-        .unbind();
-        Ok(())
+        self.last_byte = result.last_byte;
+        self.install_block(py, result.block)
     }
 }
 
