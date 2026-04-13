@@ -1133,21 +1133,7 @@ def _get_total_build_size(self, keys, positions):
         as returned by _get_components_positions)
     :return: Number of bytes to build those keys
     """
-    all_build_index_memos = {}
-    build_keys = keys
-    while build_keys:
-        next_keys = set()
-        for key in build_keys:
-            # This is mostly for the 'stacked' case
-            # Where we will be getting the data from a fallback
-            if key not in positions:
-                continue
-            _, index_memo, compression_parent = positions[key]
-            all_build_index_memos[key] = index_memo
-            if compression_parent not in all_build_index_memos:
-                next_keys.add(compression_parent)
-        build_keys = next_keys
-    return sum(index_memo[2] for index_memo in all_build_index_memos.values())
+    return _knit_rs.get_total_build_size_rs(keys, positions)
 
 
 class KnitVersionedFiles(VersionedFilesWithFallbacks):

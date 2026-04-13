@@ -534,6 +534,66 @@ fn build_network_record_rs<'py>(
     PyBytes::new(py, &out)
 }
 
+/// Compute total raw byte count needed to materialise `keys` from a knit,
+/// walking the compression-parent chain via `positions`.
+///
+/// Mirrors `bzrformats.knit._get_total_build_size`: each `positions` entry
+/// is `(info, index_memo, compression_parent)`, and the third element of
+/// `index_memo` is the compressed byte length to sum. Keys missing from
+/// `positions` (the "stacked fallback" case) are skipped. Duplicate compression
+/// parents are followed only once.
+#[pyfunction]
+fn get_total_build_size_rs(
+    py: Python<'_>,
+    keys: Bound<'_, pyo3::types::PyAny>,
+    positions: Bound<'_, pyo3::types::PyDict>,
+) -> PyResult<usize> {
+    use pyo3::types::{PyAnyMethods, PyDict};
+
+    // `seen` holds every key we've ever scheduled (to dedupe the frontier
+    // across and within levels — multiple children can share a compression
+    // parent). Values are the stored `index_memo` when the key actually
+    // resolved in `positions`, or `None` for stacked-fallback keys that we
+    // skip. We tally the total at the end from this single map.
+    let seen: Bound<'_, PyDict> = PyDict::new(py);
+    let mut frontier: Vec<Bound<'_, pyo3::types::PyAny>> = Vec::new();
+    for key in keys.try_iter()? {
+        let k = key?;
+        if !seen.contains(&k)? {
+            seen.set_item(&k, py.None())?;
+            frontier.push(k);
+        }
+    }
+
+    while !frontier.is_empty() {
+        let mut next: Vec<Bound<'_, pyo3::types::PyAny>> = Vec::new();
+        for key in frontier.drain(..) {
+            let Some(entry) = positions.get_item(&key)? else {
+                continue;
+            };
+            let tuple = entry.cast_into::<PyTuple>()?;
+            let index_memo = tuple.get_item(1)?;
+            let compression_parent = tuple.get_item(2)?;
+            seen.set_item(&key, &index_memo)?;
+            if !compression_parent.is_none() && !seen.contains(&compression_parent)? {
+                seen.set_item(&compression_parent, py.None())?;
+                next.push(compression_parent);
+            }
+        }
+        frontier = next;
+    }
+
+    let mut total: usize = 0;
+    for (_k, memo) in seen.iter() {
+        if memo.is_none() {
+            continue;
+        }
+        let memo_tuple = memo.cast_into::<PyTuple>()?;
+        total += memo_tuple.get_item(2)?.extract::<usize>()?;
+    }
+    Ok(total)
+}
+
 /// Group `keys` by their first segment, preserving first-seen order.
 /// Mirrors `KnitVersionedFiles._split_by_prefix`. Returns
 /// `(split_by_prefix_dict, prefix_order_list)`. Single-segment keys land
@@ -727,5 +787,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(get_total_build_size_rs, &m)?)?;
     Ok(m)
 }
