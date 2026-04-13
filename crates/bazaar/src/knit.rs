@@ -278,6 +278,95 @@ fn parse_delta_header(line: &[u8]) -> Result<(usize, usize, usize), KnitError> {
     Ok((start, end, count))
 }
 
+/// Build details extracted from a knit network record header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkRecordHeader<'a> {
+    /// Tuple-segment key (`key.split(b"\x00")` in the Python original).
+    pub key: Vec<&'a [u8]>,
+    /// `None` for the literal `b"None:"`, else the parsed parent key list.
+    pub parents: Option<Vec<Vec<&'a [u8]>>>,
+    /// `"fulltext"` or `"line-delta"` (chosen by the storage kind on the
+    /// caller side; this struct just carries the noeol flag).
+    pub noeol: bool,
+    /// Slice of the original input that contains the raw record body.
+    pub raw_record: &'a [u8],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NetworkHeaderError {
+    MissingKeyTerminator,
+    MissingParentsTerminator,
+    MissingNoEolByte,
+}
+
+impl std::fmt::Display for NetworkHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetworkHeaderError::MissingKeyTerminator => {
+                write!(f, "knit network record key missing newline terminator")
+            }
+            NetworkHeaderError::MissingParentsTerminator => {
+                write!(f, "knit network record parents missing newline terminator")
+            }
+            NetworkHeaderError::MissingNoEolByte => {
+                write!(f, "knit network record missing noeol byte")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NetworkHeaderError {}
+
+/// Parse the variable-length header of a `knit-*-gz` network record.
+///
+/// `bytes` is the full record and `start` is the offset just past the
+/// storage-kind line (the same `line_end` the Python caller computes via
+/// `network_bytes_to_kind_and_offset`).
+pub fn parse_network_record_header(
+    bytes: &[u8],
+    start: usize,
+) -> Result<NetworkRecordHeader<'_>, NetworkHeaderError> {
+    let key_end = bytes[start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| start + i)
+        .ok_or(NetworkHeaderError::MissingKeyTerminator)?;
+    let key: Vec<&[u8]> = bytes[start..key_end].split(|&b| b == b'\x00').collect();
+
+    let parents_start = key_end + 1;
+    let parents_end = bytes[parents_start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| parents_start + i)
+        .ok_or(NetworkHeaderError::MissingParentsTerminator)?;
+    let parents_line = &bytes[parents_start..parents_end];
+    let parents = if parents_line == b"None:" {
+        None
+    } else {
+        Some(
+            parents_line
+                .split(|&b| b == b'\t')
+                .filter(|seg| !seg.is_empty())
+                .map(|seg| seg.split(|&b| b == b'\x00').collect::<Vec<&[u8]>>())
+                .collect(),
+        )
+    };
+
+    let noeol_pos = parents_end + 1;
+    if noeol_pos >= bytes.len() {
+        return Err(NetworkHeaderError::MissingNoEolByte);
+    }
+    let noeol = bytes[noeol_pos] == b'N';
+    let raw_record = &bytes[noeol_pos + 1..];
+
+    Ok(NetworkRecordHeader {
+        key,
+        parents,
+        noeol,
+        raw_record,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +561,46 @@ mod tests {
         // Expect [(0, 0, 1), (2, 2, 1), (3, 3, 0)] — matches
         // PatienceSequenceMatcher's shape for a pure replacement.
         assert_eq!(blocks, vec![(0, 0, 1), (2, 2, 1), (3, 3, 0)]);
+    }
+
+    #[test]
+    fn network_header_no_parents_no_eol() {
+        let bytes = b"knit-ft-gz\nfile-id\x00rev\nNone:\nNDATA";
+        let header = parse_network_record_header(bytes, 11).unwrap();
+        assert_eq!(header.key, vec![b"file-id".as_slice(), b"rev".as_slice()]);
+        assert!(header.parents.is_none());
+        assert!(header.noeol);
+        assert_eq!(header.raw_record, b"DATA");
+    }
+
+    #[test]
+    fn network_header_with_parents_and_eol() {
+        let bytes = b"knit-delta-gz\nf\x00r\nf\x00p1\tf\x00p2\nYBODY";
+        let header = parse_network_record_header(bytes, 14).unwrap();
+        let parents = header.parents.unwrap();
+        assert_eq!(
+            parents,
+            vec![
+                vec![b"f".as_slice(), b"p1".as_slice()],
+                vec![b"f".as_slice(), b"p2".as_slice()],
+            ]
+        );
+        assert!(!header.noeol);
+        assert_eq!(header.raw_record, b"BODY");
+    }
+
+    #[test]
+    fn network_header_empty_parents_list_is_some_empty() {
+        let bytes = b"knit-ft-gz\nk\n\nNX";
+        let header = parse_network_record_header(bytes, 11).unwrap();
+        assert_eq!(header.parents.unwrap().len(), 0);
+        assert_eq!(header.raw_record, b"X");
+    }
+
+    #[test]
+    fn network_header_rejects_missing_noeol_byte() {
+        let bytes = b"knit-ft-gz\nk\nNone:\n";
+        let err = parse_network_record_header(bytes, 11).unwrap_err();
+        assert_eq!(err, NetworkHeaderError::MissingNoEolByte);
     }
 }

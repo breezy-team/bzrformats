@@ -87,7 +87,6 @@ from .transport import TransportNoSuchFile
 from .versionedfile import (
     AbsentContentFactory,
     ContentFactory,
-    ExistingContent,
     UnavailableRepresentation,
     VersionedFile,
     adapter_registry,
@@ -546,16 +545,6 @@ class Weave(VersionedFile):
                 with contextlib.suppress(RevisionAlreadyPresent):
                     self.add_lines(record.key[0], parents, lines)
 
-    def _check_repeated_add(self, name, parents, text, sha1):
-        """Check that a duplicated add is OK.
-
-        If it is, return the (old) index; otherwise raise an exception.
-        """
-        idx = self._lookup(name)
-        if sorted(self._parents[idx]) != sorted(parents) or sha1 != self._sha1s[idx]:
-            raise RevisionAlreadyPresent(name, self._weave_name)
-        return idx
-
     def _add_lines(
         self,
         version_id,
@@ -577,113 +566,27 @@ class Weave(VersionedFile):
         """Add a single text on top of the weave.
 
         Returns the index number of the newly added version.
-
-        version_id
-            Symbolic name for this version.
-            (Typically the revision-id of the revision that added it.)
-            If None, a name will be allocated based on the hash. (sha1:SHAHASH)
-
-        parents
-            List or set of direct parent version numbers.
-
-        lines
-            Sequence of lines to be added in the new version.
-
-        :param nostore_sha: See VersionedFile.add_lines.
         """
         self._check_lines_not_unicode(lines)
         self._check_lines_are_lines(lines)
-        if not sha1:
-            sha1 = sha_strings(lines)
-        if sha1 == nostore_sha:
-            raise ExistingContent
-        if version_id is None:
-            version_id = b"sha1:" + sha1
-        if version_id in self._name_map:
-            return self._check_repeated_add(version_id, parents, lines, sha1)
-
-        self._check_versions(parents)
-        new_version = len(self._parents)
-
-        # if we abort after here the (in-memory) weave will be corrupt because
-        # only some fields are updated
-        # XXX: FIXME implement a succeed-or-fail of the rest of this routine.
-        #      - Robert Collins 20060226
-        self._parents.append(parents[:])
-        self._sha1s.append(sha1)
-        self._names.append(version_id)
-        self._name_map[version_id] = new_version
-
-        if not parents:
-            # special case; adding with no parents revision; can do
-            # this more quickly by just appending unconditionally.
-            # even more specially, if we're adding an empty text we
-            # need do nothing at all.
-            if lines:
-                self._weave.append((b"{", new_version))
-                self._weave.extend(lines)
-                self._weave.append((b"}", None))
-            return new_version
-
-        if len(parents) == 1:
-            pv = list(parents)[0]
-            if sha1 == self._sha1s[pv]:
-                # special case: same as the single parent
-                return new_version
-
-        ancestors = self._inclusions(parents)
-
-        # basis a list of (origin, lineno, line)
-        basis_lineno = []
-        basis_lines = []
-        for _origin, lineno, line in self._extract(ancestors):
-            basis_lineno.append(lineno)
-            basis_lines.append(line)
-
-        # another small special case: a merge, producing the same text
-        # as auto-merge
-        if lines == basis_lines:
-            return new_version
-
-        # add a sentinel, because we can also match against the final line
-        basis_lineno.append(len(self._weave))
-
-        # XXX: which line of the weave should we really consider
-        # matches the end of the file?  the current code says it's the
-        # last line of the weave?
-
-        # print 'basis_lines:', basis_lines
-        # print 'new_lines:  ', lines
-
-        s = self._matcher(None, basis_lines, lines)
-
-        # offset gives the number of lines that have been inserted
-        # into the weave up to the current point; if the original edit
-        # instruction says to change line A then we actually change (A+offset)
-        offset = 0
-
-        for tag, i1, i2, j1, j2 in s.get_opcodes():
-            # i1,i2 are given in offsets within basis_lines; we need to map
-            # them back to offsets within the entire weave print 'raw match',
-            # tag, i1, i2, j1, j2
-            if tag == "equal":
-                continue
-            i1 = basis_lineno[i1]
-            i2 = basis_lineno[i2]
-            # the deletion and insertion are handled separately.
-            # first delete the region.
-            if i1 != i2:
-                self._weave.insert(i1 + offset, (b"[", new_version))
-                self._weave.insert(i2 + offset + 1, (b"]", new_version))
-                offset += 2
-
-            if j1 != j2:
-                # there may have been a deletion spanning up to
-                # i2; we want to insert after this region to make sure
-                # we don't destroy ourselves
-                i = i2 + offset
-                self._weave[i:i] = [(b"{", new_version)] + lines[j1:j2] + [(b"}", None)]
-                offset += 2 + (j2 - j1)
+        (
+            self._parents,
+            self._sha1s,
+            self._names,
+            self._weave,
+            new_version,
+        ) = _weave_rs.weave_add(
+            self._parents,
+            self._sha1s,
+            self._names,
+            self._weave,
+            version_id,
+            lines,
+            list(parents),
+            sha1,
+            nostore_sha,
+        )
+        self._name_map = {name: i for i, name in enumerate(self._names)}
         return new_version
 
     def _inclusions(self, versions):
@@ -696,14 +599,6 @@ class Weave(VersionedFile):
             version_ids = [version_ids]
         i = self._inclusions([self._lookup(v) for v in version_ids])
         return {self._idx_to_name(v) for v in i}
-
-    def _check_versions(self, indexes):
-        """Check everything in the sequence of indexes is valid."""
-        for i in indexes:
-            try:
-                self._parents[i]
-            except IndexError as err:
-                raise IndexError(f"invalid version number {i!r}") from err
 
     def _compatible_parents(self, my_parents, other_parents):
         """During join check that other_parents are joinable with my_parents.

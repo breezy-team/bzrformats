@@ -1510,3 +1510,231 @@ pub fn make_entry(
         ),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root_id() -> FileId {
+        FileId::from(b"TREE_ROOT".to_vec())
+    }
+
+    fn file(name: &str, text_sha1: &[u8], executable: bool) -> Entry {
+        Entry::file(
+            FileId::from(b"123".to_vec()),
+            name.to_string(),
+            root_id(),
+            None,
+            Some(text_sha1.to_vec()),
+            None,
+            Some(executable),
+            None,
+        )
+    }
+
+    fn directory(name: &str) -> Entry {
+        Entry::directory(
+            FileId::from(b"123".to_vec()),
+            name.to_string(),
+            root_id(),
+            None,
+        )
+    }
+
+    fn link(name: &str, target: &str) -> Entry {
+        Entry::link(
+            FileId::from(b"123".to_vec()),
+            name.to_string(),
+            root_id(),
+            None,
+            Some(target.to_string()),
+        )
+    }
+
+    #[test]
+    fn file_has_text_true() {
+        assert!(file("hello.c", b"", false).has_text());
+    }
+
+    #[test]
+    fn directory_has_text_false() {
+        assert!(!directory("hello.c").has_text());
+    }
+
+    #[test]
+    fn link_has_text_false() {
+        assert!(!link("hello.c", "target").has_text());
+    }
+
+    #[test]
+    fn dir_detect_changes_identical() {
+        let left = directory("hello.c");
+        let right = directory("hello.c");
+        assert_eq!(detect_changes(&left, &right), (false, false));
+        assert_eq!(detect_changes(&right, &left), (false, false));
+    }
+
+    #[test]
+    fn file_detect_changes_identical_same_sha() {
+        let left = file("hello.c", b"123", false);
+        let right = file("hello.c", b"123", false);
+        assert_eq!(detect_changes(&left, &right), (false, false));
+    }
+
+    #[test]
+    fn file_detect_changes_executable_bit_is_meta_modification() {
+        let left = file("hello.c", b"123", true);
+        let right = file("hello.c", b"123", false);
+        assert_eq!(detect_changes(&left, &right), (false, true));
+        assert_eq!(detect_changes(&right, &left), (false, true));
+    }
+
+    #[test]
+    fn file_detect_changes_different_sha_and_executable() {
+        let left = file("hello.c", b"123", true);
+        let right = file("hello.c", b"321", false);
+        assert_eq!(detect_changes(&left, &right), (true, true));
+        assert_eq!(detect_changes(&right, &left), (true, true));
+    }
+
+    #[test]
+    fn symlink_detect_changes_same_target() {
+        let left = link("hello.c", "foo");
+        let right = link("hello.c", "foo");
+        assert_eq!(detect_changes(&left, &right), (false, false));
+    }
+
+    #[test]
+    fn symlink_detect_changes_different_target() {
+        let left = link("hello.c", "different");
+        let right = link("hello.c", "foo");
+        assert_eq!(detect_changes(&left, &right), (true, false));
+        assert_eq!(detect_changes(&right, &left), (true, false));
+    }
+
+    #[test]
+    fn is_valid_name_rejects_slashes_and_dots() {
+        assert!(is_valid_name("foo"));
+        assert!(is_valid_name("hello.c"));
+        assert!(!is_valid_name("a/hello.c"));
+        assert!(!is_valid_name("."));
+        assert!(!is_valid_name(".."));
+    }
+
+    fn describe(a: Option<&Entry>, b: Option<&Entry>) -> String {
+        describe_change(a, b).to_string()
+    }
+
+    #[test]
+    fn describe_change_cases() {
+        let old_a = Entry::file(
+            FileId::from(b"a-id".to_vec()),
+            "a_file".to_string(),
+            root_id(),
+            None,
+            Some(b"123132".to_vec()),
+            Some(0),
+            Some(false),
+            None,
+        );
+        let new_a = old_a.clone();
+        assert_eq!(describe(Some(&old_a), Some(&new_a)), "unchanged");
+
+        let modified = Entry::file(
+            FileId::from(b"a-id".to_vec()),
+            "a_file".to_string(),
+            root_id(),
+            None,
+            Some(b"abcabc".to_vec()),
+            Some(10),
+            Some(false),
+            None,
+        );
+        assert_eq!(describe(Some(&old_a), Some(&modified)), "modified");
+
+        // added / removed / unchanged(None, None)
+        assert_eq!(describe(None, Some(&modified)), "added");
+        assert_eq!(describe(Some(&old_a), None), "removed");
+        assert_eq!(describe(None, None), "unchanged");
+
+        // modified and renamed
+        let renamed_and_modified = Entry::file(
+            FileId::from(b"a-id".to_vec()),
+            "newfilename".to_string(),
+            root_id(),
+            None,
+            Some(b"abcabc".to_vec()),
+            Some(10),
+            Some(false),
+            None,
+        );
+        assert_eq!(
+            describe(Some(&old_a), Some(&renamed_and_modified)),
+            "modified and renamed"
+        );
+
+        // reparenting counts as a rename on its own
+        let reparented = Entry::file(
+            FileId::from(b"a-id".to_vec()),
+            "a_file".to_string(),
+            FileId::from(b"somedir-id".to_vec()),
+            None,
+            Some(b"123132".to_vec()),
+            Some(0),
+            Some(false),
+            None,
+        );
+        assert_eq!(describe(Some(&old_a), Some(&reparented)), "renamed");
+    }
+
+    #[test]
+    fn make_entry_builds_correct_variant() {
+        let f = make_entry(
+            Kind::File,
+            "name".to_string(),
+            Some(root_id()),
+            Some(FileId::from(b"fid".to_vec())),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(f, Entry::File { .. }));
+
+        let l = make_entry(
+            Kind::Symlink,
+            "name".to_string(),
+            Some(root_id()),
+            Some(FileId::from(b"fid".to_vec())),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("target".to_string()),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(l, Entry::Link { .. }));
+
+        let d = make_entry(
+            Kind::Directory,
+            "name".to_string(),
+            Some(root_id()),
+            Some(FileId::from(b"fid".to_vec())),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(d, Entry::Directory { .. }));
+    }
+}

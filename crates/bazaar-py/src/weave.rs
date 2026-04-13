@@ -8,6 +8,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBytes, PyFrozenSet, PyList, PyTuple};
 
 import_exception!(bzrformats.weave, WeaveFormatError);
+import_exception!(bzrformats.errors, RevisionAlreadyPresent);
+import_exception!(bzrformats.errors, RevisionNotPresent);
+import_exception!(bzrformats.versionedfile, ExistingContent);
 
 fn py_weave_to_rust(weave: &Bound<PyList>) -> PyResult<Vec<WeaveEntry>> {
     let mut out = Vec::with_capacity(weave.len());
@@ -268,6 +271,137 @@ fn py_write_weave_v5<'py>(
     Ok(PyBytes::new(py, &write_weave_v5(&wf)))
 }
 
+/// Decode the four `Weave._parents/_sha1s/_names/_weave` lists into a
+/// pure-Rust [`WeaveFile`]. Used by helpers that need to mutate a weave.
+fn weave_lists_to_rust<'py>(
+    parents: &Bound<'py, PyList>,
+    sha1s: &Bound<'py, PyList>,
+    names: &Bound<'py, PyList>,
+    weave: &Bound<'py, PyList>,
+) -> PyResult<WeaveFile> {
+    let mut parents_rust: Vec<Vec<usize>> = Vec::with_capacity(parents.len());
+    for row in parents.iter() {
+        let mut ps = Vec::new();
+        for p in row.try_iter()? {
+            ps.push(p?.extract::<usize>()?);
+        }
+        parents_rust.push(ps);
+    }
+    let sha1s_rust: Vec<Vec<u8>> = sha1s
+        .iter()
+        .map(|s| -> PyResult<Vec<u8>> {
+            Ok(s.cast_into::<PyBytes>()
+                .map_err(|_| PyTypeError::new_err("sha1 entries must be bytes"))?
+                .as_bytes()
+                .to_vec())
+        })
+        .collect::<PyResult<_>>()?;
+    let names_rust: Vec<Vec<u8>> = names
+        .iter()
+        .map(|n| -> PyResult<Vec<u8>> {
+            Ok(n.cast_into::<PyBytes>()
+                .map_err(|_| PyTypeError::new_err("name entries must be bytes"))?
+                .as_bytes()
+                .to_vec())
+        })
+        .collect::<PyResult<_>>()?;
+    let weave_rust = py_weave_to_rust(weave)?;
+    Ok(WeaveFile {
+        parents: parents_rust,
+        sha1s: sha1s_rust,
+        names: names_rust,
+        weave: weave_rust,
+    })
+}
+
+/// Encode a [`WeaveFile`] back into the four-list shape Python expects.
+fn weave_to_lists<'py>(py: Python<'py>, wf: &WeaveFile) -> PyResult<WeaveFileFields<'py>> {
+    let parents = PyList::empty(py);
+    for ps in &wf.parents {
+        let inner: Vec<Bound<PyAny>> = ps
+            .iter()
+            .map(|p| -> PyResult<Bound<PyAny>> { Ok(p.into_pyobject(py)?.into_any()) })
+            .collect::<PyResult<_>>()?;
+        parents.append(PyList::new(py, inner)?)?;
+    }
+    let sha1s_out = PyList::empty(py);
+    for s in &wf.sha1s {
+        sha1s_out.append(PyBytes::new(py, s))?;
+    }
+    let names_out = PyList::empty(py);
+    for n in &wf.names {
+        names_out.append(PyBytes::new(py, n))?;
+    }
+    let weave_out = rust_weave_to_py(py, &wf.weave)?;
+    Ok((parents, sha1s_out, names_out, weave_out))
+}
+
+fn weave_op_err_to_py(py: Python<'_>, err: WeaveError) -> PyErr {
+    match err {
+        WeaveError::RevisionAlreadyPresent(name) => {
+            RevisionAlreadyPresent::new_err((PyBytes::new(py, &name).unbind(), py.None()))
+        }
+        WeaveError::RevisionNotPresent(idx) => RevisionNotPresent::new_err((idx, py.None())),
+        WeaveError::RevisionNotPresentByName(name) => {
+            RevisionNotPresent::new_err((PyBytes::new(py, &name).unbind(), py.None()))
+        }
+        WeaveError::ExistingContent => ExistingContent::new_err(()),
+        other => WeaveFormatError::new_err(other.to_string()),
+    }
+}
+
+/// Add a single text on top of a weave. Mirrors `Weave._add` from
+/// `bzrformats/weave.py`. Returns the four post-mutation lists plus the
+/// new version index.
+#[pyfunction]
+#[pyo3(name = "weave_add", signature = (parents, sha1s, names, weave, version_id, lines, parent_ids, sha1=None, nostore_sha=None))]
+#[allow(clippy::too_many_arguments)]
+fn py_weave_add<'py>(
+    py: Python<'py>,
+    parents: Bound<'py, PyList>,
+    sha1s: Bound<'py, PyList>,
+    names: Bound<'py, PyList>,
+    weave: Bound<'py, PyList>,
+    version_id: Option<&[u8]>,
+    lines: Bound<'py, PyAny>,
+    parent_ids: Bound<'py, PyAny>,
+    sha1: Option<&[u8]>,
+    nostore_sha: Option<&[u8]>,
+) -> PyResult<(
+    Bound<'py, PyList>,
+    Bound<'py, PyList>,
+    Bound<'py, PyList>,
+    Bound<'py, PyList>,
+    usize,
+)> {
+    let mut wf = weave_lists_to_rust(&parents, &sha1s, &names, &weave)?;
+    let lines_rust: Vec<Vec<u8>> = lines
+        .try_iter()?
+        .map(|l| -> PyResult<Vec<u8>> {
+            Ok(l?
+                .cast_into::<PyBytes>()
+                .map_err(|_| PyTypeError::new_err("lines must be bytes"))?
+                .as_bytes()
+                .to_vec())
+        })
+        .collect::<PyResult<_>>()?;
+    let parent_ids_rust: Vec<usize> = parent_ids
+        .try_iter()?
+        .map(|p| -> PyResult<usize> { p?.extract::<usize>() })
+        .collect::<PyResult<_>>()?;
+    let idx = wf
+        .add(
+            version_id,
+            &lines_rust,
+            &parent_ids_rust,
+            sha1.map(|s| s.to_vec()),
+            nostore_sha,
+        )
+        .map_err(|e| weave_op_err_to_py(py, e))?;
+    let (p, s, n, w) = weave_to_lists(py, &wf)?;
+    Ok((p, s, n, w, idx))
+}
+
 pub fn _weave_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "weave")?;
     m.add_function(wrap_pyfunction!(py_extract, &m)?)?;
@@ -275,5 +409,6 @@ pub fn _weave_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(py_walk_internal, &m)?)?;
     m.add_function(wrap_pyfunction!(py_read_weave_v5, &m)?)?;
     m.add_function(wrap_pyfunction!(py_write_weave_v5, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_weave_add, &m)?)?;
     Ok(m)
 }

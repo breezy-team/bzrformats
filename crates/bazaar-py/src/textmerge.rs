@@ -382,11 +382,77 @@ fn render_lines<'py>(
     Ok((PyList::new(py, lines)?, conflicts))
 }
 
+/// Extract `(state_str, line_obj)` tuples from an iterable, returning the
+/// states (parsed), the line objects (unbound for re-emission) and the raw
+/// line bytes (used for content comparisons inside the merge state machine).
+fn extract_plan(
+    plan: &Bound<PyAny>,
+) -> PyResult<(Vec<textmerge::PlanState>, Vec<Py<PyAny>>, Vec<Vec<u8>>)> {
+    let mut states = Vec::new();
+    let mut lines = Vec::new();
+    let mut line_bytes = Vec::new();
+    for item in plan.try_iter()? {
+        let pair = item?.cast_into::<PyTuple>()?;
+        if pair.len() != 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "plan items must be (state, line) pairs",
+            ));
+        }
+        let state_str: String = pair.get_item(0)?.extract()?;
+        let state = textmerge::PlanState::from_str(&state_str)
+            .ok_or_else(|| pyo3::exceptions::PyAssertionError::new_err(state_str.clone()))?;
+        states.push(state);
+        let line_obj = pair.get_item(1)?;
+        line_bytes.push(line_obj.extract::<Vec<u8>>().unwrap_or_default());
+        lines.push(line_obj.unbind());
+    }
+    Ok((states, lines, line_bytes))
+}
+
+/// Translate a weave merge plan into structured merge groups (length-1 tuples
+/// for resolved chunks, length-2 tuples for conflicts). Line objects from the
+/// input plan are returned by reference, preserving identity.
+#[pyfunction]
+fn merge_struct_from_plan<'py>(
+    py: Python<'py>,
+    plan: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let (states, lines, line_bytes) = extract_plan(plan)?;
+    let groups = textmerge::merge_struct_from_plan(&states, &line_bytes);
+
+    let mut tuples: Vec<Bound<PyTuple>> = Vec::with_capacity(groups.len());
+    for group in groups {
+        match group {
+            textmerge::PlanGroup::Single(indices) => {
+                let lst = PyList::new(py, indices.iter().map(|&i| lines[i].bind(py).clone()))?;
+                tuples.push(PyTuple::new(py, [lst.into_any()])?);
+            }
+            textmerge::PlanGroup::Conflict { a, b } => {
+                let la = PyList::new(py, a.iter().map(|&i| lines[i].bind(py).clone()))?;
+                let lb = PyList::new(py, b.iter().map(|&i| lines[i].bind(py).clone()))?;
+                tuples.push(PyTuple::new(py, [la.into_any(), lb.into_any()])?);
+            }
+        }
+    }
+    PyList::new(py, tuples)
+}
+
+/// Reconstruct a BASE text from a weave merge plan: emits the line objects for
+/// `unchanged`, `killed-a`, `killed-b` and `killed-both` states.
+#[pyfunction]
+fn base_from_plan<'py>(py: Python<'py>, plan: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
+    let (states, lines, _line_bytes) = extract_plan(plan)?;
+    let indices = textmerge::base_indices_from_plan(&states);
+    PyList::new(py, indices.into_iter().map(|i| lines[i].bind(py).clone()))
+}
+
 pub fn _textmerge_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "textmerge")?;
     m.add_class::<Merge2>()?;
     m.add("A_MARKER", PyBytes::new(py, textmerge::A_MARKER))?;
     m.add("B_MARKER", PyBytes::new(py, textmerge::B_MARKER))?;
     m.add("SPLIT_MARKER", PyBytes::new(py, textmerge::SPLIT_MARKER))?;
+    m.add_function(pyo3::wrap_pyfunction!(merge_struct_from_plan, &m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(base_from_plan, &m)?)?;
     Ok(m)
 }

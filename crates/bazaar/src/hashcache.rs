@@ -469,3 +469,104 @@ impl HashCache {
         Some(stat_value.into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use osutils::sha::sha_string;
+    use tempfile::TempDir;
+
+    fn empty_sha1(input: &[u8]) -> String {
+        sha_string(input)
+    }
+
+    fn make_cache(tmp: &TempDir) -> HashCache {
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir(root.join(".bzr")).unwrap();
+        HashCache::new(&root, &root.join(".bzr/stat-cache"), None, None)
+    }
+
+    fn write_file(root: &Path, name: &str, contents: &[u8]) {
+        std::fs::write(root.join(name), contents).unwrap();
+    }
+
+    #[test]
+    fn initial_miss_returns_correct_hash() {
+        let tmp = TempDir::new().unwrap();
+        let mut hc = make_cache(&tmp);
+        write_file(tmp.path(), "foo", b"hello");
+        assert_eq!(
+            hc.get_sha1(Path::new("foo"), None).unwrap(),
+            Some("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string())
+        );
+        assert_eq!(hc.miss_count(), 1);
+        assert_eq!(hc.hit_count(), 0);
+    }
+
+    #[test]
+    fn new_file_still_hashed_even_if_too_recent_to_cache() {
+        let tmp = TempDir::new().unwrap();
+        let mut hc = make_cache(&tmp);
+        write_file(tmp.path(), "foo", b"goodbye");
+        assert_eq!(
+            hc.get_sha1(Path::new("foo"), None).unwrap(),
+            Some(empty_sha1(b"goodbye"))
+        );
+    }
+
+    #[test]
+    fn nonexistent_file_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let mut hc = make_cache(&tmp);
+        assert_eq!(hc.get_sha1(Path::new("no-name-yet"), None).unwrap(), None);
+    }
+
+    #[test]
+    fn replaced_file_is_rehashed() {
+        let tmp = TempDir::new().unwrap();
+        let mut hc = make_cache(&tmp);
+        write_file(tmp.path(), "foo", b"goodbye");
+        assert_eq!(
+            hc.get_sha1(Path::new("foo"), None).unwrap(),
+            Some(empty_sha1(b"goodbye"))
+        );
+        std::fs::remove_file(tmp.path().join("foo")).unwrap();
+        assert_eq!(hc.get_sha1(Path::new("foo"), None).unwrap(), None);
+        write_file(tmp.path(), "foo", b"new content");
+        assert_eq!(
+            hc.get_sha1(Path::new("foo"), None).unwrap(),
+            Some(empty_sha1(b"new content"))
+        );
+    }
+
+    #[test]
+    fn directory_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let mut hc = make_cache(&tmp);
+        std::fs::create_dir(tmp.path().join("subdir")).unwrap();
+        assert_eq!(hc.get_sha1(Path::new("subdir"), None).unwrap(), None);
+    }
+
+    #[test]
+    fn cache_round_trips_through_disk_with_hit_after_reload() {
+        let tmp = TempDir::new().unwrap();
+        let mut hc = make_cache(&tmp);
+        write_file(tmp.path(), "foo", b"contents");
+        // Push the cutoff into the future so the file is considered old
+        // enough to cache without having to sleep for several seconds.
+        hc.set_cutoff_offset(10);
+        assert_eq!(
+            hc.get_sha1(Path::new("foo"), None).unwrap(),
+            Some(empty_sha1(b"contents"))
+        );
+        hc.write().unwrap();
+
+        let mut hc2 = HashCache::new(tmp.path(), &tmp.path().join(".bzr/stat-cache"), None, None);
+        hc2.read().unwrap();
+        assert_eq!(
+            hc2.get_sha1(Path::new("foo"), None).unwrap(),
+            Some(empty_sha1(b"contents"))
+        );
+        assert_eq!(hc2.hit_count(), 1);
+    }
+}

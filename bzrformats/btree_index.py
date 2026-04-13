@@ -23,9 +23,8 @@ import tempfile
 import zlib
 from io import BytesIO
 
-from . import chunk_writer, lru_cache, osutils
 from . import index as _mod_index
-from .index import _OPTION_KEY_ELEMENTS, _OPTION_LEN, _OPTION_NODE_REFS
+from . import lru_cache
 from .lru_cache import FIFOCache
 
 _BTSIGNATURE = b"B+Tree Graph Index 2\n"
@@ -43,58 +42,6 @@ _NODE_CACHE_SIZE = 1000
 
 logger = logging.getLogger(name="bzrformats.btree_index")
 evil_logger = logging.getLogger(name="bzrformats.evil")
-
-
-class _BuilderRow:
-    """The stored state accumulated while writing out a row in the index.
-
-    :ivar spool: A temporary file used to accumulate nodes for this row
-        in the tree.
-    :ivar nodes: The count of nodes emitted so far.
-    """
-
-    def __init__(self):
-        """Create a _BuilderRow."""
-        self.nodes = 0
-        self.spool = None  # tempfile.TemporaryFile(prefix='bzr-index-row-')
-        self.writer = None
-
-    def finish_node(self, pad=True):
-        byte_lines, _, padding = self.writer.finish()
-        if self.nodes == 0:
-            self.spool = BytesIO()
-            # padded note:
-            self.spool.write(b"\x00" * _RESERVED_HEADER_BYTES)
-        elif self.nodes == 1:
-            # We got bigger than 1 node, switch to a temp file
-            spool = tempfile.TemporaryFile(prefix="bzr-index-row-")
-            spool.write(self.spool.getvalue())
-            self.spool = spool
-        skipped_bytes = 0
-        if not pad and padding:
-            del byte_lines[-1]
-            skipped_bytes = padding
-        self.spool.writelines(byte_lines)
-        remainder = (self.spool.tell() + skipped_bytes) % _PAGE_SIZE
-        if remainder != 0:
-            raise AssertionError(
-                "incorrect node length: %d, %d" % (self.spool.tell(), remainder)
-            )
-        self.nodes += 1
-        self.writer = None
-
-
-class _InternalBuilderRow(_BuilderRow):
-    """The stored state accumulated while writing out internal rows."""
-
-    def finish_node(self, pad=True):
-        if not pad:
-            raise AssertionError("Must pad internal nodes only.")
-        _BuilderRow.finish_node(self)
-
-
-class _LeafBuilderRow(_BuilderRow):
-    """The stored state accumulated while writing out a leaf rows."""
 
 
 class BTreeBuilder(_mod_index.GraphIndexBuilder):
@@ -281,84 +228,6 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
             except StopIteration:
                 current_values[pos] = None
 
-    def _add_key(self, string_key, line, rows, allow_optimize=True):
-        """Add a key to the current chunk.
-
-        :param string_key: The key to add.
-        :param line: The fully serialised key and value.
-        :param allow_optimize: If set to False, prevent setting the optimize
-            flag when writing out. This is used by the _spill_mem_keys_to_disk
-            functionality.
-        """
-        new_leaf = False
-        if rows[-1].writer is None:
-            # opening a new leaf chunk;
-            new_leaf = True
-            for pos, internal_row in enumerate(rows[:-1]):
-                # flesh out any internal nodes that are needed to
-                # preserve the height of the tree
-                if internal_row.writer is None:
-                    length = _PAGE_SIZE
-                    if internal_row.nodes == 0:
-                        length -= _RESERVED_HEADER_BYTES  # padded
-                    if allow_optimize:
-                        optimize_for_size = self._optimize_for_size
-                    else:
-                        optimize_for_size = False
-                    internal_row.writer = chunk_writer.ChunkWriter(
-                        length, 0, optimize_for_size=optimize_for_size
-                    )
-                    internal_row.writer.write(_INTERNAL_FLAG)
-                    internal_row.writer.write(
-                        _INTERNAL_OFFSET + b"%d\n" % rows[pos + 1].nodes
-                    )
-            # add a new leaf
-            length = _PAGE_SIZE
-            if rows[-1].nodes == 0:
-                length -= _RESERVED_HEADER_BYTES  # padded
-            rows[-1].writer = chunk_writer.ChunkWriter(
-                length, optimize_for_size=self._optimize_for_size
-            )
-            rows[-1].writer.write(_LEAF_FLAG)
-        if rows[-1].writer.write(line):
-            # if we failed to write, despite having an empty page to write to,
-            # then line is too big. raising the error avoids infinite recursion
-            # searching for a suitably large page that will not be found.
-            if new_leaf:
-                raise _mod_index.BadIndexKey(string_key)
-            # this key did not fit in the node:
-            rows[-1].finish_node()
-            key_line = string_key + b"\n"
-            new_row = True
-            for row in reversed(rows[:-1]):
-                # Mark the start of the next node in the node above. If it
-                # doesn't fit then propagate upwards until we find one that
-                # it does fit into.
-                if row.writer.write(key_line):
-                    row.finish_node()
-                else:
-                    # We've found a node that can handle the pointer.
-                    new_row = False
-                    break
-            # If we reached the current root without being able to mark the
-            # division point, then we need a new root:
-            if new_row:
-                # We need a new row
-                logger.debug("Inserting new global row.")
-                new_row = _InternalBuilderRow()
-                reserved_bytes = 0
-                rows.insert(0, new_row)
-                # This will be padded, hence the -100
-                new_row.writer = chunk_writer.ChunkWriter(
-                    _PAGE_SIZE - _RESERVED_HEADER_BYTES,
-                    reserved_bytes,
-                    optimize_for_size=self._optimize_for_size,
-                )
-                new_row.writer.write(_INTERNAL_FLAG)
-                new_row.writer.write(_INTERNAL_OFFSET + b"%d\n" % (rows[1].nodes - 1))
-                new_row.writer.write(key_line)
-            self._add_key(string_key, line, rows, allow_optimize=allow_optimize)
-
     def _write_nodes(self, node_iterator, allow_optimize=True):
         """Write node_iterator out as a B+Tree.
 
@@ -370,75 +239,24 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
         :return: A file handle for a temporary file containing a B+Tree for
             the nodes.
         """
-        # The index rows - rows[0] is the root, rows[1] is the layer under it
-        # etc.
-        rows = []
-        # forward sorted by key. In future we may consider topological sorting,
-        # at the cost of table scans for direct lookup, or a second index for
-        # direct lookup
-        key_count = 0
-        # A stack with the number of nodes of each size. 0 is the root node
-        # and must always be 1 (if there are any nodes in the tree).
-        self.row_lengths = []
-        # Loop over all nodes adding them to the bottom row
-        # (rows[-1]). When we finish a chunk in a row,
-        # propagate the key that didn't fit (comes after the chunk) to the
-        # row above, transitively.
-        for node in node_iterator:
-            if key_count == 0:
-                # First key triggers the first row
-                rows.append(_LeafBuilderRow())
-            key_count += 1
-            string_key, line = _btree_serializer._flatten_node(
-                node, self.reference_lists
-            )
-            self._add_key(string_key, line, rows, allow_optimize=allow_optimize)
-        for row in reversed(rows):
-            pad = not isinstance(row, _LeafBuilderRow)
-            row.finish_node(pad=pad)
-        lines = [_BTSIGNATURE]
-        lines.append(b"%s%d\n" % (_OPTION_NODE_REFS, self.reference_lists))
-        lines.append(b"%s%d\n" % (_OPTION_KEY_ELEMENTS, self._key_length))
-        lines.append(b"%s%d\n" % (_OPTION_LEN, key_count))
-        row_lengths = [row.nodes for row in rows]
-        lines.append(
-            _OPTION_ROW_LENGTHS
-            + ",".join(map(str, row_lengths)).encode("ascii")
-            + b"\n"
+        optimize_for_size = allow_optimize and self._optimize_for_size
+        blob = _btree_serializer.serialize_btree_index(
+            node_iterator,
+            self.reference_lists,
+            self._key_length,
+            optimize_for_size=optimize_for_size,
+            page_size=_PAGE_SIZE,
+            reserved_header_bytes=_RESERVED_HEADER_BYTES,
         )
-        if row_lengths and row_lengths[-1] > 1:
+        size = len(blob)
+        # Use a NamedTemporaryFile for larger indexes to match the Python
+        # original's disk-spill behaviour; tests inspect this via .read().
+        if size > _PAGE_SIZE:
             result = tempfile.NamedTemporaryFile(prefix="bzr-index-")
         else:
             result = BytesIO()
-        result.writelines(lines)
-        position = sum(map(len, lines))
-        if position > _RESERVED_HEADER_BYTES:
-            raise AssertionError(
-                "Could not fit the header in the"
-                " reserved space: %d > %d" % (position, _RESERVED_HEADER_BYTES)
-            )
-        # write the rows out:
-        for row in rows:
-            reserved = _RESERVED_HEADER_BYTES  # reserved space for first node
-            row.spool.flush()
-            row.spool.seek(0)
-            # copy nodes to the finalised file.
-            # Special case the first node as it may be prefixed
-            node = row.spool.read(_PAGE_SIZE)
-            result.write(node[reserved:])
-            if len(node) == _PAGE_SIZE:
-                result.write(b"\x00" * (reserved - position))
-            position = 0  # Only the root row actually has an offset
-            copied_len = osutils.pumpfile(row.spool, result)
-            if copied_len != (row.nodes - 1) * _PAGE_SIZE:
-                if not isinstance(row, _LeafBuilderRow):
-                    raise AssertionError(
-                        "Incorrect amount of data copied"
-                        " expected: %d, got: %d"
-                        % ((row.nodes - 1) * _PAGE_SIZE, copied_len)
-                    )
+        result.write(blob)
         result.flush()
-        size = result.tell()
         result.seek(0)
         return result, size
 
