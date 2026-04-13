@@ -436,3 +436,61 @@ impl XMLRevisionSerializer for XMLRevisionSerializer5 {
         "5"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_and_escape_simple_ascii_passes_through() {
+        assert_eq!(encode_and_escape_string("foo bar"), "foo bar");
+        assert_eq!(encode_and_escape_bytes(b"foo bar"), "foo bar");
+    }
+
+    #[test]
+    fn encode_and_escape_xml_special_chars() {
+        assert_eq!(
+            encode_and_escape_string("&'\"<>"),
+            "&amp;&apos;&quot;&lt;&gt;"
+        );
+        assert_eq!(
+            encode_and_escape_bytes(b"&'\"<>"),
+            "&amp;&apos;&quot;&lt;&gt;"
+        );
+    }
+
+    #[test]
+    fn encode_and_escape_utf8_with_xml() {
+        // u'\xb5\xe5&\u062c'
+        let utf8_str = b"\xc2\xb5\xc3\xa5&\xd8\xac";
+        assert_eq!(
+            encode_and_escape_bytes(utf8_str),
+            "&#181;&#229;&amp;&#1580;"
+        );
+    }
+
+    #[test]
+    fn encode_and_escape_unicode_str() {
+        let uni_str = "\u{b5}\u{e5}&\u{62c}";
+        assert_eq!(
+            encode_and_escape_string(uni_str),
+            "&#181;&#229;&amp;&#1580;"
+        );
+    }
+
+    #[test]
+    fn escape_invalid_chars_keeps_normal_text() {
+        assert_eq!(escape_invalid_chars("hello world"), "hello world");
+    }
+
+    #[test]
+    fn escape_invalid_chars_escapes_control_codes() {
+        // \x01 is a forbidden XML control char and should be escaped.
+        assert_eq!(escape_invalid_chars("a\x01b"), "a\\x01b");
+    }
+
+    #[test]
+    fn escape_invalid_chars_keeps_tab_newline_cr() {
+        assert_eq!(escape_invalid_chars("a\tb\nc\rd"), "a\tb\nc\rd");
+    }
+}
