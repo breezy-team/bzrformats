@@ -11,7 +11,7 @@ pub fn validate_properties(properties: &HashMap<String, Vec<u8>>) -> bool {
     true
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Revision {
     pub revision_id: RevisionId,
     pub parent_ids: Vec<RevisionId>,
