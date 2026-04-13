@@ -296,6 +296,13 @@ impl bendy::encoding::ToBencode for Key {
 }
 
 #[test]
+fn test_network_bytes_to_kind_and_offset() {
+    let (kind, offset) = network_bytes_to_kind_and_offset(b"fulltext\nrest");
+    assert_eq!(kind, "fulltext");
+    assert_eq!(offset, 9);
+}
+
+#[test]
 fn test_key_bencode() {
     let x = Key::Fixed(vec![b"foo".to_vec(), b"bar".to_vec()]);
     let z = bendy::encoding::ToBencode::to_bencode(&x).unwrap();
@@ -731,6 +738,19 @@ fn length_prefix(data: &[u8]) -> Vec<u8> {
         .expect("Failed to write length bytes");
 
     length_bytes
+}
+
+/// Strip a record kind line from the front of `network_bytes`.
+///
+/// Returns the ASCII storage kind and the offset of the remaining bytes.
+pub fn network_bytes_to_kind_and_offset(network_bytes: &[u8]) -> (String, usize) {
+    let line_end = network_bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .expect("network bytes must contain a newline-terminated kind");
+    let storage_kind =
+        std::str::from_utf8(&network_bytes[..line_end]).expect("storage kind must be ASCII");
+    (storage_kind.to_string(), line_end + 1)
 }
 
 pub fn fulltext_network_to_record(bytes: &[u8], line_end: usize) -> FulltextContentFactory {

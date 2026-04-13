@@ -106,6 +106,169 @@ pub fn struct_to_lines(
     (lines, conflicts)
 }
 
+/// Plan-merge state, mirroring `bzrformats.versionedfile` plan strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanState {
+    Unchanged,
+    KilledA,
+    KilledB,
+    NewA,
+    NewB,
+    ConflictedA,
+    ConflictedB,
+    KilledBoth,
+    Irrelevant,
+    GhostA,
+    GhostB,
+    KilledBase,
+}
+
+impl PlanState {
+    pub fn from_str(s: &str) -> Option<PlanState> {
+        Some(match s {
+            "unchanged" => PlanState::Unchanged,
+            "killed-a" => PlanState::KilledA,
+            "killed-b" => PlanState::KilledB,
+            "new-a" => PlanState::NewA,
+            "new-b" => PlanState::NewB,
+            "conflicted-a" => PlanState::ConflictedA,
+            "conflicted-b" => PlanState::ConflictedB,
+            "killed-both" => PlanState::KilledBoth,
+            "irrelevant" => PlanState::Irrelevant,
+            "ghost-a" => PlanState::GhostA,
+            "ghost-b" => PlanState::GhostB,
+            "killed-base" => PlanState::KilledBase,
+            _ => return None,
+        })
+    }
+}
+
+/// One emitted region from `merge_struct_from_plan`. Lines are referenced by
+/// their index in the original plan so callers can preserve the source line
+/// objects byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanGroup {
+    /// Single resolved chunk: emit these line indices unchanged.
+    Single(Vec<usize>),
+    /// Conflict region: side-A vs side-B line indices.
+    Conflict { a: Vec<usize>, b: Vec<usize> },
+}
+
+/// Translate a weave merge plan to structured merge groups.
+///
+/// `states` is the per-line plan state; `lines` carries the corresponding
+/// line bytes (used for content equality when collapsing same-line "fake"
+/// conflicts) and to suppress single-line `unchanged` groups for empty lines.
+/// Output groups carry indices back into the original plan so callers can
+/// preserve byte identity for the lines.
+#[allow(unused_assignments)]
+pub fn merge_struct_from_plan<L: AsRef<[u8]>>(states: &[PlanState], lines: &[L]) -> Vec<PlanGroup> {
+    assert_eq!(states.len(), lines.len());
+    let mut out = Vec::new();
+    let mut lines_a: Vec<usize> = Vec::new();
+    let mut lines_b: Vec<usize> = Vec::new();
+    let mut ch_a = false;
+    let mut ch_b = false;
+
+    let line_bytes = |i: usize| lines[i].as_ref();
+    let same_content = |a: &[usize], b: &[usize]| -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b.iter())
+                .all(|(&i, &j)| line_bytes(i) == line_bytes(j))
+    };
+
+    macro_rules! flush {
+        () => {
+            if lines_a.is_empty() && lines_b.is_empty() {
+                // nothing
+            } else if ch_a && !ch_b {
+                out.push(PlanGroup::Single(std::mem::take(&mut lines_a)));
+            } else if ch_b && !ch_a {
+                out.push(PlanGroup::Single(std::mem::take(&mut lines_b)));
+            } else if same_content(&lines_a, &lines_b) {
+                out.push(PlanGroup::Single(std::mem::take(&mut lines_a)));
+            } else {
+                out.push(PlanGroup::Conflict {
+                    a: std::mem::take(&mut lines_a),
+                    b: std::mem::take(&mut lines_b),
+                });
+            }
+            lines_a.clear();
+            lines_b.clear();
+            ch_a = false;
+            ch_b = false;
+        };
+    }
+
+    for (idx, state) in states.iter().enumerate() {
+        if *state == PlanState::Unchanged {
+            flush!();
+            if !line_bytes(idx).is_empty() {
+                out.push(PlanGroup::Single(vec![idx]));
+            }
+            continue;
+        }
+        match state {
+            PlanState::KilledA => {
+                ch_a = true;
+                lines_b.push(idx);
+            }
+            PlanState::KilledB => {
+                ch_b = true;
+                lines_a.push(idx);
+            }
+            PlanState::NewA => {
+                ch_a = true;
+                lines_a.push(idx);
+            }
+            PlanState::NewB => {
+                ch_b = true;
+                lines_b.push(idx);
+            }
+            PlanState::ConflictedA => {
+                ch_a = true;
+                ch_b = true;
+                lines_a.push(idx);
+            }
+            PlanState::ConflictedB => {
+                ch_a = true;
+                ch_b = true;
+                lines_b.push(idx);
+            }
+            PlanState::KilledBoth => {
+                ch_a = true;
+                ch_b = true;
+            }
+            PlanState::Irrelevant
+            | PlanState::GhostA
+            | PlanState::GhostB
+            | PlanState::KilledBase => {}
+            PlanState::Unchanged => unreachable!(),
+        }
+    }
+    flush!();
+    out
+}
+
+/// Reconstruct a BASE text from a weave merge plan.
+///
+/// Returns the indices (into `states`) of the lines that belong to BASE:
+/// `unchanged`, `killed-a`, `killed-b` and `killed-both` states.
+pub fn base_indices_from_plan(states: &[PlanState]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (idx, state) in states.iter().enumerate() {
+        match state {
+            PlanState::Unchanged
+            | PlanState::KilledA
+            | PlanState::KilledB
+            | PlanState::KilledBoth => out.push(idx),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Convenience: produce merged lines plus a conflict flag from two inputs.
 pub fn merge_lines(
     lines_a: &[Vec<u8>],
@@ -163,6 +326,114 @@ mod tests {
         let joined_rp: Vec<u8> = merged_rp.into_iter().flatten().collect();
         assert_eq!(joined_rp, expected.as_bytes());
         assert!(conflicts_rp);
+    }
+
+    #[test]
+    fn plan_merge_unchanged_runs() {
+        let states = vec![
+            PlanState::Unchanged,
+            PlanState::Unchanged,
+            PlanState::Unchanged,
+        ];
+        let lines: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let groups = merge_struct_from_plan(&states, &lines);
+        assert_eq!(
+            groups,
+            vec![
+                PlanGroup::Single(vec![0]),
+                PlanGroup::Single(vec![1]),
+                PlanGroup::Single(vec![2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_merge_killed_a_then_unchanged() {
+        // killed-a sets ch_a but pushes to lines_b. The Python original
+        // yields the empty (lines_a,) chunk on flush; downstream iter_useful
+        // discards it.
+        let states = vec![PlanState::KilledA, PlanState::Unchanged];
+        let lines: Vec<&[u8]> = vec![b"x", b"y"];
+        let groups = merge_struct_from_plan(&states, &lines);
+        assert_eq!(
+            groups,
+            vec![PlanGroup::Single(vec![]), PlanGroup::Single(vec![1])]
+        );
+    }
+
+    #[test]
+    fn plan_merge_new_a_then_unchanged() {
+        // new-a is the symmetric case that does carry the line through.
+        let states = vec![PlanState::NewA, PlanState::Unchanged];
+        let lines: Vec<&[u8]> = vec![b"x", b"y"];
+        let groups = merge_struct_from_plan(&states, &lines);
+        assert_eq!(
+            groups,
+            vec![PlanGroup::Single(vec![0]), PlanGroup::Single(vec![1])]
+        );
+    }
+
+    #[test]
+    fn plan_merge_two_sided_conflict() {
+        // new-a then new-b without intervening unchanged -> conflict
+        let states = vec![PlanState::NewA, PlanState::NewB];
+        let lines: Vec<&[u8]> = vec![b"x", b"y"];
+        let groups = merge_struct_from_plan(&states, &lines);
+        assert_eq!(
+            groups,
+            vec![PlanGroup::Conflict {
+                a: vec![0],
+                b: vec![1]
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_merge_same_line_on_both_sides_collapses() {
+        // new-a and new-b inserting the *same* content collapse to a single
+        // chunk, not a conflict — content equality, not index equality.
+        let states = vec![PlanState::NewA, PlanState::NewB];
+        let lines: Vec<&[u8]> = vec![b"xxx\n", b"xxx\n"];
+        let groups = merge_struct_from_plan(&states, &lines);
+        assert_eq!(groups, vec![PlanGroup::Single(vec![0])]);
+    }
+
+    #[test]
+    fn plan_merge_killed_both_is_a_change() {
+        // killed-both with no surviving lines -> drops nothing
+        let states = vec![
+            PlanState::Unchanged,
+            PlanState::KilledBoth,
+            PlanState::Unchanged,
+        ];
+        let lines: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let groups = merge_struct_from_plan(&states, &lines);
+        assert_eq!(
+            groups,
+            vec![PlanGroup::Single(vec![0]), PlanGroup::Single(vec![2]),]
+        );
+    }
+
+    #[test]
+    fn plan_merge_skips_empty_unchanged_line() {
+        let states = vec![PlanState::Unchanged, PlanState::Unchanged];
+        let lines: Vec<&[u8]> = vec![b"", b"x"];
+        let groups = merge_struct_from_plan(&states, &lines);
+        assert_eq!(groups, vec![PlanGroup::Single(vec![1])]);
+    }
+
+    #[test]
+    fn base_indices_only_includes_base_states() {
+        let states = vec![
+            PlanState::Unchanged,
+            PlanState::KilledA,
+            PlanState::NewA,
+            PlanState::KilledB,
+            PlanState::ConflictedA,
+            PlanState::KilledBoth,
+            PlanState::GhostA,
+        ];
+        assert_eq!(base_indices_from_plan(&states), vec![0, 1, 3, 5]);
     }
 
     #[test]

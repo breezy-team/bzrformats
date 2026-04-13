@@ -22,6 +22,7 @@ mod multiparent;
 mod pack;
 mod smart;
 mod textmerge;
+mod tuned_gzip;
 mod versionedfile;
 mod weave;
 
@@ -569,6 +570,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let btree_serializerm = btree_serializer::_btree_serializer_rs(py)?;
     m.add_submodule(&btree_serializerm)?;
 
+    let tuned_gzipm = tuned_gzip::_tuned_gzip_rs(py)?;
+    m.add_submodule(&tuned_gzipm)?;
+
     // PyO3 submodule hack for proper import support
     let sys = py.import("sys")?;
     let modules = sys.getattr("modules")?;
@@ -595,6 +599,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
         format!("{}.btree_serializer", module_name),
         &btree_serializerm,
     )?;
+    modules.set_item(format!("{}.tuned_gzip", module_name), &tuned_gzipm)?;
 
     Ok(())
 }
