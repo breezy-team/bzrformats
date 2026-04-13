@@ -2,6 +2,7 @@ pub mod block;
 pub mod compressor;
 pub mod delta;
 pub mod line_delta;
+pub mod manager;
 pub mod rabin_delta;
 pub mod sort;
 pub mod wire;

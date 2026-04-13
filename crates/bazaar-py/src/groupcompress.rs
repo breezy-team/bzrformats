@@ -808,6 +808,58 @@ fn parse_wire_header<'py>(
     Ok((block_bytes, list))
 }
 
+/// Decide whether a block should be repacked.
+///
+/// `factories` is an iterable of `(start, end)` tuples and `content_length`
+/// is the uncompressed size of the block. Returns
+/// `(action, last_byte_used, total_bytes_used)` where `action` is one of
+/// `None`, `"trim"`, or `"rebuild"`.
+#[pyfunction]
+fn check_rebuild_action<'py>(
+    py: Python<'py>,
+    factories: Vec<(usize, usize)>,
+    content_length: usize,
+) -> PyResult<(Bound<'py, PyAny>, usize, usize)> {
+    let (action, last, total) =
+        bazaar::groupcompress::manager::check_rebuild_action(&factories, content_length);
+    let action: Bound<'py, PyAny> = match action {
+        bazaar::groupcompress::manager::RebuildAction::Keep => py.None().into_bound(py),
+        bazaar::groupcompress::manager::RebuildAction::Trim => "trim".into_pyobject(py)?.into_any(),
+        bazaar::groupcompress::manager::RebuildAction::Rebuild => {
+            "rebuild".into_pyobject(py)?.into_any()
+        }
+    };
+    Ok((action, last, total))
+}
+
+/// Decide whether a block is "well utilized" enough to leave intact.
+///
+/// `factories` is a list of `((start, end), prefix_bytes)` tuples where
+/// `prefix_bytes` is the joined `key[:-1]` for the record (used for the
+/// mixed-content heuristic).
+#[pyfunction]
+#[pyo3(signature = (
+    factories,
+    content_length,
+    max_cut_fraction = 0.75,
+    full_enough_block_size = 3 * 1024 * 1024,
+    full_enough_mixed_block_size = 2 * 768 * 1024,
+))]
+fn check_is_well_utilized(
+    factories: Vec<((usize, usize), Vec<u8>)>,
+    content_length: usize,
+    max_cut_fraction: f64,
+    full_enough_block_size: usize,
+    full_enough_mixed_block_size: usize,
+) -> bool {
+    let settings = bazaar::groupcompress::manager::WellUtilizedSettings {
+        max_cut_fraction,
+        full_enough_block_size,
+        full_enough_mixed_block_size,
+    };
+    bazaar::groupcompress::manager::check_is_well_utilized(&factories, content_length, &settings)
+}
+
 #[pyfunction]
 fn rabin_hash(data: Vec<u8>) -> PyResult<u32> {
     Ok(bazaar::groupcompress::rabin_delta::rabin_hash(
@@ -830,6 +882,8 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(rabin_hash))?;
     m.add_function(wrap_pyfunction!(sort_gc_optimal, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_wire_header, &m)?)?;
+    m.add_function(wrap_pyfunction!(check_rebuild_action, &m)?)?;
+    m.add_function(wrap_pyfunction!(check_is_well_utilized, &m)?)?;
     m.add_class::<GroupCompressBlock>()?;
     m.add_class::<LinesDeltaIndex>()?;
     m.add_class::<TraditionalGroupCompressor>()?;
