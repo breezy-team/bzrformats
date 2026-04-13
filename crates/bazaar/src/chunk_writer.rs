@@ -390,6 +390,17 @@ mod tests {
     }
 
     #[test]
+    fn finish_pads_to_exact_size_when_partial() {
+        // ChunkWriter::finish() must always produce chunks totalling
+        // exactly `chunk_size` (the tail of nulls makes up the difference).
+        let mut writer = ChunkWriter::new(3996, 0, false);
+        assert!(!writer.write(b"hello world\n", false));
+        let finished = writer.finish();
+        let total: usize = finished.bytes_list.iter().map(|b| b.len()).sum();
+        assert_eq!(total, 3996);
+    }
+
+    #[test]
     fn too_much_data_does_not_exceed_size() {
         let lines = make_lines();
         let mut writer = ChunkWriter::new(4096, 0, false);

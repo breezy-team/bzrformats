@@ -370,75 +370,24 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
         :return: A file handle for a temporary file containing a B+Tree for
             the nodes.
         """
-        # The index rows - rows[0] is the root, rows[1] is the layer under it
-        # etc.
-        rows = []
-        # forward sorted by key. In future we may consider topological sorting,
-        # at the cost of table scans for direct lookup, or a second index for
-        # direct lookup
-        key_count = 0
-        # A stack with the number of nodes of each size. 0 is the root node
-        # and must always be 1 (if there are any nodes in the tree).
-        self.row_lengths = []
-        # Loop over all nodes adding them to the bottom row
-        # (rows[-1]). When we finish a chunk in a row,
-        # propagate the key that didn't fit (comes after the chunk) to the
-        # row above, transitively.
-        for node in node_iterator:
-            if key_count == 0:
-                # First key triggers the first row
-                rows.append(_LeafBuilderRow())
-            key_count += 1
-            string_key, line = _btree_serializer._flatten_node(
-                node, self.reference_lists
-            )
-            self._add_key(string_key, line, rows, allow_optimize=allow_optimize)
-        for row in reversed(rows):
-            pad = not isinstance(row, _LeafBuilderRow)
-            row.finish_node(pad=pad)
-        lines = [_BTSIGNATURE]
-        lines.append(b"%s%d\n" % (_OPTION_NODE_REFS, self.reference_lists))
-        lines.append(b"%s%d\n" % (_OPTION_KEY_ELEMENTS, self._key_length))
-        lines.append(b"%s%d\n" % (_OPTION_LEN, key_count))
-        row_lengths = [row.nodes for row in rows]
-        lines.append(
-            _OPTION_ROW_LENGTHS
-            + ",".join(map(str, row_lengths)).encode("ascii")
-            + b"\n"
+        optimize_for_size = allow_optimize and self._optimize_for_size
+        blob = _btree_serializer.serialize_btree_index(
+            node_iterator,
+            self.reference_lists,
+            self._key_length,
+            optimize_for_size=optimize_for_size,
+            page_size=_PAGE_SIZE,
+            reserved_header_bytes=_RESERVED_HEADER_BYTES,
         )
-        if row_lengths and row_lengths[-1] > 1:
+        size = len(blob)
+        # Use a NamedTemporaryFile for larger indexes to match the Python
+        # original's disk-spill behaviour; tests inspect this via .read().
+        if size > _PAGE_SIZE:
             result = tempfile.NamedTemporaryFile(prefix="bzr-index-")
         else:
             result = BytesIO()
-        result.writelines(lines)
-        position = sum(map(len, lines))
-        if position > _RESERVED_HEADER_BYTES:
-            raise AssertionError(
-                "Could not fit the header in the"
-                " reserved space: %d > %d" % (position, _RESERVED_HEADER_BYTES)
-            )
-        # write the rows out:
-        for row in rows:
-            reserved = _RESERVED_HEADER_BYTES  # reserved space for first node
-            row.spool.flush()
-            row.spool.seek(0)
-            # copy nodes to the finalised file.
-            # Special case the first node as it may be prefixed
-            node = row.spool.read(_PAGE_SIZE)
-            result.write(node[reserved:])
-            if len(node) == _PAGE_SIZE:
-                result.write(b"\x00" * (reserved - position))
-            position = 0  # Only the root row actually has an offset
-            copied_len = osutils.pumpfile(row.spool, result)
-            if copied_len != (row.nodes - 1) * _PAGE_SIZE:
-                if not isinstance(row, _LeafBuilderRow):
-                    raise AssertionError(
-                        "Incorrect amount of data copied"
-                        " expected: %d, got: %d"
-                        % ((row.nodes - 1) * _PAGE_SIZE, copied_len)
-                    )
+        result.write(blob)
         result.flush()
-        size = result.tell()
         result.seek(0)
         return result, size
 

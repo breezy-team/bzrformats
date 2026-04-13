@@ -54,26 +54,51 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 const BT_SIGNATURE: &[u8] = b"B+Tree Graph Index 2\n";
-const RESERVED_HEADER_BYTES: usize = 120;
-const PAGE_SIZE: usize = 4096;
+pub const DEFAULT_RESERVED_HEADER_BYTES: usize = 120;
+pub const DEFAULT_PAGE_SIZE: usize = 4096;
 const LEAF_FLAG: &[u8] = b"type=leaf\n";
 const INTERNAL_FLAG: &[u8] = b"type=internal\n";
-const INTERNAL_OFFSET: &[u8] = b"offset=";
+
+/// Page layout parameters for [`BTreeBuilder`] and [`write_nodes`].
+///
+/// The Python tests override `_PAGE_SIZE` and `_RESERVED_HEADER_BYTES` to
+/// force smaller trees for coverage; exposing these as parameters lets the
+/// Rust port mirror those tests.
+#[derive(Debug, Clone, Copy)]
+pub struct Layout {
+    pub page_size: usize,
+    pub reserved_header_bytes: usize,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self {
+            page_size: DEFAULT_PAGE_SIZE,
+            reserved_header_bytes: DEFAULT_RESERVED_HEADER_BYTES,
+        }
+    }
+}
 
 pub struct BTreeBuilder {
     reference_lists: usize,
     key_length: usize,
     optimize_for_size: bool,
+    layout: Layout,
     nodes: BTreeMap<Key, Node>,
 }
 
 impl BTreeBuilder {
     pub fn new(reference_lists: usize, key_elements: usize) -> Self {
+        Self::with_layout(reference_lists, key_elements, Layout::default())
+    }
+
+    pub fn with_layout(reference_lists: usize, key_elements: usize, layout: Layout) -> Self {
         assert!(key_elements >= 1, "key_elements must be >= 1");
         Self {
             reference_lists,
             key_length: key_elements,
             optimize_for_size: false,
+            layout,
             nodes: BTreeMap::new(),
         }
     }
@@ -148,6 +173,7 @@ impl BTreeBuilder {
             self.reference_lists,
             self.key_length,
             self.optimize_for_size,
+            self.layout,
         )
     }
 }
@@ -227,7 +253,7 @@ impl BuilderRow {
         }
     }
 
-    fn finish_node(&mut self, pad: bool) {
+    fn finish_node(&mut self, pad: bool, layout: Layout) {
         if self.is_internal {
             assert!(pad, "internal rows must be padded");
         }
@@ -238,7 +264,8 @@ impl BuilderRow {
         let finished = writer.finish();
         if self.nodes == 0 {
             // Reserve the header bytes at the very start of the first page.
-            self.spool.extend_from_slice(&[0u8; RESERVED_HEADER_BYTES]);
+            self.spool
+                .extend_from_slice(&vec![0u8; layout.reserved_header_bytes]);
         }
         let mut byte_lines = finished.bytes_list;
         let mut skipped_bytes = 0usize;
@@ -249,11 +276,11 @@ impl BuilderRow {
         for b in &byte_lines {
             self.spool.extend_from_slice(b);
         }
-        let remainder = (self.spool.len() + skipped_bytes) % PAGE_SIZE;
+        let remainder = (self.spool.len() + skipped_bytes) % layout.page_size;
         assert_eq!(
             remainder,
             0,
-            "incorrect node length: {}, {}",
+            "incorrect node length: spool={}, remainder={}",
             self.spool.len(),
             remainder
         );
@@ -261,11 +288,12 @@ impl BuilderRow {
     }
 }
 
-fn write_nodes(
+pub fn write_nodes(
     node_iter: &[(Key, Node)],
     reference_lists: usize,
     key_length: usize,
     optimize_for_size: bool,
+    layout: Layout,
 ) -> Result<Vec<u8>, Error> {
     let mut rows: Vec<BuilderRow> = Vec::new();
     let mut key_count = 0usize;
@@ -282,6 +310,7 @@ fn write_nodes(
             &mut rows,
             optimize_for_size,
             /*allow_optimize=*/ true,
+            layout,
         )?;
     }
     // Finish every row that still has an open writer, in reverse so the leaf
@@ -290,7 +319,7 @@ fn write_nodes(
     for (idx, row) in rows.iter_mut().enumerate().rev() {
         let pad = idx < rows_len - 1 || row.is_internal;
         if row.writer.is_some() {
-            row.finish_node(pad);
+            row.finish_node(pad, layout);
         }
     }
 
@@ -310,42 +339,39 @@ fn write_nodes(
     header.extend_from_slice(row_lengths_str.as_bytes());
     header.push(b'\n');
     assert!(
-        header.len() <= RESERVED_HEADER_BYTES,
+        header.len() <= layout.reserved_header_bytes,
         "Could not fit the header in the reserved space: {} > {}",
         header.len(),
-        RESERVED_HEADER_BYTES
+        layout.reserved_header_bytes
     );
 
     let mut result = header;
     let header_len = result.len();
-    // Now write each row. The first page of the *first* row has its header
-    // bytes replaced with the header we just wrote (plus `reserved - position`
-    // bytes of padding zeros to fill the reserved region out to
-    // RESERVED_HEADER_BYTES). For single-page rows the tail of the first
-    // (and only) page may be unpadded for leaves.
-    let mut first_row = true;
+    // Now write each row. For the first row, the first page's header
+    // placeholder is overlaid by the header bytes we just wrote, and the
+    // remainder of the reserved region is zero-padded. For subsequent rows,
+    // the first page is realigned to a page boundary by emitting
+    // `reserved_header_bytes` zeros (since `position` resets to 0 after the
+    // first row).
     let mut position = header_len;
     for row in &rows {
         if row.spool.is_empty() {
             continue;
         }
-        // The first page of this row: copy `spool[RESERVED_HEADER_BYTES..min(PAGE_SIZE, spool.len())]`
+        // The first page of this row: copy `spool[reserved..min(page_size, spool.len())]`
         // (skipping the reserved header placeholder).
-        let first_page_end = std::cmp::min(PAGE_SIZE, row.spool.len());
-        result.extend_from_slice(&row.spool[RESERVED_HEADER_BYTES..first_page_end]);
-        if first_row && row.spool.len() >= PAGE_SIZE {
-            // Pad the tail of the first page out so `position..RESERVED_HEADER_BYTES`
-            // is all zero.
-            assert!(position <= RESERVED_HEADER_BYTES);
-            let pad = RESERVED_HEADER_BYTES - position;
+        let first_page_end = std::cmp::min(layout.page_size, row.spool.len());
+        result.extend_from_slice(&row.spool[layout.reserved_header_bytes..first_page_end]);
+        if row.spool.len() >= layout.page_size {
+            assert!(position <= layout.reserved_header_bytes);
+            let pad = layout.reserved_header_bytes - position;
             result.extend_from_slice(&vec![0u8; pad]);
         }
-        // Remaining pages of this row, each exactly PAGE_SIZE.
-        if row.spool.len() > PAGE_SIZE {
-            result.extend_from_slice(&row.spool[PAGE_SIZE..]);
+        // Remaining pages of this row, each exactly page_size.
+        if row.spool.len() > layout.page_size {
+            result.extend_from_slice(&row.spool[layout.page_size..]);
         }
         position = 0;
-        first_row = false;
     }
     Ok(result)
 }
@@ -356,6 +382,7 @@ fn add_key(
     rows: &mut Vec<BuilderRow>,
     optimize_for_size: bool,
     allow_optimize: bool,
+    layout: Layout,
 ) -> Result<(), Error> {
     let mut new_leaf = false;
     // Ensure the leaf (and any internal rows above with no writer) have an
@@ -366,9 +393,9 @@ fn add_key(
         for pos in 0..rows_len - 1 {
             if rows[pos].writer.is_none() {
                 let length = if rows[pos].nodes == 0 {
-                    PAGE_SIZE - RESERVED_HEADER_BYTES
+                    layout.page_size - layout.reserved_header_bytes
                 } else {
-                    PAGE_SIZE
+                    layout.page_size
                 };
                 let opt = if allow_optimize {
                     optimize_for_size
@@ -384,9 +411,9 @@ fn add_key(
         }
         let leaf_idx = rows_len - 1;
         let length = if rows[leaf_idx].nodes == 0 {
-            PAGE_SIZE - RESERVED_HEADER_BYTES
+            layout.page_size - layout.reserved_header_bytes
         } else {
-            PAGE_SIZE
+            layout.page_size
         };
         let mut writer = ChunkWriter::new(length, 0, optimize_for_size);
         let _ = writer.write(LEAF_FLAG, false);
@@ -406,8 +433,11 @@ fn add_key(
             ));
         }
         // The leaf is full; finish it and propagate the divider key upwards.
+        // Intermediate leaf pages are padded to the full page size — only
+        // the very last leaf page (flushed by the top-level write_nodes
+        // loop) is unpadded.
         let leaf_last = rows.len() - 1;
-        rows[leaf_last].finish_node(false);
+        rows[leaf_last].finish_node(true, layout);
         let mut key_line = string_key.to_vec();
         key_line.push(b'\n');
         let mut new_row_needed = true;
@@ -415,7 +445,7 @@ fn add_key(
             let writer = rows[pos].writer.as_mut().unwrap();
             let overflow = writer.write(&key_line, false);
             if overflow {
-                rows[pos].finish_node(true);
+                rows[pos].finish_node(true, layout);
             } else {
                 new_row_needed = false;
                 break;
@@ -424,8 +454,11 @@ fn add_key(
         if new_row_needed {
             // Insert a new root.
             let mut new_row = BuilderRow::new(true);
-            let mut writer =
-                ChunkWriter::new(PAGE_SIZE - RESERVED_HEADER_BYTES, 0, optimize_for_size);
+            let mut writer = ChunkWriter::new(
+                layout.page_size - layout.reserved_header_bytes,
+                0,
+                optimize_for_size,
+            );
             let _ = writer.write(INTERNAL_FLAG, false);
             let offset_line = format!("offset={}\n", rows[0].nodes - 1);
             let _ = writer.write(offset_line.as_bytes(), false);
@@ -433,7 +466,14 @@ fn add_key(
             new_row.writer = Some(writer);
             rows.insert(0, new_row);
         }
-        return add_key(string_key, line, rows, optimize_for_size, allow_optimize);
+        return add_key(
+            string_key,
+            line,
+            rows,
+            optimize_for_size,
+            allow_optimize,
+            layout,
+        );
     }
     Ok(())
 }
@@ -555,6 +595,28 @@ mod tests {
         let (string_key, line) = flatten_node(&key, value, &[], false);
         assert_eq!(string_key, b"file-id");
         assert_eq!(line, b"file-id\x00\x00val\n");
+    }
+
+    #[test]
+    fn two_leaves_with_reserved_100() {
+        // Mirrors test_btree_index.test_2_leaves_1_0: 400 nodes with the
+        // Python _RESERVED_HEADER_BYTES override set to 100.
+        let layout = Layout {
+            page_size: 4096,
+            reserved_header_bytes: 100,
+        };
+        let mut builder = BTreeBuilder::with_layout(0, 1, layout);
+        for i in 0..400 {
+            let key = vec![pos_to_key(i, b"")];
+            let value = format!("value:{}", i).into_bytes();
+            builder.add_node(key, value, vec![]).unwrap();
+        }
+        let content = builder.finish().unwrap();
+        // The header should start with the signature and claim 400 keys and
+        // some multi-row row_lengths (e.g. "1,2").
+        assert!(content.starts_with(
+            b"B+Tree Graph Index 2\nnode_ref_lists=0\nkey_elements=1\nlen=400\nrow_lengths="
+        ));
     }
 
     #[test]

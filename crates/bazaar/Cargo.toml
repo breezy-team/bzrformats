@@ -28,7 +28,7 @@ maplit = "1.0.2"
 lazy-regex = "3.4.0"
 byteorder = "1.5.0"
 lru = "0.16.3"
-flate2 = "1.0.28"
+flate2 = { version = "1.0.28", default-features = false, features = ["zlib"] }
 xz2 = "0.1.7"
 patiencediff = { version = "0.2.1", default-features = false }
 vcs-graph = "3.4.0"

@@ -785,6 +785,97 @@ fn _py_sha1_to_key<'py>(
     sha1_to_key(py, arr)
 }
 
+/// Serialize an iterable of `(index, key, value, refs?)` nodes into a B+Tree
+/// graph index. Mirrors `BTreeBuilder._write_nodes` on the Python side.
+#[pyfunction]
+#[pyo3(signature = (nodes, reference_lists, key_elements, optimize_for_size=false, page_size=None, reserved_header_bytes=None))]
+fn serialize_btree_index<'py>(
+    py: Python<'py>,
+    nodes: &Bound<'py, PyAny>,
+    reference_lists: usize,
+    key_elements: usize,
+    optimize_for_size: bool,
+    page_size: Option<usize>,
+    reserved_header_bytes: Option<usize>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    use bazaar::btree_builder::{Layout, Node};
+    let layout = Layout {
+        page_size: page_size.unwrap_or(bazaar::btree_builder::DEFAULT_PAGE_SIZE),
+        reserved_header_bytes: reserved_header_bytes
+            .unwrap_or(bazaar::btree_builder::DEFAULT_RESERVED_HEADER_BYTES),
+    };
+
+    // Collect the iterable into a sorted list of (key, Node).
+    let mut collected: Vec<(Vec<Vec<u8>>, Node)> = Vec::new();
+    for item in nodes.try_iter()? {
+        let item = item?;
+        let tuple = item.cast::<PyTuple>()?;
+        // node layout: (index, key_tuple, value[, reference_lists]).
+        let key_any = tuple.get_item(1)?;
+        let key_tuple = key_any.cast::<PyTuple>()?;
+        let key: Vec<Vec<u8>> = key_tuple
+            .iter()
+            .map(|seg| {
+                seg.cast::<PyBytes>()
+                    .map(|b| b.as_bytes().to_vec())
+                    .map_err(|_| PyTypeError::new_err("key segments must be bytes"))
+            })
+            .collect::<PyResult<_>>()?;
+        let value_any = tuple.get_item(2)?;
+        let value_bytes = value_any.cast::<PyBytes>()?.as_bytes().to_vec();
+        let references: Vec<Vec<Vec<Vec<u8>>>> = if reference_lists > 0 {
+            let refs_any = tuple.get_item(3)?;
+            let refs_tuple = refs_any.cast::<PyTuple>()?;
+            let mut rls: Vec<Vec<Vec<Vec<u8>>>> = Vec::with_capacity(refs_tuple.len());
+            for rl in refs_tuple.iter() {
+                let rl_seq = rl.cast::<PyTuple>()?;
+                let mut rl_out: Vec<Vec<Vec<u8>>> = Vec::with_capacity(rl_seq.len());
+                for r in rl_seq.iter() {
+                    let r_tup = r.cast::<PyTuple>()?;
+                    let r_out: Vec<Vec<u8>> = r_tup
+                        .iter()
+                        .map(|seg| {
+                            seg.cast::<PyBytes>()
+                                .map(|b| b.as_bytes().to_vec())
+                                .map_err(|_| PyTypeError::new_err("ref segments must be bytes"))
+                        })
+                        .collect::<PyResult<_>>()?;
+                    rl_out.push(r_out);
+                }
+                rls.push(rl_out);
+            }
+            rls
+        } else {
+            Vec::new()
+        };
+        let node = Node {
+            references,
+            value: value_bytes,
+        };
+        collected.push((key, node));
+    }
+    // The Python caller already feeds us in sorted order via iter_all_entries
+    // but sort defensively just in case.
+    collected.sort_by(|a, b| a.0.cmp(&b.0));
+
+    pyo3::import_exception!(bzrformats.index, BadIndexKey);
+    let bytes = bazaar::btree_builder::write_nodes(
+        &collected,
+        reference_lists,
+        key_elements,
+        optimize_for_size,
+        layout,
+    )
+    .map_err(|e| match e {
+        bazaar::btree_builder::Error::KeyTooBig(key) => {
+            let key_tuple = PyTuple::new(py, key.iter().map(|seg| PyBytes::new(py, seg))).unwrap();
+            BadIndexKey::new_err((key_tuple.unbind(),))
+        }
+        other => PyValueError::new_err(other.to_string()),
+    })?;
+    Ok(PyBytes::new(py, &bytes))
+}
+
 /// Register the btree serializer module.
 pub(crate) fn _btree_serializer_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "btree_serializer")?;
@@ -797,5 +888,6 @@ pub(crate) fn _btree_serializer_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(_py_unhexlify, &m)?)?;
     m.add_function(wrap_pyfunction!(_py_key_to_sha1, &m)?)?;
     m.add_function(wrap_pyfunction!(_py_sha1_to_key, &m)?)?;
+    m.add_function(wrap_pyfunction!(serialize_btree_index, &m)?)?;
     Ok(m)
 }
