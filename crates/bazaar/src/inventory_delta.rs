@@ -629,3 +629,318 @@ pub fn parse_inventory_delta(
         InventoryDelta(result),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split(s: &[u8]) -> Vec<&[u8]> {
+        // Replicates osutils.split_lines: keeps trailing newlines.
+        let mut out = Vec::new();
+        let mut start = 0;
+        for (i, &b) in s.iter().enumerate() {
+            if b == b'\n' {
+                out.push(&s[start..=i]);
+                start = i + 1;
+            }
+        }
+        if start < s.len() {
+            out.push(&s[start..]);
+        }
+        out
+    }
+
+    fn parse(
+        bytes: &[u8],
+    ) -> Result<(RevisionId, RevisionId, bool, bool, InventoryDelta), InventoryDeltaParseError>
+    {
+        let lines = split(bytes);
+        parse_inventory_delta(&lines, None, None)
+    }
+
+    #[test]
+    fn parse_no_bytes_errors() {
+        let err = parse_inventory_delta(&[], None, None).unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("empty")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn parse_bad_format_errors() {
+        let err = parse(b"format: foo\n").unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("unknown format")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn parse_no_parent_marker_errors() {
+        let err = parse(b"format: bzr inventory delta v1 (bzr 1.14)\n").unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("missing parent")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn parse_no_version_marker_errors() {
+        let err = parse(b"format: bzr inventory delta v1 (bzr 1.14)\nparent: null:\n").unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("missing version")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn parse_versioned_root_only_round_trip() {
+        let bytes = b"format: bzr inventory delta v1 (bzr 1.14)\n\
+parent: null:\n\
+version: entry-version\n\
+versioned_root: true\n\
+tree_references: true\n\
+None\x00/\x00an-id\x00\x00a@e\xc3\xa5ample.com--2004\x00dir\n";
+        let (parent, version, versioned_root, tree_refs, delta) = parse(bytes).unwrap();
+        assert_eq!(parent.as_bytes(), b"null:");
+        assert_eq!(version.as_bytes(), b"entry-version");
+        assert!(versioned_root);
+        assert!(tree_refs);
+        assert_eq!(delta.0.len(), 1);
+        let item = &delta.0[0];
+        assert_eq!(item.old_path, None);
+        assert_eq!(item.new_path.as_deref(), Some(""));
+        assert_eq!(item.file_id.as_bytes(), b"an-id");
+    }
+
+    #[test]
+    fn parse_duplicate_file_id_errors() {
+        let bytes = b"format: bzr inventory delta v1 (bzr 1.14)\n\
+parent: null:\n\
+version: null:\n\
+versioned_root: true\n\
+tree_references: true\n\
+None\x00/\x00an-id\x00\x00a@e\xc3\xa5ample.com--2004\x00dir\n\
+None\x00/\x00an-id\x00\x00a@e\xc3\xa5ample.com--2004\x00dir\n";
+        let err = parse(bytes).unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("duplicate file id")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn parse_versioned_root_when_disabled_errors() {
+        let bytes = b"format: bzr inventory delta v1 (bzr 1.14)\n\
+parent: null:\n\
+version: null:\n\
+versioned_root: true\n\
+tree_references: true\n";
+        let lines = split(bytes);
+        let err = parse_inventory_delta(&lines, Some(false), None).unwrap_err();
+        match err {
+            InventoryDeltaParseError::Incompatible(msg) => assert!(msg.contains("versioned_root")),
+            _ => panic!("expected Incompatible"),
+        }
+    }
+
+    #[test]
+    fn parse_last_line_not_empty_errors() {
+        // No trailing newline on the last line.
+        let err = parse(b"format: bzr inventory delta v1 (bzr 1.14)\nparent: null:\nversion: x")
+            .unwrap_err();
+        match err {
+            InventoryDeltaParseError::Invalid(msg) => assert!(msg.contains("last line")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    use crate::inventory::Entry;
+    use crate::FileId;
+
+    fn parent_id() -> FileId {
+        FileId::from(b"parent".to_vec())
+    }
+
+    fn file_id() -> FileId {
+        FileId::from(b"file-id".to_vec())
+    }
+
+    #[test]
+    fn serialize_dir_entry() {
+        let entry = Entry::directory(file_id(), "a dir".to_string(), parent_id(), None);
+        assert_eq!(serialize_inventory_entry(&entry).unwrap(), b"dir".to_vec());
+    }
+
+    #[test]
+    fn serialize_file_zero_length_short_sha() {
+        let entry = Entry::file(
+            file_id(),
+            "a file".to_string(),
+            parent_id(),
+            None,
+            Some(b"".to_vec()),
+            Some(0),
+            Some(false),
+            None,
+        );
+        assert_eq!(
+            serialize_inventory_entry(&entry).unwrap(),
+            b"file\x000\x00\x00".to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_file_with_sha_and_size() {
+        let entry = Entry::file(
+            file_id(),
+            "a file".to_string(),
+            parent_id(),
+            None,
+            Some(b"foo".to_vec()),
+            Some(10),
+            Some(false),
+            None,
+        );
+        assert_eq!(
+            serialize_inventory_entry(&entry).unwrap(),
+            b"file\x0010\x00\x00foo".to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_file_executable() {
+        let entry = Entry::file(
+            file_id(),
+            "a file".to_string(),
+            parent_id(),
+            None,
+            Some(b"foo".to_vec()),
+            Some(10),
+            Some(true),
+            None,
+        );
+        assert_eq!(
+            serialize_inventory_entry(&entry).unwrap(),
+            b"file\x0010\x00Y\x00foo".to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_file_without_size_errors() {
+        let entry = Entry::file(
+            file_id(),
+            "a file".to_string(),
+            parent_id(),
+            None,
+            Some(b"foo".to_vec()),
+            None,
+            Some(false),
+            None,
+        );
+        assert!(serialize_inventory_entry(&entry).is_err());
+    }
+
+    #[test]
+    fn serialize_file_without_sha1_errors() {
+        let entry = Entry::file(
+            file_id(),
+            "a file".to_string(),
+            parent_id(),
+            None,
+            None,
+            Some(10),
+            Some(false),
+            None,
+        );
+        assert!(serialize_inventory_entry(&entry).is_err());
+    }
+
+    #[test]
+    fn serialize_link_empty_target() {
+        let entry = Entry::link(
+            file_id(),
+            "a link".to_string(),
+            parent_id(),
+            None,
+            Some("".to_string()),
+        );
+        assert_eq!(
+            serialize_inventory_entry(&entry).unwrap(),
+            b"link\x00".to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_link_unicode_target() {
+        let entry = Entry::link(
+            file_id(),
+            "a link".to_string(),
+            parent_id(),
+            None,
+            Some(" \u{e5}".to_string()),
+        );
+        assert_eq!(
+            serialize_inventory_entry(&entry).unwrap(),
+            b"link\x00 \xc3\xa5".to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_link_space_target() {
+        let entry = Entry::link(
+            file_id(),
+            "a link".to_string(),
+            parent_id(),
+            None,
+            Some(" ".to_string()),
+        );
+        assert_eq!(
+            serialize_inventory_entry(&entry).unwrap(),
+            b"link\x00 ".to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_link_no_target_errors() {
+        let entry = Entry::link(file_id(), "a link".to_string(), parent_id(), None, None);
+        assert!(serialize_inventory_entry(&entry).is_err());
+    }
+
+    #[test]
+    fn serialize_reference_null() {
+        let entry = Entry::tree_reference(
+            file_id(),
+            "a tree".to_string(),
+            parent_id(),
+            None,
+            Some(crate::RevisionId::from(crate::NULL_REVISION.to_vec())),
+        );
+        assert_eq!(
+            serialize_inventory_entry(&entry).unwrap(),
+            b"tree\x00null:".to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_reference_revision() {
+        let entry = Entry::tree_reference(
+            file_id(),
+            "a tree".to_string(),
+            parent_id(),
+            None,
+            Some(crate::RevisionId::from(b"foo@\xc3\xa5b-lah".to_vec())),
+        );
+        assert_eq!(
+            serialize_inventory_entry(&entry).unwrap(),
+            b"tree\x00foo@\xc3\xa5b-lah".to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_reference_no_reference_errors() {
+        let entry = Entry::tree_reference(file_id(), "a tree".to_string(), parent_id(), None, None);
+        assert!(serialize_inventory_entry(&entry).is_err());
+    }
+}

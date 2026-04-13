@@ -105,6 +105,120 @@ pub fn bisect_path_right(paths: &[&Path], path: &Path) -> usize {
     lo
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> &Path {
+        Path::new(s)
+    }
+
+    /// Python's assertCmpByDirs(expected, a, b) with expected in {-1, 0, 1}.
+    fn assert_cmp(expected: i32, a: &str, b: &str) {
+        let (pa, pb) = (p(a), p(b));
+        match expected {
+            0 => {
+                assert_eq!(a, b);
+                assert!(!lt_by_dirs(pa, pb));
+                assert!(!lt_by_dirs(pb, pa));
+            }
+            v if v > 0 => {
+                assert!(!lt_by_dirs(pa, pb));
+                assert!(lt_by_dirs(pb, pa));
+            }
+            _ => {
+                assert!(lt_by_dirs(pa, pb));
+                assert!(!lt_by_dirs(pb, pa));
+            }
+        }
+    }
+
+    #[test]
+    fn lt_by_dirs_cmp_empty() {
+        assert_cmp(0, "", "");
+        assert_cmp(1, "a", "");
+        assert_cmp(1, "abcdef", "");
+        assert_cmp(1, "test/ing/a/path/", "");
+    }
+
+    #[test]
+    fn lt_by_dirs_cmp_same_str() {
+        for s in ["a", "ab", "abc", "a/b", "a/b/c/d/e"] {
+            assert_cmp(0, s, s);
+        }
+    }
+
+    #[test]
+    fn lt_by_dirs_simple_paths() {
+        assert_cmp(-1, "a", "b");
+        assert_cmp(-1, "aa", "ab");
+        assert_cmp(-1, "ab", "bb");
+        assert_cmp(-1, "a/a", "a/b");
+        assert_cmp(-1, "a/b", "b/b");
+        assert_cmp(-1, "a/a/a", "a/a/b");
+    }
+
+    #[test]
+    fn lt_by_dirs_tricky_paths() {
+        assert_cmp(1, "ab/cd/ef", "ab/cc/ef");
+        assert_cmp(1, "ab/cd/ef", "ab/c/ef");
+        assert_cmp(-1, "ab/cd/ef", "ab/cd-ef");
+        assert_cmp(-1, "ab/cd", "ab/cd-");
+        assert_cmp(-1, "ab/cd", "ab-cd");
+    }
+
+    #[test]
+    fn lt_by_dirs_non_ascii() {
+        // \u{b5} < \u{e5}
+        assert_cmp(-1, "\u{b5}", "\u{e5}");
+        assert_cmp(-1, "a", "\u{e5}");
+        assert_cmp(-1, "b", "\u{b5}");
+        assert_cmp(-1, "a/b", "a/\u{e5}");
+        assert_cmp(-1, "b/a", "b/\u{b5}");
+    }
+
+    #[test]
+    fn lt_path_by_dirblock_simple_sorted_list() {
+        // Sorted by dirblock: all paths in a directory before subdirectories.
+        let paths: Vec<&Path> = vec![p(""), p("a"), p("ab"), p("abc"), p("a/b/c"), p("b/d/e")];
+        for (i, a) in paths.iter().enumerate() {
+            for (j, b) in paths.iter().enumerate() {
+                assert_eq!(
+                    lt_path_by_dirblock(a, b),
+                    i < j,
+                    "lt_path_by_dirblock({:?}, {:?}) mismatched i={} j={}",
+                    a,
+                    b,
+                    i,
+                    j,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bisect_path_left_simple_list() {
+        let paths: Vec<&Path> = vec![p(""), p("a"), p("b"), p("c"), p("d")];
+        for (i, path) in paths.iter().enumerate() {
+            assert_eq!(bisect_path_left(&paths, path), i);
+        }
+        // Insertion positions for missing elements.
+        assert_eq!(bisect_path_left(&paths, p("_")), 1);
+        assert_eq!(bisect_path_left(&paths, p("aa")), 2);
+        assert_eq!(bisect_path_left(&paths, p("bb")), 3);
+        assert_eq!(bisect_path_left(&paths, p("dd")), 5);
+    }
+
+    #[test]
+    fn bisect_path_right_after_equal_entry() {
+        let paths: Vec<&Path> = vec![p(""), p("a"), p("b"), p("c"), p("d")];
+        for (i, path) in paths.iter().enumerate() {
+            // bisect_right on an existing entry returns the slot after it.
+            assert_eq!(bisect_path_right(&paths, path), i + 1);
+        }
+    }
+}
+
 #[cfg(unix)]
 pub fn pack_stat_metadata(metadata: &Metadata) -> String {
     pack_stat(

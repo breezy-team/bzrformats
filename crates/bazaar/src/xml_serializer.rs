@@ -436,3 +436,113 @@ impl XMLRevisionSerializer for XMLRevisionSerializer5 {
         "5"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_and_escape_simple_ascii_passes_through() {
+        assert_eq!(encode_and_escape_string("foo bar"), "foo bar");
+        assert_eq!(encode_and_escape_bytes(b"foo bar"), "foo bar");
+    }
+
+    #[test]
+    fn encode_and_escape_xml_special_chars() {
+        assert_eq!(
+            encode_and_escape_string("&'\"<>"),
+            "&amp;&apos;&quot;&lt;&gt;"
+        );
+        assert_eq!(
+            encode_and_escape_bytes(b"&'\"<>"),
+            "&amp;&apos;&quot;&lt;&gt;"
+        );
+    }
+
+    #[test]
+    fn encode_and_escape_utf8_with_xml() {
+        // u'\xb5\xe5&\u062c'
+        let utf8_str = b"\xc2\xb5\xc3\xa5&\xd8\xac";
+        assert_eq!(
+            encode_and_escape_bytes(utf8_str),
+            "&#181;&#229;&amp;&#1580;"
+        );
+    }
+
+    #[test]
+    fn encode_and_escape_unicode_str() {
+        let uni_str = "\u{b5}\u{e5}&\u{62c}";
+        assert_eq!(
+            encode_and_escape_string(uni_str),
+            "&#181;&#229;&amp;&#1580;"
+        );
+    }
+
+    #[test]
+    fn escape_invalid_chars_keeps_normal_text() {
+        assert_eq!(escape_invalid_chars("hello world"), "hello world");
+    }
+
+    #[test]
+    fn escape_invalid_chars_escapes_control_codes() {
+        // \x01 is a forbidden XML control char and should be escaped.
+        assert_eq!(escape_invalid_chars("a\x01b"), "a\\x01b");
+    }
+
+    #[test]
+    fn escape_invalid_chars_keeps_tab_newline_cr() {
+        assert_eq!(escape_invalid_chars("a\tb\nc\rd"), "a\tb\nc\rd");
+    }
+
+    use crate::serializer::RevisionSerializer;
+
+    const REVISION_V5: &[u8] = b"<revision committer=\"Martin Pool &lt;mbp@sourcefrog.net&gt;\"\n    inventory_sha1=\"e79c31c1deb64c163cf660fdedd476dd579ffd41\"\n    revision_id=\"mbp@sourcefrog.net-20050905080035-e0439293f8b6b9f9\"\n    timestamp=\"1125907235.212\"\n    timezone=\"36000\">\n<message>- start splitting code for xml (de)serialization away from objects\n  preparatory to supporting multiple formats by a single library\n</message>\n<parents>\n<revision_ref revision_id=\"mbp@sourcefrog.net-20050905063503-43948f59fa127d92\"/>\n</parents>\n</revision>\n";
+
+    const REVISION_V5_UTC: &[u8] = b"<revision committer=\"Martin Pool &lt;mbp@sourcefrog.net&gt;\"\n    inventory_sha1=\"e79c31c1deb64c163cf660fdedd476dd579ffd41\"\n    revision_id=\"mbp@sourcefrog.net-20050905080035-e0439293f8b6b9f9\"\n    timestamp=\"1125907235.212\"\n    timezone=\"0\">\n<message>- start splitting code for xml (de)serialization away from objects\n  preparatory to supporting multiple formats by a single library\n</message>\n<parents>\n<revision_ref revision_id=\"mbp@sourcefrog.net-20050905063503-43948f59fa127d92\"/>\n</parents>\n</revision>\n";
+
+    #[test]
+    fn unpack_revision_v5_committer_and_timezone() {
+        let serializer = XMLRevisionSerializer5;
+        let rev = serializer.read_revision_from_string(REVISION_V5).unwrap();
+        assert_eq!(
+            rev.committer.as_deref(),
+            Some("Martin Pool <mbp@sourcefrog.net>")
+        );
+        assert_eq!(rev.parent_ids.len(), 1);
+        assert_eq!(rev.timezone, Some(36000));
+        assert_eq!(
+            rev.parent_ids[0].as_bytes(),
+            b"mbp@sourcefrog.net-20050905063503-43948f59fa127d92"
+        );
+    }
+
+    #[test]
+    fn unpack_revision_v5_utc_timezone_zero() {
+        let serializer = XMLRevisionSerializer5;
+        let rev = serializer
+            .read_revision_from_string(REVISION_V5_UTC)
+            .unwrap();
+        assert_eq!(rev.timezone, Some(0));
+        assert_eq!(rev.parent_ids.len(), 1);
+    }
+
+    #[test]
+    fn repack_revision_v5_round_trips() {
+        let serializer = XMLRevisionSerializer5;
+        let rev = serializer.read_revision_from_string(REVISION_V5).unwrap();
+        let bytes = serializer.write_revision_to_string(&rev).unwrap();
+        let rev2 = serializer.read_revision_from_string(&bytes).unwrap();
+        assert_eq!(rev, rev2);
+    }
+
+    #[test]
+    fn repack_revision_v5_utc_round_trips() {
+        let serializer = XMLRevisionSerializer5;
+        let rev = serializer
+            .read_revision_from_string(REVISION_V5_UTC)
+            .unwrap();
+        let bytes = serializer.write_revision_to_string(&rev).unwrap();
+        let rev2 = serializer.read_revision_from_string(&bytes).unwrap();
+        assert_eq!(rev, rev2);
+    }
+}
