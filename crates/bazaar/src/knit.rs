@@ -429,6 +429,89 @@ pub fn build_network_record(
     out
 }
 
+/// One entry of the `_raw_record_map` table that
+/// [`build_knit_delta_closure_wire`] consumes.
+///
+/// `parents` is `None` for the literal `None:` parents line (the Python side
+/// distinguishes this via `global_map.get(key)` returning `None`).
+pub struct KnitDeltaClosureRecord<'a> {
+    pub key: &'a [&'a [u8]],
+    pub parents: Option<&'a [&'a [&'a [u8]]]>,
+    pub method: &'a [u8],
+    pub noeol: bool,
+    pub next: Option<&'a [&'a [u8]]>,
+    pub record_bytes: &'a [u8],
+}
+
+fn write_key_joined(out: &mut Vec<u8>, key: &[&[u8]]) {
+    for (i, seg) in key.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\x00');
+        }
+        out.extend_from_slice(seg);
+    }
+}
+
+fn write_parents_line(out: &mut Vec<u8>, parents: Option<&[&[&[u8]]]>) {
+    match parents {
+        None => out.extend_from_slice(b"None:"),
+        Some(list) => {
+            for (i, p) in list.iter().enumerate() {
+                if i > 0 {
+                    out.push(b'\t');
+                }
+                write_key_joined(out, p);
+            }
+        }
+    }
+}
+
+/// Serialize a `knit-delta-closure` wire record.
+///
+/// Mirrors `_ContentMapGenerator._wire_bytes` byte-for-byte. The Python parser
+/// is `_NetworkContentMapGenerator`; the on-wire format is: storage kind line,
+/// `annotated` flag line, `\t`-joined emit keys line, then a run of records
+/// each carrying `key / parents / method / noeol flag / next / byte count /
+/// record body`.
+pub fn build_knit_delta_closure_wire(
+    annotated: bool,
+    emit_keys: &[&[&[u8]]],
+    records: &[KnitDeltaClosureRecord<'_>],
+) -> Vec<u8> {
+    let body_estimate: usize = records.iter().map(|r| r.record_bytes.len() + 64).sum();
+    let mut out = Vec::with_capacity(64 + body_estimate);
+    out.extend_from_slice(b"knit-delta-closure\n");
+    if annotated {
+        out.extend_from_slice(b"annotated");
+    }
+    out.push(b'\n');
+    for (i, key) in emit_keys.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\t');
+        }
+        write_key_joined(&mut out, key);
+    }
+    out.push(b'\n');
+    for rec in records {
+        write_key_joined(&mut out, rec.key);
+        out.push(b'\n');
+        write_parents_line(&mut out, rec.parents);
+        out.push(b'\n');
+        out.extend_from_slice(rec.method);
+        out.push(b'\n');
+        out.push(if rec.noeol { b'T' } else { b'F' });
+        out.push(b'\n');
+        if let Some(next) = rec.next {
+            write_key_joined(&mut out, next);
+        }
+        out.push(b'\n');
+        out.extend_from_slice(rec.record_bytes.len().to_string().as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(rec.record_bytes);
+    }
+    out
+}
+
 /// Fields of a parsed knit record header: `(method, version_id, count, digest)`.
 ///
 /// Mirrors the 4-tuple returned by `_KnitData._split_header`, but typed.
@@ -920,6 +1003,73 @@ mod tests {
         let header = parse_network_record_header(bytes, 11).unwrap();
         assert_eq!(header.parents.unwrap().len(), 0);
         assert_eq!(header.raw_record, b"X");
+    }
+
+    #[test]
+    fn knit_delta_closure_wire_matches_python_layout() {
+        // Reference bytes built by hand from the Python _wire_bytes layout.
+        // emit_keys: [(file, rev1), (rev2,)]
+        // records: one with None parents, method "line-delta", noeol=True,
+        // next=(), record body b"BODY-1"; second annotated=False path.
+        let key1: &[&[u8]] = &[b"file", b"rev1"];
+        let key2: &[&[u8]] = &[b"rev2"];
+        let emit_keys: &[&[&[u8]]] = &[key1, key2];
+
+        let parent_a: &[&[u8]] = &[b"file", b"p0"];
+        let rec2_parents: &[&[&[u8]]] = &[parent_a];
+        let next2: &[&[u8]] = &[b"file", b"rev1"];
+
+        let records = [
+            KnitDeltaClosureRecord {
+                key: key1,
+                parents: None,
+                method: b"line-delta",
+                noeol: true,
+                next: None,
+                record_bytes: b"BODY-1",
+            },
+            KnitDeltaClosureRecord {
+                key: key2,
+                parents: Some(rec2_parents),
+                method: b"fulltext",
+                noeol: false,
+                next: Some(next2),
+                record_bytes: b"BODY-2",
+            },
+        ];
+
+        let out = build_knit_delta_closure_wire(true, emit_keys, &records);
+
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"knit-delta-closure\n");
+        expected.extend_from_slice(b"annotated\n");
+        expected.extend_from_slice(b"file\x00rev1\trev2\n");
+        // record 1
+        expected.extend_from_slice(b"file\x00rev1\n");
+        expected.extend_from_slice(b"None:\n");
+        expected.extend_from_slice(b"line-delta\n");
+        expected.extend_from_slice(b"T\n");
+        expected.extend_from_slice(b"\n"); // empty "next" line
+        expected.extend_from_slice(b"6\n"); // len("BODY-1")
+        expected.extend_from_slice(b"BODY-1");
+        // record 2
+        expected.extend_from_slice(b"rev2\n");
+        expected.extend_from_slice(b"file\x00p0\n");
+        expected.extend_from_slice(b"fulltext\n");
+        expected.extend_from_slice(b"F\n");
+        expected.extend_from_slice(b"file\x00rev1\n");
+        expected.extend_from_slice(b"6\n");
+        expected.extend_from_slice(b"BODY-2");
+
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn knit_delta_closure_wire_unannotated_has_blank_flag_line() {
+        let emit_keys: &[&[&[u8]]] = &[];
+        let out = build_knit_delta_closure_wire(false, emit_keys, &[]);
+        // knit-delta-closure\n + empty-annotated-line\n + empty-keys-line\n
+        assert_eq!(out, b"knit-delta-closure\n\n\n".to_vec());
     }
 
     #[test]

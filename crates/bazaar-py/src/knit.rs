@@ -534,6 +534,105 @@ fn build_network_record_rs<'py>(
     PyBytes::new(py, &out)
 }
 
+/// Serialize a knit-delta-closure wire record. Mirrors
+/// `_ContentMapGenerator._wire_bytes`.
+///
+/// `records` is a list of
+/// `(key, parents_or_none, method, noeol, next_or_none, record_bytes)` tuples,
+/// where `parents_or_none` is `None` for the literal `None:` line and
+/// `key`/`next`/each parent key are tuples of bytes.
+#[pyfunction]
+#[pyo3(signature = (annotated, emit_keys, records))]
+fn build_knit_delta_closure_wire_rs<'py>(
+    py: Python<'py>,
+    annotated: bool,
+    emit_keys: Vec<Vec<Vec<u8>>>,
+    records: Vec<(
+        Vec<Vec<u8>>,
+        Option<Vec<Vec<Vec<u8>>>>,
+        String,
+        bool,
+        Option<Vec<Vec<u8>>>,
+        Vec<u8>,
+    )>,
+) -> Bound<'py, PyBytes> {
+    // Own all the reference-backed data in local vectors so the builder
+    // sees `&[...]` slices that outlive the call.
+    let emit_refs_owned: Vec<Vec<&[u8]>> = emit_keys
+        .iter()
+        .map(|k| k.iter().map(|v| v.as_slice()).collect())
+        .collect();
+    let emit_refs: Vec<&[&[u8]]> = emit_refs_owned.iter().map(|k| k.as_slice()).collect();
+
+    struct OwnedRecord {
+        key: Vec<Vec<u8>>,
+        parents: Option<Vec<Vec<Vec<u8>>>>,
+        method: String,
+        noeol: bool,
+        next: Option<Vec<Vec<u8>>>,
+        record_bytes: Vec<u8>,
+    }
+    let owned: Vec<OwnedRecord> = records
+        .into_iter()
+        .map(|(k, p, m, n, nx, rb)| OwnedRecord {
+            key: k,
+            parents: p,
+            method: m,
+            noeol: n,
+            next: nx,
+            record_bytes: rb,
+        })
+        .collect();
+
+    // Build two levels of &slice shells: one for each record's parents and
+    // `next`, one for the top-level record list.
+    let per_record_key_refs: Vec<Vec<&[u8]>> = owned
+        .iter()
+        .map(|r| r.key.iter().map(|v| v.as_slice()).collect())
+        .collect();
+    let per_record_next_refs: Vec<Option<Vec<&[u8]>>> = owned
+        .iter()
+        .map(|r| {
+            r.next
+                .as_ref()
+                .map(|n| n.iter().map(|v| v.as_slice()).collect())
+        })
+        .collect();
+    let per_record_parent_outer: Vec<Option<Vec<Vec<&[u8]>>>> = owned
+        .iter()
+        .map(|r| {
+            r.parents.as_ref().map(|ps| {
+                ps.iter()
+                    .map(|p| p.iter().map(|v| v.as_slice()).collect())
+                    .collect()
+            })
+        })
+        .collect();
+    let per_record_parent_slices: Vec<Option<Vec<&[&[u8]]>>> = per_record_parent_outer
+        .iter()
+        .map(|o| {
+            o.as_ref()
+                .map(|ps| ps.iter().map(|p| p.as_slice()).collect())
+        })
+        .collect();
+
+    let record_refs: Vec<bazaar::knit::KnitDeltaClosureRecord<'_>> = owned
+        .iter()
+        .enumerate()
+        .map(|(i, r)| bazaar::knit::KnitDeltaClosureRecord {
+            key: per_record_key_refs[i].as_slice(),
+            parents: per_record_parent_slices[i].as_deref(),
+            method: r.method.as_bytes(),
+            noeol: r.noeol,
+            next: per_record_next_refs[i].as_deref(),
+            record_bytes: r.record_bytes.as_slice(),
+        })
+        .collect();
+
+    let out = bazaar::knit::build_knit_delta_closure_wire(annotated, &emit_refs, &record_refs);
+    PyBytes::new(py, &out)
+}
+
 /// Decompress only enough of a knit record to parse its header. Returns
 /// `(method, version_id, count, digest)` without validating the line count
 /// or end marker — `_KnitData._read_records_iter_raw` relies on this
@@ -597,5 +696,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(record_to_data_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_record_header_only_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     Ok(m)
 }

@@ -1446,11 +1446,6 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
             self._check_lines_not_unicode(lines)
             self._check_lines_are_lines(lines)
 
-    def _check_header(self, key, line):
-        rec = self._split_header(line)
-        self._check_header_version(rec, key[-1])
-        return rec
-
     def _check_header_version(self, rec, version_id):
         """Checks the header version on original format knit records.
 
@@ -2351,12 +2346,6 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
             key[-1], digest, len(lines), payload, has_trailing_newline
         )
 
-    def _split_header(self, line):
-        rec = line.split()
-        if len(rec) != 4:
-            raise KnitCorrupt(self, "unexpected number of elements in record header")
-        return rec
-
     def keys(self):
         """See VersionedFiles.keys."""
         evil_logger.debug("keys scales with size of history")
@@ -2499,57 +2488,24 @@ class _ContentMapGenerator:
         :param key: A key from the content generator.
         :return: Bytes to put on the wire.
         """
-        lines = []
-        # kind marker for dispatch on the far side,
-        lines.append(b"knit-delta-closure")
-        # Annotated or not
-        if self.vf._factory.annotated:
-            lines.append(b"annotated")
-        else:
-            lines.append(b"")
-        # then the list of keys
-        lines.append(
-            b"\t".join(
-                b"\x00".join(key) for key in self.keys if key not in self.nonlocal_keys
-            )
-        )
-        # then the _raw_record_map in serialised form:
-        map_byte_list = []
-        # for each item in the map:
-        # 1 line with key
-        # 1 line with parents if the key is to be yielded (None: for None, '' for ())
-        # one line with method
-        # one line with noeol
-        # one line with next ('' for None)
-        # one line with byte count of the record bytes
-        # the record bytes
+        nonlocal_keys = self.nonlocal_keys
+        emit_keys = [list(k) for k in self.keys if k not in nonlocal_keys]
+        records = []
         for key, (record_bytes, (method, noeol), next) in self._raw_record_map.items():
-            key_bytes = b"\x00".join(key)
             parents = self.global_map.get(key, None)
-            if parents is None:
-                parent_bytes = b"None:"
-            else:
-                parent_bytes = b"\t".join(b"\x00".join(key) for key in parents)
-            method_bytes = method.encode("ascii")
-            noeol_bytes = b"T" if noeol else b"F"
-            next_bytes = b"\x00".join(next) if next else b""
-            map_byte_list.append(
-                b"\n".join(
-                    [
-                        key_bytes,
-                        parent_bytes,
-                        method_bytes,
-                        noeol_bytes,
-                        next_bytes,
-                        b"%d" % len(record_bytes),
-                        record_bytes,
-                    ]
+            records.append(
+                (
+                    list(key),
+                    None if parents is None else [list(p) for p in parents],
+                    method,
+                    bool(noeol),
+                    list(next) if next else None,
+                    record_bytes,
                 )
             )
-        map_bytes = b"".join(map_byte_list)
-        lines.append(map_bytes)
-        bytes = b"\n".join(lines)
-        return bytes
+        return _knit_rs.build_knit_delta_closure_wire_rs(
+            self.vf._factory.annotated, emit_keys, records
+        )
 
 
 class _VFContentMapGenerator(_ContentMapGenerator):
