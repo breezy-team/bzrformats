@@ -8,6 +8,7 @@ use pyo3::types::{PyBytes, PyString};
 use pyo3_filelike::PyBinaryFile;
 use std::collections::HashMap;
 
+mod bisect_multi;
 mod btree_index;
 mod btree_serializer;
 mod chk_map;
@@ -569,6 +570,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let btree_serializerm = btree_serializer::_btree_serializer_rs(py)?;
     m.add_submodule(&btree_serializerm)?;
 
+    let bisect_multim = bisect_multi::_bisect_multi_rs(py)?;
+    m.add_submodule(&bisect_multim)?;
+
     // PyO3 submodule hack for proper import support
     let sys = py.import("sys")?;
     let modules = sys.getattr("modules")?;
@@ -595,6 +599,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
         format!("{}.btree_serializer", module_name),
         &btree_serializerm,
     )?;
+    modules.set_item(format!("{}.bisect_multi", module_name), &bisect_multim)?;
 
     Ok(())
 }
