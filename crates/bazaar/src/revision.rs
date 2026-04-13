@@ -110,3 +110,69 @@ impl std::fmt::Display for Revision {
         write!(f, "Revision({})", self.revision_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make(message: &str, committer: Option<&str>, props: &[(&str, &str)]) -> Revision {
+        let properties = props
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+            .collect();
+        Revision::new(
+            RevisionId::from(b"1".to_vec()),
+            vec![],
+            committer.map(str::to_string),
+            message.to_string(),
+            properties,
+            None,
+            0.0,
+            Some(0),
+        )
+    }
+
+    #[test]
+    fn get_summary_takes_first_line_of_message() {
+        assert_eq!(make("a", Some(""), &[]).get_summary(), "a");
+        assert_eq!(make("a\nb", Some(""), &[]).get_summary(), "a");
+        assert_eq!(make("\na\nb", Some(""), &[]).get_summary(), "a");
+    }
+
+    #[test]
+    fn get_summary_empty_message_is_empty() {
+        assert_eq!(make("", Some(""), &[]).get_summary(), "");
+    }
+
+    #[test]
+    fn get_apparent_authors_falls_back_to_committer() {
+        assert_eq!(
+            make("", Some("A"), &[]).get_apparent_authors(),
+            vec!["A".to_string()]
+        );
+    }
+
+    #[test]
+    fn get_apparent_authors_prefers_author_property() {
+        assert_eq!(
+            make("", Some("A"), &[("author", "B")]).get_apparent_authors(),
+            vec!["B".to_string()]
+        );
+    }
+
+    #[test]
+    fn get_apparent_authors_prefers_authors_list_property() {
+        assert_eq!(
+            make("", Some("A"), &[("author", "B"), ("authors", "C\nD")]).get_apparent_authors(),
+            vec!["C".to_string(), "D".to_string()]
+        );
+    }
+
+    #[test]
+    fn get_apparent_authors_empty_committer_returns_empty_list() {
+        assert_eq!(
+            make("", Some(""), &[]).get_apparent_authors(),
+            Vec::<String>::new()
+        );
+    }
+}
