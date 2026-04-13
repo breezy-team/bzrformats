@@ -471,6 +471,37 @@ fn parse_network_record_header_rs<'py>(
     Ok((key, parents, header.noeol, raw_offset))
 }
 
+/// Decompress and split a knit record body, returning
+/// `((method, version_id, count, digest), record_contents)`.
+///
+/// Mirrors `_KnitData._parse_record_unchecked`. On corruption raises
+/// `ValueError` with a descriptive message; the Python caller rewraps it
+/// as `KnitCorrupt(self, ...)`.
+#[pyfunction]
+fn parse_record_unchecked_rs<'py>(
+    py: Python<'py>,
+    data: &[u8],
+) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, pyo3::types::PyList>)> {
+    let (rec, contents) = bazaar::knit::parse_record_unchecked(data)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let header = PyTuple::new(
+        py,
+        [
+            PyBytes::new(py, &rec.method).into_any(),
+            PyBytes::new(py, &rec.version_id).into_any(),
+            // Python historically returns the count field as bytes (it was
+            // not converted). The caller does `int(rec[2])` itself.
+            PyBytes::new(py, rec.count.to_string().as_bytes()).into_any(),
+            PyBytes::new(py, &rec.digest).into_any(),
+        ],
+    )?;
+    let list = pyo3::types::PyList::empty(py);
+    for line in &contents {
+        list.append(PyBytes::new(py, line))?;
+    }
+    Ok((header, list))
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data_c, &m)?)?;
@@ -482,5 +513,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(lower_line_delta_raw_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(get_line_delta_blocks_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_network_record_header_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(parse_record_unchecked_rs, &m)?)?;
     Ok(m)
 }

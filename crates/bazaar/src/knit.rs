@@ -367,6 +367,149 @@ pub fn parse_network_record_header(
     })
 }
 
+/// Fields of a parsed knit record header: `(method, version_id, count, digest)`.
+///
+/// Mirrors the 4-tuple returned by `_KnitData._split_header`, but typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordHeader {
+    pub method: Vec<u8>,
+    pub version_id: Vec<u8>,
+    pub count: usize,
+    pub digest: Vec<u8>,
+}
+
+/// Errors from `parse_record_unchecked`.
+#[derive(Debug)]
+pub enum ParseRecordError {
+    Gzip(std::io::Error),
+    Empty,
+    HeaderFields(Vec<u8>),
+    HeaderCount(Vec<u8>),
+    LineCount { declared: usize, actual: usize },
+    BadEndMarker { expected: Vec<u8>, actual: Vec<u8> },
+}
+
+impl std::fmt::Display for ParseRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseRecordError::Gzip(e) => write!(f, "corrupt compressed record: {}", e),
+            ParseRecordError::Empty => write!(f, "empty knit record"),
+            ParseRecordError::HeaderFields(h) => {
+                write!(f, "unexpected number of elements in record header: {:?}", h)
+            }
+            ParseRecordError::HeaderCount(h) => {
+                write!(f, "record header line count is not an integer: {:?}", h)
+            }
+            ParseRecordError::LineCount { declared, actual } => {
+                write!(
+                    f,
+                    "incorrect number of lines {} != {} in record",
+                    actual, declared
+                )
+            }
+            ParseRecordError::BadEndMarker { expected, actual } => write!(
+                f,
+                "unexpected version end line {:?}, wanted {:?}",
+                actual, expected
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ParseRecordError {}
+
+/// Split a gunzipped record body into `\n`-terminated lines, matching
+/// `BytesIO(data).readlines()` semantics (trailing-newline-inclusive, and a
+/// final unterminated tail is kept as its own line).
+fn split_readlines(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b == b'\n' {
+            out.push(data[start..=i].to_vec());
+            start = i + 1;
+        }
+    }
+    if start < data.len() {
+        out.push(data[start..].to_vec());
+    }
+    out
+}
+
+/// Decompress and parse a raw knit record as produced by `_record_to_data`.
+///
+/// Returns the header fields plus the body lines (header and end-marker
+/// removed). Mirrors `_KnitData._parse_record_unchecked`: gzip decode, pull
+/// off the `version <id> <count> <digest>` header, verify the line count,
+/// verify the trailing `end <id>\n` marker.
+pub fn parse_record_unchecked(
+    data: &[u8],
+) -> Result<(RecordHeader, Vec<Vec<u8>>), ParseRecordError> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let mut decoder = GzDecoder::new(data);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(ParseRecordError::Gzip)?;
+
+    let mut lines = split_readlines(&decompressed);
+    if lines.is_empty() {
+        return Err(ParseRecordError::Empty);
+    }
+    let header_line = lines.remove(0);
+    // Strip trailing \n for field splitting but keep the original around for
+    // error messages.
+    let header_trimmed = header_line
+        .strip_suffix(b"\n")
+        .unwrap_or(header_line.as_slice());
+    let fields: Vec<&[u8]> = header_trimmed.split(|&b| b == b' ').collect();
+    if fields.len() != 4 {
+        return Err(ParseRecordError::HeaderFields(header_line.clone()));
+    }
+    let method = fields[0].to_vec();
+    let version_id = fields[1].to_vec();
+    let count: usize = std::str::from_utf8(fields[2])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ParseRecordError::HeaderCount(header_line.clone()))?;
+    let digest = fields[3].to_vec();
+
+    if lines.is_empty() {
+        return Err(ParseRecordError::LineCount {
+            declared: count,
+            actual: 0,
+        });
+    }
+    let last_line = lines.pop().unwrap();
+    if lines.len() != count {
+        return Err(ParseRecordError::LineCount {
+            declared: count,
+            actual: lines.len(),
+        });
+    }
+    let mut expected_end = b"end ".to_vec();
+    expected_end.extend_from_slice(&version_id);
+    expected_end.push(b'\n');
+    if last_line != expected_end {
+        return Err(ParseRecordError::BadEndMarker {
+            expected: expected_end,
+            actual: last_line,
+        });
+    }
+
+    Ok((
+        RecordHeader {
+            method,
+            version_id,
+            count,
+            digest,
+        },
+        lines,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,5 +745,85 @@ mod tests {
         let bytes = b"knit-ft-gz\nk\nNone:\n";
         let err = parse_network_record_header(bytes, 11).unwrap_err();
         assert_eq!(err, NetworkHeaderError::MissingNoEolByte);
+    }
+
+    fn build_record(version_id: &[u8], digest: &[u8], body: &[&[u8]]) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend_from_slice(b"version ");
+        header.extend_from_slice(version_id);
+        header.extend_from_slice(format!(" {} ", body.len()).as_bytes());
+        header.extend_from_slice(digest);
+        header.push(b'\n');
+
+        let mut end = Vec::new();
+        end.extend_from_slice(b"end ");
+        end.extend_from_slice(version_id);
+        end.push(b'\n');
+
+        let mut chunks: Vec<&[u8]> = vec![&header];
+        chunks.extend_from_slice(body);
+        chunks.push(&end);
+
+        let gz = crate::tuned_gzip::chunks_to_gzip(chunks.iter().copied());
+        gz.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn parse_record_unchecked_round_trip() {
+        let body: &[&[u8]] = &[b"first line\n", b"second line\n"];
+        let raw = build_record(b"rev-1", b"DIGEST", body);
+        let (rec, contents) = parse_record_unchecked(&raw).unwrap();
+        assert_eq!(rec.method, b"version");
+        assert_eq!(rec.version_id, b"rev-1");
+        assert_eq!(rec.count, 2);
+        assert_eq!(rec.digest, b"DIGEST");
+        assert_eq!(
+            contents,
+            vec![b"first line\n".to_vec(), b"second line\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn parse_record_unchecked_zero_body() {
+        let raw = build_record(b"rev-0", b"DD", &[]);
+        let (rec, contents) = parse_record_unchecked(&raw).unwrap();
+        assert_eq!(rec.count, 0);
+        assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn parse_record_unchecked_wrong_line_count() {
+        // Build a valid record then re-gzip it with a tampered header that
+        // claims too many lines.
+        let mut header = b"version rev-x 5 DD\n".to_vec();
+        let body = b"only one\n".to_vec();
+        let end = b"end rev-x\n".to_vec();
+        let chunks: Vec<&[u8]> = vec![&header[..], &body[..], &end[..]];
+        let gz = crate::tuned_gzip::chunks_to_gzip(chunks.iter().copied());
+        let raw: Vec<u8> = gz.into_iter().flatten().collect();
+        // suppress unused_mut lint; header is intentionally mutable to match
+        // the surrounding builder style.
+        let _ = &mut header;
+        let err = parse_record_unchecked(&raw).unwrap_err();
+        assert!(matches!(
+            err,
+            ParseRecordError::LineCount {
+                declared: 5,
+                actual: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_record_unchecked_bad_end_marker() {
+        let mut header = b"version rev-y 1 DD\n".to_vec();
+        let body = b"body\n".to_vec();
+        let end = b"end wrong-id\n".to_vec();
+        let chunks: Vec<&[u8]> = vec![&header[..], &body[..], &end[..]];
+        let gz = crate::tuned_gzip::chunks_to_gzip(chunks.iter().copied());
+        let raw: Vec<u8> = gz.into_iter().flatten().collect();
+        let _ = &mut header;
+        let err = parse_record_unchecked(&raw).unwrap_err();
+        assert!(matches!(err, ParseRecordError::BadEndMarker { .. }));
     }
 }

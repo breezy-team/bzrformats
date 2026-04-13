@@ -2277,33 +2277,10 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
         return df, rec
 
     def _parse_record_unchecked(self, data):
-        # profiling notes:
-        # 4168 calls in 2880 217 internal
-        # 4168 calls to _parse_record_header in 2121
-        # 4168 calls to readlines in 330
-        with gzip.GzipFile(mode="rb", fileobj=BytesIO(data)) as df:
-            try:
-                record_contents = df.readlines()
-            except Exception as e:
-                raise KnitCorrupt(
-                    self,
-                    f"Corrupt compressed record {data!r}, got {e.__class__.__name__}({e!s})",
-                ) from e
-            header = record_contents.pop(0)
-            rec = self._split_header(header)
-            last_line = record_contents.pop()
-            if len(record_contents) != int(rec[2]):
-                raise KnitCorrupt(
-                    self,
-                    f"incorrect number of lines {len(record_contents)} != {int(rec[2])}"
-                    f" for version {{{rec[1]}}} {record_contents}",
-                )
-            if last_line != b"end %s\n" % rec[1]:
-                raise KnitCorrupt(
-                    self,
-                    f"unexpected version end line {last_line!r}, wanted {rec[1]!r}",
-                )
-        return rec, record_contents
+        try:
+            return _knit_rs.parse_record_unchecked_rs(data)
+        except ValueError as e:
+            raise KnitCorrupt(self, str(e)) from e
 
     def _read_records_iter(self, records):
         """Read text records from data file and yield result.
