@@ -8,6 +8,7 @@ pub mod bencode_serializer;
 pub mod btree_index;
 pub mod chk_inventory;
 pub mod chk_map;
+pub mod chunk_writer;
 pub mod dirstate;
 pub mod filters;
 pub mod gen_ids;
