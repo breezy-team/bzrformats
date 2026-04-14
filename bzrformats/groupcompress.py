@@ -1117,24 +1117,33 @@ class _GCGraphIndex:
                         )
                 del keys[key]
                 changed = True
-        if changed:
+        if changed or not self._parents:
+            # Emit records in the shape _add_callback expects. For a
+            # parentless index that's always a 2-tuple, even when we didn't
+            # have to drop anything above (btree_index.BTreeBuilder.add_nodes
+            # unpacks strictly by length).
             result = []
             if self._parents:
                 for key, (value, node_refs) in keys.items():
                     result.append((key, value, node_refs))
             else:
-                for key, (value, node_refs) in keys.items():  # noqa: B007
+                for key, (value, _node_refs) in keys.items():
                     result.append((key, value))
             records = result
         key_dependencies = self._key_dependencies
         if key_dependencies is not None:
             if self._parents:
-                for key, value, refs in records:  # noqa: B007
+                for key, _value, refs in records:
                     parents = refs[0]
                     key_dependencies.add_references(key, parents)
             else:
-                for key, value, refs in records:  # noqa: B007
-                    new_keys.add_key(key)
+                # Parentless index: nothing references anything, but we still
+                # need to remember new keys so `track_new_keys` callers can
+                # query them afterwards. `records` may be 2-tuples
+                # `(key, value)` or 3-tuples `(key, value, refs)` depending on
+                # whether the `changed` branch above rewrote the list.
+                for record in records:
+                    key_dependencies.add_key(record[0])
         self._add_callback(records)
 
     def _check_read(self):
