@@ -1165,6 +1165,31 @@ impl DirState {
     pub fn split_root_dirblock_into_contents(&mut self) -> Result<(), SplitRootError> {
         split_root_dirblock_into_contents(&mut self.dirblocks)
     }
+
+    /// Locate the block for a given key. Mirrors
+    /// `DirState._find_block_index_from_key`, without the
+    /// `_last_block_index` / `_split_path_cache` memoisation layers
+    /// (those live on the Python object and are a follow-up port).
+    pub fn find_block_index_from_key(&self, key: &EntryKey) -> (usize, bool) {
+        find_block_index_from_key(&self.dirblocks, key)
+    }
+
+    /// Locate the entry index for a key within a block. Mirrors
+    /// `DirState._find_entry_index`, in the simpler uncached form.
+    pub fn find_entry_index(&self, key: &EntryKey, block: &[Entry]) -> (usize, bool) {
+        find_entry_index(key, block)
+    }
+
+    /// Look up a `(dirname, basename)` path in the given tree. Mirrors
+    /// `DirState._get_block_entry_index`.
+    pub fn get_block_entry_index(
+        &self,
+        dirname: &[u8],
+        basename: &[u8],
+        tree_index: usize,
+    ) -> BlockEntryIndex {
+        get_block_entry_index(&self.dirblocks, dirname, basename, tree_index)
+    }
 }
 
 /// Error returned by [`split_root_dirblock_into_contents`] when the
@@ -1205,9 +1230,169 @@ impl std::error::Error for SplitRootError {}
 /// Pure-function version of [`DirState::split_root_dirblock_into_contents`].
 /// Exposed so callers that are still building a `Vec<Dirblock>` outside of
 /// a full `DirState` (e.g. the pyo3 shim) can reuse the same logic.
-pub fn split_root_dirblock_into_contents(
-    dirblocks: &mut [Dirblock],
-) -> Result<(), SplitRootError> {
+/// Split a NUL-free dirstate `dirname` on `/` into its path components.
+/// Mirrors the `split_object` helper inside the Python and pyo3
+/// implementations of `bisect_dirblock`; the comparison is then
+/// lexicographic-by-component rather than lexicographic-by-byte, which is
+/// the ordering dirblocks use on disk.
+fn split_dirname(dirname: &[u8]) -> Vec<&[u8]> {
+    dirname.split(|&b| b == b'/').collect()
+}
+
+/// Find the insertion position for a directory name within `dirblocks`,
+/// using component-wise comparison on the dirname. Mirrors the pyo3
+/// `bisect_dirblock` function in `crates/bazaar-py/src/dirstate.rs` but
+/// operates on a plain `&[Dirblock]` slice rather than Python objects.
+///
+/// `lo` defaults to 0 (Python's default is 1, which callers pass
+/// explicitly to skip the sentinel root block); we require the caller to
+/// be explicit to avoid hiding the sentinel-skipping convention.
+pub fn bisect_dirblock(dirblocks: &[Dirblock], dirname: &[u8], lo: usize, hi: usize) -> usize {
+    let target = split_dirname(dirname);
+    let mut lo = lo;
+    let mut hi = hi;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let cur = split_dirname(&dirblocks[mid].dirname);
+        if cur < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Find the block index containing the key's `(dirname, basename)` —
+/// pure-Rust counterpart of `DirState._find_block_index_from_key`. The
+/// second tuple element is `true` when the returned index actually points
+/// at a block whose dirname equals `key.dirname` (i.e. the block exists),
+/// and `false` when the index is the position at which a block for that
+/// dirname *would* be inserted.
+///
+/// This function does not consult or update the `last_block_index` cache
+/// Python maintains; callers that want the cache should use
+/// [`DirState::find_block_index_from_key`] instead.
+pub fn find_block_index_from_key(dirblocks: &[Dirblock], key: &EntryKey) -> (usize, bool) {
+    // Python's fast path: `(b"", b"")` always lives in block 0.
+    if key.dirname.is_empty() && key.basename.is_empty() {
+        return (0, true);
+    }
+    // Skip the first sentinel block (index 0); `_right`-style bisect
+    // over the rest matches Python's `bisect_dirblock(..., 1, ...)` call.
+    let block_index = bisect_dirblock(dirblocks, &key.dirname, 1, dirblocks.len());
+    let present = block_index < dirblocks.len() && dirblocks[block_index].dirname == key.dirname;
+    (block_index, present)
+}
+
+/// Compare `(dirname, basename, file_id)` keys in the tuple order Python
+/// uses when Python's `bisect.bisect_left(block, (key, []))` walks
+/// entries. The `file_id` is the third tuple element so the ordering here
+/// matches Python's native tuple comparison.
+fn entry_key_cmp(a: &EntryKey, b: &EntryKey) -> Ordering {
+    match a.dirname.cmp(&b.dirname) {
+        Ordering::Equal => match a.basename.cmp(&b.basename) {
+            Ordering::Equal => a.file_id.cmp(&b.file_id),
+            other => other,
+        },
+        other => other,
+    }
+}
+
+/// Find the entry index for `key` within `block`. Returns the insertion
+/// index and whether an exact match was found. Mirrors
+/// `DirState._find_entry_index` in the simpler "no cache" form —
+/// Python's version also consults `self._last_entry_index` as a
+/// one-slot cache, but the caching layer is additive and lives on the
+/// `DirState` method wrapper.
+pub fn find_entry_index(key: &EntryKey, block: &[Entry]) -> (usize, bool) {
+    // bisect_left over entry keys.
+    let mut lo = 0;
+    let mut hi = block.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        match entry_key_cmp(&block[mid].key, key) {
+            Ordering::Less => lo = mid + 1,
+            _ => hi = mid,
+        }
+    }
+    let present = lo < block.len() && block[lo].key == *key;
+    (lo, present)
+}
+
+/// Result of [`get_block_entry_index`]: the four-tuple Python returns,
+/// giving coordinates of where a `(dirname, basename)` pair lives — or
+/// should be inserted — in the dirblocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockEntryIndex {
+    /// Block index within `dirblocks`.
+    pub block_index: usize,
+    /// Entry index within the block at `block_index`.
+    pub entry_index: usize,
+    /// `true` when the directory (i.e. a block with the target dirname)
+    /// exists anywhere in the dirstate.
+    pub dir_present: bool,
+    /// `true` when the specific `(dirname, basename)` exists in
+    /// `tree_index` with a non-absent / non-relocated entry.
+    pub path_present: bool,
+}
+
+/// Pure-Rust counterpart to `DirState._get_block_entry_index`.
+///
+/// Walks the block for `(dirname, basename)` to find the first entry in
+/// `tree_index` whose minikind is neither `b'a'` (absent) nor `b'r'`
+/// (relocated). Callers use this both for membership tests and for
+/// computing the insertion point when adding new entries.
+pub fn get_block_entry_index(
+    dirblocks: &[Dirblock],
+    dirname: &[u8],
+    basename: &[u8],
+    tree_index: usize,
+) -> BlockEntryIndex {
+    let key = EntryKey {
+        dirname: dirname.to_vec(),
+        basename: basename.to_vec(),
+        file_id: Vec::new(),
+    };
+    let (block_index, dir_present) = find_block_index_from_key(dirblocks, &key);
+    if !dir_present {
+        return BlockEntryIndex {
+            block_index,
+            entry_index: 0,
+            dir_present: false,
+            path_present: false,
+        };
+    }
+    let block = &dirblocks[block_index].entries;
+    let (mut entry_index, _) = find_entry_index(&key, block);
+    // Linear scan over the contiguous run of entries sharing the same
+    // (dirname, basename), skipping absent/relocated variants for the
+    // requested tree. Mirrors the Python loop at dirstate.py:2254.
+    while entry_index < block.len()
+        && block[entry_index].key.dirname == key.dirname
+        && block[entry_index].key.basename == key.basename
+    {
+        if let Some(tree) = block[entry_index].trees.get(tree_index) {
+            if tree.minikind != b'a' && tree.minikind != b'r' {
+                return BlockEntryIndex {
+                    block_index,
+                    entry_index,
+                    dir_present: true,
+                    path_present: true,
+                };
+            }
+        }
+        entry_index += 1;
+    }
+    BlockEntryIndex {
+        block_index,
+        entry_index,
+        dir_present: true,
+        path_present: false,
+    }
+}
+
+pub fn split_root_dirblock_into_contents(dirblocks: &mut [Dirblock]) -> Result<(), SplitRootError> {
     if dirblocks.len() < 2 {
         return Err(SplitRootError::MissingSentinels);
     }
@@ -1701,6 +1886,218 @@ mod dirstate_struct_tests {
             }
             other => panic!("expected BadSecondSentinel, got {:?}", other),
         }
+    }
+
+    fn dirblock_with_entries(dirname: &[u8], entries: Vec<Entry>) -> Dirblock {
+        Dirblock {
+            dirname: dirname.to_vec(),
+            entries,
+        }
+    }
+
+    /// Build the canonical two-sentinel-plus-real-blocks layout used by
+    /// the lookup tests. `subdirs` is a list of `(dirname, entries)`
+    /// pairs that become real blocks after the sentinels.
+    fn make_dirblocks(subdirs: Vec<(&[u8], Vec<Entry>)>) -> Vec<Dirblock> {
+        let mut blocks = vec![
+            dirblock_with_entries(b"", Vec::new()),
+            dirblock_with_entries(b"", Vec::new()),
+        ];
+        for (dirname, entries) in subdirs {
+            blocks.push(dirblock_with_entries(dirname, entries));
+        }
+        blocks
+    }
+
+    fn tree(minikind: u8) -> TreeData {
+        TreeData {
+            minikind,
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: b"x".repeat(32),
+        }
+    }
+
+    fn entry_with_trees(
+        dirname: &[u8],
+        basename: &[u8],
+        file_id: &[u8],
+        trees: Vec<TreeData>,
+    ) -> Entry {
+        Entry {
+            key: EntryKey {
+                dirname: dirname.to_vec(),
+                basename: basename.to_vec(),
+                file_id: file_id.to_vec(),
+            },
+            trees,
+        }
+    }
+
+    #[test]
+    fn bisect_dirblock_component_order_not_byte_order() {
+        // Component-wise ordering: `a/b` splits to ["a", "b"] which is
+        // less than ["a-b"] because the first-element comparison of "a"
+        // and "a-b" treats "a" as a prefix of "a-b". A pure byte sort
+        // would place "a-b" before "a/b" (0x2d < 0x2f), so this test
+        // pins the path-component-aware behaviour.
+        // Sorted input: ["a", "a/b", "a-b", "b"].
+        let blocks = make_dirblocks(vec![
+            (b"a", vec![]),
+            (b"a/b", vec![]),
+            (b"a-b", vec![]),
+            (b"b", vec![]),
+        ]);
+        // 2 sentinels + 4 real. lo=1 skips the first sentinel (matching
+        // Python's bisect_dirblock(..., 1, hi) idiom), hi=len.
+        assert_eq!(bisect_dirblock(&blocks, b"a", 1, blocks.len()), 2);
+        assert_eq!(bisect_dirblock(&blocks, b"a/b", 1, blocks.len()), 3);
+        assert_eq!(bisect_dirblock(&blocks, b"a-b", 1, blocks.len()), 4);
+        assert_eq!(bisect_dirblock(&blocks, b"b", 1, blocks.len()), 5);
+        // Insertion for a missing dirname: "aa" > "a-b" byte-wise in
+        // single-component form, so it lands after "a-b" (index 4) at
+        // index 5, which is also the slot for "b".
+        assert_eq!(bisect_dirblock(&blocks, b"aa", 1, blocks.len()), 5);
+    }
+
+    #[test]
+    fn find_block_index_from_key_root_fast_path() {
+        let blocks = make_dirblocks(vec![(b"sub", vec![])]);
+        let key = EntryKey {
+            dirname: b"".to_vec(),
+            basename: b"".to_vec(),
+            file_id: b"TREE_ROOT".to_vec(),
+        };
+        assert_eq!(find_block_index_from_key(&blocks, &key), (0, true));
+    }
+
+    #[test]
+    fn find_block_index_from_key_hit_and_miss() {
+        let blocks = make_dirblocks(vec![(b"a", vec![]), (b"c", vec![])]);
+        let hit = EntryKey {
+            dirname: b"a".to_vec(),
+            basename: b"foo".to_vec(),
+            file_id: b"".to_vec(),
+        };
+        assert_eq!(find_block_index_from_key(&blocks, &hit), (2, true));
+        let miss = EntryKey {
+            dirname: b"b".to_vec(),
+            basename: b"foo".to_vec(),
+            file_id: b"".to_vec(),
+        };
+        // "b" would be inserted between "a" (index 2) and "c" (index 3).
+        assert_eq!(find_block_index_from_key(&blocks, &miss), (3, false));
+    }
+
+    #[test]
+    fn find_entry_index_exact_and_insertion() {
+        let block = vec![
+            entry_with_trees(b"dir", b"a", b"fid-a", vec![tree(b'f')]),
+            entry_with_trees(b"dir", b"b", b"fid-b", vec![tree(b'f')]),
+            entry_with_trees(b"dir", b"c", b"fid-c", vec![tree(b'f')]),
+        ];
+        let hit = EntryKey {
+            dirname: b"dir".to_vec(),
+            basename: b"b".to_vec(),
+            file_id: b"fid-b".to_vec(),
+        };
+        assert_eq!(find_entry_index(&hit, &block), (1, true));
+        let miss_before = EntryKey {
+            dirname: b"dir".to_vec(),
+            basename: b"ab".to_vec(),
+            file_id: b"".to_vec(),
+        };
+        assert_eq!(find_entry_index(&miss_before, &block), (1, false));
+        let miss_end = EntryKey {
+            dirname: b"dir".to_vec(),
+            basename: b"z".to_vec(),
+            file_id: b"".to_vec(),
+        };
+        assert_eq!(find_entry_index(&miss_end, &block), (3, false));
+    }
+
+    #[test]
+    fn get_block_entry_index_finds_live_entry() {
+        let blocks = make_dirblocks(vec![(
+            b"dir",
+            vec![entry_with_trees(b"dir", b"a", b"fid-a", vec![tree(b'f')])],
+        )]);
+        let bei = get_block_entry_index(&blocks, b"dir", b"a", 0);
+        assert_eq!(bei.block_index, 2);
+        assert_eq!(bei.entry_index, 0);
+        assert!(bei.dir_present);
+        assert!(bei.path_present);
+    }
+
+    #[test]
+    fn get_block_entry_index_absent_dir() {
+        let blocks = make_dirblocks(vec![(b"a", vec![])]);
+        let bei = get_block_entry_index(&blocks, b"missing", b"file", 0);
+        assert!(!bei.dir_present);
+        assert!(!bei.path_present);
+    }
+
+    #[test]
+    fn get_block_entry_index_skips_absent_and_relocated() {
+        // Two entries at (dir, a): the first is absent in tree 0, the
+        // second is live. Python walks the contiguous run so the live
+        // one should be returned.
+        let blocks = make_dirblocks(vec![(
+            b"dir",
+            vec![
+                entry_with_trees(b"dir", b"a", b"fid-absent", vec![tree(b'a')]),
+                entry_with_trees(b"dir", b"a", b"fid-live", vec![tree(b'f')]),
+            ],
+        )]);
+        let bei = get_block_entry_index(&blocks, b"dir", b"a", 0);
+        assert!(bei.path_present);
+        assert_eq!(bei.entry_index, 1);
+        assert_eq!(
+            blocks[bei.block_index].entries[bei.entry_index].key.file_id,
+            b"fid-live".to_vec()
+        );
+    }
+
+    #[test]
+    fn get_block_entry_index_all_absent_returns_not_present() {
+        let blocks = make_dirblocks(vec![(
+            b"dir",
+            vec![
+                entry_with_trees(b"dir", b"a", b"fid-1", vec![tree(b'a')]),
+                entry_with_trees(b"dir", b"a", b"fid-2", vec![tree(b'r')]),
+            ],
+        )]);
+        let bei = get_block_entry_index(&blocks, b"dir", b"a", 0);
+        assert!(bei.dir_present);
+        assert!(!bei.path_present);
+        assert_eq!(bei.entry_index, 2);
+    }
+
+    #[test]
+    fn dirstate_method_wrappers_delegate_to_free_functions() {
+        let mut state = DirState::new(
+            "dirstate",
+            Box::new(DefaultSHA1Provider::new()),
+            0,
+            true,
+            false,
+        );
+        state.dirblocks = make_dirblocks(vec![(
+            b"dir",
+            vec![entry_with_trees(b"dir", b"a", b"fid-a", vec![tree(b'f')])],
+        )]);
+        let key = EntryKey {
+            dirname: b"dir".to_vec(),
+            basename: b"a".to_vec(),
+            file_id: b"fid-a".to_vec(),
+        };
+        assert_eq!(state.find_block_index_from_key(&key), (2, true));
+        let block = &state.dirblocks[2].entries.clone();
+        assert_eq!(state.find_entry_index(&key, block), (0, true));
+        let bei = state.get_block_entry_index(b"dir", b"a", 0);
+        assert_eq!(bei.block_index, 2);
+        assert!(bei.path_present);
     }
 
     #[test]
