@@ -24,6 +24,7 @@ mod multiparent;
 mod pack;
 mod smart;
 mod textmerge;
+mod transport;
 mod tuned_gzip;
 mod versionedfile;
 mod weave;

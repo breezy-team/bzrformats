@@ -1,7 +1,9 @@
 use bazaar::knit::{
     lower_fulltext, lower_line_delta_annotated, lower_line_delta_raw, parse_fulltext,
     parse_line_delta_annotated, parse_line_delta_plain, parse_line_delta_raw,
-    parse_network_record_header, AnnotatedLine, DeltaHunk, KnitError,
+    parse_network_record_header, AnnotatedLine, DeltaHunk, KnitAccess as KnitAccessTrait,
+    KnitAnnotateFactory, KnitError, KnitIndex as KnitIndexTrait, KnitIndexMemo, KnitKey,
+    KnitMethod, KnitPlainFactory, KnitRecordDetails,
 };
 use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
@@ -1116,6 +1118,315 @@ fn record_to_data_rs<'py>(
     Ok((len, list))
 }
 
+// ============================================================
+// PyKnitIndex / PyKnitAccess adapters
+// ============================================================
+//
+// These wrap a Python `_KnitGraphIndex` / `_KndxIndex` and a
+// `_KnitKeyAccess` / `_DirectPackAccess` respectively, exposing them
+// as pure-Rust `bazaar::knit::KnitIndex` / `KnitAccess` implementors so
+// the pure-Rust `get_text` pipeline can drive a Python-side knit.
+//
+// Memo-shuttling note: the Python side's `index_memo` is an opaque
+// `(graph_index_or_prefix, pos, size)` tuple where the first element
+// is a Python object the access layer needs to dereference. The pure-
+// Rust `KnitIndexMemo { path, offset, length }` doesn't carry arbitrary
+// Python objects, so the index adapter stuffs each Python memo into a
+// shared `Vec<Py<PyAny>>` and synthesises a `path = format!("py:{idx}")`
+// pointing at the slot. The matching access adapter looks the slot up
+// and calls `py_access.get_raw_records([memo])` to recover the bytes.
+// Both adapters share the same `Arc<Mutex<...>>` so the round-trip
+// works within one `get_text_rs` call.
+
+use bazaar::knit::get_text as rust_get_text;
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+struct MemoTable {
+    /// Original Python memo tuples, indexed by their slot in this Vec.
+    memos: Vec<Py<PyAny>>,
+}
+
+impl MemoTable {
+    fn intern(&mut self, memo: Py<PyAny>) -> usize {
+        let idx = self.memos.len();
+        self.memos.push(memo);
+        idx
+    }
+
+    fn get(&self, idx: usize) -> Option<&Py<PyAny>> {
+        self.memos.get(idx)
+    }
+}
+
+fn slot_path(idx: usize) -> String {
+    format!("py:{}", idx)
+}
+
+fn parse_slot_path(path: &str) -> Option<usize> {
+    path.strip_prefix("py:").and_then(|s| s.parse().ok())
+}
+
+/// Adapter that exposes a Python `_KnitGraphIndex` / `_KndxIndex` as a
+/// pure-Rust [`KnitIndexTrait`].
+///
+/// The Python `get_build_details(keys)` returns the dict shape
+/// `{key: (index_memo, compression_parent, parents, (method, noeol))}`;
+/// this adapter walks each entry, parks the opaque Python `index_memo`
+/// in the shared `MemoTable`, and builds a `KnitRecordDetails` with a
+/// synthetic `KnitIndexMemo` whose path points back at the slot.
+pub struct PyKnitIndex {
+    py_index: Py<PyAny>,
+    table: Arc<Mutex<MemoTable>>,
+}
+
+impl PyKnitIndex {
+    pub fn new(py_index: Bound<'_, PyAny>, table: Arc<Mutex<MemoTable>>) -> Self {
+        Self {
+            py_index: py_index.unbind(),
+            table,
+        }
+    }
+}
+
+fn knit_err_from_py(py: Python<'_>, err: PyErr) -> KnitError {
+    pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
+    if err.is_instance_of::<RevisionNotPresent>(py) {
+        return KnitError::BadIndexValue(err.to_string().into_bytes());
+    }
+    KnitError::BadIndexValue(err.to_string().into_bytes())
+}
+
+fn extract_knit_key(obj: &Bound<'_, PyAny>) -> Result<KnitKey, KnitError> {
+    let tup = obj
+        .cast::<PyTuple>()
+        .map_err(|_| KnitError::BadIndexValue(b"key is not a tuple".to_vec()))?;
+    let mut out = Vec::with_capacity(tup.len());
+    for i in 0..tup.len() {
+        let item = tup
+            .get_item(i)
+            .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
+        let bytes = item
+            .cast_into::<PyBytes>()
+            .map_err(|_| KnitError::BadIndexValue(b"key segment is not bytes".to_vec()))?;
+        out.push(bytes.as_bytes().to_vec());
+    }
+    Ok(out)
+}
+
+fn knit_key_to_py<'py>(py: Python<'py>, key: &KnitKey) -> PyResult<Bound<'py, PyTuple>> {
+    PyTuple::new(py, key.iter().map(|seg| PyBytes::new(py, seg)))
+}
+
+impl KnitIndexTrait for PyKnitIndex {
+    fn get_build_details(
+        &self,
+        keys: &[KnitKey],
+    ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails>, KnitError> {
+        Python::attach(
+            |py| -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails>, KnitError> {
+                let py_keys = pyo3::types::PyList::empty(py);
+                for k in keys {
+                    let tup = knit_key_to_py(py, k).map_err(|e| knit_err_from_py(py, e))?;
+                    py_keys.append(tup).map_err(|e| knit_err_from_py(py, e))?;
+                }
+                let result = self
+                    .py_index
+                    .bind(py)
+                    .call_method1("get_build_details", (py_keys,))
+                    .map_err(|e| knit_err_from_py(py, e))?;
+                let dict = result.cast_into::<PyDict>().map_err(|_| {
+                    KnitError::BadIndexValue(b"get_build_details did not return a dict".to_vec())
+                })?;
+                let mut out = std::collections::HashMap::new();
+                for (key_obj, value_obj) in dict.iter() {
+                    let key = extract_knit_key(&key_obj)?;
+                    let tup = value_obj.cast_into::<PyTuple>().map_err(|_| {
+                        KnitError::BadIndexValue(b"build_details value is not a tuple".to_vec())
+                    })?;
+                    if tup.len() != 4 {
+                        return Err(KnitError::BadIndexValue(
+                            b"build_details tuple is not 4-element".to_vec(),
+                        ));
+                    }
+                    let py_memo = tup.get_item(0).map_err(|e| knit_err_from_py(py, e))?;
+                    let cp_obj = tup.get_item(1).map_err(|e| knit_err_from_py(py, e))?;
+                    let parents_obj = tup.get_item(2).map_err(|e| knit_err_from_py(py, e))?;
+                    let record_details_tup = tup
+                        .get_item(3)
+                        .map_err(|e| knit_err_from_py(py, e))?
+                        .cast_into::<PyTuple>()
+                        .map_err(|_| {
+                            KnitError::BadIndexValue(b"record_details is not a tuple".to_vec())
+                        })?;
+
+                    let method_str: String = record_details_tup
+                        .get_item(0)
+                        .map_err(|e| knit_err_from_py(py, e))?
+                        .extract()
+                        .map_err(|e| knit_err_from_py(py, e))?;
+                    let noeol: bool = record_details_tup
+                        .get_item(1)
+                        .map_err(|e| knit_err_from_py(py, e))?
+                        .extract()
+                        .map_err(|e| knit_err_from_py(py, e))?;
+                    let method = match method_str.as_str() {
+                        "fulltext" => KnitMethod::Fulltext,
+                        "line-delta" => KnitMethod::LineDelta,
+                        other => {
+                            return Err(KnitError::BadIndexValue(other.as_bytes().to_vec()));
+                        }
+                    };
+
+                    // Pull (pos, size) out of the index_memo tuple — the
+                    // first element is the opaque GraphIndex/prefix, which
+                    // we park in the side table.
+                    let memo_tup = py_memo.clone().cast_into::<PyTuple>().map_err(|_| {
+                        KnitError::BadIndexValue(b"index_memo is not a tuple".to_vec())
+                    })?;
+                    let pos: u64 = memo_tup
+                        .get_item(1)
+                        .map_err(|e| knit_err_from_py(py, e))?
+                        .extract()
+                        .map_err(|e| knit_err_from_py(py, e))?;
+                    let length: u64 = memo_tup
+                        .get_item(2)
+                        .map_err(|e| knit_err_from_py(py, e))?
+                        .extract()
+                        .map_err(|e| knit_err_from_py(py, e))?;
+                    let slot = self.table.lock().unwrap().intern(py_memo.unbind());
+                    let index_memo = KnitIndexMemo {
+                        path: slot_path(slot),
+                        offset: pos,
+                        length: length as usize,
+                    };
+
+                    let compression_parent = if cp_obj.is_none() {
+                        None
+                    } else {
+                        Some(extract_knit_key(&cp_obj)?)
+                    };
+
+                    let mut parents = Vec::new();
+                    if !parents_obj.is_none() {
+                        if let Ok(plist) = parents_obj.cast::<PyTuple>() {
+                            for i in 0..plist.len() {
+                                let p_obj =
+                                    plist.get_item(i).map_err(|e| knit_err_from_py(py, e))?;
+                                parents.push(extract_knit_key(&p_obj)?);
+                            }
+                        } else if let Ok(plist) = parents_obj.cast::<PyList>() {
+                            for i in 0..plist.len() {
+                                let p_obj =
+                                    plist.get_item(i).map_err(|e| knit_err_from_py(py, e))?;
+                                parents.push(extract_knit_key(&p_obj)?);
+                            }
+                        }
+                    }
+
+                    out.insert(
+                        key,
+                        KnitRecordDetails {
+                            method,
+                            noeol,
+                            index_memo,
+                            compression_parent,
+                            parents,
+                        },
+                    );
+                }
+                Ok(out)
+            },
+        )
+    }
+}
+
+/// Adapter that exposes a Python `_KnitKeyAccess` / `_DirectPackAccess`
+/// as a pure-Rust [`KnitAccessTrait`].
+///
+/// Looks each `KnitIndexMemo` up in the shared [`MemoTable`] (where
+/// the matching [`PyKnitIndex`] parked the original Python memo
+/// tuple), then calls `py_access.get_raw_records([memo])` and reads
+/// the first item from the returned iterator.
+pub struct PyKnitAccess {
+    py_access: Py<PyAny>,
+    table: Arc<Mutex<MemoTable>>,
+}
+
+impl PyKnitAccess {
+    pub fn new(py_access: Bound<'_, PyAny>, table: Arc<Mutex<MemoTable>>) -> Self {
+        Self {
+            py_access: py_access.unbind(),
+            table,
+        }
+    }
+}
+
+impl KnitAccessTrait for PyKnitAccess {
+    fn get_raw_record(&self, memo: &KnitIndexMemo) -> Result<Vec<u8>, KnitError> {
+        Python::attach(|py| -> Result<Vec<u8>, KnitError> {
+            let slot = parse_slot_path(&memo.path)
+                .ok_or_else(|| KnitError::BadIndexValue(memo.path.as_bytes().to_vec()))?;
+            let table = self.table.lock().unwrap();
+            let py_memo = table
+                .get(slot)
+                .ok_or_else(|| KnitError::BadIndexValue(memo.path.as_bytes().to_vec()))?
+                .clone_ref(py);
+            drop(table);
+
+            let memos_list = pyo3::types::PyList::empty(py);
+            memos_list
+                .append(py_memo.bind(py))
+                .map_err(|e| knit_err_from_py(py, e))?;
+            let iter = self
+                .py_access
+                .bind(py)
+                .call_method1("get_raw_records", (memos_list,))
+                .map_err(|e| knit_err_from_py(py, e))?;
+            let mut iter = iter.try_iter().map_err(|e| knit_err_from_py(py, e))?;
+            let first = iter
+                .next()
+                .ok_or_else(|| {
+                    KnitError::BadIndexValue(b"get_raw_records returned no items".to_vec())
+                })?
+                .map_err(|e| knit_err_from_py(py, e))?;
+            let bytes = first.cast_into::<PyBytes>().map_err(|_| {
+                KnitError::BadIndexValue(b"get_raw_records yielded non-bytes".to_vec())
+            })?;
+            Ok(bytes.as_bytes().to_vec())
+        })
+    }
+}
+
+/// Reconstruct the text of `key` by driving the pure-Rust
+/// `bazaar::knit::get_text` pipeline on top of a Python `_index` /
+/// `_access` pair. `annotated` selects between [`KnitAnnotateFactory`]
+/// and [`KnitPlainFactory`] for record parsing.
+///
+/// Mirrors the Python `KnitVersionedFiles.get_text` contract, except
+/// it does not consult fallback versioned files — those still live
+/// entirely on the Python side.
+#[pyfunction]
+fn get_text_via_traits_rs<'py>(
+    py: Python<'py>,
+    py_index: Bound<'py, PyAny>,
+    py_access: Bound<'py, PyAny>,
+    key: Bound<'py, PyAny>,
+    annotated: bool,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let table = Arc::new(Mutex::new(MemoTable::default()));
+    let index = PyKnitIndex::new(py_index, table.clone());
+    let access = PyKnitAccess::new(py_access, table);
+    let knit_key = extract_knit_key(&key).map_err(knit_err_to_py)?;
+
+    let bytes = if annotated {
+        rust_get_text(&index, &access, &KnitAnnotateFactory, &knit_key).map_err(knit_err_to_py)?
+    } else {
+        rust_get_text(&index, &access, &KnitPlainFactory, &knit_key).map_err(knit_err_to_py)?
+    };
+    Ok(PyBytes::new(py, &bytes))
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data_c, &m)?)?;
@@ -1148,6 +1459,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(decode_kndx_options_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(check_should_delta_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(walk_components_positions_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(get_text_via_traits_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;
