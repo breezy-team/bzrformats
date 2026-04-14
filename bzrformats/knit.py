@@ -1502,8 +1502,23 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
             if not self.get_parent_map([key]):
                 raise RevisionNotPresent(key, self)
             return cached_version
-        generator = _VFContentMapGenerator(self, [key])
-        return generator._get_content(key)
+        # The pure-Rust read pipeline (chain walk + delta apply) lives
+        # in bazaar::knit::get_content; the pyo3 layer just wraps the
+        # result in the right Python KnitContent subclass so callers
+        # like KnitAnnotateFactory.annotate / _merge_annotations keep
+        # seeing the historical attribute API (._lines, ._should_strip_eol).
+        try:
+            version_id, payload, strip_eol = _knit_rs.get_content_via_traits_rs(
+                self._index, self._access, key, self._factory.annotated
+            )
+        except ValueError as e:
+            raise RevisionNotPresent(key, self) from e
+        if self._factory.annotated:
+            content = AnnotatedKnitContent(payload)
+        else:
+            content = PlainKnitContent(payload, version_id)
+        content._should_strip_eol = strip_eol
+        return content
 
     def get_parent_map(self, keys):
         """Get a map of the graph parents of keys.

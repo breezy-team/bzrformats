@@ -1138,7 +1138,9 @@ fn record_to_data_rs<'py>(
 // Both adapters share the same `Arc<Mutex<...>>` so the round-trip
 // works within one `get_text_rs` call.
 
-use bazaar::knit::get_text as rust_get_text;
+use bazaar::knit::{
+    get_content as rust_get_content, get_text as rust_get_text, KnitContent as KnitContentTrait,
+};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -1427,6 +1429,66 @@ fn get_text_via_traits_rs<'py>(
     Ok(PyBytes::new(py, &bytes))
 }
 
+/// Reconstruct a single key's content via the pure-Rust pipeline and
+/// return the *raw* per-line data the Python `AnnotatedKnitContent` /
+/// `PlainKnitContent` constructors expect, plus the `should_strip_eol`
+/// flag.
+///
+/// For the annotated factory the second tuple element is a list of
+/// `(origin_bytes, text_bytes)` pairs; for the plain factory it's a
+/// list of bare text bytes. The first tuple element is always the
+/// content's owning version_id (used by `PlainKnitContent`; the
+/// annotated wrapper just ignores it). The third element is the
+/// `should_strip_eol` flag from the final record's noeol bit.
+///
+/// The Python `KnitVersionedFiles._get_content` wraps these into the
+/// matching `KnitContent` subclass — the wrapping itself is a one-line
+/// Python call, but the chain walk + delta apply happens entirely in
+/// Rust.
+#[pyfunction]
+fn get_content_via_traits_rs<'py>(
+    py: Python<'py>,
+    py_index: Bound<'py, PyAny>,
+    py_access: Bound<'py, PyAny>,
+    key: Bound<'py, PyAny>,
+    annotated: bool,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyAny>, bool)> {
+    let table = Arc::new(Mutex::new(MemoTable::default()));
+    let index = PyKnitIndex::new(py_index, table.clone());
+    let access = PyKnitAccess::new(py_access, table);
+    let knit_key = extract_knit_key(&key).map_err(knit_err_to_py)?;
+    let last_segment = knit_key.last().cloned().unwrap_or_default();
+
+    if annotated {
+        let content = rust_get_content(&index, &access, &KnitAnnotateFactory, &knit_key)
+            .map_err(knit_err_to_py)?;
+        let strip = content.should_strip_eol();
+        let pairs_list = pyo3::types::PyList::empty(py);
+        for (origin, text) in &content.lines {
+            let tup = PyTuple::new(py, [PyBytes::new(py, origin), PyBytes::new(py, text)])?;
+            pairs_list.append(tup)?;
+        }
+        Ok((
+            PyBytes::new(py, &last_segment),
+            pairs_list.into_any(),
+            strip,
+        ))
+    } else {
+        let content = rust_get_content(&index, &access, &KnitPlainFactory, &knit_key)
+            .map_err(knit_err_to_py)?;
+        let strip = content.should_strip_eol();
+        let lines_list = pyo3::types::PyList::empty(py);
+        for line in &content.lines {
+            lines_list.append(PyBytes::new(py, line))?;
+        }
+        Ok((
+            PyBytes::new(py, &content.version_id),
+            lines_list.into_any(),
+            strip,
+        ))
+    }
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data_c, &m)?)?;
@@ -1460,6 +1522,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(check_should_delta_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(walk_components_positions_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(get_text_via_traits_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(get_content_via_traits_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;

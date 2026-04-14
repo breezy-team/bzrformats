@@ -443,13 +443,18 @@ pub fn get_line_delta_blocks(
 /// a delta to a parent fulltext, dump out the resulting text) can work
 /// with these types directly without going through the pyo3 layer.
 pub trait KnitContent {
+    /// Per-line payload type carried by this content's deltas.
+    /// `AnnotatedKnitContent` uses `(origin, text)` pairs;
+    /// `PlainKnitContent` uses bare text bytes.
+    type DeltaLine: Clone;
+
     /// Whether the trailing `\n` on the last line should be stripped on
     /// output. Mirrors the Python `_should_strip_eol` flag.
     fn should_strip_eol(&self) -> bool;
     /// Set the strip-eol flag.
     fn set_should_strip_eol(&mut self, strip: bool);
 
-    /// Apply a plain (origin-stripped) line delta in place.
+    /// Apply a line delta in place.
     ///
     /// Each hunk replaces lines `[offset+start .. offset+end]` with the
     /// hunk's payload, where `offset` accumulates as the running cursor
@@ -457,7 +462,7 @@ pub trait KnitContent {
     /// `new_version_id` is only meaningful for [`PlainKnitContent`],
     /// which records it as its new owning version; annotated content
     /// ignores it because each line carries its own origin already.
-    fn apply_delta(&mut self, delta: &[DeltaHunk<Vec<u8>>], new_version_id: &[u8]);
+    fn apply_delta(&mut self, delta: &[DeltaHunk<Self::DeltaLine>], new_version_id: &[u8]);
 
     /// Return just the text lines (without origin annotations). If
     /// `should_strip_eol` is set, the trailing `\n` of the last line is
@@ -491,6 +496,8 @@ impl AnnotatedKnitContent {
 }
 
 impl KnitContent for AnnotatedKnitContent {
+    type DeltaLine = AnnotatedLine;
+
     fn should_strip_eol(&self) -> bool {
         self.should_strip_eol
     }
@@ -499,22 +506,16 @@ impl KnitContent for AnnotatedKnitContent {
         self.should_strip_eol = strip;
     }
 
-    fn apply_delta(&mut self, delta: &[DeltaHunk<Vec<u8>>], _new_version_id: &[u8]) {
-        // Plain delta: lines are bare bytes, no origins. We can't
-        // recover the original origin so callers that hand us a plain
-        // delta should be feeding us lines that came from the parent
-        // chain via a separate annotation step. The Python original has
-        // the same restriction: AnnotatedKnitContent.apply_delta takes
-        // a plain delta and just splices the bytes in. We mirror that
-        // by attaching an empty origin to each spliced line — callers
-        // can re-annotate if they need to.
+    fn apply_delta(&mut self, delta: &[DeltaHunk<AnnotatedLine>], _new_version_id: &[u8]) {
+        // Each hunk's lines are already `(origin, text)` pairs that
+        // came from the annotated parser — splice them in directly,
+        // preserving the origins. Matches
+        // `AnnotatedKnitContent.apply_delta` in knit.py.
         let mut offset: isize = 0;
         for hunk in delta {
             let start = (offset + hunk.start as isize) as usize;
             let end = (offset + hunk.end as isize) as usize;
-            let new_pairs: Vec<AnnotatedLine> =
-                hunk.lines.iter().map(|l| (Vec::new(), l.clone())).collect();
-            self.lines.splice(start..end, new_pairs);
+            self.lines.splice(start..end, hunk.lines.iter().cloned());
             offset += hunk.start as isize - hunk.end as isize + hunk.count as isize;
         }
     }
@@ -568,6 +569,8 @@ impl PlainKnitContent {
 }
 
 impl KnitContent for PlainKnitContent {
+    type DeltaLine = Vec<u8>;
+
     fn should_strip_eol(&self) -> bool {
         self.should_strip_eol
     }
@@ -634,9 +637,15 @@ pub trait KnitFactory {
         version_id: &[u8],
     ) -> Result<Self::Content, KnitError>;
 
-    /// Parse a delta record's body into the plain (origin-stripped)
-    /// hunk shape that [`KnitContent::apply_delta`] consumes.
-    fn parse_line_delta(&self, lines: &[&[u8]]) -> Result<Vec<DeltaHunk<Vec<u8>>>, KnitError>;
+    /// Parse a delta record's body into the hunk shape that this
+    /// factory's [`KnitContent`] consumes. For
+    /// [`KnitAnnotateFactory`] this yields annotated
+    /// `(origin, text)` hunks; for [`KnitPlainFactory`] it yields
+    /// bare-byte hunks.
+    fn parse_line_delta(
+        &self,
+        lines: &[&[u8]],
+    ) -> Result<Vec<DeltaHunk<<Self::Content as KnitContent>::DeltaLine>>, KnitError>;
 
     /// Build a content object from a record's body lines and its
     /// `(method, noeol)` pair. For `LineDelta` records `base_content`
@@ -689,11 +698,14 @@ impl KnitFactory for KnitAnnotateFactory {
         Ok(AnnotatedKnitContent::new(pairs))
     }
 
-    fn parse_line_delta(&self, lines: &[&[u8]]) -> Result<Vec<DeltaHunk<Vec<u8>>>, KnitError> {
-        // Parse with the annotated parser but keep only the text bytes
-        // from each hunk line — same as the Python factory's
-        // `parse_line_delta(plain=True)` mode.
-        parse_line_delta_plain(lines)
+    fn parse_line_delta(
+        &self,
+        lines: &[&[u8]],
+    ) -> Result<Vec<DeltaHunk<AnnotatedLine>>, KnitError> {
+        // Parse with the annotated parser — preserves the per-line
+        // `(origin, text)` pairs so AnnotatedKnitContent.apply_delta
+        // can splice them in with their origins intact.
+        parse_line_delta_annotated(lines)
     }
 }
 
@@ -2258,7 +2270,10 @@ mod tests {
             start: 1,
             end: 3,
             count: 2,
-            lines: vec![b"B\n".to_vec(), b"C\n".to_vec()],
+            lines: vec![
+                (b"r2".to_vec(), b"B\n".to_vec()),
+                (b"r2".to_vec(), b"C\n".to_vec()),
+            ],
         }];
         content.apply_delta(&delta, b"r2");
         let texts = content.text();
