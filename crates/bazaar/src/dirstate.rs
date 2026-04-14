@@ -829,6 +829,221 @@ pub enum LockState {
     Write,
 }
 
+/// Error returned while parsing the on-disk dirblock body of a dirstate
+/// file. Corresponds to the `DirstateCorrupt` errors raised by the Python
+/// `_read_dirblocks` implementation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DirblocksError {
+    /// A NUL-delimited field was requested past the end of the input.
+    UnexpectedEof,
+    /// A NUL-delimited field was read but no terminating NUL was found
+    /// before the end of the input.
+    MissingNul { trailing: Vec<u8> },
+    /// The first post-header field was expected to be empty (the leading
+    /// NUL from the `\0\n\0` line joiner) but contained data.
+    LeadingFieldNotEmpty(Vec<u8>),
+    /// A size field could not be parsed as a decimal integer.
+    BadSize(Vec<u8>),
+    /// The trailing `\n` after a row was missing or the wrong length.
+    BadRowTerminator(Vec<u8>),
+    /// The number of parsed entries did not match the count declared by the
+    /// header.
+    WrongEntryCount { expected: usize, actual: usize },
+}
+
+impl std::fmt::Display for DirblocksError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DirblocksError::UnexpectedEof => {
+                write!(f, "get_next() called when there are no chars left")
+            }
+            DirblocksError::MissingNul { trailing } => {
+                let end = std::cmp::min(trailing.len(), 20);
+                write!(
+                    f,
+                    "failed to find trailing NULL (\\0). Trailing garbage: {:?}",
+                    &trailing[..end]
+                )
+            }
+            DirblocksError::LeadingFieldNotEmpty(field) => {
+                write!(f, "First field should be empty, not: {:?}", field)
+            }
+            DirblocksError::BadSize(bytes) => {
+                write!(f, "invalid size field: {:?}", bytes)
+            }
+            DirblocksError::BadRowTerminator(bytes) => {
+                write!(
+                    f,
+                    "Bad parse, we expected to end on \\n, not: {} {:?}",
+                    bytes.len(),
+                    bytes
+                )
+            }
+            DirblocksError::WrongEntryCount { expected, actual } => {
+                write!(
+                    f,
+                    "We read the wrong number of entries. We expected to read {}, but read {}",
+                    expected, actual
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DirblocksError {}
+
+/// Read one NUL-terminated field from `data` starting at `pos`, returning
+/// the field bytes and the new cursor position. Mirrors the inline
+/// `get_next_field` helper from the pyo3 shim / Python implementation.
+fn get_next_field(data: &[u8], pos: usize) -> Result<(&[u8], usize), DirblocksError> {
+    if pos >= data.len() {
+        return Err(DirblocksError::UnexpectedEof);
+    }
+    let remaining = &data[pos..];
+    match remaining.iter().position(|&b| b == 0) {
+        Some(offset) => Ok((&data[pos..pos + offset], pos + offset + 1)),
+        None => Err(DirblocksError::MissingNul {
+            trailing: remaining.to_vec(),
+        }),
+    }
+}
+
+/// Parse the on-disk dirblock body of a dirstate file into a flat list of
+/// [`Dirblock`]s.
+///
+/// `text` is everything after `end_of_header`; `num_trees` is
+/// `1 + num_present_parents`; `num_entries` is the value from the header
+/// used only to validate that the parse saw the expected row count.
+///
+/// The returned sequence always begins with two sentinel blocks both
+/// carrying an empty `dirname`: the first holds all root entries seen
+/// during the parse, and the second is an empty placeholder. This matches
+/// Python's `_read_dirblocks`, which relies on a follow-up
+/// `_split_root_dirblock_into_contents` call (a separate commit) to
+/// reshape those two blocks.
+pub fn parse_dirblocks(
+    text: &[u8],
+    num_trees: usize,
+    num_entries: usize,
+) -> Result<Vec<Dirblock>, DirblocksError> {
+    // Empty body: nothing to parse. The caller is expected to install the
+    // usual pair of empty sentinel blocks itself if appropriate.
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // The first NUL-delimited field is expected to be empty: it's the
+    // leading NUL of the `\0\n\0` separator written between the ghosts
+    // line and the first entry row.
+    let (first_field, mut pos) = get_next_field(text, 0)?;
+    if !first_field.is_empty() {
+        return Err(DirblocksError::LeadingFieldNotEmpty(first_field.to_vec()));
+    }
+
+    // Seed with two sentinel empty-dirname blocks, matching Python's
+    // `_read_dirblocks` initialisation.
+    let mut dirblocks: Vec<Dirblock> = vec![
+        Dirblock {
+            dirname: Vec::new(),
+            entries: Vec::new(),
+        },
+        Dirblock {
+            dirname: Vec::new(),
+            entries: Vec::new(),
+        },
+    ];
+
+    let mut current_dirname: Vec<u8> = Vec::new();
+    // Index of the "current" block within `dirblocks`; starts at the first
+    // sentinel, which collects all root-level entries until
+    // `_split_root_dirblock_into_contents` reshapes them later.
+    let mut current_block_idx: usize = 0;
+    let mut entry_count: usize = 0;
+
+    while pos < text.len() {
+        let (dirname_bytes, new_pos) = get_next_field(text, pos)?;
+        pos = new_pos;
+
+        if dirname_bytes != current_dirname.as_slice() {
+            current_dirname = dirname_bytes.to_vec();
+            dirblocks.push(Dirblock {
+                dirname: current_dirname.clone(),
+                entries: Vec::new(),
+            });
+            current_block_idx = dirblocks.len() - 1;
+        }
+
+        let (name_bytes, new_pos) = get_next_field(text, pos)?;
+        pos = new_pos;
+        let (file_id_bytes, new_pos) = get_next_field(text, pos)?;
+        pos = new_pos;
+
+        let key = EntryKey {
+            dirname: current_dirname.clone(),
+            basename: name_bytes.to_vec(),
+            file_id: file_id_bytes.to_vec(),
+        };
+
+        let mut trees: Vec<TreeData> = Vec::with_capacity(num_trees);
+        for _ in 0..num_trees {
+            let (minikind_bytes, new_pos) = get_next_field(text, pos)?;
+            pos = new_pos;
+            let (fingerprint_bytes, new_pos) = get_next_field(text, pos)?;
+            pos = new_pos;
+            let (size_bytes, new_pos) = get_next_field(text, pos)?;
+            pos = new_pos;
+            let (exec_bytes, new_pos) = get_next_field(text, pos)?;
+            pos = new_pos;
+            let (info_bytes, new_pos) = get_next_field(text, pos)?;
+            pos = new_pos;
+
+            let size_str = std::str::from_utf8(size_bytes)
+                .map_err(|_| DirblocksError::BadSize(size_bytes.to_vec()))?;
+            let size: u64 = size_str
+                .parse()
+                .map_err(|_| DirblocksError::BadSize(size_bytes.to_vec()))?;
+
+            // Matches Python `exec_bytes[0] == b'y'` with defensive
+            // handling of the empty-field case (mirrors the pyo3 shim).
+            let executable = !exec_bytes.is_empty() && exec_bytes[0] == b'y';
+
+            trees.push(TreeData {
+                // Python stores the minikind as a 1-byte `bytes` object
+                // but otherwise treats it opaquely; we store only the
+                // first byte and preserve the rest as part of the raw
+                // field should future code need it.
+                minikind: minikind_bytes.first().copied().unwrap_or(0),
+                fingerprint: fingerprint_bytes.to_vec(),
+                size,
+                executable,
+                packed_stat: info_bytes.to_vec(),
+            });
+        }
+
+        // Each row ends with a trailing `\n` stored as its own NUL-delimited
+        // field, i.e. the raw bytes `"\n\0"`.
+        let (trailing, new_pos) = get_next_field(text, pos)?;
+        pos = new_pos;
+        if trailing.len() != 1 || trailing[0] != b'\n' {
+            return Err(DirblocksError::BadRowTerminator(trailing.to_vec()));
+        }
+
+        dirblocks[current_block_idx]
+            .entries
+            .push(Entry { key, trees });
+        entry_count += 1;
+    }
+
+    if entry_count != num_entries {
+        return Err(DirblocksError::WrongEntryCount {
+            expected: num_entries,
+            actual: entry_count,
+        });
+    }
+
+    Ok(dirblocks)
+}
+
 /// In-memory `DirState`, the Rust counterpart to `bzrformats.dirstate.DirState`.
 ///
 /// This commit introduces the struct and a constructor mirroring Python's
@@ -1082,5 +1297,234 @@ mod dirstate_struct_tests {
             read_header(&bytes),
             Err(HeaderError::BadNumEntries(_))
         ));
+    }
+
+    /// Hand-built line for a single entry with one tree. Mirrors
+    /// `DirState._entry_to_line` in `bzrformats/dirstate.py`: the 3 key
+    /// fields followed by 5 fields per tree, all joined by NUL.
+    fn entry_line(
+        dirname: &[u8],
+        basename: &[u8],
+        file_id: &[u8],
+        trees: &[(&[u8], &[u8], u64, bool, &[u8])],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(dirname);
+        out.push(0);
+        out.extend_from_slice(basename);
+        out.push(0);
+        out.extend_from_slice(file_id);
+        for (minikind, fingerprint, size, executable, info) in trees {
+            out.push(0);
+            out.extend_from_slice(minikind);
+            out.push(0);
+            out.extend_from_slice(fingerprint);
+            out.push(0);
+            out.extend_from_slice(format!("{}", size).as_bytes());
+            out.push(0);
+            out.push(if *executable { b'y' } else { b'n' });
+            out.push(0);
+            out.extend_from_slice(info);
+        }
+        out
+    }
+
+    /// Build the body text (post-header) by running `get_output_lines` on a
+    /// [parents, ghosts, entry_lines...] sequence and then trimming the
+    /// bytes preceding the first NUL that begins the entry block.
+    fn make_body_bytes(parents: &[&[u8]], ghosts: &[&[u8]], entries: &[Vec<u8>]) -> Vec<u8> {
+        let parents_line = get_parents_line(parents);
+        let ghosts_line = get_ghosts_line(ghosts);
+        let mut lines: Vec<&[u8]> = vec![parents_line.as_slice(), ghosts_line.as_slice()];
+        for e in entries {
+            lines.push(e.as_slice());
+        }
+        let chunks = get_output_lines(lines);
+        let data: Vec<u8> = chunks.into_iter().flatten().collect();
+        // Locate `end_of_header` by parsing the header in the same way
+        // `DirState::read_header` does, then return the remainder.
+        let header = read_header(&data).expect("header parses");
+        data[header.end_of_header..].to_vec()
+    }
+
+    #[test]
+    fn parse_dirblocks_empty_body() {
+        let blocks = parse_dirblocks(&[], 1, 0).expect("empty body parses");
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn parse_dirblocks_single_root_entry_one_tree() {
+        let nullstat = b"x".repeat(32);
+        let entry = entry_line(
+            b"",
+            b"",
+            b"TREE_ROOT",
+            &[(b"d", b"", 0, false, nullstat.as_slice())],
+        );
+        let body = make_body_bytes(&[], &[], &[entry]);
+        let blocks = parse_dirblocks(&body, 1, 1).expect("parse dirblocks");
+        assert_eq!(blocks.len(), 2, "expected two sentinel blocks");
+        assert_eq!(blocks[0].dirname, b"".to_vec());
+        assert_eq!(blocks[1].dirname, b"".to_vec());
+        assert_eq!(blocks[0].entries.len(), 1);
+        let entry = &blocks[0].entries[0];
+        assert_eq!(entry.key.dirname, b"".to_vec());
+        assert_eq!(entry.key.basename, b"".to_vec());
+        assert_eq!(entry.key.file_id, b"TREE_ROOT".to_vec());
+        assert_eq!(entry.trees.len(), 1);
+        let tree = &entry.trees[0];
+        assert_eq!(tree.minikind, b'd');
+        assert_eq!(tree.fingerprint, Vec::<u8>::new());
+        assert_eq!(tree.size, 0);
+        assert!(!tree.executable);
+        assert_eq!(tree.packed_stat, nullstat);
+    }
+
+    #[test]
+    fn parse_dirblocks_multiple_dirs_group_by_dirname() {
+        let nullstat = b"x".repeat(32);
+        // Three entries: root, a/file-a, b/file-b. Must be sorted by
+        // `(dirname, basename)` to match what the writer produces.
+        let entries = vec![
+            entry_line(
+                b"",
+                b"",
+                b"TREE_ROOT",
+                &[(b"d", b"", 0, false, nullstat.as_slice())],
+            ),
+            entry_line(
+                b"a",
+                b"file-a",
+                b"fid-a",
+                &[(b"f", b"sha-a", 5, true, nullstat.as_slice())],
+            ),
+            entry_line(
+                b"b",
+                b"file-b",
+                b"fid-b",
+                &[(b"f", b"sha-b", 7, false, nullstat.as_slice())],
+            ),
+        ];
+        let body = make_body_bytes(&[], &[], &entries);
+        let blocks = parse_dirblocks(&body, 1, 3).expect("parse dirblocks");
+        // Two sentinels plus two real dir blocks.
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].dirname, b"".to_vec());
+        assert_eq!(blocks[0].entries.len(), 1);
+        assert_eq!(blocks[1].dirname, b"".to_vec());
+        assert_eq!(blocks[1].entries.len(), 0);
+        assert_eq!(blocks[2].dirname, b"a".to_vec());
+        assert_eq!(blocks[2].entries.len(), 1);
+        assert_eq!(blocks[2].entries[0].key.basename, b"file-a".to_vec());
+        assert!(blocks[2].entries[0].trees[0].executable);
+        assert_eq!(blocks[2].entries[0].trees[0].size, 5);
+        assert_eq!(blocks[3].dirname, b"b".to_vec());
+        assert_eq!(blocks[3].entries.len(), 1);
+        assert_eq!(blocks[3].entries[0].trees[0].size, 7);
+        assert!(!blocks[3].entries[0].trees[0].executable);
+    }
+
+    #[test]
+    fn parse_dirblocks_rejects_wrong_entry_count() {
+        let nullstat = b"x".repeat(32);
+        let entry = entry_line(
+            b"",
+            b"",
+            b"TREE_ROOT",
+            &[(b"d", b"", 0, false, nullstat.as_slice())],
+        );
+        let body = make_body_bytes(&[], &[], &[entry]);
+        // Header claimed 2 entries but body only has 1.
+        match parse_dirblocks(&body, 1, 2) {
+            Err(DirblocksError::WrongEntryCount {
+                expected: 2,
+                actual: 1,
+            }) => {}
+            other => panic!("expected WrongEntryCount, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_dirblocks_multi_tree() {
+        let nullstat = b"x".repeat(32);
+        // Two trees per entry: current + one parent.
+        let entry = entry_line(
+            b"",
+            b"README",
+            b"file-id-1",
+            &[
+                (b"f", b"sha-current", 10, true, nullstat.as_slice()),
+                (b"f", b"sha-parent", 8, false, nullstat.as_slice()),
+            ],
+        );
+        let body = make_body_bytes(&[b"rev-a"], &[], &[entry]);
+        let blocks = parse_dirblocks(&body, 2, 1).expect("parse");
+        assert_eq!(blocks.len(), 2);
+        let e = &blocks[0].entries[0];
+        assert_eq!(e.trees.len(), 2);
+        assert_eq!(e.trees[0].fingerprint, b"sha-current".to_vec());
+        assert_eq!(e.trees[0].size, 10);
+        assert!(e.trees[0].executable);
+        assert_eq!(e.trees[1].fingerprint, b"sha-parent".to_vec());
+        assert_eq!(e.trees[1].size, 8);
+        assert!(!e.trees[1].executable);
+    }
+
+    /// Cross-check against bytes produced by a full
+    /// `DirState.initialize(...); _set_data(...); save()` cycle. Pinning
+    /// the exact on-disk representation guards against any future drift
+    /// between the writer and the new Rust reader.
+    #[test]
+    fn parse_dirblocks_matches_python_saved_file() {
+        let bytes: &[u8] = b"#bazaar dirstate flat format 3\n\
+                             crc32: 2823629280\n\
+                             num_entries: 1\n\
+                             0\x00\n\
+                             \x000\x00\n\
+                             \x00\x00\x00TREE_ROOT\x00d\x00\x000\x00n\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x00\n\x00";
+        let header = read_header(bytes).expect("parse header");
+        assert_eq!(header.num_entries, 1);
+        assert!(header.parents.is_empty());
+        assert!(header.ghosts.is_empty());
+        let body = &bytes[header.end_of_header..];
+        let blocks = parse_dirblocks(body, 1, header.num_entries).expect("parse body");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].entries.len(), 1);
+        let entry = &blocks[0].entries[0];
+        assert_eq!(entry.key.file_id, b"TREE_ROOT".to_vec());
+        assert_eq!(entry.trees[0].minikind, b'd');
+        assert_eq!(entry.trees[0].packed_stat, b"x".repeat(32));
+    }
+
+    #[test]
+    fn parse_dirblocks_rejects_bad_size() {
+        // Build a body with an invalid size field. Hand-craft to bypass the
+        // `entry_line` helper which only takes u64 sizes.
+        let nullstat = b"x".repeat(32);
+        let mut entry = Vec::new();
+        entry.extend_from_slice(b"");
+        entry.push(0);
+        entry.extend_from_slice(b"");
+        entry.push(0);
+        entry.extend_from_slice(b"TREE_ROOT");
+        entry.push(0);
+        entry.extend_from_slice(b"d");
+        entry.push(0);
+        entry.extend_from_slice(b"");
+        entry.push(0);
+        entry.extend_from_slice(b"not-a-number");
+        entry.push(0);
+        entry.push(b'n');
+        entry.push(0);
+        entry.extend_from_slice(nullstat.as_slice());
+
+        let body = make_body_bytes(&[], &[], &[entry]);
+        match parse_dirblocks(&body, 1, 1) {
+            Err(DirblocksError::BadSize(bytes)) => {
+                assert_eq!(bytes, b"not-a-number".to_vec());
+            }
+            other => panic!("expected BadSize, got {:?}", other),
+        }
     }
 }
