@@ -30,6 +30,7 @@ pub mod rio;
 pub mod serializer;
 pub mod smart;
 pub mod textmerge;
+pub mod transport;
 pub mod tuned_gzip;
 pub mod versionedfile;
 pub mod weave;

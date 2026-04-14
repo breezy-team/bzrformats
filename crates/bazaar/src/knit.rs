@@ -62,6 +62,21 @@
 //!   fulltext/line-delta dispatch given a parent fulltext for the
 //!   delta case.
 //!
+//! ## High-level read pipeline
+//!
+//! - [`KnitIndex`] (trait) — looks up build details for a batch of
+//!   keys. Pure-Rust callers implement this directly; pyo3 callers
+//!   can wrap a Python `_KnitGraphIndex` / `_KndxIndex`.
+//! - [`KnitAccess`] (trait) — fetches raw record bytes for an
+//!   `index_memo`. Pure-Rust callers implement this directly; pyo3
+//!   callers can wrap a Python `_KnitKeyAccess` / `_DirectPackAccess`.
+//! - [`KnitRecordDetails`] / [`KnitIndexMemo`] / [`KnitKey`] — the
+//!   value types those traits trade in.
+//! - [`get_text`] / [`get_content`] — walk the compression chain
+//!   starting at one key, fetching raw records via the access layer
+//!   and applying deltas via the factory, to reconstruct the target
+//!   content. The pure-Rust equivalent of `KnitVersionedFiles.get_text`.
+//!
 //! ## Index helpers
 //!
 //! - [`parse_knit_index_value`] / [`KnitIndexValue`] — decode a knit
@@ -1750,6 +1765,201 @@ pub fn recompress_annotated_to_unannotated_delta(raw_record: &[u8]) -> Result<Ve
     Ok(chunks.into_iter().flatten().collect())
 }
 
+// ============================================================
+// KnitVersionedFiles read pipeline
+// ============================================================
+
+/// A knit key — a tuple of byte segments, identifying one record in
+/// one knit. The last segment is the version_id; the leading segments
+/// (if any) form the file-id prefix used by per-file knits.
+pub type KnitKey = Vec<Vec<u8>>;
+
+/// Index lookup result for one knit record.
+///
+/// Returned by [`KnitIndex::get_build_details`] for each requested key.
+/// `index_memo` is an opaque token the access layer uses to fetch the
+/// raw record bytes; for a `_KnitGraphIndex` this is the
+/// `(graph_index, pos, size)` tuple, for a `_KndxIndex` it's
+/// `(prefix_key, pos, size)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnitRecordDetails {
+    pub method: KnitMethod,
+    pub noeol: bool,
+    pub index_memo: KnitIndexMemo,
+    pub compression_parent: Option<KnitKey>,
+    pub parents: Vec<KnitKey>,
+}
+
+/// Opaque storage handle tying a key to its raw bytes on disk.
+///
+/// The `path` identifies which file on the underlying transport the
+/// bytes live in; `offset` and `length` are the byte range inside it.
+/// For pure in-memory backends, `path` can be any stable identifier
+/// the access implementation chooses to use.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KnitIndexMemo {
+    pub path: String,
+    pub offset: u64,
+    pub length: usize,
+}
+
+/// Read-side index trait for knit storage. The minimal method set
+/// [`get_text`] needs.
+///
+/// Pure-Rust callers implement this directly; the pyo3 layer can wrap
+/// a Python `_KnitGraphIndex` / `_KndxIndex` via an adapter.
+pub trait KnitIndex {
+    /// Look up build details for `keys`. Missing keys are simply
+    /// absent from the returned map. Implementations are responsible
+    /// for any `_check_read` / locking logic.
+    fn get_build_details(
+        &self,
+        keys: &[KnitKey],
+    ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails>, KnitError>;
+}
+
+/// Read-side access trait for knit storage. Fetches the raw
+/// gzip-compressed record bytes that an index memo points at.
+///
+/// `_KnitKeyAccess` and `_DirectPackAccess` would each provide an
+/// implementation; the pyo3 layer can wrap a Python access object
+/// via an adapter.
+pub trait KnitAccess {
+    /// Fetch the raw record bytes for one index memo. Returns the
+    /// gzip-compressed data ready to feed to [`decode_record_gz`].
+    fn get_raw_record(&self, memo: &KnitIndexMemo) -> Result<Vec<u8>, KnitError>;
+}
+
+/// Reconstruct the text content of `key` from a knit, walking the
+/// compression-parent chain as needed.
+///
+/// This is the pure-Rust equivalent of `KnitVersionedFiles.get_text`
+/// for the read path. `index` resolves keys to build details (method,
+/// memo, parent), `access` fetches the raw bytes, and `factory`
+/// decides whether to parse records as annotated or plain content and
+/// how to apply deltas. Returns the reconstructed text as joined bytes
+/// — exactly what `get_text` returns on the Python side.
+///
+/// The chain walk uses [`walk_compression_closure`]; reconstruction
+/// orders ancestors fulltext-first and applies each delta in turn.
+pub fn get_text<I, A, F>(
+    index: &I,
+    access: &A,
+    factory: &F,
+    key: &KnitKey,
+) -> Result<Vec<u8>, KnitError>
+where
+    I: KnitIndex,
+    A: KnitAccess,
+    F: KnitFactory,
+{
+    let content = get_content(index, access, factory, key)?;
+    let mut out = Vec::new();
+    for line in content.text() {
+        out.extend_from_slice(&line);
+    }
+    Ok(out)
+}
+
+/// Reconstruct the [`KnitFactory::Content`] for `key` without joining
+/// the lines. Used as the engine for [`get_text`]; pure-Rust callers
+/// can use this directly when they want structured access (e.g. to
+/// the per-line annotations of an `AnnotatedKnitContent`).
+pub fn get_content<I, A, F>(
+    index: &I,
+    access: &A,
+    factory: &F,
+    key: &KnitKey,
+) -> Result<F::Content, KnitError>
+where
+    I: KnitIndex,
+    A: KnitAccess,
+    F: KnitFactory,
+{
+    // 1. Walk the compression chain to discover every ancestor we'll
+    //    need to fetch and parse.
+    let chain = walk_compression_closure::<KnitKey, KnitRecordDetails, _>(
+        std::iter::once(key.clone()),
+        false,
+        |batch| {
+            let lookup = match index.get_build_details(batch) {
+                Ok(m) => m,
+                Err(_) => {
+                    // The closure error path is just a missing-key
+                    // signal; the actual error gets reported back to
+                    // the caller via the `?` below since we re-call
+                    // in that case. Stash an empty batch here.
+                    return ClosureBatch {
+                        present: Default::default(),
+                        missing: batch.iter().cloned().collect(),
+                    };
+                }
+            };
+            let mut present = std::collections::HashMap::new();
+            let mut missing = std::collections::HashSet::new();
+            for k in batch {
+                match lookup.get(k) {
+                    Some(details) => {
+                        present.insert(
+                            k.clone(),
+                            (details.compression_parent.clone(), details.clone()),
+                        );
+                    }
+                    None => {
+                        missing.insert(k.clone());
+                    }
+                }
+            }
+            ClosureBatch { present, missing }
+        },
+    )
+    .map_err(|missing| {
+        let one = missing
+            .into_iter()
+            .next()
+            .map(|k| {
+                let last = k.last().cloned().unwrap_or_default();
+                last
+            })
+            .unwrap_or_default();
+        KnitError::BadIndexValue(one)
+    })?;
+
+    // 2. Order the chain ancestor-first by following compression_parent
+    //    pointers from `key` back to the fulltext, then reversing.
+    let mut order: Vec<KnitKey> = Vec::new();
+    let mut cursor: Option<KnitKey> = Some(key.clone());
+    while let Some(k) = cursor {
+        let details = chain.get(&k).ok_or_else(|| {
+            KnitError::BadIndexValue(b"chain walk produced a key without details".to_vec())
+        })?;
+        cursor = details.compression_parent.clone();
+        order.push(k);
+    }
+    order.reverse();
+
+    // 3. Walk the ordered chain: parse the fulltext (first entry),
+    //    then apply each delta in sequence.
+    let mut content: Option<F::Content> = None;
+    for chain_key in order {
+        let details = chain.get(&chain_key).ok_or_else(|| {
+            KnitError::BadIndexValue(b"chain walk produced a key without details".to_vec())
+        })?;
+        let raw = access.get_raw_record(&details.index_memo)?;
+        let decompressed = decode_record_gz(&raw)?;
+        let (_, body_lines) = parse_record_body_unchecked(&decompressed)?;
+        let next = factory.parse_record(
+            chain_key.last().map(|s| s.as_slice()).unwrap_or(&[]),
+            &body_lines,
+            details.method,
+            details.noeol,
+            content.as_ref(),
+        )?;
+        content = Some(next);
+    }
+    content.ok_or_else(|| KnitError::BadIndexValue(b"empty compression chain for key".to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1850,6 +2060,160 @@ mod tests {
             target_content.text(),
             vec![b"a\n".to_vec(), b"B\n".to_vec()]
         );
+    }
+
+    /// Tiny in-memory KnitIndex/KnitAccess pair used by the
+    /// `get_text_*` integration tests. Stores raw record bytes keyed
+    /// by their version_id (the last segment of the knit key) and
+    /// records a flat list of build details.
+    #[derive(Default)]
+    struct MockKnit {
+        records: std::collections::HashMap<KnitKey, KnitRecordDetails>,
+        bytes: std::collections::HashMap<KnitIndexMemo, Vec<u8>>,
+    }
+
+    impl MockKnit {
+        fn add_record(&mut self, key: KnitKey, details: KnitRecordDetails, raw: Vec<u8>) {
+            self.bytes.insert(details.index_memo.clone(), raw);
+            self.records.insert(key, details);
+        }
+    }
+
+    impl KnitIndex for MockKnit {
+        fn get_build_details(
+            &self,
+            keys: &[KnitKey],
+        ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails>, KnitError> {
+            let mut out = std::collections::HashMap::new();
+            for k in keys {
+                if let Some(d) = self.records.get(k) {
+                    out.insert(k.clone(), d.clone());
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    impl KnitAccess for MockKnit {
+        fn get_raw_record(&self, memo: &KnitIndexMemo) -> Result<Vec<u8>, KnitError> {
+            self.bytes
+                .get(memo)
+                .cloned()
+                .ok_or_else(|| KnitError::BadIndexValue(memo.path.as_bytes().to_vec()))
+        }
+    }
+
+    fn build_fulltext_record(
+        version_id: &[u8],
+        annotated: &[AnnotatedLine],
+    ) -> (Vec<u8>, KnitIndexMemo) {
+        let body = lower_fulltext(annotated);
+        let (_, chunks) = record_to_data(version_id, b"DIGEST", body.len(), &body, true).unwrap();
+        let raw: Vec<u8> = chunks.into_iter().flatten().collect();
+        let memo = KnitIndexMemo {
+            path: format!("rec/{}", String::from_utf8_lossy(version_id)),
+            offset: 0,
+            length: raw.len(),
+        };
+        (raw, memo)
+    }
+
+    fn build_delta_record(
+        version_id: &[u8],
+        delta: &[DeltaHunk<AnnotatedLine>],
+    ) -> (Vec<u8>, KnitIndexMemo) {
+        let body = lower_line_delta_annotated(delta);
+        let (_, chunks) = record_to_data(version_id, b"DIGEST", body.len(), &body, true).unwrap();
+        let raw: Vec<u8> = chunks.into_iter().flatten().collect();
+        let memo = KnitIndexMemo {
+            path: format!("rec/{}", String::from_utf8_lossy(version_id)),
+            offset: 0,
+            length: raw.len(),
+        };
+        (raw, memo)
+    }
+
+    #[test]
+    fn get_text_returns_fulltext_record_via_traits() {
+        let mut knit = MockKnit::default();
+        let key: KnitKey = vec![b"file".to_vec(), b"v1".to_vec()];
+        let pairs = vec![
+            (b"v1".to_vec(), b"alpha\n".to_vec()),
+            (b"v1".to_vec(), b"beta\n".to_vec()),
+        ];
+        let (raw, memo) = build_fulltext_record(b"v1", &pairs);
+        knit.add_record(
+            key.clone(),
+            KnitRecordDetails {
+                method: KnitMethod::Fulltext,
+                noeol: false,
+                index_memo: memo,
+                compression_parent: None,
+                parents: vec![],
+            },
+            raw,
+        );
+
+        let factory = KnitAnnotateFactory;
+        let text = get_text(&knit, &knit, &factory, &key).unwrap();
+        assert_eq!(text, b"alpha\nbeta\n".to_vec());
+    }
+
+    #[test]
+    fn get_text_walks_two_step_delta_chain_via_traits() {
+        let mut knit = MockKnit::default();
+        let parent_key: KnitKey = vec![b"file".to_vec(), b"v1".to_vec()];
+        let child_key: KnitKey = vec![b"file".to_vec(), b"v2".to_vec()];
+
+        // Parent fulltext: two lines.
+        let parent_pairs = vec![
+            (b"v1".to_vec(), b"a\n".to_vec()),
+            (b"v1".to_vec(), b"b\n".to_vec()),
+        ];
+        let (parent_raw, parent_memo) = build_fulltext_record(b"v1", &parent_pairs);
+        knit.add_record(
+            parent_key.clone(),
+            KnitRecordDetails {
+                method: KnitMethod::Fulltext,
+                noeol: false,
+                index_memo: parent_memo,
+                compression_parent: None,
+                parents: vec![],
+            },
+            parent_raw,
+        );
+
+        // Child delta: replace line 1 (the "b\n") with "B\n".
+        let delta = vec![DeltaHunk {
+            start: 1,
+            end: 2,
+            count: 1,
+            lines: vec![(b"v2".to_vec(), b"B\n".to_vec())],
+        }];
+        let (delta_raw, delta_memo) = build_delta_record(b"v2", &delta);
+        knit.add_record(
+            child_key.clone(),
+            KnitRecordDetails {
+                method: KnitMethod::LineDelta,
+                noeol: false,
+                index_memo: delta_memo,
+                compression_parent: Some(parent_key.clone()),
+                parents: vec![parent_key.clone()],
+            },
+            delta_raw,
+        );
+
+        let factory = KnitAnnotateFactory;
+        let text = get_text(&knit, &knit, &factory, &child_key).unwrap();
+        assert_eq!(text, b"a\nB\n".to_vec());
+    }
+
+    #[test]
+    fn get_text_propagates_missing_key() {
+        let knit = MockKnit::default();
+        let key: KnitKey = vec![b"missing".to_vec()];
+        let factory = KnitAnnotateFactory;
+        assert!(get_text(&knit, &knit, &factory, &key).is_err());
     }
 
     #[test]
