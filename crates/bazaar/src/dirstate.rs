@@ -1044,6 +1044,52 @@ pub fn parse_dirblocks(
     Ok(dirblocks)
 }
 
+/// Serialise a single [`Entry`] to the NUL-delimited byte form Python
+/// writes via `DirState._entry_to_line`.
+///
+/// The output is `dirname\0basename\0file_id\0` followed by, for each
+/// tree, `minikind\0fingerprint\0size\0{y,n}\0packed_stat`. No trailing
+/// NUL — the outer `get_output_lines` step adds the `\0\n\0` separator
+/// between rows when it joins them into the full inventory text.
+pub fn entry_to_line(entry: &Entry) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&entry.key.dirname);
+    out.push(0);
+    out.extend_from_slice(&entry.key.basename);
+    out.push(0);
+    out.extend_from_slice(&entry.key.file_id);
+    for tree in &entry.trees {
+        out.push(0);
+        out.push(tree.minikind);
+        out.push(0);
+        out.extend_from_slice(&tree.fingerprint);
+        out.push(0);
+        out.extend_from_slice(format!("{}", tree.size).as_bytes());
+        out.push(0);
+        out.push(if tree.executable { b'y' } else { b'n' });
+        out.push(0);
+        out.extend_from_slice(&tree.packed_stat);
+    }
+    out
+}
+
+/// Flatten every entry in `dirblocks` into an iterator-style Vec of rows.
+/// Each row is produced by [`entry_to_line`]; the returned vector is
+/// ready to be chained with the parents/ghosts lines and handed to
+/// [`get_output_lines`].
+///
+/// Mirrors Python's `_iter_entries` + `map(_entry_to_line, ...)` chain
+/// inside `DirState.get_lines`.
+pub fn dirblocks_to_entry_lines(dirblocks: &[Dirblock]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for block in dirblocks {
+        for entry in &block.entries {
+            out.push(entry_to_line(entry));
+        }
+    }
+    out
+}
+
 /// In-memory `DirState`, the Rust counterpart to `bzrformats.dirstate.DirState`.
 ///
 /// This commit introduces the struct and a constructor mirroring Python's
@@ -1189,6 +1235,30 @@ impl DirState {
         tree_index: usize,
     ) -> BlockEntryIndex {
         get_block_entry_index(&self.dirblocks, dirname, basename, tree_index)
+    }
+
+    /// Serialise the in-memory state to the byte chunks that make up the
+    /// on-disk file. Mirrors Python's `DirState.get_lines` for the
+    /// common "we have in-memory data to write" branch; it does not
+    /// handle the fast-path shortcut that re-reads an unmodified file
+    /// from disk (that shortcut belongs on the soon-to-be-ported
+    /// `save` method).
+    pub fn get_lines(&self) -> Vec<Vec<u8>> {
+        let parents_refs: Vec<&[u8]> = self.parents.iter().map(|p| p.as_slice()).collect();
+        let ghosts_refs: Vec<&[u8]> = self.ghosts.iter().map(|g| g.as_slice()).collect();
+        let parents_line = get_parents_line(&parents_refs);
+        let ghosts_line = get_ghosts_line(&ghosts_refs);
+
+        let entry_lines = dirblocks_to_entry_lines(&self.dirblocks);
+
+        // Build the owned-backing-store buffer, then borrow slices into
+        // it when calling `get_output_lines`.
+        let mut owned: Vec<Vec<u8>> = Vec::with_capacity(2 + entry_lines.len());
+        owned.push(parents_line);
+        owned.push(ghosts_line);
+        owned.extend(entry_lines);
+        let borrowed: Vec<&[u8]> = owned.iter().map(|l| l.as_slice()).collect();
+        get_output_lines(borrowed)
     }
 }
 
@@ -2098,6 +2168,265 @@ mod dirstate_struct_tests {
         let bei = state.get_block_entry_index(b"dir", b"a", 0);
         assert_eq!(bei.block_index, 2);
         assert!(bei.path_present);
+    }
+
+    #[test]
+    fn entry_to_line_single_tree_matches_expected_layout() {
+        let nullstat = b"x".repeat(32);
+        let entry = Entry {
+            key: EntryKey {
+                dirname: b"".to_vec(),
+                basename: b"README".to_vec(),
+                file_id: b"fid-readme".to_vec(),
+            },
+            trees: vec![TreeData {
+                minikind: b'f',
+                fingerprint: b"sha1value".to_vec(),
+                size: 42,
+                executable: true,
+                packed_stat: nullstat.clone(),
+            }],
+        };
+        let line = entry_to_line(&entry);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"\x00README\x00fid-readme\x00f\x00sha1value\x0042\x00y\x00");
+        expected.extend_from_slice(&nullstat);
+        assert_eq!(line, expected);
+    }
+
+    #[test]
+    fn entry_to_line_multi_tree() {
+        let nullstat = b"x".repeat(32);
+        let entry = Entry {
+            key: EntryKey {
+                dirname: b"sub".to_vec(),
+                basename: b"f".to_vec(),
+                file_id: b"fid".to_vec(),
+            },
+            trees: vec![
+                TreeData {
+                    minikind: b'f',
+                    fingerprint: b"cur".to_vec(),
+                    size: 7,
+                    executable: false,
+                    packed_stat: nullstat.clone(),
+                },
+                TreeData {
+                    minikind: b'a',
+                    fingerprint: b"".to_vec(),
+                    size: 0,
+                    executable: false,
+                    packed_stat: nullstat.clone(),
+                },
+            ],
+        };
+        let line = entry_to_line(&entry);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"sub\x00f\x00fid\x00f\x00cur\x007\x00n\x00");
+        expected.extend_from_slice(&nullstat);
+        expected.extend_from_slice(b"\x00a\x00\x000\x00n\x00");
+        expected.extend_from_slice(&nullstat);
+        assert_eq!(line, expected);
+    }
+
+    #[test]
+    fn entry_to_line_round_trip_through_parse_dirblocks() {
+        // Build a DirState, serialise it via get_lines, then feed the
+        // body back through parse_dirblocks + split_root_dirblock_into_contents
+        // and check the dirblocks survive the round-trip.
+        let nullstat = b"x".repeat(32);
+        let original = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![Entry {
+                    key: EntryKey {
+                        dirname: b"".to_vec(),
+                        basename: b"".to_vec(),
+                        file_id: b"TREE_ROOT".to_vec(),
+                    },
+                    trees: vec![TreeData {
+                        minikind: b'd',
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: nullstat.clone(),
+                    }],
+                }],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![Entry {
+                    key: EntryKey {
+                        dirname: b"".to_vec(),
+                        basename: b"README".to_vec(),
+                        file_id: b"fid-readme".to_vec(),
+                    },
+                    trees: vec![TreeData {
+                        minikind: b'f',
+                        fingerprint: b"sha1".to_vec(),
+                        size: 10,
+                        executable: true,
+                        packed_stat: nullstat.clone(),
+                    }],
+                }],
+            },
+        ];
+
+        let mut state = DirState::new(
+            "dirstate",
+            Box::new(DefaultSHA1Provider::new()),
+            0,
+            true,
+            false,
+        );
+        state.dirblocks = original.clone();
+
+        let chunks = state.get_lines();
+        let data: Vec<u8> = chunks.into_iter().flatten().collect();
+
+        // Re-parse: two entries → get_output_lines writes num_entries=2.
+        let header = read_header(&data).expect("parse header");
+        assert_eq!(header.num_entries, 2);
+        let body = &data[header.end_of_header..];
+        let mut parsed = parse_dirblocks(body, 1, header.num_entries).expect("parse body");
+        split_root_dirblock_into_contents(&mut parsed).expect("split");
+
+        assert_eq!(parsed.len(), 2);
+        // Block 0: just the root entry.
+        assert_eq!(parsed[0].entries.len(), 1);
+        assert_eq!(parsed[0].entries[0].key.file_id, b"TREE_ROOT".to_vec());
+        // Block 1: the contents-of-root entry.
+        assert_eq!(parsed[1].entries.len(), 1);
+        assert_eq!(parsed[1].entries[0].key.basename, b"README".to_vec());
+        assert_eq!(parsed[1].entries[0].trees[0].size, 10);
+        assert!(parsed[1].entries[0].trees[0].executable);
+    }
+
+    #[test]
+    fn dirstate_get_lines_matches_python_saved_bytes() {
+        // The same single-entry layout we pinned earlier for
+        // parse_dirblocks, but now produced by the Rust writer and
+        // compared byte-for-byte.
+        let nullstat = b"x".repeat(32);
+        let mut state = DirState::new(
+            "dirstate",
+            Box::new(DefaultSHA1Provider::new()),
+            0,
+            true,
+            false,
+        );
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![Entry {
+                    key: EntryKey {
+                        dirname: b"".to_vec(),
+                        basename: b"".to_vec(),
+                        file_id: b"TREE_ROOT".to_vec(),
+                    },
+                    trees: vec![TreeData {
+                        minikind: b'd',
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: nullstat,
+                    }],
+                }],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        let chunks = state.get_lines();
+        let actual: Vec<u8> = chunks.into_iter().flatten().collect();
+        let expected: &[u8] = b"#bazaar dirstate flat format 3\n\
+                                crc32: 2823629280\n\
+                                num_entries: 1\n\
+                                0\x00\n\
+                                \x000\x00\n\
+                                \x00\x00\x00TREE_ROOT\x00d\x00\x000\x00n\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x00\n\x00";
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn dirstate_get_lines_multi_tree_with_parent_matches_python() {
+        // Cross-check against bytes produced by a real
+        // `DirState.initialize(...); _set_data([b"rev-a"], [...]); save()`
+        // cycle with one parent tree and a README file entry.
+        let nullstat = b"x".repeat(32);
+        let mut state = DirState::new(
+            "dirstate",
+            Box::new(DefaultSHA1Provider::new()),
+            0,
+            true,
+            false,
+        );
+        state.parents = vec![b"rev-a".to_vec()];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![Entry {
+                    key: EntryKey {
+                        dirname: b"".to_vec(),
+                        basename: b"".to_vec(),
+                        file_id: b"TREE_ROOT".to_vec(),
+                    },
+                    trees: vec![
+                        TreeData {
+                            minikind: b'd',
+                            fingerprint: Vec::new(),
+                            size: 0,
+                            executable: false,
+                            packed_stat: nullstat.clone(),
+                        },
+                        TreeData {
+                            minikind: b'd',
+                            fingerprint: Vec::new(),
+                            size: 0,
+                            executable: false,
+                            packed_stat: nullstat.clone(),
+                        },
+                    ],
+                }],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![Entry {
+                    key: EntryKey {
+                        dirname: b"".to_vec(),
+                        basename: b"README".to_vec(),
+                        file_id: b"fid-readme".to_vec(),
+                    },
+                    trees: vec![
+                        TreeData {
+                            minikind: b'f',
+                            fingerprint: b"sha-cur".to_vec(),
+                            size: 10,
+                            executable: true,
+                            packed_stat: nullstat.clone(),
+                        },
+                        TreeData {
+                            minikind: b'f',
+                            fingerprint: b"sha-par".to_vec(),
+                            size: 8,
+                            executable: false,
+                            packed_stat: nullstat,
+                        },
+                    ],
+                }],
+            },
+        ];
+        let chunks = state.get_lines();
+        let actual: Vec<u8> = chunks.into_iter().flatten().collect();
+        let expected: &[u8] = b"#bazaar dirstate flat format 3\n\
+                                crc32: 2831533605\n\
+                                num_entries: 2\n\
+                                1\x00rev-a\x00\n\
+                                \x000\x00\n\
+                                \x00\x00\x00TREE_ROOT\x00d\x00\x000\x00n\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x00d\x00\x000\x00n\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x00\n\
+                                \x00\x00README\x00fid-readme\x00f\x00sha-cur\x0010\x00y\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x00f\x00sha-par\x008\x00n\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x00\n\x00";
+        assert_eq!(actual, expected);
     }
 
     #[test]
