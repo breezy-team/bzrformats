@@ -1430,6 +1430,76 @@ impl DirState {
         }
         Ok(block_index)
     }
+
+    /// Walk the subtree rooted at `path_utf8` and return every live
+    /// entry (kind not in `b'a'`/`b'r'`) in `tree_index`, in the order
+    /// Python's `DirState._iter_child_entries` yields them.
+    ///
+    /// The walk is breadth-first: all immediate children of `path_utf8`
+    /// first, then all children of those (grouped by whichever parent
+    /// they were enqueued from). Directory entries whose tree data says
+    /// they're directories (`b'd'`) are recursed into; absent and
+    /// relocated entries are filtered out of the output but do not
+    /// suppress the recursion into other entries.
+    ///
+    /// An empty `path_utf8` walks the top of the tree. Asking for the
+    /// children of a non-directory returns an empty vector.
+    pub fn iter_child_entries(&self, tree_index: usize, path_utf8: &[u8]) -> Vec<Entry> {
+        let mut out: Vec<Entry> = Vec::new();
+        let mut next_pending: Vec<Vec<u8>> = vec![path_utf8.to_vec()];
+        while !next_pending.is_empty() {
+            let pending = std::mem::take(&mut next_pending);
+            for path in pending {
+                let lookup_key = EntryKey {
+                    dirname: path.clone(),
+                    basename: Vec::new(),
+                    file_id: Vec::new(),
+                };
+                let (mut block_index, present) =
+                    find_block_index_from_key(&self.dirblocks, &lookup_key);
+                // Python treats block_index 0 as a special case: the
+                // caller asked for the root, and the first real block
+                // with root entries lives at index 1. If there are no
+                // other blocks we're done.
+                if block_index == 0 {
+                    block_index = 1;
+                    if self.dirblocks.len() == 1 {
+                        return out;
+                    }
+                } else if !present {
+                    // children of a non-directory asked for.
+                    continue;
+                }
+                if block_index >= self.dirblocks.len() {
+                    continue;
+                }
+                let block = &self.dirblocks[block_index];
+                for entry in &block.entries {
+                    let kind = entry
+                        .trees
+                        .get(tree_index)
+                        .map(|t| t.minikind)
+                        .unwrap_or(b'a');
+                    if kind != b'a' && kind != b'r' {
+                        out.push(entry.clone());
+                    }
+                    if kind == b'd' {
+                        // Build `dirname/basename` for the recursion.
+                        let next_path = if entry.key.dirname.is_empty() {
+                            entry.key.basename.clone()
+                        } else {
+                            let mut p = entry.key.dirname.clone();
+                            p.push(b'/');
+                            p.extend_from_slice(&entry.key.basename);
+                            p
+                        };
+                        next_pending.push(next_path);
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Error returned by [`DirState::ensure_block`] when the requested
@@ -2527,6 +2597,218 @@ mod dirstate_struct_tests {
 
     /// Rust counterpart of Python
     /// `TestGetBlockRowIndex.test_simple_structure`.
+    /// Rust mirror of Python's `create_dirstate_with_two_trees` fixture
+    /// used by `TestIterChildEntries`. Two trees per row; the tree at
+    /// index 1 is a pretend parent revision with a few differences from
+    /// the working tree (b/g absent, b/h with a different file id,
+    /// b/i new, c renamed to b/j).
+    fn create_dirstate_with_two_trees() -> DirState {
+        let mut state = fresh_state();
+        state.parents = vec![b"parent".to_vec()];
+        let stat_current = TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: PACKED_STAT.to_vec(),
+        };
+        let stat_parent_dir = TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: b"parent-revid".to_vec(),
+        };
+        let null_parent = TreeData {
+            minikind: b'a',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: Vec::new(),
+        };
+        let file_cur = |size: u64| TreeData {
+            minikind: b'f',
+            fingerprint: NULL_SHA.to_vec(),
+            size,
+            executable: false,
+            packed_stat: PACKED_STAT.to_vec(),
+        };
+        let file_parent = |fingerprint: &[u8], size: u64| TreeData {
+            minikind: b'f',
+            fingerprint: fingerprint.to_vec(),
+            size,
+            executable: false,
+            packed_stat: b"parent-revid".to_vec(),
+        };
+        let relocated = |to: &[u8]| TreeData {
+            minikind: b'r',
+            fingerprint: to.to_vec(),
+            size: 0,
+            executable: false,
+            packed_stat: Vec::new(),
+        };
+
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![Entry {
+                    key: EntryKey {
+                        dirname: b"".to_vec(),
+                        basename: b"".to_vec(),
+                        file_id: b"a-root-value".to_vec(),
+                    },
+                    trees: vec![stat_current.clone(), stat_parent_dir.clone()],
+                }],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![
+                    Entry {
+                        key: EntryKey {
+                            dirname: b"".to_vec(),
+                            basename: b"a".to_vec(),
+                            file_id: b"a-dir".to_vec(),
+                        },
+                        trees: vec![stat_current.clone(), stat_parent_dir.clone()],
+                    },
+                    Entry {
+                        key: EntryKey {
+                            dirname: b"".to_vec(),
+                            basename: b"b".to_vec(),
+                            file_id: b"b-dir".to_vec(),
+                        },
+                        trees: vec![stat_current.clone(), stat_parent_dir.clone()],
+                    },
+                    Entry {
+                        key: EntryKey {
+                            dirname: b"".to_vec(),
+                            basename: b"c".to_vec(),
+                            file_id: b"c-file".to_vec(),
+                        },
+                        trees: vec![file_cur(10), relocated(b"b/j")],
+                    },
+                    Entry {
+                        key: EntryKey {
+                            dirname: b"".to_vec(),
+                            basename: b"d".to_vec(),
+                            file_id: b"d-file".to_vec(),
+                        },
+                        trees: vec![file_cur(20), file_parent(b"d", 20)],
+                    },
+                ],
+            },
+            Dirblock {
+                dirname: b"a".to_vec(),
+                entries: vec![
+                    Entry {
+                        key: EntryKey {
+                            dirname: b"a".to_vec(),
+                            basename: b"e".to_vec(),
+                            file_id: b"e-dir".to_vec(),
+                        },
+                        trees: vec![stat_current.clone(), stat_parent_dir.clone()],
+                    },
+                    Entry {
+                        key: EntryKey {
+                            dirname: b"a".to_vec(),
+                            basename: b"f".to_vec(),
+                            file_id: b"f-file".to_vec(),
+                        },
+                        trees: vec![file_cur(30), file_parent(b"f", 20)],
+                    },
+                ],
+            },
+            Dirblock {
+                dirname: b"b".to_vec(),
+                entries: vec![
+                    Entry {
+                        key: EntryKey {
+                            dirname: b"b".to_vec(),
+                            basename: b"g".to_vec(),
+                            file_id: b"g-file".to_vec(),
+                        },
+                        trees: vec![file_cur(30), null_parent.clone()],
+                    },
+                    Entry {
+                        key: EntryKey {
+                            dirname: b"b".to_vec(),
+                            basename: b"h\xc3\xa5".to_vec(),
+                            file_id: b"h-\xc3\xa5-file1".to_vec(),
+                        },
+                        trees: vec![file_cur(40), null_parent.clone()],
+                    },
+                    Entry {
+                        key: EntryKey {
+                            dirname: b"b".to_vec(),
+                            basename: b"h\xc3\xa5".to_vec(),
+                            file_id: b"h-\xc3\xa5-file2".to_vec(),
+                        },
+                        trees: vec![null_parent.clone(), file_parent(b"h", 20)],
+                    },
+                    Entry {
+                        key: EntryKey {
+                            dirname: b"b".to_vec(),
+                            basename: b"i".to_vec(),
+                            file_id: b"i-file".to_vec(),
+                        },
+                        trees: vec![null_parent.clone(), file_parent(b"h", 20)],
+                    },
+                    Entry {
+                        key: EntryKey {
+                            dirname: b"b".to_vec(),
+                            basename: b"j".to_vec(),
+                            file_id: b"c-file".to_vec(),
+                        },
+                        trees: vec![relocated(b"c"), file_parent(b"j", 20)],
+                    },
+                ],
+            },
+        ];
+        state
+    }
+
+    /// Rust counterpart of Python
+    /// `TestIterChildEntries.test_iter_children_b`. Walks the b/
+    /// subtree in tree_index=1 (the parent revision) and expects to
+    /// see the live entries h2, i, and j (in that order).
+    #[test]
+    fn iter_child_entries_children_b_tree_one() {
+        let state = create_dirstate_with_two_trees();
+        let children = state.iter_child_entries(1, b"b");
+        let basenames: Vec<&[u8]> = children.iter().map(|e| e.key.basename.as_slice()).collect();
+        let file_ids: Vec<&[u8]> = children.iter().map(|e| e.key.file_id.as_slice()).collect();
+        // h2 and i share the basename "h\xc3\xa5" and "i"; distinguish
+        // by file id so the test pins the exact row.
+        assert_eq!(basenames, vec![&b"h\xc3\xa5"[..], b"i", b"j"]);
+        assert_eq!(
+            file_ids,
+            vec![&b"h-\xc3\xa5-file2"[..], b"i-file", b"c-file"]
+        );
+    }
+
+    /// Rust counterpart of Python
+    /// `TestIterChildEntries.test_iter_child_root`. Walks the whole
+    /// tree in tree_index=1 and expects: a, b, d (c is relocated so
+    /// absent from this tree), then e, f from a/, then h2, i, j from
+    /// b/.
+    #[test]
+    fn iter_child_entries_root_tree_one() {
+        let state = create_dirstate_with_two_trees();
+        let children = state.iter_child_entries(1, b"");
+        let basenames: Vec<&[u8]> = children.iter().map(|e| e.key.basename.as_slice()).collect();
+        let expected: Vec<&[u8]> = vec![b"a", b"b", b"d", b"e", b"f", b"h\xc3\xa5", b"i", b"j"];
+        assert_eq!(basenames, expected);
+    }
+
+    #[test]
+    fn iter_child_entries_non_directory_returns_empty() {
+        let state = create_complex_dirstate();
+        // "c" is a file, not a directory — iter_child_entries of a
+        // non-directory path yields nothing.
+        let children = state.iter_child_entries(0, b"c");
+        assert!(children.is_empty());
+    }
+
     #[test]
     fn get_block_entry_index_simple_structure() {
         let state = create_dirstate_with_root_and_subdir();
