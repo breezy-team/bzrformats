@@ -1260,6 +1260,49 @@ impl DirState {
         let borrowed: Vec<&[u8]> = owned.iter().map(|l| l.as_slice()).collect();
         get_output_lines(borrowed)
     }
+
+    /// Mark the dirstate as modified. Mirrors Python's
+    /// `DirState._mark_modified`.
+    ///
+    /// If `hash_changed_entries` is non-empty, only the hash cache is
+    /// affected: the provided entry keys are added to
+    /// `known_hash_changes` and the `dirblock_state` transitions from
+    /// `NotInMemory`/`InMemoryUnmodified` into `InMemoryHashModified`
+    /// (a full `InMemoryModified` state takes precedence and is not
+    /// downgraded).
+    ///
+    /// If `hash_changed_entries` is empty the whole dirblock state is
+    /// considered dirty: `dirblock_state` becomes `InMemoryModified`
+    /// regardless of its previous value. `header_modified` is an
+    /// orthogonal flag that promotes `header_state` to
+    /// `InMemoryModified` as well.
+    pub fn mark_modified(&mut self, hash_changed_entries: &[EntryKey], header_modified: bool) {
+        if !hash_changed_entries.is_empty() {
+            for key in hash_changed_entries {
+                self.known_hash_changes.insert(key.clone());
+            }
+            if matches!(
+                self.dirblock_state,
+                MemoryState::NotInMemory | MemoryState::InMemoryUnmodified
+            ) {
+                self.dirblock_state = MemoryState::InMemoryHashModified;
+            }
+        } else {
+            self.dirblock_state = MemoryState::InMemoryModified;
+        }
+        if header_modified {
+            self.header_state = MemoryState::InMemoryModified;
+        }
+    }
+
+    /// Mark the dirstate as unmodified — both header and dirblock state
+    /// return to `InMemoryUnmodified` and the hash-change set is
+    /// cleared. Mirrors Python's `DirState._mark_unmodified`.
+    pub fn mark_unmodified(&mut self) {
+        self.header_state = MemoryState::InMemoryUnmodified;
+        self.dirblock_state = MemoryState::InMemoryUnmodified;
+        self.known_hash_changes.clear();
+    }
 }
 
 /// Error returned by [`split_root_dirblock_into_contents`] when the
@@ -2427,6 +2470,86 @@ mod dirstate_struct_tests {
                                 \x00\x00\x00TREE_ROOT\x00d\x00\x000\x00n\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x00d\x00\x000\x00n\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x00\n\
                                 \x00\x00README\x00fid-readme\x00f\x00sha-cur\x0010\x00y\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x00f\x00sha-par\x008\x00n\x00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\x00\n\x00";
         assert_eq!(actual, expected);
+    }
+
+    fn fresh_state() -> DirState {
+        DirState::new(
+            "dirstate",
+            Box::new(DefaultSHA1Provider::new()),
+            0,
+            true,
+            false,
+        )
+    }
+
+    fn entry_key(dirname: &[u8], basename: &[u8], file_id: &[u8]) -> EntryKey {
+        EntryKey {
+            dirname: dirname.to_vec(),
+            basename: basename.to_vec(),
+            file_id: file_id.to_vec(),
+        }
+    }
+
+    #[test]
+    fn mark_modified_no_hash_changes_marks_full_dirblock_state() {
+        let mut state = fresh_state();
+        state.dirblock_state = MemoryState::InMemoryUnmodified;
+        state.mark_modified(&[], false);
+        assert_eq!(state.dirblock_state, MemoryState::InMemoryModified);
+        assert_eq!(state.header_state, MemoryState::NotInMemory);
+        assert!(state.known_hash_changes.is_empty());
+    }
+
+    #[test]
+    fn mark_modified_hash_only_promotes_unmodified_to_hash_modified() {
+        let mut state = fresh_state();
+        state.dirblock_state = MemoryState::InMemoryUnmodified;
+        let key = entry_key(b"", b"README", b"fid-readme");
+        state.mark_modified(&[key.clone()], false);
+        assert_eq!(state.dirblock_state, MemoryState::InMemoryHashModified);
+        assert!(state.known_hash_changes.contains(&key));
+    }
+
+    #[test]
+    fn mark_modified_hash_only_promotes_not_in_memory_to_hash_modified() {
+        let mut state = fresh_state();
+        assert_eq!(state.dirblock_state, MemoryState::NotInMemory);
+        state.mark_modified(&[entry_key(b"", b"a", b"fid-a")], false);
+        assert_eq!(state.dirblock_state, MemoryState::InMemoryHashModified);
+    }
+
+    #[test]
+    fn mark_modified_hash_only_leaves_in_memory_modified_alone() {
+        // If the dirstate is already fully modified, a hash-only change
+        // must not downgrade it back to InMemoryHashModified — Python's
+        // comment explicitly flags the precedence rule.
+        let mut state = fresh_state();
+        state.dirblock_state = MemoryState::InMemoryModified;
+        state.mark_modified(&[entry_key(b"", b"a", b"fid-a")], false);
+        assert_eq!(state.dirblock_state, MemoryState::InMemoryModified);
+    }
+
+    #[test]
+    fn mark_modified_header_flag_promotes_header_state() {
+        let mut state = fresh_state();
+        state.header_state = MemoryState::InMemoryUnmodified;
+        state.mark_modified(&[], true);
+        assert_eq!(state.header_state, MemoryState::InMemoryModified);
+        assert_eq!(state.dirblock_state, MemoryState::InMemoryModified);
+    }
+
+    #[test]
+    fn mark_unmodified_resets_everything() {
+        let mut state = fresh_state();
+        state.header_state = MemoryState::InMemoryModified;
+        state.dirblock_state = MemoryState::InMemoryHashModified;
+        state
+            .known_hash_changes
+            .insert(entry_key(b"", b"x", b"fid"));
+        state.mark_unmodified();
+        assert_eq!(state.header_state, MemoryState::InMemoryUnmodified);
+        assert_eq!(state.dirblock_state, MemoryState::InMemoryUnmodified);
+        assert!(state.known_hash_changes.is_empty());
     }
 
     #[test]
