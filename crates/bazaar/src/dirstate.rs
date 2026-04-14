@@ -2258,6 +2258,61 @@ mod dirstate_struct_tests {
         assert_eq!(bisect_dirblock(&blocks, b"aa", 1, blocks.len()), 5);
     }
 
+    /// Build dirblocks from a list of sorted paths and, for each path,
+    /// assert that `bisect_dirblock` agrees with a manual `bisect_left`
+    /// over the split-by-`/` form. Mirrors `assertBisect` from the
+    /// Python `TestBisectDirblock` test class.
+    fn assert_bisect_matches_bisect_left(paths: &[&[u8]]) {
+        // Verify the caller's list is actually sorted component-wise
+        // (matches Python's `assertEqual(sorted(split_dirblocks), split_dirblocks)`).
+        let split: Vec<Vec<&[u8]>> = paths.iter().map(|p| split_dirname(p)).collect();
+        let mut sorted = split.clone();
+        sorted.sort();
+        assert_eq!(split, sorted, "test input paths are not sorted");
+
+        let blocks: Vec<Dirblock> = paths
+            .iter()
+            .map(|p| Dirblock {
+                dirname: p.to_vec(),
+                entries: Vec::new(),
+            })
+            .collect();
+
+        for probe in paths {
+            let got = bisect_dirblock(&blocks, probe, 0, blocks.len());
+            let probe_split = split_dirname(probe);
+            let expected = split.partition_point(|s| *s < probe_split);
+            assert_eq!(
+                got, expected,
+                "bisect_dirblock disagreed for {:?}: got {}, expected {}",
+                probe, got, expected,
+            );
+        }
+    }
+
+    /// Rust counterpart of Python `TestBisectDirblock.test_simple`.
+    #[test]
+    fn bisect_dirblock_simple() {
+        let paths: Vec<&[u8]> = vec![b"", b"a", b"b", b"c", b"d"];
+        assert_bisect_matches_bisect_left(&paths);
+    }
+
+    /// Rust counterpart of Python `TestBisectDirblock.test_involved`.
+    /// The pure-Rust `bisect_dirblock` does not have a `cache` parameter
+    /// (Python's `_split_path_cache` only speeds up repeated lookups and
+    /// does not affect results), so Python's `test_involved` and
+    /// `test_involved_cached` collapse into a single Rust test over the
+    /// same input.
+    #[test]
+    fn bisect_dirblock_involved() {
+        let paths: Vec<&[u8]> = vec![
+            b"", b"a", b"a/a", b"a/a/a", b"a/a/z", b"a/a-a", b"a/a-z", b"a/z", b"a/z/a", b"a/z/z",
+            b"a/z-a", b"a/z-z", b"a-a", b"a-z", b"z", b"z/a/a", b"z/a/z", b"z/a-a", b"z/a-z",
+            b"z/z", b"z/z/a", b"z/z/z", b"z/z-a", b"z/z-z", b"z-a", b"z-z",
+        ];
+        assert_bisect_matches_bisect_left(&paths);
+    }
+
     #[test]
     fn find_block_index_from_key_root_fast_path() {
         let blocks = make_dirblocks(vec![(b"sub", vec![])]);
@@ -2371,6 +2426,323 @@ mod dirstate_struct_tests {
         assert_eq!(bei.entry_index, 2);
     }
 
+    /// Packed_stat constant matching Python's test fixtures.
+    const PACKED_STAT: &[u8] = b"AAAAREUHaIpFB2iKAAADAQAtkqUAAIGk";
+    /// Null-sha matching Python's test fixtures.
+    const NULL_SHA: &[u8] = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+    fn stat_tree(minikind: u8) -> TreeData {
+        TreeData {
+            minikind,
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: PACKED_STAT.to_vec(),
+        }
+    }
+
+    fn file_tree(size: u64) -> TreeData {
+        TreeData {
+            minikind: b'f',
+            fingerprint: NULL_SHA.to_vec(),
+            size,
+            executable: false,
+            packed_stat: PACKED_STAT.to_vec(),
+        }
+    }
+
+    /// Rust mirror of Python's `create_dirstate_with_root_and_subdir`:
+    /// a root entry plus a single `subdir` entry in the contents-of-root
+    /// block. Used by `TestGetBlockRowIndex.test_simple_structure`.
+    fn create_dirstate_with_root_and_subdir() -> DirState {
+        let mut state = fresh_state();
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"a-root-value",
+                    vec![stat_tree(b'd')],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"subdir",
+                    b"subdir-id",
+                    vec![stat_tree(b'd')],
+                )],
+            },
+        ];
+        state
+    }
+
+    /// Rust mirror of Python's `create_complex_dirstate`. Matches the
+    /// docstring in test_dirstate.py: root + directories a/ and b/, files
+    /// c and d, a/e (empty dir), a/f, b/g, b/h\xc3\xa5.
+    fn create_complex_dirstate() -> DirState {
+        let mut state = fresh_state();
+        state.dirblocks = vec![
+            // Block 0: root entry.
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"a-root-value",
+                    vec![stat_tree(b'd')],
+                )],
+            },
+            // Block 1: contents of root — a, b (both dirs), c, d (files).
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![
+                    entry_with_trees(b"", b"a", b"a-dir", vec![stat_tree(b'd')]),
+                    entry_with_trees(b"", b"b", b"b-dir", vec![stat_tree(b'd')]),
+                    entry_with_trees(b"", b"c", b"c-file", vec![file_tree(10)]),
+                    entry_with_trees(b"", b"d", b"d-file", vec![file_tree(20)]),
+                ],
+            },
+            // Block 2: inside a/ — e (dir), f (file).
+            Dirblock {
+                dirname: b"a".to_vec(),
+                entries: vec![
+                    entry_with_trees(b"a", b"e", b"e-dir", vec![stat_tree(b'd')]),
+                    entry_with_trees(b"a", b"f", b"f-file", vec![file_tree(30)]),
+                ],
+            },
+            // Block 3: inside b/ — g, h\xc3\xa5 (file with non-ASCII name).
+            Dirblock {
+                dirname: b"b".to_vec(),
+                entries: vec![
+                    entry_with_trees(b"b", b"g", b"g-file", vec![file_tree(30)]),
+                    entry_with_trees(b"b", b"h\xc3\xa5", b"h-\xc3\xa5-file", vec![file_tree(40)]),
+                ],
+            },
+        ];
+        state
+    }
+
+    /// Rust counterpart of Python
+    /// `TestGetBlockRowIndex.test_simple_structure`.
+    #[test]
+    fn get_block_entry_index_simple_structure() {
+        let state = create_dirstate_with_root_and_subdir();
+        // subdir is present at (1, 0) in the contents-of-root block.
+        let bei = state.get_block_entry_index(b"", b"subdir", 0);
+        assert_eq!(bei.block_index, 1);
+        assert_eq!(bei.entry_index, 0);
+        assert!(bei.dir_present);
+        assert!(bei.path_present);
+        // bdir would sort before subdir — insertion point is still 0,
+        // dir_present = true, path_present = false.
+        let bei = state.get_block_entry_index(b"", b"bdir", 0);
+        assert_eq!(bei.block_index, 1);
+        assert_eq!(bei.entry_index, 0);
+        assert!(bei.dir_present);
+        assert!(!bei.path_present);
+        // zdir would sort after subdir — insertion point is 1.
+        let bei = state.get_block_entry_index(b"", b"zdir", 0);
+        assert_eq!(bei.block_index, 1);
+        assert_eq!(bei.entry_index, 1);
+        assert!(bei.dir_present);
+        assert!(!bei.path_present);
+        // Non-existent parent directories — dir_present = false and the
+        // block index is where they would be inserted (past the end).
+        let bei = state.get_block_entry_index(b"a", b"foo", 0);
+        assert_eq!(bei.block_index, 2);
+        assert_eq!(bei.entry_index, 0);
+        assert!(!bei.dir_present);
+        assert!(!bei.path_present);
+        let bei = state.get_block_entry_index(b"subdir", b"foo", 0);
+        assert_eq!(bei.block_index, 2);
+        assert!(!bei.dir_present);
+        assert!(!bei.path_present);
+    }
+
+    /// Rust counterpart of Python
+    /// `TestGetBlockRowIndex.test_complex_structure_exists`.
+    #[test]
+    fn get_block_entry_index_complex_structure_exists() {
+        let state = create_complex_dirstate();
+        // Root: (0, 0, true, true).
+        let bei = state.get_block_entry_index(b"", b"", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (0, 0, true, true)
+        );
+        // Root contents in block 1, each at their own index.
+        for (i, basename) in [&b"a"[..], b"b", b"c", b"d"].iter().enumerate() {
+            let bei = state.get_block_entry_index(b"", basename, 0);
+            assert_eq!(
+                (
+                    bei.block_index,
+                    bei.entry_index,
+                    bei.dir_present,
+                    bei.path_present
+                ),
+                (1, i, true, true),
+                "root/{:?}",
+                basename
+            );
+        }
+        // a/e and a/f live in block 2.
+        let bei = state.get_block_entry_index(b"a", b"e", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (2, 0, true, true)
+        );
+        let bei = state.get_block_entry_index(b"a", b"f", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (2, 1, true, true)
+        );
+        // b/g and b/h\xc3\xa5 live in block 3.
+        let bei = state.get_block_entry_index(b"b", b"g", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (3, 0, true, true)
+        );
+        let bei = state.get_block_entry_index(b"b", b"h\xc3\xa5", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (3, 1, true, true)
+        );
+    }
+
+    /// Rust counterpart of Python
+    /// `TestGetBlockRowIndex.test_complex_structure_missing`. Checks
+    /// that insertion points match Python's expectations for paths
+    /// that don't yet exist in the complex dirstate.
+    #[test]
+    fn get_block_entry_index_complex_structure_missing() {
+        let state = create_complex_dirstate();
+        // Root row still present.
+        let bei = state.get_block_entry_index(b"", b"", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (0, 0, true, true)
+        );
+        // "_" sorts before "a" in the contents-of-root block.
+        let bei = state.get_block_entry_index(b"", b"_", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (1, 0, true, false)
+        );
+        // "aa" sorts between "a" (index 0) and "b" (index 1).
+        let bei = state.get_block_entry_index(b"", b"aa", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (1, 1, true, false)
+        );
+        // "h\xc3\xa5" sorts after "d" — insertion point is 4 (end of block).
+        let bei = state.get_block_entry_index(b"", b"h\xc3\xa5", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (1, 4, true, false)
+        );
+        // Directories that don't exist: _, aa, bb.
+        let bei = state.get_block_entry_index(b"_", b"a", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (2, 0, false, false)
+        );
+        let bei = state.get_block_entry_index(b"aa", b"a", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (3, 0, false, false)
+        );
+        let bei = state.get_block_entry_index(b"bb", b"a", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (4, 0, false, false)
+        );
+        // "a/e" as a dirname sorts component-wise between "a" (2) and "b" (3).
+        let bei = state.get_block_entry_index(b"a/e", b"a", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (3, 0, false, false)
+        );
+        // "e" comes after "b" — insertion point is 4 (past end).
+        let bei = state.get_block_entry_index(b"e", b"a", 0);
+        assert_eq!(
+            (
+                bei.block_index,
+                bei.entry_index,
+                bei.dir_present,
+                bei.path_present
+            ),
+            (4, 0, false, false)
+        );
+    }
+
     #[test]
     fn dirstate_method_wrappers_delegate_to_free_functions() {
         let mut state = DirState::new(
@@ -2454,6 +2826,85 @@ mod dirstate_struct_tests {
         expected.extend_from_slice(b"\x00a\x00\x000\x00n\x00");
         expected.extend_from_slice(&nullstat);
         assert_eq!(line, expected);
+    }
+
+    /// Rust counterpart of Python
+    /// `TestGetLines.test_entry_to_line_with_parent`. Root entry with
+    /// current tree details plus one parent whose "tree data" is the
+    /// absent-pointer form `(b"a", <relocated-path>, 0, False, b"")`.
+    #[test]
+    fn entry_to_line_with_parent_matches_python_bytes() {
+        let entry = Entry {
+            key: EntryKey {
+                dirname: b"".to_vec(),
+                basename: b"".to_vec(),
+                file_id: b"a-root-value".to_vec(),
+            },
+            trees: vec![
+                TreeData {
+                    minikind: b'd',
+                    fingerprint: Vec::new(),
+                    size: 0,
+                    executable: false,
+                    packed_stat: PACKED_STAT.to_vec(),
+                },
+                TreeData {
+                    minikind: b'a',
+                    fingerprint: b"dirname/basename".to_vec(),
+                    size: 0,
+                    executable: false,
+                    packed_stat: Vec::new(),
+                },
+            ],
+        };
+        let expected: &[u8] = b"\x00\x00a-root-value\x00\
+                                d\x00\x000\x00n\x00AAAAREUHaIpFB2iKAAADAQAtkqUAAIGk\x00\
+                                a\x00dirname/basename\x000\x00n\x00";
+        assert_eq!(entry_to_line(&entry), expected);
+    }
+
+    /// Rust counterpart of Python
+    /// `TestGetLines.test_entry_to_line_with_two_parents_at_different_paths`.
+    /// Root entry with current tree details, one parent at the same
+    /// path, and a second parent whose data is the absent-pointer form
+    /// pointing at `dirname/basename`.
+    #[test]
+    fn entry_to_line_with_two_parents_at_different_paths_matches_python_bytes() {
+        let entry = Entry {
+            key: EntryKey {
+                dirname: b"".to_vec(),
+                basename: b"".to_vec(),
+                file_id: b"a-root-value".to_vec(),
+            },
+            trees: vec![
+                TreeData {
+                    minikind: b'd',
+                    fingerprint: Vec::new(),
+                    size: 0,
+                    executable: false,
+                    packed_stat: PACKED_STAT.to_vec(),
+                },
+                TreeData {
+                    minikind: b'd',
+                    fingerprint: Vec::new(),
+                    size: 0,
+                    executable: false,
+                    packed_stat: b"rev_id".to_vec(),
+                },
+                TreeData {
+                    minikind: b'a',
+                    fingerprint: b"dirname/basename".to_vec(),
+                    size: 0,
+                    executable: false,
+                    packed_stat: Vec::new(),
+                },
+            ],
+        };
+        let expected: &[u8] = b"\x00\x00a-root-value\x00\
+                                d\x00\x000\x00n\x00AAAAREUHaIpFB2iKAAADAQAtkqUAAIGk\x00\
+                                d\x00\x000\x00n\x00rev_id\x00\
+                                a\x00dirname/basename\x000\x00n\x00";
+        assert_eq!(entry_to_line(&entry), expected);
     }
 
     #[test]
