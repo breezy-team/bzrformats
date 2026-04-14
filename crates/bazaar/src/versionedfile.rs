@@ -271,6 +271,174 @@ impl<'py> pyo3::IntoPyObject<'py> for Key {
     }
 }
 
+/// Reference-count bookkeeping for a compression-parent graph.
+///
+/// `KeyRefs` tracks which keys are referenced by which other keys, so that
+/// during stream insertion we can tell which texts still have unresolved
+/// parents (`get_unsatisfied_refs`) and discard cached content for parents
+/// whose children have all been processed (`_satisfy_refs_for_key`).
+///
+/// Mirrors the Python `_KeyRefs` class in `bzrformats/versionedfile.py`
+/// one-to-one. Generic over the key type so pyo3 callers can store opaque
+/// Python tuples while pure-Rust callers can use `Vec<Vec<u8>>`.
+#[derive(Debug, Clone)]
+pub struct KeyRefs<K: Eq + std::hash::Hash + Clone> {
+    /// Map from referenced key -> set of keys that reference it.
+    refs: HashMap<K, std::collections::HashSet<K>>,
+    /// Optional "new keys" tracking set. `None` when `track_new_keys` was
+    /// `false` at construction.
+    new_keys: Option<std::collections::HashSet<K>>,
+}
+
+impl<K: Eq + std::hash::Hash + Clone> KeyRefs<K> {
+    /// Construct a fresh `KeyRefs`. Pass `track_new_keys = true` to enable
+    /// [`KeyRefs::new_keys`]; when `false`, calls to [`KeyRefs::add_key`]
+    /// skip recording the key as new.
+    pub fn new(track_new_keys: bool) -> Self {
+        Self {
+            refs: HashMap::new(),
+            new_keys: if track_new_keys {
+                Some(std::collections::HashSet::new())
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Remove all tracked references and new keys, keeping the
+    /// `track_new_keys` mode of this instance.
+    pub fn clear(&mut self) {
+        self.refs.clear();
+        if let Some(new_keys) = self.new_keys.as_mut() {
+            new_keys.clear();
+        }
+    }
+
+    /// Record that `key` references each of `refs`, then call
+    /// [`Self::add_key`] so any reference to `key` itself is satisfied.
+    pub fn add_references<I>(&mut self, key: K, refs: I)
+    where
+        I: IntoIterator<Item = K>,
+    {
+        for referenced in refs {
+            self.refs.entry(referenced).or_default().insert(key.clone());
+        }
+        self.add_key(key);
+    }
+
+    /// Satisfy any outstanding references to `key` and, if this instance
+    /// tracks new keys, remember that we've seen it.
+    pub fn add_key(&mut self, key: K) {
+        self.satisfy_refs_for_key(&key);
+        if let Some(new_keys) = self.new_keys.as_mut() {
+            new_keys.insert(key);
+        }
+    }
+
+    /// Satisfy outstanding references to `key` without recording it as a
+    /// new key. Safe to call even if `key` has no referrers.
+    pub fn satisfy_refs_for_key(&mut self, key: &K) {
+        self.refs.remove(key);
+    }
+
+    /// Bulk variant of [`Self::satisfy_refs_for_key`].
+    pub fn satisfy_refs_for_keys<I>(&mut self, keys: I)
+    where
+        I: IntoIterator<Item = K>,
+    {
+        for key in keys {
+            self.satisfy_refs_for_key(&key);
+        }
+    }
+
+    /// Keys that still have unresolved references, i.e. the parents of
+    /// other keys in the graph that have not yet been inserted themselves.
+    pub fn unsatisfied_refs(&self) -> impl Iterator<Item = &K> {
+        self.refs.keys()
+    }
+
+    /// All keys currently known to reference something. Flattens the
+    /// per-parent referrer sets — a key referenced by multiple children is
+    /// returned exactly once.
+    pub fn referrers(&self) -> std::collections::HashSet<K> {
+        let mut out = std::collections::HashSet::new();
+        for set in self.refs.values() {
+            for key in set {
+                out.insert(key.clone());
+            }
+        }
+        out
+    }
+
+    /// Set of keys that have been added since construction (or last
+    /// `clear()`), or `None` if this instance isn't tracking new keys.
+    pub fn new_keys(&self) -> Option<&std::collections::HashSet<K>> {
+        self.new_keys.as_ref()
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Clone> Default for KeyRefs<K> {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+#[cfg(test)]
+mod key_refs_tests {
+    use super::*;
+
+    #[test]
+    fn add_references_records_referrers() {
+        let mut refs: KeyRefs<Vec<u8>> = KeyRefs::new(false);
+        refs.add_references(b"child".to_vec(), vec![b"p1".to_vec(), b"p2".to_vec()]);
+        let unsatisfied: std::collections::HashSet<Vec<u8>> =
+            refs.unsatisfied_refs().cloned().collect();
+        let expected: std::collections::HashSet<Vec<u8>> =
+            vec![b"p1".to_vec(), b"p2".to_vec()].into_iter().collect();
+        assert_eq!(unsatisfied, expected);
+    }
+
+    #[test]
+    fn adding_a_parent_satisfies_references_to_it() {
+        let mut refs: KeyRefs<Vec<u8>> = KeyRefs::new(false);
+        refs.add_references(b"child".to_vec(), vec![b"p1".to_vec()]);
+        refs.add_key(b"p1".to_vec());
+        assert!(refs.unsatisfied_refs().next().is_none());
+    }
+
+    #[test]
+    fn new_keys_only_tracked_when_enabled() {
+        let mut tracking: KeyRefs<Vec<u8>> = KeyRefs::new(true);
+        let mut untracked: KeyRefs<Vec<u8>> = KeyRefs::new(false);
+        tracking.add_key(b"k".to_vec());
+        untracked.add_key(b"k".to_vec());
+        assert_eq!(tracking.new_keys().map(|s| s.len()), Some(1));
+        assert!(untracked.new_keys().is_none());
+    }
+
+    #[test]
+    fn referrers_flattens_duplicate_children() {
+        let mut refs: KeyRefs<Vec<u8>> = KeyRefs::new(false);
+        // c1 references p1 and p2; c2 references p1; p1 should be referenced
+        // by {c1, c2} but the flat referrers set is still {c1, c2}.
+        refs.add_references(b"c1".to_vec(), vec![b"p1".to_vec(), b"p2".to_vec()]);
+        refs.add_references(b"c2".to_vec(), vec![b"p1".to_vec()]);
+        let referrers = refs.referrers();
+        let expected: std::collections::HashSet<Vec<u8>> =
+            vec![b"c1".to_vec(), b"c2".to_vec()].into_iter().collect();
+        assert_eq!(referrers, expected);
+    }
+
+    #[test]
+    fn clear_resets_refs_and_new_keys() {
+        let mut refs: KeyRefs<Vec<u8>> = KeyRefs::new(true);
+        refs.add_references(b"c".to_vec(), vec![b"p".to_vec()]);
+        refs.clear();
+        assert!(refs.unsatisfied_refs().next().is_none());
+        assert_eq!(refs.new_keys().map(|s| s.len()), Some(0));
+    }
+}
+
 impl bendy::encoding::ToBencode for Key {
     const MAX_DEPTH: usize = 10;
 

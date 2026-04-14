@@ -294,12 +294,132 @@ fn mpdiff_first_pass<'py>(
     Ok((needed_keys, refcounts, just_parents, missing_keys))
 }
 
+/// Reference-count bookkeeping for compression-parent satisfaction during
+/// stream insertion. Python-facing counterpart of the pure-Rust
+/// `bazaar::versionedfile::KeyRefs`; stores Python tuples directly via
+/// `PyDict`/`PySet` so hashing delegates to the Python tuple hash.
+///
+/// Mirrors `bzrformats.versionedfile._KeyRefs` one-to-one. `refs` maps
+/// each referenced parent key to the set of child keys that reference it,
+/// and `new_keys` (when tracking is enabled) remembers every key added.
+#[pyclass(name = "KeyRefs")]
+struct KeyRefs {
+    refs: Py<PyDict>,
+    new_keys: Option<Py<PySet>>,
+}
+
+#[pymethods]
+impl KeyRefs {
+    #[new]
+    #[pyo3(signature = (track_new_keys = false))]
+    fn new(py: Python<'_>, track_new_keys: bool) -> PyResult<Self> {
+        Ok(Self {
+            refs: PyDict::new(py).unbind(),
+            new_keys: if track_new_keys {
+                Some(PySet::empty(py)?.unbind())
+            } else {
+                None
+            },
+        })
+    }
+
+    /// `dict` from parent key to the set of children that reference it.
+    /// Exposed as an attribute for parity with the Python implementation,
+    /// which callers read directly.
+    #[getter]
+    fn refs<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        self.refs.bind(py).clone()
+    }
+
+    /// Set of keys added since the last `clear()`, or `None` when this
+    /// instance was not constructed with `track_new_keys=True`.
+    /// Exposed as an attribute for parity with the Python implementation,
+    /// which sets `self.new_keys` directly.
+    #[getter(new_keys)]
+    fn get_new_keys_attr<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PySet>> {
+        self.new_keys.as_ref().map(|s| s.bind(py).clone())
+    }
+
+    fn clear(&self, py: Python<'_>) -> PyResult<()> {
+        self.refs.bind(py).clear();
+        if let Some(new_keys) = self.new_keys.as_ref() {
+            new_keys.bind(py).clear();
+        }
+        Ok(())
+    }
+
+    fn add_references<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+        refs: Bound<'py, PyAny>,
+    ) -> PyResult<()> {
+        let refs_dict = self.refs.bind(py);
+        for referenced in refs.try_iter()? {
+            let referenced = referenced?;
+            let set = match refs_dict.get_item(&referenced)? {
+                Some(existing) => existing.cast_into::<PySet>()?,
+                None => {
+                    let fresh = PySet::empty(py)?;
+                    refs_dict.set_item(&referenced, &fresh)?;
+                    fresh
+                }
+            };
+            set.add(&key)?;
+        }
+        self.add_key(py, key)
+    }
+
+    fn get_new_keys<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PySet>> {
+        self.new_keys.as_ref().map(|s| s.bind(py).clone())
+    }
+
+    fn get_unsatisfied_refs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.refs.bind(py).call_method0("keys")
+    }
+
+    fn add_key<'py>(&self, py: Python<'py>, key: Bound<'py, PyAny>) -> PyResult<()> {
+        // Satisfy any outstanding references to `key`.
+        let refs_dict = self.refs.bind(py);
+        if refs_dict.contains(&key)? {
+            refs_dict.del_item(&key)?;
+        }
+        if let Some(new_keys) = self.new_keys.as_ref() {
+            new_keys.bind(py).add(&key)?;
+        }
+        Ok(())
+    }
+
+    fn satisfy_refs_for_keys<'py>(&self, py: Python<'py>, keys: Bound<'py, PyAny>) -> PyResult<()> {
+        let refs_dict = self.refs.bind(py);
+        for key in keys.try_iter()? {
+            let key = key?;
+            if refs_dict.contains(&key)? {
+                refs_dict.del_item(&key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn get_referrers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PySet>> {
+        let out = PySet::empty(py)?;
+        for (_k, v) in self.refs.bind(py).iter() {
+            let inner = v.cast_into::<PySet>()?;
+            for item in inner.iter() {
+                out.add(item)?;
+            }
+        }
+        Ok(out)
+    }
+}
+
 pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "versionedfile")?;
     m.add_class::<AbstractContentFactory>()?;
     m.add_class::<FulltextContentFactory>()?;
     m.add_class::<ChunkedContentFactory>()?;
     m.add_class::<AbsentContentFactory>()?;
+    m.add_class::<KeyRefs>()?;
     m.add_function(wrap_pyfunction!(record_to_fulltext_bytes, &m)?)?;
     m.add_function(wrap_pyfunction!(fulltext_network_to_record, &m)?)?;
     m.add_function(wrap_pyfunction!(network_bytes_to_kind_and_offset, &m)?)?;
