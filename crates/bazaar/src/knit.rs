@@ -1058,6 +1058,76 @@ pub struct KnitBuildDetails {
     pub compression_parent: Option<usize>,
 }
 
+/// Result of a single batched lookup during a compression-closure walk.
+///
+/// `present` maps each found key to a `(compression_parent, payload)`
+/// pair. The compression parent (an `Option<K>`) is the only field the
+/// algorithm needs to drive the BFS — `payload` is opaque
+/// caller-defined data that gets handed back in the final result dict.
+/// `missing` is the subset of the requested keys that the lookup
+/// couldn't resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureBatch<K, P>
+where
+    K: Eq + std::hash::Hash + Clone,
+{
+    pub present: std::collections::HashMap<K, (Option<K>, P)>,
+    pub missing: std::collections::HashSet<K>,
+}
+
+/// Walk the transitive compression closure of `initial_keys`, batching
+/// lookups via `lookup_batch`.
+///
+/// Mirrors `KnitVersionedFiles._get_components_positions`: the caller's
+/// `lookup_batch` returns a `ClosureBatch` for a given batch of keys.
+/// Each present key carries its `compression_parent` (used to drive the
+/// next BFS level) and an opaque `payload` value that the algorithm
+/// just stores in the result dict — the caller decides what that
+/// payload looks like (in knit's case it's the
+/// `(record_details, index_memo, compression_parent)` triple).
+///
+/// Returns the assembled `{key: payload}` dict for every key whose
+/// closure was traversed. The result is what
+/// `KnitVersionedFiles._get_components_positions` returns minus the
+/// per-format permutation, which lives in the caller.
+///
+/// If `allow_missing` is `false` and any batch reports missing keys,
+/// returns `Err(missing_set)` after the first such batch.
+#[allow(clippy::type_complexity)]
+pub fn walk_compression_closure<K, P, F>(
+    initial_keys: impl IntoIterator<Item = K>,
+    allow_missing: bool,
+    mut lookup_batch: F,
+) -> Result<std::collections::HashMap<K, P>, std::collections::HashSet<K>>
+where
+    K: Eq + std::hash::Hash + Clone,
+    F: FnMut(&[K]) -> ClosureBatch<K, P>,
+{
+    use std::collections::HashMap;
+
+    let mut result: HashMap<K, P> = HashMap::new();
+    let mut pending: Vec<K> = initial_keys.into_iter().collect();
+
+    while !pending.is_empty() {
+        let batch = lookup_batch(&pending);
+        if !batch.missing.is_empty() && !allow_missing {
+            return Err(batch.missing);
+        }
+        let mut next: Vec<K> = Vec::new();
+        for (key, (compression_parent, payload)) in batch.present {
+            if let Some(parent) = compression_parent.as_ref() {
+                if !result.contains_key(parent) && !next.contains(parent) {
+                    next.push(parent.clone());
+                }
+            }
+            result.insert(key, payload);
+        }
+        pending = next;
+    }
+
+    Ok(result)
+}
+
 /// Outcome of [`should_use_delta`]'s parent-chain walk.
 ///
 /// Distinguishes the three reasons we might decide *against* storing a
@@ -1831,6 +1901,102 @@ mod tests {
             parse_knit_index_value(b"N5").unwrap_err(),
             KnitError::BadIndexValue(b"N5".to_vec())
         );
+    }
+
+    fn batch_from_chain<'a>(
+        chain: &'a std::collections::HashMap<&'static str, Option<&'static str>>,
+        keys: &[&'static str],
+    ) -> ClosureBatch<&'static str, &'static str> {
+        ClosureBatch {
+            present: keys
+                .iter()
+                .filter_map(|k| chain.get(k).map(|p| (*k, (*p, *k))))
+                .collect(),
+            missing: keys
+                .iter()
+                .filter(|k| !chain.contains_key(*k))
+                .copied()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn walk_compression_closure_follows_chain_until_fulltext() {
+        // a -> b -> c -> (fulltext); after walk, result has {a, b, c}.
+        let chain: std::collections::HashMap<&'static str, Option<&'static str>> =
+            vec![("a", Some("b")), ("b", Some("c")), ("c", None)]
+                .into_iter()
+                .collect();
+        let result =
+            walk_compression_closure(vec!["a"], false, |batch| batch_from_chain(&chain, batch))
+                .unwrap();
+        let learned: std::collections::HashSet<&'static str> = result.keys().copied().collect();
+        let expected: std::collections::HashSet<&'static str> =
+            vec!["a", "b", "c"].into_iter().collect();
+        assert_eq!(learned, expected);
+        // Each value is the payload we plumbed through (the key itself).
+        assert_eq!(result[&"a"], "a");
+        assert_eq!(result[&"c"], "c");
+    }
+
+    #[test]
+    fn walk_compression_closure_dedups_shared_parents() {
+        // Two children share a parent — the parent is only enqueued once.
+        let chain: std::collections::HashMap<&'static str, Option<&'static str>> =
+            vec![("c1", Some("p")), ("c2", Some("p")), ("p", None)]
+                .into_iter()
+                .collect();
+        let mut batches: usize = 0;
+        let result = walk_compression_closure(vec!["c1", "c2"], false, |batch| {
+            batches += 1;
+            batch_from_chain(&chain, batch)
+        })
+        .unwrap();
+        // Two batches: {c1, c2} then {p}.
+        assert_eq!(batches, 2);
+        let learned: std::collections::HashSet<&'static str> = result.keys().copied().collect();
+        let expected: std::collections::HashSet<&'static str> =
+            vec!["c1", "c2", "p"].into_iter().collect();
+        assert_eq!(learned, expected);
+    }
+
+    #[test]
+    fn walk_compression_closure_reports_missing_when_not_allowed() {
+        let err =
+            walk_compression_closure::<&'static str, &'static str, _>(vec!["x"], false, |_batch| {
+                ClosureBatch {
+                    present: Default::default(),
+                    missing: vec!["x"].into_iter().collect(),
+                }
+            })
+            .unwrap_err();
+        let expected: std::collections::HashSet<&'static str> = vec!["x"].into_iter().collect();
+        assert_eq!(err, expected);
+    }
+
+    #[test]
+    fn walk_compression_closure_skips_missing_when_allowed() {
+        let result = walk_compression_closure::<&'static str, &'static str, _>(
+            vec!["x", "y"],
+            true,
+            |batch| {
+                // y is present (fulltext); x is missing.
+                let mut present = std::collections::HashMap::new();
+                let mut missing = std::collections::HashSet::new();
+                for k in batch {
+                    if *k == "y" {
+                        present.insert(*k, (None, *k));
+                    } else {
+                        missing.insert(*k);
+                    }
+                }
+                ClosureBatch { present, missing }
+            },
+        )
+        .unwrap();
+        let learned: std::collections::HashSet<&'static str> = result.keys().copied().collect();
+        let expected: std::collections::HashSet<&'static str> = vec!["y"].into_iter().collect();
+        assert_eq!(learned, expected);
     }
 
     #[test]

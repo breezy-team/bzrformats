@@ -7,6 +7,8 @@ use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
+pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
+
 /// Parse a knit index record line into its components.
 ///
 /// Each line has the format: `version_id options pos size parent1 parent2 ... :`
@@ -676,6 +678,173 @@ fn parse_knit_index_value_rs(value: &[u8]) -> PyResult<(bool, u64, u64)> {
     Ok((parsed.noeol, parsed.pos, parsed.size))
 }
 
+/// Newtype wrapping a Python object so it can be used as a HashMap key
+/// in pure-Rust algorithms. Hash and equality delegate to Python's
+/// `__hash__` / `__eq__` by attaching to a `Python<'_>` token at call
+/// time. Used by `walk_components_positions_rs` to feed
+/// `bazaar::knit::walk_compression_closure` opaque key tuples without
+/// reimplementing the BFS in the pyo3 layer.
+struct PyKey(Py<PyAny>);
+
+impl PyKey {
+    fn new(b: Bound<'_, PyAny>) -> Self {
+        Self(b.unbind())
+    }
+}
+
+impl Clone for PyKey {
+    fn clone(&self) -> Self {
+        Python::attach(|py| Self(self.0.clone_ref(py)))
+    }
+}
+
+impl PartialEq for PyKey {
+    fn eq(&self, other: &Self) -> bool {
+        Python::attach(|py| {
+            self.0
+                .bind(py)
+                .eq(other.0.bind(py))
+                .expect("Python __eq__ must not raise on knit keys")
+        })
+    }
+}
+impl Eq for PyKey {}
+
+impl std::hash::Hash for PyKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let h = Python::attach(|py| {
+            self.0
+                .bind(py)
+                .hash()
+                .expect("Python __hash__ must not raise on knit keys")
+        });
+        state.write_isize(h);
+    }
+}
+
+/// Walk the transitive compression closure of `initial_keys`, batching
+/// lookups via the Python callable `lookup_batch`.
+///
+/// `lookup_batch` takes a list of keys and returns the dict
+/// `_KnitGraphIndex.get_build_details` produces — `{key: (index_memo,
+/// compression_parent_or_None, parents, record_details), ...}`. Missing
+/// keys are detected by absence from the returned dict; if
+/// `allow_missing` is False the wrapper raises RevisionNotPresent for
+/// the first missing key.
+///
+/// Returns the assembled `component_data` dict that
+/// `KnitVersionedFiles._get_components_positions` would have built:
+/// `{key: (record_details, index_memo, compression_parent), ...}`.
+///
+/// The BFS traversal lives in [`bazaar::knit::walk_compression_closure`];
+/// this function is just marshalling — wrap each Python key in a
+/// `PyKey`, call the pure-Rust algorithm, then translate the resulting
+/// `HashMap<PyKey, payload>` back into a `PyDict`.
+#[pyfunction]
+fn walk_components_positions_rs<'py>(
+    py: Python<'py>,
+    initial_keys: Bound<'py, PyAny>,
+    allow_missing: bool,
+    lookup_batch: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    use bazaar::knit::{walk_compression_closure, ClosureBatch};
+
+    let mut initial: Vec<PyKey> = Vec::new();
+    for k in initial_keys.try_iter()? {
+        initial.push(PyKey::new(k?));
+    }
+
+    // Per-key payload carries the three opaque pieces the final result
+    // dict needs: (record_details, index_memo, compression_parent). The
+    // algorithm itself only inspects the compression parent (as the
+    // separate `Option<K>` field of `ClosureBatch.present`) — the
+    // payload is just data that gets handed back at the end.
+    type Payload = (Py<PyAny>, Py<PyAny>, Py<PyAny>);
+    let mut callback_err: Option<PyErr> = None;
+
+    let walked = walk_compression_closure::<PyKey, Payload, _>(initial, allow_missing, |batch| {
+        let inner = || -> PyResult<ClosureBatch<PyKey, Payload>> {
+            let pending_list = pyo3::types::PyList::new(py, batch.iter().map(|k| k.0.bind(py)))?;
+            let lookup = lookup_batch
+                .call1((pending_list,))?
+                .cast_into::<pyo3::types::PyDict>()?;
+            let mut present: std::collections::HashMap<PyKey, (Option<PyKey>, Payload)> =
+                std::collections::HashMap::new();
+            let mut missing: std::collections::HashSet<PyKey> = std::collections::HashSet::new();
+            for k in batch {
+                if !lookup.contains(k.0.bind(py))? {
+                    missing.insert(k.clone());
+                }
+            }
+            for (key, details) in lookup.iter() {
+                let details_tuple = details.cast_into::<PyTuple>()?;
+                let index_memo = details_tuple.get_item(0)?;
+                let compression_parent = details_tuple.get_item(1)?;
+                let record_details = details_tuple.get_item(3)?;
+                let cp = if compression_parent.is_none() {
+                    None
+                } else {
+                    Some(PyKey::new(compression_parent.clone()))
+                };
+                present.insert(
+                    PyKey::new(key),
+                    (
+                        cp,
+                        (
+                            record_details.unbind(),
+                            index_memo.unbind(),
+                            compression_parent.unbind(),
+                        ),
+                    ),
+                );
+            }
+            Ok(ClosureBatch { present, missing })
+        };
+        match inner() {
+            Ok(b) => b,
+            Err(e) => {
+                callback_err = Some(e);
+                ClosureBatch {
+                    present: std::collections::HashMap::new(),
+                    missing: std::collections::HashSet::new(),
+                }
+            }
+        }
+    });
+
+    if let Some(e) = callback_err {
+        return Err(e);
+    }
+
+    let walked = match walked {
+        Ok(map) => map,
+        Err(missing) => {
+            let key: Py<PyAny> = missing
+                .into_iter()
+                .next()
+                .map(|k| k.0)
+                .unwrap_or_else(|| py.None());
+            return Err(RevisionNotPresent::new_err((key, py.None())));
+        }
+    };
+
+    let component_data = pyo3::types::PyDict::new(py);
+    for (key, (record_details, index_memo, compression_parent)) in walked {
+        let py_key = key.0.bind(py);
+        let entry = PyTuple::new(
+            py,
+            [
+                record_details.into_bound(py),
+                index_memo.into_bound(py),
+                compression_parent.into_bound(py),
+            ],
+        )?;
+        component_data.set_item(py_key, entry)?;
+    }
+
+    Ok(component_data)
+}
+
 /// Walk the compression chain starting at `initial_parent` to decide
 /// whether a new record should be stored as a delta. `get_step` is a
 /// Python callable that takes a parent key and returns either
@@ -978,6 +1147,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(parse_knit_index_value_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(decode_kndx_options_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(check_should_delta_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(walk_components_positions_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;

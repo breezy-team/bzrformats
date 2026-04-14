@@ -1486,21 +1486,9 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
         :param allow_missing: If True do not raise an error on a missing
             component, just ignore it.
         """
-        component_data = {}
-        pending_components = keys
-        while pending_components:
-            build_details = self._index.get_build_details(pending_components)
-            current_components = set(pending_components)
-            pending_components = set()
-            for key, details in build_details.items():
-                (_index_memo, compression_parent, _parents, _record_details) = details
-                if compression_parent is not None:
-                    pending_components.add(compression_parent)
-                component_data[key] = self._build_details_to_components(details)
-            missing = current_components.difference(build_details)
-            if missing and not allow_missing:
-                raise RevisionNotPresent(missing.pop(), self)
-        return component_data
+        return _knit_rs.walk_components_positions_rs(
+            list(keys), allow_missing, self._index.get_build_details
+        )
 
     def _get_content(self, key, parent_texts=None):
         """Returns a content object that makes up the specified
