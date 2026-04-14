@@ -1844,13 +1844,13 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
     def get_sha1s(self, keys):
         """See VersionedFiles.get_sha1s()."""
         missing = set(keys)
-        record_map = self._get_record_map(missing, allow_missing=True)
-        result = {}
-        for key, details in record_map.items():
-            if key not in missing:
-                continue
-            # record entry 2 is the 'digest'.
-            result[key] = details[2]
+        # The Rust pipeline fetches just the record header bytes for
+        # each locally-present key and returns its digest, skipping the
+        # body decode entirely. Fallback VFs are still consulted
+        # separately for anything this knit doesn't know about.
+        result = _knit_rs.get_sha1s_via_traits_rs(
+            self._index, self._access, list(missing)
+        )
         missing.difference_update(set(result))
         for source in self._immediate_fallback_vfs:
             if not missing:

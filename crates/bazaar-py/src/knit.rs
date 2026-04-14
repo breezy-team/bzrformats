@@ -1139,7 +1139,8 @@ fn record_to_data_rs<'py>(
 // works within one `get_text_rs` call.
 
 use bazaar::knit::{
-    get_content as rust_get_content, get_text as rust_get_text, KnitContent as KnitContentTrait,
+    get_content as rust_get_content, get_sha1s as rust_get_sha1s, get_text as rust_get_text,
+    KnitContent as KnitContentTrait,
 };
 use std::sync::{Arc, Mutex};
 
@@ -1489,6 +1490,42 @@ fn get_content_via_traits_rs<'py>(
     }
 }
 
+/// Batch digest-only lookup for `keys` via the pure-Rust pipeline.
+/// Returns a `{key: digest_bytes}` dict; keys missing from the index
+/// are simply absent, matching the Python `_get_record_map(allow_missing=True)`
+/// semantics.
+///
+/// The pure-Rust implementation fetches each raw record and parses
+/// just its header (via `parse_record_header_only`), never touching
+/// the body bytes — the same cheap path the Python
+/// `_read_records_iter_raw` takes for sha verification.
+#[pyfunction]
+fn get_sha1s_via_traits_rs<'py>(
+    py: Python<'py>,
+    py_index: Bound<'py, PyAny>,
+    py_access: Bound<'py, PyAny>,
+    keys: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let table = Arc::new(Mutex::new(MemoTable::default()));
+    let index = PyKnitIndex::new(py_index, table.clone());
+    let access = PyKnitAccess::new(py_access, table);
+
+    let mut rust_keys: Vec<KnitKey> = Vec::new();
+    for item in keys.try_iter()? {
+        let obj = item?;
+        rust_keys.push(extract_knit_key(&obj).map_err(knit_err_to_py)?);
+    }
+
+    let result = rust_get_sha1s(&index, &access, &rust_keys).map_err(knit_err_to_py)?;
+
+    let out = PyDict::new(py);
+    for (key, digest) in result {
+        let tup = knit_key_to_py(py, &key)?;
+        out.set_item(tup, PyBytes::new(py, &digest))?;
+    }
+    Ok(out)
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data_c, &m)?)?;
@@ -1523,6 +1560,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(walk_components_positions_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(get_text_via_traits_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(get_content_via_traits_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(get_sha1s_via_traits_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;

@@ -1972,6 +1972,38 @@ where
     content.ok_or_else(|| KnitError::BadIndexValue(b"empty compression chain for key".to_vec()))
 }
 
+/// Return the sha1 digest of each key's *stored* record without
+/// reconstructing the text.
+///
+/// The digest is the one recorded in each record's header — the same
+/// thing `KnitVersionedFiles.get_sha1s` returns. For every key in
+/// `keys` that the index knows about, this function fetches just
+/// enough of the raw record to parse the header and returns the
+/// digest. Missing keys (ghosts, stacked-fallback absentees) are
+/// simply absent from the result map, matching the Python
+/// `allow_missing=True` flow.
+pub fn get_sha1s<I, A>(
+    index: &I,
+    access: &A,
+    keys: &[KnitKey],
+) -> Result<std::collections::HashMap<KnitKey, Vec<u8>>, KnitError>
+where
+    I: KnitIndex,
+    A: KnitAccess,
+{
+    let details_map = index.get_build_details(keys)?;
+    let mut out = std::collections::HashMap::new();
+    for key in keys {
+        let Some(details) = details_map.get(key) else {
+            continue;
+        };
+        let raw = access.get_raw_record(&details.index_memo)?;
+        let header = parse_record_header_only(&raw)?;
+        out.insert(key.clone(), header.digest);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2218,6 +2250,54 @@ mod tests {
         let factory = KnitAnnotateFactory;
         let text = get_text(&knit, &knit, &factory, &child_key).unwrap();
         assert_eq!(text, b"a\nB\n".to_vec());
+    }
+
+    #[test]
+    fn get_sha1s_returns_digests_without_parsing_bodies() {
+        let mut knit = MockKnit::default();
+        let key_a: KnitKey = vec![b"file".to_vec(), b"a".to_vec()];
+        let key_b: KnitKey = vec![b"file".to_vec(), b"b".to_vec()];
+        let pairs_a = vec![(b"a".to_vec(), b"hello\n".to_vec())];
+        let pairs_b = vec![(b"b".to_vec(), b"world\n".to_vec())];
+        // build_fulltext_record hard-codes the digest as b"DIGEST" for
+        // both records, so both should come back equal.
+        let (raw_a, memo_a) = build_fulltext_record(b"a", &pairs_a);
+        let (raw_b, memo_b) = build_fulltext_record(b"b", &pairs_b);
+        knit.add_record(
+            key_a.clone(),
+            KnitRecordDetails {
+                method: KnitMethod::Fulltext,
+                noeol: false,
+                index_memo: memo_a,
+                compression_parent: None,
+                parents: vec![],
+            },
+            raw_a,
+        );
+        knit.add_record(
+            key_b.clone(),
+            KnitRecordDetails {
+                method: KnitMethod::Fulltext,
+                noeol: false,
+                index_memo: memo_b,
+                compression_parent: None,
+                parents: vec![],
+            },
+            raw_b,
+        );
+
+        let result = get_sha1s(&knit, &knit, &[key_a.clone(), key_b.clone()]).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[&key_a], b"DIGEST");
+        assert_eq!(result[&key_b], b"DIGEST");
+    }
+
+    #[test]
+    fn get_sha1s_skips_missing_keys() {
+        let knit = MockKnit::default();
+        let key: KnitKey = vec![b"missing".to_vec()];
+        let result = get_sha1s(&knit, &knit, &[key]).unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]
