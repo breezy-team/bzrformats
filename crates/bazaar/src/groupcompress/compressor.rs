@@ -237,7 +237,7 @@ impl TraditionalGroupCompressor {
             GroupCompressItem::Fulltext(data) => vec![data],
             GroupCompressItem::Delta(data) => {
                 let source = self.delta_index.lines()[..*start_chunk].concat();
-                vec![apply_delta(source.as_slice(), data.as_slice())?]
+                vec![apply_delta(source.as_slice(), data.as_slice()).map_err(|e| e.to_string())?]
             }
         };
         let data_sha1 = osutils::sha::sha_chunks(data.as_slice());
@@ -328,7 +328,7 @@ impl RabinGroupCompressor {
             b'f' => vec![payload.to_vec()],
             b'd' => {
                 let source = self.chunks[..*start_chunk].concat();
-                vec![apply_delta(&source, payload)?]
+                vec![apply_delta(&source, payload).map_err(|e| e.to_string())?]
             }
             other => {
                 return Err(format!(
