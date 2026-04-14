@@ -269,11 +269,42 @@ fn py_entry_to_line<'py>(
     Ok(PyBytes::new(py, &bytes))
 }
 
+/// Serialise every entry across every dirblock into a list of
+/// NUL-delimited lines, one per entry in iteration order. Replaces the
+/// `map(self._entry_to_line, self._iter_entries())` loop inside
+/// `DirState.get_lines` with a single pyo3 call that walks the Python
+/// `_dirblocks` list once.
+///
+/// Input shape matches Python's `_dirblocks`:
+/// `[(dirname_bytes, [entry_tuple, ...]), ...]` where each `entry_tuple`
+/// is `((dirname, basename, file_id), [(minikind, fingerprint, size, executable, packed_stat), ...])`.
+#[pyfunction]
+#[pyo3(name = "dirblocks_to_entry_lines")]
+fn py_dirblocks_to_entry_lines<'py>(
+    py: Python<'py>,
+    dirblocks: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for block in dirblocks.try_iter()? {
+        let block = block?;
+        let block_tuple = block.cast::<PyTuple>()?;
+        let entries = block_tuple.get_item(1)?;
+        for entry in entries.try_iter()? {
+            let entry = entry?;
+            let rust_entry = entry_from_py(&entry)?;
+            let bytes = pure_entry_to_line(&rust_entry);
+            out.append(PyBytes::new(py, &bytes))?;
+        }
+    }
+    Ok(out)
+}
+
 /// Register the dirstate helper functions into the given module.
 pub fn register(m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(_read_dirblocks, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(update_entry, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(py_entry_to_line, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(py_dirblocks_to_entry_lines, m)?)?;
     m.add_class::<ProcessEntryC>()?;
     Ok(())
 }

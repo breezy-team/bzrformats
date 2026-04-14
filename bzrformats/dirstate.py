@@ -2098,10 +2098,12 @@ class DirState:
             # read what's on disk.
             self._state_file.seek(0)
             return self._state_file.readlines()
-        lines = []
-        lines.append(_get_parents_line(self.get_parent_ids()))
-        lines.append(_get_ghosts_line(self._ghosts))
-        lines.extend(map(self._entry_to_line, self._iter_entries()))
+        self._read_dirblocks_if_needed()
+        lines = [
+            _get_parents_line(self.get_parent_ids()),
+            _get_ghosts_line(self._ghosts),
+        ]
+        lines.extend(_dirstate_rs.dirblocks_to_entry_lines(self._dirblocks))
         return _get_output_lines(lines)
 
     def _get_fields_to_entry(self):
