@@ -668,6 +668,36 @@ fn build_knit_delta_closure_wire_rs<'py>(
     PyBytes::new(py, &out)
 }
 
+/// Extract an annotated-fulltext knit record to its plain text lines.
+/// Returns a list of bytes objects. Mirrors
+/// `bzrformats.knit.FTAnnotatedToFullText.get_bytes` (without the
+/// final `b"".join` step that callers do based on storage_kind).
+#[pyfunction]
+fn extract_annotated_fulltext_to_plain_lines_rs<'py>(
+    py: Python<'py>,
+    raw_record: &[u8],
+    noeol: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let lines = bazaar::knit::extract_annotated_fulltext_to_plain_lines(raw_record, noeol)
+        .map_err(knit_err_to_py)?;
+    let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
+    PyList::new(py, items)
+}
+
+/// Extract a plain (already-unannotated) fulltext knit record to its
+/// text lines. Mirrors `bzrformats.knit.FTPlainToFullText.get_bytes`.
+#[pyfunction]
+fn extract_plain_fulltext_lines_rs<'py>(
+    py: Python<'py>,
+    raw_record: &[u8],
+    noeol: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let lines =
+        bazaar::knit::extract_plain_fulltext_lines(raw_record, noeol).map_err(knit_err_to_py)?;
+    let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
+    PyList::new(py, items)
+}
+
 /// End-to-end recompression of an annotated-fulltext knit record into
 /// an unannotated one. Mirrors
 /// `bzrformats.knit.FTAnnotatedToUnannotated.get_bytes`.
@@ -764,6 +794,11 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
         recompress_annotated_to_unannotated_delta_rs,
         &m
     )?)?;
+    m.add_function(wrap_pyfunction!(
+        extract_annotated_fulltext_to_plain_lines_rs,
+        &m
+    )?)?;
+    m.add_function(wrap_pyfunction!(extract_plain_fulltext_lines_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;

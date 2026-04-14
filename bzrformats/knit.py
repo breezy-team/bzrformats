@@ -316,18 +316,16 @@ class FTAnnotatedToFullText(KnitAdapter):
         Raises:
             UnavailableRepresentation: If target format is not supported.
         """
-        annotated_compressed_bytes = factory._raw_record
-        _rec, contents = self._data._parse_record_unchecked(annotated_compressed_bytes)
-        content, _delta = self._annotate_factory.parse_record(
-            factory.key[-1], contents, factory._build_details, None
+        if target_storage_kind not in ("fulltext", "chunked", "lines"):
+            raise UnavailableRepresentation(
+                factory.key, target_storage_kind, factory.storage_kind
+            )
+        lines = _knit_rs.extract_annotated_fulltext_to_plain_lines_rs(
+            factory._raw_record, bool(factory._build_details[1])
         )
         if target_storage_kind == "fulltext":
-            return b"".join(content.text())
-        elif target_storage_kind in ("chunked", "lines"):
-            return content.text()
-        raise UnavailableRepresentation(
-            factory.key, target_storage_kind, factory.storage_kind
-        )
+            return b"".join(lines)
+        return lines
 
 
 class DeltaAnnotatedToFullText(KnitAdapter):
@@ -388,18 +386,16 @@ class FTPlainToFullText(KnitAdapter):
         Raises:
             UnavailableRepresentation: If target format is not supported.
         """
-        compressed_bytes = factory._raw_record
-        _rec, contents = self._data._parse_record_unchecked(compressed_bytes)
-        content, _delta = self._plain_factory.parse_record(
-            factory.key[-1], contents, factory._build_details, None
+        if target_storage_kind not in ("fulltext", "chunked", "lines"):
+            raise UnavailableRepresentation(
+                factory.key, target_storage_kind, factory.storage_kind
+            )
+        lines = _knit_rs.extract_plain_fulltext_lines_rs(
+            factory._raw_record, bool(factory._build_details[1])
         )
         if target_storage_kind == "fulltext":
-            return b"".join(content.text())
-        elif target_storage_kind in ("chunked", "lines"):
-            return content.text()
-        raise UnavailableRepresentation(
-            factory.key, target_storage_kind, factory.storage_kind
-        )
+            return b"".join(lines)
+        return lines
 
 
 class DeltaPlainToFullText(KnitAdapter):

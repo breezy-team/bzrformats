@@ -969,6 +969,55 @@ where
     Ok((total, compressed))
 }
 
+/// Parse an annotated-fulltext knit record into the plain text lines it
+/// represents.
+///
+/// Composes [`decode_record_gz`] + [`parse_record_body_unchecked`] +
+/// [`parse_fulltext`] and discards the origin column. If `noeol` is true,
+/// the trailing `\n` is stripped from the last line — this mirrors the
+/// `_should_strip_eol` flag that the Python `KnitContent` carries.
+///
+/// Used by `bzrformats.knit.FTAnnotatedToFullText.get_bytes`.
+pub fn extract_annotated_fulltext_to_plain_lines(
+    raw_record: &[u8],
+    noeol: bool,
+) -> Result<Vec<Vec<u8>>, KnitError> {
+    let decompressed = decode_record_gz(raw_record)?;
+    let (_header, body_lines) = parse_record_body_unchecked(&decompressed)?;
+    let annotated: Vec<AnnotatedLine> = parse_fulltext(&body_lines)?;
+    let mut lines: Vec<Vec<u8>> = annotated.into_iter().map(|(_, text)| text).collect();
+    if noeol {
+        if let Some(last) = lines.last_mut() {
+            if last.ends_with(b"\n") {
+                last.pop();
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// Same as [`extract_annotated_fulltext_to_plain_lines`] but for plain
+/// (already-unannotated) records — used by
+/// `bzrformats.knit.FTPlainToFullText.get_bytes`. The input record body
+/// has no origin column, so we just split it into lines and apply the
+/// same `noeol` rule.
+pub fn extract_plain_fulltext_lines(
+    raw_record: &[u8],
+    noeol: bool,
+) -> Result<Vec<Vec<u8>>, KnitError> {
+    let decompressed = decode_record_gz(raw_record)?;
+    let (_header, body_lines) = parse_record_body_unchecked(&decompressed)?;
+    let mut lines: Vec<Vec<u8>> = body_lines.iter().map(|l| l.to_vec()).collect();
+    if noeol {
+        if let Some(last) = lines.last_mut() {
+            if last.ends_with(b"\n") {
+                last.pop();
+            }
+        }
+    }
+    Ok(lines)
+}
+
 /// End-to-end conversion of an annotated-fulltext knit record to an
 /// unannotated one.
 ///
@@ -1500,6 +1549,40 @@ mod tests {
         assert!(ReadLines::new(b"").next().is_none());
         assert_eq!(readlines(b"just-one"), vec![&b"just-one"[..]]);
         assert_eq!(readlines(b"\n"), vec![&b"\n"[..]]);
+    }
+
+    #[test]
+    fn extract_annotated_fulltext_strips_origins_and_honors_noeol() {
+        // Last line has a trailing \n; with noeol=true the extractor
+        // pops it so the caller sees "world" not "world\n".
+        let annotated: Vec<AnnotatedLine> = vec![
+            (b"r1".to_vec(), b"hello\n".to_vec()),
+            (b"r2".to_vec(), b"world\n".to_vec()),
+        ];
+        let body = lower_fulltext(&annotated);
+        let (_, chunks) = record_to_data(b"v", b"DD", body.len(), &body, true).unwrap();
+        let raw: Vec<u8> = chunks.into_iter().flatten().collect();
+
+        let with_eol = extract_annotated_fulltext_to_plain_lines(&raw, false).unwrap();
+        assert_eq!(with_eol, vec![b"hello\n".to_vec(), b"world\n".to_vec()]);
+
+        let no_eol = extract_annotated_fulltext_to_plain_lines(&raw, true).unwrap();
+        assert_eq!(no_eol, vec![b"hello\n".to_vec(), b"world".to_vec()]);
+    }
+
+    #[test]
+    fn extract_plain_fulltext_lines_passes_through_with_noeol_strip() {
+        // Build a plain (unannotated) record and verify the extractor
+        // reads the body lines verbatim, applying noeol on the last one.
+        let body = vec![b"alpha\n".to_vec(), b"beta\n".to_vec()];
+        let (_, chunks) = record_to_data(b"v", b"DD", body.len(), &body, true).unwrap();
+        let raw: Vec<u8> = chunks.into_iter().flatten().collect();
+
+        let plain = extract_plain_fulltext_lines(&raw, false).unwrap();
+        assert_eq!(plain, vec![b"alpha\n".to_vec(), b"beta\n".to_vec()]);
+
+        let stripped = extract_plain_fulltext_lines(&raw, true).unwrap();
+        assert_eq!(stripped, vec![b"alpha\n".to_vec(), b"beta".to_vec()]);
     }
 
     #[test]
