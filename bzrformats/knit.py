@@ -3260,18 +3260,6 @@ class _KnitGraphIndex:
         if not self._is_locked():
             raise ObjectNotLocked(self)
 
-    def _compression_parent(self, an_entry):
-        # return the key that an_entry is compressed against, or None
-        # Grab the second parent list (as deltas implies parents currently)
-        compression_parents = an_entry[3][1]
-        if not compression_parents:
-            return None
-        if len(compression_parents) != 1:
-            raise AssertionError(
-                f"Too many compression parents: {compression_parents!r}"
-            )
-        return compression_parents[0]
-
     def get_build_details(self, keys):
         """Get the method, index_memo and compression parent for version_ids.
 
@@ -3324,10 +3312,8 @@ class _KnitGraphIndex:
     def _get_method(self, node):
         if not self._deltas:
             return "fulltext"
-        if self._compression_parent(node):
-            return "line-delta"
-        else:
-            return "fulltext"
+        # node[3][1] is the compression-parent ref list.
+        return "line-delta" if node[3][1] else "fulltext"
 
     def _get_node(self, key):
         try:
@@ -3375,7 +3361,8 @@ class _KnitGraphIndex:
             logic to get the record.
         """
         node = self._get_node(key)
-        return self._node_to_position(node)
+        parsed = _knit_rs.parse_knit_index_value_rs(node[2])
+        return node[0], parsed[1], parsed[2]
 
     __contains__ = _mod_index._has_key_from_parent_map
 
@@ -3388,11 +3375,6 @@ class _KnitGraphIndex:
         return [node[1] for node in self._graph_index.iter_all_entries()]
 
     missing_keys = _mod_index._missing_keys_from_parent_map
-
-    def _node_to_position(self, node):
-        """Convert an index value to position details."""
-        bits = node[2][1:].split(b" ")
-        return node[0], int(bits[0]), int(bits[1])
 
     def _sort_keys_by_io(self, keys, positions):
         """Figure out an optimal order to read the records for the given keys.

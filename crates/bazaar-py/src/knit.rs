@@ -668,6 +668,14 @@ fn build_knit_delta_closure_wire_rs<'py>(
     PyBytes::new(py, &out)
 }
 
+/// Parse a `_KnitGraphIndex` entry's value field. Thin wrapper around
+/// [`bazaar::knit::parse_knit_index_value`]; returns `(noeol, pos, size)`.
+#[pyfunction]
+fn parse_knit_index_value_rs(value: &[u8]) -> PyResult<(bool, u64, u64)> {
+    let parsed = bazaar::knit::parse_knit_index_value(value).map_err(knit_err_to_py)?;
+    Ok((parsed.noeol, parsed.pos, parsed.size))
+}
+
 /// Build the per-key result dict that `_KnitGraphIndex.get_build_details`
 /// returns, given an iterable of GraphIndex entry tuples
 /// `(graph_index, key, value, refs)`.
@@ -887,6 +895,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     )?)?;
     m.add_function(wrap_pyfunction!(extract_plain_fulltext_lines_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(knit_entries_to_build_details_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(parse_knit_index_value_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;
