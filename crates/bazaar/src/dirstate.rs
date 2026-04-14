@@ -829,6 +829,141 @@ pub enum LockState {
     Write,
 }
 
+/// Errors returned by [`Transport`] operations.
+///
+/// Variants are coarse on purpose: callers generally either propagate
+/// the error or match on `NotFound` / `LockContention`. I/O errors are
+/// normalised into `(ErrorKind, String)` so the enum stays
+/// `Clone + PartialEq + Eq` and tests can compare values directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportError {
+    /// The backing file does not exist. Returned by `read_all` /
+    /// `exists` / lock acquisition when there is nothing to open.
+    NotFound(String),
+    /// A lock was requested but another process already holds it, or
+    /// the transport is already locked in an incompatible mode.
+    LockContention(String),
+    /// The caller tried to operate on an unlocked transport (read,
+    /// write, or unlock without a prior `lock_read` / `lock_write`).
+    NotLocked,
+    /// The caller tried to acquire a second lock while one was still
+    /// held. Dirstate's model is that you unlock before relocking;
+    /// explicit rather than RAII.
+    AlreadyLocked,
+    /// Catch-all for I/O errors from the underlying store. The
+    /// `(ErrorKind, message)` pair is preserved so callers can branch
+    /// on kind without losing the original diagnostic.
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    /// Catch-all for backend-specific failures that don't map to any
+    /// of the above (typically wrapped Python exceptions on the pyo3
+    /// adapter side).
+    Other(String),
+}
+
+impl From<std::io::Error> for TransportError {
+    fn from(e: std::io::Error) -> Self {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            TransportError::NotFound(e.to_string())
+        } else {
+            TransportError::Io {
+                kind: e.kind(),
+                message: e.to_string(),
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransportError::NotFound(p) => write!(f, "No such file: {}", p),
+            TransportError::LockContention(p) => write!(f, "Lock contention: {}", p),
+            TransportError::NotLocked => write!(f, "Transport is not locked"),
+            TransportError::AlreadyLocked => write!(f, "Transport is already locked"),
+            TransportError::Io { kind, message } => {
+                write!(f, "I/O error ({:?}): {}", kind, message)
+            }
+            TransportError::Other(s) => write!(f, "Transport error: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for TransportError {}
+
+/// Single-file backing store for a [`DirState`].
+///
+/// Unlike `bazaar::transport::Transport` (the knit-side path-keyed byte
+/// store), a dirstate transport represents exactly one file held open
+/// across a lock. Operations:
+///
+/// * [`Transport::exists`] — whether the backing file exists. Used by
+///   `on_file` to decide whether to create a fresh dirstate.
+/// * [`Transport::lock_read`] / [`Transport::lock_write`] — acquire
+///   a lock on the backing file. Explicit rather than RAII; the
+///   caller must pair each lock with an `unlock`. Re-locking while
+///   already locked returns `AlreadyLocked`.
+/// * [`Transport::unlock`] — release the current lock. No-op on the
+///   lock side if the underlying store doesn't need lock objects, but
+///   the trait still expects the state transition.
+/// * [`Transport::lock_state`] — observe the current lock state.
+/// * [`Transport::read_all`] — return the full file contents. Requires
+///   a read or write lock. The returned bytes are owned; callers parse
+///   in memory (no streaming `readline` — the pure-Rust `read_header`
+///   operates on a byte slice).
+/// * [`Transport::write_all`] — replace the full file contents,
+///   truncating any trailing bytes from the previous version. Requires
+///   a write lock. Implementations are expected to flush before
+///   returning, but are not required to fdatasync — call
+///   [`Transport::fdatasync`] for that.
+/// * [`Transport::fdatasync`] — force the current contents to durable
+///   storage. Optional no-op for stores where fsync has no meaning
+///   (e.g. in-memory tests); the trait method exists so `DirState.save`
+///   can call it unconditionally.
+///
+/// The `&mut self` receivers are deliberate: every operation either
+/// mutates the lock state, the file contents, or both. Callers that
+/// need shared access should wrap an implementation in their own
+/// synchronisation primitive.
+pub trait Transport {
+    /// Whether the backing file exists. Does not require a lock.
+    fn exists(&self) -> Result<bool, TransportError>;
+
+    /// Acquire a read lock on the backing file. Returns
+    /// `AlreadyLocked` if any lock is already held.
+    fn lock_read(&mut self) -> Result<(), TransportError>;
+
+    /// Acquire a write lock on the backing file. Returns
+    /// `AlreadyLocked` if any lock is already held.
+    fn lock_write(&mut self) -> Result<(), TransportError>;
+
+    /// Release the current lock. Returns `NotLocked` if no lock was
+    /// held.
+    fn unlock(&mut self) -> Result<(), TransportError>;
+
+    /// Current lock state, or `None` if no lock is held.
+    fn lock_state(&self) -> Option<LockState>;
+
+    /// Read the full contents of the backing file. Requires a read
+    /// or write lock; returns `NotLocked` otherwise.
+    fn read_all(&mut self) -> Result<Vec<u8>, TransportError>;
+
+    /// Replace the full contents of the backing file, truncating any
+    /// trailing bytes from the previous version. Requires a write
+    /// lock; returns `NotLocked` if no lock is held, and a generic
+    /// error if only a read lock is held.
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), TransportError>;
+
+    /// Force the current contents to durable storage. Implementations
+    /// that have no meaningful fsync (in-memory tests, mocked
+    /// backends) are free to make this a no-op; real filesystem
+    /// implementations should call `fdatasync(2)` or the platform
+    /// equivalent.
+    fn fdatasync(&mut self) -> Result<(), TransportError>;
+}
+
 /// Error returned while parsing the on-disk dirblock body of a dirstate
 /// file. Corresponds to the `DirstateCorrupt` errors raised by the Python
 /// `_read_dirblocks` implementation.
@@ -4607,5 +4742,231 @@ mod dirstate_struct_tests {
             }
             other => panic!("expected BadSize, got {:?}", other),
         }
+    }
+
+    /// In-memory [`Transport`] for tests and non-persistent use. Holds
+    /// the file contents in a `Vec<u8>`; lock state is tracked
+    /// explicitly so the tests can verify the state transitions.
+    struct MemoryTransport {
+        contents: Option<Vec<u8>>,
+        lock: Option<LockState>,
+    }
+
+    impl MemoryTransport {
+        fn new() -> Self {
+            Self {
+                contents: None,
+                lock: None,
+            }
+        }
+
+        fn with_contents(bytes: &[u8]) -> Self {
+            Self {
+                contents: Some(bytes.to_vec()),
+                lock: None,
+            }
+        }
+    }
+
+    impl Transport for MemoryTransport {
+        fn exists(&self) -> Result<bool, TransportError> {
+            Ok(self.contents.is_some())
+        }
+
+        fn lock_read(&mut self) -> Result<(), TransportError> {
+            if self.lock.is_some() {
+                return Err(TransportError::AlreadyLocked);
+            }
+            self.lock = Some(LockState::Read);
+            Ok(())
+        }
+
+        fn lock_write(&mut self) -> Result<(), TransportError> {
+            if self.lock.is_some() {
+                return Err(TransportError::AlreadyLocked);
+            }
+            self.lock = Some(LockState::Write);
+            // A write lock creates the file if it does not yet exist,
+            // matching the semantics of `lock.WriteLock` in Python.
+            if self.contents.is_none() {
+                self.contents = Some(Vec::new());
+            }
+            Ok(())
+        }
+
+        fn unlock(&mut self) -> Result<(), TransportError> {
+            if self.lock.is_none() {
+                return Err(TransportError::NotLocked);
+            }
+            self.lock = None;
+            Ok(())
+        }
+
+        fn lock_state(&self) -> Option<LockState> {
+            self.lock
+        }
+
+        fn read_all(&mut self) -> Result<Vec<u8>, TransportError> {
+            if self.lock.is_none() {
+                return Err(TransportError::NotLocked);
+            }
+            self.contents
+                .clone()
+                .ok_or_else(|| TransportError::NotFound("memory".to_string()))
+        }
+
+        fn write_all(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+            match self.lock {
+                Some(LockState::Write) => {}
+                Some(LockState::Read) => {
+                    return Err(TransportError::Other(
+                        "write_all requires a write lock".to_string(),
+                    ));
+                }
+                None => return Err(TransportError::NotLocked),
+            }
+            self.contents = Some(bytes.to_vec());
+            Ok(())
+        }
+
+        fn fdatasync(&mut self) -> Result<(), TransportError> {
+            // No-op for in-memory transport; the call is still valid
+            // so `DirState.save` can call it unconditionally.
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn transport_exists_reports_contents_presence() {
+        let empty = MemoryTransport::new();
+        assert!(!empty.exists().unwrap());
+        let populated = MemoryTransport::with_contents(b"hi");
+        assert!(populated.exists().unwrap());
+    }
+
+    #[test]
+    fn transport_read_all_requires_lock() {
+        let mut t = MemoryTransport::with_contents(b"hi");
+        assert_eq!(t.read_all().unwrap_err(), TransportError::NotLocked);
+        t.lock_read().unwrap();
+        assert_eq!(t.read_all().unwrap(), b"hi".to_vec());
+    }
+
+    #[test]
+    fn transport_write_all_requires_write_lock() {
+        let mut t = MemoryTransport::with_contents(b"hi");
+        // No lock at all.
+        assert_eq!(t.write_all(b"new").unwrap_err(), TransportError::NotLocked);
+        // Read lock is not enough.
+        t.lock_read().unwrap();
+        assert!(matches!(
+            t.write_all(b"new").unwrap_err(),
+            TransportError::Other(_)
+        ));
+        t.unlock().unwrap();
+        // Write lock works.
+        t.lock_write().unwrap();
+        t.write_all(b"new").unwrap();
+        assert_eq!(t.read_all().unwrap(), b"new".to_vec());
+    }
+
+    #[test]
+    fn transport_write_all_truncates_trailing_bytes() {
+        let mut t = MemoryTransport::with_contents(b"previous long contents");
+        t.lock_write().unwrap();
+        t.write_all(b"short").unwrap();
+        assert_eq!(t.read_all().unwrap(), b"short".to_vec());
+    }
+
+    #[test]
+    fn transport_lock_write_creates_missing_file() {
+        let mut t = MemoryTransport::new();
+        assert!(!t.exists().unwrap());
+        t.lock_write().unwrap();
+        // After lock_write the file exists (empty), matching Python's
+        // `lock.WriteLock` behaviour.
+        assert!(t.exists().unwrap());
+        assert_eq!(t.read_all().unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn transport_double_lock_is_error() {
+        let mut t = MemoryTransport::with_contents(b"");
+        t.lock_read().unwrap();
+        assert_eq!(t.lock_read().unwrap_err(), TransportError::AlreadyLocked);
+        assert_eq!(t.lock_write().unwrap_err(), TransportError::AlreadyLocked);
+    }
+
+    #[test]
+    fn transport_unlock_without_lock_is_error() {
+        let mut t = MemoryTransport::with_contents(b"");
+        assert_eq!(t.unlock().unwrap_err(), TransportError::NotLocked);
+    }
+
+    #[test]
+    fn transport_lock_state_tracks_current_lock() {
+        let mut t = MemoryTransport::with_contents(b"");
+        assert_eq!(t.lock_state(), None);
+        t.lock_read().unwrap();
+        assert_eq!(t.lock_state(), Some(LockState::Read));
+        t.unlock().unwrap();
+        assert_eq!(t.lock_state(), None);
+        t.lock_write().unwrap();
+        assert_eq!(t.lock_state(), Some(LockState::Write));
+    }
+
+    #[test]
+    fn transport_fdatasync_is_noop_on_memory_transport() {
+        let mut t = MemoryTransport::with_contents(b"");
+        // fdatasync without a lock is also fine — it just flushes
+        // whatever is already committed.
+        t.fdatasync().unwrap();
+        t.lock_write().unwrap();
+        t.fdatasync().unwrap();
+    }
+
+    #[test]
+    fn transport_round_trip_through_get_lines_and_read_header() {
+        // End-to-end sanity: write a serialised DirState to the
+        // transport via write_all, read it back via read_all, then
+        // parse the header out of the returned bytes.
+        let nullstat = b"x".repeat(32);
+        let mut state = fresh_state();
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![Entry {
+                    key: EntryKey {
+                        dirname: b"".to_vec(),
+                        basename: b"".to_vec(),
+                        file_id: b"TREE_ROOT".to_vec(),
+                    },
+                    trees: vec![TreeData {
+                        minikind: b'd',
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: nullstat,
+                    }],
+                }],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        let chunks = state.get_lines();
+        let bytes: Vec<u8> = chunks.into_iter().flatten().collect();
+
+        let mut t = MemoryTransport::new();
+        t.lock_write().unwrap();
+        t.write_all(&bytes).unwrap();
+        t.unlock().unwrap();
+
+        t.lock_read().unwrap();
+        let read_back = t.read_all().unwrap();
+        assert_eq!(read_back, bytes);
+        let header = read_header(&read_back).expect("header parses");
+        assert_eq!(header.num_entries, 1);
     }
 }
