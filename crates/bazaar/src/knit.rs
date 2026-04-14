@@ -1058,6 +1058,44 @@ pub struct KnitBuildDetails {
     pub compression_parent: Option<usize>,
 }
 
+/// Decide method + noeol for a single `_KndxIndex` cache entry, given
+/// its options bytes-list (the first element of the cached row).
+///
+/// Mirrors the Python `_KndxIndex.get_method` + `b"no-eol" in
+/// self.get_options(key)` logic. Used by `_KndxIndex.get_build_details`
+/// in tandem with the cache row's `(pos, size, parents)` to build the
+/// final dict.
+///
+/// Returns `(method, noeol)`. Errors if `options` contains neither
+/// `b"fulltext"` nor `b"line-delta"`.
+pub fn decode_kndx_options<O: AsRef<[u8]>>(options: &[O]) -> Result<(KnitMethod, bool), KnitError> {
+    let mut method: Option<KnitMethod> = None;
+    let mut noeol = false;
+    for opt in options {
+        let o = opt.as_ref();
+        if o == b"fulltext" {
+            method = Some(KnitMethod::Fulltext);
+        } else if o == b"line-delta" {
+            method = Some(KnitMethod::LineDelta);
+        } else if o == b"no-eol" {
+            noeol = true;
+        }
+    }
+    let method = method.ok_or_else(|| {
+        KnitError::BadIndexValue(
+            options
+                .iter()
+                .flat_map(|o| {
+                    let mut v = o.as_ref().to_vec();
+                    v.push(b',');
+                    v
+                })
+                .collect(),
+        )
+    })?;
+    Ok((method, noeol))
+}
+
 /// Decide the build-details for a single knit graph index entry, given
 /// just its `value` bytes and the number of compression-parent refs the
 /// index recorded for it.
@@ -1709,6 +1747,37 @@ mod tests {
             parse_knit_index_value(b"N5").unwrap_err(),
             KnitError::BadIndexValue(b"N5".to_vec())
         );
+    }
+
+    #[test]
+    fn decode_kndx_options_picks_method_and_noeol() {
+        let opts: &[&[u8]] = &[b"fulltext"];
+        assert_eq!(
+            decode_kndx_options(opts).unwrap(),
+            (KnitMethod::Fulltext, false)
+        );
+
+        let opts: &[&[u8]] = &[b"line-delta", b"no-eol"];
+        assert_eq!(
+            decode_kndx_options(opts).unwrap(),
+            (KnitMethod::LineDelta, true)
+        );
+
+        // Order-independent and tolerates unknown options.
+        let opts: &[&[u8]] = &[b"no-eol", b"some-future-flag", b"fulltext"];
+        assert_eq!(
+            decode_kndx_options(opts).unwrap(),
+            (KnitMethod::Fulltext, true)
+        );
+    }
+
+    #[test]
+    fn decode_kndx_options_rejects_missing_method() {
+        let opts: &[&[u8]] = &[b"no-eol"];
+        assert!(matches!(
+            decode_kndx_options(opts).unwrap_err(),
+            KnitError::BadIndexValue(_)
+        ));
     }
 
     #[test]

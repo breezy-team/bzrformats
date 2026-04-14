@@ -2828,25 +2828,27 @@ class _KndxIndex:
         for key in keys:
             if key not in parent_map:
                 continue  # Ghost
-            method = self.get_method(key)
-            if not isinstance(method, str):
-                raise TypeError(method)
+            prefix, suffix = self._split_key(key)
+            entry = self._kndx_cache[prefix][0][suffix]
+            options = entry[1]
+            try:
+                method, noeol = _knit_rs.decode_kndx_options_rs(options)
+            except ValueError as e:
+                raise KnitIndexUnknownMethod(self, options) from e
             parents = parent_map[key]
             compression_parent = None if method == "fulltext" else parents[0]
-            noeol = b"no-eol" in self.get_options(key)
-            index_memo = self.get_position(key)
+            index_memo = (key, entry[2], entry[3])
             result[key] = (index_memo, compression_parent, parents, (method, noeol))
         return result
 
     def get_method(self, key):
         """Return compression method of specified key."""
         options = self.get_options(key)
-        if b"fulltext" in options:
-            return "fulltext"
-        elif b"line-delta" in options:
-            return "line-delta"
-        else:
-            raise KnitIndexUnknownMethod(self, options)
+        try:
+            method, _noeol = _knit_rs.decode_kndx_options_rs(options)
+        except ValueError as e:
+            raise KnitIndexUnknownMethod(self, options) from e
+        return method
 
     def get_options(self, key):
         """Return a list representing options.
