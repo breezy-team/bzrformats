@@ -3,12 +3,12 @@ use crate::FileId;
 use base64::engine::Engine;
 use osutils::sha::{sha_file, sha_file_by_name};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::fs::Metadata;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub trait SHA1Provider: Send + Sync {
     fn sha1(&self, path: &Path) -> std::io::Result<String>;
@@ -583,4 +583,195 @@ pub fn get_output_lines(mut lines: Vec<&[u8]>) -> Vec<Vec<u8>> {
     output_lines.push(inventory_text.as_slice());
 
     output_lines.into_iter().map(|l| l.to_vec()).collect()
+}
+
+/// Default bisect page size used when scanning the dirstate file on disk.
+/// Mirrors `DirState.BISECT_PAGE_SIZE` (4096) in `bzrformats/dirstate.py`.
+pub const BISECT_PAGE_SIZE: usize = 4096;
+
+/// Per-tree record attached to an entry: `(minikind, fingerprint, size, executable, packed_stat)`.
+///
+/// Mirrors the 5-tuple stored at `entry[1][tree_index]` in the Python
+/// `DirState`. `minikind` is a single byte such as `b'f'`, `b'd'`, `b'l'`,
+/// `b'a'`, `b'r'`, or `b't'`; `fingerprint` is the sha1 for files, the link
+/// target for symlinks, or the parent revision for tree references; `size` is
+/// the file size in bytes (0 for non-files); `packed_stat` is the base64
+/// `pack_stat` string, or `DirState.NULLSTAT` when no stat is cached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeData {
+    pub minikind: u8,
+    pub fingerprint: Vec<u8>,
+    pub size: u64,
+    pub executable: bool,
+    pub packed_stat: Vec<u8>,
+}
+
+/// The `(dirname, basename, file_id)` triple that keys a dirstate entry.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EntryKey {
+    pub dirname: Vec<u8>,
+    pub basename: Vec<u8>,
+    pub file_id: Vec<u8>,
+}
+
+/// A single dirstate entry: a key plus one `TreeData` per tracked tree
+/// (current tree followed by present parent trees).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub key: EntryKey,
+    pub trees: Vec<TreeData>,
+}
+
+/// A directory block: all entries whose `dirname` equals `dirname`, in sort
+/// order. Mirrors the `(dirname, [entry, ...])` tuple Python stores in
+/// `DirState._dirblocks`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Dirblock {
+    pub dirname: Vec<u8>,
+    pub entries: Vec<Entry>,
+}
+
+/// Whether a dirstate is currently locked for read or write, matching the
+/// `_lock_state` string Python stores (`"r"`, `"w"`, or `None`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockState {
+    Read,
+    Write,
+}
+
+/// In-memory `DirState`, the Rust counterpart to `bzrformats.dirstate.DirState`.
+///
+/// This commit introduces the struct and a constructor mirroring Python's
+/// `__init__`. Behaviour (reading, writing, entry lookup, change processing)
+/// is added in follow-up commits; for now the struct is a passive container
+/// so later ports have a stable place to hang methods.
+pub struct DirState {
+    /// Path to the dirstate file on disk (Python's `_filename`).
+    pub filename: PathBuf,
+    /// Provider used to compute sha1s and stat+sha1 tuples for working-tree
+    /// files. Boxed so callers can swap in an alternate implementation for
+    /// testing, matching Python's `_sha1_provider` attribute.
+    pub sha1_provider: Box<dyn SHA1Provider>,
+    /// State of the header (`NotInMemory` until `_read_header` runs).
+    pub header_state: MemoryState,
+    /// State of the per-row dirblock data.
+    pub dirblock_state: MemoryState,
+    /// If an error was detected while updating the dirstate we refuse to
+    /// write it back. Mirrors Python's `_changes_aborted` flag.
+    pub changes_aborted: bool,
+    /// The in-memory dirblocks, sorted by dirname. Python stores this as
+    /// `[(dirname, [entry, ...])]` in `_dirblocks`.
+    pub dirblocks: Vec<Dirblock>,
+    /// Ghost parent revision ids: parents that are referenced but not
+    /// present locally.
+    pub ghosts: Vec<Vec<u8>>,
+    /// Parent revision ids for the current tree, in order. The first entry
+    /// is the current parent; subsequent entries are merged parents.
+    pub parents: Vec<Vec<u8>>,
+    /// Offset in `filename` where the header ends and the dirblock text
+    /// begins, populated after the header has been parsed.
+    pub end_of_header: Option<u64>,
+    /// Cutoff mtime/ctime for trusting cached sha1s. `None` until
+    /// `_sha_cutoff_time` has been computed for the current `now`.
+    pub cutoff_time: Option<i64>,
+    /// Declared entry count from the header, or `None` before the header is
+    /// read. Used to validate the dirblock parse.
+    pub num_entries: usize,
+    /// Current read/write lock state.
+    pub lock_state: Option<LockState>,
+    /// Set of keys whose hash is known to have changed since load. Used by
+    /// `_mark_modified` to decide whether a save is worthwhile.
+    pub known_hash_changes: HashSet<EntryKey>,
+    /// Below this many hash-only changes a save is skipped.
+    /// `-1` means *never* save hash changes; `0` means always save them.
+    pub worth_saving_limit: i64,
+    /// Call `fdatasync` after writing the state file if true.
+    pub fdatasync: bool,
+    /// Trust the filesystem's executable bit when building tree data.
+    pub use_filesystem_for_exec: bool,
+    /// Bisect chunk size when reading the state file in pages; mirrors
+    /// `_bisect_page_size`.
+    pub bisect_page_size: usize,
+}
+
+impl DirState {
+    /// Create a new, empty `DirState` object.
+    ///
+    /// The returned state has no data loaded from disk — `header_state` and
+    /// `dirblock_state` are both `NotInMemory`. Call a future `load` method
+    /// to populate it. This mirrors the Python constructor at
+    /// `bzrformats/dirstate.py` `DirState.__init__`.
+    pub fn new<P: Into<PathBuf>>(
+        path: P,
+        sha1_provider: Box<dyn SHA1Provider>,
+        worth_saving_limit: i64,
+        use_filesystem_for_exec: bool,
+        fdatasync: bool,
+    ) -> Self {
+        DirState {
+            filename: path.into(),
+            sha1_provider,
+            header_state: MemoryState::NotInMemory,
+            dirblock_state: MemoryState::NotInMemory,
+            changes_aborted: false,
+            dirblocks: Vec::new(),
+            ghosts: Vec::new(),
+            parents: Vec::new(),
+            end_of_header: None,
+            cutoff_time: None,
+            num_entries: 0,
+            lock_state: None,
+            known_hash_changes: HashSet::new(),
+            worth_saving_limit,
+            fdatasync,
+            use_filesystem_for_exec,
+            bisect_page_size: BISECT_PAGE_SIZE,
+        }
+    }
+}
+
+#[cfg(test)]
+mod dirstate_struct_tests {
+    use super::*;
+
+    #[test]
+    fn new_matches_python_defaults() {
+        let state = DirState::new(
+            "/tmp/.bzr/checkout/dirstate",
+            Box::new(DefaultSHA1Provider::new()),
+            0,
+            true,
+            false,
+        );
+        assert_eq!(state.filename, PathBuf::from("/tmp/.bzr/checkout/dirstate"));
+        assert_eq!(state.header_state, MemoryState::NotInMemory);
+        assert_eq!(state.dirblock_state, MemoryState::NotInMemory);
+        assert!(!state.changes_aborted);
+        assert!(state.dirblocks.is_empty());
+        assert!(state.ghosts.is_empty());
+        assert!(state.parents.is_empty());
+        assert_eq!(state.end_of_header, None);
+        assert_eq!(state.cutoff_time, None);
+        assert_eq!(state.num_entries, 0);
+        assert_eq!(state.lock_state, None);
+        assert!(state.known_hash_changes.is_empty());
+        assert_eq!(state.worth_saving_limit, 0);
+        assert!(!state.fdatasync);
+        assert!(state.use_filesystem_for_exec);
+        assert_eq!(state.bisect_page_size, BISECT_PAGE_SIZE);
+    }
+
+    #[test]
+    fn new_honours_overrides() {
+        let state = DirState::new(
+            "dirstate",
+            Box::new(DefaultSHA1Provider::new()),
+            -1,
+            false,
+            true,
+        );
+        assert_eq!(state.worth_saving_limit, -1);
+        assert!(!state.use_filesystem_for_exec);
+        assert!(state.fdatasync);
+    }
 }
