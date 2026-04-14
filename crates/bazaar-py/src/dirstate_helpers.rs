@@ -11,7 +11,10 @@
 //! object; future commits in the "lift DirState into Rust" series will
 //! replace them.
 
-use bazaar::dirstate::{parse_dirblocks, Dirblock, DirblocksError};
+use bazaar::dirstate::{
+    entry_to_line as pure_entry_to_line, parse_dirblocks, Dirblock, DirblocksError, Entry,
+    EntryKey, TreeData,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 
@@ -221,10 +224,56 @@ impl ProcessEntryC {
     }
 }
 
+/// Extract a single Python entry tuple into a pure-Rust [`Entry`]. The
+/// Python shape is
+/// `((dirname, basename, file_id), [(minikind, fingerprint, size, executable, packed_stat), ...])`
+/// with `minikind` as a one-byte `bytes` object, `size` as an int, and
+/// `executable` as a bool — this is the same layout `_read_dirblocks`
+/// produces.
+fn entry_from_py(py_entry: &Bound<PyAny>) -> PyResult<Entry> {
+    let tuple = py_entry.cast::<PyTuple>()?;
+    let key_tuple = tuple.get_item(0)?.cast_into::<PyTuple>()?;
+    let key = EntryKey {
+        dirname: key_tuple.get_item(0)?.extract::<Vec<u8>>()?,
+        basename: key_tuple.get_item(1)?.extract::<Vec<u8>>()?,
+        file_id: key_tuple.get_item(2)?.extract::<Vec<u8>>()?,
+    };
+    let trees_obj = tuple.get_item(1)?;
+    let mut trees: Vec<TreeData> = Vec::new();
+    for tree in trees_obj.try_iter()? {
+        let tree = tree?;
+        let tree_tuple = tree.cast::<PyTuple>()?;
+        let minikind_bytes: Vec<u8> = tree_tuple.get_item(0)?.extract()?;
+        trees.push(TreeData {
+            minikind: minikind_bytes.first().copied().unwrap_or(0),
+            fingerprint: tree_tuple.get_item(1)?.extract::<Vec<u8>>()?,
+            size: tree_tuple.get_item(2)?.extract::<u64>()?,
+            executable: tree_tuple.get_item(3)?.extract::<bool>()?,
+            packed_stat: tree_tuple.get_item(4)?.extract::<Vec<u8>>()?,
+        });
+    }
+    Ok(Entry { key, trees })
+}
+
+/// Serialise a single dirstate entry to the NUL-delimited line format
+/// the writer uses. Replaces Python's `DirState._entry_to_line`; the
+/// pure-Rust implementation lives in `bazaar::dirstate::entry_to_line`.
+#[pyfunction]
+#[pyo3(name = "entry_to_line")]
+fn py_entry_to_line<'py>(
+    py: Python<'py>,
+    entry: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let rust_entry = entry_from_py(entry)?;
+    let bytes = pure_entry_to_line(&rust_entry);
+    Ok(PyBytes::new(py, &bytes))
+}
+
 /// Register the dirstate helper functions into the given module.
 pub fn register(m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(_read_dirblocks, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(update_entry, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(py_entry_to_line, m)?)?;
     m.add_class::<ProcessEntryC>()?;
     Ok(())
 }

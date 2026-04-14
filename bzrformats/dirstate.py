@@ -1292,19 +1292,10 @@ class DirState:
 
         :param entry: An entry_tuple as defined in the module docstring.
         """
-        entire_entry = list(entry[0])
-        for tree_number, tree_data in enumerate(entry[1]):
-            # (minikind, fingerprint, size, executable, tree_specific_string)
-            entire_entry.extend(tree_data)
-            # 3 for the key, 5 for the fields per tree.
-            tree_offset = 3 + tree_number * 5
-            # minikind
-            entire_entry[tree_offset + 0] = tree_data[0]
-            # size
-            entire_entry[tree_offset + 2] = b"%d" % tree_data[2]
-            # executable
-            entire_entry[tree_offset + 3] = DirState._to_yesno[tree_data[3]]
-        return b"\0".join(entire_entry)
+        # The actual implementation is rebound at the bottom of this
+        # module to `_dirstate_rs.entry_to_line`; this definition exists
+        # only so tooling and sphinx autodoc see a method on `DirState`.
+        raise AssertionError("_entry_to_line should be rebound from _dirstate_rs")
 
     def _find_block(self, key, add_if_missing=False):
         """Return the block that key should be present in.
@@ -4567,3 +4558,4 @@ _get_output_lines = _dirstate_rs.get_output_lines
 _read_dirblocks = _dirstate_rs._read_dirblocks
 update_entry = _dirstate_rs.update_entry
 _process_entry = _dirstate_rs.ProcessEntryC
+DirState._entry_to_line = staticmethod(_dirstate_rs.entry_to_line)
