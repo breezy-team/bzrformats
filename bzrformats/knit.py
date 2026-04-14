@@ -270,11 +270,9 @@ class FTAnnotatedToUnannotated(KnitAdapter):
             raise UnavailableRepresentation(
                 factory.key, target_storage_kind, factory.storage_kind
             )
-        annotated_compressed_bytes = factory._raw_record
-        rec, contents = self._data._parse_record_unchecked(annotated_compressed_bytes)
-        content = self._annotate_factory.parse_fulltext(contents, rec[1])
-        _size, chunks = self._data._record_to_data((rec[1],), rec[3], content.text())
-        return b"".join(chunks)
+        return _knit_rs.recompress_annotated_to_unannotated_fulltext_rs(
+            factory._raw_record
+        )
 
 
 class DeltaAnnotatedToUnannotated(KnitAdapter):
@@ -297,12 +295,9 @@ class DeltaAnnotatedToUnannotated(KnitAdapter):
             raise UnavailableRepresentation(
                 factory.key, target_storage_kind, factory.storage_kind
             )
-        annotated_compressed_bytes = factory._raw_record
-        rec, contents = self._data._parse_record_unchecked(annotated_compressed_bytes)
-        delta = self._annotate_factory.parse_line_delta(contents, rec[1], plain=True)
-        contents = self._plain_factory.lower_line_delta(delta)
-        _size, chunks = self._data._record_to_data((rec[1],), rec[3], contents)
-        return b"".join(chunks)
+        return _knit_rs.recompress_annotated_to_unannotated_delta_rs(
+            factory._raw_record
+        )
 
 
 class FTAnnotatedToFullText(KnitAdapter):

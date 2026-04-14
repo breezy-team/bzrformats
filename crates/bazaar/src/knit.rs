@@ -969,6 +969,58 @@ where
     Ok((total, compressed))
 }
 
+/// End-to-end conversion of an annotated-fulltext knit record to an
+/// unannotated one.
+///
+/// Inverse-composed from the building blocks above: gunzip the record,
+/// parse the header + annotated body, strip each `(origin, text)` pair
+/// down to its `text`, and re-serialize as a plain fulltext knit record.
+/// Returns a single `Vec<u8>` of gzip-compressed bytes — the caller
+/// doesn't need to wrangle the chunk list form.
+///
+/// Mirrors `bzrformats.knit.FTAnnotatedToUnannotated.get_bytes`.
+pub fn recompress_annotated_to_unannotated_fulltext(
+    raw_record: &[u8],
+) -> Result<Vec<u8>, KnitError> {
+    let decompressed = decode_record_gz(raw_record)?;
+    let (header, body_lines) = parse_record_body_unchecked(&decompressed)?;
+    let annotated: Vec<AnnotatedLine> = parse_fulltext(&body_lines)?;
+    let plain_lines: Vec<Vec<u8>> = annotated.into_iter().map(|(_, text)| text).collect();
+    let has_trailing_newline = plain_lines.last().is_none_or(|l| l.ends_with(b"\n"));
+    let (_, chunks) = record_to_data(
+        header.version_id,
+        header.digest,
+        plain_lines.len(),
+        &plain_lines,
+        has_trailing_newline,
+    )?;
+    Ok(chunks.into_iter().flatten().collect())
+}
+
+/// End-to-end conversion of an annotated-delta knit record to an
+/// unannotated one.
+///
+/// Gunzip the record, parse the header + delta body via the plain
+/// (origin-stripping) parser, then re-serialize via `lower_line_delta_raw`.
+/// Mirrors `bzrformats.knit.DeltaAnnotatedToUnannotated.get_bytes`, which
+/// pairs `KnitAnnotateFactory.parse_line_delta(plain=True)` with
+/// `KnitPlainFactory.lower_line_delta`.
+pub fn recompress_annotated_to_unannotated_delta(raw_record: &[u8]) -> Result<Vec<u8>, KnitError> {
+    let decompressed = decode_record_gz(raw_record)?;
+    let (header, body_lines) = parse_record_body_unchecked(&decompressed)?;
+    let plain_delta = parse_line_delta_plain(&body_lines)?;
+    let plain_bytes = lower_line_delta_raw(&plain_delta);
+    let has_trailing_newline = plain_bytes.last().is_none_or(|l| l.ends_with(b"\n"));
+    let (_, chunks) = record_to_data(
+        header.version_id,
+        header.digest,
+        plain_bytes.len(),
+        &plain_bytes,
+        has_trailing_newline,
+    )?;
+    Ok(chunks.into_iter().flatten().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1448,6 +1500,55 @@ mod tests {
         assert!(ReadLines::new(b"").next().is_none());
         assert_eq!(readlines(b"just-one"), vec![&b"just-one"[..]]);
         assert_eq!(readlines(b"\n"), vec![&b"\n"[..]]);
+    }
+
+    #[test]
+    fn recompress_annotated_to_unannotated_fulltext_strips_origins() {
+        // Build an annotated fulltext record by hand, run it through the
+        // recompressor, and verify the output parses as a plain knit
+        // record carrying just the text bytes.
+        let annotated: Vec<AnnotatedLine> = vec![
+            (b"rev1".to_vec(), b"alpha\n".to_vec()),
+            (b"rev2".to_vec(), b"beta\n".to_vec()),
+        ];
+        let body = lower_fulltext(&annotated);
+        let (_, chunks) = record_to_data(b"rev-id", b"DIGEST", body.len(), &body, true).unwrap();
+        let raw: Vec<u8> = chunks.into_iter().flatten().collect();
+
+        let unannotated_raw = recompress_annotated_to_unannotated_fulltext(&raw).unwrap();
+
+        let (header, body_lines) = parse_record_unchecked(&unannotated_raw).unwrap();
+        assert_eq!(header.version_id, b"rev-id");
+        assert_eq!(header.digest, b"DIGEST");
+        assert_eq!(header.count, 2);
+        assert_eq!(body_lines, vec![b"alpha\n".to_vec(), b"beta\n".to_vec()]);
+    }
+
+    #[test]
+    fn recompress_annotated_to_unannotated_delta_strips_origins() {
+        let delta = vec![DeltaHunk {
+            start: 0,
+            end: 1,
+            count: 2,
+            lines: vec![
+                (b"r1".to_vec(), b"alpha\n".to_vec()),
+                (b"r2".to_vec(), b"beta\n".to_vec()),
+            ],
+        }];
+        let body = lower_line_delta_annotated(&delta);
+        let (_, chunks) = record_to_data(b"rev-id", b"DD", body.len(), &body, true).unwrap();
+        let raw: Vec<u8> = chunks.into_iter().flatten().collect();
+
+        let unannotated_raw = recompress_annotated_to_unannotated_delta(&raw).unwrap();
+
+        let (header, body_lines) = parse_record_unchecked(&unannotated_raw).unwrap();
+        assert_eq!(header.version_id, b"rev-id");
+        assert_eq!(header.digest, b"DD");
+        // Plain delta wire format: 1 header line + 2 content lines.
+        assert_eq!(body_lines.len(), 3);
+        assert_eq!(body_lines[0], b"0,1,2\n".to_vec());
+        assert_eq!(body_lines[1], b"alpha\n".to_vec());
+        assert_eq!(body_lines[2], b"beta\n".to_vec());
     }
 
     #[test]

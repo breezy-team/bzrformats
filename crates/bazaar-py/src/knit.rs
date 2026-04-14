@@ -668,6 +668,32 @@ fn build_knit_delta_closure_wire_rs<'py>(
     PyBytes::new(py, &out)
 }
 
+/// End-to-end recompression of an annotated-fulltext knit record into
+/// an unannotated one. Mirrors
+/// `bzrformats.knit.FTAnnotatedToUnannotated.get_bytes`.
+#[pyfunction]
+fn recompress_annotated_to_unannotated_fulltext_rs<'py>(
+    py: Python<'py>,
+    raw_record: &[u8],
+) -> PyResult<Bound<'py, PyBytes>> {
+    let out = bazaar::knit::recompress_annotated_to_unannotated_fulltext(raw_record)
+        .map_err(knit_err_to_py)?;
+    Ok(PyBytes::new(py, &out))
+}
+
+/// End-to-end recompression of an annotated-delta knit record into
+/// an unannotated one. Mirrors
+/// `bzrformats.knit.DeltaAnnotatedToUnannotated.get_bytes`.
+#[pyfunction]
+fn recompress_annotated_to_unannotated_delta_rs<'py>(
+    py: Python<'py>,
+    raw_record: &[u8],
+) -> PyResult<Bound<'py, PyBytes>> {
+    let out = bazaar::knit::recompress_annotated_to_unannotated_delta(raw_record)
+        .map_err(knit_err_to_py)?;
+    Ok(PyBytes::new(py, &out))
+}
+
 /// Decompress only enough of a knit record to parse its header. Returns
 /// `(method, version_id, count, digest)` without validating the line count
 /// or end marker — `_KnitData._read_records_iter_raw` relies on this
@@ -730,6 +756,14 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(parse_record_unchecked_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(record_to_data_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_record_header_only_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(
+        recompress_annotated_to_unannotated_fulltext_rs,
+        &m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        recompress_annotated_to_unannotated_delta_rs,
+        &m
+    )?)?;
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;
