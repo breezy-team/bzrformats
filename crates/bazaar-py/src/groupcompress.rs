@@ -571,7 +571,9 @@ impl TraditionalGroupCompressor {
                 soft,
             )
             .map_err(|e| PyValueError::new_err(format!("Error during compress: {:?}", e)))
-            .map(|(hash, size, chunks, kind)| (PyBytes::new(py, hash.as_ref()), size, chunks, kind))
+            .map(|(hash, size, chunks, kind)| {
+                (PyBytes::new(py, hash.as_ref()), size, chunks, kind.as_str())
+            })
         } else {
             Err(PyRuntimeError::new_err("Compressor is already finalized"))
         }
@@ -764,7 +766,7 @@ impl RabinGroupCompressor {
             nostore_sha,
             soft,
         )?;
-        Ok((PyBytes::new(py, hash.as_ref()), size, chunks, kind))
+        Ok((PyBytes::new(py, hash.as_ref()), size, chunks, kind.as_str()))
     }
 }
 

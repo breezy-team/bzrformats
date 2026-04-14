@@ -1,10 +1,95 @@
 use crate::groupcompress::block::{read_item, GroupCompressItem};
-use crate::groupcompress::delta::{apply_delta, read_base128_int, write_base128_int};
+use crate::groupcompress::delta::{apply_delta, read_base128_int, write_base128_int, DeltaError};
 use crate::groupcompress::rabin_delta::OwningDeltaIndex;
 use crate::groupcompress::NULL_SHA1;
 use crate::versionedfile::{Error, Key};
 use std::borrow::Cow;
 use std::collections::HashMap;
+
+/// Classification of a compressed record: either a fulltext insertion or
+/// a delta against earlier content in the same group.
+///
+/// Prefer this over stringly-typed `"fulltext"` / `"delta"` literals at
+/// the Rust boundary. [`Self::as_str`] is provided for callers (notably
+/// the pyo3 glue) that need the original string form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecordKind {
+    Fulltext,
+    Delta,
+}
+
+impl RecordKind {
+    /// The historical Python-facing name of this record kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecordKind::Fulltext => "fulltext",
+            RecordKind::Delta => "delta",
+        }
+    }
+}
+
+/// Errors returned by [`TraditionalGroupCompressor::extract`] and
+/// [`RabinGroupCompressor::extract`] when a previously-compressed record
+/// cannot be reconstructed.
+///
+/// Not `PartialEq` because the `BlockRead` variant wraps a `block::Error`
+/// that itself can carry an `io::Error`. Callers that want to branch on
+/// variant should use `matches!` rather than `assert_eq!`.
+#[derive(Debug)]
+pub enum ExtractError {
+    /// The requested `key` is not present in the compressor's
+    /// `labels_deltas` map.
+    KeyNotFound(Vec<Vec<u8>>),
+    /// The stored payload for this record was empty — the compressor
+    /// never actually wrote anything for this key.
+    EmptyPayload,
+    /// The stored length prefix disagrees with the actual number of
+    /// bytes held for this record.
+    LengthMismatch { stored: usize, expected: usize },
+    /// The record's type byte was neither `b'f'` (fulltext) nor `b'd'`
+    /// (delta).
+    UnknownKind(u8),
+    /// Reading the record's framing via [`read_item`] failed.
+    BlockRead(super::block::Error),
+    /// Reading the base128 length prefix failed.
+    BadLengthPrefix(String),
+    /// The embedded delta failed to apply.
+    DeltaApply(DeltaError),
+}
+
+impl std::fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtractError::KeyNotFound(key) => write!(f, "key not found in compressor: {:?}", key),
+            ExtractError::EmptyPayload => write!(f, "empty stored bytes"),
+            ExtractError::LengthMismatch { stored, expected } => write!(
+                f,
+                "Index claimed length, but stored bytes claim {} != {}",
+                stored, expected
+            ),
+            ExtractError::UnknownKind(b) => {
+                write!(f, "Unknown content kind, bytes claim {}", *b as char)
+            }
+            ExtractError::BlockRead(e) => write!(f, "{}", e),
+            ExtractError::BadLengthPrefix(s) => write!(f, "{}", s),
+            ExtractError::DeltaApply(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for ExtractError {}
+
+impl From<super::block::Error> for ExtractError {
+    fn from(e: super::block::Error) -> Self {
+        ExtractError::BlockRead(e)
+    }
+}
+
+impl From<DeltaError> for ExtractError {
+    fn from(e: DeltaError) -> Self {
+        ExtractError::DeltaApply(e)
+    }
+}
 
 pub trait GroupCompressor {
     /// Compress lines with label key.
@@ -35,7 +120,7 @@ pub trait GroupCompressor {
         expected_sha: Option<String>,
         nostore_sha: Option<String>,
         soft: Option<bool>,
-    ) -> Result<(String, usize, usize, &'static str), Error> {
+    ) -> Result<(String, usize, usize, RecordKind), Error> {
         if length == 0 {
             // empty, like a dir entry, etc
             if nostore_sha == Some(String::from_utf8_lossy(NULL_SHA1.as_slice()).to_string()) {
@@ -45,7 +130,7 @@ pub trait GroupCompressor {
                 String::from_utf8_lossy(NULL_SHA1.as_slice()).to_string(),
                 0,
                 0,
-                "fulltext",
+                RecordKind::Fulltext,
             ));
         }
         // we assume someone knew what they were doing when they passed it in
@@ -95,7 +180,7 @@ pub trait GroupCompressor {
         input_len: usize,
         max_delta_size: u128,
         soft: Option<bool>,
-    ) -> Result<(usize, usize, &'static str), Error>;
+    ) -> Result<(usize, usize, RecordKind), Error>;
 
     /// Return the overall compression ratio.
     fn ratio(&self) -> f32;
@@ -144,7 +229,7 @@ impl GroupCompressor for TraditionalGroupCompressor {
         input_len: usize,
         max_delta_size: u128,
         soft: Option<bool>,
-    ) -> Result<(usize, usize, &'static str), Error> {
+    ) -> Result<(usize, usize, RecordKind), Error> {
         let new_lines =
             osutils::chunks_to_lines(chunks.iter().map(|x| Ok::<_, std::io::Error>(*x)))
                 .collect::<Result<Vec<_>, _>>()
@@ -153,7 +238,7 @@ impl GroupCompressor for TraditionalGroupCompressor {
             self.delta_index
                 .make_delta(new_lines.as_slice(), input_len, soft);
         let delta_length = out_lines.iter().map(|l| l.len() as u128).sum();
-        let (r#type, out_lines) = if delta_length > max_delta_size {
+        let (kind, out_lines) = if delta_length > max_delta_size {
             // The delta is longer than the fulltext, insert a fulltext
             let mut out_lines = vec![Cow::Borrowed(&b"f"[..]), {
                 let mut data = Vec::new();
@@ -164,7 +249,7 @@ impl GroupCompressor for TraditionalGroupCompressor {
             index_lines.extend(vec![false, false]);
             index_lines.extend([true].repeat(new_lines.len()));
             out_lines.extend(new_lines);
-            ("fulltext", out_lines)
+            (RecordKind::Fulltext, out_lines)
         } else {
             // this is a worthy delta, output it
             out_lines[0] = Cow::Borrowed(&b"d"[..]);
@@ -174,7 +259,7 @@ impl GroupCompressor for TraditionalGroupCompressor {
                 write_base128_int(&mut data, delta_length).unwrap();
                 out_lines[1] = Cow::Owned(data);
             }
-            ("delta", out_lines)
+            (RecordKind::Delta, out_lines)
         };
         // Before insertion
         let start = self.endpoint;
@@ -193,7 +278,7 @@ impl GroupCompressor for TraditionalGroupCompressor {
         let chunk_end = self.delta_index.lines().len();
         self.labels_deltas
             .insert(key.to_vec(), (start, chunk_start, self.endpoint, chunk_end));
-        Ok((start, self.endpoint, r#type))
+        Ok((start, self.endpoint, kind))
     }
 }
 
@@ -229,15 +314,18 @@ impl TraditionalGroupCompressor {
     ///
     /// # Returns
     /// An iterable over chunks and the sha1.
-    pub fn extract(&self, key: &Vec<Vec<u8>>) -> Result<(Vec<Vec<u8>>, String), String> {
-        let (_start_byte, start_chunk, _end_byte, end_chunk) = self.labels_deltas.get(key).unwrap();
+    pub fn extract(&self, key: &[Vec<u8>]) -> Result<(Vec<Vec<u8>>, String), ExtractError> {
+        let (_start_byte, start_chunk, _end_byte, end_chunk) = self
+            .labels_deltas
+            .get(key)
+            .ok_or_else(|| ExtractError::KeyNotFound(key.to_vec()))?;
         let delta_chunks = &self.delta_index.lines()[*start_chunk..*end_chunk];
         let stored_bytes = delta_chunks.concat();
-        let data = match read_item(&mut stored_bytes.as_slice()).map_err(|e| e.to_string())? {
+        let data = match read_item(&mut stored_bytes.as_slice())? {
             GroupCompressItem::Fulltext(data) => vec![data],
             GroupCompressItem::Delta(data) => {
                 let source = self.delta_index.lines()[..*start_chunk].concat();
-                vec![apply_delta(source.as_slice(), data.as_slice()).map_err(|e| e.to_string())?]
+                vec![apply_delta(source.as_slice(), data.as_slice())?]
             }
         };
         let data_sha1 = osutils::sha::sha_chunks(data.as_slice());
@@ -301,41 +389,36 @@ impl RabinGroupCompressor {
     }
 
     /// Extract a previously-compressed record back to its original bytes.
-    pub fn extract(&self, key: &Vec<Vec<u8>>) -> Result<(Vec<Vec<u8>>, String), String> {
+    pub fn extract(&self, key: &[Vec<u8>]) -> Result<(Vec<Vec<u8>>, String), ExtractError> {
         let (_start_byte, start_chunk, _end_byte, end_chunk) = self
             .labels_deltas
             .get(key)
-            .ok_or_else(|| format!("key not found in compressor: {:?}", key))?;
+            .ok_or_else(|| ExtractError::KeyNotFound(key.to_vec()))?;
         let delta_chunks = &self.chunks[*start_chunk..*end_chunk];
         let stored_bytes: Vec<u8> = delta_chunks.concat();
         if stored_bytes.is_empty() {
-            return Err("empty stored bytes".to_string());
+            return Err(ExtractError::EmptyPayload);
         }
         let kind = stored_bytes[0];
         let mut cursor = std::io::Cursor::new(&stored_bytes[1..]);
-        let payload_len = read_base128_int(&mut cursor).map_err(|e| e.to_string())?;
+        let payload_len = read_base128_int(&mut cursor)
+            .map_err(|e| ExtractError::BadLengthPrefix(e.to_string()))?;
         let len_len = cursor.position() as usize;
         let data_len = payload_len as usize + 1 + len_len;
         if data_len != stored_bytes.len() {
-            return Err(format!(
-                "Index claimed length, but stored bytes claim {} != {}",
-                stored_bytes.len(),
-                data_len,
-            ));
+            return Err(ExtractError::LengthMismatch {
+                stored: stored_bytes.len(),
+                expected: data_len,
+            });
         }
         let payload = &stored_bytes[1 + len_len..];
         let data = match kind {
             b'f' => vec![payload.to_vec()],
             b'd' => {
                 let source = self.chunks[..*start_chunk].concat();
-                vec![apply_delta(&source, payload).map_err(|e| e.to_string())?]
+                vec![apply_delta(&source, payload)?]
             }
-            other => {
-                return Err(format!(
-                    "Unknown content kind, bytes claim {}",
-                    other as char
-                ))
-            }
+            other => return Err(ExtractError::UnknownKind(other)),
         };
         let data_sha1 = osutils::sha::sha_chunks(&data);
         Ok((data, data_sha1))
@@ -386,7 +469,7 @@ impl GroupCompressor for RabinGroupCompressor {
         input_len: usize,
         max_delta_size: u128,
         _soft: Option<bool>,
-    ) -> Result<(usize, usize, &'static str), Error> {
+    ) -> Result<(usize, usize, RecordKind), Error> {
         let bytes: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
         let max_delta = max_delta_size as usize;
         let delta = self
@@ -394,7 +477,7 @@ impl GroupCompressor for RabinGroupCompressor {
             .make_delta(&bytes, max_delta)
             .expect("rabin delta indexing");
 
-        let (r#type, new_chunks): (&'static str, Vec<Vec<u8>>) = match delta {
+        let (kind, new_chunks): (RecordKind, Vec<Vec<u8>>) = match delta {
             None => {
                 let mut enc_length = Vec::new();
                 write_base128_int(&mut enc_length, input_len as u128).unwrap();
@@ -406,7 +489,7 @@ impl GroupCompressor for RabinGroupCompressor {
                 for chunk in chunks {
                     new_chunks.push(chunk.to_vec());
                 }
-                ("fulltext", new_chunks)
+                (RecordKind::Fulltext, new_chunks)
             }
             Some(delta_bytes) => {
                 let mut enc_length = Vec::new();
@@ -416,7 +499,7 @@ impl GroupCompressor for RabinGroupCompressor {
                     .add_delta_source(delta_bytes.clone(), len_mini_header)
                     .expect("rabin delta source");
                 let new_chunks = vec![b"d".to_vec(), enc_length, delta_bytes];
-                ("delta", new_chunks)
+                (RecordKind::Delta, new_chunks)
             }
         };
 
@@ -427,7 +510,7 @@ impl GroupCompressor for RabinGroupCompressor {
         let chunk_end = self.chunks.len();
         self.labels_deltas
             .insert(key.to_vec(), (start, chunk_start, self.endpoint, chunk_end));
-        Ok((start, self.endpoint, r#type))
+        Ok((start, self.endpoint, kind))
     }
 }
 
@@ -453,7 +536,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(kind, "fulltext");
+        assert_eq!(kind, RecordKind::Fulltext);
         assert!(end > start);
         assert!(!sha.is_empty());
 
@@ -489,7 +572,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(kind, "delta");
+        assert_eq!(kind, RecordKind::Delta);
 
         let (data, _) = gc.extract(&vec![b"derived".to_vec()]).unwrap();
         assert_eq!(data, vec![derived.to_vec()]);
@@ -533,7 +616,7 @@ mod tests {
             .unwrap();
         assert_eq!(start, 0);
         assert_eq!(end, 0);
-        assert_eq!(kind, "fulltext");
+        assert_eq!(kind, RecordKind::Fulltext);
         assert_eq!(sha.as_bytes(), crate::groupcompress::NULL_SHA1.as_slice());
         assert_eq!(gc.endpoint(), 0);
         assert!(gc.labels_deltas().is_empty());
@@ -756,7 +839,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(kind, "fulltext");
+        assert_eq!(kind, RecordKind::Fulltext);
         assert!(end > start);
         assert!(!sha.is_empty());
 
@@ -793,7 +876,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(kind, "delta");
+        assert_eq!(kind, RecordKind::Delta);
 
         let (data, _) = gc.extract(&vec![b"derived".to_vec()]).unwrap();
         assert_eq!(data.concat(), derived.to_vec());
@@ -811,7 +894,7 @@ mod tests {
             .unwrap();
         assert_eq!(start, 0);
         assert_eq!(end, 0);
-        assert_eq!(kind, "fulltext");
+        assert_eq!(kind, RecordKind::Fulltext);
         assert_eq!(sha.as_bytes(), crate::groupcompress::NULL_SHA1.as_slice());
     }
 
