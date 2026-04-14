@@ -589,6 +589,196 @@ pub fn get_output_lines(mut lines: Vec<&[u8]>) -> Vec<Vec<u8>> {
 /// Mirrors `DirState.BISECT_PAGE_SIZE` (4096) in `bzrformats/dirstate.py`.
 pub const BISECT_PAGE_SIZE: usize = 4096;
 
+/// Error returned while parsing the dirstate header.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeaderError {
+    /// The first line is not `#bazaar dirstate flat format 3\n`.
+    BadFormatLine(Vec<u8>),
+    /// The crc32 line does not start with `crc32: `.
+    MissingCrcLine(Vec<u8>),
+    /// The crc32 value is not a valid decimal integer.
+    BadCrc(Vec<u8>),
+    /// The num_entries line does not start with `num_entries: `.
+    MissingNumEntriesLine(Vec<u8>),
+    /// The num_entries value is not a valid decimal integer.
+    BadNumEntries(Vec<u8>),
+    /// The parents line or ghosts line was missing or malformed.
+    BadParentsLine,
+    /// The ghosts line was missing or malformed.
+    BadGhostsLine,
+    /// The input ended before a complete header could be read.
+    UnexpectedEof,
+}
+
+impl std::fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeaderError::BadFormatLine(line) => {
+                write!(f, "invalid header line: {:?}", line)
+            }
+            HeaderError::MissingCrcLine(line) => {
+                write!(f, "missing crc32 checksum: {:?}", line)
+            }
+            HeaderError::BadCrc(bytes) => {
+                write!(f, "invalid crc32 value: {:?}", bytes)
+            }
+            HeaderError::MissingNumEntriesLine(line) => {
+                write!(f, "missing num_entries line: {:?}", line)
+            }
+            HeaderError::BadNumEntries(bytes) => {
+                write!(f, "invalid num_entries value: {:?}", bytes)
+            }
+            HeaderError::BadParentsLine => write!(f, "malformed parents line"),
+            HeaderError::BadGhostsLine => write!(f, "malformed ghosts line"),
+            HeaderError::UnexpectedEof => write!(f, "unexpected end of header"),
+        }
+    }
+}
+
+impl std::error::Error for HeaderError {}
+
+/// Parsed dirstate header fields.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Header {
+    /// The `crc32:` value from the header line.
+    pub crc_expected: u32,
+    /// The `num_entries:` value from the header line.
+    pub num_entries: usize,
+    /// Parent revision ids.
+    pub parents: Vec<Vec<u8>>,
+    /// Ghost parent revision ids.
+    pub ghosts: Vec<Vec<u8>>,
+    /// Byte offset in the input where the header ends and the
+    /// per-entry dirblock data begins. Mirrors Python's
+    /// `_end_of_header` (the position of `_state_file.tell()` right
+    /// after `_read_header` returns).
+    pub end_of_header: usize,
+}
+
+/// Read one `\n`-terminated line from `data` starting at `pos`. Returns the
+/// line *including* the trailing newline (mirroring Python's
+/// `file.readline()` semantics) and the new cursor position. If there is no
+/// newline, returns the remainder as the final line — matching `readline`'s
+/// behaviour on an unterminated final line.
+fn read_line(data: &[u8], pos: usize) -> Option<(&[u8], usize)> {
+    if pos >= data.len() {
+        return None;
+    }
+    let remaining = &data[pos..];
+    match remaining.iter().position(|&b| b == b'\n') {
+        Some(end) => Some((&remaining[..=end], pos + end + 1)),
+        None => Some((remaining, data.len())),
+    }
+}
+
+/// Parse the dirstate header from `data`.
+///
+/// This is the pure-Rust counterpart of `DirState._read_header` plus
+/// `_read_prelude` in `bzrformats/dirstate.py`. Given the full (or at least
+/// header-containing) dirstate file contents it returns the parsed header
+/// plus the byte offset where the per-entry block begins.
+///
+/// Only format 3 is accepted; earlier formats raise `BadFormatLine` just as
+/// the Python code raises `BzrFormatsError`.
+pub fn read_header(data: &[u8]) -> Result<Header, HeaderError> {
+    let mut pos = 0;
+
+    let (format_line, next) = read_line(data, pos).ok_or(HeaderError::UnexpectedEof)?;
+    if format_line != HEADER_FORMAT_3 {
+        return Err(HeaderError::BadFormatLine(format_line.to_vec()));
+    }
+    pos = next;
+
+    let (crc_line, next) = read_line(data, pos).ok_or(HeaderError::UnexpectedEof)?;
+    let crc_prefix: &[u8] = b"crc32: ";
+    if !crc_line.starts_with(crc_prefix) {
+        return Err(HeaderError::MissingCrcLine(crc_line.to_vec()));
+    }
+    // Strip the trailing newline (if any) before parsing.
+    let crc_body = crc_line[crc_prefix.len()..]
+        .strip_suffix(b"\n")
+        .unwrap_or(&crc_line[crc_prefix.len()..]);
+    let crc_str =
+        std::str::from_utf8(crc_body).map_err(|_| HeaderError::BadCrc(crc_body.to_vec()))?;
+    let crc_expected: u32 = crc_str
+        .parse()
+        .map_err(|_| HeaderError::BadCrc(crc_body.to_vec()))?;
+    pos = next;
+
+    let (num_entries_line, next) = read_line(data, pos).ok_or(HeaderError::UnexpectedEof)?;
+    let num_entries_prefix: &[u8] = b"num_entries: ";
+    if !num_entries_line.starts_with(num_entries_prefix) {
+        return Err(HeaderError::MissingNumEntriesLine(
+            num_entries_line.to_vec(),
+        ));
+    }
+    let num_entries_body = num_entries_line[num_entries_prefix.len()..]
+        .strip_suffix(b"\n")
+        .unwrap_or(&num_entries_line[num_entries_prefix.len()..]);
+    let num_entries_str = std::str::from_utf8(num_entries_body)
+        .map_err(|_| HeaderError::BadNumEntries(num_entries_body.to_vec()))?;
+    let num_entries: usize = num_entries_str
+        .parse()
+        .map_err(|_| HeaderError::BadNumEntries(num_entries_body.to_vec()))?;
+    pos = next;
+
+    // Parents line: `COUNT\0p1\0p2\0...\0pN\n`. Matches Python's
+    //     info = parent_line.split(b"\0"); int(info[0]); self._parents = info[1:-1]
+    // (the `\n` lives inside the last split component, which gets discarded
+    // by the `[1:-1]` slice).
+    let (parents_line, next) = read_line(data, pos).ok_or(HeaderError::UnexpectedEof)?;
+    let parents = parse_parents_field(parents_line).ok_or(HeaderError::BadParentsLine)?;
+    pos = next;
+
+    // Ghosts line: `\0COUNT\0g1\0...\0gN\n`. Matches Python's
+    //     info = ghost_line.split(b"\0"); int(info[1]); self._ghosts = info[2:-1]
+    // The leading NUL comes from the `\0\n\0` separator written between
+    // lines by `get_output_lines`.
+    let (ghosts_line, next) = read_line(data, pos).ok_or(HeaderError::UnexpectedEof)?;
+    let ghosts = parse_ghosts_field(ghosts_line).ok_or(HeaderError::BadGhostsLine)?;
+    pos = next;
+
+    Ok(Header {
+        crc_expected,
+        num_entries,
+        parents,
+        ghosts,
+        end_of_header: pos,
+    })
+}
+
+fn parse_parents_field(line: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let parts: Vec<&[u8]> = line.split(|&b| b == 0).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    // info[0] must be a valid integer count (we validate but discard it,
+    // mirroring the bare `int(info[0])` in Python).
+    std::str::from_utf8(parts[0]).ok()?.parse::<usize>().ok()?;
+    Some(
+        parts[1..parts.len() - 1]
+            .iter()
+            .map(|s| s.to_vec())
+            .collect(),
+    )
+}
+
+fn parse_ghosts_field(line: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let parts: Vec<&[u8]> = line.split(|&b| b == 0).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    // Skip parts[0] (the empty leading segment) and validate parts[1] as
+    // the integer count.
+    std::str::from_utf8(parts[1]).ok()?.parse::<usize>().ok()?;
+    Some(
+        parts[2..parts.len() - 1]
+            .iter()
+            .map(|s| s.to_vec())
+            .collect(),
+    )
+}
+
 /// Per-tree record attached to an entry: `(minikind, fingerprint, size, executable, packed_stat)`.
 ///
 /// Mirrors the 5-tuple stored at `entry[1][tree_index]` in the Python
@@ -728,6 +918,25 @@ impl DirState {
             bisect_page_size: BISECT_PAGE_SIZE,
         }
     }
+
+    /// Parse the header of the dirstate file from `data` and populate the
+    /// in-memory fields that Python's `_read_header` would populate.
+    ///
+    /// `data` must contain the full dirstate file contents (or at minimum
+    /// enough bytes to cover the header); this mirrors Python's
+    /// `state_file.readline()` loop operating on a buffered file. On
+    /// success the `parents`, `ghosts`, `num_entries`, and `end_of_header`
+    /// fields are set and `header_state` transitions to
+    /// `InMemoryUnmodified`.
+    pub fn read_header(&mut self, data: &[u8]) -> Result<(), HeaderError> {
+        let header = read_header(data)?;
+        self.parents = header.parents;
+        self.ghosts = header.ghosts;
+        self.num_entries = header.num_entries;
+        self.end_of_header = Some(header.end_of_header as u64);
+        self.header_state = MemoryState::InMemoryUnmodified;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -773,5 +982,105 @@ mod dirstate_struct_tests {
         assert_eq!(state.worth_saving_limit, -1);
         assert!(!state.use_filesystem_for_exec);
         assert!(state.fdatasync);
+    }
+
+    /// Build a minimal dirstate file containing just a header (no entries)
+    /// by running the same `get_output_lines` / `get_parents_line` /
+    /// `get_ghosts_line` helpers Python uses when writing.
+    fn make_header_bytes(parents: &[&[u8]], ghosts: &[&[u8]]) -> Vec<u8> {
+        let parents_line = get_parents_line(parents);
+        let ghosts_line = get_ghosts_line(ghosts);
+        // Matches `get_lines` with no entries: lines[0]=parents, lines[1]=ghosts.
+        let lines: Vec<&[u8]> = vec![parents_line.as_slice(), ghosts_line.as_slice()];
+        let chunks = get_output_lines(lines);
+        chunks.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn read_header_no_parents_no_ghosts() {
+        let bytes = make_header_bytes(&[], &[]);
+        let header = read_header(&bytes).expect("parse header");
+        assert_eq!(header.num_entries, 0);
+        assert!(header.parents.is_empty());
+        assert!(header.ghosts.is_empty());
+    }
+
+    #[test]
+    fn read_header_with_parents_and_ghosts() {
+        let bytes = make_header_bytes(&[b"rev-a", b"rev-b"], &[b"ghost-1"]);
+        let header = read_header(&bytes).expect("parse header");
+        assert_eq!(header.parents, vec![b"rev-a".to_vec(), b"rev-b".to_vec()]);
+        assert_eq!(header.ghosts, vec![b"ghost-1".to_vec()]);
+    }
+
+    /// Cross-check the reader against bytes produced by the Python side
+    /// calling `get_output_lines` + `get_parents_line` + `get_ghosts_line`.
+    /// Pinning the exact byte sequence guards against any drift between
+    /// the reader and the (already-Rust-backed) writer.
+    #[test]
+    fn read_header_matches_python_generated_bytes() {
+        let bytes: &[u8] = b"#bazaar dirstate flat format 3\n\
+                             crc32: 2265437010\n\
+                             num_entries: 0\n\
+                             2\x00rev-a\x00rev-b\x00\n\
+                             \x001\x00ghost-1\x00\n\x00";
+        let header = read_header(bytes).expect("parse header");
+        assert_eq!(header.crc_expected, 2265437010);
+        assert_eq!(header.num_entries, 0);
+        assert_eq!(header.parents, vec![b"rev-a".to_vec(), b"rev-b".to_vec()]);
+        assert_eq!(header.ghosts, vec![b"ghost-1".to_vec()]);
+    }
+
+    #[test]
+    fn read_header_populates_struct_fields() {
+        let bytes = make_header_bytes(&[b"rev-a"], &[]);
+        let mut state = DirState::new(
+            "dirstate",
+            Box::new(DefaultSHA1Provider::new()),
+            0,
+            true,
+            false,
+        );
+        state.read_header(&bytes).expect("parse header");
+        assert_eq!(state.header_state, MemoryState::InMemoryUnmodified);
+        assert_eq!(state.parents, vec![b"rev-a".to_vec()]);
+        assert!(state.ghosts.is_empty());
+        assert_eq!(state.num_entries, 0);
+        assert!(state.end_of_header.is_some());
+    }
+
+    #[test]
+    fn read_header_rejects_wrong_format_line() {
+        let bytes = b"#bazaar dirstate flat format 2\ncrc32: 0\nnum_entries: 0\n0\n\x000\n";
+        match read_header(bytes) {
+            Err(HeaderError::BadFormatLine(line)) => {
+                assert_eq!(line, HEADER_FORMAT_2.to_vec());
+            }
+            other => panic!("expected BadFormatLine, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn read_header_rejects_missing_crc() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(HEADER_FORMAT_3);
+        bytes.extend_from_slice(b"not-a-crc-line\n");
+        assert!(matches!(
+            read_header(&bytes),
+            Err(HeaderError::MissingCrcLine(_))
+        ));
+    }
+
+    #[test]
+    fn read_header_rejects_bad_num_entries() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(HEADER_FORMAT_3);
+        bytes.extend_from_slice(b"crc32: 0\n");
+        bytes.extend_from_slice(b"num_entries: abc\n");
+        bytes.extend_from_slice(b"0\n\x000\n");
+        assert!(matches!(
+            read_header(&bytes),
+            Err(HeaderError::BadNumEntries(_))
+        ));
     }
 }
