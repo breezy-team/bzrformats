@@ -1,7 +1,5 @@
 use byteorder::{BigEndian, WriteBytesExt};
 
-use pyo3::prelude::PyAnyMethods;
-use pyo3::types::{PyBytes, PyTuple};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -39,6 +37,7 @@ impl From<Error> for pyo3::PyErr {
 #[cfg(feature = "pyo3")]
 impl From<pyo3::PyErr> for Error {
     fn from(e: pyo3::PyErr) -> Error {
+        use pyo3::prelude::PyAnyMethods;
         pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
         pyo3::import_exception!(bzrformats.versionedfile, ExistingContent);
         pyo3::Python::attach(|py| {
@@ -137,7 +136,7 @@ impl<'py> pyo3::IntoPyObject<'py> for &VersionId {
     type Error = pyo3::PyErr;
 
     fn into_pyobject(self, py: pyo3::Python<'py>) -> Result<Self::Output, Self::Error> {
-        let bytes = PyBytes::new(py, &self.0);
+        let bytes = pyo3::types::PyBytes::new(py, &self.0);
         Ok(bytes.into_pyobject(py)?)
     }
 }
@@ -209,6 +208,7 @@ impl<'a, 'py> pyo3::FromPyObject<'a, 'py> for Key {
 
     fn extract(ob: pyo3::Borrowed<'a, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
         use pyo3::prelude::*;
+        use pyo3::types::PyBytes;
         // Look at the type name, stripping out the module name.
         match ob
             .get_type()
@@ -253,19 +253,16 @@ impl<'py> pyo3::IntoPyObject<'py> for Key {
     type Error = pyo3::PyErr;
 
     fn into_pyobject(self, py: pyo3::Python<'py>) -> Result<Self::Output, Self::Error> {
+        use pyo3::types::{PyBytes, PyTuple};
         match self {
             Key::Fixed(v) => {
-                let t = PyTuple::new(
-                    py,
-                    v.into_iter()
-                        .map(|v| pyo3::types::PyBytes::new(py, v.as_slice())),
-                );
+                let t = PyTuple::new(py, v.into_iter().map(|v| PyBytes::new(py, v.as_slice())));
                 t
             }
             Key::ContentAddressed(v) => {
                 let mut entries = v
                     .into_iter()
-                    .map(|v| pyo3::types::PyBytes::new(py, v.as_slice()).into_any())
+                    .map(|v| PyBytes::new(py, v.as_slice()).into_any())
                     .collect::<Vec<_>>();
                 entries.push(py.None().into_bound(py).into_any());
                 PyTuple::new(py, entries)
