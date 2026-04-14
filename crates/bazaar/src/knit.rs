@@ -49,6 +49,38 @@
 //!   serialise a `knit-delta-closure` batch of records for over-the-wire
 //!   streaming.
 //!
+//! ## In-memory content
+//!
+//! - [`KnitContent`] (trait) with the [`AnnotatedKnitContent`] and
+//!   [`PlainKnitContent`] implementations — typed views of a knit
+//!   version's lines that support `apply_delta`, `text`, `annotate`,
+//!   and the `should_strip_eol` flag.
+//! - [`KnitFactory`] (trait) with the [`KnitAnnotateFactory`] and
+//!   [`KnitPlainFactory`] implementations — strategies for parsing a
+//!   record's body lines into a `KnitContent`. The trait's
+//!   [`KnitFactory::parse_record`] default method handles the
+//!   fulltext/line-delta dispatch given a parent fulltext for the
+//!   delta case.
+//!
+//! ## Index helpers
+//!
+//! - [`parse_knit_index_value`] / [`KnitIndexValue`] — decode a knit
+//!   graph index entry's `value` field (`<flag><pos> <size>`).
+//! - [`decode_knit_build_details`] / [`KnitBuildDetails`] — decide
+//!   `(method, noeol, pos, size)` for a single `_KnitGraphIndex` entry.
+//! - [`decode_kndx_options`] — decide `(method, noeol)` from a kndx
+//!   cache row's options bytes-list.
+//! - [`KnitMethod`] — typed `"fulltext"` / `"line-delta"` marker.
+//!
+//! ## Closure traversal
+//!
+//! - [`walk_compression_closure`] / [`ClosureBatch`] — generic batched
+//!   BFS over a compression-parent graph, used by
+//!   `KnitVersionedFiles._get_components_positions`.
+//! - [`should_use_delta`] / [`DeltaDecision`] / [`ChainStep`] — walk a
+//!   parent chain looking for a fulltext and decide whether the
+//!   cumulative delta size is worth storing as a new delta.
+//!
 //! ## Supporting helpers
 //!
 //! - [`split_keys_by_prefix`] — order-preserving groupby over a list of
@@ -349,6 +381,301 @@ pub fn get_line_delta_blocks(
     // Sentinel terminator, mirroring SequenceMatcher.get_matching_blocks().
     out.push((s_pos + (target_len - t_pos), target_len, 0));
     out
+}
+
+// ============================================================
+// In-memory knit content layer
+// ============================================================
+
+/// Trait shared by [`AnnotatedKnitContent`] and [`PlainKnitContent`].
+///
+/// Mirrors the Python `KnitContent` base class. Both implementations are
+/// in-memory views of a knit version's lines, with a `should_strip_eol`
+/// flag that affects how the trailing newline of the last line is
+/// reported by [`Self::text`] and [`Self::annotate`].
+///
+/// Pure-Rust callers that want to read or rebuild a knit version (apply
+/// a delta to a parent fulltext, dump out the resulting text) can work
+/// with these types directly without going through the pyo3 layer.
+pub trait KnitContent {
+    /// Whether the trailing `\n` on the last line should be stripped on
+    /// output. Mirrors the Python `_should_strip_eol` flag.
+    fn should_strip_eol(&self) -> bool;
+    /// Set the strip-eol flag.
+    fn set_should_strip_eol(&mut self, strip: bool);
+
+    /// Apply a plain (origin-stripped) line delta in place.
+    ///
+    /// Each hunk replaces lines `[offset+start .. offset+end]` with the
+    /// hunk's payload, where `offset` accumulates as the running cursor
+    /// adjustment from the prior hunks (`offset += start - end + count`).
+    /// `new_version_id` is only meaningful for [`PlainKnitContent`],
+    /// which records it as its new owning version; annotated content
+    /// ignores it because each line carries its own origin already.
+    fn apply_delta(&mut self, delta: &[DeltaHunk<Vec<u8>>], new_version_id: &[u8]);
+
+    /// Return just the text lines (without origin annotations). If
+    /// `should_strip_eol` is set, the trailing `\n` of the last line is
+    /// removed in the returned copy.
+    fn text(&self) -> Vec<Vec<u8>>;
+
+    /// Return `(origin, text)` pairs. For [`PlainKnitContent`] the
+    /// `origin` is always the content's `version_id`.
+    fn annotate(&self) -> Vec<AnnotatedLine>;
+}
+
+/// In-memory view of an annotated knit version: a flat list of
+/// `(origin, text)` pairs.
+///
+/// Mirrors `bzrformats.knit.AnnotatedKnitContent`. The `apply_delta`
+/// path takes plain (origin-stripped) deltas because the annotated
+/// delta already had its origins consumed when the line was built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnotatedKnitContent {
+    pub lines: Vec<AnnotatedLine>,
+    should_strip_eol: bool,
+}
+
+impl AnnotatedKnitContent {
+    pub fn new(lines: Vec<AnnotatedLine>) -> Self {
+        Self {
+            lines,
+            should_strip_eol: false,
+        }
+    }
+}
+
+impl KnitContent for AnnotatedKnitContent {
+    fn should_strip_eol(&self) -> bool {
+        self.should_strip_eol
+    }
+
+    fn set_should_strip_eol(&mut self, strip: bool) {
+        self.should_strip_eol = strip;
+    }
+
+    fn apply_delta(&mut self, delta: &[DeltaHunk<Vec<u8>>], _new_version_id: &[u8]) {
+        // Plain delta: lines are bare bytes, no origins. We can't
+        // recover the original origin so callers that hand us a plain
+        // delta should be feeding us lines that came from the parent
+        // chain via a separate annotation step. The Python original has
+        // the same restriction: AnnotatedKnitContent.apply_delta takes
+        // a plain delta and just splices the bytes in. We mirror that
+        // by attaching an empty origin to each spliced line — callers
+        // can re-annotate if they need to.
+        let mut offset: isize = 0;
+        for hunk in delta {
+            let start = (offset + hunk.start as isize) as usize;
+            let end = (offset + hunk.end as isize) as usize;
+            let new_pairs: Vec<AnnotatedLine> =
+                hunk.lines.iter().map(|l| (Vec::new(), l.clone())).collect();
+            self.lines.splice(start..end, new_pairs);
+            offset += hunk.start as isize - hunk.end as isize + hunk.count as isize;
+        }
+    }
+
+    fn text(&self) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = self.lines.iter().map(|(_, t)| t.clone()).collect();
+        if self.should_strip_eol {
+            if let Some(last) = out.last_mut() {
+                if last.ends_with(b"\n") {
+                    last.pop();
+                }
+            }
+        }
+        out
+    }
+
+    fn annotate(&self) -> Vec<AnnotatedLine> {
+        let mut out = self.lines.clone();
+        if self.should_strip_eol {
+            if let Some((_, last)) = out.last_mut() {
+                if last.ends_with(b"\n") {
+                    last.pop();
+                }
+            }
+        }
+        out
+    }
+}
+
+/// In-memory view of an unannotated knit version: a flat list of text
+/// lines plus the version_id that owns them.
+///
+/// Mirrors `bzrformats.knit.PlainKnitContent`. `annotate` reports every
+/// line as belonging to `version_id` since plain content has no per-line
+/// origin information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainKnitContent {
+    pub lines: Vec<Vec<u8>>,
+    pub version_id: Vec<u8>,
+    should_strip_eol: bool,
+}
+
+impl PlainKnitContent {
+    pub fn new(lines: Vec<Vec<u8>>, version_id: Vec<u8>) -> Self {
+        Self {
+            lines,
+            version_id,
+            should_strip_eol: false,
+        }
+    }
+}
+
+impl KnitContent for PlainKnitContent {
+    fn should_strip_eol(&self) -> bool {
+        self.should_strip_eol
+    }
+
+    fn set_should_strip_eol(&mut self, strip: bool) {
+        self.should_strip_eol = strip;
+    }
+
+    fn apply_delta(&mut self, delta: &[DeltaHunk<Vec<u8>>], new_version_id: &[u8]) {
+        let mut offset: isize = 0;
+        for hunk in delta {
+            let start = (offset + hunk.start as isize) as usize;
+            let end = (offset + hunk.end as isize) as usize;
+            self.lines.splice(start..end, hunk.lines.iter().cloned());
+            offset += hunk.start as isize - hunk.end as isize + hunk.count as isize;
+        }
+        self.version_id = new_version_id.to_vec();
+    }
+
+    fn text(&self) -> Vec<Vec<u8>> {
+        let mut out = self.lines.clone();
+        if self.should_strip_eol {
+            if let Some(last) = out.last_mut() {
+                if last.ends_with(b"\n") {
+                    last.pop();
+                }
+            }
+        }
+        out
+    }
+
+    fn annotate(&self) -> Vec<AnnotatedLine> {
+        self.lines
+            .iter()
+            .map(|l| (self.version_id.clone(), l.clone()))
+            .collect()
+    }
+}
+
+/// Strategy for parsing raw knit body lines into [`KnitContent`] values
+/// and serializing them back out.
+///
+/// Mirrors the Python `_KnitFactory` / `KnitAnnotateFactory` /
+/// `KnitPlainFactory` hierarchy. `parse_record` is the highest-level
+/// entry point: given the body lines of a record plus the
+/// `(method, noeol)` pair from `KnitBuildDetails`, build the
+/// corresponding `KnitContent`. For `LineDelta` records the caller
+/// supplies the parent fulltext as `base_content`; the factory parses
+/// the delta, clones the base, applies the delta, and returns the
+/// reconstructed content.
+pub trait KnitFactory {
+    type Content: KnitContent + Clone;
+
+    /// Whether records emitted by this factory carry per-line origins.
+    /// The annotated factory returns `true`, the plain factory `false`.
+    fn annotated(&self) -> bool;
+
+    /// Build a fulltext content object from the body lines of a knit
+    /// record. The lines are the raw body bytes as returned by
+    /// [`parse_record_body_unchecked`] / [`parse_record_unchecked`].
+    fn parse_fulltext_content(
+        &self,
+        lines: &[&[u8]],
+        version_id: &[u8],
+    ) -> Result<Self::Content, KnitError>;
+
+    /// Parse a delta record's body into the plain (origin-stripped)
+    /// hunk shape that [`KnitContent::apply_delta`] consumes.
+    fn parse_line_delta(&self, lines: &[&[u8]]) -> Result<Vec<DeltaHunk<Vec<u8>>>, KnitError>;
+
+    /// Build a content object from a record's body lines and its
+    /// `(method, noeol)` pair. For `LineDelta` records `base_content`
+    /// must contain the parent fulltext; it's cloned and patched.
+    /// Returns the reconstructed content with `should_strip_eol` set
+    /// from `noeol`.
+    fn parse_record(
+        &self,
+        version_id: &[u8],
+        body_lines: &[&[u8]],
+        method: KnitMethod,
+        noeol: bool,
+        base_content: Option<&Self::Content>,
+    ) -> Result<Self::Content, KnitError> {
+        let mut content = match method {
+            KnitMethod::Fulltext => self.parse_fulltext_content(body_lines, version_id)?,
+            KnitMethod::LineDelta => {
+                let base = base_content.ok_or_else(|| {
+                    KnitError::BadIndexValue(b"line-delta record requires base content".to_vec())
+                })?;
+                let mut content = base.clone();
+                let delta = self.parse_line_delta(body_lines)?;
+                content.apply_delta(&delta, version_id);
+                content
+            }
+        };
+        content.set_should_strip_eol(noeol);
+        Ok(content)
+    }
+}
+
+/// Annotated knit codec strategy. Builds [`AnnotatedKnitContent`] from
+/// `(origin, text)`-formatted body lines.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KnitAnnotateFactory;
+
+impl KnitFactory for KnitAnnotateFactory {
+    type Content = AnnotatedKnitContent;
+
+    fn annotated(&self) -> bool {
+        true
+    }
+
+    fn parse_fulltext_content(
+        &self,
+        lines: &[&[u8]],
+        _version_id: &[u8],
+    ) -> Result<Self::Content, KnitError> {
+        let pairs = parse_fulltext(lines)?;
+        Ok(AnnotatedKnitContent::new(pairs))
+    }
+
+    fn parse_line_delta(&self, lines: &[&[u8]]) -> Result<Vec<DeltaHunk<Vec<u8>>>, KnitError> {
+        // Parse with the annotated parser but keep only the text bytes
+        // from each hunk line — same as the Python factory's
+        // `parse_line_delta(plain=True)` mode.
+        parse_line_delta_plain(lines)
+    }
+}
+
+/// Plain (unannotated) knit codec strategy. Builds [`PlainKnitContent`]
+/// directly from raw body lines.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KnitPlainFactory;
+
+impl KnitFactory for KnitPlainFactory {
+    type Content = PlainKnitContent;
+
+    fn annotated(&self) -> bool {
+        false
+    }
+
+    fn parse_fulltext_content(
+        &self,
+        lines: &[&[u8]],
+        version_id: &[u8],
+    ) -> Result<Self::Content, KnitError> {
+        let lines: Vec<Vec<u8>> = lines.iter().map(|l| l.to_vec()).collect();
+        Ok(PlainKnitContent::new(lines, version_id.to_vec()))
+    }
+
+    fn parse_line_delta(&self, lines: &[&[u8]]) -> Result<Vec<DeltaHunk<Vec<u8>>>, KnitError> {
+        parse_line_delta_raw(lines)
+    }
 }
 
 // ---- internals ----
@@ -1399,6 +1726,165 @@ mod tests {
 
     fn refs<'a>(v: &'a [Vec<u8>]) -> Vec<&'a [u8]> {
         v.iter().map(|l| l.as_slice()).collect()
+    }
+
+    #[test]
+    fn annotated_content_text_strips_origins() {
+        let content = AnnotatedKnitContent::new(vec![
+            (b"r1".to_vec(), b"first\n".to_vec()),
+            (b"r2".to_vec(), b"second\n".to_vec()),
+        ]);
+        assert_eq!(
+            content.text(),
+            vec![b"first\n".to_vec(), b"second\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn annotated_content_text_honors_strip_eol() {
+        let mut content = AnnotatedKnitContent::new(vec![
+            (b"r1".to_vec(), b"first\n".to_vec()),
+            (b"r2".to_vec(), b"second\n".to_vec()),
+        ]);
+        content.set_should_strip_eol(true);
+        assert_eq!(
+            content.text(),
+            vec![b"first\n".to_vec(), b"second".to_vec()]
+        );
+        // annotate() should also see the stripped tail.
+        let annotated = content.annotate();
+        assert_eq!(annotated.last().unwrap().1, b"second");
+    }
+
+    #[test]
+    fn annotated_content_apply_delta_splices_lines() {
+        // Replace lines 1..3 (zero-indexed) with two new lines, then
+        // append one more after the original tail.
+        let mut content = AnnotatedKnitContent::new(vec![
+            (b"r1".to_vec(), b"a\n".to_vec()),
+            (b"r1".to_vec(), b"b\n".to_vec()),
+            (b"r1".to_vec(), b"c\n".to_vec()),
+            (b"r1".to_vec(), b"d\n".to_vec()),
+        ]);
+        let delta = vec![DeltaHunk {
+            start: 1,
+            end: 3,
+            count: 2,
+            lines: vec![b"B\n".to_vec(), b"C\n".to_vec()],
+        }];
+        content.apply_delta(&delta, b"r2");
+        let texts = content.text();
+        assert_eq!(
+            texts,
+            vec![
+                b"a\n".to_vec(),
+                b"B\n".to_vec(),
+                b"C\n".to_vec(),
+                b"d\n".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_content_apply_delta_updates_version_id() {
+        let mut content =
+            PlainKnitContent::new(vec![b"a\n".to_vec(), b"b\n".to_vec()], b"r1".to_vec());
+        let delta = vec![DeltaHunk {
+            start: 0,
+            end: 0,
+            count: 1,
+            lines: vec![b"first\n".to_vec()],
+        }];
+        content.apply_delta(&delta, b"r2");
+        assert_eq!(content.version_id, b"r2");
+        assert_eq!(
+            content.text(),
+            vec![b"first\n".to_vec(), b"a\n".to_vec(), b"b\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn plain_content_annotate_uses_version_id() {
+        let content =
+            PlainKnitContent::new(vec![b"a\n".to_vec(), b"b\n".to_vec()], b"rev".to_vec());
+        let annotated = content.annotate();
+        assert_eq!(annotated.len(), 2);
+        assert_eq!(annotated[0].0, b"rev");
+        assert_eq!(annotated[0].1, b"a\n");
+        assert_eq!(annotated[1].0, b"rev");
+    }
+
+    #[test]
+    fn factory_parse_fulltext_round_trips_via_annotated_content() {
+        // Lower an annotated fulltext to the on-disk byte form, then
+        // parse it back through the factory and check we recover the
+        // same `(origin, text)` pairs.
+        let pairs = vec![
+            (b"r1".to_vec(), b"alpha\n".to_vec()),
+            (b"r2".to_vec(), b"beta\n".to_vec()),
+        ];
+        let body = lower_fulltext(&pairs);
+        let body_refs: Vec<&[u8]> = body.iter().map(|l| l.as_slice()).collect();
+        let factory = KnitAnnotateFactory;
+        let content = factory
+            .parse_record(b"v", &body_refs, KnitMethod::Fulltext, false, None)
+            .unwrap();
+        assert_eq!(content.lines, pairs);
+        assert!(!content.should_strip_eol());
+    }
+
+    #[test]
+    fn factory_parse_record_applies_delta_to_base() {
+        let base = AnnotatedKnitContent::new(vec![
+            (b"r1".to_vec(), b"a\n".to_vec()),
+            (b"r1".to_vec(), b"b\n".to_vec()),
+        ]);
+        // Annotated delta wire format: "start,end,count\n" + count lines of
+        // "origin text\n". The annotated factory reads this and strips
+        // origins to get a plain delta hunk it can splice in.
+        let body = vec![b"1,2,1\n".to_vec(), b"r2 B\n".to_vec()];
+        let body_refs: Vec<&[u8]> = body.iter().map(|l| l.as_slice()).collect();
+        let factory = KnitAnnotateFactory;
+        let content = factory
+            .parse_record(b"r2", &body_refs, KnitMethod::LineDelta, false, Some(&base))
+            .unwrap();
+        assert_eq!(content.text(), vec![b"a\n".to_vec(), b"B\n".to_vec()]);
+    }
+
+    #[test]
+    fn plain_factory_parses_line_delta_record() {
+        let base = PlainKnitContent::new(vec![b"a\n".to_vec(), b"b\n".to_vec()], b"r1".to_vec());
+        // Plain delta wire format: "start,end,count\n" + count bare text lines.
+        let body = vec![b"1,2,1\n".to_vec(), b"B\n".to_vec()];
+        let body_refs: Vec<&[u8]> = body.iter().map(|l| l.as_slice()).collect();
+        let factory = KnitPlainFactory;
+        let content = factory
+            .parse_record(b"r2", &body_refs, KnitMethod::LineDelta, false, Some(&base))
+            .unwrap();
+        assert_eq!(content.version_id, b"r2");
+        assert_eq!(content.text(), vec![b"a\n".to_vec(), b"B\n".to_vec()]);
+    }
+
+    #[test]
+    fn factory_line_delta_without_base_is_an_error() {
+        let factory = KnitAnnotateFactory;
+        let err = factory
+            .parse_record(b"v", &[], KnitMethod::LineDelta, false, None)
+            .unwrap_err();
+        assert!(matches!(err, KnitError::BadIndexValue(_)));
+    }
+
+    #[test]
+    fn plain_factory_parses_fulltext_into_plain_content() {
+        let factory = KnitPlainFactory;
+        let body = vec![b"alpha\n".to_vec(), b"beta\n".to_vec()];
+        let body_refs: Vec<&[u8]> = body.iter().map(|l| l.as_slice()).collect();
+        let content = factory
+            .parse_record(b"v", &body_refs, KnitMethod::Fulltext, true, None)
+            .unwrap();
+        assert_eq!(content.version_id, b"v");
+        assert!(content.should_strip_eol());
+        assert_eq!(content.text(), vec![b"alpha\n".to_vec(), b"beta".to_vec()]);
     }
 
     #[test]
