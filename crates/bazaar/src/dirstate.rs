@@ -1152,6 +1152,82 @@ impl DirState {
         self.header_state = MemoryState::InMemoryUnmodified;
         Ok(())
     }
+
+    /// Split `self.dirblocks[0]` — which the parser fills with *both* root
+    /// entries and contents-of-root entries — into the two sentinel
+    /// blocks Python's `_read_dirblocks` / `_split_root_dirblock_into_contents`
+    /// produces: block 0 holds entries whose basename is empty (the root
+    /// itself and any parent-tree variants), and block 1 holds the rest.
+    ///
+    /// Returns an error if the layout does not match the expected
+    /// post-parse shape (fewer than two blocks, or block 1 is not the
+    /// empty sentinel).
+    pub fn split_root_dirblock_into_contents(&mut self) -> Result<(), SplitRootError> {
+        split_root_dirblock_into_contents(&mut self.dirblocks)
+    }
+}
+
+/// Error returned by [`split_root_dirblock_into_contents`] when the
+/// pre-split dirblock layout is malformed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SplitRootError {
+    /// Fewer than the two sentinel blocks produced by `parse_dirblocks`.
+    MissingSentinels,
+    /// The second sentinel block is not `(b"", [])` as expected.
+    BadSecondSentinel {
+        dirname: Vec<u8>,
+        entry_count: usize,
+    },
+}
+
+impl std::fmt::Display for SplitRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SplitRootError::MissingSentinels => {
+                write!(f, "dirblocks missing the expected sentinel entries")
+            }
+            SplitRootError::BadSecondSentinel {
+                dirname,
+                entry_count,
+            } => {
+                write!(
+                    f,
+                    "bad dirblock start ({:?}, {} entries)",
+                    dirname, entry_count
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SplitRootError {}
+
+/// Pure-function version of [`DirState::split_root_dirblock_into_contents`].
+/// Exposed so callers that are still building a `Vec<Dirblock>` outside of
+/// a full `DirState` (e.g. the pyo3 shim) can reuse the same logic.
+pub fn split_root_dirblock_into_contents(
+    dirblocks: &mut [Dirblock],
+) -> Result<(), SplitRootError> {
+    if dirblocks.len() < 2 {
+        return Err(SplitRootError::MissingSentinels);
+    }
+    // Python: `if self._dirblocks[1] != (b"", []): raise ValueError(...)`.
+    // The second sentinel is always empty after parse_dirblocks; anything
+    // else means the caller already mutated the layout.
+    if !dirblocks[1].dirname.is_empty() || !dirblocks[1].entries.is_empty() {
+        return Err(SplitRootError::BadSecondSentinel {
+            dirname: dirblocks[1].dirname.clone(),
+            entry_count: dirblocks[1].entries.len(),
+        });
+    }
+
+    let block_zero = std::mem::take(&mut dirblocks[0].entries);
+    let (root_entries, contents_of_root): (Vec<Entry>, Vec<Entry>) = block_zero
+        .into_iter()
+        .partition(|entry| entry.key.basename.is_empty());
+    dirblocks[0].entries = root_entries;
+    dirblocks[1].entries = contents_of_root;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1495,6 +1571,169 @@ mod dirstate_struct_tests {
         assert_eq!(entry.key.file_id, b"TREE_ROOT".to_vec());
         assert_eq!(entry.trees[0].minikind, b'd');
         assert_eq!(entry.trees[0].packed_stat, b"x".repeat(32));
+    }
+
+    fn make_entry(dirname: &[u8], basename: &[u8], file_id: &[u8]) -> Entry {
+        Entry {
+            key: EntryKey {
+                dirname: dirname.to_vec(),
+                basename: basename.to_vec(),
+                file_id: file_id.to_vec(),
+            },
+            trees: vec![TreeData {
+                minikind: b'f',
+                fingerprint: Vec::new(),
+                size: 0,
+                executable: false,
+                packed_stat: b"x".repeat(32),
+            }],
+        }
+    }
+
+    #[test]
+    fn split_root_dirblock_separates_root_from_contents() {
+        let mut dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![
+                    make_entry(b"", b"", b"TREE_ROOT"),
+                    make_entry(b"", b"README", b"fid-readme"),
+                    make_entry(b"", b"CONTRIBUTING", b"fid-contrib"),
+                ],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        split_root_dirblock_into_contents(&mut dirblocks).expect("split");
+        assert_eq!(dirblocks.len(), 2);
+        assert_eq!(dirblocks[0].entries.len(), 1);
+        assert_eq!(dirblocks[0].entries[0].key.file_id, b"TREE_ROOT".to_vec());
+        assert_eq!(dirblocks[1].entries.len(), 2);
+        assert_eq!(dirblocks[1].entries[0].key.basename, b"README".to_vec());
+        assert_eq!(
+            dirblocks[1].entries[1].key.basename,
+            b"CONTRIBUTING".to_vec()
+        );
+    }
+
+    #[test]
+    fn split_root_dirblock_preserves_order_within_partitions() {
+        // The partition step must keep the original relative order in both
+        // halves — Python's implementation walks `_dirblocks[0][1]` in
+        // order and appends to two separate lists.
+        let mut dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![
+                    make_entry(b"", b"a", b"fid-a"),
+                    make_entry(b"", b"", b"TREE_ROOT"),
+                    make_entry(b"", b"b", b"fid-b"),
+                ],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        split_root_dirblock_into_contents(&mut dirblocks).expect("split");
+        assert_eq!(dirblocks[0].entries.len(), 1);
+        assert_eq!(dirblocks[0].entries[0].key.file_id, b"TREE_ROOT".to_vec());
+        assert_eq!(dirblocks[1].entries.len(), 2);
+        assert_eq!(dirblocks[1].entries[0].key.basename, b"a".to_vec());
+        assert_eq!(dirblocks[1].entries[1].key.basename, b"b".to_vec());
+    }
+
+    #[test]
+    fn split_root_dirblock_leaves_later_blocks_alone() {
+        let mut dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![make_entry(b"", b"", b"TREE_ROOT")],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+            Dirblock {
+                dirname: b"subdir".to_vec(),
+                entries: vec![make_entry(b"subdir", b"file", b"fid-s")],
+            },
+        ];
+        split_root_dirblock_into_contents(&mut dirblocks).expect("split");
+        assert_eq!(dirblocks.len(), 3);
+        assert_eq!(dirblocks[2].dirname, b"subdir".to_vec());
+        assert_eq!(dirblocks[2].entries.len(), 1);
+    }
+
+    #[test]
+    fn split_root_dirblock_rejects_missing_sentinel() {
+        let mut dirblocks = vec![Dirblock {
+            dirname: Vec::new(),
+            entries: Vec::new(),
+        }];
+        assert_eq!(
+            split_root_dirblock_into_contents(&mut dirblocks),
+            Err(SplitRootError::MissingSentinels)
+        );
+    }
+
+    #[test]
+    fn split_root_dirblock_rejects_polluted_sentinel() {
+        let mut dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![make_entry(b"", b"", b"TREE_ROOT")],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![make_entry(b"", b"x", b"fid-x")],
+            },
+        ];
+        match split_root_dirblock_into_contents(&mut dirblocks) {
+            Err(SplitRootError::BadSecondSentinel {
+                dirname,
+                entry_count,
+            }) => {
+                assert!(dirname.is_empty());
+                assert_eq!(entry_count, 1);
+            }
+            other => panic!("expected BadSecondSentinel, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dirstate_split_root_dirblock_method_wires_through() {
+        // Verify the `DirState::split_root_dirblock_into_contents` method
+        // calls the free function on its own `dirblocks` field.
+        let mut state = DirState::new(
+            "dirstate",
+            Box::new(DefaultSHA1Provider::new()),
+            0,
+            true,
+            false,
+        );
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![
+                    make_entry(b"", b"", b"TREE_ROOT"),
+                    make_entry(b"", b"README", b"fid-readme"),
+                ],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        state.split_root_dirblock_into_contents().expect("split");
+        assert_eq!(state.dirblocks[0].entries.len(), 1);
+        assert_eq!(state.dirblocks[1].entries.len(), 1);
+        assert_eq!(
+            state.dirblocks[1].entries[0].key.basename,
+            b"README".to_vec()
+        );
     }
 
     #[test]
