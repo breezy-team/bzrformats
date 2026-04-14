@@ -1431,6 +1431,28 @@ impl DirState {
         Ok(block_index)
     }
 
+    /// Look up the dirstate entry at `path_utf8` in `tree_index` and
+    /// return a reference to it, or `None` if the path is not present
+    /// in that tree. Mirrors the `path_utf8` branch of Python's
+    /// `DirState._get_entry` (the file-id fallback is a follow-up port
+    /// once `_get_id_index` exists in Rust).
+    ///
+    /// `path_utf8` is split on the last `/` into a `(dirname, basename)`
+    /// pair matching `osutils.split`, then fed through
+    /// [`DirState::get_block_entry_index`]. The result points at a
+    /// live (non-absent, non-relocated) entry only when `path_present`
+    /// is true; otherwise `None` is returned.
+    pub fn get_entry_by_path(&self, tree_index: usize, path_utf8: &[u8]) -> Option<&Entry> {
+        let (dirname, basename) = split_path_utf8(path_utf8);
+        let bei = self.get_block_entry_index(dirname, basename, tree_index);
+        if !bei.path_present {
+            return None;
+        }
+        self.dirblocks
+            .get(bei.block_index)
+            .and_then(|b| b.entries.get(bei.entry_index))
+    }
+
     /// Walk the subtree rooted at `path_utf8` and return every live
     /// entry (kind not in `b'a'`/`b'r'`) in `tree_index`, in the order
     /// Python's `DirState._iter_child_entries` yields them.
@@ -1604,6 +1626,16 @@ impl std::error::Error for SplitRootError {}
 /// the ordering dirblocks use on disk.
 fn split_dirname(dirname: &[u8]) -> Vec<&[u8]> {
     dirname.split(|&b| b == b'/').collect()
+}
+
+/// Split `path` on the last `/` into a `(dirname, basename)` pair,
+/// matching `bzrformats.osutils.split`. Paths with no `/` map to
+/// `(b"", path)`; `b""` itself maps to `(b"", b"")`.
+fn split_path_utf8(path: &[u8]) -> (&[u8], &[u8]) {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => (b"".as_slice(), path),
+    }
 }
 
 /// Find the insertion position for a directory name within `dirblocks`,
@@ -2807,6 +2839,87 @@ mod dirstate_struct_tests {
         // non-directory path yields nothing.
         let children = state.iter_child_entries(0, b"c");
         assert!(children.is_empty());
+    }
+
+    #[test]
+    fn split_path_utf8_matches_osutils_split() {
+        assert_eq!(split_path_utf8(b"a/b/c"), (&b"a/b"[..], &b"c"[..]));
+        assert_eq!(split_path_utf8(b"a"), (&b""[..], &b"a"[..]));
+        assert_eq!(split_path_utf8(b""), (&b""[..], &b""[..]));
+        assert_eq!(split_path_utf8(b"a/"), (&b"a"[..], &b""[..]));
+    }
+
+    /// Rust counterpart of Python
+    /// `TestGetEntry.test_simple_structure`. Probe a small dirstate by
+    /// path and verify the expected (dirname, basename, file_id) key
+    /// comes back — or `None` for paths that don't exist or live under
+    /// a non-existent directory.
+    #[test]
+    fn get_entry_by_path_simple_structure() {
+        let state = create_dirstate_with_root_and_subdir();
+        let root = state.get_entry_by_path(0, b"").expect("root");
+        assert_eq!(root.key.file_id, b"a-root-value".to_vec());
+        let subdir = state.get_entry_by_path(0, b"subdir").expect("subdir");
+        assert_eq!(subdir.key.basename, b"subdir".to_vec());
+        assert_eq!(subdir.key.file_id, b"subdir-id".to_vec());
+        assert!(state.get_entry_by_path(0, b"missing").is_none());
+        assert!(state.get_entry_by_path(0, b"missing/foo").is_none());
+        assert!(state.get_entry_by_path(0, b"subdir/foo").is_none());
+    }
+
+    /// Rust counterpart of Python
+    /// `TestGetEntry.test_complex_structure_exists`.
+    #[test]
+    fn get_entry_by_path_complex_structure_exists() {
+        let state = create_complex_dirstate();
+        let cases: &[(&[u8], &[u8], &[u8], &[u8])] = &[
+            (b"", b"", b"", b"a-root-value"),
+            (b"a", b"", b"a", b"a-dir"),
+            (b"b", b"", b"b", b"b-dir"),
+            (b"c", b"", b"c", b"c-file"),
+            (b"d", b"", b"d", b"d-file"),
+            (b"a/e", b"a", b"e", b"e-dir"),
+            (b"a/f", b"a", b"f", b"f-file"),
+            (b"b/g", b"b", b"g", b"g-file"),
+            (b"b/h\xc3\xa5", b"b", b"h\xc3\xa5", b"h-\xc3\xa5-file"),
+        ];
+        for (path, dirname, basename, file_id) in cases {
+            let entry = state
+                .get_entry_by_path(0, path)
+                .unwrap_or_else(|| panic!("expected entry at {:?}", path));
+            assert_eq!(
+                entry.key.dirname,
+                dirname.to_vec(),
+                "dirname for {:?}",
+                path
+            );
+            assert_eq!(
+                entry.key.basename,
+                basename.to_vec(),
+                "basename for {:?}",
+                path
+            );
+            assert_eq!(
+                entry.key.file_id,
+                file_id.to_vec(),
+                "file_id for {:?}",
+                path
+            );
+        }
+    }
+
+    /// Rust counterpart of Python
+    /// `TestGetEntry.test_complex_structure_missing`.
+    #[test]
+    fn get_entry_by_path_complex_structure_missing() {
+        let state = create_complex_dirstate();
+        for path in [&b"_"[..], b"_\xc3\xa5", b"a/b", b"c/d"] {
+            assert!(
+                state.get_entry_by_path(0, path).is_none(),
+                "expected None for {:?}",
+                path
+            );
+        }
     }
 
     #[test]
