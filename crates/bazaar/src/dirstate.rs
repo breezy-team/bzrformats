@@ -1475,6 +1475,129 @@ impl DirState {
         Ok(block_index)
     }
 
+    /// Look up the dirstate entry for `file_id` in `tree_index`,
+    /// following any relocation chain the entries describe. Mirrors
+    /// the `fileid_utf8` branch of Python's `DirState._get_entry`.
+    ///
+    /// If `include_deleted` is true, an entry whose tree data is
+    /// absent (`b'a'`) is returned rather than hidden. Returns
+    /// [`GetEntryResult::NotFound`] if no key for `file_id` exists in
+    /// the id index, [`GetEntryResult::Entry`] with the located entry
+    /// key on success, or [`GetEntryResult::InvalidMinikind`] if a
+    /// tree-data row has a minikind that is neither live nor
+    /// absent/relocated (mirroring the `AssertionError` Python raises).
+    ///
+    /// The result is returned as an owned [`EntryKey`] rather than a
+    /// borrow because the caller may need to keep `self` borrowable
+    /// for other lookups; callers that need the full entry can
+    /// re-fetch it via [`DirState::find_block_index_from_key`] and
+    /// [`DirState::find_entry_index`].
+    pub fn get_entry_by_file_id(
+        &mut self,
+        tree_index: usize,
+        file_id: &[u8],
+        include_deleted: bool,
+    ) -> GetEntryResult {
+        // Copy out the candidate keys so we can drop the borrow on
+        // `self.id_index` and mutate other state during the scan.
+        let candidates = {
+            let idx = self.get_or_build_id_index();
+            idx.get(&FileId::from(&file_id.to_vec()))
+        };
+        if candidates.is_empty() {
+            return GetEntryResult::NotFound;
+        }
+
+        // Follow relocation chains until we hit a live entry, an
+        // absent entry, or run out of candidate keys. Bounded by the
+        // number of relocation hops the dirstate actually contains;
+        // the `visited` set guards against pathological cycles.
+        let mut current: Vec<EntryKey> = candidates
+            .into_iter()
+            .map(|(d, b, f)| EntryKey {
+                dirname: d,
+                basename: b,
+                file_id: f.as_bytes().to_vec(),
+            })
+            .collect();
+        let mut visited: HashSet<EntryKey> = HashSet::new();
+
+        loop {
+            let mut relocation_target: Option<Vec<u8>> = None;
+            for key in &current {
+                if !visited.insert(key.clone()) {
+                    continue;
+                }
+                let (block_index, present) = find_block_index_from_key(&self.dirblocks, key);
+                // "strange, probably indicates an out of date id index" —
+                // Python's comment: silently skip stale entries.
+                if !present {
+                    continue;
+                }
+                let block = &self.dirblocks[block_index].entries;
+                let (entry_index, entry_present) = find_entry_index(key, block);
+                if !entry_present {
+                    continue;
+                }
+                let entry = &block[entry_index];
+                let Some(tree) = entry.trees.get(tree_index) else {
+                    continue;
+                };
+                match tree.minikind {
+                    b'f' | b'd' | b'l' | b't' => {
+                        return GetEntryResult::Entry(entry.key.clone());
+                    }
+                    b'a' => {
+                        if include_deleted {
+                            return GetEntryResult::Entry(entry.key.clone());
+                        }
+                        return GetEntryResult::NotFound;
+                    }
+                    b'r' => {
+                        // Follow the relocation by recursing via the
+                        // `real_path` fingerprint.
+                        relocation_target = Some(tree.fingerprint.clone());
+                        break;
+                    }
+                    other => {
+                        return GetEntryResult::InvalidMinikind {
+                            key: entry.key.clone(),
+                            tree_index,
+                            minikind: other,
+                        };
+                    }
+                }
+            }
+            match relocation_target {
+                Some(real_path) => {
+                    // The relocation target is a path — Python just
+                    // recurses with the same fileid_utf8 and the new
+                    // path, walking the id index again. We mirror that
+                    // by filtering the candidate set down to keys that
+                    // match the (dirname, basename) split of the real
+                    // path, leaving the file_id constraint in place.
+                    let (dirname, basename) = split_path_utf8(&real_path);
+                    let all = self
+                        .get_or_build_id_index()
+                        .get(&FileId::from(&file_id.to_vec()));
+                    current = all
+                        .into_iter()
+                        .filter(|(d, b, _)| d == dirname && b == basename)
+                        .map(|(d, b, f)| EntryKey {
+                            dirname: d,
+                            basename: b,
+                            file_id: f.as_bytes().to_vec(),
+                        })
+                        .collect();
+                    if current.is_empty() {
+                        return GetEntryResult::NotFound;
+                    }
+                }
+                None => return GetEntryResult::NotFound,
+            }
+        }
+    }
+
     /// Look up the dirstate entry at `path_utf8` in `tree_index` and
     /// return a reference to it, or `None` if the path is not present
     /// in that tree. Mirrors the `path_utf8` branch of Python's
@@ -1761,6 +1884,28 @@ pub fn find_entry_index(key: &EntryKey, block: &[Entry]) -> (usize, bool) {
     }
     let present = lo < block.len() && block[lo].key == *key;
     (lo, present)
+}
+
+/// Result of [`DirState::get_entry_by_file_id`]. Mirrors the
+/// `(entry, None)` / `None` return pattern Python uses for
+/// `DirState._get_entry`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GetEntryResult {
+    /// No entry for the requested file_id exists in the given tree.
+    NotFound,
+    /// The located entry's key. The full entry can be re-fetched via
+    /// [`DirState::find_block_index_from_key`] +
+    /// [`DirState::find_entry_index`] if the caller needs the trees.
+    Entry(EntryKey),
+    /// An entry's tree data had a minikind that is neither live
+    /// (`b'f'`/`b'd'`/`b'l'`/`b't'`) nor absent/relocated
+    /// (`b'a'`/`b'r'`). Mirrors Python's `AssertionError` for the
+    /// "invalid minikind" case.
+    InvalidMinikind {
+        key: EntryKey,
+        tree_index: usize,
+        minikind: u8,
+    },
 }
 
 /// Result of [`get_block_entry_index`]: the four-tuple Python returns,
@@ -3019,6 +3164,71 @@ mod dirstate_struct_tests {
             .collect();
         assert!(basenames.contains(&&b"c"[..]));
         assert!(basenames.contains(&&b"j"[..]));
+    }
+
+    #[test]
+    fn get_entry_by_file_id_direct_hit_in_tree_zero() {
+        let mut state = create_complex_dirstate();
+        let result = state.get_entry_by_file_id(0, b"c-file", false);
+        match result {
+            GetEntryResult::Entry(key) => {
+                assert_eq!(key.dirname, b"".to_vec());
+                assert_eq!(key.basename, b"c".to_vec());
+                assert_eq!(key.file_id, b"c-file".to_vec());
+            }
+            other => panic!("expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_entry_by_file_id_follows_relocation_chain() {
+        // In create_dirstate_with_two_trees, c-file's row at (b"", b"c")
+        // is relocated in tree 1 → b/j. The id_index should find the
+        // (b"b", b"j") variant on the second pass and return it.
+        let mut state = create_dirstate_with_two_trees();
+        let result = state.get_entry_by_file_id(1, b"c-file", false);
+        match result {
+            GetEntryResult::Entry(key) => {
+                assert_eq!(key.dirname, b"b".to_vec());
+                assert_eq!(key.basename, b"j".to_vec());
+                assert_eq!(key.file_id, b"c-file".to_vec());
+            }
+            other => panic!("expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_entry_by_file_id_not_found_for_unknown_id() {
+        let mut state = create_complex_dirstate();
+        assert_eq!(
+            state.get_entry_by_file_id(0, b"nonexistent", false),
+            GetEntryResult::NotFound
+        );
+    }
+
+    #[test]
+    fn get_entry_by_file_id_absent_without_include_deleted() {
+        // g-file is absent in tree 1 (null_parent). Without
+        // include_deleted the lookup returns NotFound.
+        let mut state = create_dirstate_with_two_trees();
+        assert_eq!(
+            state.get_entry_by_file_id(1, b"g-file", false),
+            GetEntryResult::NotFound
+        );
+    }
+
+    #[test]
+    fn get_entry_by_file_id_absent_with_include_deleted() {
+        // Same g-file/tree 1 lookup, but with include_deleted we get
+        // the absent entry back.
+        let mut state = create_dirstate_with_two_trees();
+        match state.get_entry_by_file_id(1, b"g-file", true) {
+            GetEntryResult::Entry(key) => {
+                assert_eq!(key.basename, b"g".to_vec());
+                assert_eq!(key.file_id, b"g-file".to_vec());
+            }
+            other => panic!("expected Entry, got {:?}", other),
+        }
     }
 
     #[test]
