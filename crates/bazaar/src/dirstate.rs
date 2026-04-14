@@ -1304,6 +1304,70 @@ impl DirState {
         self.known_hash_changes.clear();
     }
 
+    /// Number of parent entries present in each dirstate record row.
+    /// Mirrors Python's `DirState._num_present_parents` — total
+    /// parents minus ghost parents.
+    pub fn num_present_parents(&self) -> usize {
+        self.parents.len().saturating_sub(self.ghosts.len())
+    }
+
+    /// Rebuild `self.dirblocks` from a pre-sorted, flat list of
+    /// entries. Mirrors Python's `DirState._entries_to_current_state`.
+    ///
+    /// `new_entries` must start with the root row (dirname and
+    /// basename both empty); otherwise
+    /// [`EntriesToStateError::MissingRootRow`] is returned. The
+    /// resulting layout contains the two sentinel empty-dirname blocks
+    /// followed by one block per distinct subdirectory, then fed
+    /// through [`DirState::split_root_dirblock_into_contents`] to
+    /// separate the root row from the root-contents rows.
+    ///
+    /// This function does not re-sort entries — callers that hand in a
+    /// sorted list skip the cost, and Python's comment calls this out
+    /// explicitly.
+    pub fn entries_to_current_state(
+        &mut self,
+        new_entries: Vec<Entry>,
+    ) -> Result<(), EntriesToStateError> {
+        let first = new_entries.first().ok_or(EntriesToStateError::Empty)?;
+        if !first.key.dirname.is_empty() || !first.key.basename.is_empty() {
+            return Err(EntriesToStateError::MissingRootRow {
+                key: first.key.clone(),
+            });
+        }
+
+        let mut dirblocks: Vec<Dirblock> = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        // Root-group index: all entries with dirname == b"" are
+        // appended to dirblocks[0]; `split_root_dirblock_into_contents`
+        // later splits them into the true root and the contents-of-root.
+        let mut current_idx: usize = 0;
+        let mut current_dirname: Vec<u8> = Vec::new();
+        for entry in new_entries {
+            if entry.key.dirname != current_dirname {
+                current_dirname = entry.key.dirname.clone();
+                dirblocks.push(Dirblock {
+                    dirname: current_dirname.clone(),
+                    entries: Vec::new(),
+                });
+                current_idx = dirblocks.len() - 1;
+            }
+            dirblocks[current_idx].entries.push(entry);
+        }
+        self.dirblocks = dirblocks;
+        split_root_dirblock_into_contents(&mut self.dirblocks)
+            .map_err(EntriesToStateError::SplitFailed)?;
+        Ok(())
+    }
+
     /// Ensure a block for `dirname` exists in `self.dirblocks`, creating
     /// it if necessary. Mirrors Python's `DirState._ensure_block`.
     ///
@@ -1385,6 +1449,45 @@ impl std::fmt::Display for EnsureBlockError {
 }
 
 impl std::error::Error for EnsureBlockError {}
+
+/// Error returned by [`DirState::entries_to_current_state`] when the
+/// input entry list violates the layout invariants Python asserts in
+/// `_entries_to_current_state`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EntriesToStateError {
+    /// The input entry list was empty — Python's implementation
+    /// unconditionally indexes `new_entries[0]`, so an empty list is
+    /// an implicit invariant violation that we surface explicitly.
+    Empty,
+    /// The first entry was not the root row (dirname and basename
+    /// both empty). Mirrors Python's
+    /// `AssertionError("Missing root row ...")`.
+    MissingRootRow { key: EntryKey },
+    /// The follow-up `split_root_dirblock_into_contents` step failed.
+    /// Should only happen if the new entry list contains trailing
+    /// blocks that pollute the second sentinel.
+    SplitFailed(SplitRootError),
+}
+
+impl std::fmt::Display for EntriesToStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EntriesToStateError::Empty => write!(f, "new_entries is empty"),
+            EntriesToStateError::MissingRootRow { key } => {
+                write!(
+                    f,
+                    "Missing root row ({:?}, {:?}, {:?})",
+                    key.dirname, key.basename, key.file_id
+                )
+            }
+            EntriesToStateError::SplitFailed(err) => {
+                write!(f, "split_root_dirblock_into_contents: {}", err)
+            }
+        }
+    }
+}
+
+impl std::error::Error for EntriesToStateError {}
 
 /// Error returned by [`split_root_dirblock_into_contents`] when the
 /// pre-split dirblock layout is malformed.
@@ -2617,6 +2720,111 @@ mod dirstate_struct_tests {
         state.mark_modified(&[], true);
         assert_eq!(state.header_state, MemoryState::InMemoryModified);
         assert_eq!(state.dirblock_state, MemoryState::InMemoryModified);
+    }
+
+    #[test]
+    fn num_present_parents_subtracts_ghosts() {
+        let mut state = fresh_state();
+        state.parents = vec![b"rev-a".to_vec(), b"rev-b".to_vec(), b"rev-c".to_vec()];
+        state.ghosts = vec![b"rev-b".to_vec()];
+        assert_eq!(state.num_present_parents(), 2);
+    }
+
+    #[test]
+    fn num_present_parents_no_parents() {
+        let state = fresh_state();
+        assert_eq!(state.num_present_parents(), 0);
+    }
+
+    #[test]
+    fn num_present_parents_saturates_when_ghosts_exceed_parents() {
+        // Defensive: if somehow ghosts > parents we return 0 rather than
+        // underflow. Python would raise a ValueError from `-` on ints,
+        // but saturating is safer and less surprising.
+        let mut state = fresh_state();
+        state.parents = vec![b"rev-a".to_vec()];
+        state.ghosts = vec![b"g1".to_vec(), b"g2".to_vec()];
+        assert_eq!(state.num_present_parents(), 0);
+    }
+
+    #[test]
+    fn entries_to_current_state_builds_expected_dirblock_layout() {
+        let mut state = fresh_state();
+        let nullstat = b"x".repeat(32);
+        let mk_entry = |dirname: &[u8], basename: &[u8], file_id: &[u8]| Entry {
+            key: EntryKey {
+                dirname: dirname.to_vec(),
+                basename: basename.to_vec(),
+                file_id: file_id.to_vec(),
+            },
+            trees: vec![TreeData {
+                minikind: b'd',
+                fingerprint: Vec::new(),
+                size: 0,
+                executable: false,
+                packed_stat: nullstat.clone(),
+            }],
+        };
+        let new_entries = vec![
+            mk_entry(b"", b"", b"TREE_ROOT"),
+            mk_entry(b"", b"README", b"fid-readme"),
+            mk_entry(b"", b"sub", b"fid-sub"),
+            mk_entry(b"sub", b"inner", b"fid-inner"),
+        ];
+        state
+            .entries_to_current_state(new_entries)
+            .expect("entries_to_current_state");
+
+        // Two sentinels + one real block for "sub".
+        assert_eq!(state.dirblocks.len(), 3);
+        // Block 0 holds just the root entry.
+        assert_eq!(state.dirblocks[0].entries.len(), 1);
+        assert_eq!(
+            state.dirblocks[0].entries[0].key.file_id,
+            b"TREE_ROOT".to_vec()
+        );
+        // Block 1 holds README and sub (the root's contents, post-split).
+        assert_eq!(state.dirblocks[1].entries.len(), 2);
+        assert_eq!(
+            state.dirblocks[1].entries[0].key.basename,
+            b"README".to_vec()
+        );
+        assert_eq!(state.dirblocks[1].entries[1].key.basename, b"sub".to_vec());
+        // Block 2 is the real "sub" block holding inner.
+        assert_eq!(state.dirblocks[2].dirname, b"sub".to_vec());
+        assert_eq!(state.dirblocks[2].entries.len(), 1);
+        assert_eq!(
+            state.dirblocks[2].entries[0].key.basename,
+            b"inner".to_vec()
+        );
+    }
+
+    #[test]
+    fn entries_to_current_state_rejects_missing_root_row() {
+        let mut state = fresh_state();
+        let entry = Entry {
+            key: EntryKey {
+                dirname: b"".to_vec(),
+                basename: b"README".to_vec(),
+                file_id: b"fid".to_vec(),
+            },
+            trees: vec![tree(b'f')],
+        };
+        match state.entries_to_current_state(vec![entry]) {
+            Err(EntriesToStateError::MissingRootRow { key }) => {
+                assert_eq!(key.basename, b"README".to_vec());
+            }
+            other => panic!("expected MissingRootRow, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn entries_to_current_state_rejects_empty_list() {
+        let mut state = fresh_state();
+        assert_eq!(
+            state.entries_to_current_state(Vec::new()),
+            Err(EntriesToStateError::Empty)
+        );
     }
 
     #[test]
