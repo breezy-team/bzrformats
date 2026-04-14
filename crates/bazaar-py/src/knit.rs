@@ -676,6 +676,75 @@ fn parse_knit_index_value_rs(value: &[u8]) -> PyResult<(bool, u64, u64)> {
     Ok((parsed.noeol, parsed.pos, parsed.size))
 }
 
+/// Walk the compression chain starting at `initial_parent` to decide
+/// whether a new record should be stored as a delta. `get_step` is a
+/// Python callable that takes a parent key and returns either
+/// `(size, compression_parent_or_None)` or `None` if the parent isn't
+/// locally present.
+///
+/// Returns one of `"use-delta"`, `"fulltext-smaller"`, `"chain-too-long"`,
+/// `"missing-parent"` — the four `DeltaDecision` variants. The Python
+/// caller turns the first variant into `True` and the others into
+/// `False` to match the historical `_check_should_delta` bool return.
+#[pyfunction]
+fn check_should_delta_rs<'py>(
+    initial_parent: Bound<'py, PyAny>,
+    max_chain: usize,
+    get_step: Bound<'py, PyAny>,
+) -> PyResult<&'static str> {
+    use bazaar::knit::{should_use_delta, ChainStep, DeltaDecision};
+
+    let mut callback_err: Option<PyErr> = None;
+    let decision = should_use_delta(initial_parent, max_chain, |parent| {
+        match get_step.call1((parent.clone(),)) {
+            Err(e) => {
+                callback_err = Some(e);
+                None
+            }
+            Ok(result) => {
+                if result.is_none() {
+                    return None;
+                }
+                let tup = match result.cast_into::<PyTuple>() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        callback_err = Some(e.into());
+                        return None;
+                    }
+                };
+                let size: u64 = match tup.get_item(0).and_then(|o| o.extract::<u64>()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        callback_err = Some(e);
+                        return None;
+                    }
+                };
+                let cp_obj = match tup.get_item(1) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        callback_err = Some(e);
+                        return None;
+                    }
+                };
+                let compression_parent = if cp_obj.is_none() { None } else { Some(cp_obj) };
+                Some(ChainStep {
+                    size,
+                    compression_parent,
+                })
+            }
+        }
+    });
+    if let Some(e) = callback_err {
+        return Err(e);
+    }
+    Ok(match decision {
+        DeltaDecision::UseDelta => "use-delta",
+        DeltaDecision::FulltextSmaller => "fulltext-smaller",
+        DeltaDecision::ChainTooLong => "chain-too-long",
+        DeltaDecision::MissingParent => "missing-parent",
+    })
+}
+
 /// Decide method + noeol for a `_KndxIndex` cache row's options list.
 /// Returns `(method_str, noeol)`.
 #[pyfunction]
@@ -908,6 +977,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(knit_entries_to_build_details_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_knit_index_value_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(decode_kndx_options_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(check_should_delta_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;

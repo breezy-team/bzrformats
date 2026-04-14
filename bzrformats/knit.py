@@ -1444,34 +1444,25 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
         Return True if we should create a new delta, False if we should use a
         full text.
         """
-        delta_size = 0
-        fulltext_size = None
-        for _count in range(self._max_delta_chain):
+        # Note that this only looks in the index of this particular
+        # KnitVersionedFiles, not in the fallbacks.  This ensures that we
+        # won't store a delta spanning physical repository boundaries.
+        index = self._index
+
+        def get_step(p):
             try:
-                # Note that this only looks in the index of this particular
-                # KnitVersionedFiles, not in the fallbacks.  This ensures that
-                # we won't store a delta spanning physical repository
-                # boundaries.
-                build_details = self._index.get_build_details([parent])
-                parent_details = build_details[parent]
+                build_details = index.get_build_details([p])
+                parent_details = build_details[p]
             except (RevisionNotPresent, KeyError):
-                # Some basis is not locally present: always fulltext
-                return False
+                return None
             index_memo, compression_parent, _, _ = parent_details
             _, _, size = index_memo
-            if compression_parent is None:
-                fulltext_size = size
-                break
-            delta_size += size
-            # We don't explicitly check for presence because this is in an
-            # inner loop, and if it's missing it'll fail anyhow.
-            parent = compression_parent
-        else:
-            # We couldn't find a fulltext, so we must create a new one
-            return False
-        # Simple heuristic - if the total I/O wold be greater as a delta than
-        # the originally installed fulltext, we create a new fulltext.
-        return fulltext_size > delta_size
+            return (size, compression_parent)
+
+        decision = _knit_rs.check_should_delta_rs(
+            parent, self._max_delta_chain, get_step
+        )
+        return decision == "use-delta"
 
     def _build_details_to_components(self, build_details):
         """Convert a build_details tuple to a position tuple."""

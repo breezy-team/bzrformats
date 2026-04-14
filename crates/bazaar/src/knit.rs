@@ -1058,6 +1058,90 @@ pub struct KnitBuildDetails {
     pub compression_parent: Option<usize>,
 }
 
+/// Outcome of [`should_use_delta`]'s parent-chain walk.
+///
+/// Distinguishes the three reasons we might decide *against* storing a
+/// new delta — chain too long, missing parent, fulltext bigger than the
+/// chain — so callers and tests can introspect the decision rather than
+/// just see a `bool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaDecision {
+    /// Found a fulltext at the end of a chain shorter than `max_chain`,
+    /// and `delta_size` is small enough that storing a new delta is
+    /// worthwhile.
+    UseDelta,
+    /// Found a fulltext, but the cumulative delta size is greater than
+    /// or equal to the fulltext size — better to write a new fulltext.
+    FulltextSmaller,
+    /// Walked `max_chain` parents without finding a fulltext.
+    ChainTooLong,
+    /// A parent in the chain wasn't present locally (a stacked fallback
+    /// or a missing record). The Python original conservatively writes a
+    /// new fulltext in this case.
+    MissingParent,
+}
+
+impl DeltaDecision {
+    /// Convenience: should the caller create a new delta? `true` only for
+    /// [`DeltaDecision::UseDelta`].
+    pub fn should_use_delta(self) -> bool {
+        matches!(self, DeltaDecision::UseDelta)
+    }
+}
+
+/// One step's worth of information about a parent in the compression
+/// chain. The closure passed to [`should_use_delta`] returns this for
+/// each parent it's asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainStep<K> {
+    /// On-disk size (in bytes) of this parent's record.
+    pub size: u64,
+    /// Compression parent of this parent, if any. `None` means this
+    /// parent is itself a fulltext, ending the walk.
+    pub compression_parent: Option<K>,
+}
+
+/// Walk the compression chain starting at `initial_parent` and decide
+/// whether the new record should be stored as a delta or as a fresh
+/// fulltext.
+///
+/// Mirrors `KnitVersionedFiles._check_should_delta`. The closure
+/// `get_step` is called once per parent (starting with `initial_parent`)
+/// and should return `Some(ChainStep { size, compression_parent })` if
+/// the parent is locally present, or `None` if it isn't.
+///
+/// The walk stops when:
+/// - the closure returns `None` (missing parent — fall back to fulltext);
+/// - we've inspected `max_chain` parents without finding a fulltext;
+/// - we hit a fulltext (decide based on `delta_size` vs `fulltext_size`).
+pub fn should_use_delta<K, F>(initial_parent: K, max_chain: usize, mut get_step: F) -> DeltaDecision
+where
+    F: FnMut(&K) -> Option<ChainStep<K>>,
+{
+    let mut delta_size: u64 = 0;
+    let mut current = initial_parent;
+    for _ in 0..max_chain {
+        let step = match get_step(&current) {
+            Some(s) => s,
+            None => return DeltaDecision::MissingParent,
+        };
+        match step.compression_parent {
+            None => {
+                return if step.size > delta_size {
+                    DeltaDecision::UseDelta
+                } else {
+                    DeltaDecision::FulltextSmaller
+                };
+            }
+            Some(next) => {
+                delta_size += step.size;
+                current = next;
+            }
+        }
+    }
+    DeltaDecision::ChainTooLong
+}
+
 /// Decide method + noeol for a single `_KndxIndex` cache entry, given
 /// its options bytes-list (the first element of the cached row).
 ///
@@ -1747,6 +1831,94 @@ mod tests {
             parse_knit_index_value(b"N5").unwrap_err(),
             KnitError::BadIndexValue(b"N5".to_vec())
         );
+    }
+
+    #[test]
+    fn should_use_delta_finds_fulltext_and_picks_delta() {
+        // A 100-byte fulltext at the end of a chain of two 10-byte deltas.
+        // delta_size = 20, fulltext_size = 100 -> UseDelta.
+        let chain: std::collections::HashMap<&str, ChainStep<&'static str>> = vec![
+            (
+                "a",
+                ChainStep {
+                    size: 10,
+                    compression_parent: Some("b"),
+                },
+            ),
+            (
+                "b",
+                ChainStep {
+                    size: 10,
+                    compression_parent: Some("c"),
+                },
+            ),
+            (
+                "c",
+                ChainStep {
+                    size: 100,
+                    compression_parent: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let decision = should_use_delta("a", 5, |k| chain.get(k).cloned());
+        assert_eq!(decision, DeltaDecision::UseDelta);
+        assert!(decision.should_use_delta());
+    }
+
+    #[test]
+    fn should_use_delta_picks_fulltext_when_delta_chain_is_bigger() {
+        // 200 bytes of delta against a 50-byte fulltext: not worth it.
+        let chain: std::collections::HashMap<&str, ChainStep<&'static str>> = vec![
+            (
+                "a",
+                ChainStep {
+                    size: 100,
+                    compression_parent: Some("b"),
+                },
+            ),
+            (
+                "b",
+                ChainStep {
+                    size: 100,
+                    compression_parent: Some("c"),
+                },
+            ),
+            (
+                "c",
+                ChainStep {
+                    size: 50,
+                    compression_parent: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            should_use_delta("a", 5, |k| chain.get(k).cloned()),
+            DeltaDecision::FulltextSmaller
+        );
+    }
+
+    #[test]
+    fn should_use_delta_chain_too_long() {
+        // Every parent points at another delta — no fulltext within
+        // max_chain steps.
+        let decision = should_use_delta("a", 3, |_| {
+            Some(ChainStep {
+                size: 5,
+                compression_parent: Some("a"),
+            })
+        });
+        assert_eq!(decision, DeltaDecision::ChainTooLong);
+    }
+
+    #[test]
+    fn should_use_delta_missing_parent_falls_back_to_fulltext() {
+        let decision = should_use_delta("a", 5, |_| None);
+        assert_eq!(decision, DeltaDecision::MissingParent);
+        assert!(!decision.should_use_delta());
     }
 
     #[test]
