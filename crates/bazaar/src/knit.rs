@@ -195,6 +195,10 @@ pub enum KnitError {
     BadIndexValue(Vec<u8>),
     /// A knit delta record claimed more than one compression parent.
     TooManyCompressionParents(usize),
+    /// A record's header `version_id` field did not match the caller's
+    /// expected value — used by `parse_record` when verifying that a
+    /// fetched record really belongs to the requested key.
+    UnexpectedVersion { wanted: Vec<u8>, got: Vec<u8> },
 }
 
 impl std::fmt::Display for KnitError {
@@ -242,6 +246,9 @@ impl std::fmt::Display for KnitError {
             }
             KnitError::TooManyCompressionParents(n) => {
                 write!(f, "Too many compression parents: {}", n)
+            }
+            KnitError::UnexpectedVersion { wanted, got } => {
+                write!(f, "unexpected version, wanted {:?}, got {:?}", wanted, got)
             }
         }
     }
@@ -1279,6 +1286,23 @@ pub fn parse_record_unchecked(data: &[u8]) -> Result<(RecordHeader, Vec<Vec<u8>>
     }
 
     Ok((header, lines))
+}
+
+/// Parse a knit record and verify that its embedded `version_id` matches
+/// `expected_version`. Returns `(body_lines, digest)` on success, mirroring
+/// `_KnitData._parse_record` in Python.
+pub fn parse_record(
+    expected_version: &[u8],
+    data: &[u8],
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), KnitError> {
+    let (header, body) = parse_record_unchecked(data)?;
+    if header.version_id != expected_version {
+        return Err(KnitError::UnexpectedVersion {
+            wanted: expected_version.to_vec(),
+            got: header.version_id,
+        });
+    }
+    Ok((body, header.digest))
 }
 
 /// Gzip-decode just enough of a knit record to parse its header line.
@@ -2894,6 +2918,28 @@ mod tests {
             KnitError::LineCount {
                 declared: 5,
                 actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_record_checks_version_match() {
+        let body: &[&[u8]] = &[b"a\n", b"b\n"];
+        let raw = build_record(b"rev-9", b"DIGEST", body);
+        let (lines, digest) = parse_record(b"rev-9", &raw).unwrap();
+        assert_eq!(lines, vec![b"a\n".to_vec(), b"b\n".to_vec()]);
+        assert_eq!(digest, b"DIGEST");
+    }
+
+    #[test]
+    fn parse_record_rejects_version_mismatch() {
+        let raw = build_record(b"got-this", b"DD", &[b"x\n"]);
+        let err = parse_record(b"wanted-that", &raw).unwrap_err();
+        assert_eq!(
+            err,
+            KnitError::UnexpectedVersion {
+                wanted: b"wanted-that".to_vec(),
+                got: b"got-this".to_vec(),
             }
         );
     }

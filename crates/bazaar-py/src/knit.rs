@@ -506,6 +506,26 @@ fn parse_record_unchecked_rs<'py>(
     Ok((header, list))
 }
 
+/// Parse a knit record and verify that its embedded version matches
+/// `expected_version`, returning `(body_lines, digest)`. Mirrors
+/// `_KnitData._parse_record`: combines gzip decode, header parse,
+/// validation, and version check into a single FFI call so the hot
+/// read path only crosses the boundary once per record.
+#[pyfunction]
+fn parse_record_rs<'py>(
+    py: Python<'py>,
+    expected_version: &[u8],
+    data: &[u8],
+) -> PyResult<(Bound<'py, pyo3::types::PyList>, Bound<'py, PyBytes>)> {
+    let (body, digest) = bazaar::knit::parse_record(expected_version, data)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let list = pyo3::types::PyList::empty(py);
+    for line in &body {
+        list.append(PyBytes::new(py, line))?;
+    }
+    Ok((list, PyBytes::new(py, &digest)))
+}
+
 /// Serialize a knit network record. Inverse of
 /// `parse_network_record_header_rs`. Mirrors
 /// `KnitContentFactory._create_network_bytes`.
@@ -1538,6 +1558,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(get_line_delta_blocks_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_network_record_header_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_record_unchecked_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(parse_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(record_to_data_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_record_header_only_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(

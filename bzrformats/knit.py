@@ -2202,9 +2202,10 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
 
         These have the last element of the key only present in the stored data.
         """
-        rec, record_contents = self._parse_record_unchecked(data)
-        self._check_header_version(rec, version_id)
-        return record_contents, rec[3]
+        try:
+            return _knit_rs.parse_record_rs(version_id, data)
+        except ValueError as e:
+            raise KnitCorrupt(self, str(e)) from e
 
     def _parse_record_header(self, key, raw_data):
         """Parse and validate a record's header.
