@@ -183,8 +183,11 @@ mod tests {
                 s.rsplit('-').next().unwrap().parse().unwrap()
             })
             .collect();
+        // Serial is a process-global counter shared with gen_file_id, so
+        // other tests running in parallel may interleave increments. Only
+        // require that serials from this call are strictly increasing.
         for i in 1..ns.len() {
-            assert_eq!(ns[i] - 1, ns[i - 1]);
+            assert!(ns[i] > ns[i - 1]);
         }
     }
 
