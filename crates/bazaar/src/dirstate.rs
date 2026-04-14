@@ -1475,6 +1475,71 @@ impl DirState {
         Ok(block_index)
     }
 
+    /// Discard any parent trees beyond the first. Mirrors Python's
+    /// `DirState._discard_merge_parents`.
+    ///
+    /// After this function returns the dirstate contains either 1 or
+    /// 2 trees per row: current + first parent, or just current if
+    /// the first parent was a ghost (Python keeps the parent slot but
+    /// replaces its tree data with a `NULL_PARENT_DETAILS` placeholder
+    /// so every row still has two tree slots). Entries whose tree-0
+    /// and tree-1 minikinds both fall into the "dead pattern" set
+    /// `{(a,r), (a,a), (r,r), (r,a)}` — i.e. absent or relocated in
+    /// both the current tree and the first parent — are removed from
+    /// their dirblock entirely.
+    ///
+    /// The header is marked modified so the change survives a save.
+    /// This invalidates the cached `id_index`; callers must not hold
+    /// a reference to the old one across this call.
+    pub fn discard_merge_parents(&mut self) {
+        if self.parents.is_empty() {
+            return;
+        }
+
+        let first_parent_is_ghost = self.ghosts.contains(&self.parents[0]);
+
+        let dead_patterns: &[(u8, u8)] = &[(b'a', b'r'), (b'a', b'a'), (b'r', b'r'), (b'r', b'a')];
+
+        for block in self.dirblocks.iter_mut() {
+            let mut surviving: Vec<Entry> = Vec::with_capacity(block.entries.len());
+            for entry in block.entries.drain(..) {
+                let tree0_kind = entry.trees.first().map(|t| t.minikind).unwrap_or(0);
+                let tree1_kind = entry.trees.get(1).map(|t| t.minikind).unwrap_or(0);
+                let is_dead = dead_patterns
+                    .iter()
+                    .any(|(a, b)| *a == tree0_kind && *b == tree1_kind);
+                if is_dead {
+                    continue;
+                }
+                let mut new_entry = entry;
+                if first_parent_is_ghost {
+                    // Replace trees beyond index 0 with a single
+                    // NULL_PARENT_DETAILS row so every entry still
+                    // has exactly two tree slots after the discard.
+                    new_entry.trees.truncate(1);
+                    new_entry.trees.push(TreeData {
+                        minikind: b'a',
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: Vec::new(),
+                    });
+                } else {
+                    // Keep only trees 0 and 1.
+                    new_entry.trees.truncate(2);
+                }
+                surviving.push(new_entry);
+            }
+            block.entries = surviving;
+        }
+
+        self.ghosts.clear();
+        let first_parent = self.parents[0].clone();
+        self.parents = vec![first_parent];
+        self.id_index = None;
+        self.mark_modified(&[], true);
+    }
+
     /// Look up the dirstate entry for `file_id` in `tree_index`,
     /// following any relocation chain the entries describe. Mirrors
     /// the `fileid_utf8` branch of Python's `DirState._get_entry`.
@@ -3229,6 +3294,377 @@ mod dirstate_struct_tests {
             }
             other => panic!("expected Entry, got {:?}", other),
         }
+    }
+
+    /// Python-style `present_dir` tuple: `(b"d", b"", 0, False, NULLSTAT)`.
+    fn dmp_present_dir() -> TreeData {
+        TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: PACKED_STAT.to_vec(),
+        }
+    }
+
+    /// Python-style `present_file` tuple: `(b"f", b"", 0, False, NULLSTAT)`.
+    fn dmp_present_file() -> TreeData {
+        TreeData {
+            minikind: b'f',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: PACKED_STAT.to_vec(),
+        }
+    }
+
+    /// Python-style `NULL_PARENT_DETAILS`: `(b"a", b"", 0, False, b"")`.
+    fn dmp_absent() -> TreeData {
+        TreeData {
+            minikind: b'a',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: Vec::new(),
+        }
+    }
+
+    /// Python-style relocation target tree data:
+    /// `(b"r", real_path, 0, False, b"")`.
+    fn dmp_relocated(real_path: &[u8]) -> TreeData {
+        TreeData {
+            minikind: b'r',
+            fingerprint: real_path.to_vec(),
+            size: 0,
+            executable: false,
+            packed_stat: Vec::new(),
+        }
+    }
+
+    fn mk_entry(dirname: &[u8], basename: &[u8], file_id: &[u8], trees: Vec<TreeData>) -> Entry {
+        Entry {
+            key: EntryKey {
+                dirname: dirname.to_vec(),
+                basename: basename.to_vec(),
+                file_id: file_id.to_vec(),
+            },
+            trees,
+        }
+    }
+
+    /// Rust counterpart of Python
+    /// `TestDiscardMergeParents.test_discard_no_parents`: no-op on an
+    /// empty dirstate.
+    #[test]
+    fn discard_merge_parents_no_parents_is_noop() {
+        let mut state = fresh_state();
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        state.discard_merge_parents();
+        assert!(state.parents.is_empty());
+        assert!(state.ghosts.is_empty());
+        assert_eq!(state.dirblocks.len(), 2);
+    }
+
+    /// Rust counterpart of Python
+    /// `TestDiscardMergeParents.test_discard_one_parent`: with exactly
+    /// one parent there is nothing beyond tree 1 to discard, but the
+    /// method still runs and leaves dirblocks unchanged.
+    #[test]
+    fn discard_merge_parents_one_parent_is_noop_on_dirblocks() {
+        let mut state = fresh_state();
+        state.parents = vec![b"parent-id".to_vec()];
+        let original_dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![mk_entry(
+                    b"",
+                    b"",
+                    b"a-root-value",
+                    vec![dmp_present_dir(), dmp_present_dir()],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        state.dirblocks = original_dirblocks.clone();
+        state.discard_merge_parents();
+        assert_eq!(state.parents, vec![b"parent-id".to_vec()]);
+        assert_eq!(state.dirblocks, original_dirblocks);
+    }
+
+    /// Rust counterpart of Python
+    /// `TestDiscardMergeParents.test_discard_simple`: three trees per
+    /// row collapse to two, dropping the merged parent column.
+    #[test]
+    fn discard_merge_parents_strips_merge_column() {
+        let mut state = fresh_state();
+        state.parents = vec![b"parent-id".to_vec(), b"merged-id".to_vec()];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![mk_entry(
+                    b"",
+                    b"",
+                    b"a-root-value",
+                    vec![dmp_present_dir(), dmp_present_dir(), dmp_present_dir()],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        state.discard_merge_parents();
+        assert_eq!(state.parents, vec![b"parent-id".to_vec()]);
+        assert_eq!(state.dirblocks[0].entries.len(), 1);
+        assert_eq!(state.dirblocks[0].entries[0].trees.len(), 2);
+        assert_eq!(state.dirblocks[1].entries.len(), 0);
+    }
+
+    /// Rust counterpart of Python
+    /// `TestDiscardMergeParents.test_discard_absent`: a row that only
+    /// exists in the merge parent (absent in tree 0 and 1) is removed
+    /// entirely.
+    #[test]
+    fn discard_merge_parents_removes_absent_only_rows() {
+        let mut state = fresh_state();
+        state.parents = vec![b"parent-id".to_vec(), b"merged-id".to_vec()];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![mk_entry(
+                    b"",
+                    b"",
+                    b"a-root-value",
+                    vec![dmp_present_dir(), dmp_present_dir(), dmp_present_dir()],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![
+                    mk_entry(
+                        b"",
+                        b"file-in-merged",
+                        b"b-file-id",
+                        vec![dmp_absent(), dmp_absent(), dmp_present_file()],
+                    ),
+                    mk_entry(
+                        b"",
+                        b"file-in-root",
+                        b"a-file-id",
+                        vec![dmp_present_file(), dmp_present_file(), dmp_present_file()],
+                    ),
+                ],
+            },
+        ];
+        state.discard_merge_parents();
+        // file-in-merged was only in the merge tree — dropped.
+        assert_eq!(state.dirblocks[1].entries.len(), 1);
+        assert_eq!(
+            state.dirblocks[1].entries[0].key.basename,
+            b"file-in-root".to_vec()
+        );
+        assert_eq!(state.dirblocks[1].entries[0].trees.len(), 2);
+    }
+
+    /// Rust counterpart of Python
+    /// `TestDiscardMergeParents.test_discard_renamed`: rows whose
+    /// tree 0 / tree 1 kinds are `(a, r)`, `(r, a)`, or `(r, r)` are
+    /// removed; rows that still have a live kind in one of the first
+    /// two trees survive with their columns truncated.
+    #[test]
+    fn discard_merge_parents_removes_dead_relocation_rows() {
+        let mut state = fresh_state();
+        state.parents = vec![b"parent-id".to_vec(), b"merged-id".to_vec()];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![mk_entry(
+                    b"",
+                    b"",
+                    b"a-root-value",
+                    vec![dmp_present_dir(), dmp_present_dir(), dmp_present_dir()],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![
+                    // (absent, present, r) — tree0/tree1 = (a, f). Lives on.
+                    mk_entry(
+                        b"",
+                        b"file-in-1",
+                        b"c-file-id",
+                        vec![
+                            dmp_absent(),
+                            dmp_present_file(),
+                            dmp_relocated(b"file-in-2"),
+                        ],
+                    ),
+                    // (absent, r, present) — tree0/tree1 = (a, r). Dead.
+                    mk_entry(
+                        b"",
+                        b"file-in-2",
+                        b"c-file-id",
+                        vec![
+                            dmp_absent(),
+                            dmp_relocated(b"file-in-1"),
+                            dmp_present_file(),
+                        ],
+                    ),
+                    // normal file — tree0/tree1 = (f, f). Lives on.
+                    mk_entry(
+                        b"",
+                        b"file-in-root",
+                        b"a-file-id",
+                        vec![dmp_present_file(), dmp_present_file(), dmp_present_file()],
+                    ),
+                    // (r, absent, present) — tree0/tree1 = (r, a). Dead.
+                    mk_entry(
+                        b"",
+                        b"file-s",
+                        b"b-file-id",
+                        vec![dmp_relocated(b"file-t"), dmp_absent(), dmp_present_file()],
+                    ),
+                    // (present, absent, r) — tree0/tree1 = (f, a). Lives on.
+                    mk_entry(
+                        b"",
+                        b"file-t",
+                        b"b-file-id",
+                        vec![dmp_present_file(), dmp_absent(), dmp_relocated(b"file-s")],
+                    ),
+                ],
+            },
+        ];
+        state.discard_merge_parents();
+
+        let surviving: Vec<&[u8]> = state.dirblocks[1]
+            .entries
+            .iter()
+            .map(|e| e.key.basename.as_slice())
+            .collect();
+        assert_eq!(
+            surviving,
+            vec![&b"file-in-1"[..], b"file-in-root", b"file-t"]
+        );
+        for entry in &state.dirblocks[1].entries {
+            assert_eq!(entry.trees.len(), 2, "{:?}", entry.key.basename);
+        }
+    }
+
+    /// Rust counterpart of Python
+    /// `TestDiscardMergeParents.test_discard_all_subdir`: a whole
+    /// block of merge-only children is emptied (but the block itself
+    /// remains).
+    #[test]
+    fn discard_merge_parents_empties_block_of_merge_only_children() {
+        let mut state = fresh_state();
+        state.parents = vec![b"parent-id".to_vec(), b"merged-id".to_vec()];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![mk_entry(
+                    b"",
+                    b"",
+                    b"a-root-value",
+                    vec![dmp_present_dir(), dmp_present_dir(), dmp_present_dir()],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![mk_entry(
+                    b"",
+                    b"sub",
+                    b"dir-id",
+                    vec![dmp_present_dir(), dmp_present_dir(), dmp_present_dir()],
+                )],
+            },
+            Dirblock {
+                dirname: b"sub".to_vec(),
+                entries: vec![
+                    mk_entry(
+                        b"sub",
+                        b"child1",
+                        b"child1-id",
+                        vec![dmp_absent(), dmp_absent(), dmp_present_file()],
+                    ),
+                    mk_entry(
+                        b"sub",
+                        b"child2",
+                        b"child2-id",
+                        vec![dmp_absent(), dmp_absent(), dmp_present_file()],
+                    ),
+                    mk_entry(
+                        b"sub",
+                        b"child3",
+                        b"child3-id",
+                        vec![dmp_absent(), dmp_absent(), dmp_present_file()],
+                    ),
+                ],
+            },
+        ];
+        state.discard_merge_parents();
+        assert_eq!(state.dirblocks.len(), 3);
+        assert_eq!(state.dirblocks[0].entries.len(), 1);
+        assert_eq!(state.dirblocks[1].entries.len(), 1);
+        assert_eq!(state.dirblocks[2].dirname, b"sub".to_vec());
+        assert!(
+            state.dirblocks[2].entries.is_empty(),
+            "all children were merge-only and should have been removed"
+        );
+        // Each surviving entry has exactly two trees.
+        for block in &state.dirblocks {
+            for entry in &block.entries {
+                assert_eq!(entry.trees.len(), 2);
+            }
+        }
+    }
+
+    /// Ghost parent path: the first parent is in the ghosts list, so
+    /// every surviving row gets `NULL_PARENT_DETAILS` in slot 1
+    /// rather than slot 1's real data. Python documents this
+    /// behaviour via the `entry[1][1:] = empty_parent` branch.
+    #[test]
+    fn discard_merge_parents_ghost_first_parent_replaces_with_null_parent() {
+        let mut state = fresh_state();
+        state.parents = vec![b"parent-id".to_vec(), b"merged-id".to_vec()];
+        state.ghosts = vec![b"parent-id".to_vec()];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![mk_entry(
+                    b"",
+                    b"",
+                    b"a-root-value",
+                    vec![dmp_present_dir(), dmp_present_dir(), dmp_present_dir()],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        state.discard_merge_parents();
+        // First parent is kept but the tree-1 slot is replaced with
+        // a NULL_PARENT_DETAILS (minikind b'a').
+        assert_eq!(state.parents, vec![b"parent-id".to_vec()]);
+        assert!(state.ghosts.is_empty());
+        let root = &state.dirblocks[0].entries[0];
+        assert_eq!(root.trees.len(), 2);
+        assert_eq!(root.trees[0].minikind, b'd');
+        assert_eq!(root.trees[1].minikind, b'a');
+        assert!(root.trees[1].fingerprint.is_empty());
+        assert!(root.trees[1].packed_stat.is_empty());
     }
 
     #[test]
