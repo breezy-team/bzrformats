@@ -1143,6 +1143,11 @@ pub struct DirState {
     /// Bisect chunk size when reading the state file in pages; mirrors
     /// `_bisect_page_size`.
     pub bisect_page_size: usize,
+    /// Lazily-populated index of `file_id → [(dirname, basename, file_id)]`.
+    /// `None` until [`DirState::get_or_build_id_index`] is called, at
+    /// which point it is rebuilt from the current `dirblocks`.
+    /// Invalidate by setting to `None` whenever dirblocks change.
+    pub id_index: Option<IdIndex>,
 }
 
 impl DirState {
@@ -1177,7 +1182,46 @@ impl DirState {
             fdatasync,
             use_filesystem_for_exec,
             bisect_page_size: BISECT_PAGE_SIZE,
+            id_index: None,
         }
+    }
+
+    /// Yield a reference to every entry across every dirblock, in
+    /// dirblock order. Mirrors Python's `_iter_entries` in the simple
+    /// case (without the implicit `_read_dirblocks_if_needed` —
+    /// callers are expected to have populated `dirblocks` already).
+    pub fn iter_entries(&self) -> impl Iterator<Item = &Entry> {
+        self.dirblocks.iter().flat_map(|b| b.entries.iter())
+    }
+
+    /// Build an [`IdIndex`] from the current dirblocks. Pure — no
+    /// cache interaction; callers that want Python's cached behaviour
+    /// should use [`DirState::get_or_build_id_index`] instead.
+    pub fn build_id_index(&self) -> IdIndex {
+        let mut idx = IdIndex::new();
+        for entry in self.iter_entries() {
+            let file_id = FileId::from(&entry.key.file_id);
+            idx.add((
+                entry.key.dirname.as_slice(),
+                entry.key.basename.as_slice(),
+                &file_id,
+            ));
+        }
+        idx
+    }
+
+    /// Return a reference to the cached [`IdIndex`], rebuilding it
+    /// from `self.dirblocks` on first call after the cache was last
+    /// invalidated. Mirrors Python's `DirState._get_id_index`.
+    ///
+    /// The cache lives in `self.id_index`; any code that mutates
+    /// `self.dirblocks` must set `self.id_index = None` afterwards to
+    /// force a rebuild on the next access.
+    pub fn get_or_build_id_index(&mut self) -> &IdIndex {
+        if self.id_index.is_none() {
+            self.id_index = Some(self.build_id_index());
+        }
+        self.id_index.as_ref().unwrap()
     }
 
     /// Parse the header of the dirstate file from `data` and populate the
@@ -1843,6 +1887,7 @@ mod dirstate_struct_tests {
         assert!(!state.fdatasync);
         assert!(state.use_filesystem_for_exec);
         assert_eq!(state.bisect_page_size, BISECT_PAGE_SIZE);
+        assert!(state.id_index.is_none());
     }
 
     #[test]
@@ -2906,6 +2951,96 @@ mod dirstate_struct_tests {
                 path
             );
         }
+    }
+
+    #[test]
+    fn iter_entries_yields_every_entry_across_blocks() {
+        let state = create_complex_dirstate();
+        let entries: Vec<&[u8]> = state
+            .iter_entries()
+            .map(|e| e.key.file_id.as_slice())
+            .collect();
+        // Expected order: root, then root contents (a, b, c, d), then
+        // the a/ block (e, f), then the b/ block (g, h\xc3\xa5).
+        let expected: Vec<&[u8]> = vec![
+            b"a-root-value",
+            b"a-dir",
+            b"b-dir",
+            b"c-file",
+            b"d-file",
+            b"e-dir",
+            b"f-file",
+            b"g-file",
+            b"h-\xc3\xa5-file",
+        ];
+        assert_eq!(entries, expected);
+    }
+
+    #[test]
+    fn build_id_index_maps_every_file_id_to_its_key() {
+        let state = create_complex_dirstate();
+        let idx = state.build_id_index();
+        // Every file_id in the complex dirstate should round-trip
+        // through the index to the same (dirname, basename) triple.
+        let expected: &[(&[u8], &[u8], &[u8])] = &[
+            (b"a-root-value", b"", b""),
+            (b"a-dir", b"", b"a"),
+            (b"b-dir", b"", b"b"),
+            (b"c-file", b"", b"c"),
+            (b"d-file", b"", b"d"),
+            (b"e-dir", b"a", b"e"),
+            (b"f-file", b"a", b"f"),
+            (b"g-file", b"b", b"g"),
+            (b"h-\xc3\xa5-file", b"b", b"h\xc3\xa5"),
+        ];
+        for (file_id, dirname, basename) in expected {
+            let got = idx.get(&FileId::from(&file_id.to_vec()));
+            assert_eq!(got.len(), 1, "expected one entry for {:?}", file_id);
+            assert_eq!(got[0].0, dirname.to_vec());
+            assert_eq!(got[0].1, basename.to_vec());
+            assert_eq!(got[0].2.as_bytes(), *file_id);
+        }
+    }
+
+    #[test]
+    fn build_id_index_collapses_duplicate_file_ids_across_trees() {
+        // The two-tree fixture has two rows with the same file_id in
+        // different trees (c-file appears as the c/ entry in tree 0
+        // and the b/j relocation in tree 1). Both rows share the same
+        // file_id and should appear under the same id_index bucket.
+        let state = create_dirstate_with_two_trees();
+        let idx = state.build_id_index();
+        let c_file_entries = idx.get(&FileId::from(&b"c-file".to_vec()));
+        // Two rows share the file_id across the dirstate (c and b/j).
+        assert_eq!(c_file_entries.len(), 2);
+        let basenames: Vec<&[u8]> = c_file_entries
+            .iter()
+            .map(|(_, b, _)| b.as_slice())
+            .collect();
+        assert!(basenames.contains(&&b"c"[..]));
+        assert!(basenames.contains(&&b"j"[..]));
+    }
+
+    #[test]
+    fn get_or_build_id_index_caches_result() {
+        let mut state = create_complex_dirstate();
+        assert!(state.id_index.is_none());
+        state.get_or_build_id_index();
+        assert!(state.id_index.is_some());
+        // Second call does not rebuild — we can't observe that
+        // directly, but we can verify the cache survives by mutating
+        // `dirblocks` and re-calling: the cached index should still
+        // point to the pre-mutation data. (Invalidation is the
+        // caller's responsibility, as Python documents.)
+        state.dirblocks.clear();
+        let idx_after = state.get_or_build_id_index();
+        assert!(
+            idx_after
+                .get(&FileId::from(&b"a-root-value".to_vec()))
+                .iter()
+                .any(|(_, _, f)| f.as_bytes() == b"a-root-value"),
+            "cache should survive dirblock mutation"
+        );
     }
 
     /// Rust counterpart of Python
