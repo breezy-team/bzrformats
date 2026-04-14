@@ -1303,7 +1303,88 @@ impl DirState {
         self.dirblock_state = MemoryState::InMemoryUnmodified;
         self.known_hash_changes.clear();
     }
+
+    /// Ensure a block for `dirname` exists in `self.dirblocks`, creating
+    /// it if necessary. Mirrors Python's `DirState._ensure_block`.
+    ///
+    /// `parent_block_index` and `parent_row_index` identify the entry
+    /// whose directory is being ensured. The root row is special-cased:
+    /// `(parent_block_index=0, parent_row_index=0, dirname=b"")`
+    /// shortcuts to block index 1 — the sentinel contents-of-root
+    /// block produced by `split_root_dirblock_into_contents`.
+    ///
+    /// On success returns the index of the block for `dirname`. On
+    /// failure — the dirname does not end with the basename stored at
+    /// the given parent coordinates — returns
+    /// [`EnsureBlockError::BadDirname`] to match Python's
+    /// `AssertionError("bad dirname ...")`.
+    pub fn ensure_block(
+        &mut self,
+        parent_block_index: isize,
+        parent_row_index: isize,
+        dirname: &[u8],
+    ) -> Result<usize, EnsureBlockError> {
+        // Root shortcut: block 0 row 0 with an empty dirname is always
+        // followed by the empty sentinel at block 1.
+        if dirname.is_empty() && parent_row_index == 0 && parent_block_index == 0 {
+            return Ok(1);
+        }
+        // Python's assertion: dirname must end with the parent entry's
+        // basename. The Python source guards the lookup with a
+        // `(parent_block_index == -1 and parent_block_index == -1 and
+        //   dirname == b"")` short-circuit — the second `parent_block_index`
+        // is almost certainly meant to be `parent_row_index`, but we
+        // preserve the (tautological) behaviour so this port is strictly
+        // observation-preserving.
+        let sentinel_shortcut =
+            parent_block_index == -1 && parent_block_index == -1 && dirname.is_empty();
+        if !sentinel_shortcut {
+            let parent_basename = self
+                .dirblocks
+                .get(parent_block_index as usize)
+                .and_then(|b| b.entries.get(parent_row_index as usize))
+                .map(|e| e.key.basename.as_slice())
+                .ok_or_else(|| EnsureBlockError::BadDirname(dirname.to_vec()))?;
+            if !dirname.ends_with(parent_basename) {
+                return Err(EnsureBlockError::BadDirname(dirname.to_vec()));
+            }
+        }
+        let lookup_key = EntryKey {
+            dirname: dirname.to_vec(),
+            basename: Vec::new(),
+            file_id: Vec::new(),
+        };
+        let (block_index, present) = find_block_index_from_key(&self.dirblocks, &lookup_key);
+        if !present {
+            self.dirblocks.insert(
+                block_index,
+                Dirblock {
+                    dirname: dirname.to_vec(),
+                    entries: Vec::new(),
+                },
+            );
+        }
+        Ok(block_index)
+    }
 }
+
+/// Error returned by [`DirState::ensure_block`] when the requested
+/// dirname does not end with the parent entry's basename. Mirrors the
+/// `AssertionError("bad dirname ...")` Python raises.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnsureBlockError {
+    BadDirname(Vec<u8>),
+}
+
+impl std::fmt::Display for EnsureBlockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnsureBlockError::BadDirname(dirname) => write!(f, "bad dirname {:?}", dirname),
+        }
+    }
+}
+
+impl std::error::Error for EnsureBlockError {}
 
 /// Error returned by [`split_root_dirblock_into_contents`] when the
 /// pre-split dirblock layout is malformed.
@@ -2536,6 +2617,83 @@ mod dirstate_struct_tests {
         state.mark_modified(&[], true);
         assert_eq!(state.header_state, MemoryState::InMemoryModified);
         assert_eq!(state.dirblock_state, MemoryState::InMemoryModified);
+    }
+
+    #[test]
+    fn ensure_block_root_shortcut_returns_one() {
+        let mut state = fresh_state();
+        state.dirblocks = make_dirblocks(vec![]);
+        // Root row coordinates: block 0, row 0, dirname=b"".
+        assert_eq!(state.ensure_block(0, 0, b""), Ok(1));
+        // No new block was created — we still have just the two
+        // sentinel blocks.
+        assert_eq!(state.dirblocks.len(), 2);
+    }
+
+    #[test]
+    fn ensure_block_creates_missing_block() {
+        let mut state = fresh_state();
+        // Root entry lives in the first sentinel block's row 0.
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(b"", b"sub", b"fid-sub", vec![tree(b'd')])],
+            },
+        ];
+        // Parent entry at block 1, row 0 has basename "sub"; "sub"
+        // ends with "sub", so the assertion passes.
+        let idx = state.ensure_block(1, 0, b"sub").expect("ensure");
+        // A new block for dirname=b"sub" should have been inserted.
+        assert_eq!(idx, 2);
+        assert_eq!(state.dirblocks.len(), 3);
+        assert_eq!(state.dirblocks[2].dirname, b"sub".to_vec());
+        assert!(state.dirblocks[2].entries.is_empty());
+    }
+
+    #[test]
+    fn ensure_block_idempotent_for_existing_block() {
+        let mut state = fresh_state();
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(b"", b"sub", b"fid-sub", vec![tree(b'd')])],
+            },
+            Dirblock {
+                dirname: b"sub".to_vec(),
+                entries: vec![],
+            },
+        ];
+        let idx = state.ensure_block(1, 0, b"sub").expect("ensure");
+        assert_eq!(idx, 2);
+        assert_eq!(state.dirblocks.len(), 3);
+    }
+
+    #[test]
+    fn ensure_block_rejects_bad_dirname() {
+        let mut state = fresh_state();
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(b"", b"sub", b"fid-sub", vec![tree(b'd')])],
+            },
+        ];
+        // dirname "other" does not end with parent basename "sub".
+        let err = state.ensure_block(1, 0, b"other").expect_err("bad dirname");
+        assert_eq!(err, EnsureBlockError::BadDirname(b"other".to_vec()));
+        // No block was inserted.
+        assert_eq!(state.dirblocks.len(), 2);
     }
 
     #[test]
