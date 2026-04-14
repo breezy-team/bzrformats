@@ -89,6 +89,36 @@
 //!
 //! All of the above share a single [`KnitError`] enum; functions return
 //! `Result<_, KnitError>` so callers only need one error match-arm set.
+//!
+//! # Pure-Rust read pipeline
+//!
+//! Reading a knit fulltext record without going through the pyo3 layer
+//! looks like this:
+//!
+//! ```ignore
+//! use bazaar::knit::{
+//!     decode_record_gz, parse_record_body_unchecked, KnitAnnotateFactory,
+//!     KnitFactory, KnitMethod, KnitContent,
+//! };
+//!
+//! let raw: Vec<u8> = read_record_from_disk();
+//! let body = decode_record_gz(&raw)?;
+//! let (header, body_lines) = parse_record_body_unchecked(&body)?;
+//! let factory = KnitAnnotateFactory;
+//! let content = factory.parse_record(
+//!     header.version_id,
+//!     &body_lines,
+//!     KnitMethod::Fulltext,
+//!     /* noeol */ false,
+//!     /* base_content */ None,
+//! )?;
+//! let lines: Vec<Vec<u8>> = content.text();
+//! ```
+//!
+//! For a delta record, fetch the parent record first, run it through
+//! the same pipeline as a fulltext, and pass the resulting content as
+//! `base_content`. The `pure_rust_delta_chain_apply_pipeline` test in
+//! this module is a worked example.
 
 /// Unified error type for every fallible operation in this module.
 ///
@@ -1726,6 +1756,100 @@ mod tests {
 
     fn refs<'a>(v: &'a [Vec<u8>]) -> Vec<&'a [u8]> {
         v.iter().map(|l| l.as_slice()).collect()
+    }
+
+    #[test]
+    fn pure_rust_full_record_read_pipeline() {
+        // Demonstration that a downstream pure-Rust caller can take raw
+        // gzip-compressed knit record bytes and end up with a typed
+        // KnitContent, using only the public API of this module. No
+        // Python types involved.
+        let pairs = vec![
+            (b"r1".to_vec(), b"hello\n".to_vec()),
+            (b"r1".to_vec(), b"world\n".to_vec()),
+        ];
+        let body = lower_fulltext(&pairs);
+        let (_, chunks) = record_to_data(b"v", b"DD", body.len(), &body, true).unwrap();
+        let raw: Vec<u8> = chunks.into_iter().flatten().collect();
+
+        // The pipeline a downstream consumer would write:
+        let decompressed = decode_record_gz(&raw).unwrap();
+        let (header, body_lines) = parse_record_body_unchecked(&decompressed).unwrap();
+        let factory = KnitAnnotateFactory;
+        let content = factory
+            .parse_record(
+                header.version_id,
+                &body_lines,
+                KnitMethod::Fulltext,
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(content.lines, pairs);
+        assert_eq!(
+            content.text(),
+            vec![b"hello\n".to_vec(), b"world\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn pure_rust_delta_chain_apply_pipeline() {
+        // A more complete end-to-end: build a fulltext record + a delta
+        // record on top of it, then walk the compression chain (one
+        // step) and apply the delta to reconstruct the target text.
+        let parent_pairs = vec![
+            (b"r1".to_vec(), b"a\n".to_vec()),
+            (b"r1".to_vec(), b"b\n".to_vec()),
+        ];
+        let parent_body = lower_fulltext(&parent_pairs);
+        let (_, p_chunks) =
+            record_to_data(b"r1", b"D1", parent_body.len(), &parent_body, true).unwrap();
+        let parent_raw: Vec<u8> = p_chunks.into_iter().flatten().collect();
+
+        // Delta record: replace line 1 (the second line) with "B\n".
+        let delta = vec![DeltaHunk {
+            start: 1,
+            end: 2,
+            count: 1,
+            lines: vec![(b"r2".to_vec(), b"B\n".to_vec())],
+        }];
+        let delta_body = lower_line_delta_annotated(&delta);
+        let (_, d_chunks) =
+            record_to_data(b"r2", b"D2", delta_body.len(), &delta_body, true).unwrap();
+        let delta_raw: Vec<u8> = d_chunks.into_iter().flatten().collect();
+
+        // Pure-Rust read + apply pipeline:
+        let factory = KnitAnnotateFactory;
+
+        let parent_decomp = decode_record_gz(&parent_raw).unwrap();
+        let (parent_header, parent_lines) = parse_record_body_unchecked(&parent_decomp).unwrap();
+        let parent_content = factory
+            .parse_record(
+                parent_header.version_id,
+                &parent_lines,
+                KnitMethod::Fulltext,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let delta_decomp = decode_record_gz(&delta_raw).unwrap();
+        let (delta_header, delta_lines) = parse_record_body_unchecked(&delta_decomp).unwrap();
+        let target_content = factory
+            .parse_record(
+                delta_header.version_id,
+                &delta_lines,
+                KnitMethod::LineDelta,
+                false,
+                Some(&parent_content),
+            )
+            .unwrap();
+
+        assert_eq!(
+            target_content.text(),
+            vec![b"a\n".to_vec(), b"B\n".to_vec()]
+        );
     }
 
     #[test]
