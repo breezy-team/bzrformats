@@ -3292,24 +3292,9 @@ class _KnitGraphIndex:
                 Factory.parse_record
         """
         self._check_read()
-        result = {}
-        entries = self._get_entries(keys, False)
-        for entry in entries:
-            key = entry[1]
-            parents = () if not self._parents else entry[3][0]
-            if not self._deltas:
-                compression_parent_key = None
-            else:
-                compression_parent_key = self._compression_parent(entry)
-            noeol = entry[2][0:1] == b"N"
-            method = "line-delta" if compression_parent_key else "fulltext"
-            result[key] = (
-                self._node_to_position(entry),
-                compression_parent_key,
-                parents,
-                (method, noeol),
-            )
-        return result
+        return _knit_rs.knit_entries_to_build_details_rs(
+            self._get_entries(keys, False), self._parents, self._deltas
+        )
 
     def _get_entries(self, keys, check_present=False):
         """Get the entries for keys.

@@ -111,6 +111,13 @@ pub enum KnitError {
     /// `parse_network_record_header`: the noeol flag byte was missing
     /// (input ended before the record body).
     NetworkMissingNoEolByte,
+
+    // --- knit graph index layer ---
+    /// A knit graph index entry's `value` field was not in the expected
+    /// `[N| ]<pos> <size>` shape.
+    BadIndexValue(Vec<u8>),
+    /// A knit delta record claimed more than one compression parent.
+    TooManyCompressionParents(usize),
 }
 
 impl std::fmt::Display for KnitError {
@@ -152,6 +159,12 @@ impl std::fmt::Display for KnitError {
             }
             KnitError::NetworkMissingNoEolByte => {
                 write!(f, "knit network record missing noeol byte")
+            }
+            KnitError::BadIndexValue(v) => {
+                write!(f, "bad knit index value: {:?}", v)
+            }
+            KnitError::TooManyCompressionParents(n) => {
+                write!(f, "Too many compression parents: {}", n)
             }
         }
     }
@@ -969,6 +982,124 @@ where
     Ok((total, compressed))
 }
 
+/// Whether a knit record is a fulltext or a line-delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KnitMethod {
+    Fulltext,
+    LineDelta,
+}
+
+impl KnitMethod {
+    /// The historical Python-facing name of this method, used in the
+    /// `record_details` tuple returned by `_KnitGraphIndex.get_build_details`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KnitMethod::Fulltext => "fulltext",
+            KnitMethod::LineDelta => "line-delta",
+        }
+    }
+}
+
+/// Parsed contents of a knit graph index `value` field.
+///
+/// `value` has the shape `<flag><pos> <size>` where `<flag>` is one byte
+/// — `b'N'` for "no end-of-line" or `b' '` for the regular case — and
+/// `pos` / `size` are ASCII decimal integers separated by a space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnitIndexValue {
+    pub noeol: bool,
+    pub pos: u64,
+    pub size: u64,
+}
+
+/// Parse a `_KnitGraphIndex` entry's `value` field.
+///
+/// Mirrors the byte-splitting logic of the Python `_node_to_position`
+/// helper: skip the leading flag byte, split the rest on the first
+/// space, and parse `pos` / `size` as ASCII decimal.
+pub fn parse_knit_index_value(value: &[u8]) -> Result<KnitIndexValue, KnitError> {
+    if value.is_empty() {
+        return Err(KnitError::BadIndexValue(value.to_vec()));
+    }
+    let noeol = value[0] == b'N';
+    let trimmed = &value[1..];
+    let mut parts = trimmed.splitn(2, |&b| b == b' ');
+    let pos_bytes = parts
+        .next()
+        .ok_or_else(|| KnitError::BadIndexValue(value.to_vec()))?;
+    let size_bytes = parts
+        .next()
+        .ok_or_else(|| KnitError::BadIndexValue(value.to_vec()))?;
+    let pos: u64 = std::str::from_utf8(pos_bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| KnitError::BadIndexValue(value.to_vec()))?;
+    let size: u64 = std::str::from_utf8(size_bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| KnitError::BadIndexValue(value.to_vec()))?;
+    Ok(KnitIndexValue { noeol, pos, size })
+}
+
+/// Result of decoding the non-opaque parts of a `_KnitGraphIndex` entry.
+///
+/// The `index_memo`'s GraphIndex pointer (the first element of `entry`)
+/// is opaque to this crate — pyo3 callers stitch it back together with
+/// `pos` / `size` to form the final memo tuple. The other fields are
+/// fully derived from the entry's `value` and `refs` columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnitBuildDetails {
+    pub pos: u64,
+    pub size: u64,
+    pub noeol: bool,
+    pub method: KnitMethod,
+    /// The `compression_parent` key, if any. `None` for fulltexts and
+    /// for parentless / non-delta indices.
+    pub compression_parent: Option<usize>,
+}
+
+/// Decide the build-details for a single knit graph index entry, given
+/// just its `value` bytes and the number of compression-parent refs the
+/// index recorded for it.
+///
+/// `compression_parent_count` is the length of `entry[3][1]` on the
+/// Python side: zero means no compression parent (a fulltext), one
+/// means a delta against that parent, anything else is corrupt.
+///
+/// The returned `compression_parent` is `Some(0)` to signal "yes, there
+/// is exactly one compression parent — go fetch its key from the entry's
+/// refs at index 0", or `None` for fulltexts. The pyo3 caller does the
+/// final `Py<PyAny>` lookup itself; this function stays free of any
+/// Python types.
+pub fn decode_knit_build_details(
+    value: &[u8],
+    has_deltas: bool,
+    compression_parent_count: usize,
+) -> Result<KnitBuildDetails, KnitError> {
+    let parsed = parse_knit_index_value(value)?;
+    let compression_parent = if has_deltas {
+        match compression_parent_count {
+            0 => None,
+            1 => Some(0),
+            n => return Err(KnitError::TooManyCompressionParents(n)),
+        }
+    } else {
+        None
+    };
+    let method = if compression_parent.is_some() {
+        KnitMethod::LineDelta
+    } else {
+        KnitMethod::Fulltext
+    };
+    Ok(KnitBuildDetails {
+        pos: parsed.pos,
+        size: parsed.size,
+        noeol: parsed.noeol,
+        method,
+        compression_parent,
+    })
+}
+
 /// Parse an annotated-fulltext knit record into the plain text lines it
 /// represents.
 ///
@@ -1549,6 +1680,61 @@ mod tests {
         assert!(ReadLines::new(b"").next().is_none());
         assert_eq!(readlines(b"just-one"), vec![&b"just-one"[..]]);
         assert_eq!(readlines(b"\n"), vec![&b"\n"[..]]);
+    }
+
+    #[test]
+    fn parse_knit_index_value_handles_noeol_flag() {
+        let v = parse_knit_index_value(b"N123 4567").unwrap();
+        assert!(v.noeol);
+        assert_eq!(v.pos, 123);
+        assert_eq!(v.size, 4567);
+
+        let v = parse_knit_index_value(b" 5 10").unwrap();
+        assert!(!v.noeol);
+        assert_eq!(v.pos, 5);
+        assert_eq!(v.size, 10);
+    }
+
+    #[test]
+    fn parse_knit_index_value_rejects_garbage() {
+        assert_eq!(
+            parse_knit_index_value(b"").unwrap_err(),
+            KnitError::BadIndexValue(b"".to_vec())
+        );
+        assert_eq!(
+            parse_knit_index_value(b"Nfoo bar").unwrap_err(),
+            KnitError::BadIndexValue(b"Nfoo bar".to_vec())
+        );
+        assert_eq!(
+            parse_knit_index_value(b"N5").unwrap_err(),
+            KnitError::BadIndexValue(b"N5".to_vec())
+        );
+    }
+
+    #[test]
+    fn decode_knit_build_details_picks_method_from_parent_count() {
+        // No deltas: always fulltext, even if the (irrelevant) parent
+        // count is non-zero.
+        let d = decode_knit_build_details(b" 0 10", false, 5).unwrap();
+        assert_eq!(d.method, KnitMethod::Fulltext);
+        assert_eq!(d.compression_parent, None);
+
+        // Deltas + zero parents: fulltext.
+        let d = decode_knit_build_details(b" 0 10", true, 0).unwrap();
+        assert_eq!(d.method, KnitMethod::Fulltext);
+        assert_eq!(d.compression_parent, None);
+
+        // Deltas + one parent: line-delta.
+        let d = decode_knit_build_details(b"N0 10", true, 1).unwrap();
+        assert_eq!(d.method, KnitMethod::LineDelta);
+        assert!(d.noeol);
+        assert_eq!(d.compression_parent, Some(0));
+
+        // Deltas + multiple parents: error.
+        assert_eq!(
+            decode_knit_build_details(b" 0 10", true, 2).unwrap_err(),
+            KnitError::TooManyCompressionParents(2)
+        );
     }
 
     #[test]

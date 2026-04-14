@@ -668,6 +668,93 @@ fn build_knit_delta_closure_wire_rs<'py>(
     PyBytes::new(py, &out)
 }
 
+/// Build the per-key result dict that `_KnitGraphIndex.get_build_details`
+/// returns, given an iterable of GraphIndex entry tuples
+/// `(graph_index, key, value, refs)`.
+///
+/// All the actual decoding work — value-string parsing, fulltext-vs-delta
+/// dispatch, compression-parent-count validation — lives in
+/// [`bazaar::knit::decode_knit_build_details`]. This wrapper only marshals
+/// Python tuples in and out and threads through the opaque `graph_index`
+/// pointer that ends up as the first element of the `index_memo` tuple.
+#[pyfunction]
+fn knit_entries_to_build_details_rs<'py>(
+    py: Python<'py>,
+    entries: Bound<'py, PyAny>,
+    has_parents: bool,
+    has_deltas: bool,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let result = pyo3::types::PyDict::new(py);
+    let empty_parents = PyTuple::empty(py);
+
+    for entry in entries.try_iter()? {
+        let entry_tuple = entry?.cast_into::<PyTuple>()?;
+        let graph_index = entry_tuple.get_item(0)?;
+        let key = entry_tuple.get_item(1)?;
+        let value_pb = entry_tuple.get_item(2)?.cast_into::<PyBytes>()?;
+        let refs = entry_tuple.get_item(3)?;
+
+        let compression_parent_count = if has_deltas {
+            refs.get_item(1)?.len()?
+        } else {
+            0
+        };
+        let details = bazaar::knit::decode_knit_build_details(
+            value_pb.as_bytes(),
+            has_deltas,
+            compression_parent_count,
+        )
+        .map_err(knit_err_to_py)?;
+
+        let parents = if has_parents {
+            refs.get_item(0)?
+        } else {
+            empty_parents.clone().into_any()
+        };
+
+        let compression_parent_key: Bound<'py, PyAny> = match details.compression_parent {
+            Some(idx) => refs.get_item(1)?.get_item(idx)?,
+            None => py.None().into_bound(py),
+        };
+
+        let index_memo = PyTuple::new(
+            py,
+            [
+                graph_index.into_any(),
+                details.pos.into_pyobject(py)?.into_any(),
+                details.size.into_pyobject(py)?.into_any(),
+            ],
+        )?;
+        let record_details = PyTuple::new(
+            py,
+            [
+                knit_method_to_py(py, details.method),
+                details.noeol.into_pyobject(py)?.to_owned().into_any(),
+            ],
+        )?;
+
+        let value_tuple = PyTuple::new(
+            py,
+            [
+                index_memo.into_any(),
+                compression_parent_key,
+                parents,
+                record_details.into_any(),
+            ],
+        )?;
+        result.set_item(key, value_tuple)?;
+    }
+    Ok(result)
+}
+
+fn knit_method_to_py<'py>(py: Python<'py>, method: bazaar::knit::KnitMethod) -> Bound<'py, PyAny> {
+    let s = match method {
+        bazaar::knit::KnitMethod::Fulltext => pyo3::intern!(py, "fulltext"),
+        bazaar::knit::KnitMethod::LineDelta => pyo3::intern!(py, "line-delta"),
+    };
+    s.clone().into_any()
+}
+
 /// Extract an annotated-fulltext knit record to its plain text lines.
 /// Returns a list of bytes objects. Mirrors
 /// `bzrformats.knit.FTAnnotatedToFullText.get_bytes` (without the
@@ -799,6 +886,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
         &m
     )?)?;
     m.add_function(wrap_pyfunction!(extract_plain_fulltext_lines_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(knit_entries_to_build_details_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_network_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;
