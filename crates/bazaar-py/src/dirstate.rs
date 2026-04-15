@@ -615,6 +615,35 @@ impl PyDirState {
         self.inner.parents.push(revid);
     }
 
+    /// In-memory dirblocks, in the same list-of-tuples shape Python's
+    /// `DirState._dirblocks` uses. Each block is `(dirname_bytes,
+    /// [entry_tuple, ...])`; each entry is
+    /// `((dirname, basename, file_id), [tree_tuple, ...])`; each tree
+    /// tuple is `(minikind, fingerprint, size, executable,
+    /// packed_stat_or_revid)`.
+    ///
+    /// Both the getter and the setter convert the full dirblock tree
+    /// on every call. They exist as a temporary sync boundary while
+    /// dirblock ownership migrates from Python's `_dirblocks`
+    /// attribute to the pure-Rust `DirState.dirblocks` field. Once
+    /// every reader and writer on the Python side has migrated, these
+    /// conversions go away along with Python's `_dirblocks`.
+    ///
+    /// Writing through the setter clears the cached id_index, since
+    /// the previous index is no longer consistent with the new data.
+    #[getter]
+    fn dirblocks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        crate::dirstate_helpers::dirblocks_to_py(py, &self.inner.dirblocks)
+    }
+
+    #[setter]
+    fn set_dirblocks(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
+        let new_blocks = crate::dirstate_helpers::dirblocks_from_py(value)?;
+        self.inner.dirblocks = new_blocks;
+        self.inner.id_index = None;
+        Ok(())
+    }
+
     /// Replace the parent at `index`. Replaces the Python pattern
     /// `self._parents[index] = revid`. Raises `IndexError` if `index`
     /// is out of range.

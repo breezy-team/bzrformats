@@ -40,7 +40,10 @@ fn dirblocks_err_to_py(state: &Bound<PyAny>, err: DirblocksError) -> PyErr {
 /// `((dirname, basename, file_id), [(minikind, fingerprint, size, exec, packed_stat), ...])`
 /// with `minikind` being a one-byte `bytes` object — matching what the
 /// previous inline parser produced.
-fn dirblocks_to_py<'py>(py: Python<'py>, dirblocks: &[Dirblock]) -> PyResult<Bound<'py, PyList>> {
+pub(crate) fn dirblocks_to_py<'py>(
+    py: Python<'py>,
+    dirblocks: &[Dirblock],
+) -> PyResult<Bound<'py, PyList>> {
     let out = PyList::empty(py);
     for block in dirblocks {
         let dirname_py = PyBytes::new(py, &block.dirname);
@@ -230,7 +233,7 @@ impl ProcessEntryC {
 /// with `minikind` as a one-byte `bytes` object, `size` as an int, and
 /// `executable` as a bool — this is the same layout `_read_dirblocks`
 /// produces.
-fn entry_from_py(py_entry: &Bound<PyAny>) -> PyResult<Entry> {
+pub(crate) fn entry_from_py(py_entry: &Bound<PyAny>) -> PyResult<Entry> {
     let tuple = py_entry.cast::<PyTuple>()?;
     let key_tuple = tuple.get_item(0)?.cast_into::<PyTuple>()?;
     let key = EntryKey {
@@ -253,6 +256,33 @@ fn entry_from_py(py_entry: &Bound<PyAny>) -> PyResult<Entry> {
         });
     }
     Ok(Entry { key, trees })
+}
+
+/// Convert a Python dirblocks list into the pure-Rust
+/// `Vec<Dirblock>` layout. Input shape matches Python's `_dirblocks`:
+/// `[(dirname_bytes, [entry_tuple, ...]), ...]` where each
+/// `entry_tuple` is `((dirname, basename, file_id), [tree_tuple, ...])`
+/// and each `tree_tuple` is
+/// `(minikind, fingerprint, size, executable, packed_stat_or_revid)`.
+///
+/// Used as the sync boundary between Python's `_dirblocks` attribute
+/// and the pure-Rust `DirState.dirblocks` field while dirblock
+/// ownership is being migrated method-by-method.
+pub(crate) fn dirblocks_from_py(dirblocks: &Bound<PyAny>) -> PyResult<Vec<Dirblock>> {
+    let mut out = Vec::new();
+    for block in dirblocks.try_iter()? {
+        let block = block?;
+        let block_tuple = block.cast::<PyTuple>()?;
+        let dirname: Vec<u8> = block_tuple.get_item(0)?.extract()?;
+        let entries_obj = block_tuple.get_item(1)?;
+        let mut entries: Vec<Entry> = Vec::new();
+        for entry in entries_obj.try_iter()? {
+            let entry = entry?;
+            entries.push(entry_from_py(&entry)?);
+        }
+        out.push(Dirblock { dirname, entries });
+    }
+    Ok(out)
 }
 
 /// Serialise a single dirstate entry to the NUL-delimited line format
