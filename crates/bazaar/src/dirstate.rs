@@ -2757,6 +2757,210 @@ impl DirState {
         Ok(())
     }
 
+    /// Mirrors Python's `DirState._validate`. Walks the dirblocks
+    /// and cross-references tree state invariants: root-block
+    /// sentinel, dirblock ordering, per-block entry ordering,
+    /// per-tree id→path consistency (absent / relocation /
+    /// file-or-dir rules), parent-entry presence, and id_index
+    /// back-references when the cache is populated.
+    ///
+    /// Returns `Ok(())` when all invariants hold, or a
+    /// [`ValidateError`] describing the first violation — which the
+    /// pyo3 layer turns into `AssertionError` to match Python.
+    pub fn validate(&self) -> Result<(), ValidateError> {
+        if !self.dirblocks.is_empty() && !self.dirblocks[0].dirname.is_empty() {
+            return Err(ValidateError(
+                "dirblocks don't start with root block".into(),
+            ));
+        }
+        if self.dirblocks.len() > 1 && !self.dirblocks[1].dirname.is_empty() {
+            return Err(ValidateError("dirblocks missing root directory".into()));
+        }
+        // dirblock names after the root pair must be in sorted
+        // component order. Python does
+        // `[d[0].split(b"/") for d in self._dirblocks[1:]]`.
+        let dir_names: Vec<Vec<&[u8]>> = self
+            .dirblocks
+            .iter()
+            .skip(1)
+            .map(|d| d.dirname.split(|&b| b == b'/').collect())
+            .collect();
+        let mut sorted_dir_names = dir_names.clone();
+        sorted_dir_names.sort();
+        if dir_names != sorted_dir_names {
+            return Err(ValidateError("dir names are not in sorted order".into()));
+        }
+        for dirblock in &self.dirblocks {
+            for entry in &dirblock.entries {
+                if dirblock.dirname != entry.key.dirname {
+                    return Err(ValidateError(format!(
+                        "entry key dirname {:?} doesn't match block {:?}",
+                        entry.key.dirname, dirblock.dirname
+                    )));
+                }
+            }
+            let key_tuple =
+                |k: &EntryKey| (k.dirname.clone(), k.basename.clone(), k.file_id.clone());
+            if !dirblock
+                .entries
+                .windows(2)
+                .all(|w| key_tuple(&w[0].key) <= key_tuple(&w[1].key))
+            {
+                return Err(ValidateError(format!(
+                    "dirblock for {:?} is not sorted",
+                    dirblock.dirname
+                )));
+            }
+        }
+
+        // Per-tree id→path map. Each slot is
+        // Option<(previous_path, previous_loc)> matching Python's
+        // tuple: previous_path == None means "seen as absent",
+        // otherwise it's the canonical path (for a live row) or the
+        // relocation target (for a relocation row).
+        type IdMap = std::collections::HashMap<Vec<u8>, (Option<Vec<u8>>, Vec<u8>)>;
+        let tree_count = 1 + self.num_present_parents();
+        let mut id_path_maps: Vec<IdMap> = (0..tree_count).map(|_| IdMap::new()).collect();
+        for entry in self.iter_entries() {
+            let file_id = &entry.key.file_id;
+            let mut this_path = entry.key.dirname.clone();
+            if !this_path.is_empty() {
+                this_path.push(b'/');
+            }
+            this_path.extend_from_slice(&entry.key.basename);
+            if entry.trees.len() != tree_count {
+                return Err(ValidateError(format!(
+                    "wrong number of entry details for {:?}, expected {}",
+                    entry.key, tree_count
+                )));
+            }
+            let mut absent_positions = 0usize;
+            for (tree_index, tree_state) in entry.trees.iter().enumerate() {
+                let minikind = tree_state.minikind;
+                if minikind == b'a' || minikind == b'r' {
+                    absent_positions += 1;
+                }
+                if let Some((previous_path, previous_loc)) =
+                    id_path_maps[tree_index].get(file_id.as_slice()).cloned()
+                {
+                    if minikind == b'a' {
+                        if previous_path.is_some() {
+                            return Err(ValidateError(format!(
+                                "file {:?} absent but previously present",
+                                file_id
+                            )));
+                        }
+                    } else if minikind == b'r' {
+                        let target = tree_state.fingerprint.clone();
+                        if previous_path.as_deref() != Some(target.as_slice()) {
+                            return Err(ValidateError(format!(
+                                "relocation {:?} inconsistent with previous {:?}",
+                                file_id, previous_path
+                            )));
+                        }
+                    } else {
+                        if previous_path.as_deref() != Some(this_path.as_slice()) {
+                            return Err(ValidateError(format!(
+                                "entry {:?} inconsistent with previous path {:?} at {:?}",
+                                entry.key, previous_path, previous_loc
+                            )));
+                        }
+                        self.check_valid_parent(tree_index, &entry.key, &this_path)?;
+                    }
+                } else {
+                    match minikind {
+                        b'a' => {
+                            id_path_maps[tree_index]
+                                .insert(file_id.to_vec(), (None, this_path.clone()));
+                        }
+                        b'r' => {
+                            id_path_maps[tree_index].insert(
+                                file_id.to_vec(),
+                                (Some(tree_state.fingerprint.clone()), this_path.clone()),
+                            );
+                        }
+                        _ => {
+                            id_path_maps[tree_index].insert(
+                                file_id.to_vec(),
+                                (Some(this_path.clone()), this_path.clone()),
+                            );
+                            self.check_valid_parent(tree_index, &entry.key, &this_path)?;
+                        }
+                    }
+                }
+            }
+            if absent_positions == tree_count {
+                return Err(ValidateError(format!(
+                    "entry {:?} has no data for any tree",
+                    entry.key
+                )));
+            }
+        }
+
+        // id_index back-reference check, if the cache is built.
+        if let Some(id_index) = &self.id_index {
+            for (dirname, basename, file_id) in id_index.iter_all() {
+                let lookup_key = EntryKey {
+                    dirname: dirname.clone(),
+                    basename: basename.clone(),
+                    file_id: file_id.as_bytes().to_vec(),
+                };
+                let (block_index, present) =
+                    find_block_index_from_key(&self.dirblocks, &lookup_key);
+                if !present {
+                    return Err(ValidateError(format!(
+                        "missing block for entry key: {:?}",
+                        lookup_key
+                    )));
+                }
+                let (_, entry_present) =
+                    find_entry_index(&lookup_key, &self.dirblocks[block_index].entries);
+                if !entry_present {
+                    return Err(ValidateError(format!(
+                        "missing entry for key: {:?}",
+                        lookup_key
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Helper for [`DirState::validate`] — mirrors Python's nested
+    /// `check_valid_parent`. Verifies the containing directory
+    /// entry exists and is marked as a directory in `tree_index`.
+    /// The root row (empty dirname + empty basename) has no parent.
+    fn check_valid_parent(
+        &self,
+        tree_index: usize,
+        key: &EntryKey,
+        this_path: &[u8],
+    ) -> Result<(), ValidateError> {
+        if key.dirname.is_empty() && key.basename.is_empty() {
+            return Ok(());
+        }
+        let parent = self
+            .get_entry_by_path(tree_index, &key.dirname)
+            .ok_or_else(|| {
+                ValidateError(format!(
+                    "no parent entry for {:?} in tree {}",
+                    this_path, tree_index
+                ))
+            })?;
+        let parent_minikind = parent
+            .trees
+            .get(tree_index)
+            .map(|t| t.minikind)
+            .unwrap_or(0);
+        if parent_minikind != b'd' {
+            return Err(ValidateError(format!(
+                "parent entry for {:?} is not a directory",
+                this_path
+            )));
+        }
+        Ok(())
+    }
+
     /// Apply a sequence of "insertions" to tree 0. Mirrors Python's
     /// `DirState._apply_insertions`: sort the adds and, for each,
     /// call [`DirState::update_minimal`]. A `NotVersioned` error
@@ -3422,6 +3626,20 @@ pub enum BasisApplyError {
     /// without `add_if_missing`.
     NotVersioned { path: Vec<u8> },
 }
+
+/// Error returned by [`DirState::validate`]. A single descriptive
+/// string is enough — the pyo3 layer wraps it in `AssertionError`
+/// exactly like Python's `_validate` raises.
+#[derive(Debug, Clone)]
+pub struct ValidateError(pub String);
+
+impl std::fmt::Display for ValidateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ValidateError {}
 
 impl std::fmt::Display for BasisApplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

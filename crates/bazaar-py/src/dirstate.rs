@@ -1155,6 +1155,16 @@ impl PyDirState {
         }
     }
 
+    /// Walk the dirblocks and verify `DirState._validate`'s
+    /// invariants. On violation raises `AssertionError` with the
+    /// same message Python would — mirroring
+    /// `DirState._validate`.
+    fn validate(&self) -> PyResult<()> {
+        self.inner
+            .validate()
+            .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))
+    }
+
     /// Apply a sequence of "insertions" to tree 0. Mirrors Python's
     /// `DirState._apply_insertions`. Input is a Python iterable of
     /// `(key, minikind, executable, fingerprint, path_utf8)` 5-tuples
