@@ -1155,6 +1155,41 @@ impl PyDirState {
         }
     }
 
+    /// Apply a sequence of "insertions" to tree 0. Mirrors Python's
+    /// `DirState._apply_insertions`. Input is a Python iterable of
+    /// `(key, minikind, executable, fingerprint, path_utf8)` 5-tuples
+    /// matching the shape assembled by `update_by_delta`.
+    fn apply_insertions(&mut self, adds: &Bound<PyAny>) -> PyResult<()> {
+        let mut rust_adds: Vec<(bazaar::dirstate::EntryKey, u8, bool, Vec<u8>, Vec<u8>)> =
+            Vec::new();
+        for item in adds.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            if tup.len() != 5 {
+                return Err(PyTypeError::new_err(
+                    "apply_insertions entries must be 5-tuples",
+                ));
+            }
+            let key_tup = tup.get_item(0)?.cast_into::<PyTuple>()?;
+            let key = bazaar::dirstate::EntryKey {
+                dirname: key_tup.get_item(0)?.extract()?,
+                basename: key_tup.get_item(1)?.extract()?,
+                file_id: key_tup.get_item(2)?.extract()?,
+            };
+            let minikind_bytes: Vec<u8> = tup.get_item(1)?.extract()?;
+            let minikind = *minikind_bytes
+                .first()
+                .ok_or_else(|| PyTypeError::new_err("minikind must be non-empty"))?;
+            let executable: bool = tup.get_item(2)?.extract()?;
+            let fingerprint: Vec<u8> = tup.get_item(3)?.extract()?;
+            let path_utf8: Vec<u8> = tup.get_item(4)?.extract()?;
+            rust_adds.push((key, minikind, executable, fingerprint, path_utf8));
+        }
+        match self.inner.apply_insertions(rust_adds) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.raise_basis_apply_error(adds.py(), e)),
+        }
+    }
+
     /// Apply a sequence of "changes" to tree 1. Mirrors Python's
     /// `DirState._update_basis_apply_changes`. Input is a Python
     /// iterable of `(old_path, new_path, file_id, new_details)`

@@ -2757,6 +2757,47 @@ impl DirState {
         Ok(())
     }
 
+    /// Apply a sequence of "insertions" to tree 0. Mirrors Python's
+    /// `DirState._apply_insertions`: sort the adds and, for each,
+    /// call [`DirState::update_minimal`]. A `NotVersioned` error
+    /// from `update_minimal` is reshaped into `Invalid` with reason
+    /// `"Missing parent"`, matching Python's
+    /// `except NotVersionedError: self._raise_invalid(..., "Missing parent")`.
+    pub fn apply_insertions(
+        &mut self,
+        adds: Vec<(EntryKey, u8, bool, Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), BasisApplyError> {
+        let mut sorted = adds;
+        sorted.sort_by(|a, b| {
+            a.0.dirname
+                .cmp(&b.0.dirname)
+                .then_with(|| a.0.basename.cmp(&b.0.basename))
+                .then_with(|| a.0.file_id.cmp(&b.0.file_id))
+        });
+        for (key, minikind, executable, fingerprint, path_utf8) in sorted {
+            let file_id = key.file_id.clone();
+            let tree0_details = TreeData {
+                minikind,
+                fingerprint,
+                size: 0,
+                executable,
+                packed_stat: b"x".repeat(32),
+            };
+            match self.update_minimal(key, tree0_details, Some(&path_utf8), false) {
+                Ok(()) => {}
+                Err(BasisApplyError::NotVersioned { .. }) => {
+                    return Err(BasisApplyError::Invalid {
+                        path: path_utf8,
+                        file_id,
+                        reason: "Missing parent".to_string(),
+                    });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Apply a sequence of "changes" to tree 1. Mirrors Python's
     /// `DirState._update_basis_apply_changes`. Each change updates
     /// the tree-1 slot of an existing entry whose file_id matches

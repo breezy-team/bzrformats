@@ -1467,13 +1467,10 @@ class DirState:
         self._id_index = None
 
     def _apply_insertions(self, adds):
-        try:
-            for key, minikind, executable, fingerprint, path_utf8 in sorted(adds):
-                self.update_minimal(
-                    key, minikind, executable, fingerprint, path_utf8=path_utf8
-                )
-        except NotVersionedError:
-            self._raise_invalid(path_utf8.decode("utf8"), key[2], "Missing parent")
+        self._rs.dirblocks = self._dirblocks
+        self._rs.apply_insertions(list(adds))
+        self._dirblocks = self._rs.dirblocks
+        self._id_index = None
 
     def update_basis_by_delta(self, delta, new_revid):
         """Update the parents of this tree after a commit.
