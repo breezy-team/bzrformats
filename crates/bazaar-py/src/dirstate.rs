@@ -709,6 +709,17 @@ impl PyDirState {
         self.inner.discard_merge_parents();
     }
 
+    /// Split the root dirblock into two sentinel blocks: block 0 with
+    /// the root row, block 1 with the contents-of-root rows. Mirrors
+    /// Python's `DirState._split_root_dirblock_into_contents`. Raises
+    /// `ValueError` when the pre-split layout is not the expected
+    /// "everything in block 0, block 1 empty" shape.
+    fn split_root_dirblock_into_contents(&mut self) -> PyResult<()> {
+        self.inner
+            .split_root_dirblock_into_contents()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
+    }
+
     /// Replace the entire in-memory state with `parent_ids` and
     /// `dirblocks` (both in the Python tuple shape), marking both the
     /// header and the dirblock data fully modified. Mirrors Python's

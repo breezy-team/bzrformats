@@ -1279,20 +1279,9 @@ class DirState:
         After parsing by path, we end up with root entries and contents-of-root
         entries in the same block. This loop splits them out again.
         """
-        # The above loop leaves the "root block" entries mixed with the
-        # "contents-of-root block". But we don't want an if check on
-        # all entries, so instead we just fix it up here.
-        if self._dirblocks[1] != (b"", []):
-            raise ValueError(f"bad dirblock start {self._dirblocks[1]!r}")
-        root_block = []
-        contents_of_root_block = []
-        for entry in self._dirblocks[0][1]:
-            if not entry[0][1]:  # This is a root entry
-                root_block.append(entry)
-            else:
-                contents_of_root_block.append(entry)
-        self._dirblocks[0] = (b"", root_block)
-        self._dirblocks[1] = (b"", contents_of_root_block)
+        self._rs.dirblocks = self._dirblocks
+        self._rs.split_root_dirblock_into_contents()
+        self._dirblocks = self._rs.dirblocks
 
     def _entries_for_path(self, path):
         """Return a list with all the entries that match path for all ids."""
