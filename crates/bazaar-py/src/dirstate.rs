@@ -782,6 +782,24 @@ impl PyDirState {
         )
     }
 
+    /// Ensure a dirblock for `dirname` exists. Mirrors Python's
+    /// `DirState._ensure_block`: takes the (block_index, row_index)
+    /// coordinates of the parent entry (used for the basename
+    /// assertion) and returns the index of the block for `dirname`,
+    /// creating an empty block if necessary. Raises `AssertionError`
+    /// when the supplied dirname does not end with the parent entry's
+    /// basename.
+    fn ensure_block(
+        &mut self,
+        parent_block_index: isize,
+        parent_row_index: isize,
+        dirname: &[u8],
+    ) -> PyResult<usize> {
+        self.inner
+            .ensure_block(parent_block_index, parent_row_index, dirname)
+            .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(format!("{:?}", e)))
+    }
+
     /// Return the sha1 of the file whose packed_stat matches
     /// `packed_stat`, or `None` if no such file is present. Mirrors
     /// Python's `DirState.sha1_from_stat` slow path
