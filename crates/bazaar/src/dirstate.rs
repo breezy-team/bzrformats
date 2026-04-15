@@ -1780,6 +1780,117 @@ impl DirState {
         self.mark_modified(&[], true);
     }
 
+    /// Mark `key` as absent for tree 0, following Python's
+    /// `DirState._make_absent`.
+    ///
+    /// Behaviour:
+    /// 1. Scan trees 1.. of the entry at `key`. For each non-absent,
+    ///    non-relocated row, remember `key` as still-referenced; for
+    ///    each relocated row, remember the relocation target's key
+    ///    (same file_id, new dirname/basename).
+    /// 2. If `key` is not still-referenced by any remaining tree,
+    ///    remove its entry row from the block and drop `key` from the
+    ///    id index.
+    /// 3. For every remaining-key, set its tree-0 slot to
+    ///    `NULL_PARENT_DETAILS`. Assert that the slot isn't already
+    ///    absent (mirroring Python's `bad row` assertion).
+    /// 4. Mark the dirstate modified.
+    ///
+    /// Returns `true` when the entry row was removed in step (2),
+    /// matching Python's `last_reference` return.
+    pub fn make_absent(&mut self, key: &EntryKey) -> Result<bool, MakeAbsentError> {
+        // Locate the entry we're making absent.
+        let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
+        if !block_present {
+            return Err(MakeAbsentError::BlockNotFound { key: key.clone() });
+        }
+        let (entry_index, entry_present) =
+            find_entry_index(key, &self.dirblocks[block_index].entries);
+        if !entry_present {
+            return Err(MakeAbsentError::EntryNotFound { key: key.clone() });
+        }
+
+        // Collect remaining references across trees 1..N. Python scans
+        // `current_old[1][1:]`, i.e. every tree slot except tree 0.
+        let mut remaining_keys: Vec<EntryKey> = Vec::new();
+        {
+            let entry = &self.dirblocks[block_index].entries[entry_index];
+            for tree in entry.trees.iter().skip(1) {
+                match tree.minikind {
+                    // Python's branches treat 'a' as "not present at any
+                    // path" and everything else except 'r' as "still at
+                    // the original key". The `elif details[0] == b'r'`
+                    // clause inside the first branch is effectively
+                    // unreachable in Python because the outer
+                    // `if details[0] not in (b'a', b'r')` already excludes
+                    // 'r' — we mirror the intended split here.
+                    b'a' => {}
+                    b'r' => {
+                        // Relocated row: fingerprint holds the target
+                        // path, file_id stays the same.
+                        let (dirname, basename) = split_path_utf8(&tree.fingerprint);
+                        remaining_keys.push(EntryKey {
+                            dirname: dirname.to_vec(),
+                            basename: basename.to_vec(),
+                            file_id: key.file_id.clone(),
+                        });
+                    }
+                    _ => {
+                        remaining_keys.push(key.clone());
+                    }
+                }
+            }
+        }
+
+        let last_reference = !remaining_keys.iter().any(|k| k == key);
+
+        if last_reference {
+            // Remove the entry row entirely.
+            self.dirblocks[block_index].entries.remove(entry_index);
+            if let Some(id_index) = self.id_index.as_mut() {
+                let fid = FileId::from(&key.file_id);
+                id_index.remove((key.dirname.as_slice(), key.basename.as_slice(), &fid));
+            }
+        }
+
+        // Update every remaining-key's tree 0 slot to NULL_PARENT_DETAILS.
+        for update_key in &remaining_keys {
+            let (ub, ub_present) = find_block_index_from_key(&self.dirblocks, update_key);
+            if !ub_present {
+                return Err(MakeAbsentError::UpdateBlockNotFound {
+                    key: update_key.clone(),
+                });
+            }
+            let (ue, ue_present) = find_entry_index(update_key, &self.dirblocks[ub].entries);
+            if !ue_present {
+                return Err(MakeAbsentError::UpdateEntryNotFound {
+                    key: update_key.clone(),
+                });
+            }
+            let tree0 = self.dirblocks[ub].entries[ue]
+                .trees
+                .first_mut()
+                .ok_or_else(|| MakeAbsentError::BadRow {
+                    key: update_key.clone(),
+                })?;
+            if tree0.minikind == b'a' {
+                return Err(MakeAbsentError::BadRow {
+                    key: update_key.clone(),
+                });
+            }
+            *tree0 = TreeData {
+                minikind: b'a',
+                fingerprint: Vec::new(),
+                size: 0,
+                executable: false,
+                packed_stat: Vec::new(),
+            };
+        }
+
+        self.mark_modified(&[], false);
+        Ok(last_reference)
+    }
+
     /// Look up the dirstate entry for `file_id` in `tree_index`,
     /// following any relocation chain the entries describe. Mirrors
     /// the `fileid_utf8` branch of Python's `DirState._get_entry`.
@@ -2137,6 +2248,52 @@ impl std::fmt::Display for EntriesToStateError {
 }
 
 impl std::error::Error for EntriesToStateError {}
+
+/// Error returned by [`DirState::make_absent`] when the dirstate is
+/// not in the shape Python's `_make_absent` expects. Each variant
+/// mirrors one of Python's `AssertionError`s, carrying the offending
+/// key for diagnostic messages.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MakeAbsentError {
+    /// No dirblock exists for `key.dirname`.
+    BlockNotFound { key: EntryKey },
+    /// The dirblock exists but `key` is not in it.
+    EntryNotFound { key: EntryKey },
+    /// While updating a remaining-reference key, its dirblock was not
+    /// found — equivalent to Python's "could not find block for ..."
+    /// assertion.
+    UpdateBlockNotFound { key: EntryKey },
+    /// While updating a remaining-reference key, its entry row was
+    /// not found — equivalent to Python's "could not find entry
+    /// for ..." assertion.
+    UpdateEntryNotFound { key: EntryKey },
+    /// A remaining-reference key's tree 0 slot was missing or already
+    /// marked absent. Mirrors Python's `bad row {update_tree_details}`
+    /// assertion.
+    BadRow { key: EntryKey },
+}
+
+impl std::fmt::Display for MakeAbsentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MakeAbsentError::BlockNotFound { key } => {
+                write!(f, "could not find block for {:?}", key)
+            }
+            MakeAbsentError::EntryNotFound { key } => {
+                write!(f, "could not find entry for {:?}", key)
+            }
+            MakeAbsentError::UpdateBlockNotFound { key } => {
+                write!(f, "could not find block for {:?}", key)
+            }
+            MakeAbsentError::UpdateEntryNotFound { key } => {
+                write!(f, "could not find entry for {:?}", key)
+            }
+            MakeAbsentError::BadRow { key } => write!(f, "bad row for {:?}", key),
+        }
+    }
+}
+
+impl std::error::Error for MakeAbsentError {}
 
 /// Error returned by [`split_root_dirblock_into_contents`] when the
 /// pre-split dirblock layout is malformed.
@@ -4130,6 +4287,183 @@ mod dirstate_struct_tests {
         assert_eq!(root.trees[1].minikind, b'a');
         assert!(root.trees[1].fingerprint.is_empty());
         assert!(root.trees[1].packed_stat.is_empty());
+    }
+
+    /// A tree-row builder that lets tests set a non-default fingerprint
+    /// on a single row — needed to exercise the relocation branch of
+    /// `make_absent`, which uses the fingerprint as the target path.
+    fn tree_with_fingerprint(minikind: u8, fingerprint: &[u8]) -> TreeData {
+        TreeData {
+            minikind,
+            fingerprint: fingerprint.to_vec(),
+            size: 0,
+            executable: false,
+            packed_stat: b"x".repeat(32),
+        }
+    }
+
+    /// Build a minimal dirblocks layout containing the two empty
+    /// sentinel blocks plus a single dirblock named `dir` with the
+    /// supplied entries. The `make_absent` tests only need this
+    /// shape; richer structure goes through `create_complex_dirstate`.
+    fn absent_fixture(entries: Vec<Entry>) -> DirState {
+        let mut state = fresh_state();
+        state.parents = vec![b"parent-id".to_vec(), b"merged-id".to_vec()];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+            Dirblock {
+                dirname: b"dir".to_vec(),
+                entries,
+            },
+        ];
+        state
+    }
+
+    /// The entry has no trees beyond tree 0, so marking it absent is
+    /// the last reference — the row is removed from its block and
+    /// dropped from the id_index.
+    #[test]
+    fn make_absent_removes_last_reference_and_updates_id_index() {
+        let mut state = absent_fixture(vec![entry_with_trees(
+            b"dir",
+            b"a",
+            b"fid-a",
+            vec![tree(b'f')],
+        )]);
+        // Prime the id_index cache.
+        let fid = FileId::from(&b"fid-a".to_vec());
+        state.get_or_build_id_index();
+        assert_eq!(state.id_index.as_ref().unwrap().get(&fid).len(), 1);
+
+        let last_reference = state
+            .make_absent(&EntryKey {
+                dirname: b"dir".to_vec(),
+                basename: b"a".to_vec(),
+                file_id: b"fid-a".to_vec(),
+            })
+            .expect("make_absent");
+        assert!(last_reference);
+        assert!(state.dirblocks[2].entries.is_empty());
+        assert!(state.id_index.as_ref().unwrap().get(&fid).is_empty());
+        assert_eq!(state.dirblock_state, MemoryState::InMemoryModified);
+    }
+
+    /// A merge-parent row keeps the entry alive at its current key,
+    /// so `make_absent` does not remove it — instead it sets tree 0
+    /// to NULL_PARENT_DETAILS and leaves the block populated.
+    #[test]
+    fn make_absent_sets_tree0_absent_when_other_trees_keep_entry() {
+        let mut state = absent_fixture(vec![entry_with_trees(
+            b"dir",
+            b"a",
+            b"fid-a",
+            vec![tree(b'f'), tree(b'd')],
+        )]);
+
+        let last_reference = state
+            .make_absent(&EntryKey {
+                dirname: b"dir".to_vec(),
+                basename: b"a".to_vec(),
+                file_id: b"fid-a".to_vec(),
+            })
+            .expect("make_absent");
+        assert!(!last_reference);
+        assert_eq!(state.dirblocks[2].entries.len(), 1);
+        let entry = &state.dirblocks[2].entries[0];
+        assert_eq!(entry.trees[0].minikind, b'a');
+        assert!(entry.trees[0].fingerprint.is_empty());
+        assert!(entry.trees[0].packed_stat.is_empty());
+        assert_eq!(entry.trees[1].minikind, b'd');
+    }
+
+    /// A relocated parent row promotes the relocation target to a
+    /// remaining-key, whose tree 0 slot must get set to absent too.
+    /// The original entry is removed (last_reference=true).
+    #[test]
+    fn make_absent_follows_relocation_and_updates_target() {
+        // Two entries:
+        //   - dir/a: tree 0 present, tree 1 relocation → dir/b
+        //   - dir/b: tree 0 present, tree 1 present (so make_absent
+        //     against dir/a wipes dir/a and sets dir/b's tree 0 to a).
+        let mut state = absent_fixture(vec![
+            entry_with_trees(
+                b"dir",
+                b"a",
+                b"fid-a",
+                vec![tree(b'f'), tree_with_fingerprint(b'r', b"dir/b")],
+            ),
+            entry_with_trees(b"dir", b"b", b"fid-a", vec![tree(b'f'), tree(b'f')]),
+        ]);
+        // Prime the id_index; make_absent should remove dir/a from it.
+        let fid = FileId::from(&b"fid-a".to_vec());
+        state.get_or_build_id_index();
+        assert_eq!(state.id_index.as_ref().unwrap().get(&fid).len(), 2);
+
+        let last_reference = state
+            .make_absent(&EntryKey {
+                dirname: b"dir".to_vec(),
+                basename: b"a".to_vec(),
+                file_id: b"fid-a".to_vec(),
+            })
+            .expect("make_absent");
+        assert!(last_reference);
+        // dir/a is gone.
+        assert_eq!(state.dirblocks[2].entries.len(), 1);
+        assert_eq!(state.dirblocks[2].entries[0].key.basename, b"b".to_vec());
+        // dir/b's tree 0 flipped to absent; tree 1 stayed intact.
+        let survivor = &state.dirblocks[2].entries[0];
+        assert_eq!(survivor.trees[0].minikind, b'a');
+        assert_eq!(survivor.trees[1].minikind, b'f');
+        assert_eq!(state.id_index.as_ref().unwrap().get(&fid).len(), 1);
+    }
+
+    /// An absent-parent row contributes nothing to remaining-keys —
+    /// still a last_reference, still removes the entry, but makes no
+    /// tree-0 updates elsewhere.
+    #[test]
+    fn make_absent_absent_parent_row_is_ignored() {
+        let mut state = absent_fixture(vec![entry_with_trees(
+            b"dir",
+            b"a",
+            b"fid-a",
+            vec![tree(b'f'), tree(b'a')],
+        )]);
+        let last_reference = state
+            .make_absent(&EntryKey {
+                dirname: b"dir".to_vec(),
+                basename: b"a".to_vec(),
+                file_id: b"fid-a".to_vec(),
+            })
+            .expect("make_absent");
+        assert!(last_reference);
+        assert!(state.dirblocks[2].entries.is_empty());
+    }
+
+    /// Missing entry raises EntryNotFound — Python's corresponding
+    /// AssertionError.
+    #[test]
+    fn make_absent_missing_entry_returns_error() {
+        let mut state = absent_fixture(vec![entry_with_trees(
+            b"dir",
+            b"a",
+            b"fid-a",
+            vec![tree(b'f')],
+        )]);
+        let err = state
+            .make_absent(&EntryKey {
+                dirname: b"dir".to_vec(),
+                basename: b"ghost".to_vec(),
+                file_id: b"fid-ghost".to_vec(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, MakeAbsentError::EntryNotFound { .. }));
     }
 
     #[test]
