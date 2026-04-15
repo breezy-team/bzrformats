@@ -113,6 +113,13 @@ class TestInventoryUpdates(TestCase):
         inv.add(child)
         self.assertEqual("src/hello.c", inv.id2path(b"hello-id"))
 
+    def test_invalid_file_id_raises_value_error(self):
+        # file_ids containing whitespace or that are empty must be rejected
+        # at the pyo3 boundary with a ValueError rather than panicking.
+        inv = inventory.Inventory(b"tree-root")
+        for bad_id in (b"", b"with space", b"tab\there", b"line\nbreak", b"cr\rlf"):
+            self.assertRaises(ValueError, inv.is_root, bad_id)
+
 
 class TestInventoryEntry(TestCase):
     def test_file_invalid_entry_name(self):

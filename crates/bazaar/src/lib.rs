@@ -93,6 +93,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for FileId {
 
     fn extract(ob: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let s: Vec<u8> = ob.extract()?;
+        if !is_valid(&s) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid file id: {:?}",
+                s
+            )));
+        }
         Ok(FileId::from(s))
     }
 }
@@ -253,5 +259,26 @@ impl RevisionId {
         if self.is_reserved() {
             panic!("Expected non-reserved revision id, got {:?}", self);
         }
+    }
+}
+
+#[cfg(test)]
+mod id_validation_tests {
+    use super::*;
+
+    #[test]
+    fn is_valid_accepts_normal_ids() {
+        assert!(is_valid(b"simple-id"));
+        assert!(is_valid(b"with.dots"));
+        assert!(is_valid(b"\xc3\xa9clair")); // non-ascii utf-8
+    }
+
+    #[test]
+    fn is_valid_rejects_whitespace_and_empty() {
+        assert!(!is_valid(b""));
+        assert!(!is_valid(b"a dir id"));
+        assert!(!is_valid(b"tabbed\tid"));
+        assert!(!is_valid(b"newline\nid"));
+        assert!(!is_valid(b"carriage\rid"));
     }
 }
