@@ -1935,6 +1935,292 @@ impl DirState {
         Ok(last_reference)
     }
 
+    /// Apply a sequence of "adds" to tree 1, mirroring Python's
+    /// `DirState._update_basis_apply_adds`. `adds` is a flat list of
+    /// per-entry records produced by `update_basis_by_delta`: each
+    /// describes a new entry to insert (or, when `real_add` is false,
+    /// the add half of a split rename). The caller is responsible for
+    /// collecting and translating Python inventory entries into
+    /// [`BasisAdd`] records — this function only touches dirblocks.
+    ///
+    /// Sorts `adds` in-place by `new_path` to match Python's
+    /// `adds.sort(key=lambda x: x[1])`. The resulting lexicographic
+    /// order ensures every parent dirblock is visited before its
+    /// children.
+    ///
+    /// Invariants that produce an `InconsistentDelta` error — mirroring
+    /// Python's `_raise_invalid` — are carried as
+    /// [`BasisApplyError::Invalid`] values so the pyo3 layer can wrap
+    /// them in the Python `InconsistentDelta` exception. Assertions
+    /// about internal state that should never happen (such as
+    /// `_find_entry_index` missing a key the linear scan locates) are
+    /// reported as [`BasisApplyError::Internal`].
+    ///
+    /// Side effects:
+    /// - may call [`DirState::ensure_block`] to materialise a dirblock
+    ///   for a missing parent directory;
+    /// - mutates tree-1 slots of existing entries;
+    /// - inserts new entries with `[NULL_PARENT_DETAILS, new_details]`;
+    /// - converts cross-directory renames to tree-0 relocation rows
+    ///   when the new tree-1 entry's tree-0 slot is absent but the
+    ///   file_id exists at a different path in tree 0;
+    /// - ensures a child dirblock exists for directory-kind adds;
+    /// - invalidates `id_index` and `packed_stat_index` caches.
+    pub fn update_basis_apply_adds(
+        &mut self,
+        adds: &mut Vec<BasisAdd>,
+    ) -> Result<(), BasisApplyError> {
+        // Sort lexographically by new_path so parents are processed
+        // before children.
+        adds.sort_by(|a, b| a.new_path.cmp(&b.new_path));
+
+        for add in adds.iter() {
+            let (dirname_raw, basename_raw) = split_path_utf8(&add.new_path);
+            let dirname = dirname_raw.to_vec();
+            let basename = basename_raw.to_vec();
+            let entry_key = EntryKey {
+                dirname: dirname.clone(),
+                basename: basename.clone(),
+                file_id: add.file_id.clone(),
+            };
+
+            let (mut block_index, mut present) =
+                find_block_index_from_key(&self.dirblocks, &entry_key);
+            if !present {
+                // The target dirblock is missing; look up the parent
+                // in tree 1 and ensure a child block for `dirname`.
+                let (parent_dir_raw, parent_base_raw) = split_path_utf8(&dirname);
+                let bei =
+                    get_block_entry_index(&self.dirblocks, parent_dir_raw, parent_base_raw, 1);
+                if !bei.path_present {
+                    return Err(BasisApplyError::Invalid {
+                        path: add.new_path.clone(),
+                        file_id: add.file_id.clone(),
+                        reason: "Unable to find block for this record. Was the parent added?"
+                            .to_string(),
+                    });
+                }
+                self.ensure_block(bei.block_index as isize, bei.entry_index as isize, &dirname)
+                    .map_err(|e| BasisApplyError::Invalid {
+                        path: add.new_path.clone(),
+                        file_id: add.file_id.clone(),
+                        reason: format!("{:?}", e),
+                    })?;
+                // ensure_block may have inserted a new block at or
+                // before the original `block_index`, shifting us.
+                let (new_block_index, new_present) =
+                    find_block_index_from_key(&self.dirblocks, &entry_key);
+                block_index = new_block_index;
+                present = new_present;
+                // We expect the block to exist now; the entry itself
+                // is still absent.
+                debug_assert!(!present);
+            }
+
+            let (entry_index, entry_present) =
+                find_entry_index(&entry_key, &self.dirblocks[block_index].entries);
+
+            if add.real_add && add.old_path.is_some() {
+                return Err(BasisApplyError::Invalid {
+                    path: add.new_path.clone(),
+                    file_id: add.file_id.clone(),
+                    reason: format!(
+                        "considered a real add but still had old_path at {:?}",
+                        add.old_path.as_ref().unwrap()
+                    ),
+                });
+            }
+
+            if entry_present {
+                // Update the existing entry's tree 1 slot.
+                let entry = &mut self.dirblocks[block_index].entries[entry_index];
+                let basis_kind = entry.trees.get(1).map(|t| t.minikind).unwrap_or(0);
+                match basis_kind {
+                    b'a' => {
+                        if entry.trees.len() >= 2 {
+                            entry.trees[1] = add.new_details.clone();
+                        } else {
+                            entry.trees.push(add.new_details.clone());
+                        }
+                    }
+                    b'r' => {
+                        return Err(BasisApplyError::NotImplemented {
+                            reason: "basis entry is a relocation".to_string(),
+                        });
+                    }
+                    _ => {
+                        return Err(BasisApplyError::Invalid {
+                            path: add.new_path.clone(),
+                            file_id: add.file_id.clone(),
+                            reason:
+                                "An entry was marked as a new add but the basis target already existed"
+                                    .to_string(),
+                        });
+                    }
+                }
+            } else {
+                // The exact key is not present; scan the two
+                // neighbouring positions for same-path-different-id
+                // conflicts (Python only checks `entry_index - 1`
+                // and `entry_index`).
+                let block_len = self.dirblocks[block_index].entries.len();
+                let start = entry_index.saturating_sub(1);
+                let end = entry_index + 1;
+                for maybe_index in start..end {
+                    if maybe_index >= block_len {
+                        continue;
+                    }
+                    let maybe = &self.dirblocks[block_index].entries[maybe_index];
+                    if maybe.key.dirname != dirname || maybe.key.basename != basename {
+                        continue;
+                    }
+                    if maybe.key.file_id == add.file_id {
+                        return Err(BasisApplyError::Internal {
+                            reason: format!(
+                                "find_entry_index did not find a key match but walking the data did, for ({:?}, {:?}, {:?})",
+                                dirname, basename, add.file_id
+                            ),
+                        });
+                    }
+                    let basis_kind = maybe.trees.get(1).map(|t| t.minikind).unwrap_or(0);
+                    if basis_kind != b'a' && basis_kind != b'r' {
+                        return Err(BasisApplyError::Invalid {
+                            path: add.new_path.clone(),
+                            file_id: add.file_id.clone(),
+                            reason: format!(
+                                "we have an add record for path, but the path is already present with another file_id {:?}",
+                                maybe.key.file_id
+                            ),
+                        });
+                    }
+                }
+
+                // Insert the new entry with NULL_PARENT_DETAILS for
+                // tree 0 and `new_details` for tree 1.
+                let new_entry = Entry {
+                    key: entry_key.clone(),
+                    trees: vec![
+                        TreeData {
+                            minikind: b'a',
+                            fingerprint: Vec::new(),
+                            size: 0,
+                            executable: false,
+                            packed_stat: Vec::new(),
+                        },
+                        add.new_details.clone(),
+                    ],
+                };
+                self.dirblocks[block_index]
+                    .entries
+                    .insert(entry_index, new_entry);
+            }
+
+            // Cross-tree check: if the (possibly just-inserted) entry's
+            // tree 0 slot is absent, look up the file_id in tree 0
+            // elsewhere and, if found, rewrite both sides into
+            // relocation rows.
+            let active_kind = self.dirblocks[block_index].entries[entry_index]
+                .trees
+                .first()
+                .map(|t| t.minikind)
+                .unwrap_or(0);
+
+            if active_kind == b'a' {
+                // Look up file_id via id_index; collect candidate
+                // (block, entry) coordinates before mutating, to
+                // keep the borrow checker happy.
+                let fid = FileId::from(&add.file_id);
+                let candidate_keys = self.get_or_build_id_index().get(&fid);
+
+                let mut relocation: Option<(usize, usize, Vec<u8>)> = None;
+                for key_tuple in candidate_keys {
+                    let (k_dirname, k_basename, _k_file_id) = key_tuple;
+                    let bei = get_block_entry_index(&self.dirblocks, &k_dirname, &k_basename, 0);
+                    if !bei.path_present {
+                        continue;
+                    }
+                    let candidate = &self.dirblocks[bei.block_index].entries[bei.entry_index];
+                    if candidate.key.file_id != add.file_id {
+                        continue;
+                    }
+                    let real_kind = candidate.trees.first().map(|t| t.minikind).unwrap_or(0);
+                    if real_kind == b'a' || real_kind == b'r' {
+                        return Err(BasisApplyError::Invalid {
+                            path: add.new_path.clone(),
+                            file_id: add.file_id.clone(),
+                            reason: "We found a tree0 entry that doesnt make sense".to_string(),
+                        });
+                    }
+                    let active_dir = candidate.key.dirname.clone();
+                    let active_name = candidate.key.basename.clone();
+                    let active_path = if active_dir.is_empty() {
+                        active_name.clone()
+                    } else {
+                        let mut p = active_dir.clone();
+                        p.push(b'/');
+                        p.extend_from_slice(&active_name);
+                        p
+                    };
+                    relocation = Some((bei.block_index, bei.entry_index, active_path));
+                    break;
+                }
+
+                if let Some((other_block, other_entry, active_path)) = relocation {
+                    // Update the other entry's tree 1 slot to point
+                    // at the new path.
+                    {
+                        let other = &mut self.dirblocks[other_block].entries[other_entry];
+                        let new_tree1 = TreeData {
+                            minikind: b'r',
+                            fingerprint: add.new_path.clone(),
+                            size: 0,
+                            executable: false,
+                            packed_stat: Vec::new(),
+                        };
+                        if other.trees.len() >= 2 {
+                            other.trees[1] = new_tree1;
+                        } else {
+                            other.trees.push(new_tree1);
+                        }
+                    }
+                    // Update the new entry's tree 0 slot to point at
+                    // the other path.
+                    {
+                        let e = &mut self.dirblocks[block_index].entries[entry_index];
+                        e.trees[0] = TreeData {
+                            minikind: b'r',
+                            fingerprint: active_path,
+                            size: 0,
+                            executable: false,
+                            packed_stat: Vec::new(),
+                        };
+                    }
+                }
+            } else if active_kind == b'r' {
+                return Err(BasisApplyError::NotImplemented {
+                    reason: "active entry is a relocation".to_string(),
+                });
+            }
+
+            // If the new entry is a directory, ensure a child dirblock
+            // for its path exists.
+            if add.new_details.minikind == b'd' {
+                // Use the (possibly-shifted) block_index + entry_index
+                // as the parent coordinates for the child dirblock.
+                self.ensure_block(block_index as isize, entry_index as isize, &add.new_path)
+                    .map_err(|e| BasisApplyError::Invalid {
+                        path: add.new_path.clone(),
+                        file_id: add.file_id.clone(),
+                        reason: format!("{:?}", e),
+                    })?;
+            }
+        }
+
+        self.id_index = None;
+        self.packed_stat_index = None;
+        Ok(())
+    }
+
     /// Look up the dirstate entry for `file_id` in `tree_index`,
     /// following any relocation chain the entries describe. Mirrors
     /// the `fileid_utf8` branch of Python's `DirState._get_entry`.
@@ -2292,6 +2578,69 @@ impl std::fmt::Display for EntriesToStateError {
 }
 
 impl std::error::Error for EntriesToStateError {}
+
+/// One record in the `adds` list consumed by
+/// [`DirState::update_basis_apply_adds`]. Mirrors the per-entry
+/// tuple Python's `_update_basis_apply_adds` iterates over:
+/// `(old_path, new_path_utf8, file_id, (entry_details), real_add)`.
+#[derive(Debug, Clone)]
+pub struct BasisAdd {
+    /// Previous path when this add is the second half of a split
+    /// rename. `None` for a genuine add.
+    pub old_path: Option<Vec<u8>>,
+    /// UTF-8 path of the entry to insert/update.
+    pub new_path: Vec<u8>,
+    /// File id of the entry.
+    pub file_id: Vec<u8>,
+    /// Tree details for the new entry's tree-1 slot.
+    pub new_details: TreeData,
+    /// True for a real add, false when this record is the add half
+    /// of a split rename.
+    pub real_add: bool,
+}
+
+/// Error returned by [`DirState::update_basis_apply_adds`] and the
+/// sibling apply-changes / apply-deletes methods. Mirrors Python's
+/// `_raise_invalid` and `AssertionError` / `NotImplementedError` paths.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BasisApplyError {
+    /// The caller-supplied add/change/delete conflicts with existing
+    /// dirstate content — mirrors Python's `InconsistentDelta(path,
+    /// file_id, reason)` exception.
+    Invalid {
+        path: Vec<u8>,
+        file_id: Vec<u8>,
+        reason: String,
+    },
+    /// The Python implementation raises `NotImplementedError` in this
+    /// branch; carry the same signal so the caller can reproduce it.
+    NotImplemented { reason: String },
+    /// An invariant that should never be reachable was violated.
+    /// Mirrors Python's `AssertionError` inside the apply helpers.
+    Internal { reason: String },
+}
+
+impl std::fmt::Display for BasisApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BasisApplyError::Invalid {
+                path,
+                file_id,
+                reason,
+            } => write!(
+                f,
+                "inconsistent delta at {:?} ({:?}): {}",
+                path, file_id, reason
+            ),
+            BasisApplyError::NotImplemented { reason } => {
+                write!(f, "not implemented: {}", reason)
+            }
+            BasisApplyError::Internal { reason } => write!(f, "internal error: {}", reason),
+        }
+    }
+}
+
+impl std::error::Error for BasisApplyError {}
 
 /// Error returned by [`DirState::make_absent`] when the dirstate is
 /// not in the shape Python's `_make_absent` expects. Each variant
@@ -4608,6 +4957,213 @@ mod dirstate_struct_tests {
             })
             .unwrap_err();
         assert!(matches!(err, MakeAbsentError::EntryNotFound { .. }));
+    }
+
+    /// Build a TreeData that looks like Python's
+    /// `(minikind, fingerprint, size, executable, packed_stat)`
+    /// tuple — more convenient than the raw `tree()` helper when a
+    /// test needs to set specific size/fingerprint fields.
+    fn basis_details(minikind: u8, fingerprint: &[u8], size: u64, executable: bool) -> TreeData {
+        TreeData {
+            minikind,
+            fingerprint: fingerprint.to_vec(),
+            size,
+            executable,
+            packed_stat: b"x".repeat(32),
+        }
+    }
+
+    fn null_parent_details() -> TreeData {
+        TreeData {
+            minikind: b'a',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: Vec::new(),
+        }
+    }
+
+    /// Build a minimal two-tree dirstate populated with a single
+    /// file at `b""/README` in tree 0 and NULL_PARENT_DETAILS in
+    /// tree 1. Suitable for exercising the "insert new add" path of
+    /// `update_basis_apply_adds`.
+    fn basis_adds_fixture_one_file() -> DirState {
+        let mut state = fresh_state();
+        state.parents = vec![b"parent-id".to_vec()];
+        let tree0 = basis_details(b'f', b"sha-r", 10, false);
+        let tree1 = null_parent_details();
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(b'd'), tree(b'd')],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"README",
+                    b"fid-readme",
+                    vec![tree0, tree1],
+                )],
+            },
+        ];
+        state
+    }
+
+    #[test]
+    fn update_basis_apply_adds_inserts_new_entry() {
+        // Add a brand new file at b"" / b"a.txt". The block for the
+        // root contents already exists; the entry does not. ASCII
+        // ordering places b"README" before b"a.txt" (0x52 < 0x61), so
+        // the new entry lands after README.
+        let mut state = basis_adds_fixture_one_file();
+        let mut adds = vec![BasisAdd {
+            old_path: None,
+            new_path: b"a.txt".to_vec(),
+            file_id: b"fid-a".to_vec(),
+            new_details: basis_details(b'f', b"sha-a", 7, false),
+            real_add: true,
+        }];
+        state.update_basis_apply_adds(&mut adds).expect("apply");
+
+        let block = &state.dirblocks[1];
+        assert_eq!(block.entries.len(), 2);
+        assert_eq!(block.entries[0].key.basename, b"README".to_vec());
+        assert_eq!(block.entries[1].key.basename, b"a.txt".to_vec());
+        assert_eq!(block.entries[1].trees[0].minikind, b'a');
+        assert_eq!(block.entries[1].trees[1].minikind, b'f');
+        assert_eq!(block.entries[1].trees[1].fingerprint, b"sha-a".to_vec());
+    }
+
+    #[test]
+    fn update_basis_apply_adds_updates_absent_tree1_slot_in_place() {
+        // README already exists with tree1=absent; adding the same
+        // entry fills in tree 1 instead of inserting a new row.
+        let mut state = basis_adds_fixture_one_file();
+        let mut adds = vec![BasisAdd {
+            old_path: None,
+            new_path: b"README".to_vec(),
+            file_id: b"fid-readme".to_vec(),
+            new_details: basis_details(b'f', b"sha-updated", 42, true),
+            real_add: true,
+        }];
+        state.update_basis_apply_adds(&mut adds).expect("apply");
+
+        let block = &state.dirblocks[1];
+        assert_eq!(block.entries.len(), 1);
+        assert_eq!(
+            block.entries[0].trees[1].fingerprint,
+            b"sha-updated".to_vec()
+        );
+        assert_eq!(block.entries[0].trees[1].size, 42);
+        assert!(block.entries[0].trees[1].executable);
+    }
+
+    #[test]
+    fn update_basis_apply_adds_conflicting_existing_basis_is_invalid() {
+        // README already has tree1 populated with a live file entry;
+        // trying to add a new entry at the same path flags it as
+        // InconsistentDelta rather than silently overwriting.
+        let mut state = basis_adds_fixture_one_file();
+        state.dirblocks[1].entries[0].trees[1] = basis_details(b'f', b"sha-existing", 11, false);
+
+        let mut adds = vec![BasisAdd {
+            old_path: None,
+            new_path: b"README".to_vec(),
+            file_id: b"fid-readme".to_vec(),
+            new_details: basis_details(b'f', b"sha-new", 22, false),
+            real_add: true,
+        }];
+        let err = state.update_basis_apply_adds(&mut adds).unwrap_err();
+        match err {
+            BasisApplyError::Invalid { path, reason, .. } => {
+                assert_eq!(path, b"README".to_vec());
+                assert!(
+                    reason.contains("basis target already existed"),
+                    "{}",
+                    reason
+                );
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_basis_apply_adds_real_add_with_old_path_is_invalid() {
+        let mut state = basis_adds_fixture_one_file();
+        let mut adds = vec![BasisAdd {
+            old_path: Some(b"some/old".to_vec()),
+            new_path: b"new.txt".to_vec(),
+            file_id: b"fid-new".to_vec(),
+            new_details: basis_details(b'f', b"sha", 0, false),
+            real_add: true,
+        }];
+        let err = state.update_basis_apply_adds(&mut adds).unwrap_err();
+        assert!(matches!(err, BasisApplyError::Invalid { .. }));
+    }
+
+    #[test]
+    fn update_basis_apply_adds_sorts_input_so_parents_come_first() {
+        // Feed the adds out of order and confirm the function still
+        // processes them correctly. We add `dir/` (a directory) and
+        // then `dir/child`; the sort must place `dir/` first so the
+        // directory block exists by the time the child is processed.
+        let mut state = fresh_state();
+        state.parents = vec![b"parent-id".to_vec()];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(b'd'), tree(b'd')],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+
+        let mut adds = vec![
+            BasisAdd {
+                old_path: None,
+                new_path: b"dir/child".to_vec(),
+                file_id: b"fid-child".to_vec(),
+                new_details: basis_details(b'f', b"sha-c", 1, false),
+                real_add: true,
+            },
+            BasisAdd {
+                old_path: None,
+                new_path: b"dir".to_vec(),
+                file_id: b"fid-dir".to_vec(),
+                new_details: basis_details(b'd', b"", 0, false),
+                real_add: true,
+            },
+        ];
+        state.update_basis_apply_adds(&mut adds).expect("apply");
+
+        // After the adds: a dirblock for b"dir" exists, the contents-of-root
+        // block holds dir, and a dedicated dir block holds dir/child.
+        let dirblock_names: Vec<&[u8]> = state
+            .dirblocks
+            .iter()
+            .map(|b| b.dirname.as_slice())
+            .collect();
+        assert!(dirblock_names.iter().any(|&n| n == b"dir"));
+        let dir_block = state
+            .dirblocks
+            .iter()
+            .find(|b| b.dirname == b"dir")
+            .unwrap();
+        assert_eq!(dir_block.entries.len(), 1);
+        assert_eq!(dir_block.entries[0].key.basename, b"child".to_vec());
     }
 
     #[test]
