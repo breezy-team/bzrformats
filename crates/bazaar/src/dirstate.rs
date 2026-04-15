@@ -1283,6 +1283,11 @@ pub struct DirState {
     /// which point it is rebuilt from the current `dirblocks`.
     /// Invalidate by setting to `None` whenever dirblocks change.
     pub id_index: Option<IdIndex>,
+    /// Lazily-populated index of `packed_stat → sha1` for every file
+    /// entry in tree 0. `None` until [`DirState::get_or_build_packed_stat_index`]
+    /// is called, mirroring Python's `_packed_stat_index` attribute.
+    /// Invalidate by setting to `None` whenever tree-0 entries change.
+    pub packed_stat_index: Option<HashMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl DirState {
@@ -1318,6 +1323,7 @@ impl DirState {
             use_filesystem_for_exec,
             bisect_page_size: BISECT_PAGE_SIZE,
             id_index: None,
+            packed_stat_index: None,
         }
     }
 
@@ -1357,6 +1363,38 @@ impl DirState {
             self.id_index = Some(self.build_id_index());
         }
         self.id_index.as_ref().unwrap()
+    }
+
+    /// Rebuild the `packed_stat → sha1` map from every tree-0 file
+    /// entry. Pure — no cache interaction.
+    pub fn build_packed_stat_index(&self) -> HashMap<Vec<u8>, Vec<u8>> {
+        let mut index: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        for entry in self.iter_entries() {
+            let tree0 = match entry.trees.first() {
+                Some(t) => t,
+                None => continue,
+            };
+            if tree0.minikind == b'f' {
+                // Python stores the mapping keyed by the packed_stat
+                // and with the fingerprint (the sha1) as the value.
+                index.insert(tree0.packed_stat.clone(), tree0.fingerprint.clone());
+            }
+        }
+        index
+    }
+
+    /// Return a reference to the cached `packed_stat → sha1` map,
+    /// rebuilding it on first call after the cache was last
+    /// invalidated. Mirrors Python's `DirState._get_packed_stat_index`.
+    ///
+    /// The cache lives in `self.packed_stat_index`; any code that
+    /// mutates tree-0 file entries must set `self.packed_stat_index =
+    /// None` afterwards to force a rebuild on the next access.
+    pub fn get_or_build_packed_stat_index(&mut self) -> &HashMap<Vec<u8>, Vec<u8>> {
+        if self.packed_stat_index.is_none() {
+            self.packed_stat_index = Some(self.build_packed_stat_index());
+        }
+        self.packed_stat_index.as_ref().unwrap()
     }
 
     /// Parse the header of the dirstate file from `data` and populate the
@@ -1497,18 +1535,18 @@ impl DirState {
         self.mark_modified(&[], true);
         self.parents = parent_ids;
         self.id_index = None;
+        self.packed_stat_index = None;
     }
 
     /// Forget all in-memory state, returning the object to the same
     /// shape a freshly constructed [`DirState`] has before any load.
     /// Mirrors Python's `DirState._wipe_state`.
     ///
-    /// Python additionally clears `_packed_stat_index` and
-    /// `_split_path_cache`; neither field exists on the Rust struct
-    /// yet (the equivalents are the `id_index` cache plus the still
-    /// un-ported memoisation layers on `_find_block_index_from_key`),
-    /// so this function resets what it can and leaves a note for the
-    /// future port to extend.
+    /// Python additionally clears `_split_path_cache`; that field has
+    /// no equivalent on the Rust struct yet (the still un-ported
+    /// memoisation layer on `_find_block_index_from_key`), so this
+    /// function resets what it can and leaves a note for the future
+    /// port to extend.
     pub fn wipe_state(&mut self) {
         self.header_state = MemoryState::NotInMemory;
         self.dirblock_state = MemoryState::NotInMemory;
@@ -1517,6 +1555,7 @@ impl DirState {
         self.ghosts.clear();
         self.dirblocks.clear();
         self.id_index = None;
+        self.packed_stat_index = None;
         self.end_of_header = None;
         self.cutoff_time = None;
     }
@@ -1647,6 +1686,8 @@ impl DirState {
             dirblocks[current_idx].entries.push(entry);
         }
         self.dirblocks = dirblocks;
+        self.id_index = None;
+        self.packed_stat_index = None;
         split_root_dirblock_into_contents(&mut self.dirblocks)
             .map_err(EntriesToStateError::SplitFailed)?;
         Ok(())
@@ -1777,6 +1818,7 @@ impl DirState {
         let first_parent = self.parents[0].clone();
         self.parents = vec![first_parent];
         self.id_index = None;
+        self.packed_stat_index = None;
         self.mark_modified(&[], true);
     }
 
@@ -1887,6 +1929,8 @@ impl DirState {
             };
         }
 
+        // Tree-0 mutations invalidate the packed_stat_index.
+        self.packed_stat_index = None;
         self.mark_modified(&[], false);
         Ok(last_reference)
     }
@@ -4444,6 +4488,106 @@ mod dirstate_struct_tests {
             .expect("make_absent");
         assert!(last_reference);
         assert!(state.dirblocks[2].entries.is_empty());
+    }
+
+    #[test]
+    fn packed_stat_index_only_contains_file_entries() {
+        // Mix of file, directory, symlink, absent, relocated: only
+        // `f` entries should make it into the index, keyed by their
+        // packed_stat and valued by their fingerprint (sha1).
+        let mut state = fresh_state();
+        let f1 = TreeData {
+            minikind: b'f',
+            fingerprint: b"sha-f1".to_vec(),
+            size: 10,
+            executable: false,
+            packed_stat: b"stat-f1".to_vec(),
+        };
+        let f2 = TreeData {
+            minikind: b'f',
+            fingerprint: b"sha-f2".to_vec(),
+            size: 20,
+            executable: true,
+            packed_stat: b"stat-f2".to_vec(),
+        };
+        let dir = tree(b'd');
+        let symlink = TreeData {
+            minikind: b'l',
+            fingerprint: b"target".to_vec(),
+            size: 0,
+            executable: false,
+            packed_stat: b"stat-l".to_vec(),
+        };
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![dir.clone()])],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![
+                    entry_with_trees(b"", b"a", b"fid-a", vec![f1.clone()]),
+                    entry_with_trees(b"", b"b", b"fid-b", vec![f2.clone()]),
+                    entry_with_trees(b"", b"c", b"fid-c", vec![symlink]),
+                    entry_with_trees(b"", b"d", b"fid-d", vec![tree(b'a')]),
+                ],
+            },
+        ];
+        let idx = state.build_packed_stat_index();
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.get(&b"stat-f1".to_vec()).unwrap(), &b"sha-f1".to_vec());
+        assert_eq!(idx.get(&b"stat-f2".to_vec()).unwrap(), &b"sha-f2".to_vec());
+    }
+
+    #[test]
+    fn get_or_build_packed_stat_index_caches_result() {
+        let mut state = fresh_state();
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"a",
+                    b"fid-a",
+                    vec![TreeData {
+                        minikind: b'f',
+                        fingerprint: b"sha-a".to_vec(),
+                        size: 1,
+                        executable: false,
+                        packed_stat: b"stat-a".to_vec(),
+                    }],
+                )],
+            },
+        ];
+        assert!(state.packed_stat_index.is_none());
+        let idx = state.get_or_build_packed_stat_index();
+        assert_eq!(idx.len(), 1);
+        // Second call returns the cached map — structural equality
+        // since we can't easily compare references without breaking
+        // the borrow.
+        assert!(state.packed_stat_index.is_some());
+        let idx_again = state.get_or_build_packed_stat_index();
+        assert_eq!(idx_again.len(), 1);
+    }
+
+    #[test]
+    fn packed_stat_index_invalidated_by_set_data() {
+        let mut state = fresh_state();
+        state.packed_stat_index = Some(HashMap::new());
+        state.set_data(Vec::new(), Vec::new());
+        assert!(state.packed_stat_index.is_none());
+    }
+
+    #[test]
+    fn packed_stat_index_invalidated_by_wipe_state() {
+        let mut state = fresh_state();
+        state.packed_stat_index = Some(HashMap::new());
+        state.wipe_state();
+        assert!(state.packed_stat_index.is_none());
     }
 
     /// Missing entry raises EntryNotFound — Python's corresponding
