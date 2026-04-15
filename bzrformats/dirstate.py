@@ -1267,24 +1267,11 @@ class DirState:
             to prevent unneeded overhead when callers have a sorted list already.
         :return: Nothing.
         """
-        if new_entries[0][0][0:2] != (b"", b""):
-            raise AssertionError(f"Missing root row {new_entries[0][0]!r}")
-        # The two blocks here are deliberate: the root block and the
-        # contents-of-root block.
-        self._dirblocks = [(b"", []), (b"", [])]
-        current_block = self._dirblocks[0][1]
-        current_dirname = b""
-        append_entry = current_block.append
-        for entry in new_entries:
-            if entry[0][0] != current_dirname:
-                # new block - different dirname
-                current_block = []
-                current_dirname = entry[0][0]
-                self._dirblocks.append((current_dirname, current_block))
-                append_entry = current_block.append
-            # append the entry to the current block
-            append_entry(entry)
-        self._split_root_dirblock_into_contents()
+        # Pure-Rust implementation rebuilds the dirblocks from the
+        # sorted entry stream and runs split_root_dirblock_into_contents
+        # as the last step. Sync the result back into Python's mirror.
+        self._rs.entries_to_current_state(new_entries)
+        self._dirblocks = self._rs.dirblocks
 
     def _split_root_dirblock_into_contents(self):
         """Split the root dirblocks into root and contents-of-root.

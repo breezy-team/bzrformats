@@ -720,6 +720,27 @@ impl PyDirState {
         Ok(())
     }
 
+    /// Rebuild dirblocks from a flat, sorted list of entries.
+    /// Mirrors Python's `DirState._entries_to_current_state`:
+    /// assembles per-directory dirblocks from the sorted entry
+    /// stream and runs `split_root_dirblock_into_contents` at the
+    /// end so the two empty-dirname sentinel blocks are present.
+    ///
+    /// The input is a Python iterable of entry tuples in the same
+    /// shape as `DirStateRs.dirblocks` entries. Raises `ValueError`
+    /// if the entry list is empty or does not start with the root
+    /// row.
+    fn entries_to_current_state(&mut self, new_entries: &Bound<PyAny>) -> PyResult<()> {
+        let mut entries: Vec<bazaar::dirstate::Entry> = Vec::new();
+        for item in new_entries.try_iter()? {
+            let item = item?;
+            entries.push(crate::dirstate_helpers::entry_from_py(&item)?);
+        }
+        self.inner
+            .entries_to_current_state(entries)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
+    }
+
     /// Mark the dirstate as modified. `hash_changed_keys` is an
     /// optional iterable of `(dirname, basename, file_id)` tuples
     /// indicating hash-only changes; pass `None` for a full
