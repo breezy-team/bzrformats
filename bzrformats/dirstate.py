@@ -1330,16 +1330,21 @@ class DirState:
 
         :return: The block index, True if the block for the key is present.
         """
+        # Not delegated to DirStateRs.find_block_index_from_key yet:
+        # this helper is called in tight loops inside add /
+        # update_minimal / _get_entry, and per-call dirblocks syncing
+        # turned the full test suite from 45s into 110s. Delegation
+        # has to wait until _dirblocks ownership flips to Rust once
+        # and for all.
         if key[0:2] == (b"", b""):
             return 0, True
-        try:
-            if (
-                self._last_block_index is not None
-                and self._dirblocks[self._last_block_index][0] == key[0]
-            ):
+        if self._last_block_index is not None:
+            try:
+                last_block_dirname = self._dirblocks[self._last_block_index][0]
+            except IndexError:
+                last_block_dirname = None
+            if last_block_dirname == key[0]:
                 return self._last_block_index, True
-        except IndexError:
-            pass
         block_index = bisect_dirblock(
             self._dirblocks, key[0], 1, cache=self._split_path_cache
         )
