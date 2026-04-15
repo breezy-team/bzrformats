@@ -1274,28 +1274,6 @@ class DirState:
         # only so tooling and sphinx autodoc see a method on `DirState`.
         raise AssertionError("_entry_to_line should be rebound from _dirstate_rs")
 
-    def _find_block(self, key, add_if_missing=False):
-        """Return the block that key should be present in.
-
-        :param key: A dirstate entry key.
-        :return: The block tuple.
-        """
-        block_index, present = self._find_block_index_from_key(key)
-        if not present:
-            if not add_if_missing:
-                # check to see if key is versioned itself - we might want to
-                # add it anyway, because dirs with no entries dont get a
-                # dirblock at parse time.
-                # This is an uncommon branch to take: most dirs have children,
-                # and most code works with versioned paths.
-                parent_base, parent_name = osutils.split(key[0])
-                if not self._get_block_entry_index(parent_base, parent_name, 0)[3]:
-                    # some parent path has not been added - its an error to add
-                    # this child
-                    raise NotVersionedError(key[0:2], str(self))
-            self._dirblocks.insert(block_index, (key[0], []))
-        return self._dirblocks[block_index]
-
     def _find_block_index_from_key(self, key):
         """Find the dirblock index for a key.
 
@@ -2795,24 +2773,6 @@ class DirState:
         )
         self._dirblocks = self._rs.dirblocks
         self._id_index = None
-
-    def _maybe_remove_row(self, block, index, id_index):
-        """Remove index if it is absent or relocated across the row.
-
-        id_index is updated accordingly.
-        :return: True if we removed the row, False otherwise
-        """
-        present_in_row = False
-        entry = block[index]
-        for column in entry[1]:
-            if column[0] not in (b"a", b"r"):
-                present_in_row = True
-                break
-        if not present_in_row:
-            block.pop(index)
-            id_index.remove(entry[0])
-            return True
-        return False
 
     def _validate(self):
         """Check that invariants on the dirblock are correct.
