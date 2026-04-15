@@ -675,6 +675,7 @@ impl PyDirState {
         let new_blocks = crate::dirstate_helpers::dirblocks_from_py(value)?;
         self.inner.dirblocks = new_blocks;
         self.inner.id_index = None;
+        self.inner.packed_stat_index = None;
         Ok(())
     }
 
@@ -779,6 +780,23 @@ impl PyDirState {
             bei.dir_present,
             bei.path_present,
         )
+    }
+
+    /// Return the sha1 of the file whose packed_stat matches
+    /// `packed_stat`, or `None` if no such file is present. Mirrors
+    /// Python's `DirState.sha1_from_stat` slow path
+    /// (`_get_packed_stat_index().get(pack_stat(stat))`). The caller
+    /// provides the already-packed stat bytes since pack_stat is
+    /// already a pure-Rust pyo3 function on the module.
+    fn sha1_from_packed_stat<'py>(
+        &mut self,
+        py: Python<'py>,
+        packed_stat: &[u8],
+    ) -> Option<Bound<'py, PyBytes>> {
+        self.inner
+            .get_or_build_packed_stat_index()
+            .get(packed_stat)
+            .map(|sha1| PyBytes::new(py, sha1))
     }
 
     /// Mark the entry at `key` as absent for tree 0, returning True

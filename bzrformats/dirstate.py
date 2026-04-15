@@ -489,8 +489,6 @@ class DirState:
         self._lock_token = None
         self._lock_state = None
         self._id_index = None
-        # a map from packed_stat to sha's.
-        self._packed_stat_index = None
         self._split_path_cache = {}
         self._bisect_page_size = DirState.BISECT_PAGE_SIZE
         self._sha1_provider = sha1_provider
@@ -2530,17 +2528,8 @@ class DirState:
 
     def sha1_from_stat(self, path, stat_result):
         """Find a sha1 given a stat lookup."""
-        return self._get_packed_stat_index().get(pack_stat(stat_result), None)
-
-    def _get_packed_stat_index(self):
-        """Get a packed_stat index of self._dirblocks."""
-        if self._packed_stat_index is None:
-            index = {}
-            for _key, tree_details in self._iter_entries():
-                if tree_details[0][0] == b"f":
-                    index[tree_details[0][4]] = tree_details[0][1]
-            self._packed_stat_index = index
-        return self._packed_stat_index
+        self._rs.dirblocks = self._dirblocks
+        return self._rs.sha1_from_packed_stat(pack_stat(stat_result))
 
     def save(self):
         """Save any pending changes created during this session.
@@ -2619,11 +2608,10 @@ class DirState:
         # Rust side absorbs parent_ids and dirblocks, marks both states
         # fully modified, and clears its id_index cache.
         self._rs.set_data(parent_ids, dirblocks)
-        # Python still keeps its own _dirblocks mirror and caches in
-        # sync with the Rust side until they migrate.
+        # Python still keeps its own _dirblocks mirror in sync with
+        # the Rust side until it migrates.
         self._dirblocks = dirblocks
         self._id_index = None
-        self._packed_stat_index = None
 
     def set_path_id(self, path, new_id):
         """Change the id of path to new_id in the current working tree.
@@ -2987,7 +2975,6 @@ class DirState:
                 current_old = advance(old_iterator)
         self._mark_modified()
         self._id_index = None
-        self._packed_stat_index = None
         if tracing:
             logger.debug("set_state_from_inventory complete.")
 
@@ -3410,7 +3397,6 @@ class DirState:
         # _dirblocks mirror; reset them explicitly until they migrate.
         self._dirblocks = []
         self._id_index = None
-        self._packed_stat_index = None
         self._split_path_cache = {}
 
     def lock_read(self):
