@@ -3494,16 +3494,15 @@ class DirState:
 
     def _wipe_state(self):
         """Forget all state information about the dirstate."""
-        self._header_state = DirState.NOT_IN_MEMORY
-        self._dirblock_state = DirState.NOT_IN_MEMORY
-        self._changes_aborted = False
-        self._parents = []
-        self._ghosts = []
+        # Rust side wipes header/dirblock state, changes_aborted,
+        # parents, ghosts, dirblocks (now empty on the Rust side),
+        # id_index (on the Rust side), end_of_header, cutoff_time.
+        self._rs.wipe_state()
+        # Python still owns these caches and the authoritative
+        # _dirblocks mirror; reset them explicitly until they migrate.
         self._dirblocks = []
         self._id_index = None
         self._packed_stat_index = None
-        self._end_of_header = None
-        self._cutoff_time = None
         self._split_path_cache = {}
 
     def lock_read(self):
