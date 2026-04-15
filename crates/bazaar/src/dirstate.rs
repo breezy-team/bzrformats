@@ -2012,10 +2012,12 @@ impl DirState {
                     find_block_index_from_key(&self.dirblocks, &entry_key);
                 block_index = new_block_index;
                 present = new_present;
-                // We expect the block to exist now; the entry itself
-                // is still absent.
-                debug_assert!(!present);
+                // ensure_block must have created the dirblock for
+                // `dirname`; `present` here refers to the dirblock,
+                // not the entry inside it.
+                debug_assert!(present);
             }
+            let _ = present;
 
             let (entry_index, entry_present) =
                 find_entry_index(&entry_key, &self.dirblocks[block_index].entries);
@@ -2218,6 +2220,51 @@ impl DirState {
 
         self.id_index = None;
         self.packed_stat_index = None;
+        Ok(())
+    }
+
+    /// Verify that none of `new_ids` is already present at a live
+    /// entry in `tree_index`. Mirrors Python's
+    /// `DirState._check_delta_ids_absent` — used by both
+    /// `update_by_delta` and `update_basis_by_delta` to guard against
+    /// a delta that resurrects an already-present file id.
+    ///
+    /// On a conflict, returns [`BasisApplyError::Invalid`] carrying
+    /// the first offending path / file id.
+    pub fn check_delta_ids_absent(
+        &mut self,
+        new_ids: &[Vec<u8>],
+        tree_index: usize,
+    ) -> Result<(), BasisApplyError> {
+        if new_ids.is_empty() {
+            return Ok(());
+        }
+        let _ = self.get_or_build_id_index();
+        for file_id in new_ids {
+            let fid = FileId::from(file_id);
+            let candidates = self.id_index.as_ref().unwrap().get(&fid);
+            for (dn, bn, _) in candidates {
+                let bei = get_block_entry_index(&self.dirblocks, &dn, &bn, tree_index);
+                if !bei.path_present {
+                    continue;
+                }
+                let entry = &self.dirblocks[bei.block_index].entries[bei.entry_index];
+                if entry.key.file_id != *file_id {
+                    continue;
+                }
+                let mut path = dn.clone();
+                if !path.is_empty() {
+                    path.push(b'/');
+                }
+                path.extend_from_slice(&bn);
+                return Err(BasisApplyError::Invalid {
+                    path,
+                    file_id: file_id.clone(),
+                    reason: "This file_id is new in the delta but already present in the target"
+                        .to_string(),
+                });
+            }
+        }
         Ok(())
     }
 

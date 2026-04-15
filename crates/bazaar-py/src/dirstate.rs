@@ -1015,6 +1015,27 @@ impl PyDirState {
         none_pair()
     }
 
+    /// Verify that none of `new_ids` is already present at a live
+    /// entry in `tree_index`. Mirrors Python's
+    /// `DirState._check_delta_ids_absent`. Raises
+    /// `InconsistentDelta` on conflict, via the shared
+    /// `raise_basis_apply_error` helper.
+    fn check_delta_ids_absent(
+        &mut self,
+        py: Python<'_>,
+        new_ids: &Bound<PyAny>,
+        tree_index: usize,
+    ) -> PyResult<()> {
+        let mut ids: Vec<Vec<u8>> = Vec::new();
+        for item in new_ids.try_iter()? {
+            ids.push(item?.extract()?);
+        }
+        match self.inner.check_delta_ids_absent(&ids, tree_index) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
+        }
+    }
+
     /// Update a single entry in tree 0. Mirrors Python's
     /// `DirState.update_minimal`. Inputs are passed as separate
     /// positional arguments rather than bundled into a tuple to

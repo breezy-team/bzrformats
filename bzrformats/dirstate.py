@@ -1638,25 +1638,8 @@ class DirState:
         """Check that none of the file_ids in new_ids are present in a tree."""
         if not new_ids:
             return
-        id_index = self._get_id_index()
-        for file_id in new_ids:
-            for key in id_index.get(file_id):
-                block_i, entry_i, _d_present, f_present = self._get_block_entry_index(
-                    key[0], key[1], tree_index
-                )
-                if not f_present:
-                    # In a different tree
-                    continue
-                entry = self._dirblocks[block_i][1][entry_i]
-                if entry[0][2] != file_id:
-                    # Different file_id, so not what we want.
-                    continue
-                self._raise_invalid(
-                    (b"%s/%s" % key[0:2]).decode("utf8"),
-                    file_id,
-                    "This file_id is new in the delta but already present in "
-                    "the target",
-                )
+        self._rs.dirblocks = self._dirblocks
+        self._rs.check_delta_ids_absent(list(new_ids), tree_index)
 
     def _raise_invalid(self, path, file_id, reason):
         self._changes_aborted = True
