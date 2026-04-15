@@ -4029,7 +4029,7 @@ class ProcessEntryPython:
 
     def __iter__(self):
         """Return iterator for processing entries."""
-        return self
+        return self.iter_changes()
 
     def _gather_result_for_consistency(self, result):
         """Check a result we will yield to make sure we are consistent later.

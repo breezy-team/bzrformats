@@ -291,22 +291,16 @@ impl ProcessEntryC {
         })
     }
 
-    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
-        slf
-    }
-
-    fn __next__(&self, py: Python) -> PyResult<Option<Py<PyAny>>> {
+    fn __iter__(&self, py: Python) -> PyResult<Py<PyAny>> {
+        // Delegate to the inner Python object's iter_changes() generator so
+        // that `for x in process_entry_c` works.
         let inner = self.inner.bind(py);
-        match inner.call_method0("__next__") {
-            Ok(result) => Ok(Some(result.into())),
-            Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => Ok(None),
-            Err(e) => Err(e),
-        }
+        Ok(inner.call_method0("iter_changes")?.into())
     }
 
-    fn iter_changes(&self, py: Python) -> Py<PyAny> {
-        // ProcessEntryPython.iter_changes() returns self
-        self.inner.clone_ref(py)
+    fn iter_changes(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let inner = self.inner.bind(py);
+        Ok(inner.call_method0("iter_changes")?.into())
     }
 
     #[getter]
