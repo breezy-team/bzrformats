@@ -410,7 +410,7 @@ pub enum YesNo {
 /// will probably support partially-in-memory as a separate variable,
 /// allowing for partially-in-memory unmodified and partially-in-memory
 /// modified states.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum MemoryState {
     /// indicates that no data is in memory
     NotInMemory,

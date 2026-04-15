@@ -313,6 +313,296 @@ fn DefaultSHA1Provider() -> PyResult<SHA1Provider> {
     })
 }
 
+/// Python constants that [`DirStateRs`] uses in its scalar-state
+/// getters/setters to match `bzrformats.dirstate.DirState`'s
+/// `NOT_IN_MEMORY` / `IN_MEMORY_UNMODIFIED` / `IN_MEMORY_MODIFIED` /
+/// `IN_MEMORY_HASH_MODIFIED` class attributes.
+const PY_NOT_IN_MEMORY: i64 = 0;
+const PY_IN_MEMORY_UNMODIFIED: i64 = 1;
+const PY_IN_MEMORY_MODIFIED: i64 = 2;
+const PY_IN_MEMORY_HASH_MODIFIED: i64 = 3;
+
+fn memory_state_to_py(state: bazaar::dirstate::MemoryState) -> i64 {
+    use bazaar::dirstate::MemoryState;
+    match state {
+        MemoryState::NotInMemory => PY_NOT_IN_MEMORY,
+        MemoryState::InMemoryUnmodified => PY_IN_MEMORY_UNMODIFIED,
+        MemoryState::InMemoryModified => PY_IN_MEMORY_MODIFIED,
+        MemoryState::InMemoryHashModified => PY_IN_MEMORY_HASH_MODIFIED,
+    }
+}
+
+fn memory_state_from_py(value: i64) -> PyResult<bazaar::dirstate::MemoryState> {
+    use bazaar::dirstate::MemoryState;
+    match value {
+        PY_NOT_IN_MEMORY => Ok(MemoryState::NotInMemory),
+        PY_IN_MEMORY_UNMODIFIED => Ok(MemoryState::InMemoryUnmodified),
+        PY_IN_MEMORY_MODIFIED => Ok(MemoryState::InMemoryModified),
+        PY_IN_MEMORY_HASH_MODIFIED => Ok(MemoryState::InMemoryHashModified),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid memory state: {}",
+            other
+        ))),
+    }
+}
+
+/// Python-facing owner of a pure-Rust [`bazaar::dirstate::DirState`].
+///
+/// This is the beginning of the gradual replacement of
+/// `bzrformats.dirstate.DirState` with the Rust port: each commit
+/// exposes a few more attributes or methods, Python's `DirState`
+/// gradually delegates to them, and once the whole surface is here
+/// the Python class collapses into a thin shim.
+///
+/// Commit 1 (this one) only exposes the scalar state flags and the
+/// methods from the pure crate that do not touch dirblocks/parents
+/// (`worth_saving`, `wipe_state`, `mark_modified`, `mark_unmodified`,
+/// `num_present_parents`). Dirblocks, parents, ghosts, id_index, the
+/// save path, and the various get_entry/iter variants come in later
+/// commits.
+#[pyclass(name = "DirStateRs", unsendable)]
+struct PyDirState {
+    inner: bazaar::dirstate::DirState,
+}
+
+#[pymethods]
+impl PyDirState {
+    /// Construct an empty dirstate at `path`. Mirrors Python's
+    /// `DirState.__init__` for the pure-state fields only — lock and
+    /// file-object plumbing stays on the Python side until its
+    /// counterpart exists in Rust.
+    #[new]
+    #[pyo3(signature = (
+        path,
+        sha1_provider = None,
+        worth_saving_limit = 0,
+        use_filesystem_for_exec = true,
+        fdatasync = false,
+    ))]
+    fn new(
+        path: &Bound<PyAny>,
+        sha1_provider: Option<&Bound<PyAny>>,
+        worth_saving_limit: i64,
+        use_filesystem_for_exec: bool,
+        fdatasync: bool,
+    ) -> PyResult<Self> {
+        let path = extract_path(path)?;
+        // Commit 1 only supports the default sha1 provider. Custom
+        // providers — whether the pyo3 SHA1Provider wrapper or an
+        // arbitrary Python callable — need a dedicated adapter, which
+        // is a follow-up commit.
+        if sha1_provider.is_some() {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "custom sha1_provider is not yet wired through DirStateRs",
+            ));
+        }
+        let provider: Box<dyn bazaar::dirstate::SHA1Provider> =
+            Box::new(bazaar::dirstate::DefaultSHA1Provider::new());
+        Ok(Self {
+            inner: bazaar::dirstate::DirState::new(
+                path,
+                provider,
+                worth_saving_limit,
+                use_filesystem_for_exec,
+                fdatasync,
+            ),
+        })
+    }
+
+    /// On-disk filename the dirstate points at. Read-only; matches
+    /// Python's `DirState._filename` attribute.
+    #[getter]
+    fn filename<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        // Python stores `_filename` as bytes on POSIX and as str on
+        // Windows; we always return bytes for now, matching the
+        // POSIX-only branch that dirstate tests exercise.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            Ok(PyBytes::new(py, self.inner.filename.as_os_str().as_bytes()))
+        }
+        #[cfg(not(unix))]
+        {
+            let s = self
+                .inner
+                .filename
+                .to_str()
+                .ok_or_else(|| PyTypeError::new_err("dirstate filename is not valid utf-8"))?;
+            Ok(PyBytes::new(py, s.as_bytes()))
+        }
+    }
+
+    /// Header state flag matching Python's `_header_state` attribute.
+    #[getter]
+    fn header_state(&self) -> i64 {
+        memory_state_to_py(self.inner.header_state)
+    }
+
+    #[setter]
+    fn set_header_state(&mut self, value: i64) -> PyResult<()> {
+        self.inner.header_state = memory_state_from_py(value)?;
+        Ok(())
+    }
+
+    /// Dirblock state flag matching Python's `_dirblock_state`.
+    #[getter]
+    fn dirblock_state(&self) -> i64 {
+        memory_state_to_py(self.inner.dirblock_state)
+    }
+
+    #[setter]
+    fn set_dirblock_state(&mut self, value: i64) -> PyResult<()> {
+        self.inner.dirblock_state = memory_state_from_py(value)?;
+        Ok(())
+    }
+
+    #[getter]
+    fn changes_aborted(&self) -> bool {
+        self.inner.changes_aborted
+    }
+
+    #[setter]
+    fn set_changes_aborted(&mut self, value: bool) {
+        self.inner.changes_aborted = value;
+    }
+
+    /// Offset in the backing file where the header ends and the
+    /// dirblock body begins. `None` before the header has been read.
+    /// Matches Python's `_end_of_header` attribute.
+    #[getter]
+    fn end_of_header(&self) -> Option<u64> {
+        self.inner.end_of_header
+    }
+
+    #[setter]
+    fn set_end_of_header(&mut self, value: Option<u64>) {
+        self.inner.end_of_header = value;
+    }
+
+    /// Cutoff mtime/ctime used when deciding whether cached sha1s are
+    /// trustworthy. `None` before `_sha_cutoff_time` runs. Matches
+    /// Python's `_cutoff_time` attribute.
+    #[getter]
+    fn cutoff_time(&self) -> Option<i64> {
+        self.inner.cutoff_time
+    }
+
+    #[setter]
+    fn set_cutoff_time(&mut self, value: Option<i64>) {
+        self.inner.cutoff_time = value;
+    }
+
+    /// Declared entry count from the header. Matches Python's
+    /// `_num_entries`; Python stores `None` before the header is read,
+    /// but the Rust struct always has a count, so we expose the
+    /// numeric value unconditionally.
+    #[getter]
+    fn num_entries(&self) -> usize {
+        self.inner.num_entries
+    }
+
+    #[setter]
+    fn set_num_entries(&mut self, value: usize) {
+        self.inner.num_entries = value;
+    }
+
+    #[getter]
+    fn worth_saving_limit(&self) -> i64 {
+        self.inner.worth_saving_limit
+    }
+
+    #[setter]
+    fn set_worth_saving_limit(&mut self, value: i64) {
+        self.inner.worth_saving_limit = value;
+    }
+
+    #[getter]
+    fn fdatasync(&self) -> bool {
+        self.inner.fdatasync
+    }
+
+    #[setter]
+    fn set_fdatasync(&mut self, value: bool) {
+        self.inner.fdatasync = value;
+    }
+
+    #[getter]
+    fn use_filesystem_for_exec(&self) -> bool {
+        self.inner.use_filesystem_for_exec
+    }
+
+    #[setter]
+    fn set_use_filesystem_for_exec(&mut self, value: bool) {
+        self.inner.use_filesystem_for_exec = value;
+    }
+
+    #[getter]
+    fn bisect_page_size(&self) -> usize {
+        self.inner.bisect_page_size
+    }
+
+    #[setter]
+    fn set_bisect_page_size(&mut self, value: usize) {
+        self.inner.bisect_page_size = value;
+    }
+
+    /// Number of parent entries present in each record row. Mirrors
+    /// Python's `DirState._num_present_parents`.
+    fn num_present_parents(&self) -> usize {
+        self.inner.num_present_parents()
+    }
+
+    /// Whether the current in-memory state is worth persisting. Mirrors
+    /// `DirState._worth_saving`.
+    fn worth_saving(&self) -> bool {
+        self.inner.worth_saving()
+    }
+
+    /// Forget all in-memory state. Mirrors `DirState._wipe_state`.
+    fn wipe_state(&mut self) {
+        self.inner.wipe_state();
+    }
+
+    /// Mark the dirstate as modified. `hash_changed_keys` is an
+    /// optional iterable of `(dirname, basename, file_id)` tuples
+    /// indicating hash-only changes; pass `None` for a full
+    /// modification. Mirrors `DirState._mark_modified`.
+    #[pyo3(signature = (hash_changed_keys = None, header_modified = false))]
+    fn mark_modified(
+        &mut self,
+        hash_changed_keys: Option<&Bound<PyAny>>,
+        header_modified: bool,
+    ) -> PyResult<()> {
+        let mut keys: Vec<bazaar::dirstate::EntryKey> = Vec::new();
+        if let Some(iter) = hash_changed_keys {
+            for item in iter.try_iter()? {
+                let tup = item?.cast_into::<PyTuple>()?;
+                if tup.len() != 3 {
+                    return Err(PyTypeError::new_err(
+                        "hash_changed_keys entries must be 3-tuples",
+                    ));
+                }
+                let dirname: Vec<u8> = tup.get_item(0)?.extract()?;
+                let basename: Vec<u8> = tup.get_item(1)?.extract()?;
+                let file_id: Vec<u8> = tup.get_item(2)?.extract()?;
+                keys.push(bazaar::dirstate::EntryKey {
+                    dirname,
+                    basename,
+                    file_id,
+                });
+            }
+        }
+        self.inner.mark_modified(&keys, header_modified);
+        Ok(())
+    }
+
+    /// Mark the dirstate as unmodified. Mirrors
+    /// `DirState._mark_unmodified`.
+    fn mark_unmodified(&mut self) {
+        self.inner.mark_unmodified();
+    }
+}
+
 fn extract_fs_time(obj: &Bound<PyAny>) -> PyResult<u64> {
     if let Ok(u) = obj.extract::<u64>() {
         Ok(u)
@@ -468,6 +758,7 @@ pub fn _dirstate_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(get_ghosts_line))?;
     m.add_wrapped(wrap_pyfunction!(get_parents_line))?;
     m.add_class::<IdIndex>()?;
+    m.add_class::<PyDirState>()?;
     m.add_wrapped(wrap_pyfunction!(inv_entry_to_details))?;
     m.add_wrapped(wrap_pyfunction!(get_output_lines))?;
 
