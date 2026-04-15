@@ -1903,6 +1903,29 @@ impl DirState {
         }
     }
 
+    /// Sort `entries` into canonical dirblock order. Mirrors Python's
+    /// `DirState._sort_entries`: the sort key is
+    /// `(dirname.split(b"/"), basename, file_id)`, which matches the
+    /// order `_entries_to_current_state` expects before writing.
+    ///
+    /// The Python version caches `dirname → split` because real-world
+    /// calls re-sort ~10× more entries than distinct directories;
+    /// Rust's `sort_by_cached_key` gets the same amortisation
+    /// automatically.
+    pub fn sort_entries(entries: &mut [Entry]) {
+        entries.sort_by_cached_key(|e| {
+            (
+                e.key
+                    .dirname
+                    .split(|&b| b == b'/')
+                    .map(|s| s.to_vec())
+                    .collect::<Vec<Vec<u8>>>(),
+                e.key.basename.clone(),
+                e.key.file_id.clone(),
+            )
+        });
+    }
+
     /// Return references to every dirstate entry whose key `(dirname,
     /// basename)` matches `path_utf8`, across all file ids. Mirrors
     /// Python's `DirState._entries_for_path`: a path can be represented
@@ -3382,6 +3405,73 @@ mod dirstate_struct_tests {
     /// path and verify the expected (dirname, basename, file_id) key
     /// comes back — or `None` for paths that don't exist or live under
     /// a non-existent directory.
+    #[test]
+    fn sort_entries_orders_by_dirname_basename_file_id() {
+        // Shuffled input covering root, shallow file, nested file, and
+        // deeper nested file; we expect canonical dirblock order on the
+        // way out.
+        let mut entries = vec![
+            make_entry(b"a", b"e", b"fid-e"),
+            make_entry(b"", b"", b"TREE_ROOT"),
+            make_entry(b"b", b"g", b"fid-g"),
+            make_entry(b"", b"a", b"fid-a"),
+            make_entry(b"a", b"f", b"fid-f"),
+        ];
+        DirState::sort_entries(&mut entries);
+        let keys: Vec<(&[u8], &[u8], &[u8])> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.key.dirname.as_slice(),
+                    e.key.basename.as_slice(),
+                    e.key.file_id.as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (b"".as_slice(), b"".as_slice(), b"TREE_ROOT".as_slice()),
+                (b"".as_slice(), b"a".as_slice(), b"fid-a".as_slice()),
+                (b"a".as_slice(), b"e".as_slice(), b"fid-e".as_slice()),
+                (b"a".as_slice(), b"f".as_slice(), b"fid-f".as_slice()),
+                (b"b".as_slice(), b"g".as_slice(), b"fid-g".as_slice()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_entries_breaks_basename_ties_on_file_id() {
+        // Same (dirname, basename) with different file ids.
+        let mut entries = vec![
+            make_entry(b"a", b"e", b"fid-z"),
+            make_entry(b"a", b"e", b"fid-a"),
+        ];
+        DirState::sort_entries(&mut entries);
+        assert_eq!(entries[0].key.file_id, b"fid-a".to_vec());
+        assert_eq!(entries[1].key.file_id, b"fid-z".to_vec());
+    }
+
+    #[test]
+    fn sort_entries_split_ordering_differs_from_raw_bytes() {
+        // Python's `_sort_entries` splits the dirname on '/' before
+        // comparing, which is the whole point of the port: a purely
+        // byte-wise sort would put `"a-b"` before `"a/..."` because
+        // `'-' < '/'`, while the split-based sort puts them *after*
+        // every entry under `"a"`.
+        let mut entries = vec![
+            make_entry(b"a-b", b"x", b"fid-x"),
+            make_entry(b"a/c", b"y", b"fid-y"),
+            make_entry(b"a", b"z", b"fid-z"),
+        ];
+        DirState::sort_entries(&mut entries);
+        let dirnames: Vec<&[u8]> = entries.iter().map(|e| e.key.dirname.as_slice()).collect();
+        assert_eq!(
+            dirnames,
+            vec![b"a".as_slice(), b"a/c".as_slice(), b"a-b".as_slice()]
+        );
+    }
+
     #[test]
     fn entries_for_path_returns_all_rows_at_path() {
         let state = create_complex_dirstate();
