@@ -831,6 +831,89 @@ impl PyDirState {
             .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))
     }
 
+    /// Apply a sequence of "adds" to tree 1. Mirrors Python's
+    /// `DirState._update_basis_apply_adds`. The input is a Python
+    /// iterable of `(old_path, new_path, file_id, new_details,
+    /// real_add)` 5-tuples where `new_details` itself is a
+    /// `(minikind, fingerprint, size, executable, packed_stat)`
+    /// 5-tuple, matching the shape Python's `update_basis_by_delta`
+    /// passes through today.
+    ///
+    /// Raises `InconsistentDelta(path, file_id, reason)` for
+    /// caller-visible delta problems (setting `changes_aborted` on
+    /// the inner state first, mirroring Python's `_raise_invalid`),
+    /// `NotImplementedError` for the basis-relocation branch, and
+    /// `AssertionError` for internal invariant violations.
+    fn update_basis_apply_adds(&mut self, adds: &Bound<PyAny>) -> PyResult<()> {
+        let mut rust_adds: Vec<bazaar::dirstate::BasisAdd> = Vec::new();
+        for item in adds.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            if tup.len() != 5 {
+                return Err(PyTypeError::new_err(
+                    "update_basis_apply_adds entries must be 5-tuples",
+                ));
+            }
+            let old_path: Option<Vec<u8>> = {
+                let obj = tup.get_item(0)?;
+                if obj.is_none() {
+                    None
+                } else {
+                    Some(obj.extract()?)
+                }
+            };
+            let new_path: Vec<u8> = tup.get_item(1)?.extract()?;
+            let file_id: Vec<u8> = tup.get_item(2)?.extract()?;
+            let details_tup = tup.get_item(3)?.cast_into::<PyTuple>()?;
+            if details_tup.len() != 5 {
+                return Err(PyTypeError::new_err(
+                    "entry details tuple must have 5 fields",
+                ));
+            }
+            let minikind_bytes: Vec<u8> = details_tup.get_item(0)?.extract()?;
+            let new_details = bazaar::dirstate::TreeData {
+                minikind: minikind_bytes.first().copied().unwrap_or(0),
+                fingerprint: details_tup.get_item(1)?.extract()?,
+                size: details_tup.get_item(2)?.extract()?,
+                executable: details_tup.get_item(3)?.extract()?,
+                packed_stat: details_tup.get_item(4)?.extract()?,
+            };
+            let real_add: bool = tup.get_item(4)?.extract()?;
+            rust_adds.push(bazaar::dirstate::BasisAdd {
+                old_path,
+                new_path,
+                file_id,
+                new_details,
+                real_add,
+            });
+        }
+
+        match self.inner.update_basis_apply_adds(&mut rust_adds) {
+            Ok(()) => Ok(()),
+            Err(bazaar::dirstate::BasisApplyError::Invalid {
+                path,
+                file_id,
+                reason,
+            }) => {
+                // Match Python's `_raise_invalid`, which sets
+                // `_changes_aborted = True` before raising.
+                self.inner.changes_aborted = true;
+                let py = adds.py();
+                let errors_mod = py.import("bzrformats.errors")?;
+                let cls = errors_mod.getattr("InconsistentDelta")?;
+                let path_bytes = PyBytes::new(py, &path);
+                let file_id_bytes = PyBytes::new(py, &file_id);
+                let instance = cls.call1((path_bytes, file_id_bytes, reason))?;
+                Err(PyErr::from_value(instance))
+            }
+            Err(bazaar::dirstate::BasisApplyError::NotImplemented { reason }) => {
+                Err(pyo3::exceptions::PyNotImplementedError::new_err(reason))
+            }
+            Err(bazaar::dirstate::BasisApplyError::Internal { reason }) => {
+                Err(pyo3::exceptions::PyAssertionError::new_err(reason))
+            }
+        }
+    }
+
     /// Replace the entire in-memory state with `parent_ids` and
     /// `dirblocks` (both in the Python tuple shape), marking both the
     /// header and the dirblock data fully modified. Mirrors Python's
