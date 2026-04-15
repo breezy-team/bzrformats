@@ -2449,34 +2449,14 @@ class DirState:
         Asking for the children of a non-directory will return an empty
         iterator.
         """
-        pending_dirs = []
-        next_pending_dirs = [path_utf8]
-        absent = (b"a", b"r")
-        while next_pending_dirs:
-            pending_dirs = next_pending_dirs
-            next_pending_dirs = []
-            for path in pending_dirs:
-                block_index, present = self._find_block_index_from_key((path, b"", b""))
-                if block_index == 0:
-                    block_index = 1
-                    if len(self._dirblocks) == 1:
-                        # asked for the children of the root with no other
-                        # contents.
-                        return
-                if not present:
-                    # children of a non-directory asked for.
-                    continue
-                block = self._dirblocks[block_index]
-                for entry in block[1]:
-                    kind = entry[1][tree_index][0]
-                    if kind not in absent:
-                        yield entry
-                    if kind == b"d":
-                        if entry[0][0]:
-                            path = entry[0][0] + b"/" + entry[0][1]
-                        else:
-                            path = entry[0][1]
-                        next_pending_dirs.append(path)
+        # Temporary sync boundary: push Python's dirblocks into the
+        # DirStateRs wrapper before calling the pure-Rust walker. The
+        # returned entries are snapshot tuples — the two call sites in
+        # update_basis_by_delta only read them, so the aliasing
+        # difference from the previous `yield entry` version is
+        # invisible to callers.
+        self._rs.dirblocks = self._dirblocks
+        return iter(self._rs.iter_child_entries(tree_index, path_utf8))
 
     def _iter_entries(self):
         """Iterate over all the entries in the dirstate.

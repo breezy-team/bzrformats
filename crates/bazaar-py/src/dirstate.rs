@@ -717,6 +717,51 @@ impl PyDirState {
         let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
         PyList::new(py, items)
     }
+
+    /// Walk the subtree rooted at `path_utf8` and return every live
+    /// entry in `tree_index`. Mirrors Python's
+    /// `DirState._iter_child_entries`. Returns a list of Python
+    /// entries in the same tuple shape as `DirStateRs.dirblocks`.
+    ///
+    /// The result is a snapshot: mutating returned entry tuples does
+    /// NOT write back to the Rust-owned dirblocks. Callers that need
+    /// in-place mutation must go through the (not-yet-exposed) Rust
+    /// mutation methods.
+    fn iter_child_entries<'py>(
+        &mut self,
+        py: Python<'py>,
+        tree_index: usize,
+        path_utf8: &[u8],
+    ) -> PyResult<Bound<'py, PyList>> {
+        let entries = self.inner.iter_child_entries(tree_index, path_utf8);
+        let out = PyList::empty(py);
+        for entry in &entries {
+            let key = PyTuple::new(
+                py,
+                [
+                    PyBytes::new(py, &entry.key.dirname).into_any(),
+                    PyBytes::new(py, &entry.key.basename).into_any(),
+                    PyBytes::new(py, &entry.key.file_id).into_any(),
+                ],
+            )?;
+            let trees = PyList::empty(py);
+            for tree in &entry.trees {
+                let tree_tuple = PyTuple::new(
+                    py,
+                    [
+                        PyBytes::new(py, &[tree.minikind]).into_any(),
+                        PyBytes::new(py, &tree.fingerprint).into_any(),
+                        tree.size.into_pyobject(py)?.into_any(),
+                        tree.executable.into_pyobject(py)?.to_owned().into_any(),
+                        PyBytes::new(py, &tree.packed_stat).into_any(),
+                    ],
+                )?;
+                trees.append(tree_tuple)?;
+            }
+            out.append(PyTuple::new(py, [key.as_any(), trees.as_any()])?)?;
+        }
+        Ok(out)
+    }
 }
 
 fn extract_fs_time(obj: &Bound<PyAny>) -> PyResult<u64> {
