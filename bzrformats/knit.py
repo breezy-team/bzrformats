@@ -3000,20 +3000,13 @@ class _KndxIndex:
         """
         if not keys:
             return b""
-        result_list = []
         prefix = keys[0][:-1]
-        cache = self._kndx_cache[prefix][0]
+        suffixes = []
         for key in keys:
             if key[:-1] != prefix:
-                # kndx indices cannot refer across partitioned storage.
                 raise ValueError(f"mismatched prefixes for {keys!r}")
-            if key[-1] in cache:
-                # -- inlined lookup() --
-                result_list.append(b"%d" % cache[key[-1]][5])
-                # -- end lookup () --
-            else:
-                result_list.append(b"." + key[-1])
-        return b" ".join(result_list)
+            suffixes.append(key[-1])
+        return _knit_rs.dictionary_compress_rs(suffixes, self._kndx_cache[prefix][0])
 
     def _reset_cache(self):
         # Possibly this should be a LRU cache. A dictionary from key_prefix to

@@ -940,6 +940,48 @@ where
     out
 }
 
+/// Serialize a `_KnitGraphIndex`-style dictionary-compressed parent list.
+///
+/// Mirrors `_KndxIndex._dictionary_compress`: for each suffix, emit either its
+/// decimal position in the per-prefix history (when the suffix is already in
+/// the cache) or `b"." + suffix` as a fulltext fallback. Space-joined.
+///
+/// The caller extracts `cache[suffix] -> position` upfront; this function just
+/// does the encoding so the whole serialization is a single FFI crossing.
+///
+/// Returns `Err` with the offending suffix on a cache miss is NOT this
+/// function's job — the caller decides whether an unknown suffix is a fulltext
+/// fallback (current kndx behaviour) or an error.
+pub fn dictionary_compress_suffixes<S>(
+    suffixes: &[S],
+    lookup: &std::collections::HashMap<&[u8], u64>,
+) -> Vec<u8>
+where
+    S: AsRef<[u8]>,
+{
+    if suffixes.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, suffix) in suffixes.iter().enumerate() {
+        if i > 0 {
+            out.push(b' ');
+        }
+        let s = suffix.as_ref();
+        match lookup.get(s) {
+            Some(pos) => {
+                use std::io::Write;
+                write!(out, "{}", pos).unwrap();
+            }
+            None => {
+                out.push(b'.');
+                out.extend_from_slice(s);
+            }
+        }
+    }
+    out
+}
+
 /// Group keys by their first segment, preserving first-seen order per group
 /// and the global order in which new prefixes appeared.
 ///
@@ -3413,6 +3455,33 @@ mod tests {
                 expected: b"end rev-y\n".to_vec(),
                 actual: b"end wrong-id\n".to_vec(),
             }
+        );
+    }
+
+    #[test]
+    fn dictionary_compress_empty() {
+        let lookup = std::collections::HashMap::new();
+        let suffixes: Vec<&[u8]> = vec![];
+        assert_eq!(dictionary_compress_suffixes(&suffixes, &lookup), b"");
+    }
+
+    #[test]
+    fn dictionary_compress_all_cached() {
+        let mut lookup = std::collections::HashMap::new();
+        lookup.insert(&b"rev-a"[..], 0u64);
+        lookup.insert(&b"rev-b"[..], 3u64);
+        let suffixes: Vec<&[u8]> = vec![b"rev-a", b"rev-b"];
+        assert_eq!(dictionary_compress_suffixes(&suffixes, &lookup), b"0 3");
+    }
+
+    #[test]
+    fn dictionary_compress_mixed_and_fallback() {
+        let mut lookup = std::collections::HashMap::new();
+        lookup.insert(&b"rev-a"[..], 12u64);
+        let suffixes: Vec<&[u8]> = vec![b"rev-a", b"rev-ghost", b"rev-a"];
+        assert_eq!(
+            dictionary_compress_suffixes(&suffixes, &lookup),
+            b"12 .rev-ghost 12"
         );
     }
 }

@@ -1546,6 +1546,44 @@ fn get_sha1s_via_traits_rs<'py>(
     Ok(out)
 }
 
+/// Dictionary-compress a list of suffixes against a per-prefix kndx cache.
+///
+/// Mirrors `_KndxIndex._dictionary_compress`: the caller hands in the list of
+/// `key[-1]` suffixes (all from keys sharing the same prefix) and the raw
+/// `_kndx_cache[prefix][0]` dict. Each suffix is emitted as either its decimal
+/// history index (cache hit) or `.`+suffix (cache miss). The mismatched-prefix
+/// check stays on the Python side to keep error reporting identical.
+#[pyfunction]
+fn dictionary_compress_rs<'py>(
+    py: Python<'py>,
+    suffixes: Vec<Vec<u8>>,
+    cache: &Bound<'py, PyDict>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    if suffixes.is_empty() {
+        return Ok(PyBytes::new(py, b""));
+    }
+    let mut out = Vec::new();
+    for (i, suffix) in suffixes.iter().enumerate() {
+        if i > 0 {
+            out.push(b' ');
+        }
+        let key = PyBytes::new(py, suffix);
+        match cache.get_item(&key)? {
+            Some(entry) => {
+                let tup = entry.cast_into::<PyTuple>()?;
+                let pos: i64 = tup.get_item(5)?.extract()?;
+                use std::io::Write;
+                write!(out, "{}", pos).unwrap();
+            }
+            None => {
+                out.push(b'.');
+                out.extend_from_slice(suffix);
+            }
+        }
+    }
+    Ok(PyBytes::new(py, &out))
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data_c, &m)?)?;
@@ -1586,5 +1624,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(build_knit_delta_closure_wire_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(get_total_build_size_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(dictionary_compress_rs, &m)?)?;
     Ok(m)
 }
