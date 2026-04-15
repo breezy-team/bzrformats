@@ -322,6 +322,40 @@ const PY_IN_MEMORY_UNMODIFIED: i64 = 1;
 const PY_IN_MEMORY_MODIFIED: i64 = 2;
 const PY_IN_MEMORY_HASH_MODIFIED: i64 = 3;
 
+/// Build the Python tuple representation of a single dirstate entry,
+/// matching the shape `((dirname, basename, file_id),
+/// [(minikind, fingerprint, size, executable, packed_stat), ...])`
+/// that `DirStateRs.dirblocks` and the rest of the legacy Python
+/// `_dirblocks` consumers use.
+fn entry_to_py_tuple<'py>(
+    py: Python<'py>,
+    entry: &bazaar::dirstate::Entry,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let key = PyTuple::new(
+        py,
+        [
+            PyBytes::new(py, &entry.key.dirname).into_any(),
+            PyBytes::new(py, &entry.key.basename).into_any(),
+            PyBytes::new(py, &entry.key.file_id).into_any(),
+        ],
+    )?;
+    let trees = PyList::empty(py);
+    for tree in &entry.trees {
+        let tree_tuple = PyTuple::new(
+            py,
+            [
+                PyBytes::new(py, &[tree.minikind]).into_any(),
+                PyBytes::new(py, &tree.fingerprint).into_any(),
+                tree.size.into_pyobject(py)?.into_any(),
+                tree.executable.into_pyobject(py)?.to_owned().into_any(),
+                PyBytes::new(py, &tree.packed_stat).into_any(),
+            ],
+        )?;
+        trees.append(tree_tuple)?;
+    }
+    PyTuple::new(py, [key.as_any(), trees.as_any()])
+}
+
 /// Collect any Python iterable of `bytes` into a `Vec<Vec<u8>>`. Used
 /// by the parents / ghosts setters on [`PyDirState`] to accept plain
 /// Python lists as well as tuples or generators.
@@ -718,6 +752,23 @@ impl PyDirState {
         PyList::new(py, items)
     }
 
+    /// Return all dirstate entries whose key `(dirname, basename)`
+    /// matches `path_utf8`, across every file id. Mirrors Python's
+    /// `DirState._entries_for_path`. Returns a snapshot list of
+    /// entries in the `DirStateRs.dirblocks` tuple shape.
+    fn entries_for_path<'py>(
+        &self,
+        py: Python<'py>,
+        path_utf8: &[u8],
+    ) -> PyResult<Bound<'py, PyList>> {
+        let entries = self.inner.entries_for_path(path_utf8);
+        let out = PyList::empty(py);
+        for entry in entries {
+            out.append(entry_to_py_tuple(py, entry)?)?;
+        }
+        Ok(out)
+    }
+
     /// Walk the subtree rooted at `path_utf8` and return every live
     /// entry in `tree_index`. Mirrors Python's
     /// `DirState._iter_child_entries`. Returns a list of Python
@@ -736,29 +787,7 @@ impl PyDirState {
         let entries = self.inner.iter_child_entries(tree_index, path_utf8);
         let out = PyList::empty(py);
         for entry in &entries {
-            let key = PyTuple::new(
-                py,
-                [
-                    PyBytes::new(py, &entry.key.dirname).into_any(),
-                    PyBytes::new(py, &entry.key.basename).into_any(),
-                    PyBytes::new(py, &entry.key.file_id).into_any(),
-                ],
-            )?;
-            let trees = PyList::empty(py);
-            for tree in &entry.trees {
-                let tree_tuple = PyTuple::new(
-                    py,
-                    [
-                        PyBytes::new(py, &[tree.minikind]).into_any(),
-                        PyBytes::new(py, &tree.fingerprint).into_any(),
-                        tree.size.into_pyobject(py)?.into_any(),
-                        tree.executable.into_pyobject(py)?.to_owned().into_any(),
-                        PyBytes::new(py, &tree.packed_stat).into_any(),
-                    ],
-                )?;
-                trees.append(tree_tuple)?;
-            }
-            out.append(PyTuple::new(py, [key.as_any(), trees.as_any()])?)?;
+            out.append(entry_to_py_tuple(py, entry)?)?;
         }
         Ok(out)
     }
