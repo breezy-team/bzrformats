@@ -473,34 +473,24 @@ class DirState:
         :param use_filesystem_for_exec: Whether to trust the filesystem
             for executable bit information
         """
-        # _header_state and _dirblock_state represent the current state
-        # of the dirstate metadata and the per-row data respectiely.
-        # NOT_IN_MEMORY indicates that no data is in memory
-        # IN_MEMORY_UNMODIFIED indicates that what we have in memory
-        #   is the same as is on disk
-        # IN_MEMORY_MODIFIED indicates that we have a modified version
-        #   of what is on disk.
-        # In future we will add more granularity, for instance _dirblock_state
-        # will probably support partially-in-memory as a separate variable,
-        # allowing for partially-in-memory unmodified and partially-in-memory
-        # modified states.
-        self._header_state = DirState.NOT_IN_MEMORY
-        self._dirblock_state = DirState.NOT_IN_MEMORY
-        # If true, an error has been detected while updating the dirstate, and
-        # for safety we're not going to commit to disk.
-        self._changes_aborted = False
+        # All scalar state and the parents/ghosts lists live on the
+        # Rust-side DirStateRs wrapper; Python still owns the dirblocks,
+        # the id_index, the packed-stat/split-path caches, the lock
+        # plumbing, and the sha1 provider because those haven't been
+        # migrated yet.
+        self._rs = _dirstate_rs.DirStateRs(
+            path,
+            worth_saving_limit=worth_saving_limit,
+            use_filesystem_for_exec=use_filesystem_for_exec,
+            fdatasync=fdatasync,
+        )
         self._dirblocks = []
-        self._ghosts = []
-        self._parents = []
         self._state_file = None
-        self._filename = path
         self._lock_token = None
         self._lock_state = None
         self._id_index = None
         # a map from packed_stat to sha's.
         self._packed_stat_index = None
-        self._end_of_header = None
-        self._cutoff_time = None
         self._split_path_cache = {}
         self._bisect_page_size = DirState.BISECT_PAGE_SIZE
         self._sha1_provider = sha1_provider
@@ -511,12 +501,98 @@ class DirState:
         # during commit.
         self._last_block_index = None
         self._last_entry_index = None
-        # The set of known hash changes
-        self._known_hash_changes = set()
-        # How many hash changed entries can we have without saving
-        self._worth_saving_limit = worth_saving_limit
-        self._fdatasync = fdatasync
-        self._use_filesystem_for_exec = use_filesystem_for_exec
+
+    # ---- Rust-backed scalar attributes ----
+    #
+    # Each `_*` attribute below was a plain Python field before the
+    # DirStateRs migration. Python code still reads and writes the
+    # `self._foo` names (and test suites poke at them directly), so
+    # we expose them as properties that delegate to the pyclass on
+    # `self._rs`.
+
+    @property
+    def _header_state(self):
+        return self._rs.header_state
+
+    @_header_state.setter
+    def _header_state(self, value):
+        self._rs.header_state = value
+
+    @property
+    def _dirblock_state(self):
+        return self._rs.dirblock_state
+
+    @_dirblock_state.setter
+    def _dirblock_state(self, value):
+        self._rs.dirblock_state = value
+
+    @property
+    def _changes_aborted(self):
+        return self._rs.changes_aborted
+
+    @_changes_aborted.setter
+    def _changes_aborted(self, value):
+        self._rs.changes_aborted = value
+
+    @property
+    def _end_of_header(self):
+        return self._rs.end_of_header
+
+    @_end_of_header.setter
+    def _end_of_header(self, value):
+        self._rs.end_of_header = value
+
+    @property
+    def _cutoff_time(self):
+        return self._rs.cutoff_time
+
+    @_cutoff_time.setter
+    def _cutoff_time(self, value):
+        self._rs.cutoff_time = value
+
+    @property
+    def _filename(self):
+        return self._rs.filename
+
+    @property
+    def _worth_saving_limit(self):
+        return self._rs.worth_saving_limit
+
+    @_worth_saving_limit.setter
+    def _worth_saving_limit(self, value):
+        self._rs.worth_saving_limit = value
+
+    @property
+    def _fdatasync(self):
+        return self._rs.fdatasync
+
+    @_fdatasync.setter
+    def _fdatasync(self, value):
+        self._rs.fdatasync = value
+
+    @property
+    def _use_filesystem_for_exec(self):
+        return self._rs.use_filesystem_for_exec
+
+    @_use_filesystem_for_exec.setter
+    def _use_filesystem_for_exec(self, value):
+        self._rs.use_filesystem_for_exec = value
+
+    @property
+    def _parents(self):
+        return self._rs.parents
+
+    @_parents.setter
+    def _parents(self, value):
+        self._rs.parents = value
+
+    @property
+    def _ghosts(self):
+        return self._rs.ghosts
+
+    @_ghosts.setter
+    def _ghosts(self, value):
+        self._rs.ghosts = value
 
     def __repr__(self):
         """Return string representation of the dirstate."""
@@ -530,30 +606,14 @@ class DirState:
         :param header_modified: mark the header modified as well, not just the
             dirblocks.
         """
-        # logger.debug_callsite(3, "modified hash entries: %s", hash_changed_entries)
-        if hash_changed_entries:
-            self._known_hash_changes.update([e[0] for e in hash_changed_entries])
-            if self._dirblock_state in (
-                DirState.NOT_IN_MEMORY,
-                DirState.IN_MEMORY_UNMODIFIED,
-            ):
-                # If the dirstate is already marked a IN_MEMORY_MODIFIED, then
-                # that takes precedence.
-                self._dirblock_state = DirState.IN_MEMORY_HASH_MODIFIED
-        else:
-            # TODO: Since we now have a IN_MEMORY_HASH_MODIFIED state, we
-            #       should fail noisily if someone tries to set
-            #       IN_MEMORY_MODIFIED but we don't have a write-lock!
-            # We don't know exactly what changed so disable smart saving
-            self._dirblock_state = DirState.IN_MEMORY_MODIFIED
-        if header_modified:
-            self._header_state = DirState.IN_MEMORY_MODIFIED
+        hash_changed_keys = (
+            [e[0] for e in hash_changed_entries] if hash_changed_entries else None
+        )
+        self._rs.mark_modified(hash_changed_keys, header_modified)
 
     def _mark_unmodified(self):
         """Mark this dirstate as unmodified."""
-        self._header_state = DirState.IN_MEMORY_UNMODIFIED
-        self._dirblock_state = DirState.IN_MEMORY_UNMODIFIED
-        self._known_hash_changes = set()
+        self._rs.mark_unmodified()
 
     def add(self, path, file_id, kind, stat, fingerprint):
         """Add a path to be tracked.
@@ -1574,9 +1634,9 @@ class DirState:
             empty_parent = DirState.NULL_PARENT_DETAILS
             for entry in self._iter_entries():
                 entry[1].append(empty_parent)
-            self._parents.append(new_revid)
+            self._rs.append_parent(new_revid)
 
-        self._parents[0] = new_revid
+        self._rs.set_parent_at(0, new_revid)
 
         delta.check()
         delta.sort()
@@ -2625,25 +2685,7 @@ class DirState:
 
     def _worth_saving(self):
         """Is it worth saving the dirstate or not?"""
-        if (
-            self._header_state == DirState.IN_MEMORY_MODIFIED
-            or self._dirblock_state == DirState.IN_MEMORY_MODIFIED
-        ):
-            return True
-        if self._dirblock_state == DirState.IN_MEMORY_HASH_MODIFIED:
-            if self._worth_saving_limit == -1:
-                # We never save hash changes when the limit is -1
-                return False
-            # If we're using smart saving and only a small number of
-            # entries have changed their hash, don't bother saving. John has
-            # suggested using a heuristic here based on the size of the
-            # changed files and/or tree. For now, we go with a configurable
-            # number of changes, keeping the calculation time
-            # as low overhead as possible. (This also keeps all existing
-            # tests passing as the default is 0, i.e. always save.)
-            if len(self._known_hash_changes) >= self._worth_saving_limit:
-                return True
-        return False
+        return self._rs.worth_saving()
 
     def _set_data(self, parent_ids, dirblocks):
         """Set the full dirstate data in memory.
