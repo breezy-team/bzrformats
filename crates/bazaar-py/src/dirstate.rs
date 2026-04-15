@@ -893,6 +893,128 @@ impl PyDirState {
         }
     }
 
+    /// Look up a dirstate entry by path and/or file_id in
+    /// `tree_index`. Mirrors Python's `DirState._get_entry` —
+    /// including the `(None, None)` sentinel returned on a miss.
+    /// On hit, the return is the same entry-tuple shape as
+    /// `DirStateRs.dirblocks` entries.
+    ///
+    /// `include_deleted` controls whether the file_id branch
+    /// returns absent entries (`b'a'`) as-is or hides them.
+    ///
+    /// Raises `BzrFormatsError` for the "unversioned entry?" and
+    /// "mismatching tree_index/file_id/path" guards; the second one
+    /// also sets `changes_aborted` to match Python's side effect.
+    #[pyo3(signature = (
+        tree_index,
+        fileid_utf8 = None,
+        path_utf8 = None,
+        include_deleted = false,
+    ))]
+    fn get_entry<'py>(
+        &mut self,
+        py: Python<'py>,
+        tree_index: usize,
+        fileid_utf8: Option<&[u8]>,
+        path_utf8: Option<&[u8]>,
+        include_deleted: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let none_pair = || -> PyResult<Py<PyAny>> {
+            Ok(PyTuple::new(py, [py.None(), py.None()])?.unbind().into())
+        };
+
+        if let Some(path) = path_utf8 {
+            // Path lookup branch.
+            let (dirname_raw, basename_raw) = match path.iter().rposition(|&b| b == b'/') {
+                Some(i) => (&path[..i], &path[i + 1..]),
+                None => (b"".as_slice(), path),
+            };
+            let bei = self
+                .inner
+                .get_block_entry_index(dirname_raw, basename_raw, tree_index);
+            if !bei.path_present {
+                return none_pair();
+            }
+            let entry = &self.inner.dirblocks[bei.block_index].entries[bei.entry_index];
+            let t_kind = entry.trees.get(tree_index).map(|t| t.minikind).unwrap_or(0);
+            if entry.key.file_id.is_empty() || t_kind == b'a' || t_kind == b'r' {
+                let errors_mod = py.import("bzrformats.errors")?;
+                let bzr_err_cls = errors_mod.getattr("BzrFormatsError")?;
+                let exc = bzr_err_cls.call1(("unversioned entry?",))?;
+                return Err(PyErr::from_value(exc));
+            }
+            if let Some(fid) = fileid_utf8 {
+                if entry.key.file_id != fid {
+                    self.inner.changes_aborted = true;
+                    let errors_mod = py.import("bzrformats.errors")?;
+                    let bzr_err_cls = errors_mod.getattr("BzrFormatsError")?;
+                    let exc = bzr_err_cls
+                        .call1(("integrity error ? : mismatching tree_index, file_id and path",))?;
+                    return Err(PyErr::from_value(exc));
+                }
+            }
+            return Ok(entry_to_py_tuple(py, entry)?.unbind().into());
+        }
+
+        // file_id lookup branch.
+        let fid = match fileid_utf8 {
+            Some(f) => f,
+            None => return none_pair(),
+        };
+
+        let file_id = bazaar::FileId::from(&fid.to_vec());
+        let candidates = self.inner.get_or_build_id_index().get(&file_id);
+
+        let mut next_path: Option<Vec<u8>> = None;
+        for (dn, bn, _) in candidates {
+            let search_key = bazaar::dirstate::EntryKey {
+                dirname: dn.clone(),
+                basename: bn.clone(),
+                file_id: fid.to_vec(),
+            };
+            let (b_idx, b_present) = self.inner.find_block_index_from_key(&search_key);
+            if !b_present {
+                continue;
+            }
+            let (e_idx, e_present) = self
+                .inner
+                .find_entry_index(&search_key, &self.inner.dirblocks[b_idx].entries);
+            if !e_present {
+                continue;
+            }
+            let entry = &self.inner.dirblocks[b_idx].entries[e_idx];
+            let t_kind = entry.trees.get(tree_index).map(|t| t.minikind).unwrap_or(0);
+            match t_kind {
+                b'f' | b'd' | b'l' | b't' => {
+                    return Ok(entry_to_py_tuple(py, entry)?.unbind().into());
+                }
+                b'a' => {
+                    if include_deleted {
+                        return Ok(entry_to_py_tuple(py, entry)?.unbind().into());
+                    }
+                    return none_pair();
+                }
+                b'r' => {
+                    let real_path = entry.trees[tree_index].fingerprint.clone();
+                    next_path = Some(real_path);
+                    break;
+                }
+                other => {
+                    return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                        "entry has invalid minikind {:?} for tree {}",
+                        other, tree_index
+                    )));
+                }
+            }
+        }
+
+        if let Some(real_path) = next_path {
+            return self.get_entry(py, tree_index, Some(fid), Some(&real_path), include_deleted);
+        }
+
+        none_pair()
+    }
+
     /// Update a single entry in tree 0. Mirrors Python's
     /// `DirState.update_minimal`. Inputs are passed as separate
     /// positional arguments rather than bundled into a tuple to

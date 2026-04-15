@@ -1981,6 +1981,11 @@ class DirState:
             (absent) paths.
         :return: The dirstate entry tuple for path, or (None, None)
         """
+        # NOTE: not delegated to DirStateRs.get_entry. This helper is
+        # called in hot paths inside iter_changes, _process_entry, and
+        # add; per-call dirblocks syncing more than doubled the full
+        # test suite runtime (46s → 108s). Delegation has to wait
+        # until _dirblocks ownership flips to Rust wholesale.
         self._read_dirblocks_if_needed()
         if path_utf8 is not None:
             if not isinstance(path_utf8, bytes):
