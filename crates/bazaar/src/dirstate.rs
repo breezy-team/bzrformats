@@ -2341,17 +2341,34 @@ impl DirState {
     ) -> Result<(), BasisApplyError> {
         // Ensure the block for `key.dirname` exists. Python's
         // `_find_block` performs a `_find_block_index_from_key`
-        // lookup then inserts an empty block if missing.
-        let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, &key);
+        // lookup then — when the block is missing and the caller
+        // does not pass `add_if_missing=True` — verifies the parent
+        // directory is versioned in tree 0, raising
+        // `NotVersionedError` otherwise.
+        let (_block_index, block_present) = find_block_index_from_key(&self.dirblocks, &key);
         if !block_present {
-            self.dirblocks.insert(
-                block_index,
-                Dirblock {
-                    dirname: key.dirname.clone(),
-                    entries: Vec::new(),
-                },
-            );
+            // Python's parent-check: osutils.split(key.dirname) and
+            // require the result to be a present path in tree 0.
+            let (parent_dir, parent_base) = split_path_utf8(&key.dirname);
+            let parent_bei = get_block_entry_index(&self.dirblocks, parent_dir, parent_base, 0);
+            if !parent_bei.path_present {
+                let mut path = key.dirname.clone();
+                if !path.is_empty() {
+                    path.push(b'/');
+                }
+                path.extend_from_slice(&key.basename);
+                return Err(BasisApplyError::NotVersioned { path });
+            }
+            self.ensure_block(
+                parent_bei.block_index as isize,
+                parent_bei.entry_index as isize,
+                &key.dirname,
+            )
+            .map_err(|e| BasisApplyError::Internal {
+                reason: format!("ensure_block failed: {:?}", e),
+            })?;
         }
+        let (block_index, _) = find_block_index_from_key(&self.dirblocks, &key);
 
         // Find the insertion point within the block.
         let (mut entry_index, present) =
@@ -3358,6 +3375,11 @@ pub enum BasisApplyError {
     /// An invariant that should never be reachable was violated.
     /// Mirrors Python's `AssertionError` inside the apply helpers.
     Internal { reason: String },
+    /// The (dirname, basename) path is not versioned — the parent
+    /// directory has no entry in tree 0. Mirrors Python's
+    /// `NotVersionedError` raised from `_find_block` when called
+    /// without `add_if_missing`.
+    NotVersioned { path: Vec<u8> },
 }
 
 impl std::fmt::Display for BasisApplyError {
@@ -3376,6 +3398,9 @@ impl std::fmt::Display for BasisApplyError {
                 write!(f, "not implemented: {}", reason)
             }
             BasisApplyError::Internal { reason } => write!(f, "internal error: {}", reason),
+            BasisApplyError::NotVersioned { path } => {
+                write!(f, "not versioned: {:?}", path)
+            }
         }
     }
 }

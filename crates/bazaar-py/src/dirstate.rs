@@ -12,6 +12,8 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+pyo3::import_exception!(bzrformats.errors, NotVersionedError);
+
 // TODO(jelmer): Shared pyo3 utils?
 fn extract_path(object: &Bound<PyAny>) -> PyResult<PathBuf> {
     if let Ok(path) = object.extract::<Vec<u8>>() {
@@ -1388,6 +1390,9 @@ impl PyDirState {
             }
             bazaar::dirstate::BasisApplyError::Internal { reason } => {
                 pyo3::exceptions::PyAssertionError::new_err(reason)
+            }
+            bazaar::dirstate::BasisApplyError::NotVersioned { path } => {
+                NotVersionedError::new_err((PyBytes::new(py, &path).unbind(), ""))
             }
         }
     }
