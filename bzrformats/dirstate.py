@@ -2167,20 +2167,9 @@ class DirState:
 
         After reading in, the file should be positioned at the null
         just before the start of the first record in the file.
-
-        :return: (expected crc checksum, number of entries, parent list)
         """
-        self._read_prelude()
-        parent_line = self._state_file.readline()
-        info = parent_line.split(b"\0")
-        int(info[0])
-        self._parents = info[1:-1]
-        ghost_line = self._state_file.readline()
-        info = ghost_line.split(b"\0")
-        int(info[1])
-        self._ghosts = info[2:-1]
-        self._header_state = DirState.IN_MEMORY_UNMODIFIED
-        self._end_of_header = self._state_file.tell()
+        header_bytes = b"".join(self._state_file.readline() for _ in range(5))
+        self._rs.read_header(header_bytes)
 
     def _read_header_if_needed(self):
         """Read the header of the dirstate file if needed."""
@@ -2189,27 +2178,6 @@ class DirState:
             raise ObjectNotLocked(self)
         if self._header_state == DirState.NOT_IN_MEMORY:
             self._read_header()
-
-    def _read_prelude(self):
-        """Read in the prelude header of the dirstate file.
-
-        This only reads in the stuff that is not connected to the crc
-        checksum. The position will be correct to read in the rest of
-        the file and check the checksum after this point.
-        The next entry in the file should be the number of parents,
-        and their ids. Followed by a newline.
-        """
-        header = self._state_file.readline()
-        if header != DirState.HEADER_FORMAT_3:
-            raise BzrFormatsError(f"invalid header line: {header!r}")
-        crc_line = self._state_file.readline()
-        if not crc_line.startswith(b"crc32: "):
-            raise BzrFormatsError(f"missing crc32 checksum: {crc_line!r}")
-        self.crc_expected = int(crc_line[len(b"crc32: ") : -1])
-        num_entries_line = self._state_file.readline()
-        if not num_entries_line.startswith(b"num_entries: "):
-            raise BzrFormatsError("missing num_entries line")
-        self._num_entries = int(num_entries_line[len(b"num_entries: ") : -1])
 
     def sha1_from_stat(self, path, stat_result):
         """Find a sha1 given a stat lookup."""

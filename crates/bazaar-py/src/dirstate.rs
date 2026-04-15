@@ -13,6 +13,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pyo3::import_exception!(bzrformats.errors, NotVersionedError);
+pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
 
 // TODO(jelmer): Shared pyo3 utils?
 fn extract_path(object: &Bound<PyAny>) -> PyResult<PathBuf> {
@@ -703,6 +704,20 @@ impl PyDirState {
     /// Forget all in-memory state. Mirrors `DirState._wipe_state`.
     fn wipe_state(&mut self) {
         self.inner.wipe_state();
+    }
+
+    /// Parse the 5-line dirstate header out of `data`. Mirrors
+    /// Python's `DirState._read_header`: populates parents, ghosts,
+    /// num_entries, end_of_header, and marks the header as in-memory
+    /// unmodified. `data` must be exactly the bytes of the five
+    /// header lines as returned by sequential `readline()` calls on
+    /// the state file — the resulting `end_of_header` equals
+    /// `len(data)` so it matches `state_file.tell()` on the caller
+    /// side.
+    fn read_header(&mut self, data: &[u8]) -> PyResult<()> {
+        self.inner
+            .read_header(data)
+            .map_err(|e| BzrFormatsError::new_err(e.to_string()))
     }
 
     /// Discard any parent trees beyond the first, including any
