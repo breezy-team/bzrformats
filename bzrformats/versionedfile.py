@@ -310,25 +310,10 @@ class _MPDiffGenerator:
             # None for any parent request, so we replace it with an empty tuple
             if parent_keys is None:
                 parent_keys = ()
-            parent_lines = []
-            for p in parent_keys:
-                # Alternatively we could check p not in self.needed_keys, but
-                # ghost_parents should be tiny versus huge
-                if p in self.ghost_parents:
-                    continue
-                refcount = self.refcounts[p]
-                if refcount == 1:  # Last child reference
-                    self.refcounts.pop(p)
-                    parent_chunks = self.chunks.pop(p)
-                else:
-                    self.refcounts[p] = refcount - 1
-                    parent_chunks = self.chunks[p]
-                p_lines = osutils.chunks_to_lines(parent_chunks)
-                # TODO: Should we cache the line form? We did the
-                #       computation to get it, but storing it this way will
-                #       be less memory efficient...
-                parent_lines.append(p_lines)
-                del p_lines
+            parent_chunks_list = _versionedfile_rs.mpdiff_collect_parent_chunks(
+                parent_keys, self.ghost_parents, self.refcounts, self.chunks
+            )
+            parent_lines = [osutils.chunks_to_lines(pc) for pc in parent_chunks_list]
             lines = osutils.chunks_to_lines(this_chunks)
             # Since we needed the lines, we'll go ahead and cache them this way
             this_chunks = lines

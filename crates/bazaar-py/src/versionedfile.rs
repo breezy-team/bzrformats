@@ -294,6 +294,54 @@ fn mpdiff_first_pass<'py>(
     Ok((needed_keys, refcounts, just_parents, missing_keys))
 }
 
+/// Release satisfied parents for `_MPDiffGenerator._process_one_record`.
+///
+/// For each non-ghost parent key, decrement its refcount in `refcounts`. When
+/// the refcount reaches zero, pop the cached value from `chunks` (last child);
+/// otherwise fetch (not pop) the still-shared cached value. Returns the list
+/// of parent cached values in the original order, ready for the caller to run
+/// `osutils.chunks_to_lines` and `_compute_diff`.
+///
+/// Mutates `refcounts` and `chunks` in place. The caller is responsible for
+/// the per-record `this_chunks` cache write after diffing.
+#[pyfunction]
+fn mpdiff_collect_parent_chunks<'py>(
+    py: Python<'py>,
+    parent_keys: &Bound<'py, PyAny>,
+    ghost_parents: &Bound<'py, PySet>,
+    refcounts: &Bound<'py, PyDict>,
+    chunks: &Bound<'py, PyDict>,
+) -> PyResult<Py<PyAny>> {
+    let out = pyo3::types::PyList::empty(py);
+    for p in parent_keys.try_iter()? {
+        let p = p?;
+        if ghost_parents.contains(&p)? {
+            continue;
+        }
+        let refcount: i64 = refcounts
+            .get_item(&p)?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!("missing refcount for {:?}", p))
+            })?
+            .extract()?;
+        let parent_value = if refcount == 1 {
+            let value = chunks.get_item(&p)?.ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!("missing chunks for {:?}", p))
+            })?;
+            refcounts.del_item(&p)?;
+            chunks.del_item(&p)?;
+            value
+        } else {
+            refcounts.set_item(&p, refcount - 1)?;
+            chunks.get_item(&p)?.ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!("missing chunks for {:?}", p))
+            })?
+        };
+        out.append(parent_value)?;
+    }
+    Ok(out.into_any().unbind())
+}
+
 /// Reference-count bookkeeping for compression-parent satisfaction during
 /// stream insertion. Python-facing counterpart of the pure-Rust
 /// `bazaar::versionedfile::KeyRefs`; stores Python tuples directly via
@@ -430,5 +478,6 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(hash_escaped_prefix_map, &m)?)?;
     m.add_function(wrap_pyfunction!(hash_escaped_prefix_unmap, &m)?)?;
     m.add_function(wrap_pyfunction!(mpdiff_first_pass, &m)?)?;
+    m.add_function(wrap_pyfunction!(mpdiff_collect_parent_chunks, &m)?)?;
     Ok(m)
 }
