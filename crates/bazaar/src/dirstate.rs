@@ -1483,6 +1483,22 @@ impl DirState {
         self.known_hash_changes.clear();
     }
 
+    /// Replace the entire in-memory state with `parent_ids` and
+    /// `dirblocks`, marking both the header and the dirblock data
+    /// fully modified. Mirrors Python's `DirState._set_data`: the
+    /// caller owns any sort/shape invariants on `dirblocks`; this
+    /// method does not validate them.
+    ///
+    /// Any cached `id_index` is invalidated. Python's
+    /// `_packed_stat_index` has no equivalent on the Rust struct yet
+    /// and is therefore not touched here.
+    pub fn set_data(&mut self, parent_ids: Vec<Vec<u8>>, dirblocks: Vec<Dirblock>) {
+        self.dirblocks = dirblocks;
+        self.mark_modified(&[], true);
+        self.parents = parent_ids;
+        self.id_index = None;
+    }
+
     /// Forget all in-memory state, returning the object to the same
     /// shape a freshly constructed [`DirState`] has before any load.
     /// Mirrors Python's `DirState._wipe_state`.
@@ -5193,6 +5209,32 @@ mod dirstate_struct_tests {
         let wrote = state.save_to(&mut t).expect("save_to");
         assert!(!wrote);
         assert_eq!(t.read_all().unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn set_data_replaces_parents_and_dirblocks_and_marks_modified() {
+        let mut state = fresh_state();
+        // Start in a clean, unmodified state and make sure set_data
+        // flips both dirblock and header to InMemoryModified.
+        state.header_state = MemoryState::InMemoryUnmodified;
+        state.dirblock_state = MemoryState::InMemoryUnmodified;
+        // Pre-populate id_index so we can verify it is invalidated.
+        state.id_index = Some(IdIndex::new());
+
+        let new_parents = vec![b"rev-x".to_vec()];
+        let new_dirblocks = vec![Dirblock {
+            dirname: b"sub".to_vec(),
+            entries: Vec::new(),
+        }];
+
+        state.set_data(new_parents.clone(), new_dirblocks.clone());
+
+        assert_eq!(state.parents, new_parents);
+        assert_eq!(state.dirblocks.len(), 1);
+        assert_eq!(state.dirblocks[0].dirname, b"sub".to_vec());
+        assert_eq!(state.dirblock_state, MemoryState::InMemoryModified);
+        assert_eq!(state.header_state, MemoryState::InMemoryModified);
+        assert!(state.id_index.is_none());
     }
 
     #[test]
