@@ -1903,6 +1903,35 @@ impl DirState {
         }
     }
 
+    /// Remove `entries[index]` from `entries` (and drop it from
+    /// `id_index`) if none of its trees hold a live record — i.e.
+    /// every tree column is `b'a'` (absent) or `b'r'` (relocation).
+    /// Mirrors Python's `DirState._maybe_remove_row`.
+    ///
+    /// Returns `true` if the row was removed, `false` otherwise.
+    pub fn maybe_remove_row(
+        entries: &mut Vec<Entry>,
+        index: usize,
+        id_index: &mut IdIndex,
+    ) -> bool {
+        let entry = &entries[index];
+        let present_in_row = entry
+            .trees
+            .iter()
+            .any(|t| t.minikind != b'a' && t.minikind != b'r');
+        if present_in_row {
+            return false;
+        }
+        let file_id = FileId::from(&entry.key.file_id);
+        id_index.remove((
+            entry.key.dirname.as_slice(),
+            entry.key.basename.as_slice(),
+            &file_id,
+        ));
+        entries.remove(index);
+        true
+    }
+
     /// Sort `entries` into canonical dirblock order. Mirrors Python's
     /// `DirState._sort_entries`: the sort key is
     /// `(dirname.split(b"/"), basename, file_id)`, which matches the
@@ -3405,6 +3434,44 @@ mod dirstate_struct_tests {
     /// path and verify the expected (dirname, basename, file_id) key
     /// comes back — or `None` for paths that don't exist or live under
     /// a non-existent directory.
+    #[test]
+    fn maybe_remove_row_keeps_row_with_any_live_tree() {
+        let mut entries = vec![
+            entry_with_trees(b"", b"a", b"fid-a", vec![tree(b'f'), tree(b'a')]),
+            entry_with_trees(b"", b"b", b"fid-b", vec![tree(b'a'), tree(b'a')]),
+        ];
+        let mut id_index = IdIndex::new();
+        let fid_a = FileId::from(&b"fid-a".to_vec());
+        id_index.add((b"", b"a", &fid_a));
+
+        let removed = DirState::maybe_remove_row(&mut entries, 0, &mut id_index);
+        assert!(!removed);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(id_index.get(&fid_a).len(), 1);
+    }
+
+    #[test]
+    fn maybe_remove_row_drops_row_when_all_trees_dead() {
+        let mut entries = vec![
+            entry_with_trees(b"", b"a", b"fid-a", vec![tree(b'f')]),
+            entry_with_trees(b"", b"b", b"fid-b", vec![tree(b'a'), tree(b'r')]),
+        ];
+        let mut id_index = IdIndex::new();
+        let fid_a = FileId::from(&b"fid-a".to_vec());
+        let fid_b = FileId::from(&b"fid-b".to_vec());
+        id_index.add((b"", b"a", &fid_a));
+        id_index.add((b"", b"b", &fid_b));
+
+        let removed = DirState::maybe_remove_row(&mut entries, 1, &mut id_index);
+        assert!(removed);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key.file_id, b"fid-a".to_vec());
+        // fid_b was dropped from the index.
+        assert!(id_index.get(&fid_b).is_empty());
+        // fid_a is still indexed.
+        assert_eq!(id_index.get(&fid_a).len(), 1);
+    }
+
     #[test]
     fn sort_entries_orders_by_dirname_basename_file_id() {
         // Shuffled input covering root, shallow file, nested file, and
