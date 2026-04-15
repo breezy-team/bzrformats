@@ -2221,6 +2221,84 @@ impl DirState {
         Ok(())
     }
 
+    /// Apply a sequence of "removals" to tree 0, mirroring Python's
+    /// `DirState._apply_removals`. Each record is a
+    /// `(file_id, path)` tuple; the method sorts them in reverse
+    /// path order (so deeper paths are removed first), locates the
+    /// entry in tree 0, asserts it is present with the expected
+    /// file_id, and calls [`DirState::make_absent`].
+    ///
+    /// After each removal the directory block that used to hold the
+    /// removed entry's children is scanned for live tree-0 rows —
+    /// any surviving row flags an inconsistent delta, matching
+    /// Python's "file id was deleted but its children were not
+    /// deleted" guard.
+    pub fn apply_removals(
+        &mut self,
+        removals: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), BasisApplyError> {
+        // Sort by path in reverse so nested children come out before
+        // their parents — matches Python's
+        // `sorted(removals, reverse=True, key=operator.itemgetter(1))`.
+        let mut sorted: Vec<&(Vec<u8>, Vec<u8>)> = removals.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (file_id, path) in sorted {
+            let (dirname, basename) = split_path_utf8(path);
+            let bei = get_block_entry_index(&self.dirblocks, dirname, basename, 0);
+            if !bei.path_present {
+                return Err(BasisApplyError::Invalid {
+                    path: path.clone(),
+                    file_id: file_id.clone(),
+                    reason: "Wrong path for old path.".to_string(),
+                });
+            }
+            let entry_file_id = self.dirblocks[bei.block_index].entries[bei.entry_index]
+                .key
+                .file_id
+                .clone();
+            if entry_file_id != *file_id {
+                return Err(BasisApplyError::Invalid {
+                    path: path.clone(),
+                    file_id: file_id.clone(),
+                    reason: format!(
+                        "Attempt to remove path has wrong id - found {:?}.",
+                        entry_file_id
+                    ),
+                });
+            }
+            let target_key = self.dirblocks[bei.block_index].entries[bei.entry_index]
+                .key
+                .clone();
+            self.make_absent(&target_key)
+                .map_err(|e| BasisApplyError::Invalid {
+                    path: path.clone(),
+                    file_id: file_id.clone(),
+                    reason: format!("{:?}", e),
+                })?;
+
+            // After-removal integrity check: if a dirblock for
+            // `path` still exists in tree 0, none of its rows may
+            // be live.
+            let child_bei = get_block_entry_index(&self.dirblocks, path, b"", 0);
+            if child_bei.dir_present {
+                let block = &self.dirblocks[child_bei.block_index];
+                for child in &block.entries {
+                    let t0 = child.trees.first().map(|t| t.minikind).unwrap_or(0);
+                    if t0 != b'a' && t0 != b'r' {
+                        return Err(BasisApplyError::Invalid {
+                            path: path.clone(),
+                            file_id: file_id.clone(),
+                            reason: "The file id was deleted but its children were not deleted."
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Apply a sequence of "changes" to tree 1. Mirrors Python's
     /// `DirState._update_basis_apply_changes`. Each change updates
     /// the tree-1 slot of an existing entry whose file_id matches

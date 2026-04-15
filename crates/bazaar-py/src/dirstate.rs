@@ -893,6 +893,29 @@ impl PyDirState {
         }
     }
 
+    /// Apply a sequence of "removals" to tree 0. Mirrors Python's
+    /// `DirState._apply_removals`. Input is a Python iterable of
+    /// `(file_id, path)` 2-tuples, matching the caller pattern
+    /// `update_by_delta` uses: `removals.items()`.
+    fn apply_removals(&mut self, removals: &Bound<PyAny>) -> PyResult<()> {
+        let mut rust_removals: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for item in removals.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            if tup.len() != 2 {
+                return Err(PyTypeError::new_err(
+                    "apply_removals entries must be 2-tuples",
+                ));
+            }
+            let file_id: Vec<u8> = tup.get_item(0)?.extract()?;
+            let path: Vec<u8> = tup.get_item(1)?.extract()?;
+            rust_removals.push((file_id, path));
+        }
+        match self.inner.apply_removals(&rust_removals) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.raise_basis_apply_error(removals.py(), e)),
+        }
+    }
+
     /// Apply a sequence of "changes" to tree 1. Mirrors Python's
     /// `DirState._update_basis_apply_changes`. Input is a Python
     /// iterable of `(old_path, new_path, file_id, new_details)`
