@@ -322,6 +322,17 @@ const PY_IN_MEMORY_UNMODIFIED: i64 = 1;
 const PY_IN_MEMORY_MODIFIED: i64 = 2;
 const PY_IN_MEMORY_HASH_MODIFIED: i64 = 3;
 
+/// Collect any Python iterable of `bytes` into a `Vec<Vec<u8>>`. Used
+/// by the parents / ghosts setters on [`PyDirState`] to accept plain
+/// Python lists as well as tuples or generators.
+fn collect_bytes_vec(obj: &Bound<PyAny>) -> PyResult<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    for item in obj.try_iter()? {
+        out.push(item?.extract::<Vec<u8>>()?);
+    }
+    Ok(out)
+}
+
 fn memory_state_to_py(state: bazaar::dirstate::MemoryState) -> i64 {
     use bazaar::dirstate::MemoryState;
     match state {
@@ -550,6 +561,71 @@ impl PyDirState {
     /// Python's `DirState._num_present_parents`.
     fn num_present_parents(&self) -> usize {
         self.inner.num_present_parents()
+    }
+
+    /// Parent revision ids for the current tree, in order. First
+    /// entry is the current parent; subsequent entries are merged
+    /// parents. Matches Python's `DirState._parents` attribute.
+    ///
+    /// Returns a fresh Python list on each access — mutating that
+    /// list does NOT write back to the dirstate. Use
+    /// [`Self::append_parent`] or [`Self::set_parent_at`] for in-place
+    /// mutation, or assign the attribute to replace the list
+    /// wholesale.
+    #[getter]
+    fn parents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let items: Vec<Bound<PyBytes>> = self
+            .inner
+            .parents
+            .iter()
+            .map(|p| PyBytes::new(py, p))
+            .collect();
+        PyList::new(py, items)
+    }
+
+    #[setter]
+    fn set_parents(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
+        self.inner.parents = collect_bytes_vec(value)?;
+        Ok(())
+    }
+
+    /// Ghost parent revision ids: parents referenced by the tree but
+    /// not present locally. Same aliasing semantics as
+    /// [`Self::parents`] — the getter returns a copy.
+    #[getter]
+    fn ghosts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let items: Vec<Bound<PyBytes>> = self
+            .inner
+            .ghosts
+            .iter()
+            .map(|g| PyBytes::new(py, g))
+            .collect();
+        PyList::new(py, items)
+    }
+
+    #[setter]
+    fn set_ghosts(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
+        self.inner.ghosts = collect_bytes_vec(value)?;
+        Ok(())
+    }
+
+    /// Append a revision id to the parents list in place. Replaces
+    /// the Python pattern `self._parents.append(revid)`.
+    fn append_parent(&mut self, revid: Vec<u8>) {
+        self.inner.parents.push(revid);
+    }
+
+    /// Replace the parent at `index`. Replaces the Python pattern
+    /// `self._parents[index] = revid`. Raises `IndexError` if `index`
+    /// is out of range.
+    fn set_parent_at(&mut self, index: usize, revid: Vec<u8>) -> PyResult<()> {
+        if index >= self.inner.parents.len() {
+            return Err(pyo3::exceptions::PyIndexError::new_err(
+                "parent index out of range",
+            ));
+        }
+        self.inner.parents[index] = revid;
+        Ok(())
     }
 
     /// Whether the current in-memory state is worth persisting. Mirrors
