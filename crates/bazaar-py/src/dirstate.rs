@@ -720,6 +720,67 @@ impl PyDirState {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
     }
 
+    /// Find the dirblock index whose dirname matches `key[0]`.
+    /// Mirrors Python's `DirState._find_block_index_from_key` and
+    /// returns `(block_index, present)`. Python's one-slot
+    /// `_last_block_index` cache is dropped by this port — bisect in
+    /// Rust is cheap enough that the extra branch isn't worth it.
+    fn find_block_index_from_key(&self, key: &Bound<PyTuple>) -> PyResult<(usize, bool)> {
+        let entry_key = bazaar::dirstate::EntryKey {
+            dirname: key.get_item(0)?.extract()?,
+            basename: key.get_item(1)?.extract()?,
+            file_id: key.get_item(2)?.extract()?,
+        };
+        Ok(self.inner.find_block_index_from_key(&entry_key))
+    }
+
+    /// Find the entry index within `block` for `key`. Mirrors Python's
+    /// `DirState._find_entry_index`. `block` is the
+    /// `self._dirblocks[block_index][1]` list.
+    fn find_entry_index(
+        &self,
+        key: &Bound<PyTuple>,
+        block: &Bound<PyAny>,
+    ) -> PyResult<(usize, bool)> {
+        let entry_key = bazaar::dirstate::EntryKey {
+            dirname: key.get_item(0)?.extract()?,
+            basename: key.get_item(1)?.extract()?,
+            file_id: key.get_item(2)?.extract()?,
+        };
+        // The caller's `block` is Python's view of
+        // self._dirblocks[i][1]; we need the Rust view, so convert
+        // the block entries on the fly. This is wasteful — once the
+        // dirblock aliasing migrates fully, callers will pass
+        // block_index and we can read from self.inner.dirblocks
+        // directly.
+        let mut entries: Vec<bazaar::dirstate::Entry> = Vec::new();
+        for item in block.try_iter()? {
+            entries.push(crate::dirstate_helpers::entry_from_py(&item?)?);
+        }
+        Ok(self.inner.find_entry_index(&entry_key, &entries))
+    }
+
+    /// Look up `(dirname, basename)` in `tree_index` and return the
+    /// four-field result Python's `DirState._get_block_entry_index`
+    /// produces: `(block_index, entry_index, dir_present,
+    /// path_present)`.
+    fn get_block_entry_index(
+        &self,
+        dirname: &[u8],
+        basename: &[u8],
+        tree_index: usize,
+    ) -> (usize, usize, bool, bool) {
+        let bei = self
+            .inner
+            .get_block_entry_index(dirname, basename, tree_index);
+        (
+            bei.block_index,
+            bei.entry_index,
+            bei.dir_present,
+            bei.path_present,
+        )
+    }
+
     /// Replace the entire in-memory state with `parent_ids` and
     /// `dirblocks` (both in the Python tuple shape), marking both the
     /// header and the dirblock data fully modified. Mirrors Python's

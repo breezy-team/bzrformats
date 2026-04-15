@@ -2241,21 +2241,8 @@ class DirState:
             tree present there.
         """
         self._read_dirblocks_if_needed()
-        key = dirname, basename, b""
-        block_index, present = self._find_block_index_from_key(key)
-        if not present:
-            # no such directory - return the dir index and 0 for the row.
-            return block_index, 0, False, False
-        block = self._dirblocks[block_index][1]  # access the entries only
-        entry_index, present = self._find_entry_index(key, block)
-        # linear search through entries at this path to find the one
-        # requested.
-        while entry_index < len(block) and block[entry_index][0][1] == basename:
-            if block[entry_index][1][tree_index][0] not in (b"a", b"r"):
-                # neither absent or relocated
-                return block_index, entry_index, True, True
-            entry_index += 1
-        return block_index, entry_index, True, False
+        self._rs.dirblocks = self._dirblocks
+        return self._rs.get_block_entry_index(dirname, basename, tree_index)
 
     def _get_entry(
         self, tree_index, fileid_utf8=None, path_utf8=None, include_deleted=False
