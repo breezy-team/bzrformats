@@ -103,6 +103,49 @@ fn parse_patch<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyList>
     PyList::new(py, out)
 }
 
+/// Build multi-parent diff hunks from `text` and per-parent matching blocks.
+///
+/// `text` is the child text as a list of line bytes. `parent_blocks[p]` is
+/// the list of `(i, j, n)` matches against parent `p` (typically produced by
+/// `patiencediff.PatienceSequenceMatcher.get_matching_blocks`). Returns the
+/// hunks in the same `(kind, payload)` shape as [`parse_patch`] so the caller
+/// can materialise them into `NewText` / `ParentText` instances.
+#[pyfunction]
+fn from_lines_with_blocks<'py>(
+    py: Python<'py>,
+    text: Vec<Vec<u8>>,
+    parent_blocks: Vec<Vec<(usize, usize, usize)>>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mp = MultiParent::from_lines_with_blocks(&text, &parent_blocks);
+    let mut out: Vec<Bound<PyTuple>> = Vec::with_capacity(mp.hunks.len());
+    for hunk in mp.hunks {
+        match hunk {
+            Hunk::NewText(lines) => {
+                let py_lines: Vec<Bound<PyBytes>> =
+                    lines.iter().map(|l| PyBytes::new(py, l)).collect();
+                let lines_list = PyList::new(py, py_lines)?;
+                out.push(PyTuple::new(
+                    py,
+                    [PyBytes::new(py, b"n").into_any(), lines_list.into_any()],
+                )?);
+            }
+            Hunk::ParentText {
+                parent,
+                parent_pos,
+                child_pos,
+                num_lines,
+            } => {
+                let payload = PyTuple::new(py, [parent, parent_pos, child_pos, num_lines])?;
+                out.push(PyTuple::new(
+                    py,
+                    [PyBytes::new(py, b"p").into_any(), payload.into_any()],
+                )?);
+            }
+        }
+    }
+    PyList::new(py, out)
+}
+
 /// A hashable Python object whose `Hash` and `Eq` defer to Python. The
 /// interpreter lock is assumed to be held whenever these methods run, since
 /// they may execute arbitrary Python code.
@@ -192,5 +235,6 @@ pub fn _multiparent_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(is_snapshot, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_patch, &m)?)?;
     m.add_function(wrap_pyfunction!(topo_iter, &m)?)?;
+    m.add_function(wrap_pyfunction!(from_lines_with_blocks, &m)?)?;
     Ok(m)
 }

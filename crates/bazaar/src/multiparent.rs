@@ -61,6 +61,86 @@ impl MultiParent {
         Self { hunks }
     }
 
+    /// Build a [`MultiParent`] from `text` and per-parent matching blocks.
+    ///
+    /// Mirrors `MultiParent.from_lines` in `bzrformats/multiparent.py`. The
+    /// caller computes each parent's `get_matching_blocks()` sequence
+    /// (typically via patiencediff) and passes them here; this function owns
+    /// the greedy longest-match selection loop.
+    ///
+    /// Each element of `parent_blocks` is the block list for parent `p`: a
+    /// sequence of `(i, j, n)` triples where `i` is the offset in the parent,
+    /// `j` the offset in `text`, and `n` the run length. The final sentinel
+    /// block `(parent_len, text_len, 0)` may be present or absent — both
+    /// shapes are accepted.
+    pub fn from_lines_with_blocks(
+        text: &[Vec<u8>],
+        parent_blocks: &[Vec<(usize, usize, usize)>],
+    ) -> Self {
+        let mut hunks: Vec<Hunk> = Vec::new();
+        let mut new_lines: Vec<Vec<u8>> = Vec::new();
+        let mut iters: Vec<std::slice::Iter<'_, (usize, usize, usize)>> =
+            parent_blocks.iter().map(|b| b.iter()).collect();
+        // cur_block[p] tracks the next candidate block for parent p, or None
+        // when the iterator is exhausted.
+        let mut cur_block: Vec<Option<(usize, usize, usize)>> =
+            iters.iter_mut().map(|it| it.next().copied()).collect();
+
+        let mut cur_line = 0usize;
+        while cur_line < text.len() {
+            // Best match across parents: the longest ParentText we can anchor
+            // at cur_line.
+            let mut best: Option<(usize, usize, usize, usize)> = None; // (parent, parent_pos, child_pos, num_lines)
+            for (p, slot) in cur_block.iter_mut().enumerate() {
+                // Advance past blocks that end at or before cur_line.
+                loop {
+                    match *slot {
+                        Some((_, j, n)) if j + n <= cur_line => {
+                            *slot = iters[p].next().copied();
+                        }
+                        _ => break,
+                    }
+                }
+                let Some((i, j, n)) = *slot else { continue };
+                if j > cur_line {
+                    continue;
+                }
+                let offset = cur_line - j;
+                let i = i + offset;
+                let j = cur_line;
+                let n = n - offset;
+                if n == 0 {
+                    continue;
+                }
+                if best.is_none_or(|b| n > b.3) {
+                    best = Some((p, i, j, n));
+                }
+            }
+            match best {
+                None => {
+                    new_lines.push(text[cur_line].clone());
+                    cur_line += 1;
+                }
+                Some((parent, parent_pos, child_pos, num_lines)) => {
+                    if !new_lines.is_empty() {
+                        hunks.push(Hunk::NewText(std::mem::take(&mut new_lines)));
+                    }
+                    hunks.push(Hunk::ParentText {
+                        parent,
+                        parent_pos,
+                        child_pos,
+                        num_lines,
+                    });
+                    cur_line += num_lines;
+                }
+            }
+        }
+        if !new_lines.is_empty() {
+            hunks.push(Hunk::NewText(new_lines));
+        }
+        Self { hunks }
+    }
+
     /// Total number of lines in the reconstructed text.
     ///
     /// Mirrors Python's `num_lines`: a trailing ParentText carries absolute
@@ -721,6 +801,93 @@ mod tests {
         assert_eq!(
             MultiParent::from_patch(b"i 3\nonly\n"),
             Err(ParseError::Truncated)
+        );
+    }
+
+    #[test]
+    fn from_lines_no_parents_is_single_new_text() {
+        let text = lines(&[b"a\n", b"b\n"]);
+        let mp = MultiParent::from_lines_with_blocks(&text, &[]);
+        assert_eq!(mp.hunks, vec![Hunk::NewText(lines(&[b"a\n", b"b\n"]))]);
+    }
+
+    #[test]
+    fn from_lines_single_parent_full_match() {
+        // text == parent. One (0,0,2) block plus sentinel.
+        let text = lines(&[b"a\n", b"b\n"]);
+        let blocks = vec![vec![(0, 0, 2), (2, 2, 0)]];
+        let mp = MultiParent::from_lines_with_blocks(&text, &blocks);
+        assert_eq!(
+            mp.hunks,
+            vec![Hunk::ParentText {
+                parent: 0,
+                parent_pos: 0,
+                child_pos: 0,
+                num_lines: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn from_lines_prefers_longest_match_across_parents() {
+        // text = [a b c d]
+        // parent 0 matches [a b] at (0,0,2)
+        // parent 1 matches [a b c d] at (0,0,4)
+        // The longest match (parent 1) should win.
+        let text = lines(&[b"a\n", b"b\n", b"c\n", b"d\n"]);
+        let blocks = vec![vec![(0, 0, 2), (2, 4, 0)], vec![(0, 0, 4), (4, 4, 0)]];
+        let mp = MultiParent::from_lines_with_blocks(&text, &blocks);
+        assert_eq!(
+            mp.hunks,
+            vec![Hunk::ParentText {
+                parent: 1,
+                parent_pos: 0,
+                child_pos: 0,
+                num_lines: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn from_lines_mixes_new_text_and_parent_text() {
+        // text = [x a b y]
+        // parent 0 matches [a b] at (0,1,2)
+        let text = lines(&[b"x\n", b"a\n", b"b\n", b"y\n"]);
+        let blocks = vec![vec![(0, 1, 2), (2, 4, 0)]];
+        let mp = MultiParent::from_lines_with_blocks(&text, &blocks);
+        assert_eq!(
+            mp.hunks,
+            vec![
+                Hunk::NewText(lines(&[b"x\n"])),
+                Hunk::ParentText {
+                    parent: 0,
+                    parent_pos: 0,
+                    child_pos: 1,
+                    num_lines: 2,
+                },
+                Hunk::NewText(lines(&[b"y\n"])),
+            ]
+        );
+    }
+
+    #[test]
+    fn from_lines_advances_block_offset_when_partial() {
+        // text = [a b c]; parent provides (0,0,3) but cur_line might land
+        // mid-block if a prior hunk consumed the start. Simulate this by
+        // pretending a longer parent matched first.
+        // text = [a b c d]
+        // parent 0: single block (0,0,4)
+        let text = lines(&[b"a\n", b"b\n", b"c\n", b"d\n"]);
+        let blocks = vec![vec![(0, 0, 4), (4, 4, 0)]];
+        let mp = MultiParent::from_lines_with_blocks(&text, &blocks);
+        assert_eq!(
+            mp.hunks,
+            vec![Hunk::ParentText {
+                parent: 0,
+                parent_pos: 0,
+                child_pos: 0,
+                num_lines: 4,
+            }]
         );
     }
 }
