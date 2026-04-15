@@ -1483,6 +1483,28 @@ impl DirState {
         self.known_hash_changes.clear();
     }
 
+    /// Forget all in-memory state, returning the object to the same
+    /// shape a freshly constructed [`DirState`] has before any load.
+    /// Mirrors Python's `DirState._wipe_state`.
+    ///
+    /// Python additionally clears `_packed_stat_index` and
+    /// `_split_path_cache`; neither field exists on the Rust struct
+    /// yet (the equivalents are the `id_index` cache plus the still
+    /// un-ported memoisation layers on `_find_block_index_from_key`),
+    /// so this function resets what it can and leaves a note for the
+    /// future port to extend.
+    pub fn wipe_state(&mut self) {
+        self.header_state = MemoryState::NotInMemory;
+        self.dirblock_state = MemoryState::NotInMemory;
+        self.changes_aborted = false;
+        self.parents.clear();
+        self.ghosts.clear();
+        self.dirblocks.clear();
+        self.id_index = None;
+        self.end_of_header = None;
+        self.cutoff_time = None;
+    }
+
     /// Whether the current in-memory state is worth persisting. Mirrors
     /// `DirState._worth_saving`: full-dirblock or header modifications
     /// always save; hash-only changes save only once they exceed
@@ -5171,6 +5193,32 @@ mod dirstate_struct_tests {
         let wrote = state.save_to(&mut t).expect("save_to");
         assert!(!wrote);
         assert_eq!(t.read_all().unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn wipe_state_resets_all_fields() {
+        let mut state = minimal_populated_state();
+        state.parents = vec![b"rev-a".to_vec(), b"rev-b".to_vec()];
+        state.ghosts = vec![b"rev-b".to_vec()];
+        state.header_state = MemoryState::InMemoryModified;
+        state.dirblock_state = MemoryState::InMemoryModified;
+        state.changes_aborted = true;
+        state.end_of_header = Some(42);
+        state.cutoff_time = Some(123);
+        let _ = state.get_or_build_id_index();
+        assert!(state.id_index.is_some());
+
+        state.wipe_state();
+
+        assert_eq!(state.header_state, MemoryState::NotInMemory);
+        assert_eq!(state.dirblock_state, MemoryState::NotInMemory);
+        assert!(!state.changes_aborted);
+        assert!(state.parents.is_empty());
+        assert!(state.ghosts.is_empty());
+        assert!(state.dirblocks.is_empty());
+        assert!(state.id_index.is_none());
+        assert!(state.end_of_header.is_none());
+        assert!(state.cutoff_time.is_none());
     }
 
     #[test]
