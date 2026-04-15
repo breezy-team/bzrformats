@@ -1015,6 +1015,34 @@ impl PyDirState {
         none_pair()
     }
 
+    /// Check that every `(dirname_utf8, file_id)` pair in `parents`
+    /// exists in `tree_index`. Mirrors Python's
+    /// `DirState._after_delta_check_parents`. Raises
+    /// `InconsistentDelta` on the first bad parent.
+    fn after_delta_check_parents(
+        &mut self,
+        py: Python<'_>,
+        parents: &Bound<PyAny>,
+        index: usize,
+    ) -> PyResult<()> {
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for item in parents.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            if tup.len() != 2 {
+                return Err(PyTypeError::new_err(
+                    "after_delta_check_parents entries must be 2-tuples",
+                ));
+            }
+            let dirname: Vec<u8> = tup.get_item(0)?.extract()?;
+            let file_id: Vec<u8> = tup.get_item(1)?.extract()?;
+            pairs.push((dirname, file_id));
+        }
+        match self.inner.after_delta_check_parents(&pairs, index) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
+        }
+    }
+
     /// Verify that none of `new_ids` is already present at a live
     /// entry in `tree_index`. Mirrors Python's
     /// `DirState._check_delta_ids_absent`. Raises

@@ -1699,21 +1699,8 @@ class DirState:
             and be a directory.
         :param index: The column in the dirstate to check for parents in.
         """
-        for dirname_utf8, file_id in parents:
-            # Get the entry - the ensures that file_id, dirname_utf8 exists and
-            # has the right file id.
-            entry = self._get_entry(index, file_id, dirname_utf8)
-            if entry[1] is None:
-                self._raise_invalid(
-                    dirname_utf8.decode("utf8"), file_id, "This parent is not present."
-                )
-            # Parents of things must be directories
-            if entry[1][index][0] != b"d":
-                self._raise_invalid(
-                    dirname_utf8.decode("utf8"),
-                    file_id,
-                    "This parent is not a directory.",
-                )
+        self._rs.dirblocks = self._dirblocks
+        self._rs.after_delta_check_parents(list(parents), index)
 
     def _observed_sha1(
         self, entry, sha1, stat_value, _stat_to_minikind=_stat_to_minikind

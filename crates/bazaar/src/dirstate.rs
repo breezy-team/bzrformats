@@ -2223,6 +2223,49 @@ impl DirState {
         Ok(())
     }
 
+    /// Check that every `(dirname_utf8, file_id)` pair in `parents`
+    /// exists in `tree_index` at the given path with the given id
+    /// *and* is a directory. Mirrors Python's
+    /// `DirState._after_delta_check_parents`.
+    ///
+    /// Returns [`BasisApplyError::Invalid`] on the first parent that
+    /// is missing (`"This parent is not present."`) or not a
+    /// directory (`"This parent is not a directory."`).
+    pub fn after_delta_check_parents(
+        &mut self,
+        parents: &[(Vec<u8>, Vec<u8>)],
+        tree_index: usize,
+    ) -> Result<(), BasisApplyError> {
+        for (dirname_utf8, file_id) in parents {
+            let (d, b) = split_path_utf8(dirname_utf8);
+            let bei = get_block_entry_index(&self.dirblocks, d, b, tree_index);
+            if !bei.path_present {
+                return Err(BasisApplyError::Invalid {
+                    path: dirname_utf8.clone(),
+                    file_id: file_id.clone(),
+                    reason: "This parent is not present.".to_string(),
+                });
+            }
+            let entry = &self.dirblocks[bei.block_index].entries[bei.entry_index];
+            if entry.key.file_id != *file_id {
+                return Err(BasisApplyError::Invalid {
+                    path: dirname_utf8.clone(),
+                    file_id: file_id.clone(),
+                    reason: "This parent is not present.".to_string(),
+                });
+            }
+            let kind = entry.trees.get(tree_index).map(|t| t.minikind).unwrap_or(0);
+            if kind != b'd' {
+                return Err(BasisApplyError::Invalid {
+                    path: dirname_utf8.clone(),
+                    file_id: file_id.clone(),
+                    reason: "This parent is not a directory.".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Verify that none of `new_ids` is already present at a live
     /// entry in `tree_index`. Mirrors Python's
     /// `DirState._check_delta_ids_absent` — used by both
