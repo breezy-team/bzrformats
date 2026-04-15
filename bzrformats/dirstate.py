@@ -2159,12 +2159,12 @@ class DirState:
             self._state_file.seek(0)
             return self._state_file.readlines()
         self._read_dirblocks_if_needed()
-        lines = [
-            _get_parents_line(self.get_parent_ids()),
-            _get_ghosts_line(self._ghosts),
-        ]
-        lines.extend(_dirstate_rs.dirblocks_to_entry_lines(self._dirblocks))
-        return _get_output_lines(lines)
+        # Temporary sync boundary: push Python's dirblocks into the
+        # DirStateRs wrapper before calling the pure-Rust serialiser.
+        # Goes away once every dirblock writer has migrated and
+        # self._dirblocks is no longer the source of truth.
+        self._rs.dirblocks = self._dirblocks
+        return self._rs.get_lines()
 
     def _get_fields_to_entry(self):
         """Get a function which converts entry fields into a entry record.

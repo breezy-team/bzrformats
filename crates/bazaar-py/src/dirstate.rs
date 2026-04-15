@@ -706,6 +706,17 @@ impl PyDirState {
     fn mark_unmodified(&mut self) {
         self.inner.mark_unmodified();
     }
+
+    /// Serialise the in-memory state to the byte chunks that make up
+    /// the on-disk dirstate file. Mirrors Python's
+    /// `DirState.get_lines` slow path (the fast path that re-reads
+    /// unchanged bytes from disk belongs to the caller, since it
+    /// requires the Python `_state_file` handle).
+    fn get_lines<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let lines = self.inner.get_lines();
+        let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
+        PyList::new(py, items)
+    }
 }
 
 fn extract_fs_time(obj: &Bound<PyAny>) -> PyResult<u64> {
