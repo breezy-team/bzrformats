@@ -1483,6 +1483,73 @@ impl DirState {
         self.known_hash_changes.clear();
     }
 
+    /// Whether the current in-memory state is worth persisting. Mirrors
+    /// `DirState._worth_saving`: full-dirblock or header modifications
+    /// always save; hash-only changes save only once they exceed
+    /// `worth_saving_limit`, and `-1` disables hash-only saves entirely.
+    pub fn worth_saving(&self) -> bool {
+        if matches!(self.header_state, MemoryState::InMemoryModified)
+            || matches!(self.dirblock_state, MemoryState::InMemoryModified)
+        {
+            return true;
+        }
+        if matches!(self.dirblock_state, MemoryState::InMemoryHashModified) {
+            if self.worth_saving_limit == -1 {
+                return false;
+            }
+            if self.known_hash_changes.len() as i64 >= self.worth_saving_limit {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Persist the in-memory state through `transport`, assuming a
+    /// write lock is already held. This is the post-lock-upgrade core
+    /// of Python's `DirState.save`: honours `changes_aborted` and
+    /// `worth_saving` as early-return gates, serialises `get_lines()`
+    /// via `write_all`, optionally `fdatasync`s, and finishes with
+    /// `mark_unmodified`.
+    ///
+    /// The caller owns the read→write lock-upgrade dance that Python's
+    /// `save` performs via `temporary_write_lock` — the `Transport`
+    /// trait deliberately does not model it, because lock-upgrade
+    /// semantics belong to the Python `LockToken` plumbing rather than
+    /// to dirstate. A caller that wants the full Python behaviour
+    /// performs the upgrade, calls `save_to`, then restores the read
+    /// lock.
+    ///
+    /// Returns `Ok(true)` if the state was actually written, `Ok(false)`
+    /// if an early-return gate prevented the write, and `Err` if the
+    /// transport is not write-locked or any `write_all`/`fdatasync`
+    /// call failed.
+    pub fn save_to<T: Transport + ?Sized>(
+        &mut self,
+        transport: &mut T,
+    ) -> Result<bool, TransportError> {
+        if self.changes_aborted {
+            return Ok(false);
+        }
+        if !self.worth_saving() {
+            return Ok(false);
+        }
+        if transport.lock_state() != Some(LockState::Write) {
+            return Err(TransportError::Other(
+                "save_to requires a write lock".to_string(),
+            ));
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        for line in self.get_lines() {
+            buf.extend_from_slice(&line);
+        }
+        transport.write_all(&buf)?;
+        if self.fdatasync {
+            transport.fdatasync()?;
+        }
+        self.mark_unmodified();
+        Ok(true)
+    }
+
     /// Number of parent entries present in each dirstate record row.
     /// Mirrors Python's `DirState._num_present_parents` — total
     /// parents minus ghost parents.
@@ -4968,5 +5035,159 @@ mod dirstate_struct_tests {
         assert_eq!(read_back, bytes);
         let header = read_header(&read_back).expect("header parses");
         assert_eq!(header.num_entries, 1);
+    }
+
+    /// Build a minimal in-memory DirState whose dirblocks are the two
+    /// empty-dirname sentinel blocks plus a single TREE_ROOT entry —
+    /// the smallest shape `get_lines` accepts without panicking.
+    fn minimal_populated_state() -> DirState {
+        let nullstat = b"x".repeat(32);
+        let mut state = fresh_state();
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![Entry {
+                    key: EntryKey {
+                        dirname: b"".to_vec(),
+                        basename: b"".to_vec(),
+                        file_id: b"TREE_ROOT".to_vec(),
+                    },
+                    trees: vec![TreeData {
+                        minikind: b'd',
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: nullstat,
+                    }],
+                }],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        state
+    }
+
+    #[test]
+    fn worth_saving_full_dirblock_modification_always_saves() {
+        let mut state = fresh_state();
+        state.dirblock_state = MemoryState::InMemoryModified;
+        assert!(state.worth_saving());
+    }
+
+    #[test]
+    fn worth_saving_header_modification_always_saves() {
+        let mut state = fresh_state();
+        state.header_state = MemoryState::InMemoryModified;
+        assert!(state.worth_saving());
+    }
+
+    #[test]
+    fn worth_saving_unmodified_state_is_not_worth_saving() {
+        let mut state = fresh_state();
+        state.header_state = MemoryState::InMemoryUnmodified;
+        state.dirblock_state = MemoryState::InMemoryUnmodified;
+        assert!(!state.worth_saving());
+    }
+
+    #[test]
+    fn worth_saving_hash_only_under_limit_is_not_worth_saving() {
+        let mut state = fresh_state();
+        state.worth_saving_limit = 5;
+        state.dirblock_state = MemoryState::InMemoryHashModified;
+        state
+            .known_hash_changes
+            .insert(entry_key(b"", b"a", b"fid-a"));
+        assert!(!state.worth_saving());
+    }
+
+    #[test]
+    fn worth_saving_hash_only_at_or_above_limit_saves() {
+        let mut state = fresh_state();
+        state.worth_saving_limit = 2;
+        state.dirblock_state = MemoryState::InMemoryHashModified;
+        state
+            .known_hash_changes
+            .insert(entry_key(b"", b"a", b"fid-a"));
+        state
+            .known_hash_changes
+            .insert(entry_key(b"", b"b", b"fid-b"));
+        assert!(state.worth_saving());
+    }
+
+    #[test]
+    fn worth_saving_hash_only_with_negative_limit_never_saves() {
+        let mut state = fresh_state();
+        state.worth_saving_limit = -1;
+        state.dirblock_state = MemoryState::InMemoryHashModified;
+        for i in 0..10 {
+            state
+                .known_hash_changes
+                .insert(entry_key(b"", &[b'a' + i], b"fid"));
+        }
+        assert!(!state.worth_saving());
+    }
+
+    #[test]
+    fn save_to_writes_get_lines_and_marks_unmodified() {
+        let mut state = minimal_populated_state();
+        state.dirblock_state = MemoryState::InMemoryModified;
+        let expected: Vec<u8> = state.get_lines().into_iter().flatten().collect();
+
+        let mut t = MemoryTransport::new();
+        t.lock_write().unwrap();
+        let wrote = state.save_to(&mut t).expect("save_to");
+        assert!(wrote);
+        assert_eq!(t.read_all().unwrap(), expected);
+        // After a successful save the state flips back to unmodified.
+        assert_eq!(state.dirblock_state, MemoryState::InMemoryUnmodified);
+        assert_eq!(state.header_state, MemoryState::InMemoryUnmodified);
+    }
+
+    #[test]
+    fn save_to_honours_changes_aborted() {
+        let mut state = minimal_populated_state();
+        state.dirblock_state = MemoryState::InMemoryModified;
+        state.changes_aborted = true;
+        let mut t = MemoryTransport::new();
+        t.lock_write().unwrap();
+        let wrote = state.save_to(&mut t).expect("save_to");
+        assert!(!wrote);
+        // Nothing was written.
+        assert_eq!(t.read_all().unwrap(), Vec::<u8>::new());
+        // State flags are left alone.
+        assert_eq!(state.dirblock_state, MemoryState::InMemoryModified);
+    }
+
+    #[test]
+    fn save_to_skips_when_not_worth_saving() {
+        let mut state = minimal_populated_state();
+        // Fresh + unmodified → worth_saving is false.
+        state.header_state = MemoryState::InMemoryUnmodified;
+        state.dirblock_state = MemoryState::InMemoryUnmodified;
+        let mut t = MemoryTransport::new();
+        t.lock_write().unwrap();
+        let wrote = state.save_to(&mut t).expect("save_to");
+        assert!(!wrote);
+        assert_eq!(t.read_all().unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn save_to_requires_write_lock() {
+        let mut state = minimal_populated_state();
+        state.dirblock_state = MemoryState::InMemoryModified;
+        // No lock at all.
+        let mut t = MemoryTransport::new();
+        assert!(matches!(
+            state.save_to(&mut t).unwrap_err(),
+            TransportError::Other(_)
+        ));
+        // Read lock is still not enough.
+        t.lock_read().unwrap();
+        assert!(matches!(
+            state.save_to(&mut t).unwrap_err(),
+            TransportError::Other(_)
+        ));
     }
 }
