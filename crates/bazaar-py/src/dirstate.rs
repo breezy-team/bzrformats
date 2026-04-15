@@ -889,28 +889,78 @@ impl PyDirState {
 
         match self.inner.update_basis_apply_adds(&mut rust_adds) {
             Ok(()) => Ok(()),
-            Err(bazaar::dirstate::BasisApplyError::Invalid {
-                path,
-                file_id,
-                reason,
-            }) => {
-                // Match Python's `_raise_invalid`, which sets
-                // `_changes_aborted = True` before raising.
-                self.inner.changes_aborted = true;
-                let py = adds.py();
-                let errors_mod = py.import("bzrformats.errors")?;
-                let cls = errors_mod.getattr("InconsistentDelta")?;
-                let path_bytes = PyBytes::new(py, &path);
-                let file_id_bytes = PyBytes::new(py, &file_id);
-                let instance = cls.call1((path_bytes, file_id_bytes, reason))?;
-                Err(PyErr::from_value(instance))
+            Err(e) => Err(self.raise_basis_apply_error(adds.py(), e)),
+        }
+    }
+
+    /// Apply a sequence of "changes" to tree 1. Mirrors Python's
+    /// `DirState._update_basis_apply_changes`. Input is a Python
+    /// iterable of `(old_path, new_path, file_id, new_details)`
+    /// 4-tuples; `new_details` is the same 5-tuple layout used by
+    /// `update_basis_apply_adds`. Raises `InconsistentDelta` on a
+    /// stale entry.
+    fn update_basis_apply_changes(&mut self, changes: &Bound<PyAny>) -> PyResult<()> {
+        let mut rust_changes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, bazaar::dirstate::TreeData)> =
+            Vec::new();
+        for item in changes.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            if tup.len() != 4 {
+                return Err(PyTypeError::new_err(
+                    "update_basis_apply_changes entries must be 4-tuples",
+                ));
             }
-            Err(bazaar::dirstate::BasisApplyError::NotImplemented { reason }) => {
-                Err(pyo3::exceptions::PyNotImplementedError::new_err(reason))
+            let old_path: Vec<u8> = tup.get_item(0)?.extract()?;
+            let new_path: Vec<u8> = tup.get_item(1)?.extract()?;
+            let file_id: Vec<u8> = tup.get_item(2)?.extract()?;
+            let details_tup = tup.get_item(3)?.cast_into::<PyTuple>()?;
+            let minikind_bytes: Vec<u8> = details_tup.get_item(0)?.extract()?;
+            let new_details = bazaar::dirstate::TreeData {
+                minikind: minikind_bytes.first().copied().unwrap_or(0),
+                fingerprint: details_tup.get_item(1)?.extract()?,
+                size: details_tup.get_item(2)?.extract()?,
+                executable: details_tup.get_item(3)?.extract()?,
+                packed_stat: details_tup.get_item(4)?.extract()?,
+            };
+            rust_changes.push((old_path, new_path, file_id, new_details));
+        }
+        match self.inner.update_basis_apply_changes(&rust_changes) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.raise_basis_apply_error(changes.py(), e)),
+        }
+    }
+
+    /// Apply a sequence of "deletes" to tree 1. Mirrors Python's
+    /// `DirState._update_basis_apply_deletes`. Input is a Python
+    /// iterable of `(old_path, new_path_or_None, file_id, _ignored,
+    /// real_delete)` 5-tuples — the 4th element is unused by the
+    /// Python implementation (it carries `None` in the current
+    /// caller) but we accept it to preserve the existing wire shape.
+    fn update_basis_apply_deletes(&mut self, deletes: &Bound<PyAny>) -> PyResult<()> {
+        let mut rust_deletes: Vec<(Vec<u8>, Option<Vec<u8>>, Vec<u8>, bool)> = Vec::new();
+        for item in deletes.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            if tup.len() != 5 {
+                return Err(PyTypeError::new_err(
+                    "update_basis_apply_deletes entries must be 5-tuples",
+                ));
             }
-            Err(bazaar::dirstate::BasisApplyError::Internal { reason }) => {
-                Err(pyo3::exceptions::PyAssertionError::new_err(reason))
-            }
+            let old_path: Vec<u8> = tup.get_item(0)?.extract()?;
+            let new_path: Option<Vec<u8>> = {
+                let obj = tup.get_item(1)?;
+                if obj.is_none() {
+                    None
+                } else {
+                    Some(obj.extract()?)
+                }
+            };
+            let file_id: Vec<u8> = tup.get_item(2)?.extract()?;
+            // tup.get_item(3) ignored — matches Python's `_` binding.
+            let real_delete: bool = tup.get_item(4)?.extract()?;
+            rust_deletes.push((old_path, new_path, file_id, real_delete));
+        }
+        match self.inner.update_basis_apply_deletes(&rust_deletes) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.raise_basis_apply_error(deletes.py(), e)),
         }
     }
 
@@ -1034,6 +1084,52 @@ impl PyDirState {
             out.append(entry_to_py_tuple(py, entry)?)?;
         }
         Ok(out)
+    }
+}
+
+impl PyDirState {
+    /// Shared error conversion for the three update_basis_apply_*
+    /// methods: `Invalid` becomes `bzrformats.errors.InconsistentDelta`
+    /// and also sets `changes_aborted` on the inner state (mirroring
+    /// Python's `_raise_invalid`); `NotImplemented` and `Internal`
+    /// become `NotImplementedError` and `AssertionError`.
+    ///
+    /// Defined in a plain `impl` block rather than `#[pymethods]`
+    /// because `BasisApplyError` is not FFI-exposable.
+    fn raise_basis_apply_error(
+        &mut self,
+        py: Python<'_>,
+        err: bazaar::dirstate::BasisApplyError,
+    ) -> PyErr {
+        match err {
+            bazaar::dirstate::BasisApplyError::Invalid {
+                path,
+                file_id,
+                reason,
+            } => {
+                self.inner.changes_aborted = true;
+                let errors_mod = match py.import("bzrformats.errors") {
+                    Ok(m) => m,
+                    Err(e) => return e,
+                };
+                let cls = match errors_mod.getattr("InconsistentDelta") {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                let path_bytes = PyBytes::new(py, &path);
+                let file_id_bytes = PyBytes::new(py, &file_id);
+                match cls.call1((path_bytes, file_id_bytes, reason)) {
+                    Ok(instance) => PyErr::from_value(instance),
+                    Err(e) => e,
+                }
+            }
+            bazaar::dirstate::BasisApplyError::NotImplemented { reason } => {
+                pyo3::exceptions::PyNotImplementedError::new_err(reason)
+            }
+            bazaar::dirstate::BasisApplyError::Internal { reason } => {
+                pyo3::exceptions::PyAssertionError::new_err(reason)
+            }
+        }
     }
 }
 

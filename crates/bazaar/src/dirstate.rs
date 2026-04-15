@@ -2221,6 +2221,227 @@ impl DirState {
         Ok(())
     }
 
+    /// Apply a sequence of "changes" to tree 1. Mirrors Python's
+    /// `DirState._update_basis_apply_changes`. Each change updates
+    /// the tree-1 slot of an existing entry whose file_id matches
+    /// at the new path. The entry must already exist and be live
+    /// (tree-1 minikind not absent/relocated); otherwise the caller
+    /// sees `BasisApplyError::Invalid`.
+    ///
+    /// Invalidates id_index and packed_stat_index caches.
+    pub fn update_basis_apply_changes(
+        &mut self,
+        changes: &[(Vec<u8>, Vec<u8>, Vec<u8>, TreeData)],
+    ) -> Result<(), BasisApplyError> {
+        for (_old_path, new_path, file_id, new_details) in changes {
+            let (dirname, basename) = split_path_utf8(new_path);
+            let bei = get_block_entry_index(&self.dirblocks, dirname, basename, 1);
+            if !bei.path_present {
+                return Err(BasisApplyError::Invalid {
+                    path: new_path.clone(),
+                    file_id: file_id.clone(),
+                    reason: "changed entry considered not present".to_string(),
+                });
+            }
+            let entry = &mut self.dirblocks[bei.block_index].entries[bei.entry_index];
+            if entry.key.file_id != *file_id {
+                return Err(BasisApplyError::Invalid {
+                    path: new_path.clone(),
+                    file_id: file_id.clone(),
+                    reason: "changed entry considered not present".to_string(),
+                });
+            }
+            let tree1_kind = entry.trees.get(1).map(|t| t.minikind).unwrap_or(0);
+            if tree1_kind == b'a' || tree1_kind == b'r' {
+                return Err(BasisApplyError::Invalid {
+                    path: new_path.clone(),
+                    file_id: file_id.clone(),
+                    reason: "changed entry considered not present".to_string(),
+                });
+            }
+            if entry.trees.len() >= 2 {
+                entry.trees[1] = new_details.clone();
+            } else {
+                entry.trees.push(new_details.clone());
+            }
+        }
+        self.id_index = None;
+        self.packed_stat_index = None;
+        Ok(())
+    }
+
+    /// Apply a sequence of "deletes" to tree 1. Mirrors Python's
+    /// `DirState._update_basis_apply_deletes`. Each delete either
+    /// removes an entry row entirely (when the active tree is also
+    /// absent/relocated) or sets its tree-1 slot to NULL_PARENT_DETAILS
+    /// so the file id survives in the active tree. The post-delete
+    /// dirblock integrity check walks child blocks to ensure no live
+    /// rows were left behind; that check follows Python exactly.
+    ///
+    /// Each tuple is `(old_path, Option<new_path>, file_id, real_delete)`
+    /// where `real_delete` must equal `new_path.is_none()` — otherwise
+    /// the caller sees `BasisApplyError::Invalid("bad delete delta")`.
+    ///
+    /// Invalidates id_index and packed_stat_index caches.
+    pub fn update_basis_apply_deletes(
+        &mut self,
+        deletes: &[(Vec<u8>, Option<Vec<u8>>, Vec<u8>, bool)],
+    ) -> Result<(), BasisApplyError> {
+        for (old_path, new_path, file_id, real_delete) in deletes {
+            if *real_delete != new_path.is_none() {
+                return Err(BasisApplyError::Invalid {
+                    path: old_path.clone(),
+                    file_id: file_id.clone(),
+                    reason: "bad delete delta".to_string(),
+                });
+            }
+
+            let (dirname, basename) = split_path_utf8(old_path);
+            let bei = get_block_entry_index(&self.dirblocks, dirname, basename, 1);
+            if !bei.path_present {
+                return Err(BasisApplyError::Invalid {
+                    path: old_path.clone(),
+                    file_id: file_id.clone(),
+                    reason: "basis tree does not contain removed entry".to_string(),
+                });
+            }
+            let (active_kind, old_kind, entry_file_id) = {
+                let entry = &self.dirblocks[bei.block_index].entries[bei.entry_index];
+                (
+                    entry.trees.first().map(|t| t.minikind).unwrap_or(0),
+                    entry.trees.get(1).map(|t| t.minikind).unwrap_or(0),
+                    entry.key.file_id.clone(),
+                )
+            };
+            if entry_file_id != *file_id {
+                return Err(BasisApplyError::Invalid {
+                    path: old_path.clone(),
+                    file_id: file_id.clone(),
+                    reason: "mismatched file_id in tree 1".to_string(),
+                });
+            }
+
+            // The dirblock whose children are then scanned for
+            // live-row leaks. `None` when no follow-up check is
+            // needed.
+            let mut dir_block_index: Option<usize> = None;
+
+            if active_kind == b'a' || active_kind == b'r' {
+                if active_kind == b'r' {
+                    // Follow the tree-0 relocation pointer and
+                    // clear the target's tree-1 slot.
+                    let active_path = self.dirblocks[bei.block_index].entries[bei.entry_index]
+                        .trees[0]
+                        .fingerprint
+                        .clone();
+                    let (adirname, abasename) = split_path_utf8(&active_path);
+                    let abei = get_block_entry_index(&self.dirblocks, adirname, abasename, 0);
+                    if !abei.path_present {
+                        return Err(BasisApplyError::Invalid {
+                            path: old_path.clone(),
+                            file_id: file_id.clone(),
+                            reason: "Dirstate did not have matching rename entries".to_string(),
+                        });
+                    }
+                    let (a_t0, a_t1) = {
+                        let ae = &self.dirblocks[abei.block_index].entries[abei.entry_index];
+                        (
+                            ae.trees.first().map(|t| t.minikind).unwrap_or(0),
+                            ae.trees.get(1).map(|t| t.minikind).unwrap_or(0),
+                        )
+                    };
+                    if a_t1 != b'r' {
+                        return Err(BasisApplyError::Invalid {
+                            path: old_path.clone(),
+                            file_id: file_id.clone(),
+                            reason: "Dirstate did not have matching rename entries".to_string(),
+                        });
+                    }
+                    if a_t0 == b'a' || a_t0 == b'r' {
+                        return Err(BasisApplyError::Invalid {
+                            path: old_path.clone(),
+                            file_id: file_id.clone(),
+                            reason: "Dirstate had a rename pointing at an inactive tree0"
+                                .to_string(),
+                        });
+                    }
+                    let ae = &mut self.dirblocks[abei.block_index].entries[abei.entry_index];
+                    let null = TreeData {
+                        minikind: b'a',
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: Vec::new(),
+                    };
+                    if ae.trees.len() >= 2 {
+                        ae.trees[1] = null;
+                    } else {
+                        ae.trees.push(null);
+                    }
+                }
+
+                self.dirblocks[bei.block_index]
+                    .entries
+                    .remove(bei.entry_index);
+
+                if old_kind == b'd' {
+                    let dirblock_key = EntryKey {
+                        dirname: old_path.clone(),
+                        basename: Vec::new(),
+                        file_id: Vec::new(),
+                    };
+                    let (db_index, db_present) =
+                        find_block_index_from_key(&self.dirblocks, &dirblock_key);
+                    if db_present {
+                        if self.dirblocks[db_index].entries.is_empty() {
+                            self.dirblocks.remove(db_index);
+                        } else {
+                            dir_block_index = Some(db_index);
+                        }
+                    }
+                }
+            } else {
+                let entry = &mut self.dirblocks[bei.block_index].entries[bei.entry_index];
+                let null = TreeData {
+                    minikind: b'a',
+                    fingerprint: Vec::new(),
+                    size: 0,
+                    executable: false,
+                    packed_stat: Vec::new(),
+                };
+                if entry.trees.len() >= 2 {
+                    entry.trees[1] = null;
+                } else {
+                    entry.trees.push(null);
+                }
+
+                let child_bei = get_block_entry_index(&self.dirblocks, old_path, b"", 1);
+                if child_bei.dir_present {
+                    dir_block_index = Some(child_bei.block_index);
+                }
+            }
+
+            if let Some(db_index) = dir_block_index {
+                let block = &self.dirblocks[db_index];
+                for child in &block.entries {
+                    let child_tree1 = child.trees.get(1).map(|t| t.minikind).unwrap_or(0);
+                    if child_tree1 != b'a' && child_tree1 != b'r' {
+                        return Err(BasisApplyError::Invalid {
+                            path: old_path.clone(),
+                            file_id: file_id.clone(),
+                            reason: "The file id was deleted but its children were not deleted."
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        self.id_index = None;
+        self.packed_stat_index = None;
+        Ok(())
+    }
+
     /// Look up the dirstate entry for `file_id` in `tree_index`,
     /// following any relocation chain the entries describe. Mirrors
     /// the `fileid_utf8` branch of Python's `DirState._get_entry`.
@@ -5105,6 +5326,167 @@ mod dirstate_struct_tests {
         }];
         let err = state.update_basis_apply_adds(&mut adds).unwrap_err();
         assert!(matches!(err, BasisApplyError::Invalid { .. }));
+    }
+
+    #[test]
+    fn update_basis_apply_changes_updates_existing_tree1_slot() {
+        // README exists in both trees 0 and 1. The change records a
+        // new tree-1 value; tree 0 is left alone.
+        let mut state = fresh_state();
+        state.parents = vec![b"parent-id".to_vec()];
+        let tree0 = basis_details(b'f', b"sha-r", 10, false);
+        let tree1 = basis_details(b'f', b"sha-old", 10, false);
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(b'd'), tree(b'd')],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"README",
+                    b"fid-readme",
+                    vec![tree0.clone(), tree1],
+                )],
+            },
+        ];
+
+        let new_details = basis_details(b'f', b"sha-updated", 99, true);
+        let changes = vec![(
+            b"README".to_vec(),
+            b"README".to_vec(),
+            b"fid-readme".to_vec(),
+            new_details.clone(),
+        )];
+        state
+            .update_basis_apply_changes(&changes)
+            .expect("apply_changes");
+
+        let entry = &state.dirblocks[1].entries[0];
+        assert_eq!(entry.trees[0].fingerprint, b"sha-r".to_vec());
+        assert_eq!(entry.trees[1].fingerprint, b"sha-updated".to_vec());
+        assert_eq!(entry.trees[1].size, 99);
+        assert!(entry.trees[1].executable);
+    }
+
+    #[test]
+    fn update_basis_apply_changes_absent_entry_is_invalid() {
+        let mut state = basis_adds_fixture_one_file();
+        // README's tree-1 is absent in the fixture; a change targeting it
+        // is inconsistent.
+        let changes = vec![(
+            b"README".to_vec(),
+            b"README".to_vec(),
+            b"fid-readme".to_vec(),
+            basis_details(b'f', b"sha", 1, false),
+        )];
+        let err = state.update_basis_apply_changes(&changes).unwrap_err();
+        assert!(matches!(err, BasisApplyError::Invalid { .. }));
+    }
+
+    #[test]
+    fn update_basis_apply_deletes_removes_row_when_active_also_absent() {
+        // README has tree 0 absent and tree 1 live; a real_delete
+        // should drop the row entirely.
+        let mut state = fresh_state();
+        state.parents = vec![b"parent-id".to_vec()];
+        let t0 = null_parent_details();
+        let t1 = basis_details(b'f', b"sha", 1, false);
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(b'd'), tree(b'd')],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"README",
+                    b"fid-readme",
+                    vec![t0, t1],
+                )],
+            },
+        ];
+
+        let deletes = vec![(
+            b"README".to_vec(),
+            None::<Vec<u8>>,
+            b"fid-readme".to_vec(),
+            true,
+        )];
+        state
+            .update_basis_apply_deletes(&deletes)
+            .expect("apply_deletes");
+        assert!(state.dirblocks[1].entries.is_empty());
+    }
+
+    #[test]
+    fn update_basis_apply_deletes_keeps_row_when_active_still_present() {
+        // README has tree 0 live and tree 1 live; a non-real-delete
+        // (split rename) should nullify tree 1 but keep the row.
+        let mut state = basis_adds_fixture_one_file();
+        state.dirblocks[1].entries[0].trees[1] = basis_details(b'f', b"sha-old", 10, false);
+
+        let deletes = vec![(
+            b"README".to_vec(),
+            Some(b"README.new".to_vec()),
+            b"fid-readme".to_vec(),
+            false,
+        )];
+        state
+            .update_basis_apply_deletes(&deletes)
+            .expect("apply_deletes");
+        let entry = &state.dirblocks[1].entries[0];
+        assert_eq!(entry.trees[1].minikind, b'a');
+        assert!(entry.trees[1].fingerprint.is_empty());
+    }
+
+    #[test]
+    fn update_basis_apply_deletes_bad_delta_is_invalid() {
+        let mut state = basis_adds_fixture_one_file();
+        // real_delete=true but new_path=Some — inconsistent.
+        let deletes = vec![(
+            b"README".to_vec(),
+            Some(b"README.new".to_vec()),
+            b"fid-readme".to_vec(),
+            true,
+        )];
+        let err = state.update_basis_apply_deletes(&deletes).unwrap_err();
+        match err {
+            BasisApplyError::Invalid { reason, .. } => {
+                assert!(reason.contains("bad delete delta"), "{}", reason);
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_basis_apply_deletes_missing_entry_is_invalid() {
+        let mut state = basis_adds_fixture_one_file();
+        let deletes = vec![(
+            b"ghost".to_vec(),
+            None::<Vec<u8>>,
+            b"fid-ghost".to_vec(),
+            true,
+        )];
+        let err = state.update_basis_apply_deletes(&deletes).unwrap_err();
+        match err {
+            BasisApplyError::Invalid { reason, .. } => {
+                assert!(reason.contains("basis tree does not contain"), "{}", reason);
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
     }
 
     #[test]

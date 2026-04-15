@@ -1740,17 +1740,13 @@ class DirState:
     def _update_basis_apply_changes(self, changes):
         """Apply a sequence of changes to tree 1 during update_basis_by_delta.
 
-        :param adds: A sequence of changes. Each change is a tuple:
+        :param changes: A sequence of changes. Each change is a tuple:
             (path_utf8, path_utf8, file_id, (entry_details))
         """
-        for _old_path, new_path, file_id, new_details in changes:
-            # the entry for this file_id must be in tree 0.
-            entry = self._get_entry(1, file_id, new_path)
-            if entry[0] is None or entry[1][1][0] in (b"a", b"r"):
-                self._raise_invalid(
-                    new_path, file_id, "changed entry considered not present"
-                )
-            entry[1][1] = new_details
+        self._rs.dirblocks = self._dirblocks
+        self._rs.update_basis_apply_changes(changes)
+        self._dirblocks = self._rs.dirblocks
+        self._id_index = None
 
     def _update_basis_apply_deletes(self, deletes):
         """Apply a sequence of deletes to tree 1 during update_basis_by_delta.
@@ -1764,82 +1760,10 @@ class DirState:
             rather than the rename handling logic temporarily deleting a path
             during the replacement of a parent.
         """
-        null = DirState.NULL_PARENT_DETAILS
-        for old_path, new_path, file_id, _, real_delete in deletes:
-            if real_delete != (new_path is None):
-                self._raise_invalid(old_path, file_id, "bad delete delta")
-            # the entry for this file_id must be in tree 1.
-            dirname, basename = osutils.split(old_path)
-            (
-                block_index,
-                entry_index,
-                _dir_present,
-                file_present,
-            ) = self._get_block_entry_index(dirname, basename, 1)
-            if not file_present:
-                self._raise_invalid(
-                    old_path, file_id, "basis tree does not contain removed entry"
-                )
-            entry = self._dirblocks[block_index][1][entry_index]
-            # The state of the entry in the 'active' WT
-            active_kind = entry[1][0][0]
-            if entry[0][2] != file_id:
-                self._raise_invalid(old_path, file_id, "mismatched file_id in tree 1")
-            dir_block = ()
-            old_kind = entry[1][1][0]
-            if active_kind in b"ar":
-                # The active tree doesn't have this file_id.
-                # The basis tree is changing this record. If this is a
-                # rename, then we don't want the record here at all
-                # anymore. If it is just an in-place change, we want the
-                # record here, but we'll add it if we need to. So we just
-                # delete it
-                if active_kind == b"r":
-                    active_path = entry[1][0][1]
-                    active_entry = self._get_entry(0, file_id, active_path)
-                    if active_entry[1][1][0] != b"r":
-                        self._raise_invalid(
-                            old_path,
-                            file_id,
-                            "Dirstate did not have matching rename entries",
-                        )
-                    elif active_entry[1][0][0] in b"ar":
-                        self._raise_invalid(
-                            old_path,
-                            file_id,
-                            "Dirstate had a rename pointing at an inactive tree0",
-                        )
-                    active_entry[1][1] = null
-                del self._dirblocks[block_index][1][entry_index]
-                if old_kind == b"d":
-                    # This was a directory, and the active tree says it
-                    # doesn't exist, and now the basis tree says it doesn't
-                    # exist. Remove its dirblock if present
-                    (dir_block_index, present) = self._find_block_index_from_key(
-                        (old_path, b"", b"")
-                    )
-                    if present:
-                        dir_block = self._dirblocks[dir_block_index][1]
-                        if not dir_block:
-                            # This entry is empty, go ahead and just remove it
-                            del self._dirblocks[dir_block_index]
-            else:
-                # There is still an active record, so just mark this
-                # removed.
-                entry[1][1] = null
-                block_i, _entry_i, d_present, _f_present = self._get_block_entry_index(
-                    old_path, b"", 1
-                )
-                if d_present:
-                    dir_block = self._dirblocks[block_i][1]
-            for child_entry in dir_block:
-                child_basis_kind = child_entry[1][1][0]
-                if child_basis_kind not in b"ar":
-                    self._raise_invalid(
-                        old_path,
-                        file_id,
-                        "The file id was deleted but its children were not deleted.",
-                    )
+        self._rs.dirblocks = self._dirblocks
+        self._rs.update_basis_apply_deletes(deletes)
+        self._dirblocks = self._rs.dirblocks
+        self._id_index = None
 
     def _after_delta_check_parents(self, parents, index):
         """Check that parents required by the delta are all intact.
