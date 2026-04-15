@@ -1903,6 +1903,39 @@ impl DirState {
         }
     }
 
+    /// Return references to every dirstate entry whose key `(dirname,
+    /// basename)` matches `path_utf8`, across all file ids. Mirrors
+    /// Python's `DirState._entries_for_path`: a path can be represented
+    /// by multiple rows when the same location held different file ids
+    /// in different parent trees, so the lookup walks the block
+    /// starting at the first matching entry and stops at the first
+    /// non-match. Returns an empty list when no block exists for the
+    /// parent directory.
+    pub fn entries_for_path(&self, path_utf8: &[u8]) -> Vec<&Entry> {
+        let (dirname, basename) = split_path_utf8(path_utf8);
+        let key = EntryKey {
+            dirname: dirname.to_vec(),
+            basename: basename.to_vec(),
+            file_id: Vec::new(),
+        };
+        let (block_index, present) = self.find_block_index_from_key(&key);
+        if !present {
+            return Vec::new();
+        }
+        let block = &self.dirblocks[block_index].entries;
+        let (mut entry_index, _) = self.find_entry_index(&key, block);
+        let mut result = Vec::new();
+        while entry_index < block.len() {
+            let candidate = &block[entry_index];
+            if candidate.key.dirname != key.dirname || candidate.key.basename != key.basename {
+                break;
+            }
+            result.push(candidate);
+            entry_index += 1;
+        }
+        result
+    }
+
     /// Look up the dirstate entry at `path_utf8` in `tree_index` and
     /// return a reference to it, or `None` if the path is not present
     /// in that tree. Mirrors the `path_utf8` branch of Python's
@@ -3349,6 +3382,41 @@ mod dirstate_struct_tests {
     /// path and verify the expected (dirname, basename, file_id) key
     /// comes back — or `None` for paths that don't exist or live under
     /// a non-existent directory.
+    #[test]
+    fn entries_for_path_returns_all_rows_at_path() {
+        let state = create_complex_dirstate();
+        let rows = state.entries_for_path(b"a/e");
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert_eq!(row.key.dirname, b"a".to_vec());
+            assert_eq!(row.key.basename, b"e".to_vec());
+        }
+        // At least the direct entry should be present.
+        assert!(rows.iter().any(|r| r.key.file_id == b"e-dir".to_vec()));
+    }
+
+    #[test]
+    fn entries_for_path_root_returns_root_row() {
+        let state = create_complex_dirstate();
+        let rows = state.entries_for_path(b"");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key.dirname, b"".to_vec());
+        assert_eq!(rows[0].key.basename, b"".to_vec());
+        assert_eq!(rows[0].key.file_id, b"a-root-value".to_vec());
+    }
+
+    #[test]
+    fn entries_for_path_missing_directory_returns_empty() {
+        let state = create_complex_dirstate();
+        assert!(state.entries_for_path(b"nosuchdir/nope").is_empty());
+    }
+
+    #[test]
+    fn entries_for_path_missing_basename_returns_empty() {
+        let state = create_complex_dirstate();
+        assert!(state.entries_for_path(b"a/nope").is_empty());
+    }
+
     #[test]
     fn get_entry_by_path_simple_structure() {
         let state = create_dirstate_with_root_and_subdir();
