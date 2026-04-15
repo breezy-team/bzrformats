@@ -1237,7 +1237,7 @@ pub struct DirState {
     /// Provider used to compute sha1s and stat+sha1 tuples for working-tree
     /// files. Boxed so callers can swap in an alternate implementation for
     /// testing, matching Python's `_sha1_provider` attribute.
-    pub sha1_provider: Box<dyn SHA1Provider>,
+    pub sha1_provider: Box<dyn SHA1Provider + Send + Sync>,
     /// State of the header (`NotInMemory` until `_read_header` runs).
     pub header_state: MemoryState,
     /// State of the per-row dirblock data.
@@ -1299,7 +1299,7 @@ impl DirState {
     /// `bzrformats/dirstate.py` `DirState.__init__`.
     pub fn new<P: Into<PathBuf>>(
         path: P,
-        sha1_provider: Box<dyn SHA1Provider>,
+        sha1_provider: Box<dyn SHA1Provider + Send + Sync>,
         worth_saving_limit: i64,
         use_filesystem_for_exec: bool,
         fdatasync: bool,
@@ -2217,6 +2217,357 @@ impl DirState {
         }
 
         self.id_index = None;
+        self.packed_stat_index = None;
+        Ok(())
+    }
+
+    /// Update a single entry in tree 0 — either insert a new row or
+    /// replace its tree-0 details. Mirrors Python's
+    /// `DirState.update_minimal`.
+    ///
+    /// # Parameters
+    /// - `key`: `(dirname, basename, file_id)` identifying the entry.
+    /// - `tree0_details`: replacement data for the tree-0 slot
+    ///   (the `new_details` tuple Python builds from minikind,
+    ///   fingerprint, size, executable, packed_stat).
+    /// - `path_utf8`: `dirname + "/" + basename` without the leading
+    ///   slash, or `b""` for the root; used when building relocation
+    ///   pointers. Required whenever the method takes the
+    ///   cross-reference branch.
+    /// - `fullscan`: when true, skip the conflicting-entry check
+    ///   that `set_state_from_inventory` disables for bulk loads.
+    ///
+    /// Returns `Ok(())` on success, or
+    /// [`BasisApplyError::Invalid`] / [`BasisApplyError::Internal`]
+    /// for user-visible delta conflicts and internal invariant
+    /// violations (matching Python's `_raise_invalid` /
+    /// `AssertionError` / "no path").
+    pub fn update_minimal(
+        &mut self,
+        key: EntryKey,
+        tree0_details: TreeData,
+        path_utf8: Option<&[u8]>,
+        fullscan: bool,
+    ) -> Result<(), BasisApplyError> {
+        // Ensure the block for `key.dirname` exists. Python's
+        // `_find_block` performs a `_find_block_index_from_key`
+        // lookup then inserts an empty block if missing.
+        let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, &key);
+        if !block_present {
+            self.dirblocks.insert(
+                block_index,
+                Dirblock {
+                    dirname: key.dirname.clone(),
+                    entries: Vec::new(),
+                },
+            );
+        }
+
+        // Find the insertion point within the block.
+        let (mut entry_index, present) =
+            find_entry_index(&key, &self.dirblocks[block_index].entries);
+
+        // Pre-populate the id_index cache once.
+        let _ = self.get_or_build_id_index();
+
+        if !present {
+            // Non-fullscan conflict check: walk forward from the
+            // basename-only match position and ensure no existing
+            // entry occupies the same (dirname, basename) with a
+            // live tree-0 row.
+            if !fullscan {
+                let prefix_key = EntryKey {
+                    dirname: key.dirname.clone(),
+                    basename: key.basename.clone(),
+                    file_id: Vec::new(),
+                };
+                let (mut low_index, _) =
+                    find_entry_index(&prefix_key, &self.dirblocks[block_index].entries);
+                while low_index < self.dirblocks[block_index].entries.len() {
+                    let candidate = &self.dirblocks[block_index].entries[low_index];
+                    if candidate.key.dirname == key.dirname
+                        && candidate.key.basename == key.basename
+                    {
+                        let t0 = candidate.trees.first().map(|t| t.minikind).unwrap_or(0);
+                        if t0 != b'a' && t0 != b'r' {
+                            let mut path = key.dirname.clone();
+                            if !path.is_empty() {
+                                path.push(b'/');
+                            }
+                            path.extend_from_slice(&key.basename);
+                            return Err(BasisApplyError::Invalid {
+                                path,
+                                file_id: key.file_id.clone(),
+                                reason: format!(
+                                    "Attempt to add item at path already occupied by id {:?}",
+                                    candidate.key.file_id
+                                ),
+                            });
+                        }
+                        low_index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // Existing keys for this file_id across the id_index.
+            let fid = FileId::from(&key.file_id);
+            let existing_keys: Vec<(Vec<u8>, Vec<u8>, FileId)> =
+                self.id_index.as_ref().unwrap().get(&fid);
+
+            let new_trees: Vec<TreeData> = if existing_keys.is_empty() {
+                // Simple case: a new file id, no parents to link.
+                let mut trees = vec![tree0_details.clone()];
+                for _ in 0..self.num_present_parents() {
+                    trees.push(TreeData {
+                        minikind: b'a',
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: Vec::new(),
+                    });
+                }
+                trees
+            } else {
+                // Cross-reference case: rewrite other rows to point
+                // at this new entry, then assemble parent details
+                // by cloning from existing rows or synthesising
+                // relocation pointers.
+                let path_bytes = path_utf8.ok_or_else(|| BasisApplyError::Internal {
+                    reason: "update_minimal: no path".to_string(),
+                })?;
+
+                // Convert each existing key's tree-0 slot to a
+                // relocation pointer to `path_utf8`. Python also
+                // drops entries that become entirely dead
+                // afterwards via `_maybe_remove_row`.
+                let mut removed_before_target = 0usize;
+                let keys_snapshot: Vec<(Vec<u8>, Vec<u8>, FileId)> = existing_keys.clone();
+                for other_tuple in &keys_snapshot {
+                    let (odirname, obasename, _ofid) = other_tuple;
+                    let other_key = EntryKey {
+                        dirname: odirname.clone(),
+                        basename: obasename.clone(),
+                        file_id: key.file_id.clone(),
+                    };
+                    let (ob_idx, ob_present) =
+                        find_block_index_from_key(&self.dirblocks, &other_key);
+                    if !ob_present {
+                        return Err(BasisApplyError::Internal {
+                            reason: format!("could not find block for {:?}", other_key),
+                        });
+                    }
+                    let (oe_idx, oe_present) =
+                        find_entry_index(&other_key, &self.dirblocks[ob_idx].entries);
+                    if !oe_present {
+                        return Err(BasisApplyError::Internal {
+                            reason: format!(
+                                "update_minimal: could not find other entry for {:?}",
+                                other_key
+                            ),
+                        });
+                    }
+
+                    self.dirblocks[ob_idx].entries[oe_idx].trees[0] = TreeData {
+                        minikind: b'r',
+                        fingerprint: path_bytes.to_vec(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: Vec::new(),
+                    };
+
+                    let all_dead = self.dirblocks[ob_idx].entries[oe_idx]
+                        .trees
+                        .iter()
+                        .all(|t| t.minikind == b'a' || t.minikind == b'r');
+                    if all_dead {
+                        let removed_key = self.dirblocks[ob_idx].entries[oe_idx].key.clone();
+                        self.dirblocks[ob_idx].entries.remove(oe_idx);
+                        if let Some(idx) = self.id_index.as_mut() {
+                            let rfid = FileId::from(&removed_key.file_id);
+                            idx.remove((
+                                removed_key.dirname.as_slice(),
+                                removed_key.basename.as_slice(),
+                                &rfid,
+                            ));
+                        }
+                        if ob_idx == block_index && oe_idx < entry_index {
+                            removed_before_target += 1;
+                        }
+                    }
+                }
+                entry_index = entry_index.saturating_sub(removed_before_target);
+
+                let mut trees = vec![tree0_details.clone()];
+                let num_parents = self.num_present_parents();
+                if num_parents > 0 {
+                    // Python grabs `list(existing_keys)[0]` before
+                    // the removals, so the first key in the
+                    // snapshot is the authoritative source for
+                    // parent-tree details.
+                    let (odirname, obasename, _ofid) = keys_snapshot[0].clone();
+                    let other_key = EntryKey {
+                        dirname: odirname.clone(),
+                        basename: obasename.clone(),
+                        file_id: key.file_id.clone(),
+                    };
+                    let (ub_idx, ub_present) =
+                        find_block_index_from_key(&self.dirblocks, &other_key);
+                    if !ub_present {
+                        return Err(BasisApplyError::Internal {
+                            reason: format!("could not find block for {:?}", other_key),
+                        });
+                    }
+                    let (ue_idx, ue_present) =
+                        find_entry_index(&other_key, &self.dirblocks[ub_idx].entries);
+                    if !ue_present {
+                        return Err(BasisApplyError::Internal {
+                            reason: format!(
+                                "update_minimal: could not find entry for {:?}",
+                                other_key
+                            ),
+                        });
+                    }
+                    for lookup_index in 1..=num_parents {
+                        let source_tree = self.dirblocks[ub_idx].entries[ue_idx]
+                            .trees
+                            .get(lookup_index)
+                            .cloned();
+                        match source_tree {
+                            Some(ref t) if t.minikind == b'a' || t.minikind == b'r' => {
+                                trees.push(t.clone());
+                            }
+                            Some(_) => {
+                                let mut ptr = odirname.clone();
+                                if !ptr.is_empty() {
+                                    ptr.push(b'/');
+                                }
+                                ptr.extend_from_slice(&obasename);
+                                trees.push(TreeData {
+                                    minikind: b'r',
+                                    fingerprint: ptr,
+                                    size: 0,
+                                    executable: false,
+                                    packed_stat: Vec::new(),
+                                });
+                            }
+                            None => {
+                                trees.push(TreeData {
+                                    minikind: b'a',
+                                    fingerprint: Vec::new(),
+                                    size: 0,
+                                    executable: false,
+                                    packed_stat: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                }
+                trees
+            };
+
+            // Insert the new entry at `entry_index`, then extend
+            // the id_index.
+            let new_entry = Entry {
+                key: key.clone(),
+                trees: new_trees,
+            };
+            self.dirblocks[block_index]
+                .entries
+                .insert(entry_index, new_entry);
+            if let Some(idx) = self.id_index.as_mut() {
+                idx.add((
+                    key.dirname.as_slice(),
+                    key.basename.as_slice(),
+                    &FileId::from(&key.file_id),
+                ));
+            }
+        } else {
+            // Update the tree-0 slot of the existing entry in place.
+            self.dirblocks[block_index].entries[entry_index].trees[0] = tree0_details.clone();
+
+            let path_bytes = path_utf8.ok_or_else(|| BasisApplyError::Internal {
+                reason: "update_minimal: no path".to_string(),
+            })?;
+
+            // Cross-reference maintenance: every other entry that
+            // shares this file_id (as recorded in the id_index)
+            // must be turned into a relocation pointer to
+            // `path_utf8`.
+            let fid = FileId::from(&key.file_id);
+            let existing_keys: Vec<(Vec<u8>, Vec<u8>, FileId)> =
+                self.id_index.as_ref().unwrap().get(&fid);
+            if !existing_keys
+                .iter()
+                .any(|(d, b, _)| d == &key.dirname && b == &key.basename)
+            {
+                return Err(BasisApplyError::Internal {
+                    reason: format!(
+                        "We found the entry in the blocks, but the key is not in the id_index. key: {:?}, existing_keys: {:?}",
+                        key, existing_keys
+                    ),
+                });
+            }
+
+            for (odirname, obasename, _ofid) in &existing_keys {
+                if odirname == &key.dirname && obasename == &key.basename {
+                    continue;
+                }
+                let other_key = EntryKey {
+                    dirname: odirname.clone(),
+                    basename: obasename.clone(),
+                    file_id: key.file_id.clone(),
+                };
+                let (ob_idx, ob_present) = find_block_index_from_key(&self.dirblocks, &other_key);
+                if !ob_present {
+                    return Err(BasisApplyError::Internal {
+                        reason: format!("not present: {:?}", other_key),
+                    });
+                }
+                let (oe_idx, oe_present) =
+                    find_entry_index(&other_key, &self.dirblocks[ob_idx].entries);
+                if !oe_present {
+                    return Err(BasisApplyError::Internal {
+                        reason: format!("not present: {:?}", other_key),
+                    });
+                }
+                self.dirblocks[ob_idx].entries[oe_idx].trees[0] = TreeData {
+                    minikind: b'r',
+                    fingerprint: path_bytes.to_vec(),
+                    size: 0,
+                    executable: false,
+                    packed_stat: Vec::new(),
+                };
+            }
+        }
+
+        // If the new entry is a directory, ensure a child block
+        // exists for its path.
+        if tree0_details.minikind == b'd' {
+            let mut subdir_name = key.dirname.clone();
+            if !subdir_name.is_empty() {
+                subdir_name.push(b'/');
+            }
+            subdir_name.extend_from_slice(&key.basename);
+            let subdir_key = EntryKey {
+                dirname: subdir_name,
+                basename: Vec::new(),
+                file_id: Vec::new(),
+            };
+            let (sb_idx, sb_present) = find_block_index_from_key(&self.dirblocks, &subdir_key);
+            if !sb_present {
+                self.dirblocks.insert(
+                    sb_idx,
+                    Dirblock {
+                        dirname: subdir_key.dirname.clone(),
+                        entries: Vec::new(),
+                    },
+                );
+            }
+        }
+
+        self.mark_modified(&[], false);
         self.packed_stat_index = None;
         Ok(())
     }

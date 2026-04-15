@@ -277,7 +277,7 @@ impl StatResult {
 
 #[pyclass]
 struct SHA1Provider {
-    provider: Box<dyn bazaar::dirstate::SHA1Provider>,
+    provider: Box<dyn bazaar::dirstate::SHA1Provider + Send + Sync>,
 }
 
 #[pymethods]
@@ -405,7 +405,7 @@ fn memory_state_from_py(value: i64) -> PyResult<bazaar::dirstate::MemoryState> {
 /// `num_present_parents`). Dirblocks, parents, ghosts, id_index, the
 /// save path, and the various get_entry/iter variants come in later
 /// commits.
-#[pyclass(name = "DirStateRs", unsendable)]
+#[pyclass(name = "DirStateRs")]
 struct PyDirState {
     inner: bazaar::dirstate::DirState,
 }
@@ -441,7 +441,7 @@ impl PyDirState {
                 "custom sha1_provider is not yet wired through DirStateRs",
             ));
         }
-        let provider: Box<dyn bazaar::dirstate::SHA1Provider> =
+        let provider: Box<dyn bazaar::dirstate::SHA1Provider + Send + Sync> =
             Box::new(bazaar::dirstate::DefaultSHA1Provider::new());
         Ok(Self {
             inner: bazaar::dirstate::DirState::new(
@@ -890,6 +890,72 @@ impl PyDirState {
         match self.inner.update_basis_apply_adds(&mut rust_adds) {
             Ok(()) => Ok(()),
             Err(e) => Err(self.raise_basis_apply_error(adds.py(), e)),
+        }
+    }
+
+    /// Update a single entry in tree 0. Mirrors Python's
+    /// `DirState.update_minimal`. Inputs are passed as separate
+    /// positional arguments rather than bundled into a tuple to
+    /// match the Python signature byte-for-byte:
+    /// - `key` — a `(dirname, basename, file_id)` 3-tuple;
+    /// - `minikind` — a one-byte `bytes` object;
+    /// - `executable` — bool;
+    /// - `fingerprint` — bytes (defaults to `b""`);
+    /// - `packed_stat` — bytes or None (None is treated as
+    ///   NULLSTAT);
+    /// - `size` — unsigned int;
+    /// - `path_utf8` — bytes or None (required when the
+    ///   cross-reference branch runs);
+    /// - `fullscan` — bool.
+    ///
+    /// Raises `InconsistentDelta` / `NotImplementedError` /
+    /// `AssertionError` via the shared `raise_basis_apply_error`
+    /// helper.
+    #[pyo3(signature = (
+        key,
+        minikind,
+        executable = false,
+        fingerprint = None,
+        packed_stat = None,
+        size = 0,
+        path_utf8 = None,
+        fullscan = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn update_minimal(
+        &mut self,
+        py: Python<'_>,
+        key: &Bound<PyTuple>,
+        minikind: &[u8],
+        executable: bool,
+        fingerprint: Option<&[u8]>,
+        packed_stat: Option<&[u8]>,
+        size: u64,
+        path_utf8: Option<&[u8]>,
+        fullscan: bool,
+    ) -> PyResult<()> {
+        let entry_key = bazaar::dirstate::EntryKey {
+            dirname: key.get_item(0)?.extract()?,
+            basename: key.get_item(1)?.extract()?,
+            file_id: key.get_item(2)?.extract()?,
+        };
+        let packed_stat_bytes = match packed_stat {
+            Some(s) => s.to_vec(),
+            None => b"x".repeat(32), // DirState.NULLSTAT is 32 `x` bytes.
+        };
+        let tree0_details = bazaar::dirstate::TreeData {
+            minikind: minikind.first().copied().unwrap_or(0),
+            fingerprint: fingerprint.unwrap_or(b"").to_vec(),
+            size,
+            executable,
+            packed_stat: packed_stat_bytes,
+        };
+        match self
+            .inner
+            .update_minimal(entry_key, tree0_details, path_utf8, fullscan)
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 

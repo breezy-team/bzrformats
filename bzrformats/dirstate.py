@@ -2782,172 +2782,19 @@ class DirState:
         If packed_stat and fingerprint are not given, they're invalidated in
         the entry.
         """
-        block = self._find_block(key)[1]
-        if packed_stat is None:
-            packed_stat = DirState.NULLSTAT
-        # XXX: Some callers pass b'' as the packed_stat, and it seems to be
-        # sometimes present in the dirstate - this seems oddly inconsistent.
-        # mbp 20071008
-        entry_index, present = self._find_entry_index(key, block)
-        new_details = (minikind, fingerprint, size, executable, packed_stat)
-        id_index = self._get_id_index()
-        if not present:
-            # New record. Check there isn't a entry at this path already.
-            if not fullscan:
-                low_index, _ = self._find_entry_index(key[0:2] + (b"",), block)
-                while low_index < len(block):
-                    entry = block[low_index]
-                    if entry[0][0:2] == key[0:2]:
-                        if entry[1][0][0] not in (b"a", b"r"):
-                            # This entry has the same path (but a different id) as
-                            # the new entry we're adding, and is present in ths
-                            # tree.
-                            self._raise_invalid(
-                                (b"%s/%s" % key[0:2]).decode("utf8"),
-                                key[2],
-                                "Attempt to add item at path already occupied by "
-                                "id {!r}".format(entry[0][2]),
-                            )
-                        low_index += 1
-                    else:
-                        break
-            # new entry, synthesis cross reference here,
-            existing_keys = id_index.get(key[2])
-            if not existing_keys:
-                # not currently in the state, simplest case
-                new_entry = key, [new_details] + self._empty_parent_info()
-            else:
-                # present at one or more existing other paths.
-                # grab one of them and use it to generate parent
-                # relocation/absent entries.
-                new_entry = key, [new_details]
-                # existing_keys can be changed as we iterate.
-                for other_key in tuple(existing_keys):
-                    # change the record at other to be a pointer to this new
-                    # record. The loop looks similar to the change to
-                    # relocations when updating an existing record but its not:
-                    # the test for existing kinds is different: this can be
-                    # factored out to a helper though.
-                    other_block_index, present = self._find_block_index_from_key(
-                        other_key
-                    )
-                    if not present:
-                        raise AssertionError(f"could not find block for {other_key}")
-                    other_block = self._dirblocks[other_block_index][1]
-                    other_entry_index, present = self._find_entry_index(
-                        other_key, other_block
-                    )
-                    if not present:
-                        raise AssertionError(
-                            f"update_minimal: could not find other entry for {other_key}"
-                        )
-                    if path_utf8 is None:
-                        raise AssertionError("no path")
-                    # Turn this other location into a reference to the new
-                    # location. This also updates the aliased iterator
-                    # (current_old in set_state_from_inventory) so that the old
-                    # entry, if not already examined, is skipped over by that
-                    # loop.
-                    other_entry = other_block[other_entry_index]
-                    other_entry[1][0] = (b"r", path_utf8, 0, False, b"")
-                    if self._maybe_remove_row(other_block, other_entry_index, id_index):
-                        # If the row holding this was removed, we need to
-                        # recompute where this entry goes
-                        entry_index, _ = self._find_entry_index(key, block)
-
-                # This loop:
-                # adds a tuple to the new details for each column
-                #  - either by copying an existing relocation pointer inside that column
-                #  - or by creating a new pointer to the right row inside that column
-                num_present_parents = self._num_present_parents()
-                if num_present_parents:
-                    # TODO: This re-evaluates the existing_keys set, do we need
-                    #       to do that ourselves?
-                    other_key = list(existing_keys)[0]
-                for lookup_index in range(1, num_present_parents + 1):
-                    # grab any one entry, use it to find the right path.
-                    # TODO: optimise this to reduce memory use in highly
-                    # fragmented situations by reusing the relocation
-                    # records.
-                    update_block_index, present = self._find_block_index_from_key(
-                        other_key
-                    )
-                    if not present:
-                        raise AssertionError(f"could not find block for {other_key}")
-                    update_entry_index, present = self._find_entry_index(
-                        other_key, self._dirblocks[update_block_index][1]
-                    )
-                    if not present:
-                        raise AssertionError(
-                            f"update_minimal: could not find entry for {other_key}"
-                        )
-                    update_details = self._dirblocks[update_block_index][1][
-                        update_entry_index
-                    ][1][lookup_index]
-                    if update_details[0] in (b"a", b"r"):  # relocated, absent
-                        # its a pointer or absent in lookup_index's tree, use
-                        # it as is.
-                        new_entry[1].append(update_details)
-                    else:
-                        # we have the right key, make a pointer to it.
-                        pointer_path = osutils.pathjoin(*other_key[0:2])
-                        new_entry[1].append((b"r", pointer_path, 0, False, b""))
-            block.insert(entry_index, new_entry)
-            id_index.add(key)
-        else:
-            # Does the new state matter?
-            block[entry_index][1][0] = new_details
-            # parents cannot be affected by what we do.
-            # other occurences of this id can be found
-            # from the id index.
-            # ---
-            # tree index consistency: All other paths for this id in this tree
-            # index must point to the correct path. We have to loop here because
-            # we may have passed entries in the state with this file id already
-            # that were absent - where parent entries are - and they need to be
-            # converted to relocated.
-            if path_utf8 is None:
-                raise AssertionError("no path")
-            existing_keys = id_index.get(key[2])
-            if key not in existing_keys:
-                raise AssertionError(
-                    "We found the entry in the blocks, but"
-                    " the key is not in the id_index."
-                    f" key: {key}, existing_keys: {existing_keys}"
-                )
-            for entry_key in existing_keys:
-                # TODO:PROFILING: It might be faster to just update
-                # rather than checking if we need to, and then overwrite
-                # the one we are located at.
-                if entry_key != key:
-                    # this file id is at a different path in one of the
-                    # other trees, so put absent pointers there
-                    # This is the vertical axis in the matrix, all pointing
-                    # to the real path.
-                    block_index, present = self._find_block_index_from_key(entry_key)
-                    if not present:
-                        raise AssertionError("not present: %r", entry_key)
-                    entry_index, present = self._find_entry_index(
-                        entry_key, self._dirblocks[block_index][1]
-                    )
-                    if not present:
-                        raise AssertionError("not present: %r", entry_key)
-                    self._dirblocks[block_index][1][entry_index][1][0] = (
-                        b"r",
-                        path_utf8,
-                        0,
-                        False,
-                        b"",
-                    )
-        # add a containing dirblock if needed.
-        if new_details[0] == b"d":
-            # GZ 2017-06-09: Using pathjoin why?
-            subdir_key = (osutils.pathjoin(*key[0:2]), b"", b"")
-            block_index, present = self._find_block_index_from_key(subdir_key)
-            if not present:
-                self._dirblocks.insert(block_index, (subdir_key[0], []))
-
-        self._mark_modified()
+        self._rs.dirblocks = self._dirblocks
+        self._rs.update_minimal(
+            key,
+            minikind,
+            executable,
+            fingerprint,
+            packed_stat,
+            size,
+            path_utf8,
+            fullscan,
+        )
+        self._dirblocks = self._rs.dirblocks
+        self._id_index = None
 
     def _maybe_remove_row(self, block, index, id_index):
         """Remove index if it is absent or relocated across the row.
