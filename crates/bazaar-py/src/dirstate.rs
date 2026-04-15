@@ -702,6 +702,24 @@ impl PyDirState {
         self.inner.wipe_state();
     }
 
+    /// Discard any parent trees beyond the first, including any
+    /// entries that are dead in both tree 0 and tree 1 after the
+    /// discard. Mirrors Python's `DirState._discard_merge_parents`.
+    fn discard_merge_parents(&mut self) {
+        self.inner.discard_merge_parents();
+    }
+
+    /// Replace the entire in-memory state with `parent_ids` and
+    /// `dirblocks` (both in the Python tuple shape), marking both the
+    /// header and the dirblock data fully modified. Mirrors Python's
+    /// `DirState._set_data`. Invalidates the cached id_index.
+    fn set_data(&mut self, parent_ids: &Bound<PyAny>, dirblocks: &Bound<PyAny>) -> PyResult<()> {
+        let parents = collect_bytes_vec(parent_ids)?;
+        let blocks = crate::dirstate_helpers::dirblocks_from_py(dirblocks)?;
+        self.inner.set_data(parents, blocks);
+        Ok(())
+    }
+
     /// Mark the dirstate as modified. `hash_changed_keys` is an
     /// optional iterable of `(dirname, basename, file_id)` tuples
     /// indicating hash-only changes; pass `None` for a full

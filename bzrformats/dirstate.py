@@ -1204,39 +1204,17 @@ class DirState:
         which are ghosted.
         """
         self._read_header_if_needed()
-        parents = self.get_parent_ids()
-        if len(parents) < 1:
+        if len(self._rs.parents) < 1:
             return
         # only require all dirblocks if we are doing a full-pass removal.
         self._read_dirblocks_if_needed()
-        dead_patterns = {(b"a", b"r"), (b"a", b"a"), (b"r", b"r"), (b"r", b"a")}
-
-        def iter_entries_removable():
-            for block in self._dirblocks:
-                deleted_positions = []
-                for pos, entry in enumerate(block[1]):
-                    yield entry
-                    if (entry[1][0][0], entry[1][1][0]) in dead_patterns:
-                        deleted_positions.append(pos)
-                if deleted_positions:
-                    if len(deleted_positions) == len(block[1]):
-                        del block[1][:]
-                    else:
-                        for pos in reversed(deleted_positions):
-                            del block[1][pos]
-
-        # if the first parent is a ghost:
-        if parents[0] in self.get_ghosts():
-            empty_parent = [DirState.NULL_PARENT_DETAILS]
-            for entry in iter_entries_removable():
-                entry[1][1:] = empty_parent
-        else:
-            for entry in iter_entries_removable():
-                del entry[1][2:]
-
-        self._ghosts = []
-        self._parents = [parents[0]]
-        self._mark_modified(header_modified=True)
+        # Sync dirblocks into the Rust wrapper, run the pure-Rust
+        # discard which mutates dirblocks + ghosts + parents, then
+        # sync the new dirblocks back into Python's mirror.
+        self._rs.dirblocks = self._dirblocks
+        self._rs.discard_merge_parents()
+        self._dirblocks = self._rs.dirblocks
+        self._id_index = None
 
     def _empty_parent_info(self):
         return [DirState.NULL_PARENT_DETAILS] * (len(self._parents) - len(self._ghosts))
@@ -2670,10 +2648,12 @@ class DirState:
             tree. Each tuple contains the directory path and a list of entries
             found in that directory.
         """
-        # our memory copy is now authoritative.
+        # Rust side absorbs parent_ids and dirblocks, marks both states
+        # fully modified, and clears its id_index cache.
+        self._rs.set_data(parent_ids, dirblocks)
+        # Python still keeps its own _dirblocks mirror and caches in
+        # sync with the Rust side until they migrate.
         self._dirblocks = dirblocks
-        self._mark_modified(header_modified=True)
-        self._parents = list(parent_ids)
         self._id_index = None
         self._packed_stat_index = None
 

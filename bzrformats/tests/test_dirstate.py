@@ -362,7 +362,7 @@ class TestGetLines(TestCaseWithDirState, TestCaseInTempDir):
                 ],
             )
         ]
-        dirblocks.append(("", root_entries))
+        dirblocks.append((b"", root_entries))
         # add two files in the root
         subdir_entry = (
             (b"", b"subdir", b"subdir-id"),
@@ -376,7 +376,7 @@ class TestGetLines(TestCaseWithDirState, TestCaseInTempDir):
                 (b"f", b"sha1value", 34, False, packed_stat),  # current tree details
             ],
         )
-        dirblocks.append(("", [subdir_entry, afile_entry]))
+        dirblocks.append((b"", [subdir_entry, afile_entry]))
         # and one in subdir
         file_entry2 = (
             (b"subdir", b"2file", b"2file-id"),
@@ -384,7 +384,7 @@ class TestGetLines(TestCaseWithDirState, TestCaseInTempDir):
                 (b"f", b"sha1value", 23, False, packed_stat),  # current tree details
             ],
         )
-        dirblocks.append(("subdir", [file_entry2]))
+        dirblocks.append((b"subdir", [file_entry2]))
         state = dirstate.DirState.initialize("dirstate")
         try:
             state._set_data([], dirblocks)
@@ -857,6 +857,11 @@ class TestDiscardMergeParents(TestCaseWithDirState, TestCaseInTempDir):
         key_in_1 = (b"", b"file-in-1", b"c-file-id")
         key_in_2 = (b"", b"file-in-2", b"c-file-id")
 
+        # Production code always writes 5-tuple relocation rows
+        # ((b"r", target_path, 0, False, b"")); the test used to
+        # pass 3-tuples here because Python's _dirblocks was lax
+        # about the shape. Normalised to match production so the
+        # Rust pyclass converter accepts it.
         dirblocks = [
             (b"", [(root_key, [present_dir, present_dir, present_dir])]),
             (
@@ -864,20 +869,20 @@ class TestDiscardMergeParents(TestCaseWithDirState, TestCaseInTempDir):
                 [
                     (
                         key_in_1,
-                        [absent, present_file, (b"r", b"file-in-2", b"c-file-id")],
+                        [absent, present_file, (b"r", b"file-in-2", 0, False, b"")],
                     ),
                     (
                         key_in_2,
-                        [absent, (b"r", b"file-in-1", b"c-file-id"), present_file],
+                        [absent, (b"r", b"file-in-1", 0, False, b""), present_file],
                     ),
                     (file_in_root_key, [present_file, present_file, present_file]),
                     (
                         file_rename_s_key,
-                        [(b"r", b"file-t", b"b-file-id"), absent, present_file],
+                        [(b"r", b"file-t", 0, False, b""), absent, present_file],
                     ),
                     (
                         file_rename_t_key,
-                        [present_file, absent, (b"r", b"file-s", b"b-file-id")],
+                        [present_file, absent, (b"r", b"file-s", 0, False, b"")],
                     ),
                 ],
             ),
