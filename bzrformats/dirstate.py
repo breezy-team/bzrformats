@@ -3017,53 +3017,13 @@ class DirState:
             that is, if the underlying block has had the entry removed, thus
             shrinking in length.
         """
-        # build up paths that this id will be left at after the change is made,
-        # so we can update their cross references in tree 0
-        all_remaining_keys = set()
-        # Dont check the working tree, because it's going.
-        for details in current_old[1][1:]:
-            if details[0] not in (b"a", b"r"):  # absent, relocated
-                all_remaining_keys.add(current_old[0])
-            elif details[0] == b"r":  # relocated
-                # record the key for the real path.
-                all_remaining_keys.add(
-                    tuple(osutils.split(details[1])) + (current_old[0][2],)
-                )
-            # absent rows are not present at any path.
-        last_reference = current_old[0] not in all_remaining_keys
-        if last_reference:
-            # the current row consists entire of the current item (being marked
-            # absent), and relocated or absent entries for the other trees:
-            # Remove it, its meaningless.
-            block = self._find_block(current_old[0])
-            entry_index, present = self._find_entry_index(current_old[0], block[1])
-            if not present:
-                raise AssertionError(f"could not find entry for {current_old}")
-            block[1].pop(entry_index)
-            # if we have an id_index in use, remove this key from it for this id.
-            if self._id_index is not None:
-                self._id_index.remove(current_old[0])
-        # update all remaining keys for this id to record it as absent. The
-        # existing details may either be the record we are marking as deleted
-        # (if there were other trees with the id present at this path), or may
-        # be relocations.
-        for update_key in all_remaining_keys:
-            update_block_index, present = self._find_block_index_from_key(update_key)
-            if not present:
-                raise AssertionError(f"could not find block for {update_key}")
-            update_entry_index, present = self._find_entry_index(
-                update_key, self._dirblocks[update_block_index][1]
-            )
-            if not present:
-                raise AssertionError(f"could not find entry for {update_key}")
-            update_tree_details = self._dirblocks[update_block_index][1][
-                update_entry_index
-            ][1]
-            # it must not be absent at the moment
-            if update_tree_details[0][0] == b"a":  # absent
-                raise AssertionError(f"bad row {update_tree_details!r}")
-            update_tree_details[0] = DirState.NULL_PARENT_DETAILS
-        self._mark_modified()
+        self._rs.dirblocks = self._dirblocks
+        last_reference = self._rs.make_absent(current_old[0])
+        # Sync the (possibly-mutated) dirblocks back out; Rust also
+        # updated its own id_index cache, so invalidate Python's
+        # view to force a rebuild on next access.
+        self._dirblocks = self._rs.dirblocks
+        self._id_index = None
         return last_reference
 
     def update_minimal(

@@ -781,6 +781,20 @@ impl PyDirState {
         )
     }
 
+    /// Mark the entry at `key` as absent for tree 0, returning True
+    /// when the entry row was removed entirely (the "last reference"
+    /// case). Mirrors Python's `DirState._make_absent`.
+    fn make_absent(&mut self, key: &Bound<PyTuple>) -> PyResult<bool> {
+        let entry_key = bazaar::dirstate::EntryKey {
+            dirname: key.get_item(0)?.extract()?,
+            basename: key.get_item(1)?.extract()?,
+            file_id: key.get_item(2)?.extract()?,
+        };
+        self.inner
+            .make_absent(&entry_key)
+            .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))
+    }
+
     /// Replace the entire in-memory state with `parent_ids` and
     /// `dirblocks` (both in the Python tuple shape), marking both the
     /// header and the dirblock data fully modified. Mirrors Python's
