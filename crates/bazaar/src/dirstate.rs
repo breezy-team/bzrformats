@@ -6659,6 +6659,332 @@ mod dirstate_struct_tests {
         assert_eq!(dir_block.entries[0].key.basename, b"child".to_vec());
     }
 
+    /// Build a fresh single-tree dirstate with a live root entry and
+    /// an empty contents-of-root block. Suitable for exercising
+    /// `update_by_delta` adds/removes.
+    fn one_tree_root_state() -> DirState {
+        let mut state = fresh_state();
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        state
+    }
+
+    #[test]
+    fn update_by_delta_add_file_at_root() {
+        // Minimal add: one row inserts README under the root.
+        let mut state = one_tree_root_state();
+        let entries = vec![FlatDeltaEntry {
+            old_path: None,
+            new_path: Some(b"README".to_vec()),
+            file_id: b"fid-r".to_vec(),
+            parent_id: Some(b"TREE_ROOT".to_vec()),
+            minikind: b'f',
+            executable: false,
+            fingerprint: Vec::new(),
+        }];
+        state.update_by_delta(entries).expect("update_by_delta");
+
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"README", 0);
+        assert!(bei.path_present);
+        let entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(entry.trees[0].minikind, b'f');
+        assert_eq!(entry.key.file_id, b"fid-r".to_vec());
+    }
+
+    #[test]
+    fn update_by_delta_delete_then_reinsert_different_id_is_rejected() {
+        // Adding a file id already present (not part of the
+        // simultaneous delete) must fail via check_delta_ids_absent.
+        let mut state = one_tree_root_state();
+        state.dirblocks[1].entries.push(entry_with_trees(
+            b"",
+            b"README",
+            b"fid-existing",
+            vec![tree(b'f')],
+        ));
+
+        let entries = vec![FlatDeltaEntry {
+            old_path: None,
+            new_path: Some(b"OTHER".to_vec()),
+            file_id: b"fid-existing".to_vec(),
+            parent_id: Some(b"TREE_ROOT".to_vec()),
+            minikind: b'f',
+            executable: false,
+            fingerprint: Vec::new(),
+        }];
+        let err = state.update_by_delta(entries).unwrap_err();
+        match err {
+            BasisApplyError::Invalid { file_id, .. } => {
+                assert_eq!(file_id, b"fid-existing".to_vec());
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_by_delta_repeated_file_id_is_rejected() {
+        // Two delta rows touching the same file_id must fail — this
+        // matches Python's "repeated file_id" _raise_invalid branch.
+        let mut state = one_tree_root_state();
+        let entries = vec![
+            FlatDeltaEntry {
+                old_path: None,
+                new_path: Some(b"a".to_vec()),
+                file_id: b"fid-dup".to_vec(),
+                parent_id: Some(b"TREE_ROOT".to_vec()),
+                minikind: b'f',
+                executable: false,
+                fingerprint: Vec::new(),
+            },
+            FlatDeltaEntry {
+                old_path: None,
+                new_path: Some(b"b".to_vec()),
+                file_id: b"fid-dup".to_vec(),
+                parent_id: Some(b"TREE_ROOT".to_vec()),
+                minikind: b'f',
+                executable: false,
+                fingerprint: Vec::new(),
+            },
+        ];
+        let err = state.update_by_delta(entries).unwrap_err();
+        match err {
+            BasisApplyError::Invalid { reason, .. } => {
+                assert_eq!(reason, "repeated file_id");
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_by_delta_rename_expands_children() {
+        // Rename a/ -> z/ when a/ has a child a/f. After the delta:
+        // a/ and a/f should be gone from tree 0, and z/ + z/f should
+        // be present.
+        let mut state = fresh_state();
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(b"", b"a", b"a-dir", vec![tree(b'd')])],
+            },
+            Dirblock {
+                dirname: b"a".to_vec(),
+                entries: vec![entry_with_trees(b"a", b"f", b"f-file", vec![tree(b'f')])],
+            },
+        ];
+
+        let entries = vec![FlatDeltaEntry {
+            old_path: Some(b"a".to_vec()),
+            new_path: Some(b"z".to_vec()),
+            file_id: b"a-dir".to_vec(),
+            parent_id: Some(b"TREE_ROOT".to_vec()),
+            minikind: b'd',
+            executable: false,
+            fingerprint: Vec::new(),
+        }];
+        state.update_by_delta(entries).expect("rename");
+
+        // Old paths are now absent/relocated (make_absent), new paths
+        // are present.
+        let old_a = get_block_entry_index(&state.dirblocks, b"", b"a", 0);
+        assert!(!old_a.path_present, "a should be gone from tree 0");
+        let old_af = get_block_entry_index(&state.dirblocks, b"a", b"f", 0);
+        assert!(!old_af.path_present, "a/f should be gone from tree 0");
+
+        let new_z = get_block_entry_index(&state.dirblocks, b"", b"z", 0);
+        assert!(new_z.path_present, "z should be present in tree 0");
+        let new_zf = get_block_entry_index(&state.dirblocks, b"z", b"f", 0);
+        assert!(new_zf.path_present, "z/f should be present in tree 0");
+        assert_eq!(
+            state.dirblocks[new_zf.block_index].entries[new_zf.entry_index]
+                .key
+                .file_id,
+            b"f-file".to_vec()
+        );
+    }
+
+    /// Build a two-tree dirstate suitable for `update_basis_by_delta`
+    /// tests: tree 0 and tree 1 both contain the root and a single
+    /// README file with different fingerprints.
+    fn two_tree_basis_state() -> DirState {
+        let mut state = fresh_state();
+        state.parents = vec![b"old-revid".to_vec()];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(b'd'), tree(b'd')],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"README",
+                    b"fid-readme",
+                    vec![
+                        basis_details(b'f', b"sha-cur", 10, false),
+                        basis_details(b'f', b"sha-old", 10, false),
+                    ],
+                )],
+            },
+        ];
+        state
+    }
+
+    #[test]
+    fn update_basis_by_delta_in_place_change() {
+        // In-place change of README: keep tree 0 untouched, update
+        // tree 1 fingerprint.
+        let mut state = two_tree_basis_state();
+        let entries = vec![FlatBasisDeltaEntry {
+            old_path: Some(b"README".to_vec()),
+            new_path: Some(b"README".to_vec()),
+            file_id: b"fid-readme".to_vec(),
+            parent_id: Some(b"TREE_ROOT".to_vec()),
+            details: Some((b'f', b"sha-new".to_vec(), 20, false, b"new-revid".to_vec())),
+        }];
+        state
+            .update_basis_by_delta(entries)
+            .expect("update_basis_by_delta");
+
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"README", 1);
+        assert!(bei.path_present);
+        let entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(entry.trees[1].fingerprint, b"sha-new".to_vec());
+        assert_eq!(entry.trees[1].size, 20);
+        // Tree 0 is untouched.
+        assert_eq!(entry.trees[0].fingerprint, b"sha-cur".to_vec());
+    }
+
+    #[test]
+    fn update_basis_by_delta_add_new_file() {
+        // Add NEWFILE to tree 1 only.
+        let mut state = two_tree_basis_state();
+        let entries = vec![FlatBasisDeltaEntry {
+            old_path: None,
+            new_path: Some(b"NEWFILE".to_vec()),
+            file_id: b"fid-new".to_vec(),
+            parent_id: Some(b"TREE_ROOT".to_vec()),
+            details: Some((b'f', b"sha-new".to_vec(), 5, false, b"new-revid".to_vec())),
+        }];
+        state
+            .update_basis_by_delta(entries)
+            .expect("update_basis_by_delta");
+
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"NEWFILE", 1);
+        assert!(bei.path_present);
+        let entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(entry.trees[1].minikind, b'f');
+        assert_eq!(entry.key.file_id, b"fid-new".to_vec());
+    }
+
+    #[test]
+    fn update_basis_by_delta_rename_directory_with_child() {
+        // Rename a/ -> z/ when a/ has a child a/f in tree 1. After
+        // the delta the rename child-expansion must emit add+delete
+        // pairs for a/f so that tree 1 ends up with z/ + z/f live
+        // and a/ + a/f gone. This exercises the mid-loop
+        // apply_deletes drain + iter_child_entries(1, ...) walk.
+        let mut state = fresh_state();
+        state.parents = vec![b"old-revid".to_vec()];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(b'd'), tree(b'd')],
+                )],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"a",
+                    b"a-dir",
+                    vec![tree(b'd'), tree(b'd')],
+                )],
+            },
+            Dirblock {
+                dirname: b"a".to_vec(),
+                entries: vec![entry_with_trees(
+                    b"a",
+                    b"f",
+                    b"f-file",
+                    vec![
+                        basis_details(b'f', b"sha-cur-f", 3, false),
+                        basis_details(b'f', b"sha-old-f", 3, false),
+                    ],
+                )],
+            },
+        ];
+
+        let entries = vec![FlatBasisDeltaEntry {
+            old_path: Some(b"a".to_vec()),
+            new_path: Some(b"z".to_vec()),
+            file_id: b"a-dir".to_vec(),
+            parent_id: Some(b"TREE_ROOT".to_vec()),
+            details: Some((b'd', Vec::new(), 0, false, b"new-revid".to_vec())),
+        }];
+        state
+            .update_basis_by_delta(entries)
+            .expect("update_basis_by_delta");
+
+        // Tree 1: a and a/f should no longer be live.
+        let old_a = get_block_entry_index(&state.dirblocks, b"", b"a", 1);
+        assert!(!old_a.path_present, "a should be gone from tree 1");
+        let old_af = get_block_entry_index(&state.dirblocks, b"a", b"f", 1);
+        assert!(!old_af.path_present, "a/f should be gone from tree 1");
+
+        // Tree 1: z and z/f should now be live.
+        let new_z = get_block_entry_index(&state.dirblocks, b"", b"z", 1);
+        assert!(new_z.path_present, "z should be present in tree 1");
+        let new_zf = get_block_entry_index(&state.dirblocks, b"z", b"f", 1);
+        assert!(new_zf.path_present, "z/f should be present in tree 1");
+        assert_eq!(
+            state.dirblocks[new_zf.block_index].entries[new_zf.entry_index]
+                .key
+                .file_id,
+            b"f-file".to_vec()
+        );
+    }
+
+    #[test]
+    fn update_basis_by_delta_delete_file() {
+        // Delete README from tree 1 (old_path set, new_path None).
+        let mut state = two_tree_basis_state();
+        let entries = vec![FlatBasisDeltaEntry {
+            old_path: Some(b"README".to_vec()),
+            new_path: None,
+            file_id: b"fid-readme".to_vec(),
+            parent_id: None,
+            details: None,
+        }];
+        state
+            .update_basis_by_delta(entries)
+            .expect("update_basis_by_delta");
+
+        // After delete: tree 1 for README is absent.
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"README", 1);
+        assert!(!bei.path_present);
+    }
+
     #[test]
     fn get_or_build_id_index_caches_result() {
         let mut state = create_complex_dirstate();
