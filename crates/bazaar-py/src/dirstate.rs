@@ -1180,6 +1180,52 @@ impl PyDirState {
             .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))
     }
 
+    /// Apply a pre-flattened inventory delta to tree 0. Mirrors
+    /// Python's `DirState.update_by_delta`. Input is a Python
+    /// iterable of 7-tuples:
+    /// `(old_path, new_path, file_id, parent_id, minikind,
+    /// executable, fingerprint)` with `old_path`, `new_path`, and
+    /// `parent_id` optional (None for missing). Python handles delta
+    /// `.check()`/`.sort()` and `inv_entry` attribute extraction
+    /// before calling this method.
+    fn update_by_delta(&mut self, entries: &Bound<PyAny>) -> PyResult<()> {
+        let mut rust_entries: Vec<bazaar::dirstate::FlatDeltaEntry> = Vec::new();
+        for item in entries.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            if tup.len() != 7 {
+                return Err(PyTypeError::new_err(
+                    "update_by_delta entries must be 7-tuples",
+                ));
+            }
+            let old_path: Option<Vec<u8>> = tup.get_item(0)?.extract()?;
+            let new_path: Option<Vec<u8>> = tup.get_item(1)?.extract()?;
+            let file_id: Vec<u8> = tup.get_item(2)?.extract()?;
+            let parent_id: Option<Vec<u8>> = tup.get_item(3)?.extract()?;
+            let minikind_bytes: Vec<u8> = tup.get_item(4)?.extract()?;
+            let minikind = *minikind_bytes
+                .first()
+                .ok_or_else(|| PyTypeError::new_err("minikind must be non-empty"))?;
+            let executable: bool = tup.get_item(5)?.extract()?;
+            let fingerprint: Vec<u8> = tup.get_item(6)?.extract()?;
+            rust_entries.push(bazaar::dirstate::FlatDeltaEntry {
+                old_path,
+                new_path,
+                file_id,
+                parent_id,
+                minikind,
+                executable,
+                fingerprint,
+            });
+        }
+        match self.inner.update_by_delta(rust_entries) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.inner.changes_aborted = true;
+                Err(self.raise_basis_apply_error(entries.py(), e))
+            }
+        }
+    }
+
     /// Apply a sequence of "insertions" to tree 0. Mirrors Python's
     /// `DirState._apply_insertions`. Input is a Python iterable of
     /// `(key, minikind, executable, fingerprint, path_utf8)` 5-tuples

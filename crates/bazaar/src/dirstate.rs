@@ -2961,6 +2961,140 @@ impl DirState {
         Ok(())
     }
 
+    /// Apply a pre-flattened inventory delta to tree 0. Mirrors
+    /// Python's `DirState.update_by_delta` — the workhorse for
+    /// `apply_inventory_delta` in dirstate-based trees.
+    ///
+    /// Each `entries` element is the Python-side extraction of one
+    /// delta row: `(old_path, new_path, file_id, parent_id,
+    /// minikind, executable, fingerprint)`. The Python caller is
+    /// responsible for delta `.check()`/`.sort()` and for looking up
+    /// `inv_entry.parent_id` / kind → minikind / `reference_revision`
+    /// before calling this method.
+    ///
+    /// This function:
+    /// 1. validates no repeated file_id,
+    /// 2. accumulates `removals`, `insertions`, `new_ids`, `parents`,
+    /// 3. expands each rename into delete+add pairs for all
+    ///    descendant entries by walking [`DirState::iter_child_entries`],
+    /// 4. calls `check_delta_ids_absent`, `apply_removals`,
+    ///    `apply_insertions`, and `after_delta_check_parents` in
+    ///    order — matching Python's try/except block exactly.
+    pub fn update_by_delta(&mut self, entries: Vec<FlatDeltaEntry>) -> Result<(), BasisApplyError> {
+        use std::collections::{BTreeSet, HashMap};
+
+        let mut insertions: HashMap<Vec<u8>, (EntryKey, u8, bool, Vec<u8>, Vec<u8>)> =
+            HashMap::new();
+        let mut removals: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut parents_set: BTreeSet<(Vec<u8>, Vec<u8>)> = BTreeSet::new();
+        let mut new_ids: Vec<Vec<u8>> = Vec::new();
+
+        for entry in entries {
+            let FlatDeltaEntry {
+                old_path,
+                new_path,
+                file_id,
+                parent_id,
+                minikind,
+                executable,
+                fingerprint,
+            } = entry;
+            if insertions.contains_key(&file_id) || removals.contains_key(&file_id) {
+                let path = old_path
+                    .clone()
+                    .or_else(|| new_path.clone())
+                    .unwrap_or_default();
+                return Err(BasisApplyError::Invalid {
+                    path,
+                    file_id,
+                    reason: "repeated file_id".to_string(),
+                });
+            }
+            if let Some(ref op) = old_path {
+                removals.insert(file_id.clone(), op.clone());
+            } else {
+                new_ids.push(file_id.clone());
+            }
+            if let Some(ref np) = new_path {
+                let (dirname_utf8, basename) = split_path_utf8(np);
+                if !basename.is_empty() {
+                    let pid = parent_id.clone().unwrap_or_default();
+                    parents_set.insert((dirname_utf8.to_vec(), pid));
+                }
+                let key = EntryKey {
+                    dirname: dirname_utf8.to_vec(),
+                    basename: basename.to_vec(),
+                    file_id: file_id.clone(),
+                };
+                insertions.insert(
+                    file_id.clone(),
+                    (key, minikind, executable, fingerprint.clone(), np.clone()),
+                );
+            }
+            // Transform renames into delete+add pairs for all children.
+            if let (Some(ref op), Some(ref np)) = (&old_path, &new_path) {
+                let children = self.iter_child_entries(0, op);
+                for child in children {
+                    let child_id = child.key.file_id.clone();
+                    if insertions.contains_key(&child_id) || removals.contains_key(&child_id) {
+                        continue;
+                    }
+                    let child_dirname = child.key.dirname.clone();
+                    let child_basename = child.key.basename.clone();
+                    let child_tree0 = child.trees.first();
+                    let child_minikind = child_tree0.map(|t| t.minikind).unwrap_or(0);
+                    let child_fingerprint = child_tree0
+                        .map(|t| t.fingerprint.clone())
+                        .unwrap_or_default();
+                    let child_executable = child_tree0.map(|t| t.executable).unwrap_or(false);
+                    let mut old_child_path = child_dirname.clone();
+                    if !old_child_path.is_empty() {
+                        old_child_path.push(b'/');
+                    }
+                    old_child_path.extend_from_slice(&child_basename);
+                    removals.insert(child_id.clone(), old_child_path);
+                    // new_child_dirname = new_path + child_dirname[len(old_path):]
+                    let suffix = &child_dirname[op.len()..];
+                    let mut new_child_dirname = np.clone();
+                    new_child_dirname.extend_from_slice(suffix);
+                    let mut new_child_path = new_child_dirname.clone();
+                    if !new_child_path.is_empty() {
+                        new_child_path.push(b'/');
+                    }
+                    new_child_path.extend_from_slice(&child_basename);
+                    let key = EntryKey {
+                        dirname: new_child_dirname,
+                        basename: child_basename,
+                        file_id: child_id.clone(),
+                    };
+                    insertions.insert(
+                        child_id,
+                        (
+                            key,
+                            child_minikind,
+                            child_executable,
+                            child_fingerprint,
+                            new_child_path,
+                        ),
+                    );
+                }
+            }
+        }
+
+        self.check_delta_ids_absent(&new_ids, 0)?;
+        let removals_vec: Vec<(Vec<u8>, Vec<u8>)> = removals
+            .into_iter()
+            .map(|(fid, path)| (fid, path))
+            .collect();
+        self.apply_removals(&removals_vec)?;
+        let insertions_vec: Vec<(EntryKey, u8, bool, Vec<u8>, Vec<u8>)> =
+            insertions.into_values().collect();
+        self.apply_insertions(insertions_vec)?;
+        let parents_vec: Vec<(Vec<u8>, Vec<u8>)> = parents_set.into_iter().collect();
+        self.after_delta_check_parents(&parents_vec, 0)?;
+        Ok(())
+    }
+
     /// Apply a sequence of "insertions" to tree 0. Mirrors Python's
     /// `DirState._apply_insertions`: sort the adds and, for each,
     /// call [`DirState::update_minimal`]. A `NotVersioned` error
@@ -3625,6 +3759,23 @@ pub enum BasisApplyError {
     /// `NotVersionedError` raised from `_find_block` when called
     /// without `add_if_missing`.
     NotVersioned { path: Vec<u8> },
+}
+
+/// A pre-flattened inventory-delta row passed to
+/// [`DirState::update_by_delta`]. Mirrors the Python-side tuple the
+/// caller builds by unpacking a delta entry and its
+/// `InventoryEntry`. `minikind` is the single-byte code from
+/// `DirState._kind_to_minikind`; `fingerprint` is empty for
+/// non-tree-reference entries.
+#[derive(Debug, Clone)]
+pub struct FlatDeltaEntry {
+    pub old_path: Option<Vec<u8>>,
+    pub new_path: Option<Vec<u8>>,
+    pub file_id: Vec<u8>,
+    pub parent_id: Option<Vec<u8>>,
+    pub minikind: u8,
+    pub executable: bool,
+    pub fingerprint: Vec<u8>,
 }
 
 /// Error returned by [`DirState::validate`]. A single descriptive

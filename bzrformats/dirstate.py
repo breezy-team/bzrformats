@@ -1378,87 +1378,39 @@ class DirState:
             details.
         """
         self._read_dirblocks_if_needed()
-        insertions = {}
-        removals = {}
-        # Accumulate parent references (path_utf8, id), to check for parentless
-        # items or items placed under files/links/tree-references. We get
-        # references from every item in the delta that is not a deletion and
-        # is not itself the root.
-        parents = set()
-        # Added ids must not be in the dirstate already. This set holds those
-        # ids.
-        new_ids = set()
-        # This loop transforms the delta to single atomic operations that can
-        # be executed and validated.
         delta.check()
         delta.sort()
+        flat = []
         for old_path, new_path, file_id, inv_entry in delta:
             if not isinstance(file_id, bytes):
                 raise AssertionError(f"must be a utf8 file_id not {type(file_id)}")
-            if (file_id in insertions) or (file_id in removals):
-                self._raise_invalid(old_path or new_path, file_id, "repeated file_id")
-            if old_path is not None:
-                old_path = old_path.encode("utf-8")
-                removals[file_id] = old_path
-            else:
-                new_ids.add(file_id)
+            op = old_path.encode("utf-8") if old_path is not None else None
             if new_path is not None:
                 if inv_entry is None:
                     self._raise_invalid(new_path, file_id, "new_path with no entry")
-                new_path = new_path.encode("utf-8")
-                dirname_utf8, basename = osutils.split(new_path)
-                if basename:
-                    parents.add((dirname_utf8, inv_entry.parent_id))
-                key = (dirname_utf8, basename, file_id)
+                np = new_path.encode("utf-8")
+                parent_id = inv_entry.parent_id
                 minikind = DirState._kind_to_minikind[inv_entry.kind]
-                if minikind == b"t":
-                    fingerprint = inv_entry.reference_revision or b""
-                else:
-                    fingerprint = b""
-                insertions[file_id] = (
-                    key,
-                    minikind,
-                    inv_entry.executable,
-                    fingerprint,
-                    new_path,
+                fingerprint = (
+                    (inv_entry.reference_revision or b"") if minikind == b"t" else b""
                 )
-            # Transform moves into delete+add pairs
-            if None not in (old_path, new_path):
-                for child in self._iter_child_entries(0, old_path):
-                    if child[0][2] in insertions or child[0][2] in removals:
-                        continue
-                    child_dirname = child[0][0]
-                    child_basename = child[0][1]
-                    minikind = child[1][0][0]
-                    fingerprint = child[1][0][4]
-                    executable = child[1][0][3]
-                    old_child_path = osutils.pathjoin(child_dirname, child_basename)
-                    removals[child[0][2]] = old_child_path
-                    child_suffix = child_dirname[len(old_path) :]
-                    new_child_dirname = new_path + child_suffix
-                    key = (new_child_dirname, child_basename, child[0][2])
-                    new_child_path = osutils.pathjoin(new_child_dirname, child_basename)
-                    insertions[child[0][2]] = (
-                        key,
-                        minikind,
-                        executable,
-                        fingerprint,
-                        new_child_path,
-                    )
-        self._check_delta_ids_absent(new_ids, 0)
+                executable = inv_entry.executable
+            else:
+                np = None
+                parent_id = None
+                minikind = b"a"
+                fingerprint = b""
+                executable = False
+            flat.append((op, np, file_id, parent_id, minikind, executable, fingerprint))
+        self._rs.dirblocks = self._dirblocks
         try:
-            self._apply_removals(removals.items())
-            self._apply_insertions(insertions.values())
-            # Validate parents
-            self._after_delta_check_parents(parents, 0)
+            self._rs.update_by_delta(flat)
         except BzrFormatsError as e:
-            self._changes_aborted = True
             if "integrity error" not in str(e):
                 raise
-            # _get_entry raises BzrError when a request is inconsistent; we
-            # want such errors to be shown as InconsistentDelta - and that
-            # fits the behaviour we trigger.
             raise InconsistentDeltaDelta(delta, f"error from _get_entry. {e}") from e
+        self._dirblocks = self._rs.dirblocks
+        self._id_index = None
 
     def _apply_removals(self, removals):
         self._rs.dirblocks = self._dirblocks
