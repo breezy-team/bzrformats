@@ -1,51 +1,84 @@
-//! Rust implementations of dirstate helper functions.
+//! PyO3 glue for the dirstate helper functions.
 //!
-//! This module provides `_read_dirblocks`, `update_entry`, and `ProcessEntryC`
-//! as Rust/PyO3 replacements for the former Cython `_dirstate_helpers_pyx` module.
+//! `_read_dirblocks` delegates the NUL-delimited parse of the on-disk body
+//! to `bazaar::dirstate::parse_dirblocks` in the pure crate; this module
+//! only marshals the resulting `Vec<Dirblock>` into the list-of-tuples
+//! shape Python stores in `DirState._dirblocks`, and handles the
+//! surrounding file I/O and state-object mutation.
 //!
-//! `_read_dirblocks` is fully implemented in Rust for performance.
-//! `update_entry` and `ProcessEntryC` delegate to their Python implementations
-//! since they interact deeply with the Python DirState object.
+//! `update_entry` and `ProcessEntryC` still delegate to their Python
+//! counterparts since those interact deeply with the Python `DirState`
+//! object; future commits in the "lift DirState into Rust" series will
+//! replace them.
 
-use pyo3::exceptions::{PyAssertionError, PyValueError};
+use bazaar::dirstate::{
+    entry_to_line as pure_entry_to_line, parse_dirblocks, Dirblock, DirblocksError, Entry,
+    EntryKey, TreeData,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 
-/// Parse a single null-terminated field from `data` starting at `pos`.
-/// Returns (field_bytes, next_pos). Raises DirstateCorrupt if no null found.
-fn get_next_field<'a>(
-    data: &'a [u8],
-    pos: usize,
-    state: &Bound<PyAny>,
-) -> PyResult<(&'a [u8], usize)> {
-    if pos >= data.len() {
-        let dirstate_corrupt = state
-            .py()
-            .import("bzrformats.dirstate")?
-            .getattr("DirstateCorrupt")?;
-        return Err(PyErr::from_value(dirstate_corrupt.call1((
-            state,
-            "get_next() called when there are no chars left",
-        ))?));
+/// Convert a `DirblocksError` from the pure crate into the Python-level
+/// `DirstateCorrupt` exception that Python callers expect.
+fn dirblocks_err_to_py(state: &Bound<PyAny>, err: DirblocksError) -> PyErr {
+    match state
+        .py()
+        .import("bzrformats.dirstate")
+        .and_then(|m| m.getattr("DirstateCorrupt"))
+    {
+        Ok(cls) => match cls.call1((state, err.to_string())) {
+            Ok(instance) => PyErr::from_value(instance),
+            Err(e) => e,
+        },
+        Err(e) => e,
     }
-    let remaining = &data[pos..];
-    match remaining.iter().position(|&b| b == 0) {
-        Some(offset) => Ok((&data[pos..pos + offset], pos + offset + 1)),
-        None => {
-            let dirstate_corrupt = state
-                .py()
-                .import("bzrformats.dirstate")?
-                .getattr("DirstateCorrupt")?;
-            let end = std::cmp::min(remaining.len(), 20);
-            Err(PyErr::from_value(dirstate_corrupt.call1((
-                state,
-                format!(
-                    "failed to find trailing NULL (\\0). Trailing garbage: {:?}",
-                    &remaining[..end]
-                ),
-            ))?))
+}
+
+/// Marshal a `Vec<Dirblock>` from the pure crate into the
+/// `[(dirname_bytes, [entry_tuple, ...])]` layout Python uses for
+/// `DirState._dirblocks`. Each entry tuple is
+/// `((dirname, basename, file_id), [(minikind, fingerprint, size, exec, packed_stat), ...])`
+/// with `minikind` being a one-byte `bytes` object — matching what the
+/// previous inline parser produced.
+pub(crate) fn dirblocks_to_py<'py>(
+    py: Python<'py>,
+    dirblocks: &[Dirblock],
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for block in dirblocks {
+        let dirname_py = PyBytes::new(py, &block.dirname);
+        let entries_py = PyList::empty(py);
+        for entry in &block.entries {
+            let key = PyTuple::new(
+                py,
+                [
+                    PyBytes::new(py, &entry.key.dirname).into_any(),
+                    PyBytes::new(py, &entry.key.basename).into_any(),
+                    PyBytes::new(py, &entry.key.file_id).into_any(),
+                ],
+            )?;
+            let trees = PyList::empty(py);
+            for tree in &entry.trees {
+                let tree_tuple = PyTuple::new(
+                    py,
+                    [
+                        PyBytes::new(py, &[tree.minikind]).into_any(),
+                        PyBytes::new(py, &tree.fingerprint).into_any(),
+                        tree.size.into_pyobject(py)?.into_any(),
+                        tree.executable.into_pyobject(py)?.to_owned().into_any(),
+                        PyBytes::new(py, &tree.packed_stat).into_any(),
+                    ],
+                )?;
+                trees.append(tree_tuple)?;
+            }
+            entries_py.append(PyTuple::new(py, [key.as_any(), trees.as_any()])?)?;
         }
+        out.append(PyTuple::new(
+            py,
+            [dirname_py.as_any(), entries_py.as_any()],
+        )?)?;
     }
+    Ok(out)
 }
 
 /// Read in the dirblocks for the given DirState object.
@@ -81,146 +114,18 @@ pub fn _read_dirblocks(py: Python, state: &Bound<PyAny>) -> PyResult<()> {
 
     let num_present_parents: usize = state.call_method0("_num_present_parents")?.extract()?;
     let num_trees = num_present_parents + 1;
-    let num_entries: usize = state.getattr("_num_entries")?.extract()?;
+    let num_entries: usize = state.getattr("_rs")?.getattr("num_entries")?.extract()?;
 
-    // Skip the first null byte (trailing from header)
-    let mut pos: usize = 0;
+    let dirblocks =
+        parse_dirblocks(text, num_trees, num_entries).map_err(|e| dirblocks_err_to_py(state, e))?;
 
-    // The first field should be an empty string left over from the Header
-    let (first_field, new_pos) = get_next_field(text, pos, state)?;
-    if !first_field.is_empty() {
-        return Err(PyAssertionError::new_err(format!(
-            "First field should be empty, not: {:?}",
-            first_field
-        )));
-    }
-    pos = new_pos;
-
-    // Build dirblocks
-    let empty_bytes = PyBytes::new(py, b"");
-    let root_block = PyList::empty(py);
-    let dirblocks = PyList::new(
-        py,
-        [
-            PyTuple::new(py, [empty_bytes.as_any(), root_block.as_any()])?,
-            PyTuple::new(py, [empty_bytes.as_any(), PyList::empty(py).as_any()])?,
-        ],
-    )?;
-
-    let mut current_dirname: Vec<u8> = Vec::new();
-    let mut current_block = root_block;
-    let mut entry_count: usize = 0;
-
-    while pos < text.len() {
-        // Read key: dirname, name, file_id
-        let (dirname_bytes, new_pos) = get_next_field(text, pos, state)?;
-        pos = new_pos;
-
-        // Check if we have a new directory block
-        let new_block = dirname_bytes != current_dirname.as_slice();
-        if new_block {
-            current_dirname = dirname_bytes.to_vec();
-            current_block = PyList::empty(py);
-            let dirname_py = PyBytes::new(py, dirname_bytes);
-            dirblocks.append(PyTuple::new(
-                py,
-                [dirname_py.as_any(), current_block.as_any()],
-            )?)?;
-        }
-
-        let dirname_py = PyBytes::new(py, &current_dirname);
-        let (name_bytes, new_pos) = get_next_field(text, pos, state)?;
-        pos = new_pos;
-        let name_py = PyBytes::new(py, name_bytes);
-
-        let (file_id_bytes, new_pos) = get_next_field(text, pos, state)?;
-        pos = new_pos;
-        let file_id_py = PyBytes::new(py, file_id_bytes);
-
-        let key = PyTuple::new(
-            py,
-            [dirname_py.as_any(), name_py.as_any(), file_id_py.as_any()],
-        )?;
-
-        // Parse per-tree data
-        let trees = PyList::empty(py);
-        for _i in 0..num_trees {
-            let (minikind_bytes, new_pos) = get_next_field(text, pos, state)?;
-            pos = new_pos;
-            let minikind = PyBytes::new(py, minikind_bytes);
-
-            let (fingerprint_bytes, new_pos) = get_next_field(text, pos, state)?;
-            pos = new_pos;
-            let fingerprint = PyBytes::new(py, fingerprint_bytes);
-
-            let (size_bytes, new_pos) = get_next_field(text, pos, state)?;
-            pos = new_pos;
-            let size_str = std::str::from_utf8(size_bytes).map_err(|e| {
-                PyValueError::new_err(format!("Invalid UTF-8 in size field: {}", e))
-            })?;
-            let size: u64 = size_str.parse().map_err(|e| {
-                PyValueError::new_err(format!("Invalid size field '{}': {}", size_str, e))
-            })?;
-
-            let (exec_bytes, new_pos) = get_next_field(text, pos, state)?;
-            pos = new_pos;
-            let is_executable = !exec_bytes.is_empty() && exec_bytes[0] == b'y';
-
-            let (info_bytes, new_pos) = get_next_field(text, pos, state)?;
-            pos = new_pos;
-            let info = PyBytes::new(py, info_bytes);
-
-            let tree_data = PyTuple::new(
-                py,
-                [
-                    minikind.into_any(),
-                    fingerprint.into_any(),
-                    size.into_pyobject(py)?.into_any(),
-                    is_executable.into_pyobject(py)?.to_owned().into_any(),
-                    info.into_any(),
-                ],
-            )?;
-            trees.append(tree_data)?;
-        }
-
-        let entry = PyTuple::new(py, [key.as_any(), trees.as_any()])?;
-
-        // Read and check trailing newline
-        let (trailing, new_pos) = get_next_field(text, pos, state)?;
-        pos = new_pos;
-        if trailing.len() != 1 || trailing[0] != b'\n' {
-            let dirstate_corrupt = py
-                .import("bzrformats.dirstate")?
-                .getattr("DirstateCorrupt")?;
-            return Err(PyErr::from_value(dirstate_corrupt.call1((
-                state,
-                format!(
-                    "Bad parse, we expected to end on \\n, not: {} {:?}: {:?}",
-                    trailing.len(),
-                    trailing,
-                    entry
-                ),
-            ))?));
-        }
-
-        current_block.append(entry)?;
-        entry_count += 1;
-    }
-
-    if entry_count != num_entries {
-        let dirstate_corrupt = py
-            .import("bzrformats.dirstate")?
-            .getattr("DirstateCorrupt")?;
-        return Err(PyErr::from_value(dirstate_corrupt.call1((
-            state,
-            format!(
-                "We read the wrong number of entries. We expected to read {}, but read {}",
-                num_entries, entry_count
-            ),
-        ))?));
-    }
-
-    state.setattr("_dirblocks", dirblocks)?;
+    let py_dirblocks = dirblocks_to_py(py, &dirblocks)?;
+    state.setattr("_dirblocks", py_dirblocks)?;
+    // `_split_root_dirblock_into_contents` still lives in Python; it is a
+    // pure reshuffle of `_dirblocks[0]` / `_dirblocks[1]` and is cheap to
+    // call across the FFI boundary. A later commit can delegate the split
+    // to `bazaar::dirstate::split_root_dirblock_into_contents` once the
+    // pure-Rust version is wired into the marshalling path.
     state.call_method0("_split_root_dirblock_into_contents")?;
     state.setattr(
         "_dirblock_state",
@@ -322,10 +227,114 @@ impl ProcessEntryC {
     }
 }
 
+/// Extract a single Python entry tuple into a pure-Rust [`Entry`]. The
+/// Python shape is
+/// `((dirname, basename, file_id), [(minikind, fingerprint, size, executable, packed_stat), ...])`
+/// with `minikind` as a one-byte `bytes` object, `size` as an int, and
+/// `executable` as a bool — this is the same layout `_read_dirblocks`
+/// produces.
+pub(crate) fn entry_from_py(py_entry: &Bound<PyAny>) -> PyResult<Entry> {
+    let tuple = py_entry.cast::<PyTuple>()?;
+    let key_tuple = tuple.get_item(0)?.cast_into::<PyTuple>()?;
+    let key = EntryKey {
+        dirname: key_tuple.get_item(0)?.extract::<Vec<u8>>()?,
+        basename: key_tuple.get_item(1)?.extract::<Vec<u8>>()?,
+        file_id: key_tuple.get_item(2)?.extract::<Vec<u8>>()?,
+    };
+    let trees_obj = tuple.get_item(1)?;
+    let mut trees: Vec<TreeData> = Vec::new();
+    for tree in trees_obj.try_iter()? {
+        let tree = tree?;
+        let tree_tuple = tree.cast::<PyTuple>()?;
+        let minikind_bytes: Vec<u8> = tree_tuple.get_item(0)?.extract()?;
+        trees.push(TreeData {
+            minikind: minikind_bytes.first().copied().unwrap_or(0),
+            fingerprint: tree_tuple.get_item(1)?.extract::<Vec<u8>>()?,
+            size: tree_tuple.get_item(2)?.extract::<u64>()?,
+            executable: tree_tuple.get_item(3)?.extract::<bool>()?,
+            packed_stat: tree_tuple.get_item(4)?.extract::<Vec<u8>>()?,
+        });
+    }
+    Ok(Entry { key, trees })
+}
+
+/// Convert a Python dirblocks list into the pure-Rust
+/// `Vec<Dirblock>` layout. Input shape matches Python's `_dirblocks`:
+/// `[(dirname_bytes, [entry_tuple, ...]), ...]` where each
+/// `entry_tuple` is `((dirname, basename, file_id), [tree_tuple, ...])`
+/// and each `tree_tuple` is
+/// `(minikind, fingerprint, size, executable, packed_stat_or_revid)`.
+///
+/// Used as the sync boundary between Python's `_dirblocks` attribute
+/// and the pure-Rust `DirState.dirblocks` field while dirblock
+/// ownership is being migrated method-by-method.
+pub(crate) fn dirblocks_from_py(dirblocks: &Bound<PyAny>) -> PyResult<Vec<Dirblock>> {
+    let mut out = Vec::new();
+    for block in dirblocks.try_iter()? {
+        let block = block?;
+        let block_tuple = block.cast::<PyTuple>()?;
+        let dirname: Vec<u8> = block_tuple.get_item(0)?.extract()?;
+        let entries_obj = block_tuple.get_item(1)?;
+        let mut entries: Vec<Entry> = Vec::new();
+        for entry in entries_obj.try_iter()? {
+            let entry = entry?;
+            entries.push(entry_from_py(&entry)?);
+        }
+        out.push(Dirblock { dirname, entries });
+    }
+    Ok(out)
+}
+
+/// Serialise a single dirstate entry to the NUL-delimited line format
+/// the writer uses. Replaces Python's `DirState._entry_to_line`; the
+/// pure-Rust implementation lives in `bazaar::dirstate::entry_to_line`.
+#[pyfunction]
+#[pyo3(name = "entry_to_line")]
+fn py_entry_to_line<'py>(
+    py: Python<'py>,
+    entry: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let rust_entry = entry_from_py(entry)?;
+    let bytes = pure_entry_to_line(&rust_entry);
+    Ok(PyBytes::new(py, &bytes))
+}
+
+/// Serialise every entry across every dirblock into a list of
+/// NUL-delimited lines, one per entry in iteration order. Replaces the
+/// `map(self._entry_to_line, self._iter_entries())` loop inside
+/// `DirState.get_lines` with a single pyo3 call that walks the Python
+/// `_dirblocks` list once.
+///
+/// Input shape matches Python's `_dirblocks`:
+/// `[(dirname_bytes, [entry_tuple, ...]), ...]` where each `entry_tuple`
+/// is `((dirname, basename, file_id), [(minikind, fingerprint, size, executable, packed_stat), ...])`.
+#[pyfunction]
+#[pyo3(name = "dirblocks_to_entry_lines")]
+fn py_dirblocks_to_entry_lines<'py>(
+    py: Python<'py>,
+    dirblocks: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for block in dirblocks.try_iter()? {
+        let block = block?;
+        let block_tuple = block.cast::<PyTuple>()?;
+        let entries = block_tuple.get_item(1)?;
+        for entry in entries.try_iter()? {
+            let entry = entry?;
+            let rust_entry = entry_from_py(&entry)?;
+            let bytes = pure_entry_to_line(&rust_entry);
+            out.append(PyBytes::new(py, &bytes))?;
+        }
+    }
+    Ok(out)
+}
+
 /// Register the dirstate helper functions into the given module.
 pub fn register(m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(_read_dirblocks, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(update_entry, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(py_entry_to_line, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(py_dirblocks_to_entry_lines, m)?)?;
     m.add_class::<ProcessEntryC>()?;
     Ok(())
 }
