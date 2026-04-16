@@ -1884,6 +1884,20 @@ impl DirState {
             }
         }
 
+        // The same `key` can be pushed multiple times when an entry
+        // has several parent-tree slots that all happen to be 'f' (or
+        // 'd' / 'l' / 't'). Each such slot maps to "still at the
+        // original key", so the tree-0 update only needs to happen
+        // once per distinct key — Python achieves this implicitly by
+        // working through a dict.
+        remaining_keys.sort_by(|a, b| {
+            a.dirname
+                .cmp(&b.dirname)
+                .then_with(|| a.basename.cmp(&b.basename))
+                .then_with(|| a.file_id.cmp(&b.file_id))
+        });
+        remaining_keys.dedup();
+
         let last_reference = !remaining_keys.iter().any(|k| k == key);
 
         if last_reference {
