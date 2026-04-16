@@ -222,7 +222,6 @@ import bisect
 import codecs
 import contextlib
 import logging
-import operator
 import os
 import stat
 import sys
