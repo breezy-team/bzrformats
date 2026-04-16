@@ -972,7 +972,6 @@ struct FactoryState {
 /// pyclasses on demand; iteration breaks the back-reference exactly the same
 /// way the Python original does.
 #[pyclass(
-    unsendable,
     name = "LazyGroupContentManager",
     module = "bzrformats._bzr_rs.groupcompress"
 )]
