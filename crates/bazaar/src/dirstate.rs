@@ -2961,6 +2961,149 @@ impl DirState {
         Ok(())
     }
 
+    /// Apply a pre-flattened inventory delta to tree 1. Mirrors
+    /// Python's `DirState.update_basis_by_delta` — the sibling of
+    /// [`DirState::update_by_delta`] that rebases the basis tree.
+    ///
+    /// Prerequisites the caller must handle: calling
+    /// `discard_merge_parents`, setting the parent slot to
+    /// `new_revid` (via `set_parent_at` / `append_parent`), and
+    /// bootstrapping per-entry tree-1 slots when the dirstate had
+    /// zero parents. The ghost-parents check is also a caller
+    /// concern — this method takes a pre-sorted, pre-checked delta.
+    ///
+    /// On success, the caller should mark the dirstate modified
+    /// (header included) and invalidate its id_index cache.
+    pub fn update_basis_by_delta(
+        &mut self,
+        entries: Vec<FlatBasisDeltaEntry>,
+    ) -> Result<(), BasisApplyError> {
+        use std::collections::BTreeSet;
+
+        let mut adds: Vec<BasisAdd> = Vec::new();
+        let mut changes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, TreeData)> = Vec::new();
+        let mut deletes: Vec<(Vec<u8>, Option<Vec<u8>>, Vec<u8>, bool)> = Vec::new();
+        let mut parents_set: BTreeSet<(Vec<u8>, Vec<u8>)> = BTreeSet::new();
+        let mut new_ids: Vec<Vec<u8>> = Vec::new();
+
+        let details_to_tree_data = |d: &(u8, Vec<u8>, u64, bool, Vec<u8>)| TreeData {
+            minikind: d.0,
+            fingerprint: d.1.clone(),
+            size: d.2,
+            executable: d.3,
+            packed_stat: d.4.clone(),
+        };
+
+        for entry in entries {
+            let FlatBasisDeltaEntry {
+                old_path,
+                new_path,
+                file_id,
+                parent_id,
+                details,
+            } = entry;
+            if let Some(ref np) = new_path {
+                let (dirname_utf8, basename_utf8) = split_path_utf8(np);
+                if !basename_utf8.is_empty() {
+                    let pid = parent_id.clone().unwrap_or_default();
+                    parents_set.insert((dirname_utf8.to_vec(), pid));
+                }
+            }
+            match (old_path.clone(), new_path.clone()) {
+                (None, Some(np)) => {
+                    let details = details.as_ref().expect("add must have details");
+                    adds.push(BasisAdd {
+                        old_path: None,
+                        new_path: np,
+                        file_id: file_id.clone(),
+                        new_details: details_to_tree_data(details),
+                        real_add: true,
+                    });
+                    new_ids.push(file_id);
+                }
+                (Some(op), None) => {
+                    deletes.push((op, None, file_id, true));
+                }
+                (Some(op), Some(np)) if op.is_empty() && np.is_empty() => {
+                    let details = details.as_ref().expect("change must have details");
+                    changes.push((op, np, file_id, details_to_tree_data(details)));
+                }
+                (Some(op), Some(np)) => {
+                    // Drain pending deletes before walking tree-1
+                    // children of old_path — otherwise we'd see
+                    // stale rows.
+                    self.update_basis_apply_deletes(&deletes)?;
+                    deletes.clear();
+                    let details = details.as_ref().expect("rename must have details");
+                    adds.push(BasisAdd {
+                        old_path: Some(op.clone()),
+                        new_path: np.clone(),
+                        file_id: file_id.clone(),
+                        new_details: details_to_tree_data(details),
+                        real_add: false,
+                    });
+                    // Walk children of old_path in tree 1 in
+                    // reverse (Python does `reversed(list(...))`)
+                    // so deeper paths come out first.
+                    let mut children = self.iter_child_entries(1, &op);
+                    children.reverse();
+                    for child in children {
+                        let child_dirname = child.key.dirname.clone();
+                        let child_basename = child.key.basename.clone();
+                        let child_fid = child.key.file_id.clone();
+                        let mut source_path = child_dirname.clone();
+                        if !source_path.is_empty() {
+                            source_path.push(b'/');
+                        }
+                        source_path.extend_from_slice(&child_basename);
+                        let target_path = if !np.is_empty() {
+                            let suffix = &source_path[op.len()..];
+                            let mut t = np.clone();
+                            t.extend_from_slice(suffix);
+                            t
+                        } else {
+                            if op.is_empty() {
+                                return Err(BasisApplyError::Internal {
+                                    reason: "cannot rename directory to itself".to_string(),
+                                });
+                            }
+                            source_path[op.len() + 1..].to_vec()
+                        };
+                        let child_tree1 = child.trees.get(1).cloned().unwrap_or(TreeData {
+                            minikind: 0,
+                            fingerprint: Vec::new(),
+                            size: 0,
+                            executable: false,
+                            packed_stat: Vec::new(),
+                        });
+                        adds.push(BasisAdd {
+                            old_path: None,
+                            new_path: target_path.clone(),
+                            file_id: child_fid.clone(),
+                            new_details: child_tree1,
+                            real_add: false,
+                        });
+                        deletes.push((source_path, Some(target_path), child_fid, false));
+                    }
+                    deletes.push((op, Some(np), file_id, false));
+                }
+                (None, None) => {
+                    return Err(BasisApplyError::Internal {
+                        reason: "delta row with neither old_path nor new_path".to_string(),
+                    });
+                }
+            }
+        }
+
+        self.check_delta_ids_absent(&new_ids, 1)?;
+        self.update_basis_apply_deletes(&deletes)?;
+        self.update_basis_apply_adds(&mut adds)?;
+        self.update_basis_apply_changes(&changes)?;
+        let parents_vec: Vec<(Vec<u8>, Vec<u8>)> = parents_set.into_iter().collect();
+        self.after_delta_check_parents(&parents_vec, 1)?;
+        Ok(())
+    }
+
     /// Apply a pre-flattened inventory delta to tree 0. Mirrors
     /// Python's `DirState.update_by_delta` — the workhorse for
     /// `apply_inventory_delta` in dirstate-based trees.
@@ -3776,6 +3919,20 @@ pub struct FlatDeltaEntry {
     pub minikind: u8,
     pub executable: bool,
     pub fingerprint: Vec<u8>,
+}
+
+/// A pre-flattened row passed to [`DirState::update_basis_by_delta`].
+/// `details` is the 5-tuple returned by
+/// [`inv_entry_to_details`]: `(minikind, fingerprint, size,
+/// executable, tree_data)` — Python runs `inv_entry_to_details` per
+/// row before dispatching. `details` may be `None` for deletions.
+#[derive(Debug, Clone)]
+pub struct FlatBasisDeltaEntry {
+    pub old_path: Option<Vec<u8>>,
+    pub new_path: Option<Vec<u8>>,
+    pub file_id: Vec<u8>,
+    pub parent_id: Option<Vec<u8>>,
+    pub details: Option<(u8, Vec<u8>, u64, bool, Vec<u8>)>,
 }
 
 /// Error returned by [`DirState::validate`]. A single descriptive

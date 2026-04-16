@@ -1180,6 +1180,67 @@ impl PyDirState {
             .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))
     }
 
+    /// Apply a pre-flattened inventory delta to tree 1. Mirrors
+    /// Python's `DirState.update_basis_by_delta`. Input is a Python
+    /// iterable of 5-tuples:
+    /// `(old_path, new_path, file_id, parent_id, details)` where
+    /// `details` is either None (delete) or the 5-tuple returned by
+    /// `inv_entry_to_details`: `(minikind, fingerprint, size,
+    /// executable, tree_data)`.
+    ///
+    /// The caller is responsible for: running delta.check()/.sort(),
+    /// rejecting ghost parents, calling `discard_merge_parents`,
+    /// setting the parent slot to new_revid (via set_parent_at /
+    /// append_parent), and bootstrapping per-entry tree-1 slots
+    /// when the dirstate had zero parents.
+    fn update_basis_by_delta(&mut self, entries: &Bound<PyAny>) -> PyResult<()> {
+        let mut rust_entries: Vec<bazaar::dirstate::FlatBasisDeltaEntry> = Vec::new();
+        for item in entries.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            if tup.len() != 5 {
+                return Err(PyTypeError::new_err(
+                    "update_basis_by_delta entries must be 5-tuples",
+                ));
+            }
+            let old_path: Option<Vec<u8>> = tup.get_item(0)?.extract()?;
+            let new_path: Option<Vec<u8>> = tup.get_item(1)?.extract()?;
+            let file_id: Vec<u8> = tup.get_item(2)?.extract()?;
+            let parent_id: Option<Vec<u8>> = tup.get_item(3)?.extract()?;
+            let details_obj = tup.get_item(4)?;
+            let details = if details_obj.is_none() {
+                None
+            } else {
+                let dtup = details_obj.cast_into::<PyTuple>()?;
+                if dtup.len() != 5 {
+                    return Err(PyTypeError::new_err("details must be a 5-tuple or None"));
+                }
+                let mk_bytes: Vec<u8> = dtup.get_item(0)?.extract()?;
+                let mk = *mk_bytes
+                    .first()
+                    .ok_or_else(|| PyTypeError::new_err("minikind must be non-empty"))?;
+                let fp: Vec<u8> = dtup.get_item(1)?.extract()?;
+                let sz: u64 = dtup.get_item(2)?.extract()?;
+                let ex: bool = dtup.get_item(3)?.extract()?;
+                let td: Vec<u8> = dtup.get_item(4)?.extract()?;
+                Some((mk, fp, sz, ex, td))
+            };
+            rust_entries.push(bazaar::dirstate::FlatBasisDeltaEntry {
+                old_path,
+                new_path,
+                file_id,
+                parent_id,
+                details,
+            });
+        }
+        match self.inner.update_basis_by_delta(rust_entries) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.inner.changes_aborted = true;
+                Err(self.raise_basis_apply_error(entries.py(), e))
+            }
+        }
+    }
+
     /// Apply a pre-flattened inventory delta to tree 0. Mirrors
     /// Python's `DirState.update_by_delta`. Input is a Python
     /// iterable of 7-tuples:

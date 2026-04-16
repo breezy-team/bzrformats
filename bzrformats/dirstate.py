@@ -1454,29 +1454,8 @@ class DirState:
 
         delta.check()
         delta.sort()
-        adds = []
-        changes = []
-        deletes = []
-        # The paths this function accepts are unicode and must be encoded as we
-        # go.
         inv_to_entry = _inv_entry_to_details
-        # delta is now (deletes, changes), (adds) in reverse lexographical
-        # order.
-        # deletes in reverse lexographic order are safe to process in situ.
-        # renames are not, as a rename from any path could go to a path
-        # lexographically lower, so we transform renames into delete, add pairs,
-        # expanding them recursively as needed.
-        # At the same time, to reduce interface friction we convert the input
-        # inventory entries to dirstate.
-        root_only = ("", "")
-        # Accumulate parent references (path_utf8, id), to check for parentless
-        # items or items placed under files/links/tree-references. We get
-        # references from every item in the delta that is not a deletion and
-        # is not itself the root.
-        parents = set()
-        # Added ids must not be in the dirstate already. This set holds those
-        # ids.
-        new_ids = set()
+        flat = []
         for old_path, new_path, file_id, inv_entry in delta:
             if file_id.__class__ is not bytes:
                 raise AssertionError(f"must be a utf8 file_id not {type(file_id)}")
@@ -1485,103 +1464,27 @@ class DirState:
                     new_path, file_id, f"mismatched entry file_id {inv_entry!r}"
                 )
             if new_path is None:
-                new_path_utf8 = None
+                np = None
+                parent_id = None
             else:
                 if inv_entry is None:
                     self._raise_invalid(new_path, file_id, "new_path with no entry")
-                new_path_utf8 = new_path.encode("utf-8")
-                # note the parent for validation
-                dirname_utf8, basename_utf8 = osutils.split(new_path_utf8)
-                if basename_utf8:
-                    parents.add((dirname_utf8, inv_entry.parent_id))
-            old_path_utf8 = None if old_path is None else old_path.encode("utf-8")
-            if old_path is None:
-                adds.append(
-                    (None, new_path_utf8, file_id, inv_to_entry(inv_entry), True)
-                )
-                new_ids.add(file_id)
-            elif new_path is None:
-                deletes.append((old_path_utf8, None, file_id, None, True))
-            elif (old_path, new_path) == root_only:
-                # change things in-place
-                # Note: the case of a parent directory changing its file_id
-                #       tends to break optimizations here, because officially
-                #       the file has actually been moved, it just happens to
-                #       end up at the same path. If we can figure out how to
-                #       handle that case, we can avoid a lot of add+delete
-                #       pairs for objects that stay put.
-                # elif old_path == new_path:
-                changes.append(
-                    (old_path_utf8, new_path_utf8, file_id, inv_to_entry(inv_entry))
-                )
-            else:
-                # Renames:
-                # Because renames must preserve their children we must have
-                # processed all relocations and removes before hand. The sort
-                # order ensures we've examined the child paths, but we also
-                # have to execute the removals, or the split to an add/delete
-                # pair will result in the deleted item being reinserted, or
-                # renamed items being reinserted twice - and possibly at the
-                # wrong place. Splitting into a delete/add pair also simplifies
-                # the handling of entries with (b'f', ...), (b'r' ...) because
-                # the target of the b'r' is old_path here, and we add that to
-                # deletes, meaning that the add handler does not need to check
-                # for b'r' items on every pass.
-                self._update_basis_apply_deletes(deletes)
-                deletes = []
-                # Split into an add/delete pair recursively.
-                adds.append(
-                    (
-                        old_path_utf8,
-                        new_path_utf8,
-                        file_id,
-                        inv_to_entry(inv_entry),
-                        False,
-                    )
-                )
-                # Expunge deletes that we've seen so that deleted/renamed
-                # children of a rename directory are handled correctly.
-                new_deletes = reversed(list(self._iter_child_entries(1, old_path_utf8)))
-                # Remove the current contents of the tree at orig_path, and
-                # reinsert at the correct new path.
-                for entry in new_deletes:
-                    child_dirname, child_basename, _child_file_id = entry[0]
-                    if child_dirname:
-                        source_path = child_dirname + b"/" + child_basename
-                    else:
-                        source_path = child_basename
-                    if new_path_utf8:
-                        target_path = new_path_utf8 + source_path[len(old_path_utf8) :]
-                    else:
-                        if old_path_utf8 == b"":
-                            raise AssertionError("cannot rename directory to itself")
-                        target_path = source_path[len(old_path_utf8) + 1 :]
-                    adds.append((None, target_path, entry[0][2], entry[1][1], False))
-                    deletes.append((source_path, target_path, entry[0][2], None, False))
-                deletes.append((old_path_utf8, new_path_utf8, file_id, None, False))
+                np = new_path.encode("utf-8")
+                parent_id = inv_entry.parent_id
+            op = None if old_path is None else old_path.encode("utf-8")
+            details = None if inv_entry is None else inv_to_entry(inv_entry)
+            flat.append((op, np, file_id, parent_id, details))
 
-        self._check_delta_ids_absent(new_ids, 1)
+        self._rs.dirblocks = self._dirblocks
         try:
-            # Finish expunging deletes/first half of renames.
-            self._update_basis_apply_deletes(deletes)
-            # Reinstate second half of renames and new paths.
-            self._update_basis_apply_adds(adds)
-            # Apply in-situ changes.
-            self._update_basis_apply_changes(changes)
-            # Validate parents
-            self._after_delta_check_parents(parents, 1)
+            self._rs.update_basis_by_delta(flat)
         except BzrFormatsError as e:
-            self._changes_aborted = True
             if "integrity error" not in str(e):
                 raise
-            # _get_entry raises BzrError when a request is inconsistent; we
-            # want such errors to be shown as InconsistentDelta - and that
-            # fits the behaviour we trigger.
             raise InconsistentDeltaDelta(delta, f"error from _get_entry. {e}") from e
-
+        self._dirblocks = self._rs.dirblocks
         self._mark_modified(header_modified=True)
         self._id_index = None
-        return
 
     def _check_delta_ids_absent(self, new_ids, tree_index):
         """Check that none of the file_ids in new_ids are present in a tree."""
