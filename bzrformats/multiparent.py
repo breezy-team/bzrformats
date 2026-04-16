@@ -69,70 +69,33 @@ class MultiParent:
     @staticmethod
     def from_lines(text, parents=(), left_blocks=None):
         """Produce a MultiParent from a list of lines and parents."""
-        try:
-            import patiencediff
-        except ImportError as e:
-            raise ImportError(
-                "patiencediff module is required for multiparent operations"
-            ) from e
-
-        def compare(parent):
-            matcher = patiencediff.PatienceSequenceMatcher(None, parent, text)
-            return matcher.get_matching_blocks()
-
         if len(parents) > 0:
+            try:
+                import patiencediff
+            except ImportError as e:
+                raise ImportError(
+                    "patiencediff module is required for multiparent operations"
+                ) from e
+
+            def compare(parent):
+                matcher = patiencediff.PatienceSequenceMatcher(None, parent, text)
+                return list(matcher.get_matching_blocks())
+
             if left_blocks is None:
                 left_blocks = compare(parents[0])
-            parent_comparisons = [left_blocks] + [compare(p) for p in parents[1:]]
-        else:
-            parent_comparisons = []
-        cur_line = 0
-        new_text = NewText([])
-        block_iter = [iter(i) for i in parent_comparisons]
-        diff = MultiParent([])
-
-        def next_block(p):
-            try:
-                return next(block_iter[p])
-            except StopIteration:
-                return None
-
-        cur_block = [next_block(p) for p, i in enumerate(block_iter)]
-        while cur_line < len(text):
-            best_match = None
-            for p, block in enumerate(cur_block):
-                if block is None:
-                    continue
-                i, j, n = block
-                while j + n <= cur_line:
-                    block = cur_block[p] = next_block(p)
-                    if block is None:
-                        break
-                    i, j, n = block
-                if block is None:
-                    continue
-                if j > cur_line:
-                    continue
-                offset = cur_line - j
-                i += offset
-                j = cur_line
-                n -= offset
-                if n == 0:
-                    continue
-                if best_match is None or n > best_match.num_lines:
-                    best_match = ParentText(p, i, j, n)
-            if best_match is None:
-                new_text.lines.append(text[cur_line])
-                cur_line += 1
             else:
-                if len(new_text.lines) > 0:
-                    diff.hunks.append(new_text)
-                    new_text = NewText([])
-                diff.hunks.append(best_match)
-                cur_line += best_match.num_lines
-        if len(new_text.lines) > 0:
-            diff.hunks.append(new_text)
-        return diff
+                left_blocks = list(left_blocks)
+            parent_blocks = [left_blocks] + [compare(p) for p in parents[1:]]
+        else:
+            parent_blocks = []
+        raw_hunks = _multiparent_rs.from_lines_with_blocks(list(text), parent_blocks)
+        hunks = []
+        for kind, payload in raw_hunks:
+            if kind == b"n":
+                hunks.append(NewText(payload))
+            else:
+                hunks.append(ParentText(*payload))
+        return MultiParent(hunks)
 
     def get_matching_blocks(self, parent, parent_len):
         """Get matching blocks for a specific parent."""

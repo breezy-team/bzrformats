@@ -270,31 +270,13 @@ class _MPDiffGenerator:
             refcounts is a dict of {key: num_children} letting us know when we
                 no longer need to cache a given parent text
         """
-        # All the keys and their parents
-        needed_keys = set(self.ordered_keys)
-        parent_map = self.vf.get_parent_map(needed_keys)
+        parent_map = self.vf.get_parent_map(set(self.ordered_keys))
         self.parent_map = parent_map
-        # TODO: Should we be using a different construct here? I think this
-        #       uses difference_update internally, and we expect the result to
-        #       be tiny
-        missing_keys = needed_keys.difference(parent_map)
+        needed_keys, refcounts, just_parents, missing_keys = (
+            _versionedfile_rs.mpdiff_first_pass(self.ordered_keys, parent_map)
+        )
         if missing_keys:
-            raise RevisionNotPresent(list(missing_keys)[0], self.vf)
-        # Parents that might be missing. They are allowed to be ghosts, but we
-        # should check for them
-        refcounts = {}
-        setdefault = refcounts.setdefault
-        just_parents = set()
-        for _child_key, parent_keys in parent_map.items():
-            if not parent_keys:
-                # parent_keys may be None if a given VersionedFile claims to
-                # not support graph operations.
-                continue
-            just_parents.update(parent_keys)
-            needed_keys.update(parent_keys)
-            for p in parent_keys:
-                refcounts[p] = setdefault(p, 0) + 1
-        just_parents.difference_update(parent_map)
+            raise RevisionNotPresent(next(iter(missing_keys)), self.vf)
         # Remove any parents that are actually ghosts from the needed set
         self.present_parents = set(self.vf.get_parent_map(just_parents))
         self.ghost_parents = just_parents.difference(self.present_parents)
@@ -328,25 +310,10 @@ class _MPDiffGenerator:
             # None for any parent request, so we replace it with an empty tuple
             if parent_keys is None:
                 parent_keys = ()
-            parent_lines = []
-            for p in parent_keys:
-                # Alternatively we could check p not in self.needed_keys, but
-                # ghost_parents should be tiny versus huge
-                if p in self.ghost_parents:
-                    continue
-                refcount = self.refcounts[p]
-                if refcount == 1:  # Last child reference
-                    self.refcounts.pop(p)
-                    parent_chunks = self.chunks.pop(p)
-                else:
-                    self.refcounts[p] = refcount - 1
-                    parent_chunks = self.chunks[p]
-                p_lines = osutils.chunks_to_lines(parent_chunks)
-                # TODO: Should we cache the line form? We did the
-                #       computation to get it, but storing it this way will
-                #       be less memory efficient...
-                parent_lines.append(p_lines)
-                del p_lines
+            parent_chunks_list = _versionedfile_rs.mpdiff_collect_parent_chunks(
+                parent_keys, self.ghost_parents, self.refcounts, self.chunks
+            )
+            parent_lines = [osutils.chunks_to_lines(pc) for pc in parent_chunks_list]
             lines = osutils.chunks_to_lines(this_chunks)
             # Since we needed the lines, we'll go ahead and cache them this way
             this_chunks = lines
@@ -2144,55 +2111,4 @@ def sort_groupcompress(parent_map):
     return _groupcompress_rs.sort_gc_optimal(parent_map)
 
 
-class _KeyRefs:
-    def __init__(self, track_new_keys=False):
-        # dict mapping 'key' to 'set of keys referring to that key'
-        self.refs = {}
-        if track_new_keys:
-            # set remembering all new keys
-            self.new_keys = set()
-        else:
-            self.new_keys = None
-
-    def clear(self):
-        if self.refs:
-            self.refs.clear()
-        if self.new_keys:
-            self.new_keys.clear()
-
-    def add_references(self, key, refs):
-        # Record the new references
-        for referenced in refs:
-            try:
-                needed_by = self.refs[referenced]
-            except KeyError:
-                needed_by = self.refs[referenced] = set()
-            needed_by.add(key)
-        # Discard references satisfied by the new key
-        self.add_key(key)
-
-    def get_new_keys(self):
-        return self.new_keys
-
-    def get_unsatisfied_refs(self):
-        return self.refs.keys()
-
-    def _satisfy_refs_for_key(self, key):
-        try:
-            del self.refs[key]
-        except KeyError:
-            # No keys depended on this key.  That's ok.
-            pass
-
-    def add_key(self, key):
-        # satisfy refs for key, and remember that we've seen this key.
-        self._satisfy_refs_for_key(key)
-        if self.new_keys is not None:
-            self.new_keys.add(key)
-
-    def satisfy_refs_for_keys(self, keys):
-        for key in keys:
-            self._satisfy_refs_for_key(key)
-
-    def get_referrers(self):
-        return set(itertools.chain.from_iterable(self.refs.values()))
+_KeyRefs = _versionedfile_rs.KeyRefs

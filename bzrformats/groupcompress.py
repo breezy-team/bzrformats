@@ -1014,67 +1014,7 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
         return result
 
 
-class _GCBuildDetails:
-    """A blob of data about the build details.
-
-    This stores the minimal data, which then allows compatibility with the old
-    api, without taking as much memory.
-    """
-
-    __slots__ = (
-        "_basis_end",
-        "_delta_end",
-        "_group_end",
-        "_group_start",
-        "_index",
-        "_parents",
-    )
-
-    method = "group"
-    compression_parent = None
-
-    def __init__(self, parents, position_info):
-        self._parents = parents
-        (
-            self._index,
-            self._group_start,
-            self._group_end,
-            self._basis_end,
-            self._delta_end,
-        ) = position_info
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}({self.index_memo}, {self._parents})"
-
-    @property
-    def index_memo(self):
-        return (
-            self._index,
-            self._group_start,
-            self._group_end,
-            self._basis_end,
-            self._delta_end,
-        )
-
-    @property
-    def record_details(self):
-        return (self.method, None)
-
-    def __getitem__(self, offset):
-        """Compatibility thunk to act like a tuple."""
-        if offset == 0:
-            return self.index_memo
-        elif offset == 1:
-            return self.compression_parent  # Always None
-        elif offset == 2:
-            return self._parents
-        elif offset == 3:
-            return self.record_details
-        else:
-            raise IndexError("offset out of range")
-
-    def __len__(self):
-        return 4
+from ._bzr_rs.groupcompress import GCBuildDetails as _GCBuildDetails
 
 
 class _GCGraphIndex:
@@ -1177,24 +1117,33 @@ class _GCGraphIndex:
                         )
                 del keys[key]
                 changed = True
-        if changed:
+        if changed or not self._parents:
+            # Emit records in the shape _add_callback expects. For a
+            # parentless index that's always a 2-tuple, even when we didn't
+            # have to drop anything above (btree_index.BTreeBuilder.add_nodes
+            # unpacks strictly by length).
             result = []
             if self._parents:
                 for key, (value, node_refs) in keys.items():
                     result.append((key, value, node_refs))
             else:
-                for key, (value, node_refs) in keys.items():  # noqa: B007
+                for key, (value, _node_refs) in keys.items():
                     result.append((key, value))
             records = result
         key_dependencies = self._key_dependencies
         if key_dependencies is not None:
             if self._parents:
-                for key, value, refs in records:  # noqa: B007
+                for key, _value, refs in records:
                     parents = refs[0]
                     key_dependencies.add_references(key, parents)
             else:
-                for key, value, refs in records:  # noqa: B007
-                    new_keys.add_key(key)
+                # Parentless index: nothing references anything, but we still
+                # need to remember new keys so `track_new_keys` callers can
+                # query them afterwards. `records` may be 2-tuples
+                # `(key, value)` or 3-tuples `(key, value, refs)` depending on
+                # whether the `changed` branch above rewrote the list.
+                for record in records:
+                    key_dependencies.add_key(record[0])
         self._add_callback(records)
 
     def _check_read(self):

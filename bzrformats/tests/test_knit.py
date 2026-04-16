@@ -2000,6 +2000,39 @@ class TestKnitVersionedFiles(KnitTests):
             [(b"f", b"a"), (b"g", b"b"), (b"a",), (b"b",), (b"g", b"a"), (b"f", b"b")],
         )
 
+    def test_get_text_via_traits_rs_fulltext(self):
+        # The pyo3 PyKnitIndex / PyKnitAccess adapters wrap the Python
+        # _index / _access pair of a real KnitVersionedFiles and feed
+        # them to the pure-Rust get_text pipeline. Verify the output
+        # for a fresh fulltext record matches what get_text returns.
+        from bzrformats._bzr_rs.knit import get_text_via_traits_rs
+
+        knit = self.make_test_knit(annotate=True)
+        key = (b"v1",)
+        knit.add_lines(key, (), [b"alpha\n", b"beta\n"])
+
+        text = get_text_via_traits_rs(
+            knit._index, knit._access, key, knit._factory.annotated
+        )
+        self.assertEqual(b"alpha\nbeta\n", text)
+
+    def test_get_text_via_traits_rs_delta_chain(self):
+        # Same as above but for a record that's stored as a delta
+        # against a parent — exercises the chain-walking branch of the
+        # pure-Rust get_text.
+        from bzrformats._bzr_rs.knit import get_text_via_traits_rs
+
+        knit = self.make_test_knit(annotate=True)
+        parent = (b"v1",)
+        child = (b"v2",)
+        knit.add_lines(parent, (), [b"a\n", b"b\n"])
+        knit.add_lines(child, (parent,), [b"a\n", b"B\n"])
+
+        text = get_text_via_traits_rs(
+            knit._index, knit._access, child, knit._factory.annotated
+        )
+        self.assertEqual(b"a\nB\n", text)
+
 
 class TestStacking(KnitTests):
     def get_basis_and_test_knit(self):

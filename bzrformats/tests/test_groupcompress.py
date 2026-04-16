@@ -743,6 +743,32 @@ class TestGroupCompressVersionedFiles(TestCaseWithGroupCompressVersionedFiles):
             frozenset([(b"parent-1",), (b"parent-2",)]), index.get_missing_parents()
         )
 
+    def test_track_new_keys_on_parentless_index(self):
+        # Regression: when _parents=False the add_records path used to
+        # reference an undefined `new_keys` local while trying to record
+        # freshly-inserted keys. The branch is reachable any time the
+        # index is constructed with parents=False AND
+        # track_external_parent_refs=True.
+        mod_index = btree_index.BTreeBuilder(0, 1)
+        combined = _mod_index.CombinedGraphIndex([mod_index])
+        index = groupcompress._GCGraphIndex(
+            combined,
+            is_locked=lambda: True,
+            parents=False,
+            add_callback=mod_index.add_nodes,
+            track_external_parent_refs=True,
+            track_new_keys=True,
+        )
+        index.add_records([((b"a",), b"2 10 2 10", [])])
+        index.add_records([((b"b",), b"3 10 2 10", [])])
+        # Both keys should show up in get_new_keys; get_missing_parents
+        # should be empty because a parentless index has no references.
+        self.assertEqual(
+            frozenset([(b"a",), (b"b",)]),
+            frozenset(index._key_dependencies.get_new_keys()),
+        )
+        self.assertEqual(frozenset(), index.get_missing_parents())
+
     def make_source_with_b(self, a_parent, path):
         source = self.make_test_vf(True, dir=path)
         source.add_lines((b"a",), (), [b"lines\n"])

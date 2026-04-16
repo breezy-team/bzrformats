@@ -65,6 +65,17 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<super::delta::DeltaError> for Error {
+    fn from(e: super::delta::DeltaError) -> Self {
+        match e {
+            super::delta::DeltaError::Io { kind, ref message } => {
+                Error::Io(std::io::Error::new(kind, message.clone()))
+            }
+            other => Error::InvalidData(other.to_string()),
+        }
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match *self {
@@ -398,8 +409,7 @@ impl GroupCompressBlock {
         match read_item(&mut record)? {
             GroupCompressItem::Fulltext(data) => Ok(vec![data]),
             GroupCompressItem::Delta(delta) => {
-                let reconstructed =
-                    apply_delta(content, delta.as_slice()).map_err(Error::InvalidData)?;
+                let reconstructed = apply_delta(content, delta.as_slice())?;
                 Ok(vec![reconstructed])
             }
         }

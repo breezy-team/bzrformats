@@ -1,10 +1,144 @@
+//! Groupcompress delta wire format: base128 integers, copy/insert
+//! instructions, and whole-delta apply.
+//!
+//! This module implements the low-level bits of the groupcompress delta
+//! format shared by both the knit-derived [`super::line_delta`] path and
+//! the rabin-hash path in [`super::rabin_delta`]. Callers normally want
+//! the `read_*`/`write_*` pair that takes an `impl Read`/`impl Write` —
+//! the slice-based helpers ([`encode_base128_int`], [`decode_base128_int`],
+//! [`decode_copy_instruction`]) are ergonomic wrappers that allocate or
+//! build a `Cursor` under the hood.
+//!
+//! High-level whole-delta operations ([`apply_delta`],
+//! [`apply_delta_to_source`], [`decode_instruction`]) return structured
+//! [`DeltaError`] values so callers can discriminate truncated streams,
+//! out-of-range copies, and length mismatches without string matching.
+
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
 pub const MAX_INSERT_SIZE: usize = 0x7F;
 pub const MAX_COPY_SIZE: usize = 0x10000;
 
-#[deprecated]
+/// Errors returned by the groupcompress delta decoder / applier.
+///
+/// The variants distinguish I/O-shaped failures (truncated streams) from
+/// invariant violations (out-of-range copies, wrong command byte) so
+/// callers can tell "this is a short read" apart from "this is corrupt
+/// data".
+///
+/// `DeltaError` is `Clone + PartialEq + Eq` so it can participate in test
+/// assertions directly. The I/O path normalises `std::io::Error` into a
+/// `(ErrorKind, String)` pair for the same reason the knit module does
+/// it: corrupt streams produce textual diagnostics and carrying a live
+/// `io::Error` would poison the derive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaError {
+    /// The underlying reader (usually `&[u8]`) returned an `io::Error`,
+    /// most commonly `UnexpectedEof` from a truncated delta stream.
+    /// The original error is normalised into its `ErrorKind` and
+    /// display message so the variant stays value-typed.
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    /// A copy instruction addressed bytes past the end of its source.
+    CopyOutOfRange {
+        offset: usize,
+        length: usize,
+        source_len: usize,
+    },
+    /// The `0x00` command byte is reserved and not supported.
+    ReservedCommandZero,
+    /// The high bit (`0x80`) of a copy command was clear. Used by the
+    /// low-level [`read_copy_instruction`] path when the caller hands in
+    /// a byte that wasn't a copy instruction at all.
+    NotACopyCommand { cmd: u8 },
+    /// The trailing length self-check on an applied delta failed: the
+    /// header claimed `declared` output bytes but the applier produced
+    /// `actual`.
+    LengthMismatch { declared: usize, actual: usize },
+    /// [`apply_delta_to_source`] got an out-of-range `[delta_start,
+    /// delta_end)` slice of the source buffer.
+    InvalidDeltaRange {
+        start: usize,
+        end: usize,
+        source_len: usize,
+    },
+    /// An insert instruction claimed more bytes than the backing buffer
+    /// had left. Used by the slice-oriented [`decode_instruction`]; the
+    /// streaming [`read_instruction`] path surfaces this as
+    /// [`DeltaError::Io`] with `UnexpectedEof`.
+    InsertPastEnd {
+        pos: usize,
+        length: usize,
+        data_len: usize,
+    },
+}
+
+impl From<std::io::Error> for DeltaError {
+    fn from(e: std::io::Error) -> Self {
+        DeltaError::Io {
+            kind: e.kind(),
+            message: e.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for DeltaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeltaError::Io { message, .. } => write!(f, "{}", message),
+            DeltaError::CopyOutOfRange {
+                offset,
+                length,
+                source_len,
+            } => write!(
+                f,
+                "data would copy bytes past the end of source \
+                 (offset={}, length={}, source_len={})",
+                offset, length, source_len
+            ),
+            DeltaError::ReservedCommandZero => write!(f, "Command == 0 not supported yet"),
+            DeltaError::NotACopyCommand { cmd } => {
+                write!(
+                    f,
+                    "copy instructions must have bit 0x80 set (got {:#x})",
+                    cmd
+                )
+            }
+            DeltaError::LengthMismatch { declared, actual } => write!(
+                f,
+                "Delta claimed to be {} long, but ended up {} long",
+                declared, actual
+            ),
+            DeltaError::InvalidDeltaRange {
+                start,
+                end,
+                source_len,
+            } => write!(
+                f,
+                "invalid delta range [{}, {}) in source of length {}",
+                start, end, source_len
+            ),
+            DeltaError::InsertPastEnd {
+                pos,
+                length,
+                data_len,
+            } => write!(
+                f,
+                "Instruction length {} at position {} extends past end of data ({} bytes)",
+                length, pos, data_len
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeltaError {}
+
+/// Allocating convenience for [`write_base128_int`]: encode `val` into a
+/// fresh `Vec<u8>`. Prefer the `write_*` variant when you already have an
+/// `impl Write` sink to avoid the intermediate allocation.
 pub fn encode_base128_int(val: u128) -> Vec<u8> {
     let mut data = Vec::new();
     write_base128_int(&mut data, val).unwrap();
@@ -118,23 +252,27 @@ mod test_base128_int {
     }
 }
 
-#[deprecated]
+/// Slice-oriented counterpart to [`read_base128_int`]: returns
+/// `(value, consumed_bytes)`. Panics if `data` doesn't contain a complete
+/// base128 encoding — use the streaming variant directly if you need to
+/// tolerate truncation.
 pub fn decode_base128_int(data: &[u8]) -> (u128, usize) {
     let mut cursor = std::io::Cursor::new(data);
     let val = read_base128_int(&mut cursor).unwrap();
     (val, cursor.position() as usize)
 }
 
-#[deprecated]
+/// Slice-oriented counterpart to [`read_copy_instruction`]: decode a
+/// copy command that starts at `pos` in `data`, returning
+/// `(offset, length, new_pos)` where `new_pos` is the byte just after
+/// the instruction.
 pub fn decode_copy_instruction(
     data: &[u8],
     cmd: u8,
     pos: usize,
-) -> Result<(usize, usize, usize), String> {
+) -> Result<(usize, usize, usize), DeltaError> {
     let mut c = std::io::Cursor::new(&data[pos..]);
-
-    let (offset, length) = read_copy_instruction(&mut c, cmd).unwrap();
-
+    let (offset, length) = read_copy_instruction(&mut c, cmd)?;
     Ok((offset, length, pos + c.position() as usize))
 }
 
@@ -143,12 +281,9 @@ pub type CopyInstruction = (usize, usize);
 pub fn read_copy_instruction<R: Read>(
     reader: &mut R,
     cmd: u8,
-) -> Result<CopyInstruction, std::io::Error> {
+) -> Result<CopyInstruction, DeltaError> {
     if cmd & 0x80 != 0x80 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "copy instructions must have bit 0x80 set".to_string(),
-        ));
+        return Err(DeltaError::NotACopyCommand { cmd });
     }
     let mut offset = 0;
     let mut length = 0;
@@ -181,36 +316,41 @@ pub fn read_copy_instruction<R: Read>(
     Ok((offset, length))
 }
 
-pub fn apply_delta(basis: &[u8], mut delta: &[u8]) -> Result<Vec<u8>, String> {
-    let target_length = read_base128_int(&mut delta).map_err(|e| e.to_string())?;
+/// Apply a groupcompress delta to `basis`, returning the reconstructed
+/// target bytes.
+pub fn apply_delta(basis: &[u8], mut delta: &[u8]) -> Result<Vec<u8>, DeltaError> {
+    let target_length = read_base128_int(&mut delta)?;
     let mut lines = Vec::new();
 
     while !delta.is_empty() {
-        let cmd = delta.read_u8().map_err(|e| e.to_string())?;
+        let cmd = delta.read_u8()?;
 
         if cmd & 0x80 != 0 {
-            let (offset, length) =
-                read_copy_instruction(&mut delta, cmd).map_err(|e| e.to_string())?;
+            let (offset, length) = read_copy_instruction(&mut delta, cmd)?;
             let last = offset + length;
             if last > basis.len() {
-                return Err("data would copy bytes past the end of source".to_string());
+                return Err(DeltaError::CopyOutOfRange {
+                    offset,
+                    length,
+                    source_len: basis.len(),
+                });
             }
             lines.extend_from_slice(&basis[offset..last]);
         } else {
             if cmd == 0 {
-                return Err("Command == 0 not supported yet".to_string());
+                return Err(DeltaError::ReservedCommandZero);
             }
             lines.extend_from_slice(&delta[..cmd as usize]);
             delta = &delta[cmd as usize..];
         }
     }
 
-    if lines.len() != target_length as usize {
-        return Err(format!(
-            "Delta claimed to be {} long, but ended up {} long",
-            target_length,
-            lines.len()
-        ));
+    let target_len = target_length as usize;
+    if lines.len() != target_len {
+        return Err(DeltaError::LengthMismatch {
+            declared: target_len,
+            actual: lines.len(),
+        });
     }
 
     Ok(lines)
@@ -241,21 +381,21 @@ against other text
     }
 }
 
-#[deprecated]
+/// Apply a delta that lives at bytes `[delta_start, delta_end)` within
+/// `source`. Convenience wrapper around [`apply_delta`] that validates
+/// the range first.
 pub fn apply_delta_to_source(
     source: &[u8],
     delta_start: usize,
     delta_end: usize,
-) -> Result<Vec<u8>, String> {
-    let source_size = source.len();
-    if delta_start >= source_size {
-        return Err("delta starts after source".to_string());
-    }
-    if delta_end > source_size {
-        return Err("delta ends after source".to_string());
-    }
-    if delta_start >= delta_end {
-        return Err("delta starts after it ends".to_string());
+) -> Result<Vec<u8>, DeltaError> {
+    let source_len = source.len();
+    if delta_start >= source_len || delta_end > source_len || delta_start >= delta_end {
+        return Err(DeltaError::InvalidDeltaRange {
+            start: delta_start,
+            end: delta_end,
+            source_len,
+        });
     }
     let delta_bytes = &source[delta_start..delta_end];
     apply_delta(source, delta_bytes)
@@ -334,16 +474,13 @@ pub fn write_instruction<W: Write, T: std::borrow::Borrow<[u8]>>(
     }
 }
 
-pub fn read_instruction<R: Read>(mut reader: R) -> Result<Instruction<Vec<u8>>, std::io::Error> {
+pub fn read_instruction<R: Read>(mut reader: R) -> Result<Instruction<Vec<u8>>, DeltaError> {
     let cmd = reader.read_u8()?;
     if cmd & 0x80 != 0 {
         let (offset, length) = read_copy_instruction(&mut reader, cmd)?;
         Ok(Instruction::Copy { offset, length })
     } else if cmd == 0 {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Command == 0 not supported yet",
-        ))
+        Err(DeltaError::ReservedCommandZero)
     } else {
         let length = cmd as usize;
         let mut data = vec![0; length];
@@ -353,21 +490,27 @@ pub fn read_instruction<R: Read>(mut reader: R) -> Result<Instruction<Vec<u8>>, 
 }
 
 /// Decode a copy instruction from the given data, starting at the given position.
-pub fn decode_instruction(data: &[u8], pos: usize) -> Result<(Instruction<&[u8]>, usize), String> {
+/// Decode a single delta instruction from `data` starting at `pos`,
+/// returning the instruction and the new cursor position.
+pub fn decode_instruction(
+    data: &[u8],
+    pos: usize,
+) -> Result<(Instruction<&[u8]>, usize), DeltaError> {
     let cmd = data[pos];
     if cmd & 0x80 != 0 {
         let mut c = std::io::Cursor::new(&data[pos + 1..]);
-        let (offset, length) = read_copy_instruction(&mut c, cmd).map_err(|e| e.to_string())?;
+        let (offset, length) = read_copy_instruction(&mut c, cmd)?;
         let newpos = pos + 1 + c.position() as usize;
         Ok((Instruction::Copy { offset, length }, newpos))
     } else {
         let length = cmd as usize;
         let newpos = pos + 1 + length;
         if newpos > data.len() {
-            return Err(format!(
-                "Instruction length {} at position {} extends past end of data",
-                length, pos
-            ));
+            return Err(DeltaError::InsertPastEnd {
+                pos,
+                length,
+                data_len: data.len(),
+            });
         }
         Ok((Instruction::Insert(&data[pos + 1..newpos]), newpos))
     }
