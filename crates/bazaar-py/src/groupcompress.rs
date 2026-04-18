@@ -179,7 +179,7 @@ impl LinesDeltaIndex {
     }
 }
 
-#[pyclass(unsendable)]
+#[pyclass]
 struct GroupCompressBlock {
     inner: bazaar::groupcompress::block::GroupCompressBlock,
     /// Cached PyBytes for `_z_content`. Matches Python's semantics where
@@ -1543,7 +1543,7 @@ impl LazyGroupContentManager {
 /// the next slot, then on the *following* call it sets that factory's manager
 /// reference to `None` to break the back-pointer (matching the Python
 /// original's `factory._manager = None` after `yield factory`).
-#[pyclass(unsendable)]
+#[pyclass]
 struct RecordStreamIter {
     manager: Option<Py<LazyGroupContentManager>>,
     index: usize,
@@ -1587,7 +1587,6 @@ impl RecordStreamIter {
 /// method can extract bytes lazily; the back-reference can be cleared from
 /// Python (mirroring `factory._manager = None`).
 #[pyclass(
-    unsendable,
     name = "LazyGroupCompressFactory",
     module = "bzrformats._bzr_rs.groupcompress"
 )]
@@ -1888,7 +1887,6 @@ fn unavailable_representation(
 /// is always `None` and `method` is always `"group"`, so `__getitem__` exposes
 /// the 4-tuple `(index_memo, None, parents, ("group", None))`.
 #[pyclass(
-    unsendable,
     name = "GCBuildDetails",
     module = "bzrformats._bzr_rs.groupcompress"
 )]

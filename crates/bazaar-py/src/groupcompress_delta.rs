@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::convert::TryInto;
 
-#[pyclass(unsendable)]
+#[pyclass]
 pub struct DeltaIndex {
     inner: OwningDeltaIndex,
 }
