@@ -118,6 +118,23 @@ pub fn read_item<R: Read>(r: &mut R) -> Result<GroupCompressItem, Error> {
     }
 }
 
+/// Concrete streaming decompressor for a [`GroupCompressBlock`]. Using an
+/// enum (rather than `Box<dyn Read>`) keeps the owning struct `Send + Sync`
+/// so it can live inside a pyo3 `#[pyclass]` without the `unsendable` marker.
+enum Decompressor {
+    Lzma(xz2::read::XzDecoder<osutils::chunkreader::ChunksReader<Vec<u8>>>),
+    Zlib(flate2::read::ZlibDecoder<osutils::chunkreader::ChunksReader<Vec<u8>>>),
+}
+
+impl std::io::Read for Decompressor {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Decompressor::Lzma(d) => d.read(buf),
+            Decompressor::Zlib(d) => d.read(buf),
+        }
+    }
+}
+
 /// An object which maintains the internal structure of the compressed data.
 ///
 /// This tracks the meta info (start of text, length, type, etc.)
@@ -127,7 +144,7 @@ pub struct GroupCompressBlock {
     /// The compressed content
     z_content_chunks: Option<Vec<Vec<u8>>>,
     /// The decompressor object
-    z_content_decompressor: Option<Box<dyn std::io::Read>>,
+    z_content_decompressor: Option<Decompressor>,
     /// The length of the compressed content
     z_content_length: Option<usize>,
     /// The length of the uncompressed content
@@ -262,12 +279,8 @@ impl GroupCompressBlock {
                     self.z_content_chunks.clone().unwrap().into_iter(),
                 ));
                 self.z_content_decompressor = Some(match self.compressor.unwrap() {
-                    CompressorKind::Lzma => {
-                        Box::new(xz2::read::XzDecoder::new(c)) as Box<dyn std::io::Read>
-                    }
-                    CompressorKind::Zlib => {
-                        Box::new(flate2::read::ZlibDecoder::new(c)) as Box<dyn std::io::Read>
-                    }
+                    CompressorKind::Lzma => Decompressor::Lzma(xz2::read::XzDecoder::new(c)),
+                    CompressorKind::Zlib => Decompressor::Zlib(flate2::read::ZlibDecoder::new(c)),
                 });
                 self.content = Some(Vec::new());
             }
