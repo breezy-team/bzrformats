@@ -2808,8 +2808,9 @@ impl DirState {
             for entry in &dirblock.entries {
                 if dirblock.dirname != entry.key.dirname {
                     return Err(ValidateError(format!(
-                        "entry key dirname {:?} doesn't match block {:?}",
-                        entry.key.dirname, dirblock.dirname
+                        "entry key dirname {} doesn't match block directory name {}",
+                        String::from_utf8_lossy(&entry.key.dirname),
+                        String::from_utf8_lossy(&dirblock.dirname)
                     )));
                 }
             }
@@ -2860,16 +2861,17 @@ impl DirState {
                     if minikind == b'a' {
                         if previous_path.is_some() {
                             return Err(ValidateError(format!(
-                                "file {:?} absent but previously present",
-                                file_id
+                                "file {} absent but previously present",
+                                String::from_utf8_lossy(file_id)
                             )));
                         }
                     } else if minikind == b'r' {
                         let target = tree_state.fingerprint.clone();
                         if previous_path.as_deref() != Some(target.as_slice()) {
                             return Err(ValidateError(format!(
-                                "relocation {:?} inconsistent with previous {:?}",
-                                file_id, previous_path
+                                "relocation {} inconsistent with previous {:?}",
+                                String::from_utf8_lossy(file_id),
+                                previous_path.as_deref().map(String::from_utf8_lossy)
                             )));
                         }
                     } else {
