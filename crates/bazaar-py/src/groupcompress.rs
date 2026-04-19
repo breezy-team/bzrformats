@@ -1611,6 +1611,23 @@ impl LazyGroupCompressFactory {
             .ok_or_else(|| PyValueError::new_err("factory index out of range"))?;
         f(state)
     }
+
+    fn with_state_mut<R, F>(&self, py: Python<'_>, f: F) -> PyResult<R>
+    where
+        F: FnOnce(&mut FactoryState) -> PyResult<R>,
+    {
+        let manager_py = self
+            .manager
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("factory has no manager"))?;
+        let mut manager = manager_py.borrow_mut(py);
+        let index = self.index;
+        let state = manager
+            .factories
+            .get_mut(index)
+            .ok_or_else(|| PyValueError::new_err("factory index out of range"))?;
+        f(state)
+    }
 }
 
 #[pymethods]
@@ -1632,6 +1649,14 @@ impl LazyGroupCompressFactory {
                 .as_ref()
                 .map(|p| p.clone_ref(py))
                 .unwrap_or_else(|| py.None()))
+        })
+    }
+
+    #[setter]
+    fn set_parents(&mut self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        self.with_state_mut(py, |s| {
+            s.parents = if value.is_none(py) { None } else { Some(value) };
+            Ok(())
         })
     }
 
