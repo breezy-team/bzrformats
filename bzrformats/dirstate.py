@@ -637,9 +637,11 @@ class DirState:
         if isinstance(path, bytes):
             path = path.decode("utf-8")
         self._rs.add_path(path, file_id, kind, stat, fingerprint)
-        # Rust side updated its id_index; invalidate the Python mirror
-        # so the next access rebuilds from authoritative state.
-        self._id_index = None
+        # Rust side updated its id_index; refill the Python mirror in
+        # place so callers that cached a reference to the IdIndex (via
+        # _get_id_index) see the new entry.
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _bisect(self, paths):
         """Bisect through the disk structure for specific rows.

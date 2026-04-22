@@ -2336,7 +2336,7 @@ impl PyDirState {
         file_id: &[u8],
         kind: osutils::Kind,
         stat: Option<&Bound<PyAny>>,
-        fingerprint: &[u8],
+        fingerprint: Option<&[u8]>,
     ) -> PyResult<()> {
         let stat_info: Option<bazaar::dirstate::StatInfo> = match stat {
             None => None,
@@ -2352,7 +2352,7 @@ impl PyDirState {
         };
         match self
             .inner
-            .add_path(path, file_id, kind, stat_info, fingerprint)
+            .add_path(path, file_id, kind, stat_info, fingerprint.unwrap_or(b""))
         {
             Ok(()) => Ok(()),
             Err(e) => Err(add_error_to_py(py, e)),
