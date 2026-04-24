@@ -33,10 +33,10 @@ mod id_index;
 pub use id_index::{inv_entry_to_details, IdIndex};
 
 mod iter_changes;
+use iter_changes::IterPhase;
 pub use iter_changes::{
     DirstateChange, IterChangesIter, ProcessEntryError, ProcessEntryState, ProcessPathInfo,
 };
-use iter_changes::IterPhase;
 
 fn null_parent_details() -> TreeData {
     TreeData {
@@ -185,11 +185,11 @@ fn compute_path_info(
     pstate: &ProcessEntryState,
     transport: &dyn Transport,
     path_utf8: &[u8],
-) -> Option<ProcessPathInfo> {
+) -> Result<Option<ProcessPathInfo>, ProcessEntryError> {
     let abspath = join_path(&pstate.root_abspath, path_utf8);
     let stat = match transport.lstat(&abspath) {
         Ok(s) => s,
-        Err(_) => return None,
+        Err(_) => return Ok(None),
     };
     let mut kind = if stat.is_file() {
         Some(osutils::Kind::File)
@@ -200,17 +200,28 @@ fn compute_path_info(
     } else {
         None
     };
+    // The tree root itself is never a tree-reference (mirrors Python's
+    // `_directory_may_be_tree_reference`: `return relpath and ...`).
     if kind == Some(osutils::Kind::Directory)
         && pstate.supports_tree_reference
-        && transport.is_tree_reference_dir(&abspath).unwrap_or(false)
+        && !path_utf8.is_empty()
     {
-        kind = Some(osutils::Kind::TreeReference);
+        let is_ref = transport.is_tree_reference_dir(&abspath).map_err(|e| {
+            ProcessEntryError::Internal(format!(
+                "is_tree_reference_dir({}): {}",
+                String::from_utf8_lossy(&abspath),
+                e
+            ))
+        })?;
+        if is_ref {
+            kind = Some(osutils::Kind::TreeReference);
+        }
     }
-    Some(ProcessPathInfo {
+    Ok(Some(ProcessPathInfo {
         abspath,
         kind,
         stat,
-    })
+    }))
 }
 
 /// Update `seen_ids` + `search_specific_file_parents` from a
@@ -273,7 +284,6 @@ pub use transport::{DirEntryInfo, StatInfo, Transport, TransportError};
 /// synchronisation primitive.
 mod walker;
 pub use walker::{WalkDirsUtf8, WalkedDir};
-
 
 mod parser;
 pub use parser::{dirblocks_to_entry_lines, entry_to_line, parse_dirblocks, DirblocksError};
@@ -1151,30 +1161,43 @@ impl DirState {
                             )))
                         }
                     };
-                    let root_path_info = root_stat.map(|stat| {
-                        let mut kind = if stat.is_file() {
-                            Some(osutils::Kind::File)
-                        } else if stat.is_dir() {
-                            Some(osutils::Kind::Directory)
-                        } else if stat.is_symlink() {
-                            Some(osutils::Kind::Symlink)
-                        } else {
-                            None
-                        };
-                        if kind == Some(osutils::Kind::Directory)
-                            && pstate.supports_tree_reference
-                            && transport
-                                .is_tree_reference_dir(&root_abspath)
-                                .unwrap_or(false)
-                        {
-                            kind = Some(osutils::Kind::TreeReference);
+                    let root_path_info = match root_stat {
+                        None => None,
+                        Some(stat) => {
+                            let mut kind = if stat.is_file() {
+                                Some(osutils::Kind::File)
+                            } else if stat.is_dir() {
+                                Some(osutils::Kind::Directory)
+                            } else if stat.is_symlink() {
+                                Some(osutils::Kind::Symlink)
+                            } else {
+                                None
+                            };
+                            // The tree root itself is never a tree-reference.
+                            if kind == Some(osutils::Kind::Directory)
+                                && pstate.supports_tree_reference
+                                && !current_root.is_empty()
+                            {
+                                let is_ref = transport
+                                    .is_tree_reference_dir(&root_abspath)
+                                    .map_err(|e| {
+                                        ProcessEntryError::Internal(format!(
+                                            "is_tree_reference_dir({}): {}",
+                                            String::from_utf8_lossy(&root_abspath),
+                                            e
+                                        ))
+                                    })?;
+                                if is_ref {
+                                    kind = Some(osutils::Kind::TreeReference);
+                                }
+                            }
+                            Some(ProcessPathInfo {
+                                abspath: root_abspath.clone(),
+                                kind,
+                                stat,
+                            })
                         }
-                        ProcessPathInfo {
-                            abspath: root_abspath.clone(),
-                            kind,
-                            stat,
-                        }
-                    });
+                    };
 
                     let root_entries_owned: Vec<(EntryKey, Vec<TreeData>)> = self
                         .entries_for_path(&current_root)
@@ -1232,11 +1255,17 @@ impl DirState {
                         }
                     }
 
-                    // Stop here if the root is a tree-reference or
-                    // absent on disk — we don't descend into it.
+                    // Stop here if the root isn't a plain directory we
+                    // can descend into. Mirrors Python, which catches
+                    // `ENOENT/ENOTDIR/EINVAL` from the first
+                    // `_walkdirs_utf8` step and treats the walk as
+                    // empty: that covers a missing path, a path that
+                    // turned out to be a tree-reference, and a
+                    // specific-file root that points at a regular file
+                    // or symlink.
                     let skip_walk = root_path_info
                         .as_ref()
-                        .map(|p| p.kind == Some(osutils::Kind::TreeReference))
+                        .map(|p| p.kind != Some(osutils::Kind::Directory))
                         .unwrap_or(true);
                     if skip_walk {
                         iter.phase = IterPhase::PickRoot;
@@ -1298,6 +1327,7 @@ impl DirState {
             let walker = iter.walker.as_mut().expect("walker initialised");
             let mut captured: Option<(Vec<u8>, Vec<u8>, Vec<DirEntryInfo>)> = None;
             let supports_ref = pstate.supports_tree_reference;
+            let mut tref_err: Option<(Vec<u8>, TransportError)> = None;
             let progressed = walker
                 .next_dir(transport, |rel, abs, entries| {
                     if rel.is_empty() {
@@ -1305,16 +1335,30 @@ impl DirState {
                     }
                     if supports_ref {
                         for e in entries.iter_mut() {
-                            if e.kind == Some(osutils::Kind::Directory)
-                                && transport.is_tree_reference_dir(&e.abspath).unwrap_or(false)
-                            {
-                                e.kind = Some(osutils::Kind::TreeReference);
+                            if e.kind != Some(osutils::Kind::Directory) {
+                                continue;
+                            }
+                            match transport.is_tree_reference_dir(&e.abspath) {
+                                Ok(true) => e.kind = Some(osutils::Kind::TreeReference),
+                                Ok(false) => {}
+                                Err(err) => {
+                                    if tref_err.is_none() {
+                                        tref_err = Some((e.abspath.clone(), err));
+                                    }
+                                }
                             }
                         }
                     }
                     captured = Some((rel.to_vec(), abs.to_vec(), entries.clone()));
                 })
                 .map_err(|e| ProcessEntryError::Internal(format!("walkdirs: {}", e)))?;
+            if let Some((path, err)) = tref_err {
+                return Err(ProcessEntryError::Internal(format!(
+                    "is_tree_reference_dir({}): {}",
+                    String::from_utf8_lossy(&path),
+                    err
+                )));
+            }
             iter.staged_walker_block = if progressed { captured } else { None };
         }
 
@@ -1661,7 +1705,7 @@ impl DirState {
                 path_utf8
             )));
         }
-        let path_info = compute_path_info(pstate, transport, &path_utf8);
+        let path_info = compute_path_info(pstate, transport, &path_utf8)?;
         for (ek, trees) in &selected {
             if pstate.seen_ids.contains(&ek.file_id) {
                 continue;
@@ -5325,12 +5369,11 @@ use bisect::{bisect_bytes, cmp_by_dirs_bytes, BisectMode};
 // ``BisectMode`` / ``cmp_by_dirs_bytes`` picks them up through the
 // module-local ``use`` above.
 
-
 mod errors;
 pub use errors::{
-    AddError, BasisAdd, BasisApplyError, EnsureBlockError, EntriesToStateError, FlatBasisDeltaEntry,
-    FlatDeltaEntry, MakeAbsentError, SetPathIdError, SplitRootError, UpdateEntryError,
-    ValidateError,
+    AddError, BasisAdd, BasisApplyError, EnsureBlockError, EntriesToStateError,
+    FlatBasisDeltaEntry, FlatDeltaEntry, MakeAbsentError, SetPathIdError, SplitRootError,
+    UpdateEntryError, ValidateError,
 };
 
 /// Seconds-since-epoch from a [`Metadata::modified`] reading.  Returns
@@ -5380,7 +5423,6 @@ fn metadata_ctime_secs(m: &Metadata) -> i64 {
             .unwrap_or(0)
     }
 }
-
 
 /// Pure-function version of [`DirState::split_root_dirblock_into_contents`].
 /// Exposed so callers that are still building a `Vec<Dirblock>` outside of
@@ -5592,7 +5634,6 @@ pub fn split_root_dirblock_into_contents(dirblocks: &mut [Dirblock]) -> Result<(
     dirblocks[1].entries = contents_of_root;
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests;
