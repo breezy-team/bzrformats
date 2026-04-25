@@ -901,7 +901,15 @@ class DirState:
         breezy.filters.FilteredStat) that only carries st_mode /
         st_size / st_mtime / st_ctime — fall back to zero for the
         device/inode fields in that case.
+
+        Callers may pass an unversioned-path entry (``(None, None)``);
+        in that case there is no row to update and we silently do
+        nothing, matching Python ``DirState._observed_sha1``'s no-op
+        behaviour for those paths (its cutoff_time guard skips fresh
+        files before it would dereference ``entry[1][0]``).
         """
+        if entry[0] is None:
+            return
         new_tree0 = self._rs.observed_sha1(
             entry[0],
             sha1,
