@@ -18,7 +18,7 @@ fancy-regex = ">=0.7"
 chrono = { workspace = true }
 bendy = "0.6"
 xmltree = "0.12"
-sha1 = "0.10"
+sha1 = "0.11"
 tempfile = "3"
 log = "0.4"
 pyo3 = { version = ">=0.26, <0.29", optional = true }
