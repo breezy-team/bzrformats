@@ -1191,7 +1191,14 @@ class DirState:
 
     def _read_header(self):
         """Read the metadata header and parent ids from the state file."""
-        self._rs.read_header_from_file(self._state_file)
+        try:
+            self._rs.read_header_from_file(self._state_file)
+        except ValueError as e:
+            # The Rust binding raises ValueError for any malformed
+            # header line; translate to the dirstate-specific
+            # corruption exception so callers can catch a single
+            # class for "the dirstate is unreadable".
+            raise DirstateCorrupt(self, str(e)) from e
 
     def _read_header_if_needed(self):
         """Read the header of the dirstate file if needed."""

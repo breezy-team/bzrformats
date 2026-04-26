@@ -182,18 +182,6 @@ class KnitHeaderError(BzrFormatsError):
         self.badline = badline
 
 
-class DirstateCorrupt(BzrFormatsError):
-    """The dirstate file appears to be corrupt."""
-
-    _fmt = "The dirstate file (%(state)s) appears to be corrupt: %(msg)s"
-
-    def __init__(self, state, msg):
-        """Initialize with the state file path and corruption message."""
-        super().__init__()
-        self.state = state
-        self.msg = msg
-
-
 # Index errors
 class BadIndexFormatSignature(BzrFormatsError):
     """Value is not an index of the expected type."""
