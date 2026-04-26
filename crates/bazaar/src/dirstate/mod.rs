@@ -843,9 +843,17 @@ impl DirState {
             }
 
             let (content_change, target_kind, target_exec) = if let Some(info) = path_info {
-                // Python defaults to `"file"` when the walker didn't
-                // supply a kind; preserve that (`None` → File).
-                let target_kind = info.kind.unwrap_or(osutils::Kind::File);
+                // Walker reports `kind = None` for fifo / socket /
+                // block / char device — kinds dirstate can't track
+                // and that we must not try to sha1 (opening a fifo
+                // for reading blocks).  Surface
+                // `BadFileKindError` to callers; mirrors how the
+                // original Python dirstate fails out via
+                // `entry_factory[kind]` lookup.
+                let target_kind = info.kind.ok_or_else(|| ProcessEntryError::BadFileKind {
+                    path: info.abspath.clone(),
+                    mode: info.stat.mode,
+                })?;
                 match target_kind {
                     osutils::Kind::Directory => {
                         if path.is_none() {

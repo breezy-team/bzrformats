@@ -380,6 +380,39 @@ fn kind_from_mode(mode: u32) -> Option<osutils::Kind> {
     }
 }
 
+/// Spell out the kind name for an `st_mode`, matching breezy's
+/// `_readdir_py._formats` mapping.  Used to format
+/// `BadFileKindError` payloads for kinds the dirstate can't track.
+fn kind_name_from_mode(mode: u32) -> &'static str {
+    match mode & 0o170000 {
+        0o010000 => "fifo",
+        0o020000 => "chardev",
+        0o040000 => "directory",
+        0o060000 => "block",
+        0o100000 => "file",
+        0o120000 => "symlink",
+        0o140000 => "socket",
+        _ => "unknown",
+    }
+}
+
+/// Build a `bzrformats.errors.BadFileKindError` for `path` (utf-8
+/// bytes) and the raw stat mode.  Surfaces the kinds the walker
+/// cannot represent (fifo, socket, …) without coupling the pure
+/// crate to the Python error class.
+fn bad_file_kind_error(py: Python<'_>, path: &[u8], mode: u32) -> PyErr {
+    let path_str = String::from_utf8_lossy(path).into_owned();
+    let kind = kind_name_from_mode(mode);
+    match py
+        .import("bzrformats.errors")
+        .and_then(|m| m.getattr("BadFileKindError"))
+        .and_then(|cls| cls.call1((path_str.clone(), kind)))
+    {
+        Ok(exc) => PyErr::from_value(exc),
+        Err(e) => e,
+    }
+}
+
 /// Build a `read_range(offset, len)` closure that seeks + reads on a
 /// Python file-like object.  Used by the bisect entrypoints — the
 /// pure-Rust bisect only needs random byte access, not the full
@@ -1654,6 +1687,9 @@ impl PyDirState {
                     let ds_mod = py.import("bzrformats.dirstate").unwrap();
                     let cls = ds_mod.getattr("DirstateCorrupt").unwrap();
                     PyErr::from_value(cls.call1(("<unknown>", msg)).unwrap())
+                }
+                bazaar::dirstate::ProcessEntryError::BadFileKind { path, mode } => {
+                    bad_file_kind_error(py, &path, mode)
                 }
                 bazaar::dirstate::ProcessEntryError::Internal(msg) => {
                     pyo3::exceptions::PyAssertionError::new_err(msg)
@@ -3013,6 +3049,9 @@ impl IterChanges {
                 let ds_mod = py.import("bzrformats.dirstate")?;
                 let cls = ds_mod.getattr("DirstateCorrupt")?;
                 Err(PyErr::from_value(cls.call1(("<unknown>", msg))?))
+            }
+            Err(bazaar::dirstate::ProcessEntryError::BadFileKind { path, mode }) => {
+                Err(bad_file_kind_error(py, &path, mode))
             }
             Err(bazaar::dirstate::ProcessEntryError::Internal(msg)) => {
                 Err(pyo3::exceptions::PyAssertionError::new_err(msg))
