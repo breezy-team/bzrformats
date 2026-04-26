@@ -1255,35 +1255,51 @@ impl DirState {
                         }
                     }
 
-                    // Stop here if the root isn't a plain directory we
-                    // can descend into. Mirrors Python, which catches
+                    // Decide whether to seed the on-disk walker.  We
+                    // only walk the filesystem when the root exists on
+                    // disk and is a plain directory; tree-references,
+                    // regular files, symlinks, and missing paths all
+                    // skip the walker.  Mirrors Python's catching of
                     // `ENOENT/ENOTDIR/EINVAL` from the first
-                    // `_walkdirs_utf8` step and treats the walk as
-                    // empty: that covers a missing path, a path that
-                    // turned out to be a tree-reference, and a
-                    // specific-file root that points at a regular file
-                    // or symlink.
-                    let skip_walk = root_path_info
+                    // `_walkdirs_utf8` step.
+                    //
+                    // The dirblock side of the walk still runs even if
+                    // the disk side is absent: a deleted directory
+                    // whose children remain in the source dirblocks
+                    // (e.g. ``specific_files=["b"]`` when ``b`` and
+                    // ``b/c`` were both removed) needs them reported.
+                    let walk_disk = root_path_info
                         .as_ref()
-                        .map(|p| p.kind != Some(osutils::Kind::Directory))
-                        .unwrap_or(true);
-                    if skip_walk {
-                        iter.phase = IterPhase::PickRoot;
-                        continue;
-                    }
-
-                    // Seed the subtree walker.
-                    iter.walker = Some(WalkDirsUtf8::new(&root_abspath, &current_root));
+                        .map(|p| p.kind == Some(osutils::Kind::Directory))
+                        .unwrap_or(false);
                     let initial_key = EntryKey {
                         dirname: current_root.clone(),
                         basename: Vec::new(),
                         file_id: Vec::new(),
                     };
-                    let (mut bi, _) = find_block_index_from_key(&self.dirblocks, &initial_key);
-                    if bi == 0 {
-                        bi = 1;
+                    let (mut bi_check, _) =
+                        find_block_index_from_key(&self.dirblocks, &initial_key);
+                    if bi_check == 0 {
+                        bi_check = 1;
                     }
-                    iter.block_index = bi;
+                    let has_dirblocks = self
+                        .dirblocks
+                        .get(bi_check)
+                        .map(|b| is_inside(&current_root, &b.dirname))
+                        .unwrap_or(false);
+                    if !walk_disk && !has_dirblocks {
+                        iter.phase = IterPhase::PickRoot;
+                        continue;
+                    }
+
+                    // Seed the subtree walker (disk-side only when
+                    // the root actually exists as a directory).
+                    iter.walker = if walk_disk {
+                        Some(WalkDirsUtf8::new(&root_abspath, &current_root))
+                    } else {
+                        None
+                    };
+                    iter.block_index = bi_check;
                     iter.staged_walker_block = None;
                     iter.merge_entry_index = 0;
                     iter.merge_path_index = 0;
@@ -1322,8 +1338,12 @@ impl DirState {
             .0
             .clone();
 
-        // Pull the next walker block if we haven't cached one.
-        if iter.staged_walker_block.is_none() {
+        // Pull the next walker block if we haven't cached one. The
+        // walker is only seeded when the root exists on disk; for a
+        // pure dirblock-only walk (e.g. a deleted specific-file dir
+        // whose source-side children still need reporting) `walker`
+        // is `None` and `staged_walker_block` stays `None`.
+        if iter.staged_walker_block.is_none() && iter.walker.is_some() {
             let walker = iter.walker.as_mut().expect("walker initialised");
             let mut captured: Option<(Vec<u8>, Vec<u8>, Vec<DirEntryInfo>)> = None;
             let supports_ref = pstate.supports_tree_reference;
