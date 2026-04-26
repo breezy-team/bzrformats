@@ -2556,7 +2556,7 @@ impl DirState {
         // preserve the (tautological) behaviour so this port is strictly
         // observation-preserving.
         // `parent_block_index` twice is intentional — see comment above.
-        #[allow(clippy::nonminimal_bool)]
+        #[allow(clippy::nonminimal_bool, clippy::eq_op)]
         let sentinel_shortcut =
             parent_block_index == -1 && parent_block_index == -1 && dirname.is_empty();
         if !sentinel_shortcut {
