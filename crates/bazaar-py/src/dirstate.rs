@@ -1125,26 +1125,17 @@ impl PyDirState {
     }
 
     /// On-disk filename the dirstate points at. Read-only; matches
-    /// Python's `DirState._filename` attribute.
+    /// Python's `DirState._filename` attribute, which is the ``str``
+    /// path returned by ``Transport.local_abspath`` (always str, on
+    /// every platform).
     #[getter]
-    fn filename<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        // Python stores `_filename` as bytes on POSIX and as str on
-        // Windows; we always return bytes for now, matching the
-        // POSIX-only branch that dirstate tests exercise.
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            Ok(PyBytes::new(py, self.inner.filename.as_os_str().as_bytes()))
-        }
-        #[cfg(not(unix))]
-        {
-            let s = self
-                .inner
-                .filename
-                .to_str()
-                .ok_or_else(|| PyTypeError::new_err("dirstate filename is not valid utf-8"))?;
-            Ok(PyBytes::new(py, s.as_bytes()))
-        }
+    fn filename<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyString>> {
+        let s = self
+            .inner
+            .filename
+            .to_str()
+            .ok_or_else(|| PyTypeError::new_err("dirstate filename is not valid utf-8"))?;
+        Ok(pyo3::types::PyString::new(py, s))
     }
 
     /// Header state flag matching Python's `_header_state` attribute.
