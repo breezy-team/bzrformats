@@ -186,12 +186,17 @@ class InventorySerializer_v8(XMLInventorySerializer):
         else:
             revid1 = b""
         append(b'<inventory format="%s"%s>\n' % (self.format_num, revid1))
+        # Default an unset root revision to the inventory's revision
+        # rather than failing in encode_and_escape — callers (e.g.
+        # update_basis_by_delta) hand us inventories whose root entry
+        # was reconstructed from a delta whose tree_data slot was empty.
+        root_revision = inv.root.revision or inv.revision_id
         append(
             b'<directory file_id="%s" name="%s" revision="%s" />\n'
             % (
                 encode_and_escape(inv.root.file_id),
                 encode_and_escape(inv.root.name),
-                encode_and_escape(inv.root.revision),
+                encode_and_escape(root_revision),
             )
         )
 
