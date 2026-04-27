@@ -179,7 +179,7 @@ impl LinesDeltaIndex {
     }
 }
 
-#[pyclass(unsendable)]
+#[pyclass]
 struct GroupCompressBlock {
     inner: bazaar::groupcompress::block::GroupCompressBlock,
     /// Cached PyBytes for `_z_content`. Matches Python's semantics where
@@ -1543,7 +1543,7 @@ impl LazyGroupContentManager {
 /// the next slot, then on the *following* call it sets that factory's manager
 /// reference to `None` to break the back-pointer (matching the Python
 /// original's `factory._manager = None` after `yield factory`).
-#[pyclass(unsendable)]
+#[pyclass]
 struct RecordStreamIter {
     manager: Option<Py<LazyGroupContentManager>>,
     index: usize,
@@ -1587,7 +1587,6 @@ impl RecordStreamIter {
 /// method can extract bytes lazily; the back-reference can be cleared from
 /// Python (mirroring `factory._manager = None`).
 #[pyclass(
-    unsendable,
     name = "LazyGroupCompressFactory",
     module = "bzrformats._bzr_rs.groupcompress"
 )]
@@ -1612,6 +1611,23 @@ impl LazyGroupCompressFactory {
             .ok_or_else(|| PyValueError::new_err("factory index out of range"))?;
         f(state)
     }
+
+    fn with_state_mut<R, F>(&self, py: Python<'_>, f: F) -> PyResult<R>
+    where
+        F: FnOnce(&mut FactoryState) -> PyResult<R>,
+    {
+        let manager_py = self
+            .manager
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("factory has no manager"))?;
+        let mut manager = manager_py.borrow_mut(py);
+        let index = self.index;
+        let state = manager
+            .factories
+            .get_mut(index)
+            .ok_or_else(|| PyValueError::new_err("factory index out of range"))?;
+        f(state)
+    }
 }
 
 #[pymethods]
@@ -1633,6 +1649,14 @@ impl LazyGroupCompressFactory {
                 .as_ref()
                 .map(|p| p.clone_ref(py))
                 .unwrap_or_else(|| py.None()))
+        })
+    }
+
+    #[setter]
+    fn set_parents(&mut self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        self.with_state_mut(py, |s| {
+            s.parents = if value.is_none(py) { None } else { Some(value) };
+            Ok(())
         })
     }
 
@@ -1888,7 +1912,6 @@ fn unavailable_representation(
 /// is always `None` and `method` is always `"group"`, so `__getitem__` exposes
 /// the 4-tuple `(index_memo, None, parents, ("group", None))`.
 #[pyclass(
-    unsendable,
     name = "GCBuildDetails",
     module = "bzrformats._bzr_rs.groupcompress"
 )]

@@ -124,7 +124,7 @@ fn format_record(record: &GcChkSha1Record) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Parse the leaf nodes of a BTree index.
-#[pyclass(unsendable)]
+#[pyclass]
 struct BTreeLeafParser {
     data: Py<PyBytes>,
     key_length: usize,
@@ -283,7 +283,7 @@ fn _parse_leaf_lines(
 ///
 /// This is a performance-critical class that uses binary search with a
 /// precomputed offset table for fast lookups of sha1-keyed records.
-#[pyclass(unsendable)]
+#[pyclass]
 struct GCCHKSHA1LeafNode {
     records: Vec<GcChkSha1Record>,
     last_key: Option<Py<PyAny>>,

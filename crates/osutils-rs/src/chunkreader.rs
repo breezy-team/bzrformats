@@ -2,13 +2,13 @@ use std::borrow::Borrow;
 use std::io::Read;
 
 pub struct ChunksReader<T: Borrow<[u8]>> {
-    chunks: Box<dyn Iterator<Item = T>>,
+    chunks: Box<dyn Iterator<Item = T> + Send + Sync>,
     current_chunk: Option<T>,
     position: usize,
 }
 
 impl<T: Borrow<[u8]>> ChunksReader<T> {
-    pub fn new(chunks: Box<dyn Iterator<Item = T>>) -> Self {
+    pub fn new(chunks: Box<dyn Iterator<Item = T> + Send + Sync>) -> Self {
         ChunksReader {
             chunks,
             position: 0,

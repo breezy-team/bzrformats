@@ -1042,6 +1042,15 @@ class CHKInventory:
             siblings[basename] = ie
         self._fully_cached = True
 
+    def _make_delta(self, old):
+        """Produce an InventoryDelta describing the changes from `old` to self.
+
+        Accepts `CHKInventory` and `Inventory` for `old`; the module-level
+        `_make_delta(new, old)` dispatcher handles every pairing of the two
+        inventory shapes.
+        """
+        return _make_delta(self, old)
+
     def iter_changes(self, basis):
         """Generate a Tree.iter_changes change list between this and basis.
 

@@ -1364,12 +1364,22 @@ impl Inventory {
     }
 
     fn _make_delta<'py>(
-        &self,
+        slf: &Bound<'py, Self>,
         py: Python<'py>,
-        old: &Inventory,
-    ) -> PyResult<Bound<'py, InventoryDelta>> {
-        let inventory_delta = self.0.make_delta(&old.0);
-        Bound::new(py, InventoryDelta(inventory_delta))
+        old: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Fast path: both inventories are the Rust-backed `Inventory`.
+        if let Ok(old_inv) = old.extract::<PyRef<Inventory>>() {
+            let this = slf.borrow();
+            let inventory_delta = this.0.make_delta(&old_inv.0);
+            return Ok(Bound::new(py, InventoryDelta(inventory_delta))?.into_any());
+        }
+        // TODO: handle `CHKInventory` natively in Rust so we don't need the
+        // Python round-trip. For now, fall back to the Python-side dispatcher
+        // which knows how to produce a delta across mixed inventory types.
+        py.import("bzrformats.inventory")?
+            .getattr("_make_delta")?
+            .call1((slf, old))
     }
 
     fn remove_recursive_id<'a>(
