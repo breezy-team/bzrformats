@@ -819,7 +819,7 @@ struct PyCallbackSha1Provider {
 
 impl bazaar::dirstate::SHA1Provider for PyCallbackSha1Provider {
     fn sha1(&self, path: &std::path::Path) -> std::io::Result<String> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let path_obj = path_to_py(py, path)
                 .map_err(|e| std::io::Error::other(format!("path_to_py: {}", e)))?;
             let result = self
