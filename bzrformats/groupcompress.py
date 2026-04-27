@@ -905,6 +905,12 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
                 adapter_key = record.storage_kind, "chunked"
                 adapter = get_adapter(adapter_key)
                 chunks = adapter.get_bytes(record, "chunked")
+            except ValueError as e:
+                # Rust groupcompress raises ValueError for corrupt
+                # deflate / mismatched length / unparseable content;
+                # surface a structured BzrFormatsError so callers see
+                # the same class regardless of source.
+                raise DecompressCorruption(str(e)) from e
             chunks_len = record.size
             if chunks_len is None:
                 chunks_len = sum(map(len, chunks))
