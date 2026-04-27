@@ -248,40 +248,6 @@ fn gather_result_for_consistency(pstate: &mut ProcessEntryState, change: &Dirsta
 mod transport;
 pub use transport::{DirEntryInfo, StatInfo, Transport, TransportError};
 
-/// Single-file backing store for a [`DirState`].
-///
-/// Unlike `bazaar::transport::Transport` (the knit-side path-keyed byte
-/// store), a dirstate transport represents exactly one file held open
-/// across a lock. Operations:
-///
-/// * [`Transport::exists`] — whether the backing file exists. Used by
-///   `on_file` to decide whether to create a fresh dirstate.
-/// * [`Transport::lock_read`] / [`Transport::lock_write`] — acquire
-///   a lock on the backing file. Explicit rather than RAII; the
-///   caller must pair each lock with an `unlock`. Re-locking while
-///   already locked returns `AlreadyLocked`.
-/// * [`Transport::unlock`] — release the current lock. No-op on the
-///   lock side if the underlying store doesn't need lock objects, but
-///   the trait still expects the state transition.
-/// * [`Transport::lock_state`] — observe the current lock state.
-/// * [`Transport::read_all`] — return the full file contents. Requires
-///   a read or write lock. The returned bytes are owned; callers parse
-///   in memory (no streaming `readline` — the pure-Rust `read_header`
-///   operates on a byte slice).
-/// * [`Transport::write_all`] — replace the full file contents,
-///   truncating any trailing bytes from the previous version. Requires
-///   a write lock. Implementations are expected to flush before
-///   returning, but are not required to fdatasync — call
-///   [`Transport::fdatasync`] for that.
-/// * [`Transport::fdatasync`] — force the current contents to durable
-///   storage. Optional no-op for stores where fsync has no meaning
-///   (e.g. in-memory tests); the trait method exists so `DirState.save`
-///   can call it unconditionally.
-///
-/// The `&mut self` receivers are deliberate: every operation either
-/// mutates the lock state, the file contents, or both. Callers that
-/// need shared access should wrap an implementation in their own
-/// synchronisation primitive.
 mod walker;
 pub use walker::{WalkDirsUtf8, WalkedDir};
 
@@ -2557,16 +2523,15 @@ impl DirState {
             return Ok(1);
         }
         // Python's assertion: dirname must end with the parent entry's
-        // basename. The Python source guards the lookup with a
+        // basename.  The Python source guards the lookup with
         // `(parent_block_index == -1 and parent_block_index == -1 and
-        //   dirname == b"")` short-circuit — the second `parent_block_index`
-        // is almost certainly meant to be `parent_row_index`, but we
-        // preserve the (tautological) behaviour so this port is strictly
-        // observation-preserving.
-        // `parent_block_index` twice is intentional — see comment above.
-        #[allow(clippy::nonminimal_bool, clippy::eq_op)]
-        let sentinel_shortcut =
-            parent_block_index == -1 && parent_block_index == -1 && dirname.is_empty();
+        //   dirname == b"")` — the duplicate `parent_block_index`
+        // appears to be a typo for `parent_row_index`, but the duplicate
+        // collapses to a single check anyway, so the actually-observable
+        // condition is `parent_block_index == -1 && dirname.is_empty()`.
+        // We preserve the observable behaviour without carrying the
+        // typo forward.
+        let sentinel_shortcut = parent_block_index == -1 && dirname.is_empty();
         if !sentinel_shortcut {
             let parent_basename = self
                 .dirblocks

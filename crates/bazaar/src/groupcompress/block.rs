@@ -244,19 +244,18 @@ impl GroupCompressBlock {
     /// # Arguments
     /// * `num_bytes` - Ensure that we have extracted at least num_bytes of content. If None, consume everything
     pub fn ensure_content(&mut self, num_bytes: Option<usize>) -> Result<(), Error> {
-        assert!(
-            self.content_length.is_some(),
-            "self.content_length should never be None"
-        );
+        let content_length = self
+            .content_length
+            .ok_or_else(|| Error::InvalidData("ensure_content: content_length not set".into()))?;
         let mut num_bytes = match num_bytes {
-            None => self.content_length.unwrap(),
+            None => content_length,
             Some(num_bytes) => {
-                assert!(
-                    num_bytes <= self.content_length.unwrap(),
-                    "requested num_bytes ({}) > content length ({})",
-                    num_bytes,
-                    self.content_length.unwrap()
-                );
+                if num_bytes > content_length {
+                    return Err(Error::InvalidData(format!(
+                        "ensure_content: requested {} bytes but content length is {}",
+                        num_bytes, content_length
+                    )));
+                }
                 num_bytes
             }
         };
@@ -342,31 +341,28 @@ impl GroupCompressBlock {
         buf.read_until(b'\n', &mut z_content_length_buf)?;
         // Chop off the '\n'
         z_content_length_buf.pop();
-        self.z_content_length = Some(
-            String::from_utf8(z_content_length_buf)
-                .unwrap()
-                .parse()
-                .unwrap(),
-        );
+        let z_content_length: usize = String::from_utf8(z_content_length_buf)
+            .map_err(|e| Error::InvalidData(format!("z_content_length not UTF-8: {}", e)))?
+            .parse()
+            .map_err(|e| Error::InvalidData(format!("invalid z_content_length: {}", e)))?;
+        self.z_content_length = Some(z_content_length);
         let mut content_length_buf = Vec::new();
         buf.read_until(b'\n', &mut content_length_buf)?;
         content_length_buf.pop();
-        self.content_length = Some(
-            String::from_utf8(content_length_buf)
-                .unwrap()
-                .parse()
-                .unwrap(),
-        );
+        let content_length: usize = String::from_utf8(content_length_buf)
+            .map_err(|e| Error::InvalidData(format!("content_length not UTF-8: {}", e)))?
+            .parse()
+            .map_err(|e| Error::InvalidData(format!("invalid content_length: {}", e)))?;
+        self.content_length = Some(content_length);
         let mut data = Vec::new();
         buf.read_to_end(&mut data)?;
-        // XXX: Define some GCCorrupt error ?
-        assert_eq!(
-            data.len(),
-            self.z_content_length.unwrap(),
-            "Invalid bytes: ({}) != {}",
-            data.len(),
-            self.z_content_length.unwrap()
-        );
+        if data.len() != z_content_length {
+            return Err(Error::InvalidData(format!(
+                "compressed body length mismatch: got {} bytes, header says {}",
+                data.len(),
+                z_content_length
+            )));
+        }
         self.z_content_chunks = Some(vec![data.to_vec()]);
         Ok(())
     }

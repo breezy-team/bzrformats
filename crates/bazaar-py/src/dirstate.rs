@@ -17,6 +17,7 @@ pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
 pyo3::import_exception!(bzrformats.errors, InvalidNormalization);
 pyo3::import_exception!(bzrformats.inventory, DuplicateFileId);
 pyo3::import_exception!(bzrformats.inventory, InvalidEntryName);
+pyo3::import_exception!(bzrformats.dirstate, DirstateCorrupt);
 
 /// `bazaar::dirstate::Transport` adapter backed by a Python file-like
 /// object.  Used by `DirStateRs.save_to_file` so the pure-Rust
@@ -358,10 +359,15 @@ impl bazaar::dirstate::Transport for PyFileTransport {
 }
 
 /// Decode a minikind from the first byte of a Python-supplied
-/// `bytes` object, raising `ValueError` on an unknown byte.  Used by
-/// every pyo3 entry that accepts a minikind slice from Python.
+/// `bytes` object, raising `ValueError` on an empty slice or unknown
+/// byte.  Used by every pyo3 entry that accepts a minikind slice from
+/// Python.
 fn decode_minikind(bytes: &[u8]) -> PyResult<bazaar::dirstate::Kind> {
-    bazaar::dirstate::Kind::from_minikind(bytes.first().copied().unwrap_or(0)).map_err(|b| {
+    let byte = bytes
+        .first()
+        .copied()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("empty minikind"))?;
+    bazaar::dirstate::Kind::from_minikind(byte).map_err(|b| {
         pyo3::exceptions::PyValueError::new_err(format!("invalid minikind byte {:?}", b))
     })
 }
@@ -410,6 +416,18 @@ fn bad_file_kind_error(py: Python<'_>, path: &[u8], mode: u32) -> PyErr {
     {
         Ok(exc) => PyErr::from_value(exc),
         Err(e) => e,
+    }
+}
+
+/// Translate a `BisectError` into the appropriate Python exception:
+/// genuine I/O failures become `OSError`, anything else (bad minikind,
+/// bad size field, too many seeks while parsing) is dirstate corruption
+/// and is raised as `DirstateCorrupt(state, msg)` so callers can catch
+/// a single class for "the dirstate is unreadable".
+fn bisect_err_to_py(state: &Bound<PyAny>, err: bazaar::dirstate::BisectError) -> PyErr {
+    match err {
+        bazaar::dirstate::BisectError::ReadError(s) => pyo3::exceptions::PyOSError::new_err(s),
+        other => DirstateCorrupt::new_err((state.clone().unbind(), other.to_string())),
     }
 }
 
@@ -564,8 +582,8 @@ fn bisect_path_left(paths: Vec<Bound<PyAny>>, path: &Bound<PyAny>) -> PyResult<u
     let path = extract_path(path)?;
     let paths = paths
         .iter()
-        .map(|x| extract_path(x).unwrap())
-        .collect::<Vec<PathBuf>>();
+        .map(extract_path)
+        .collect::<PyResult<Vec<PathBuf>>>()?;
     let offset = bazaar::dirstate::bisect_path_left(
         paths
             .iter()
@@ -600,8 +618,8 @@ fn bisect_path_right(paths: Vec<Bound<PyAny>>, path: &Bound<PyAny>) -> PyResult<
     let path = extract_path(path)?;
     let paths = paths
         .iter()
-        .map(|x| extract_path(x).unwrap())
-        .collect::<Vec<PathBuf>>();
+        .map(extract_path)
+        .collect::<PyResult<Vec<PathBuf>>>()?;
     let offset = bazaar::dirstate::bisect_path_right(
         paths
             .iter()
@@ -784,6 +802,78 @@ fn DefaultSHA1Provider() -> PyResult<SHA1Provider> {
     Ok(SHA1Provider {
         provider: Box::new(bazaar::dirstate::DefaultSHA1Provider::new()),
     })
+}
+
+/// Adapter that lets a Python `SHA1Provider`-shaped object (anything
+/// with a `sha1(abspath)` method returning bytes) be plugged into the
+/// pure-Rust `DirState`. The provider is held as a `Py<PyAny>` so we
+/// can call back into Python; the GIL is acquired on each call.
+///
+/// `stat_and_sha1` is not invoked from the Rust side today, so this
+/// adapter falls back to filesystem stat + sha for that path. Callers
+/// that need filtered `stat_and_sha1` should plumb it through Python
+/// directly.
+struct PyCallbackSha1Provider {
+    obj: Py<PyAny>,
+}
+
+impl bazaar::dirstate::SHA1Provider for PyCallbackSha1Provider {
+    fn sha1(&self, path: &std::path::Path) -> std::io::Result<String> {
+        Python::with_gil(|py| {
+            let path_obj = path_to_py(py, path)
+                .map_err(|e| std::io::Error::other(format!("path_to_py: {}", e)))?;
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("sha1", (path_obj,))
+                .map_err(|e| std::io::Error::other(format!("sha1 callback: {}", e)))?;
+            let bytes: &[u8] = result
+                .extract()
+                .map_err(|e| std::io::Error::other(format!("sha1 result: {}", e)))?;
+            std::str::from_utf8(bytes)
+                .map(|s| s.to_string())
+                .map_err(|e| std::io::Error::other(format!("sha1 utf8: {}", e)))
+        })
+    }
+
+    fn stat_and_sha1(
+        &self,
+        path: &std::path::Path,
+    ) -> std::io::Result<(std::fs::Metadata, String)> {
+        let fallback = bazaar::dirstate::DefaultSHA1Provider::new();
+        fallback.stat_and_sha1(path)
+    }
+}
+
+/// Build the `Box<dyn SHA1Provider>` to hand to `DirState::new`.
+/// Recognises the pyo3 `SHA1Provider` pyclass (uses its inner Rust
+/// provider directly) and otherwise wraps the Python object in
+/// `PyCallbackSha1Provider`.
+fn sha1_provider_from_py(
+    py: Python<'_>,
+    obj: &Bound<PyAny>,
+) -> Box<dyn bazaar::dirstate::SHA1Provider + Send + Sync> {
+    let _ = py;
+    Box::new(PyCallbackSha1Provider {
+        obj: obj.clone().unbind(),
+    })
+}
+
+/// Convert a `&Path` to a Python object suitable for passing to
+/// `SHA1Provider.sha1`. On Unix, hand back raw bytes so non-utf8
+/// paths survive; on other platforms fall back to the path string.
+fn path_to_py<'py>(py: Python<'py>, path: &Path) -> PyResult<Bound<'py, PyAny>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        Ok(PyBytes::new(py, bytes).into_any())
+    }
+    #[cfg(not(unix))]
+    {
+        let s = path.to_string_lossy();
+        Ok(PyString::new(py, &s).into_any())
+    }
 }
 
 /// Python constants that [`DirStateRs`] uses in its scalar-state
@@ -1026,10 +1116,23 @@ fn dirstate_change_to_pytuple<'py>(
             },
         ],
     )?;
+    // Python expects file_id=None for unversioned entries.  The Rust
+    // DirstateChange currently stores file_id as Vec<u8>, with an
+    // empty vec sentinel meaning "unversioned"; surface that as None
+    // here so the resulting InventoryTreeChange compares equal to
+    // what InterInventoryTree.iter_changes produces.
+    let file_id_obj = if change.file_id.is_empty()
+        && !change.old_versioned
+        && !change.new_versioned
+    {
+        py.None()
+    } else {
+        PyBytes::new(py, &change.file_id).into_any().unbind()
+    };
     PyTuple::new(
         py,
         [
-            PyBytes::new(py, &change.file_id).into_any().unbind(),
+            file_id_obj,
             path_tuple.into_any().unbind(),
             pyo3::types::PyBool::new(py, change.content_change)
                 .to_owned()
@@ -1128,6 +1231,7 @@ impl PyDirState {
         fdatasync = false,
     ))]
     fn new(
+        py: Python<'_>,
         path: &Bound<PyAny>,
         sha1_provider: Option<&Bound<PyAny>>,
         worth_saving_limit: i64,
@@ -1135,17 +1239,11 @@ impl PyDirState {
         fdatasync: bool,
     ) -> PyResult<Self> {
         let path = extract_path(path)?;
-        // Commit 1 only supports the default sha1 provider. Custom
-        // providers — whether the pyo3 SHA1Provider wrapper or an
-        // arbitrary Python callable — need a dedicated adapter, which
-        // is a follow-up commit.
-        if sha1_provider.is_some() {
-            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "custom sha1_provider is not yet wired through DirStateRs",
-            ));
-        }
         let provider: Box<dyn bazaar::dirstate::SHA1Provider + Send + Sync> =
-            Box::new(bazaar::dirstate::DefaultSHA1Provider::new());
+            match sha1_provider {
+                Some(obj) => sha1_provider_from_py(py, obj),
+                None => Box::new(bazaar::dirstate::DefaultSHA1Provider::new()),
+            };
         Ok(Self {
             inner: bazaar::dirstate::DirState::new(
                 path,
@@ -1579,14 +1677,7 @@ impl PyDirState {
         for t in trees_any.try_iter()? {
             let tt = t?.cast_into::<PyTuple>()?;
             let mk_bytes: Vec<u8> = tt.get_item(0)?.extract()?;
-            let minikind =
-                bazaar::dirstate::Kind::from_minikind(mk_bytes.first().copied().unwrap_or(0))
-                    .map_err(|b| {
-                        pyo3::exceptions::PyValueError::new_err(format!(
-                            "invalid minikind byte {:?}",
-                            b
-                        ))
-                    })?;
+            let minikind = decode_minikind(&mk_bytes)?;
             entry_trees.push(bazaar::dirstate::TreeData {
                 minikind,
                 fingerprint: tt.get_item(1)?.extract()?,
@@ -1680,13 +1771,7 @@ impl PyDirState {
             )
             .map_err(|e| match e {
                 bazaar::dirstate::ProcessEntryError::DirstateCorrupt(msg) => {
-                    // `bzrformats.dirstate` re-exports its own
-                    // DirstateCorrupt subclass; breezy tests catch
-                    // that specific class, not the generic one in
-                    // bzrformats.errors.
-                    let ds_mod = py.import("bzrformats.dirstate").unwrap();
-                    let cls = ds_mod.getattr("DirstateCorrupt").unwrap();
-                    PyErr::from_value(cls.call1(("<unknown>", msg)).unwrap())
+                    DirstateCorrupt::new_err(("<unknown>", msg))
                 }
                 bazaar::dirstate::ProcessEntryError::BadFileKind { path, mode } => {
                     bad_file_kind_error(py, &path, mode)
@@ -1716,8 +1801,14 @@ impl PyDirState {
     /// pointer immediately after the fifth newline — the position
     /// where the first dirblock record begins.  The caller must hold
     /// a read or write lock and must have positioned the file at the
-    /// start of the header.
-    fn read_header_from_file(&mut self, state_file: &Bound<PyAny>) -> PyResult<()> {
+    /// start of the header.  `state` is forwarded into the
+    /// `DirstateCorrupt(state, msg)` exception so callers can inspect
+    /// which dirstate failed to parse.
+    fn read_header_from_file(
+        &mut self,
+        state: &Bound<PyAny>,
+        state_file: &Bound<PyAny>,
+    ) -> PyResult<()> {
         let mut data: Vec<u8> = Vec::new();
         for _ in 0..5 {
             let line = state_file.call_method0("readline")?;
@@ -1726,7 +1817,7 @@ impl PyDirState {
         }
         self.inner
             .read_header(&data)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
+            .map_err(|e| DirstateCorrupt::new_err((state.clone().unbind(), e.to_string())))
     }
 
     /// Bisect for rows at the given paths. Mirrors Python's
@@ -1738,6 +1829,7 @@ impl PyDirState {
     fn bisect<'py>(
         &self,
         py: Python<'py>,
+        state: &Bound<PyAny>,
         state_file: &Bound<PyAny>,
         file_size: u64,
         paths: &Bound<PyAny>,
@@ -1747,7 +1839,7 @@ impl PyDirState {
         let found = self
             .inner
             .bisect(rust_paths, file_size, read_range)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("bisect failed: {}", e)))?;
+            .map_err(|e| bisect_err_to_py(state, e))?;
         bisect_result_to_pydict(py, &found)
     }
 
@@ -1756,6 +1848,7 @@ impl PyDirState {
     fn bisect_dirblocks<'py>(
         &self,
         py: Python<'py>,
+        state: &Bound<PyAny>,
         state_file: &Bound<PyAny>,
         file_size: u64,
         dir_list: &Bound<PyAny>,
@@ -1765,9 +1858,7 @@ impl PyDirState {
         let found = self
             .inner
             .bisect_dirblocks(rust_dirs, file_size, read_range)
-            .map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!("bisect_dirblocks failed: {}", e))
-            })?;
+            .map_err(|e| bisect_err_to_py(state, e))?;
         bisect_result_to_pydict(py, &found)
     }
 
@@ -1778,6 +1869,7 @@ impl PyDirState {
     fn bisect_recursive<'py>(
         &self,
         py: Python<'py>,
+        state: &Bound<PyAny>,
         state_file: &Bound<PyAny>,
         file_size: u64,
         paths: &Bound<PyAny>,
@@ -1787,9 +1879,7 @@ impl PyDirState {
         let found = self
             .inner
             .bisect_recursive(rust_paths, file_size, read_range)
-            .map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!("bisect_recursive failed: {}", e))
-            })?;
+            .map_err(|e| bisect_err_to_py(state, e))?;
         let out = PyDict::new(py);
         for ((dn, bn, fid), trees) in &found {
             let key = PyTuple::new(
@@ -2804,6 +2894,20 @@ impl PyDirState {
         Ok(out)
     }
 
+    /// Materialise every entry across every dirblock as a list of
+    /// `((dirname, basename, file_id), [tree_tuple, ...])` tuples in
+    /// dirblock order.  Mirrors Python's `_iter_entries`, but does the
+    /// marshalling once instead of once per dirblock access — call
+    /// once and iterate the returned list, do not re-call inside a
+    /// loop.
+    fn entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        for entry in self.inner.iter_entries() {
+            out.append(entry_to_py_tuple(py, entry)?)?;
+        }
+        Ok(out)
+    }
+
     /// Build a lazy `IterChanges` iterator.  Wraps the pure-crate
     /// `IterChangesIter` state machine; call repeatedly via
     /// `__next__` to drain one `DirstateInventoryChange`-shaped tuple
@@ -3046,9 +3150,7 @@ impl IterChanges {
             }
             Ok(None) => Ok(None),
             Err(bazaar::dirstate::ProcessEntryError::DirstateCorrupt(msg)) => {
-                let ds_mod = py.import("bzrformats.dirstate")?;
-                let cls = ds_mod.getattr("DirstateCorrupt")?;
-                Err(PyErr::from_value(cls.call1(("<unknown>", msg))?))
+                Err(DirstateCorrupt::new_err(("<unknown>", msg)))
             }
             Err(bazaar::dirstate::ProcessEntryError::BadFileKind { path, mode }) => {
                 Err(bad_file_kind_error(py, &path, mode))

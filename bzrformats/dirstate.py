@@ -473,6 +473,7 @@ class DirState:
         # because those haven't been migrated yet.
         self._rs = _dirstate_rs.DirStateRs(
             path,
+            sha1_provider=sha1_provider,
             worth_saving_limit=worth_saving_limit,
             use_filesystem_for_exec=use_filesystem_for_exec,
             fdatasync=fdatasync,
@@ -654,7 +655,7 @@ class DirState:
         if self._dirblock_state != DirState.NOT_IN_MEMORY:
             raise AssertionError(f"bad dirblock state {self._dirblock_state!r}")
         file_size = os.fstat(self._state_file.fileno()).st_size
-        return self._rs.bisect(self._state_file, file_size, paths)
+        return self._rs.bisect(self, self._state_file, file_size, paths)
 
     def _bisect_dirblocks(self, dir_list):
         """Bisect through the disk structure to find entries in given dirs.
@@ -667,7 +668,7 @@ class DirState:
         if self._dirblock_state != DirState.NOT_IN_MEMORY:
             raise AssertionError(f"bad dirblock state {self._dirblock_state!r}")
         file_size = os.fstat(self._state_file.fileno()).st_size
-        return self._rs.bisect_dirblocks(self._state_file, file_size, dir_list)
+        return self._rs.bisect_dirblocks(self, self._state_file, file_size, dir_list)
 
     def _bisect_recursive(self, paths):
         """Bisect for entries for all paths and their children.
@@ -680,7 +681,7 @@ class DirState:
         if self._dirblock_state != DirState.NOT_IN_MEMORY:
             raise AssertionError(f"bad dirblock state {self._dirblock_state!r}")
         file_size = os.fstat(self._state_file.fileno()).st_size
-        return self._rs.bisect_recursive(self._state_file, file_size, paths)
+        return self._rs.bisect_recursive(self, self._state_file, file_size, paths)
 
     def _discard_merge_parents(self):
         """Discard any parents trees beyond the first.
@@ -1115,8 +1116,11 @@ class DirState:
         docstring of bzrformats.dirstate.
         """
         self._read_dirblocks_if_needed()
-        for directory in self._dirblocks:
-            yield from directory[1]
+        # Materialise the entry list once on the Rust side; reading
+        # ``self._dirblocks`` would re-marshal every block on every
+        # outer-loop iteration of any caller doing ``for e in
+        # state._iter_entries(): for d in state._dirblocks: ...``.
+        return iter(self._rs.entries())
 
     def _get_id_index(self):
         """Get an id index of self._dirblocks.
@@ -1191,14 +1195,7 @@ class DirState:
 
     def _read_header(self):
         """Read the metadata header and parent ids from the state file."""
-        try:
-            self._rs.read_header_from_file(self._state_file)
-        except ValueError as e:
-            # The Rust binding raises ValueError for any malformed
-            # header line; translate to the dirstate-specific
-            # corruption exception so callers can catch a single
-            # class for "the dirstate is unreadable".
-            raise DirstateCorrupt(self, str(e)) from e
+        self._rs.read_header_from_file(self, self._state_file)
 
     def _read_header_if_needed(self):
         """Read the header of the dirstate file if needed."""

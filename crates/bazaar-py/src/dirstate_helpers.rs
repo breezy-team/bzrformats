@@ -247,29 +247,38 @@ pub(crate) fn entry_from_py(py_entry: &Bound<PyAny>) -> PyResult<Entry> {
         let tree = tree?;
         let tree_tuple = tree.cast::<PyTuple>()?;
         let minikind_bytes: Vec<u8> = tree_tuple.get_item(0)?.extract()?;
-        let minikind =
-            bazaar::dirstate::Kind::from_minikind(minikind_bytes.first().copied().unwrap_or(0))
-                .map_err(|b| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "invalid minikind byte {:?}",
-                        b
-                    ))
-                })?;
+        let minikind_byte = minikind_bytes
+            .first()
+            .copied()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("empty minikind"))?;
+        let minikind = bazaar::dirstate::Kind::from_minikind(minikind_byte).map_err(|b| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid minikind byte {:?}", b))
+        })?;
         let fingerprint: Vec<u8> = tree_tuple.get_item(1)?.extract()?;
         // Legacy Python dirblocks tolerated 3-tuple relocation rows
         // `(b"r", target_path, target_file_id)` alongside the normal
         // 5-tuple shape, since nothing in the Python code path accessed
-        // slots 2/3/4 on `b'r'` / `b'a'` entries. Production writers
-        // always emit 5-tuples, but accept the shorter shape so
-        // long-standing callers (and their test fixtures) keep working.
+        // slots 2/3/4 on `b'r'` / `b'a'` entries.  Production writers
+        // always emit 5-tuples; only accept the shorter shape for the
+        // two minikinds where it is actually meaningful, so a malformed
+        // 3-tuple for a normal entry still rejects.
         let (size, executable, packed_stat) = if tree_tuple.len() >= 5 {
             (
                 tree_tuple.get_item(2)?.extract::<u64>()?,
                 tree_tuple.get_item(3)?.extract::<bool>()?,
                 tree_tuple.get_item(4)?.extract::<Vec<u8>>()?,
             )
-        } else {
+        } else if matches!(
+            minikind,
+            bazaar::dirstate::Kind::Relocated | bazaar::dirstate::Kind::Absent
+        ) {
             (0u64, false, Vec::new())
+        } else {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "entry tuple too short for minikind {:?}: got {} items, expected 5",
+                minikind,
+                tree_tuple.len(),
+            )));
         };
         trees.push(TreeData {
             minikind,

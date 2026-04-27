@@ -592,8 +592,8 @@ fn bisect_dirblock_simple() {
 fn bisect_dirblock_involved() {
     let paths: Vec<&[u8]> = vec![
         b"", b"a", b"a/a", b"a/a/a", b"a/a/z", b"a/a-a", b"a/a-z", b"a/z", b"a/z/a", b"a/z/z",
-        b"a/z-a", b"a/z-z", b"a-a", b"a-z", b"z", b"z/a/a", b"z/a/z", b"z/a-a", b"z/a-z",
-        b"z/z", b"z/z/a", b"z/z/z", b"z/z-a", b"z/z-z", b"z-a", b"z-z",
+        b"a/z-a", b"a/z-z", b"a-a", b"a-z", b"z", b"z/a/a", b"z/a/z", b"z/a-a", b"z/a-z", b"z/z",
+        b"z/z/a", b"z/z/z", b"z/z-a", b"z/z-z", b"z-a", b"z-z",
     ];
     assert_bisect_matches_bisect_left(&paths);
 }
@@ -2961,8 +2961,7 @@ fn update_basis_apply_adds_conflicting_existing_basis_is_invalid() {
     // trying to add a new entry at the same path flags it as
     // InconsistentDelta rather than silently overwriting.
     let mut state = basis_adds_fixture_one_file();
-    state.dirblocks[1].entries[0].trees[1] =
-        basis_details(Kind::File, b"sha-existing", 11, false);
+    state.dirblocks[1].entries[0].trees[1] = basis_details(Kind::File, b"sha-existing", 11, false);
 
     let mut adds = vec![BasisAdd {
         old_path: None,
@@ -4657,18 +4656,17 @@ impl Transport for MemoryTransport {
     }
 
     fn lstat(&self, abspath: &[u8]) -> Result<StatInfo, TransportError> {
-        self.fs.get(abspath).map(|(info, _)| *info).ok_or_else(|| {
-            TransportError::NotFound(String::from_utf8_lossy(abspath).into_owned())
-        })
+        self.fs
+            .get(abspath)
+            .map(|(info, _)| *info)
+            .ok_or_else(|| TransportError::NotFound(String::from_utf8_lossy(abspath).into_owned()))
     }
 
     fn read_link(&self, abspath: &[u8]) -> Result<Vec<u8>, TransportError> {
         self.fs
             .get(abspath)
             .and_then(|(_, link)| link.clone())
-            .ok_or_else(|| {
-                TransportError::NotFound(String::from_utf8_lossy(abspath).into_owned())
-            })
+            .ok_or_else(|| TransportError::NotFound(String::from_utf8_lossy(abspath).into_owned()))
     }
 
     fn is_tree_reference_dir(&self, _abspath: &[u8]) -> Result<bool, TransportError> {

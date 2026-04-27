@@ -1657,6 +1657,20 @@ impl LazyGroupCompressFactory {
 
     #[setter]
     fn set_parents(&mut self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        // Contract: parents is a list/tuple of revision-id keys, or None.
+        // Reject anything else at the binding boundary so a typo in the
+        // caller (e.g. passing an int) fails loudly here rather than
+        // surfacing as a confusing AttributeError later inside reconcile.
+        if !value.is_none(py) {
+            let bound = value.bind(py);
+            if !bound.is_instance_of::<pyo3::types::PyList>()
+                && !bound.is_instance_of::<pyo3::types::PyTuple>()
+            {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "parents must be a list, tuple, or None",
+                ));
+            }
+        }
         self.with_state_mut(py, |s| {
             s.parents = if value.is_none(py) { None } else { Some(value) };
             Ok(())

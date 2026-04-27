@@ -105,7 +105,9 @@ impl std::fmt::Display for HeaderError {
             HeaderError::MissingNumEntriesLine(line) => {
                 write!(f, "missing num_entries line: {:?}", line)
             }
-            HeaderError::BadNumEntries(bytes) => write!(f, "invalid num_entries value: {:?}", bytes),
+            HeaderError::BadNumEntries(bytes) => {
+                write!(f, "invalid num_entries value: {:?}", bytes)
+            }
             HeaderError::BadParentsLine => write!(f, "malformed parents line"),
             HeaderError::BadGhostsLine => write!(f, "malformed ghosts line"),
             HeaderError::UnexpectedEof => write!(f, "unexpected end of header"),
