@@ -1432,7 +1432,10 @@ impl DirState {
                     // Dirstate knows about a block the walker didn't
                     // visit (directory removed from disk).  Emit
                     // removals for every live entry.
-                    let (_, block_entries) = block_info.unwrap();
+                    let block_entries: Vec<_> = block_info
+                        .as_ref()
+                        .map(|(_, e)| e.clone())
+                        .unwrap_or_default();
                     for entry in &block_entries {
                         let (change, changed) =
                             self.process_entry(pstate, &entry.key, &entry.trees, None, transport)?;
@@ -1481,74 +1484,16 @@ impl DirState {
         let mut walker_local = walker_entries.clone();
         loop {
             let current_entry = block_entries.get(entry_index).cloned();
-            let current_path_info = if path_index < walker_local.len() {
-                Some(walker_local[path_index].clone())
-            } else {
-                None
-            };
-            if current_entry.is_none() && current_path_info.is_none() {
-                break;
-            }
-            if current_entry.is_none() {
-                // handled by want_unversioned below
-            } else if current_path_info.is_none() {
-                let ce = current_entry.as_ref().unwrap();
-                let (change, changed) =
-                    self.process_entry(pstate, &ce.key, &ce.trees, None, transport)?;
-                if changed.is_some() {
-                    if changed == Some(true) {
-                        if let Some(ref c) = change {
-                            gather_result_for_consistency(pstate, c);
-                        }
-                    }
-                    if changed == Some(true) || pstate.include_unchanged {
-                        if let Some(c) = change {
-                            iter.pending.push_back(c);
-                        }
-                    }
+            let current_path_info = walker_local.get(path_index).cloned();
+            match (&current_entry, &current_path_info) {
+                (None, None) => break,
+                (None, _) => {
+                    // handled by want_unversioned below
                 }
-            } else {
-                let ce = current_entry.as_ref().unwrap();
-                let pi = current_path_info.as_ref().unwrap();
-                let target0 = ce.trees.get(pstate.target_index).map(|t| t.minikind);
-                let mismatch = ce.key.basename != pi.basename
-                    || matches!(target0, Some(Kind::Absent) | Some(Kind::Relocated));
-                if mismatch {
-                    if pi.basename.as_slice() < ce.key.basename.as_slice() {
-                        advance_entry = false;
-                    } else {
-                        let path_info_absent: Option<&ProcessPathInfo> = None;
-                        let (change, changed) = self.process_entry(
-                            pstate,
-                            &ce.key,
-                            &ce.trees,
-                            path_info_absent,
-                            transport,
-                        )?;
-                        if changed.is_some() {
-                            if changed == Some(true) {
-                                if let Some(ref c) = change {
-                                    gather_result_for_consistency(pstate, c);
-                                }
-                            }
-                            if changed == Some(true) || pstate.include_unchanged {
-                                if let Some(c) = change {
-                                    iter.pending.push_back(c);
-                                }
-                            }
-                        }
-                        advance_path = false;
-                    }
-                } else {
-                    let pi_rs = ProcessPathInfo {
-                        abspath: pi.abspath.clone(),
-                        kind: pi.kind,
-                        stat: pi.stat,
-                    };
+                (Some(ce), None) => {
                     let (change, changed) =
-                        self.process_entry(pstate, &ce.key, &ce.trees, Some(&pi_rs), transport)?;
+                        self.process_entry(pstate, &ce.key, &ce.trees, None, transport)?;
                     if changed.is_some() {
-                        path_handled = true;
                         if changed == Some(true) {
                             if let Some(ref c) = change {
                                 gather_result_for_consistency(pstate, c);
@@ -1561,6 +1506,64 @@ impl DirState {
                         }
                     }
                 }
+                (Some(ce), Some(pi)) => {
+                    let target0 = ce.trees.get(pstate.target_index).map(|t| t.minikind);
+                    let mismatch = ce.key.basename != pi.basename
+                        || matches!(target0, Some(Kind::Absent) | Some(Kind::Relocated));
+                    if mismatch {
+                        if pi.basename.as_slice() < ce.key.basename.as_slice() {
+                            advance_entry = false;
+                        } else {
+                            let path_info_absent: Option<&ProcessPathInfo> = None;
+                            let (change, changed) = self.process_entry(
+                                pstate,
+                                &ce.key,
+                                &ce.trees,
+                                path_info_absent,
+                                transport,
+                            )?;
+                            if changed.is_some() {
+                                if changed == Some(true) {
+                                    if let Some(ref c) = change {
+                                        gather_result_for_consistency(pstate, c);
+                                    }
+                                }
+                                if changed == Some(true) || pstate.include_unchanged {
+                                    if let Some(c) = change {
+                                        iter.pending.push_back(c);
+                                    }
+                                }
+                            }
+                            advance_path = false;
+                        }
+                    } else {
+                        let pi_rs = ProcessPathInfo {
+                            abspath: pi.abspath.clone(),
+                            kind: pi.kind,
+                            stat: pi.stat,
+                        };
+                        let (change, changed) = self.process_entry(
+                            pstate,
+                            &ce.key,
+                            &ce.trees,
+                            Some(&pi_rs),
+                            transport,
+                        )?;
+                        if changed.is_some() {
+                            path_handled = true;
+                            if changed == Some(true) {
+                                if let Some(ref c) = change {
+                                    gather_result_for_consistency(pstate, c);
+                                }
+                            }
+                            if changed == Some(true) || pstate.include_unchanged {
+                                if let Some(c) = change {
+                                    iter.pending.push_back(c);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             if advance_entry && current_entry.is_some() {
@@ -1568,11 +1571,11 @@ impl DirState {
             } else {
                 advance_entry = true;
             }
-            if advance_path && current_path_info.is_some() {
+            if let (true, Some(pi)) = (advance_path, current_path_info.as_ref()) {
                 if !path_handled {
                     if pstate.want_unversioned {
-                        let pi = current_path_info.as_ref().unwrap();
-                        let new_executable = pi.stat.is_file() && (pi.stat.mode & 0o100) != 0;
+                        let new_executable =
+                            pi.stat.is_file() && (pi.stat.mode & 0o100) != 0;
                         let path = if walker_rel.is_empty() {
                             pi.basename.clone()
                         } else {
@@ -1598,7 +1601,6 @@ impl DirState {
                             target_exec: Some(new_executable),
                         });
                     }
-                    let pi = current_path_info.as_ref().unwrap();
                     if pi.kind == Some(osutils::Kind::Directory) {
                         let child_rel = if walker_rel.is_empty() {
                             pi.basename.clone()
@@ -1613,7 +1615,6 @@ impl DirState {
                         }
                     }
                 }
-                let pi = current_path_info.as_ref().unwrap();
                 if pi.kind == Some(osutils::Kind::TreeReference) {
                     let child_rel = if walker_rel.is_empty() {
                         pi.basename.clone()
@@ -2853,13 +2854,13 @@ impl DirState {
             let (entry_index, entry_present) =
                 find_entry_index(&entry_key, &self.dirblocks[block_index].entries);
 
-            if add.real_add && add.old_path.is_some() {
+            if let (true, Some(old_path)) = (add.real_add, add.old_path.as_ref()) {
                 return Err(BasisApplyError::Invalid {
                     path: add.new_path.clone(),
                     file_id: add.file_id.clone(),
                     reason: format!(
                         "considered a real add but still had old_path at {:?}",
-                        add.old_path.as_ref().unwrap()
+                        old_path
                     ),
                 });
             }
