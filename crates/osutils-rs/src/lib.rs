@@ -211,15 +211,29 @@ impl std::fmt::Display for Kind {
     }
 }
 
+/// Error returned by [`<Kind as FromStr>::from_str`] when the input is
+/// not one of the four recognised kind names.  Carries the offending
+/// string so callers can surface it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KindParseError(pub String);
+
+impl std::fmt::Display for KindParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown kind {:?}", self.0)
+    }
+}
+
+impl std::error::Error for KindParseError {}
+
 impl std::str::FromStr for Kind {
-    type Err = String;
+    type Err = KindParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "file" => Ok(Kind::File),
             "directory" => Ok(Kind::Directory),
             "symlink" => Ok(Kind::Symlink),
             "tree-reference" => Ok(Kind::TreeReference),
-            other => Err(other.to_string()),
+            other => Err(KindParseError(other.to_string())),
         }
     }
 }
