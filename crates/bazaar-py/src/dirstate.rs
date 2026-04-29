@@ -1747,6 +1747,7 @@ impl PyDirState {
             bazaar::dirstate::LockState::Read,
         );
 
+        let dirstate_path = self.inner.filename.to_string_lossy().into_owned();
         let (change, changed) = self
             .inner
             .process_entry(
@@ -1758,7 +1759,7 @@ impl PyDirState {
             )
             .map_err(|e| match e {
                 bazaar::dirstate::ProcessEntryError::DirstateCorrupt(msg) => {
-                    DirstateCorrupt::new_err(("<unknown>", msg))
+                    DirstateCorrupt::new_err((dirstate_path, msg))
                 }
                 bazaar::dirstate::ProcessEntryError::BadFileKind { path, mode } => {
                     bad_file_kind_error(py, &path, mode)
@@ -3118,11 +3119,13 @@ impl IterChanges {
             ref mut pstate,
             ..
         } = *slf;
-        let result = {
+        let (result, dirstate_path) = {
             let mut state_ref = dirstate.borrow_mut(py);
-            state_ref
+            let path = state_ref.inner.filename.to_string_lossy().into_owned();
+            let r = state_ref
                 .inner
-                .iter_changes_next(iter_state, pstate, &transport)
+                .iter_changes_next(iter_state, pstate, &transport);
+            (r, path)
         };
         match result {
             Ok(Some(change)) => {
@@ -3133,7 +3136,7 @@ impl IterChanges {
             }
             Ok(None) => Ok(None),
             Err(bazaar::dirstate::ProcessEntryError::DirstateCorrupt(msg)) => {
-                Err(DirstateCorrupt::new_err(("<unknown>", msg)))
+                Err(DirstateCorrupt::new_err((dirstate_path, msg)))
             }
             Err(bazaar::dirstate::ProcessEntryError::BadFileKind { path, mode }) => {
                 Err(bad_file_kind_error(py, &path, mode))
