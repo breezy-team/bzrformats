@@ -213,13 +213,9 @@ impl bazaar::dirstate::Transport for PyFileTransport {
                     return Err(Self::map_err(py, e));
                 }
             };
-            let bytes: Vec<u8> = match target.extract::<Vec<u8>>() {
-                Ok(b) => b,
-                Err(_) => {
-                    let s: String = target.extract().map_err(|e| Self::map_err(py, e))?;
-                    s.into_bytes()
-                }
-            };
+            // os.readlink(bytes) returns bytes per the Python docs; if it
+            // ever returns str, that's the caller's bug to fix.
+            let bytes: Vec<u8> = target.extract().map_err(|e| Self::map_err(py, e))?;
             Ok(bytes)
         })
     }
@@ -249,26 +245,16 @@ impl bazaar::dirstate::Transport for PyFileTransport {
                 let mut out: Vec<bazaar::dirstate::DirEntryInfo> = Vec::new();
                 for item in iter.try_iter().map_err(|e| Self::map_err(py, e))? {
                     let entry = item.map_err(|e| Self::map_err(py, e))?;
-                    let name_bytes: Vec<u8> = {
-                        let n = entry.getattr("name").map_err(|e| Self::map_err(py, e))?;
-                        if let Ok(b) = n.extract::<Vec<u8>>() {
-                            b
-                        } else {
-                            n.extract::<String>()
-                                .map_err(|e| Self::map_err(py, e))?
-                                .into_bytes()
-                        }
-                    };
-                    let abspath_child: Vec<u8> = {
-                        let p = entry.getattr("path").map_err(|e| Self::map_err(py, e))?;
-                        if let Ok(b) = p.extract::<Vec<u8>>() {
-                            b
-                        } else {
-                            p.extract::<String>()
-                                .map_err(|e| Self::map_err(py, e))?
-                                .into_bytes()
-                        }
-                    };
+                    // os.scandir(bytes) yields DirEntry whose name/path are
+                    // bytes; we always pass bytes above, so trust that.
+                    let name_bytes: Vec<u8> = entry
+                        .getattr("name")
+                        .and_then(|n| n.extract())
+                        .map_err(|e| Self::map_err(py, e))?;
+                    let abspath_child: Vec<u8> = entry
+                        .getattr("path")
+                        .and_then(|p| p.extract())
+                        .map_err(|e| Self::map_err(py, e))?;
                     let kwargs = pyo3::types::PyDict::new(py);
                     kwargs
                         .set_item("follow_symlinks", false)
@@ -1598,11 +1584,7 @@ impl PyDirState {
             basename: key.get_item(1)?.extract()?,
             file_id: key.get_item(2)?.extract()?,
         };
-        let abspath_bytes: Vec<u8> = if let Ok(b) = abspath.extract::<Vec<u8>>() {
-            b
-        } else {
-            abspath.extract::<String>()?.into_bytes()
-        };
+        let abspath_bytes: Vec<u8> = abspath.extract()?;
         // Unpack stat_value into a StatInfo — Python already did the
         // lstat, no need to double-stat.
         let stat = bazaar::dirstate::StatInfo {
@@ -1719,14 +1701,7 @@ impl PyDirState {
                     Some(kind_obj.extract::<osutils::Kind>()?)
                 };
                 let stat_obj = pt.get_item(3)?;
-                let abspath: Vec<u8> = {
-                    let a = pt.get_item(4)?;
-                    if let Ok(b) = a.extract::<Vec<u8>>() {
-                        b
-                    } else {
-                        a.extract::<String>()?.into_bytes()
-                    }
-                };
+                let abspath: Vec<u8> = pt.get_item(4)?.extract()?;
                 let stat = bazaar::dirstate::StatInfo {
                     mode: stat_obj.getattr("st_mode")?.extract()?,
                     size: stat_obj.getattr("st_size")?.extract()?,
@@ -2953,11 +2928,7 @@ impl PyDirState {
     ) -> PyResult<IterChanges> {
         let search: std::collections::HashSet<Vec<u8>> = collect_bytes_set(search_specific_files)?;
         let partial = !(search.len() == 1 && search.contains(&Vec::<u8>::new()));
-        let root_abspath_bytes: Vec<u8> = if let Ok(b) = root_abspath.extract::<Vec<u8>>() {
-            b
-        } else {
-            root_abspath.extract::<String>()?.into_bytes()
-        };
+        let root_abspath_bytes: Vec<u8> = root_abspath.extract()?;
         let pstate = bazaar::dirstate::ProcessEntryState {
             source_index,
             target_index,
