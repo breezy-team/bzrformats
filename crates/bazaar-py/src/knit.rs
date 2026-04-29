@@ -73,7 +73,7 @@ fn process_one_record<'py>(
                 )));
             }
             let parent = history.get_item(idx as usize)?;
-            parents.push(parent.downcast_into::<PyBytes>()?);
+            parents.push(parent.cast_into::<PyBytes>()?);
         }
     }
     let parents_tuple = PyTuple::new(py, &parents)?;
@@ -81,7 +81,7 @@ fn process_one_record<'py>(
     // Check if version_id is already in cache
     let index: i64;
     if let Some(existing) = cache.get_item(&version_id)? {
-        let existing_tuple = existing.downcast_into::<PyTuple>()?;
+        let existing_tuple = existing.cast_into::<PyTuple>()?;
         index = existing_tuple.get_item(5)?.extract()?;
     } else {
         history.append(&version_id)?;
@@ -114,16 +114,16 @@ fn process_one_record<'py>(
 #[pyfunction]
 pub fn _load_data_c(py: Python, kndx: &Bound<PyAny>, fp: &Bound<PyAny>) -> PyResult<()> {
     let cache = kndx.getattr("_cache")?;
-    let cache = cache.downcast_into::<PyDict>()?;
+    let cache = cache.cast_into::<PyDict>()?;
     let history = kndx.getattr("_history")?;
-    let history = history.downcast_into::<PyList>()?;
+    let history = history.cast_into::<PyList>()?;
 
     // Call kndx.check_header(fp)
     kndx.call_method1("check_header", (fp,))?;
 
     // Read the entire file content
     let text = fp.call_method0("read")?;
-    let text_bytes = text.downcast_into::<PyBytes>()?;
+    let text_bytes = text.cast_into::<PyBytes>()?;
     let data = text_bytes.as_bytes();
 
     let mut history_len = history.len() as i64;
@@ -1165,7 +1165,7 @@ use bazaar::knit::{
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
-struct MemoTable {
+pub(crate) struct MemoTable {
     /// Original Python memo tuples, indexed by their slot in this Vec.
     memos: Vec<Py<PyAny>>,
 }

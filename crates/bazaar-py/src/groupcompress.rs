@@ -230,8 +230,8 @@ impl GroupCompressBlock {
         self.inner.content_length()
     }
 
-    #[setter]
-    fn set__content_length(&mut self, value: usize) {
+    #[setter(_content_length)]
+    fn set_content_length_py(&mut self, value: usize) {
         self.inner.set_content_length(value);
     }
 
@@ -240,13 +240,13 @@ impl GroupCompressBlock {
         self.inner.z_content_length()
     }
 
-    #[setter]
-    fn set__z_content_length(&mut self, value: usize) {
+    #[setter(_z_content_length)]
+    fn set_z_content_length_py(&mut self, value: usize) {
         self.inner.set_z_content_length(value);
     }
 
-    #[setter]
-    fn set__z_content_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+    #[setter(_z_content_chunks)]
+    fn set_z_content_chunks_py(&mut self, chunks: Vec<Vec<u8>>) {
         self.inner.set_z_content_chunks(chunks);
         self.invalidate_cache();
     }
@@ -263,8 +263,8 @@ impl GroupCompressBlock {
         }
     }
 
-    #[setter]
-    fn set__compressor_name(&mut self, name: &str) -> PyResult<()> {
+    #[setter(_compressor_name)]
+    fn set_compressor_name_py(&mut self, name: &str) -> PyResult<()> {
         let kind = match name {
             "zlib" => bazaar::groupcompress::block::CompressorKind::Zlib,
             "lzma" => bazaar::groupcompress::block::CompressorKind::Lzma,
@@ -1102,8 +1102,8 @@ impl LazyGroupContentManager {
         self.full_enough_block_size
     }
 
-    #[setter]
-    fn set__full_enough_block_size(&mut self, v: usize) {
+    #[setter(_full_enough_block_size)]
+    fn set_full_enough_block_size_py(&mut self, v: usize) {
         self.full_enough_block_size = v;
     }
 
@@ -1112,8 +1112,8 @@ impl LazyGroupContentManager {
         self.full_enough_mixed_block_size
     }
 
-    #[setter]
-    fn set__full_enough_mixed_block_size(&mut self, v: usize) {
+    #[setter(_full_enough_mixed_block_size)]
+    fn set_full_enough_mixed_block_size_py(&mut self, v: usize) {
         self.full_enough_mixed_block_size = v;
     }
 
@@ -1122,8 +1122,8 @@ impl LazyGroupContentManager {
         self.max_cut_fraction
     }
 
-    #[setter]
-    fn set__max_cut_fraction(&mut self, v: f64) {
+    #[setter(_max_cut_fraction)]
+    fn set_max_cut_fraction_py(&mut self, v: f64) {
         self.max_cut_fraction = v;
     }
 
@@ -1727,8 +1727,8 @@ impl LazyGroupCompressFactory {
         self.manager.as_ref().map(|m| m.clone_ref(py))
     }
 
-    #[setter]
-    fn set__manager(&mut self, value: Option<Py<LazyGroupContentManager>>) {
+    #[setter(_manager)]
+    fn set_manager_py(&mut self, value: Option<Py<LazyGroupContentManager>>) {
         self.manager = value;
     }
 

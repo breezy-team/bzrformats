@@ -586,34 +586,6 @@ has a lot more data
 at the end of the file
 ";
 
-    const FIRST_TEXT: &[u8] = b"a bit of text, that
-does not have much in
-common with the next text
-";
-
-    const SECOND_TEXT: &[u8] = b"some more bit of text, that
-does not have much in
-common with the previous text
-and has some extra text
-";
-
-    const THIRD_TEXT: &[u8] = b"a bit of text, that
-has some in common with the previous text
-and has some extra text
-and not have much in
-common with the next text
-";
-
-    const FOURTH_TEXT: &[u8] = b"123456789012345
-same rabin hash
-123456789012345
-same rabin hash
-123456789012345
-same rabin hash
-123456789012345
-same rabin hash
-";
-
     fn apply_delta_test(source: &[u8], delta: &[u8]) -> Vec<u8> {
         use crate::groupcompress::delta::{decode_instruction, Instruction};
         let mut remaining = &delta[..];
