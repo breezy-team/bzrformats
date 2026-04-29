@@ -775,7 +775,6 @@ class DirState:
             with contextlib.ExitStack() as exit_stack:
                 exit_stack.enter_context(tree.lock_read())
                 parent_ids = tree.get_parent_ids()
-                len(parent_ids)
                 parent_trees = []
                 for parent_id in parent_ids:
                     parent_tree = tree.branch.repository.revision_tree(parent_id)
