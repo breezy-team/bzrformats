@@ -725,10 +725,7 @@ class DirState:
 
         :param entry: An entry_tuple as defined in the module docstring.
         """
-        # The actual implementation is rebound at the bottom of this
-        # module to `_dirstate_rs.entry_to_line`; this definition exists
-        # only so tooling and sphinx autodoc see a method on `DirState`.
-        raise AssertionError("_entry_to_line should be rebound from _dirstate_rs")
+        return _dirstate_rs.entry_to_line(entry)
 
     def _find_block_index_from_key(self, key):
         """Find the dirblock index for a key.
@@ -1673,4 +1670,3 @@ _get_output_lines = _dirstate_rs.get_output_lines
 _read_dirblocks = _dirstate_rs._read_dirblocks
 update_entry = _dirstate_rs.update_entry
 _process_entry = _dirstate_rs.ProcessEntryC
-DirState._entry_to_line = staticmethod(_dirstate_rs.entry_to_line)
