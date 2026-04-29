@@ -18,12 +18,17 @@
 
 
 def _coerce_bytes(value):
-    """Recursively convert ``bytes`` to UTF-8 ``str`` inside formatting
+    """Recursively convert ``bytes`` to ``str`` inside formatting
     arguments so ``fmt % d`` and ``repr(...)`` never produce a bytes
     string in error messages.
+
+    Uses ``repr()`` (which produces a ``b'...'`` literal) so the
+    underlying byte sequence is reversible — a previous version
+    used ``decode("utf-8", "replace")`` which silently mojibaked
+    binary payloads (file_ids, sha1 digests).
     """
     if isinstance(value, bytes):
-        return value.decode("utf-8", "replace")
+        return repr(value)
     if isinstance(value, tuple):
         return tuple(_coerce_bytes(item) for item in value)
     if isinstance(value, list):
@@ -87,7 +92,7 @@ class BzrFormatsError(Exception):
             # other non-str type bubble up as a TypeError so a
             # genuinely broken caller still surfaces.
             if isinstance(s, bytes):
-                return s.decode("utf-8", "replace")
+                return repr(s)
             if isinstance(s, tuple):
                 return repr(_coerce_bytes(s))
             return s
