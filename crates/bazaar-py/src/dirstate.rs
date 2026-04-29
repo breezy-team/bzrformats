@@ -1329,6 +1329,12 @@ impl PyDirState {
         self.inner.cutoff_time = value;
     }
 
+    /// Compute, cache, and return the SHA cutoff time (`now - 3`).
+    /// Mirrors Python's `DirState._sha_cutoff_time`.
+    fn compute_sha_cutoff_time(&mut self) -> i64 {
+        self.inner.compute_sha_cutoff_time()
+    }
+
     /// Declared entry count from the header. Matches Python's
     /// `_num_entries`; Python stores `None` before the header is read,
     /// but the Rust struct always has a count, so we expose the

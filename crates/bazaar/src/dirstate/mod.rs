@@ -611,6 +611,27 @@ impl DirState {
             .map(|t| t.minikind)
     }
 
+    /// Compute and cache the SHA cutoff time: the boundary mtime/ctime
+    /// such that files newer than this are considered "racy" and skip
+    /// the cached-sha optimisation.  Mirrors Python's
+    /// `DirState._sha_cutoff_time`: returns `now - 3` and stores it on
+    /// the instance so subsequent calls (within the same lock window)
+    /// reuse the same value rather than re-reading the wall clock.
+    ///
+    /// The 3-second window is the legacy bzr value, picked so that
+    /// stats made within a typical filesystem timestamp resolution
+    /// of "now" are not trusted.
+    pub fn compute_sha_cutoff_time(&mut self) -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_secs: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let c = now_secs - 3;
+        self.cutoff_time = Some(c);
+        c
+    }
+
     /// Record an observed sha1 for `key`'s tree-0 row when the file's
     /// stat falls in the cacheable window.  Mirrors Python's
     /// `DirState._observed_sha1`: silently ignores non-file kinds and
@@ -638,22 +659,14 @@ impl DirState {
         st_dev: u64,
         st_ino: u64,
     ) -> Result<Option<TreeData>, UpdateEntryError> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         // S_IFREG (0o100000) after masking with S_IFMT.
         if (st_mode & 0o170000) != 0o100000 {
             return Ok(None);
         }
 
-        let now_secs: i64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let cutoff: i64 = self.cutoff_time.unwrap_or_else(|| {
-            let c = now_secs - 3;
-            self.cutoff_time = Some(c);
-            c
-        });
+        let cutoff: i64 = self
+            .cutoff_time
+            .unwrap_or_else(|| self.compute_sha_cutoff_time());
 
         if st_mtime >= cutoff || st_ctime >= cutoff {
             return Ok(None);

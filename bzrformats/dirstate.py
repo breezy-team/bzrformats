@@ -225,7 +225,6 @@ import logging
 import os
 import stat
 import sys
-import time
 from stat import S_IEXEC
 
 from . import inventory, lock, osutils
@@ -935,12 +934,7 @@ class DirState:
         Files modified more recently than this time are at risk of being
         undetectably modified and so can't be cached.
         """
-        # Cache the cutoff time as long as we hold a lock.
-        # time.time() isn't super expensive (approx 3.38us), but
-        # when you call it 50,000 times it adds up.
-        # For comparison, os.lstat() costs 7.2us if it is hot.
-        self._cutoff_time = int(time.time()) - 3
-        return self._cutoff_time
+        return self._rs.compute_sha_cutoff_time()
 
     @staticmethod
     def _lstat(abspath, entry):
