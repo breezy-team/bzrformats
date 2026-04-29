@@ -1553,7 +1553,15 @@ impl PyDirState {
                 st_dev,
                 st_ino,
             )
-            .map_err(|e| pyo3::exceptions::PyKeyError::new_err(format!("observed_sha1: {}", e)))?;
+            .map_err(|e| match e {
+                bazaar::dirstate::UpdateEntryError::EntryNotFound => {
+                    pyo3::exceptions::PyKeyError::new_err("observed_sha1: entry not found")
+                }
+                bazaar::dirstate::UpdateEntryError::Io(io) => {
+                    pyo3::exceptions::PyOSError::new_err(io.to_string())
+                }
+                other => pyo3::exceptions::PyRuntimeError::new_err(other.to_string()),
+            })?;
         match updated {
             None => Ok(None),
             Some(td) => Ok(Some(PyTuple::new(
