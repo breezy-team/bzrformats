@@ -8,8 +8,6 @@ use pyo3::wrap_pyfunction;
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pyo3::import_exception!(bzrformats.errors, NotVersionedError);
@@ -704,65 +702,43 @@ fn bisect_dirblock(
     Ok(lo)
 }
 
-// TODO(jelmer): Move this into a more central place?
+/// Lightweight `os.stat_result`-shaped pyclass exposing exactly the
+/// six fields dirstate consumes.
 #[pyclass]
 struct StatResult {
-    metadata: std::fs::Metadata,
+    info: bazaar::dirstate::StatInfo,
 }
 
 #[pymethods]
 impl StatResult {
     #[getter]
-    fn st_size(&self) -> PyResult<u64> {
-        Ok(self.metadata.len())
+    fn st_size(&self) -> u64 {
+        self.info.size
     }
 
     #[getter]
-    fn st_mtime(&self) -> PyResult<u64> {
-        let modified = self
-            .metadata
-            .modified()
-            .map_err(PyErr::new::<pyo3::exceptions::PyOSError, _>)?;
-        let since_epoch = modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-        Ok(since_epoch.as_secs())
+    fn st_mtime(&self) -> i64 {
+        self.info.mtime
     }
 
     #[getter]
-    fn st_ctime(&self) -> PyResult<u64> {
-        let created = self
-            .metadata
-            .created()
-            .map_err(PyErr::new::<pyo3::exceptions::PyOSError, _>)?;
-        let since_epoch = created
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-        Ok(since_epoch.as_secs())
+    fn st_ctime(&self) -> i64 {
+        self.info.ctime
     }
 
-    #[cfg(unix)]
     #[getter]
-    fn st_mode(&self) -> PyResult<u32> {
-        Ok(self.metadata.permissions().mode())
+    fn st_mode(&self) -> u32 {
+        self.info.mode
     }
 
-    #[cfg(not(unix))]
     #[getter]
-    fn st_mode(&self) -> PyResult<u32> {
-        Ok(0)
+    fn st_dev(&self) -> u64 {
+        self.info.dev
     }
 
-    #[cfg(unix)]
     #[getter]
-    fn st_dev(&self) -> PyResult<u64> {
-        Ok(self.metadata.dev())
-    }
-
-    #[cfg(unix)]
-    #[getter]
-    fn st_ino(&self) -> PyResult<u64> {
-        Ok(self.metadata.ino())
+    fn st_ino(&self) -> u64 {
+        self.info.ino
     }
 }
 
@@ -788,8 +764,8 @@ impl SHA1Provider {
         path: &Bound<PyAny>,
     ) -> PyResult<(Py<PyAny>, Bound<'a, PyBytes>)> {
         let path = extract_path(path)?;
-        let (md, sha1) = self.provider.stat_and_sha1(&path)?;
-        let pmd = StatResult { metadata: md };
+        let (info, sha1) = self.provider.stat_and_sha1(&path)?;
+        let pmd = StatResult { info };
         Ok((
             pmd.into_pyobject(py)?.unbind().into(),
             PyBytes::new(py, sha1.as_bytes()),
@@ -808,11 +784,6 @@ fn DefaultSHA1Provider() -> PyResult<SHA1Provider> {
 /// with a `sha1(abspath)` method returning bytes) be plugged into the
 /// pure-Rust `DirState`. The provider is held as a `Py<PyAny>` so we
 /// can call back into Python; the GIL is acquired on each call.
-///
-/// `stat_and_sha1` is not invoked from the Rust side today, so this
-/// adapter falls back to filesystem stat + sha for that path. Callers
-/// that need filtered `stat_and_sha1` should plumb it through Python
-/// directly.
 struct PyCallbackSha1Provider {
     obj: Py<PyAny>,
 }
@@ -839,10 +810,43 @@ impl bazaar::dirstate::SHA1Provider for PyCallbackSha1Provider {
     fn stat_and_sha1(
         &self,
         path: &std::path::Path,
-    ) -> std::io::Result<(std::fs::Metadata, String)> {
-        let fallback = bazaar::dirstate::DefaultSHA1Provider::new();
-        fallback.stat_and_sha1(path)
+    ) -> std::io::Result<(bazaar::dirstate::StatInfo, String)> {
+        Python::attach(|py| {
+            let path_obj = path_to_py(py, path)
+                .map_err(|e| std::io::Error::other(format!("path_to_py: {}", e)))?;
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("stat_and_sha1", (path_obj,))
+                .map_err(|e| std::io::Error::other(format!("stat_and_sha1 callback: {}", e)))?;
+            let (stat_obj, sha_obj): (Bound<'_, PyAny>, Bound<'_, PyAny>) = result
+                .extract()
+                .map_err(|e| std::io::Error::other(format!("stat_and_sha1 result: {}", e)))?;
+            let info = stat_result_to_info(&stat_obj)
+                .map_err(|e| std::io::Error::other(format!("stat_and_sha1 stat_result: {}", e)))?;
+            let sha_bytes: &[u8] = sha_obj
+                .extract()
+                .map_err(|e| std::io::Error::other(format!("stat_and_sha1 sha bytes: {}", e)))?;
+            let sha = std::str::from_utf8(sha_bytes)
+                .map_err(|e| std::io::Error::other(format!("stat_and_sha1 sha utf8: {}", e)))?
+                .to_string();
+            Ok((info, sha))
+        })
     }
+}
+
+/// Read the `st_*` attributes off a Python `os.stat_result`-shaped
+/// object and pack them into a [`StatInfo`].  Used by callback
+/// adapters that bridge Python `SHA1Provider`s into the Rust trait.
+fn stat_result_to_info(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::dirstate::StatInfo> {
+    Ok(bazaar::dirstate::StatInfo {
+        mode: obj.getattr("st_mode")?.extract()?,
+        size: obj.getattr("st_size")?.extract()?,
+        mtime: obj.getattr("st_mtime")?.extract::<f64>()? as i64,
+        ctime: obj.getattr("st_ctime")?.extract::<f64>()? as i64,
+        dev: obj.getattr("st_dev")?.extract()?,
+        ino: obj.getattr("st_ino")?.extract()?,
+    })
 }
 
 /// Build the `Box<dyn SHA1Provider>` to hand to `DirState::new`.
