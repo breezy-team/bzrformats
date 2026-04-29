@@ -638,9 +638,8 @@ class DirState:
         if isinstance(path, bytes):
             path = path.decode("utf-8")
         self._rs.add_path(path, file_id, kind, stat, fingerprint)
-        # Rust side updated its id_index; refill the Python mirror in
-        # place so callers that cached a reference to the IdIndex (via
-        # _get_id_index) see the new entry.
+        # Refill the cached IdIndex in place so callers that hold the
+        # reference returned by ``_get_id_index`` see the new entry.
         if self._id_index is not None:
             self._id_index.fill_from_state(self._rs)
 
@@ -696,7 +695,8 @@ class DirState:
             return
         self._read_dirblocks_if_needed()
         self._rs.discard_merge_parents()
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _empty_parent_info(self):
         return [DirState.NULL_PARENT_DETAILS] * (len(self._parents) - len(self._ghosts))
@@ -807,15 +807,18 @@ class DirState:
         delta.check()
         delta.sort()
         self._rs.update_by_delta(delta)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _apply_removals(self, removals):
         self._rs.apply_removals(list(removals))
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _apply_insertions(self, adds):
         self._rs.apply_insertions(list(adds))
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def update_basis_by_delta(self, delta, new_revid):
         """Update the parents of this tree after a commit.
@@ -836,7 +839,8 @@ class DirState:
         delta.check()
         delta.sort()
         self._rs.update_basis_by_delta(delta, new_revid)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _check_delta_ids_absent(self, new_ids, tree_index):
         """Check that none of the file_ids in new_ids are present in a tree."""
@@ -856,9 +860,8 @@ class DirState:
             pair created to handle renames and deletes.
         """
         self._rs.update_basis_apply_adds(adds)
-        # Rust may have inserted entries and/or dirblocks; pull the
-        # rewritten state back into Python's mirror.
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _update_basis_apply_changes(self, changes):
         """Apply a sequence of changes to tree 1 during update_basis_by_delta.
@@ -867,7 +870,8 @@ class DirState:
             (path_utf8, path_utf8, file_id, (entry_details))
         """
         self._rs.update_basis_apply_changes(changes)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _update_basis_apply_deletes(self, deletes):
         """Apply a sequence of deletes to tree 1 during update_basis_by_delta.
@@ -882,7 +886,8 @@ class DirState:
             during the replacement of a parent.
         """
         self._rs.update_basis_apply_deletes(deletes)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _after_delta_check_parents(self, parents, index):
         """Check that parents required by the delta are all intact.
@@ -1127,6 +1132,11 @@ class DirState:
 
         This maps from file_id => [(directory, name, file_id)] entries where
         that file_id appears in one of the trees.
+
+        Callers may hold the returned object across mutations and expect
+        to see fresh state — the original bzr contract.  We therefore
+        cache a Python-side IdIndex on ``self._id_index`` and refill it
+        from Rust's authoritative index in every mutating method.
         """
         if self._id_index is None:
             self._id_index = IdIndex()
@@ -1265,7 +1275,8 @@ class DirState:
         # Rust side absorbs parent_ids and dirblocks, marks both states
         # fully modified, and clears its id_index cache.
         self._rs.set_data(parent_ids, dirblocks)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def set_path_id(self, path, new_id):
         """Change the id of path to new_id in the current working tree.
@@ -1279,7 +1290,8 @@ class DirState:
         if not isinstance(new_id, bytes):
             raise AssertionError(f"must be a utf8 file_id not {type(new_id)}")
         self._rs.set_path_id(path, new_id)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def set_parent_trees(self, trees, ghosts):
         """Set the parent trees for the dirstate.
@@ -1312,7 +1324,8 @@ class DirState:
                 )
             parent_tree_entries.append(rows)
         self._rs.set_parent_trees(parent_ids, ghosts_list, parent_tree_entries)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def set_state_from_inventory(self, new_inv):
         """Set new_inv as the current state.
@@ -1347,7 +1360,8 @@ class DirState:
                 )
             )
         self._rs.set_state_from_inventory(rows)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def set_state_from_scratch(self, working_inv, parent_trees, parent_ghosts):
         """Wipe the currently stored state and set it to something new.
@@ -1376,7 +1390,8 @@ class DirState:
             shrinking in length.
         """
         last_reference = self._rs.make_absent(current_old[0])
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
         return last_reference
 
     def update_minimal(
@@ -1445,7 +1460,8 @@ class DirState:
         # parents, ghosts, dirblocks, id_index, end_of_header,
         # cutoff_time.
         self._rs.wipe_state()
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def lock_read(self):
         """Acquire a read lock on the dirstate."""
