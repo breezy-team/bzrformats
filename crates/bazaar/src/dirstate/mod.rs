@@ -12,7 +12,7 @@ mod sha1;
 pub use sha1::{DefaultSHA1Provider, SHA1Provider};
 
 mod pack_stat;
-pub use pack_stat::{pack_stat, pack_stat_metadata, stat_to_minikind};
+pub use pack_stat::{pack_stat, pack_stat_metadata, stat_to_kind};
 
 mod path;
 pub use path::{bisect_path_left, bisect_path_right, lt_by_dirs, lt_path_by_dirblock};
