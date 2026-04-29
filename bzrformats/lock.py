@@ -34,7 +34,7 @@ import fcntl
 import logging
 import threading
 
-from .errors import LockContention
+from .errors import LockContention, LockNotHeld
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +116,11 @@ class ReadLock:
 
     def unlock(self):
         """Release the lock and close the file."""
+        if self.f is None:
+            raise LockNotHeld(self.filename)
         fcntl.lockf(self.f, fcntl.LOCK_UN)
         self.f.close()
+        self.f = None
         _release_read_slot(self.filename)
 
     def temporary_write_lock(self):
@@ -125,6 +128,12 @@ class ReadLock:
 
         Returns ``(True, write_lock)`` if the upgrade succeeded, or
         ``(False, self)`` if it failed (read lock is re-acquired).
+
+        If the upgrade fails AND the read lock cannot be re-acquired,
+        marks this :class:`ReadLock` as released (``self.f`` becomes
+        ``None``) and raises the underlying exception so the caller
+        sees the lock loss rather than silently believing they still
+        hold a read lock.
         """
         # fcntl.lockf has per-process semantics: a write lock in the same
         # process would happily coexist with an unrelated read lock on the
@@ -137,6 +146,7 @@ class ReadLock:
         # Drop our read lock before attempting the upgrade.
         fcntl.lockf(self.f, fcntl.LOCK_UN)
         self.f.close()
+        self.f = None
         _release_read_slot(self.filename)
         try:
             wl = WriteLock(self.filename)
@@ -148,6 +158,14 @@ class ReadLock:
                 self.f = open(self.filename, "rb")
                 fcntl.lockf(self.f, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except BaseException:
+                # Re-acquire failed — release the slot we just took and
+                # leave self.f as None so a subsequent unlock() doesn't
+                # operate on a half-acquired handle.
+                if self.f is not None:
+                    try:
+                        self.f.close()
+                    finally:
+                        self.f = None
                 _release_read_slot(self.filename)
                 raise
             return False, self

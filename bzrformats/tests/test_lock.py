@@ -99,7 +99,9 @@ class TestLockBookkeeping(TestCase):
             self.assertNotIn(self.path, lock._read_locks)
             self.assertIn(self.path, lock._write_locks)
         finally:
-            wl.unlock() if ok else a.unlock()
+            # On the failure path temporary_write_lock returns (False, self)
+            # so wl == a; either way we unlock through `wl`.
+            wl.unlock()
         self.assertNotIn(self.path, lock._write_locks)
         self.assertNotIn(self.path, lock._read_locks)
 
