@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pyo3::import_exception!(bzrformats.errors, NotVersionedError);
 pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
 pyo3::import_exception!(bzrformats.errors, InvalidNormalization);
+pyo3::import_exception!(bzrformats.errors, BadFileKindError);
 pyo3::import_exception!(bzrformats.inventory, DuplicateFileId);
 pyo3::import_exception!(bzrformats.inventory, InvalidEntryName);
 pyo3::import_exception!(bzrformats.dirstate, DirstateCorrupt);
@@ -390,17 +391,10 @@ fn kind_name_from_mode(mode: u32) -> &'static str {
 /// bytes) and the raw stat mode.  Surfaces the kinds the walker
 /// cannot represent (fifo, socket, …) without coupling the pure
 /// crate to the Python error class.
-fn bad_file_kind_error(py: Python<'_>, path: &[u8], mode: u32) -> PyErr {
+fn bad_file_kind_error(_py: Python<'_>, path: &[u8], mode: u32) -> PyErr {
     let path_str = String::from_utf8_lossy(path).into_owned();
     let kind = kind_name_from_mode(mode);
-    match py
-        .import("bzrformats.errors")
-        .and_then(|m| m.getattr("BadFileKindError"))
-        .and_then(|cls| cls.call1((path_str.clone(), kind)))
-    {
-        Ok(exc) => PyErr::from_value(exc),
-        Err(e) => e,
-    }
+    BadFileKindError::new_err((path_str, kind))
 }
 
 /// Translate a `BisectError` into the appropriate Python exception:
