@@ -1053,20 +1053,35 @@ impl PyDirState {
             basename: key.get_item(1)?.extract()?,
             file_id: key.get_item(2)?.extract()?,
         };
-        // Re-stat on the Rust side: `stat_value` might be any
-        // os.stat_result shape, but we need a std::fs::Metadata.
-        // abspath is normally bytes (utf8-encoded filesystem path).
-        let path = extract_path(abspath)?;
-        // Python already did the lstat; stat_value carries the result
-        // but extracting attribute by attribute is brittle.  Re-stat
-        // in Rust — the cost is one syscall we already paid for in
-        // Python, and it lets us use the platform-native Metadata.
-        let _ = stat_value;
-        let meta = std::fs::symlink_metadata(&path)
-            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+        let abspath_bytes: Vec<u8> = if let Ok(b) = abspath.extract::<Vec<u8>>() {
+            b
+        } else {
+            abspath.extract::<String>()?.into_bytes()
+        };
+        // Unpack stat_value into a StatInfo — Python already did the
+        // lstat, no need to double-stat.
+        let stat = bazaar::dirstate::StatInfo {
+            mode: stat_value.getattr("st_mode")?.extract()?,
+            size: stat_value.getattr("st_size")?.extract()?,
+            mtime: stat_value.getattr("st_mtime")?.extract::<f64>()? as i64,
+            ctime: stat_value.getattr("st_ctime")?.extract::<f64>()? as i64,
+            dev: stat_value.getattr("st_dev")?.extract()?,
+            ino: stat_value.getattr("st_ino")?.extract()?,
+        };
+        // Transport for read_link / lstat; `update_entry` only uses
+        // read_link (symlink case), but we still need the trait object.
+        // A fresh PyFileTransport over a placeholder file is wrong —
+        // PyFileTransport's read_all/write_all/fdatasync are tied to
+        // the dirstate file.  The pure-crate contract is that lstat
+        // and read_link take arbitrary paths, which PyFileTransport
+        // implements via os.lstat / os.readlink directly.
+        let transport = PyFileTransport::new(
+            pyo3::types::PyNone::get(py).to_owned().into_any().unbind(),
+            bazaar::dirstate::LockState::Read,
+        );
         let result = self
             .inner
-            .update_entry(&entry_key, path.as_path(), &meta)
+            .update_entry(&entry_key, &abspath_bytes, &stat, &transport)
             .map_err(|e| match e {
                 bazaar::dirstate::UpdateEntryError::EntryNotFound => {
                     pyo3::exceptions::PyKeyError::new_err("update_entry: entry not found")

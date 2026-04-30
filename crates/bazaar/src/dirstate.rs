@@ -1716,26 +1716,34 @@ impl DirState {
     pub fn update_entry(
         &mut self,
         key: &EntryKey,
-        abspath: &Path,
-        stat_meta: &Metadata,
+        abspath: &[u8],
+        stat: &StatInfo,
+        transport: &dyn Transport,
     ) -> Result<Option<Vec<u8>>, UpdateEntryError> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         // 1. Derive minikind from st_mode.  Non-file/dir/symlink kinds
         //    are silently skipped (Python returns None via the
         //    KeyError branch).
-        let file_type = stat_meta.file_type();
-        let mut minikind: u8 = if file_type.is_file() {
+        let mut minikind: u8 = if stat.is_file() {
             b'f'
-        } else if file_type.is_dir() {
+        } else if stat.is_dir() {
             b'd'
-        } else if file_type.is_symlink() {
+        } else if stat.is_symlink() {
             b'l'
         } else {
             return Ok(None);
         };
 
-        let packed_stat = pack_stat_metadata(stat_meta).into_bytes();
+        let packed_stat = pack_stat(
+            stat.size,
+            stat.mtime as u64,
+            stat.ctime as u64,
+            stat.dev,
+            stat.ino,
+            stat.mode,
+        )
+        .into_bytes();
 
         // 2. Fetch the saved tree-0 row (need a clone, we'll mutate it).
         let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
@@ -1768,7 +1776,7 @@ impl DirState {
             if minikind == b'd' {
                 return Ok(None);
             }
-            if saved.size == stat_meta.len() {
+            if saved.size == stat.size {
                 return Ok(Some(saved.fingerprint.clone()));
             }
         }
@@ -1784,9 +1792,7 @@ impl DirState {
             c
         });
 
-        let mtime_secs: i64 = metadata_mtime_secs(stat_meta);
-        let ctime_secs: i64 = metadata_ctime_secs(stat_meta);
-        let stat_is_cacheable = mtime_secs < cutoff && ctime_secs < cutoff;
+        let stat_is_cacheable = stat.mtime < cutoff && stat.ctime < cutoff;
 
         let mut result: Option<Vec<u8>> = None;
         let mut worth_saving = true;
@@ -1803,27 +1809,26 @@ impl DirState {
         let new_tree0 = match minikind {
             b'f' => {
                 let executable = if self.use_filesystem_for_exec {
-                    #[cfg(unix)]
-                    {
-                        (stat_meta.mode() & 0o100) != 0
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        saved.executable
-                    }
+                    (stat.mode & 0o100) != 0
                 } else {
                     saved.executable
                 };
                 if stat_is_cacheable && entry_len > 1 && tree1_minikind != b'a' {
+                    // SHA1Provider remains a pluggable indirection for
+                    // content hashing (content filters).  Callers can
+                    // install a provider that reads through their own
+                    // layer; DefaultSHA1Provider is a thin wrapper
+                    // over `sha_file_by_name`.
+                    let path_buf = bytes_to_path(abspath);
                     let sha1 = self
                         .sha1_provider
-                        .sha1(abspath)
+                        .sha1(&path_buf)
                         .map_err(UpdateEntryError::Io)?;
                     result = Some(sha1.as_bytes().to_vec());
                     TreeData {
                         minikind: b'f',
                         fingerprint: sha1.into_bytes(),
-                        size: stat_meta.len(),
+                        size: stat.size,
                         executable,
                         packed_stat,
                     }
@@ -1832,7 +1837,7 @@ impl DirState {
                     TreeData {
                         minikind: b'f',
                         fingerprint: Vec::new(),
-                        size: stat_meta.len(),
+                        size: stat.size,
                         executable,
                         packed_stat: b"x".repeat(32),
                     }
@@ -1856,24 +1861,21 @@ impl DirState {
                 if saved.minikind == b'l' {
                     worth_saving = false;
                 }
-                let target = std::fs::read_link(abspath).map_err(UpdateEntryError::Io)?;
-                let target_bytes = {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::ffi::OsStringExt;
-                        target.into_os_string().into_vec()
+                let target_bytes = transport.read_link(abspath).map_err(|e| match e {
+                    TransportError::Io { kind, message } => {
+                        UpdateEntryError::Io(std::io::Error::new(kind, message))
                     }
-                    #[cfg(not(unix))]
-                    {
-                        target.into_os_string().into_string().unwrap().into_bytes()
+                    TransportError::NotFound(p) => {
+                        UpdateEntryError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, p))
                     }
-                };
+                    other => UpdateEntryError::Other(other.to_string()),
+                })?;
                 result = Some(target_bytes.clone());
                 if stat_is_cacheable {
                     TreeData {
                         minikind: b'l',
                         fingerprint: target_bytes,
-                        size: stat_meta.len(),
+                        size: stat.size,
                         executable: false,
                         packed_stat,
                     }
@@ -1881,7 +1883,7 @@ impl DirState {
                     TreeData {
                         minikind: b'l',
                         fingerprint: Vec::new(),
-                        size: stat_meta.len(),
+                        size: stat.size,
                         executable: false,
                         packed_stat: b"x".repeat(32),
                     }
@@ -5776,6 +5778,24 @@ impl std::error::Error for UpdateEntryError {}
 
 /// Seconds-since-epoch from a [`Metadata::modified`] reading.  Returns
 /// 0 when the platform does not carry the information.
+/// Convert a byte-encoded filesystem path into a `PathBuf`.  On unix
+/// this is a zero-copy `OsString::from_vec`; on other platforms we
+/// fall back to utf8 decoding.  Callers that hold a `&[u8]` from the
+/// Transport contract use this to talk to `SHA1Provider::sha1` which
+/// still takes a `&Path`.
+fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
 fn metadata_mtime_secs(m: &Metadata) -> i64 {
     m.modified()
         .ok()
@@ -8347,13 +8367,50 @@ mod dirstate_struct_tests {
         state.cutoff_time = Some(i64::MAX);
 
         let meta = std::fs::symlink_metadata(&fpath).unwrap();
+        let stat_info = StatInfo {
+            mode: {
+                #[cfg(unix)]
+                {
+                    meta.mode()
+                }
+                #[cfg(not(unix))]
+                {
+                    0o100644
+                }
+            },
+            size: meta.len(),
+            mtime: metadata_mtime_secs(&meta),
+            ctime: metadata_ctime_secs(&meta),
+            dev: {
+                #[cfg(unix)]
+                {
+                    meta.dev()
+                }
+                #[cfg(not(unix))]
+                {
+                    0
+                }
+            },
+            ino: {
+                #[cfg(unix)]
+                {
+                    meta.ino()
+                }
+                #[cfg(not(unix))]
+                {
+                    0
+                }
+            },
+        };
         let key = EntryKey {
             dirname: Vec::new(),
             basename: b"a-file".to_vec(),
             file_id: b"file-id".to_vec(),
         };
+        let abspath_bytes = fpath.as_os_str().as_encoded_bytes().to_vec();
+        let transport = MemoryTransport::new();
         let result = state
-            .update_entry(&key, fpath.as_path(), &meta)
+            .update_entry(&key, &abspath_bytes, &stat_info, &transport)
             .expect("update_entry");
         let sha = result.expect("file should yield a sha");
         // Sha of "first content\n".
