@@ -485,7 +485,6 @@ class DirState:
         self._lock_token = None
         self._lock_state = None
         self._id_index = None
-        self._split_path_cache = {}
         self._bisect_page_size = DirState.BISECT_PAGE_SIZE
         self._sha1_provider = sha1_provider
         self._sha1_file = self._sha1_provider.sha1
@@ -1515,7 +1514,6 @@ class DirState:
         # cutoff_time.
         self._rs.wipe_state()
         self._id_index = None
-        self._split_path_cache = {}
 
     def lock_read(self):
         """Acquire a read lock on the dirstate."""
@@ -1557,7 +1555,6 @@ class DirState:
         self._lock_state = None
         self._lock_token.unlock()
         self._lock_token = None
-        self._split_path_cache = {}
 
     def _requires_lock(self):
         """Check that a lock is currently held by someone on the dirstate."""
