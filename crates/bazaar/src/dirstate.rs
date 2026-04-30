@@ -1398,9 +1398,11 @@ impl WalkDirsUtf8 {
         F: FnMut(&[u8], &[u8], &mut Vec<DirEntryInfo>),
     {
         // Promote subdirectories discovered on the previous iteration
-        // into the pending stack, in reverse order so `pop` yields
-        // them in forward (alphabetical) order.
-        while let Some(entry) = self.pending_subdirs.pop() {
+        // into the pending stack.  `pending_subdirs` is in forward
+        // (byte-sorted) order; drain it in reverse so the
+        // smallest-named child lands on top of the stack and
+        // `pop()` below yields it first — depth-first, alphabetical.
+        for entry in self.pending_subdirs.drain(..).rev() {
             self.pending.push(entry);
         }
         let (relpath, abspath) = match self.pending.pop() {
@@ -1412,10 +1414,12 @@ impl WalkDirsUtf8 {
         entries.sort_by(|a, b| a.basename.cmp(&b.basename));
         callback(&relpath, &abspath, &mut entries);
 
-        // Collect surviving directory entries into pending_subdirs
-        // for the *next* next_dir call to push.  We reverse so the
-        // depth-first traversal lands in alphabetical order.
-        let mut subdirs: Vec<(Vec<u8>, Vec<u8>)> = entries
+        // Collect surviving directory entries into `pending_subdirs`
+        // in forward (byte-sorted) order.  The promotion loop above
+        // runs in that same order on the next call, which puts the
+        // last-named child on top of the stack — so `pop` yields
+        // the first-named child first.
+        self.pending_subdirs = entries
             .iter()
             .filter(|e| e.kind == "directory")
             .map(|e| {
@@ -1427,8 +1431,6 @@ impl WalkDirsUtf8 {
                 (child_relpath, e.abspath.clone())
             })
             .collect();
-        subdirs.reverse();
-        self.pending_subdirs = subdirs;
         Ok(true)
     }
 }
@@ -9961,6 +9963,56 @@ mod dirstate_struct_tests {
             .unwrap()
         {}
         assert_eq!(visited, vec![b"".to_vec()], "pruned dir should not recurse");
+    }
+
+    #[test]
+    fn walkdirs_utf8_depth_first_across_siblings() {
+        // Root contains two sibling dirs `a` and `a-b`.  The walker
+        // should visit `a`, recurse into `a/b`, then visit `a-b` —
+        // i.e. depth-first in byte-sorted order.  Regression for a
+        // pending-stack reversal that flipped sibling order after
+        // the first level.
+        let mut t = MemoryTransport::new();
+        let dir = StatInfo {
+            mode: 0o040755,
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 1,
+        };
+        let file = StatInfo {
+            mode: 0o100644,
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 2,
+        };
+        t.set_fs(b"", dir, None);
+        t.set_fs(b"a", dir, None);
+        t.set_fs(b"a/b", dir, None);
+        t.set_fs(b"a/b/foo", file, None);
+        t.set_fs(b"a-b", dir, None);
+        t.set_fs(b"a-b/bar", file, None);
+
+        let mut walker = WalkDirsUtf8::new(b"", b"");
+        let mut visited: Vec<Vec<u8>> = Vec::new();
+        while walker
+            .next_dir(&t, |rel, _abs, _entries| {
+                visited.push(rel.to_vec());
+            })
+            .unwrap()
+        {}
+        assert_eq!(
+            visited,
+            vec![
+                b"".to_vec(),
+                b"a".to_vec(),
+                b"a/b".to_vec(),
+                b"a-b".to_vec(),
+            ]
+        );
     }
 
     #[test]
