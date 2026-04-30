@@ -99,7 +99,7 @@ impl InventoryEntry {
 
     #[getter]
     fn kind(&self) -> &'static str {
-        self.0.kind().to_string()
+        self.0.kind().as_str()
     }
 
     #[getter]
@@ -1338,8 +1338,8 @@ impl Inventory {
             .ok_or_else(|| NoSuchId::new_err((py.None(), file_id)))
     }
 
-    fn get_file_kind(&self, file_id: FileId) -> Option<&str> {
-        self.0.get_file_kind(&file_id).map(|kind| kind.to_string())
+    fn get_file_kind(&self, file_id: FileId) -> Option<&'static str> {
+        self.0.get_file_kind(&file_id).map(|kind| kind.as_str())
     }
 
     fn has_id(&self, file_id: FileId) -> bool {

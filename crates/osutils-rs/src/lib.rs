@@ -174,7 +174,7 @@ pub fn contains_whitespace(s: &str) -> bool {
     false
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     File,
     Directory,
@@ -192,12 +192,34 @@ impl Kind {
         }
     }
 
-    pub fn to_string(&self) -> &'static str {
+    /// The string form used throughout the codebase (``"file"``,
+    /// ``"directory"``, ``"symlink"``, ``"tree-reference"``) — the
+    /// same tokens Python's inventory layer speaks.
+    pub fn as_str(&self) -> &'static str {
         match self {
             Kind::File => "file",
             Kind::Directory => "directory",
             Kind::Symlink => "symlink",
             Kind::TreeReference => "tree-reference",
+        }
+    }
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Kind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "file" => Ok(Kind::File),
+            "directory" => Ok(Kind::Directory),
+            "symlink" => Ok(Kind::Symlink),
+            "tree-reference" => Ok(Kind::TreeReference),
+            other => Err(other.to_string()),
         }
     }
 }

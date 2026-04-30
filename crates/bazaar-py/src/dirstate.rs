@@ -357,16 +357,26 @@ impl bazaar::dirstate::Transport for PyFileTransport {
     }
 }
 
-/// Map a POSIX `st_mode` to the kind string dirstate uses.  Matches
-/// `bzrformats.osutils.file_kind_from_stat_mode`; anything other
-/// than file/dir/symlink falls through to `"unknown"` (the walker
-/// ignores those rows anyway).
-fn kind_from_mode(mode: u32) -> String {
+/// Decode a minikind from the first byte of a Python-supplied
+/// `bytes` object, raising `ValueError` on an unknown byte.  Used by
+/// every pyo3 entry that accepts a minikind slice from Python.
+fn decode_minikind(bytes: &[u8]) -> PyResult<bazaar::dirstate::Kind> {
+    bazaar::dirstate::Kind::from_minikind(bytes.first().copied().unwrap_or(0)).map_err(|b| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid minikind byte {:?}", b))
+    })
+}
+
+/// Map a POSIX `st_mode` to the dirstate kind.  Matches
+/// `bzrformats.osutils.file_kind_from_stat_mode`; block / char /
+/// socket / fifo kinds are reported as `None` (the walker ignores
+/// those rows).  Never returns `TreeReference` — that distinction
+/// comes from `is_tree_reference_dir`, not the stat mode.
+fn kind_from_mode(mode: u32) -> Option<osutils::Kind> {
     match mode & 0o170000 {
-        0o100000 => "file".to_string(),
-        0o040000 => "directory".to_string(),
-        0o120000 => "symlink".to_string(),
-        _ => "unknown".to_string(),
+        0o100000 => Some(osutils::Kind::File),
+        0o040000 => Some(osutils::Kind::Directory),
+        0o120000 => Some(osutils::Kind::Symlink),
+        _ => None,
     }
 }
 
@@ -420,7 +430,7 @@ fn bisect_result_to_pydict<'py>(
                 let tup = PyTuple::new(
                     py,
                     [
-                        PyBytes::new(py, &[t.minikind]).into_any(),
+                        PyBytes::new(py, &[t.minikind.to_minikind()]).into_any(),
                         PyBytes::new(py, &t.fingerprint).into_any(),
                         t.size.into_pyobject(py)?.into_any(),
                         pyo3::types::PyBool::new(py, t.executable)
@@ -774,7 +784,7 @@ fn entry_to_py_tuple<'py>(
         let tree_tuple = PyTuple::new(
             py,
             [
-                PyBytes::new(py, &[tree.minikind]).into_any(),
+                PyBytes::new(py, &[tree.minikind.to_minikind()]).into_any(),
                 PyBytes::new(py, &tree.fingerprint).into_any(),
                 tree.size.into_pyobject(py)?.into_any(),
                 tree.executable.into_pyobject(py)?.to_owned().into_any(),
@@ -954,12 +964,12 @@ fn dirstate_change_to_pytuple<'py>(
     let kind_tuple = PyTuple::new(
         py,
         [
-            match &change.source_kind {
-                Some(s) => PyString::new(py, s).into_any().unbind(),
+            match change.source_kind {
+                Some(k) => PyString::new(py, k.as_str()).into_any().unbind(),
                 None => py.None(),
             },
-            match &change.target_kind {
-                Some(s) => PyString::new(py, s).into_any().unbind(),
+            match change.target_kind {
+                Some(k) => PyString::new(py, k.as_str()).into_any().unbind(),
                 None => py.None(),
             },
         ],
@@ -1014,9 +1024,6 @@ fn add_error_to_py(py: Python<'_>, err: bazaar::dirstate::AddError) -> PyErr {
         }
         AddError::NotVersioned { path } => {
             NotVersionedError::new_err((PyBytes::new(py, &path).unbind(), ""))
-        }
-        AddError::UnknownKind { kind } => {
-            BzrFormatsError::new_err(format!("unknown kind {:?}", kind))
         }
         AddError::AlreadyAddedAssertion { basename, file_id } => {
             pyo3::exceptions::PyAssertionError::new_err(format!(
@@ -1420,7 +1427,7 @@ impl PyDirState {
             Some(td) => Ok(Some(PyTuple::new(
                 py,
                 [
-                    PyBytes::new(py, &[td.minikind]).into_any(),
+                    PyBytes::new(py, &[td.minikind.to_minikind()]).into_any(),
                     PyBytes::new(py, &td.fingerprint).into_any(),
                     td.size.into_pyobject(py)?.into_any(),
                     pyo3::types::PyBool::new(py, td.executable)
@@ -1548,8 +1555,16 @@ impl PyDirState {
         for t in trees_any.try_iter()? {
             let tt = t?.cast_into::<PyTuple>()?;
             let mk_bytes: Vec<u8> = tt.get_item(0)?.extract()?;
+            let minikind =
+                bazaar::dirstate::Kind::from_minikind(mk_bytes.first().copied().unwrap_or(0))
+                    .map_err(|b| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "invalid minikind byte {:?}",
+                            b
+                        ))
+                    })?;
             entry_trees.push(bazaar::dirstate::TreeData {
-                minikind: mk_bytes.first().copied().unwrap_or(0),
+                minikind,
                 fingerprint: tt.get_item(1)?.extract()?,
                 size: tt.get_item(2)?.extract()?,
                 executable: tt.get_item(3)?.extract()?,
@@ -1565,10 +1580,10 @@ impl PyDirState {
             } else {
                 let pt = pi.cast::<PyTuple>()?;
                 let kind_obj = pt.get_item(2)?;
-                let kind = if kind_obj.is_none() {
+                let kind: Option<osutils::Kind> = if kind_obj.is_none() {
                     None
                 } else {
-                    Some(kind_obj.extract::<String>()?)
+                    Some(kind_obj.extract::<osutils::Kind>()?)
                 };
                 let stat_obj = pt.get_item(3)?;
                 let abspath: Vec<u8> = {
@@ -1648,11 +1663,6 @@ impl PyDirState {
                     let ds_mod = py.import("bzrformats.dirstate").unwrap();
                     let cls = ds_mod.getattr("DirstateCorrupt").unwrap();
                     PyErr::from_value(cls.call1(("<unknown>", msg)).unwrap())
-                }
-                bazaar::dirstate::ProcessEntryError::BadFileKind { path, kind } => {
-                    let errors_mod = py.import("bzrformats.errors").unwrap();
-                    let cls = errors_mod.getattr("BadFileKindError").unwrap();
-                    PyErr::from_value(cls.call1((PyBytes::new(py, &path), kind)).unwrap())
                 }
                 bazaar::dirstate::ProcessEntryError::Internal(msg) => {
                     pyo3::exceptions::PyAssertionError::new_err(msg)
@@ -1769,7 +1779,7 @@ impl PyDirState {
                     PyTuple::new(
                         py,
                         [
-                            PyBytes::new(py, &[t.minikind]).into_any(),
+                            PyBytes::new(py, &[t.minikind.to_minikind()]).into_any(),
                             PyBytes::new(py, &t.fingerprint).into_any(),
                             t.size.into_pyobject(py)?.into_any(),
                             pyo3::types::PyBool::new(py, t.executable)
@@ -1858,7 +1868,7 @@ impl PyDirState {
             file_id: key.get_item(2)?.extract()?,
         };
         let details = bazaar::dirstate::TreeData {
-            minikind: minikind.first().copied().unwrap_or(0),
+            minikind: decode_minikind(minikind)?,
             fingerprint: fingerprint.to_vec(),
             size,
             executable,
@@ -2005,7 +2015,7 @@ impl PyDirState {
             }
             let minikind_bytes: Vec<u8> = details_tup.get_item(0)?.extract()?;
             let new_details = bazaar::dirstate::TreeData {
-                minikind: minikind_bytes.first().copied().unwrap_or(0),
+                minikind: decode_minikind(&minikind_bytes)?,
                 fingerprint: details_tup.get_item(1)?.extract()?,
                 size: details_tup.get_item(2)?.extract()?,
                 executable: details_tup.get_item(3)?.extract()?,
@@ -2070,8 +2080,14 @@ impl PyDirState {
                 return none_pair();
             }
             let entry = &self.inner.dirblocks[bei.block_index].entries[bei.entry_index];
-            let t_kind = entry.trees.get(tree_index).map(|t| t.minikind).unwrap_or(0);
-            if entry.key.file_id.is_empty() || t_kind == b'a' || t_kind == b'r' {
+            let t_kind = entry.trees.get(tree_index).map(|t| t.minikind);
+            if entry.key.file_id.is_empty()
+                || matches!(
+                    t_kind,
+                    None | Some(bazaar::dirstate::Kind::Absent)
+                        | Some(bazaar::dirstate::Kind::Relocated)
+                )
+            {
                 let errors_mod = py.import("bzrformats.errors")?;
                 let bzr_err_cls = errors_mod.getattr("BzrFormatsError")?;
                 let exc = bzr_err_cls.call1(("unversioned entry?",))?;
@@ -2117,26 +2133,26 @@ impl PyDirState {
                 continue;
             }
             let entry = &self.inner.dirblocks[b_idx].entries[e_idx];
-            let t_kind = entry.trees.get(tree_index).map(|t| t.minikind).unwrap_or(0);
+            let t_kind = entry.trees.get(tree_index).map(|t| t.minikind);
             match t_kind {
-                b'f' | b'd' | b'l' | b't' => {
+                Some(k) if k.is_fdlt() => {
                     return Ok(entry_to_py_tuple(py, entry)?.unbind().into());
                 }
-                b'a' => {
+                Some(bazaar::dirstate::Kind::Absent) => {
                     if include_deleted {
                         return Ok(entry_to_py_tuple(py, entry)?.unbind().into());
                     }
                     return none_pair();
                 }
-                b'r' => {
+                Some(bazaar::dirstate::Kind::Relocated) => {
                     let real_path = entry.trees[tree_index].fingerprint.clone();
                     next_path = Some(real_path);
                     break;
                 }
-                other => {
+                Some(_) | None => {
                     return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
-                        "entry has invalid minikind {:?} for tree {}",
-                        other, tree_index
+                        "entry has invalid minikind for tree {}",
+                        tree_index
                     )));
                 }
             }
@@ -2249,7 +2265,7 @@ impl PyDirState {
             None => b"x".repeat(32), // DirState.NULLSTAT is 32 `x` bytes.
         };
         let tree0_details = bazaar::dirstate::TreeData {
-            minikind: minikind.first().copied().unwrap_or(0),
+            minikind: decode_minikind(minikind)?,
             fingerprint: fingerprint.unwrap_or(b"").to_vec(),
             size,
             executable,
@@ -2283,7 +2299,7 @@ impl PyDirState {
         dirname: &[u8],
         basename: &[u8],
         file_id: &[u8],
-        kind: &str,
+        kind: osutils::Kind,
         size: u64,
         packed_stat: &[u8],
         fingerprint: Option<&[u8]>,
@@ -2318,7 +2334,7 @@ impl PyDirState {
         py: Python<'_>,
         path: &str,
         file_id: &[u8],
-        kind: &str,
+        kind: osutils::Kind,
         stat: Option<&Bound<PyAny>>,
         fingerprint: &[u8],
     ) -> PyResult<()> {
@@ -2438,8 +2454,13 @@ impl PyDirState {
     /// `(key, minikind, executable, fingerprint, path_utf8)` 5-tuples
     /// matching the shape assembled by `update_by_delta`.
     fn apply_insertions(&mut self, adds: &Bound<PyAny>) -> PyResult<()> {
-        let mut rust_adds: Vec<(bazaar::dirstate::EntryKey, u8, bool, Vec<u8>, Vec<u8>)> =
-            Vec::new();
+        let mut rust_adds: Vec<(
+            bazaar::dirstate::EntryKey,
+            bazaar::dirstate::Kind,
+            bool,
+            Vec<u8>,
+            Vec<u8>,
+        )> = Vec::new();
         for item in adds.try_iter()? {
             let tup = item?.cast_into::<PyTuple>()?;
             if tup.len() != 5 {
@@ -2454,9 +2475,7 @@ impl PyDirState {
                 file_id: key_tup.get_item(2)?.extract()?,
             };
             let minikind_bytes: Vec<u8> = tup.get_item(1)?.extract()?;
-            let minikind = *minikind_bytes
-                .first()
-                .ok_or_else(|| PyTypeError::new_err("minikind must be non-empty"))?;
+            let minikind = decode_minikind(&minikind_bytes)?;
             let executable: bool = tup.get_item(2)?.extract()?;
             let fingerprint: Vec<u8> = tup.get_item(3)?.extract()?;
             let path_utf8: Vec<u8> = tup.get_item(4)?.extract()?;
@@ -2490,7 +2509,7 @@ impl PyDirState {
             let details_tup = tup.get_item(3)?.cast_into::<PyTuple>()?;
             let minikind_bytes: Vec<u8> = details_tup.get_item(0)?.extract()?;
             let new_details = bazaar::dirstate::TreeData {
-                minikind: minikind_bytes.first().copied().unwrap_or(0),
+                minikind: decode_minikind(&minikind_bytes)?,
                 fingerprint: details_tup.get_item(1)?.extract()?,
                 size: details_tup.get_item(2)?.extract()?,
                 executable: details_tup.get_item(3)?.extract()?,
@@ -2549,7 +2568,7 @@ impl PyDirState {
         py: Python<'_>,
         new_entries: &Bound<PyAny>,
     ) -> PyResult<()> {
-        let mut rows: Vec<(Vec<u8>, Vec<u8>, u8, Vec<u8>, bool)> = Vec::new();
+        let mut rows: Vec<(Vec<u8>, Vec<u8>, bazaar::dirstate::Kind, Vec<u8>, bool)> = Vec::new();
         for item in new_entries.try_iter()? {
             let tup = item?.cast_into::<PyTuple>()?;
             if tup.len() != 5 {
@@ -2560,7 +2579,7 @@ impl PyDirState {
             let path: Vec<u8> = tup.get_item(0)?.extract()?;
             let file_id: Vec<u8> = tup.get_item(1)?.extract()?;
             let minikind_bytes: Vec<u8> = tup.get_item(2)?.extract()?;
-            let minikind = minikind_bytes.first().copied().unwrap_or(0);
+            let minikind = decode_minikind(&minikind_bytes)?;
             let fingerprint: Vec<u8> = tup.get_item(3)?.extract()?;
             let executable: bool = tup.get_item(4)?.extract()?;
             rows.push((path, file_id, minikind, fingerprint, executable));
@@ -2612,7 +2631,7 @@ impl PyDirState {
                     return Err(PyTypeError::new_err("details must be a 5-tuple"));
                 }
                 let minikind_bytes: Vec<u8> = details_tup.get_item(0)?.extract()?;
-                let minikind = minikind_bytes.first().copied().unwrap_or(0);
+                let minikind = decode_minikind(&minikind_bytes)?;
                 let fingerprint: Vec<u8> = details_tup.get_item(1)?.extract()?;
                 let size: u64 = details_tup.get_item(2)?.extract()?;
                 let executable: bool = details_tup.get_item(3)?.extract()?;
@@ -3004,13 +3023,6 @@ impl IterChanges {
                 let cls = ds_mod.getattr("DirstateCorrupt")?;
                 Err(PyErr::from_value(cls.call1(("<unknown>", msg))?))
             }
-            Err(bazaar::dirstate::ProcessEntryError::BadFileKind { path, kind }) => {
-                let errors_mod = py.import("bzrformats.errors")?;
-                let cls = errors_mod.getattr("BadFileKindError")?;
-                Err(PyErr::from_value(
-                    cls.call1((PyBytes::new(py, &path), kind))?,
-                ))
-            }
             Err(bazaar::dirstate::ProcessEntryError::Internal(msg)) => {
                 Err(pyo3::exceptions::PyAssertionError::new_err(msg))
             }
@@ -3162,7 +3174,7 @@ fn inv_entry_to_details<'a>(
     let ret = bazaar::dirstate::inv_entry_to_details(&e.0);
 
     (
-        PyBytes::new(py, &[ret.0]),
+        PyBytes::new(py, &[ret.0.to_minikind()]),
         PyBytes::new(py, ret.1.as_slice()),
         ret.2,
         ret.3,
