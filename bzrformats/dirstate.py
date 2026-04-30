@@ -237,7 +237,7 @@ from .errors import (
     LockNotHeld,
     ObjectNotLocked,
 )
-from .osutils import _walkdirs_utf8, is_inside, is_inside_any, parent_directories
+from .osutils import is_inside, is_inside_any, parent_directories
 
 logger = logging.getLogger("bzrformats.dirstate")
 evil_logger = logging.getLogger("bzrformats.evil")
@@ -1705,376 +1705,49 @@ class ProcessEntryPython:
             self.search_specific_file_parents.add(b"")
 
     def iter_changes(self):
-        """Iterate over the changes."""
-        utf8_decode = codecs.utf_8_decode
-        _lt_by_dirs = lt_by_dirs
-        _process_entry = self._process_entry
-        search_specific_files = self.search_specific_files
-        searched_specific_files = self.searched_specific_files
-        splitpath = osutils.splitpath
-        # sketch:
-        # compare source_index and target_index at or under each element of search_specific_files.
-        # follow the following comparison table. Note that we only want to do diff operations when
-        # the target is fdl because thats when the walkdirs logic will have exposed the pathinfo
-        # for the target.
-        # cases:
-        #
-        # Source | Target | disk | action
-        #   r    | fdlt   |      | add source to search, add id path move and perform
-        #        |        |      | diff check on source-target
-        #   r    | fdlt   |  a   | dangling file that was present in the basis.
-        #        |        |      | ???
-        #   r    |  a     |      | add source to search
-        #   r    |  a     |  a   |
-        #   r    |  r     |      | this path is present in a non-examined tree, skip.
-        #   r    |  r     |  a   | this path is present in a non-examined tree, skip.
-        #   a    | fdlt   |      | add new id
-        #   a    | fdlt   |  a   | dangling locally added file, skip
-        #   a    |  a     |      | not present in either tree, skip
-        #   a    |  a     |  a   | not present in any tree, skip
-        #   a    |  r     |      | not present in either tree at this path, skip as it
-        #        |        |      | may not be selected by the users list of paths.
-        #   a    |  r     |  a   | not present in either tree at this path, skip as it
-        #        |        |      | may not be selected by the users list of paths.
-        #  fdlt  | fdlt   |      | content in both: diff them
-        #  fdlt  | fdlt   |  a   | deleted locally, but not unversioned - show as deleted ?
-        #  fdlt  |  a     |      | unversioned: output deleted id for now
-        #  fdlt  |  a     |  a   | unversioned and deleted: output deleted id
-        #  fdlt  |  r     |      | relocated in this tree, so add target to search.
-        #        |        |      | Dont diff, we will see an r,fd; pair when we reach
-        #        |        |      | this id at the other path.
-        #  fdlt  |  r     |  a   | relocated in this tree, so add target to search.
-        #        |        |      | Dont diff, we will see an r,fd; pair when we reach
-        #        |        |      | this id at the other path.
+        """Iterate over the changes.
 
-        # TODO: jam 20070516 - Avoid the _get_entry lookup overhead by
-        #       keeping a cache of directories that we have seen.
-
-        while search_specific_files:
-            # TODO: the pending list should be lexically sorted?  the
-            # interface doesn't require it.
-            current_root = search_specific_files.pop()
-            current_root_unicode = current_root.decode("utf8")
-            searched_specific_files.add(current_root)
-            # process the entries for this containing directory: the rest will be
-            # found by their parents recursively.
-            root_entries = self.state._entries_for_path(current_root)
-            root_abspath = self.tree.abspath(current_root_unicode)
-            try:
-                root_stat = os.lstat(root_abspath)
-            except FileNotFoundError:
-                # the path does not exist: let _process_entry know that.
-                root_dir_info = None
-            else:
-                root_dir_info = (
-                    b"",
-                    current_root,
-                    osutils.file_kind_from_stat_mode(root_stat.st_mode),
-                    root_stat,
-                    root_abspath,
+        Thin forwarder to the pure-crate IterChangesIter, which runs
+        the full walk + ``_gather_result_for_consistency`` +
+        ``_iter_specific_file_parents`` state machine and yields
+        :class:`DirstateInventoryChange` tuples one at a time.
+        """
+        if self.state is None:
+            # Empty-state callers (the iterator-protocol regression
+            # test) only care that iterating an empty
+            # search_specific_files yields nothing.
+            if self.search_specific_files:
+                raise AssertionError(
+                    "iter_changes with state=None requires empty search_specific_files"
                 )
-                if root_dir_info[2] == "directory":
-                    if self.tree._directory_is_tree_reference(
-                        current_root.decode("utf8")
-                    ):
-                        root_dir_info = (
-                            root_dir_info[:2] + ("tree-reference",) + root_dir_info[3:]
-                        )
-
-            if not root_entries and not root_dir_info:
-                # this specified path is not present at all, skip it.
-                continue
-            path_handled = False
-            for entry in root_entries:
-                result, changed = _process_entry(entry, root_dir_info)
-                if changed is not None:
-                    path_handled = True
-                    if changed:
-                        self._gather_result_for_consistency(result)
-                    if changed or self.include_unchanged:
-                        yield result
-            if self.want_unversioned and not path_handled and root_dir_info:
-                new_executable = bool(
-                    stat.S_ISREG(root_dir_info[3].st_mode)
-                    and stat.S_IEXEC & root_dir_info[3].st_mode
-                )
-                yield DirstateInventoryChange(
-                    None,
-                    (None, current_root_unicode),
-                    True,
-                    (False, False),
-                    (None, None),
-                    (None, splitpath(current_root_unicode)[-1]),
-                    (None, root_dir_info[2]),
-                    (None, new_executable),
-                )
-            initial_key = (current_root, b"", b"")
-            block_index, _ = self.state._find_block_index_from_key(initial_key)
-            if block_index == 0:
-                # we have processed the total root already, but because the
-                # initial key matched it we should skip it here.
-                block_index += 1
-            if root_dir_info and root_dir_info[2] == "tree-reference":
-                current_dir_info = None
-            else:
-                dir_iterator = _walkdirs_utf8(root_abspath, prefix=current_root)
-                try:
-                    current_dir_info = next(dir_iterator)
-                except (FileNotFoundError, NotADirectoryError, ValueError):
-                    current_dir_info = None
-                else:
-                    if current_dir_info[0][0] == b"":
-                        # remove .bzr from iteration
-                        bzr_index = bisect.bisect_left(current_dir_info[1], (b".bzr",))
-                        if current_dir_info[1][bzr_index][0] != b".bzr":
-                            raise AssertionError()
-                        del current_dir_info[1][bzr_index]
-            # walk until both the directory listing and the versioned metadata
-            # are exhausted.
-            if block_index < len(self.state._dirblocks) and is_inside(
-                current_root, self.state._dirblocks[block_index][0]
-            ):
-                current_block = self.state._dirblocks[block_index]
-            else:
-                current_block = None
-            while current_dir_info is not None or current_block is not None:
-                if (
-                    current_dir_info
-                    and current_block
-                    and current_dir_info[0][0] != current_block[0]
-                ):
-                    if _lt_by_dirs(current_dir_info[0][0], current_block[0]):
-                        # filesystem data refers to paths not covered by the dirblock.
-                        # this has two possibilities:
-                        # A) it is versioned but empty, so there is no block for it
-                        # B) it is not versioned.
-
-                        # if (A) then we need to recurse into it to check for
-                        # new unknown files or directories.
-                        # if (B) then we should ignore it, because we don't
-                        # recurse into unknown directories.
-                        path_index = 0
-                        while path_index < len(current_dir_info[1]):
-                            current_path_info = current_dir_info[1][path_index]
-                            if self.want_unversioned:
-                                if current_path_info[2] == "directory":
-                                    if self.tree._directory_is_tree_reference(
-                                        current_path_info[0].decode("utf8")
-                                    ):
-                                        current_path_info = (
-                                            current_path_info[:2]
-                                            + ("tree-reference",)
-                                            + current_path_info[3:]
-                                        )
-                                new_executable = bool(
-                                    stat.S_ISREG(current_path_info[3].st_mode)
-                                    and stat.S_IEXEC & current_path_info[3].st_mode
-                                )
-                                yield DirstateInventoryChange(
-                                    None,
-                                    (
-                                        None,
-                                        utf8_decode(
-                                            current_path_info[0], "surrogateescape"
-                                        )[0],
-                                    ),
-                                    True,
-                                    (False, False),
-                                    (None, None),
-                                    (
-                                        None,
-                                        utf8_decode(
-                                            current_path_info[1], "surrogateescape"
-                                        )[0],
-                                    ),
-                                    (None, current_path_info[2]),
-                                    (None, new_executable),
-                                )
-                            # dont descend into this unversioned path if it is
-                            # a dir
-                            if current_path_info[2] in ("directory", "tree-reference"):
-                                del current_dir_info[1][path_index]
-                                path_index -= 1
-                            path_index += 1
-
-                        # This dir info has been handled, go to the next
-                        try:
-                            current_dir_info = next(dir_iterator)
-                        except StopIteration:
-                            current_dir_info = None
-                    else:
-                        # We have a dirblock entry for this location, but there
-                        # is no filesystem path for this. This is most likely
-                        # because a directory was removed from the disk.
-                        # We don't have to report the missing directory,
-                        # because that should have already been handled, but we
-                        # need to handle all of the files that are contained
-                        # within.
-                        for current_entry in current_block[1]:
-                            # entry referring to file not present on disk.
-                            # advance the entry only, after processing.
-                            result, changed = _process_entry(current_entry, None)
-                            if changed is not None:
-                                if changed:
-                                    self._gather_result_for_consistency(result)
-                                if changed or self.include_unchanged:
-                                    yield result
-                        block_index += 1
-                        if block_index < len(self.state._dirblocks) and is_inside(
-                            current_root, self.state._dirblocks[block_index][0]
-                        ):
-                            current_block = self.state._dirblocks[block_index]
-                        else:
-                            current_block = None
-                    continue
-                entry_index = 0
-                if current_block and entry_index < len(current_block[1]):
-                    current_entry = current_block[1][entry_index]
-                else:
-                    current_entry = None
-                advance_entry = True
-                path_index = 0
-                if current_dir_info and path_index < len(current_dir_info[1]):
-                    current_path_info = current_dir_info[1][path_index]
-                    if current_path_info[2] == "directory":
-                        if self.tree._directory_is_tree_reference(
-                            current_path_info[0].decode("utf8")
-                        ):
-                            current_path_info = (
-                                current_path_info[:2]
-                                + ("tree-reference",)
-                                + current_path_info[3:]
-                            )
-                else:
-                    current_path_info = None
-                advance_path = True
-                path_handled = False
-                while current_entry is not None or current_path_info is not None:
-                    if current_entry is None:
-                        # the check for path_handled when the path is advanced
-                        # will yield this path if needed.
-                        pass
-                    elif current_path_info is None:
-                        # no path is fine: the per entry code will handle it.
-                        result, changed = _process_entry(
-                            current_entry, current_path_info
-                        )
-                        if changed is not None:
-                            if changed:
-                                self._gather_result_for_consistency(result)
-                            if changed or self.include_unchanged:
-                                yield result
-                    elif current_entry[0][1] != current_path_info[1] or current_entry[
-                        1
-                    ][self.target_index][0] in (b"a", b"r"):
-                        # The current path on disk doesn't match the dirblock
-                        # record. Either the dirblock is marked as absent, or
-                        # the file on disk is not present at all in the
-                        # dirblock. Either way, report about the dirblock
-                        # entry, and let other code handle the filesystem one.
-
-                        # Compare the basename for these files to determine
-                        # which comes first
-                        if current_path_info[1] < current_entry[0][1]:
-                            # extra file on disk: pass for now, but only
-                            # increment the path, not the entry
-                            advance_entry = False
-                        else:
-                            # entry referring to file not present on disk.
-                            # advance the entry only, after processing.
-                            result, changed = _process_entry(current_entry, None)
-                            if changed is not None:
-                                if changed:
-                                    self._gather_result_for_consistency(result)
-                                if changed or self.include_unchanged:
-                                    yield result
-                            advance_path = False
-                    else:
-                        result, changed = _process_entry(
-                            current_entry, current_path_info
-                        )
-                        if changed is not None:
-                            path_handled = True
-                            if changed:
-                                self._gather_result_for_consistency(result)
-                            if changed or self.include_unchanged:
-                                yield result
-                    if advance_entry and current_entry is not None:
-                        entry_index += 1
-                        if entry_index < len(current_block[1]):
-                            current_entry = current_block[1][entry_index]
-                        else:
-                            current_entry = None
-                    else:
-                        advance_entry = True  # reset the advance flaga
-                    if advance_path and current_path_info is not None:
-                        if not path_handled:
-                            # unversioned in all regards
-                            if self.want_unversioned:
-                                new_executable = bool(
-                                    stat.S_ISREG(current_path_info[3].st_mode)
-                                    and stat.S_IEXEC & current_path_info[3].st_mode
-                                )
-                                relpath_unicode = utf8_decode(
-                                    current_path_info[0], "surrogateescape"
-                                )[0]
-                                yield DirstateInventoryChange(
-                                    None,
-                                    (None, relpath_unicode),
-                                    True,
-                                    (False, False),
-                                    (None, None),
-                                    (
-                                        None,
-                                        utf8_decode(
-                                            current_path_info[1], "surrogateescape"
-                                        )[0],
-                                    ),
-                                    (None, current_path_info[2]),
-                                    (None, new_executable),
-                                )
-                            # dont descend into this unversioned path if it is
-                            # a dir
-                            if current_path_info[2] in ("directory"):
-                                del current_dir_info[1][path_index]
-                                path_index -= 1
-                        # dont descend the disk iterator into any tree
-                        # paths.
-                        if current_path_info[2] == "tree-reference":
-                            del current_dir_info[1][path_index]
-                            path_index -= 1
-                        path_index += 1
-                        if path_index < len(current_dir_info[1]):
-                            current_path_info = current_dir_info[1][path_index]
-                            if current_path_info[2] == "directory":
-                                if self.tree._directory_is_tree_reference(
-                                    current_path_info[0].decode("utf8")
-                                ):
-                                    current_path_info = (
-                                        current_path_info[:2]
-                                        + ("tree-reference",)
-                                        + current_path_info[3:]
-                                    )
-                        else:
-                            current_path_info = None
-                        path_handled = False
-                    else:
-                        advance_path = True  # reset the advance flagg.
-                if current_block is not None:
-                    block_index += 1
-                    if block_index < len(self.state._dirblocks) and is_inside(
-                        current_root, self.state._dirblocks[block_index][0]
-                    ):
-                        current_block = self.state._dirblocks[block_index]
-                    else:
-                        current_block = None
-                if current_dir_info is not None:
-                    try:
-                        current_dir_info = next(dir_iterator)
-                    except StopIteration:
-                        current_dir_info = None
-        for result in self._iter_specific_file_parents():
-            yield result
+            return
+        root_abspath = (
+            self.tree.abspath("").encode("utf8", "surrogateescape")
+            if self.tree is not None
+            else b""
+        )
+        supports_tree_reference = bool(
+            getattr(self.tree, "_repo_supports_tree_reference", False)
+        )
+        rs_iter = self.state._rs.iter_changes(
+            self.source_index,
+            self.target_index,
+            self.include_unchanged,
+            self.want_unversioned,
+            self.search_specific_files,
+            supports_tree_reference,
+            root_abspath,
+        )
+        try:
+            yield from rs_iter
+        finally:
+            # Surface the walker's final state back onto the Python
+            # instance for callers that inspect it after iteration.
+            self.searched_specific_files = rs_iter.searched_specific_files
+            self.search_specific_files = rs_iter.search_specific_files
+            self.searched_exact_paths = rs_iter.searched_exact_paths
+            self.search_specific_file_parents = rs_iter.search_specific_file_parents
+            self.seen_ids = rs_iter.seen_ids
 
     def _iter_specific_file_parents(self):
         """Iter over the specific file parents."""
