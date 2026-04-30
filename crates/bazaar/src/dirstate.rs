@@ -413,23 +413,24 @@ impl From<osutils::Kind> for Kind {
     }
 }
 
-impl std::fmt::Display for Kind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.to_str())
+impl Kind {
+    /// Convert to the 4-variant [`osutils::Kind`]; returns `None`
+    /// for ``Absent`` / ``Relocated`` (which have no filesystem
+    /// counterpart).
+    pub fn to_osutils_kind(self) -> Option<osutils::Kind> {
+        match self {
+            Kind::File => Some(osutils::Kind::File),
+            Kind::Directory => Some(osutils::Kind::Directory),
+            Kind::Symlink => Some(osutils::Kind::Symlink),
+            Kind::TreeReference => Some(osutils::Kind::TreeReference),
+            Kind::Absent | Kind::Relocated => None,
+        }
     }
 }
 
-impl From<String> for Kind {
-    fn from(s: String) -> Self {
-        match s.as_str() {
-            "absent" => Kind::Absent,
-            "file" => Kind::File,
-            "directory" => Kind::Directory,
-            "relocated" => Kind::Relocated,
-            "symlink" => Kind::Symlink,
-            "tree-reference" => Kind::TreeReference,
-            _ => panic!("Unknown kind: {}", s),
-        }
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.to_str())
     }
 }
 
@@ -875,9 +876,9 @@ pub enum LockState {
 pub struct ProcessPathInfo {
     /// Absolute path of the file on disk (utf8 bytes).
     pub abspath: Vec<u8>,
-    /// Filesystem kind ("file", "directory", "symlink",
-    /// "tree-reference"), or `None` when the path is missing.
-    pub kind: Option<String>,
+    /// Filesystem kind, or `None` when the path is missing or is of
+    /// a kind dirstate doesn't track (block / char / socket / fifo).
+    pub kind: Option<osutils::Kind>,
     /// Stat info for the path.
     pub stat: StatInfo,
 }
@@ -949,8 +950,8 @@ pub struct DirstateChange {
     pub target_parent_id: Option<Vec<u8>>,
     pub old_basename: Option<Vec<u8>>,
     pub new_basename: Option<Vec<u8>>,
-    pub source_kind: Option<String>,
-    pub target_kind: Option<String>,
+    pub source_kind: Option<osutils::Kind>,
+    pub target_kind: Option<osutils::Kind>,
     pub source_exec: Option<bool>,
     pub target_exec: Option<bool>,
 }
@@ -959,7 +960,6 @@ pub struct DirstateChange {
 #[derive(Debug)]
 pub enum ProcessEntryError {
     DirstateCorrupt(String),
-    BadFileKind { path: Vec<u8>, kind: String },
     Internal(String),
 }
 
@@ -967,9 +967,6 @@ impl std::fmt::Display for ProcessEntryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProcessEntryError::DirstateCorrupt(s) => write!(f, "dirstate corrupt: {}", s),
-            ProcessEntryError::BadFileKind { path, kind } => {
-                write!(f, "bad file kind {:?} for path {:?}", kind, path)
-            }
             ProcessEntryError::Internal(s) => write!(f, "process_entry: {}", s),
         }
     }
@@ -1011,16 +1008,6 @@ fn is_inside(parent: &[u8], candidate: &[u8]) -> bool {
     candidate.len() > parent.len()
         && candidate.starts_with(parent)
         && candidate[parent.len()] == b'/'
-}
-
-fn kind_for_minikind(mk: Kind) -> Option<String> {
-    match mk {
-        Kind::File => Some("file".to_string()),
-        Kind::Directory => Some("directory".to_string()),
-        Kind::Symlink => Some("symlink".to_string()),
-        Kind::TreeReference => Some("tree-reference".to_string()),
-        Kind::Absent | Kind::Relocated => None,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1141,23 +1128,23 @@ fn compute_path_info(
         Err(_) => return None,
     };
     let mut kind = if stat.is_file() {
-        "file".to_string()
+        Some(osutils::Kind::File)
     } else if stat.is_dir() {
-        "directory".to_string()
+        Some(osutils::Kind::Directory)
     } else if stat.is_symlink() {
-        "symlink".to_string()
+        Some(osutils::Kind::Symlink)
     } else {
-        "unknown".to_string()
+        None
     };
-    if kind == "directory"
+    if kind == Some(osutils::Kind::Directory)
         && pstate.supports_tree_reference
         && transport.is_tree_reference_dir(&abspath).unwrap_or(false)
     {
-        kind = "tree-reference".to_string();
+        kind = Some(osutils::Kind::TreeReference);
     }
     Some(ProcessPathInfo {
         abspath,
-        kind: Some(kind),
+        kind,
         stat,
     })
 }
@@ -1455,7 +1442,7 @@ impl WalkDirsUtf8 {
         // the first-named child first.
         self.pending_subdirs = entries
             .iter()
-            .filter(|e| e.kind == "directory")
+            .filter(|e| e.kind == Some(osutils::Kind::Directory))
             .map(|e| {
                 let mut child_relpath = relpath.clone();
                 if !child_relpath.is_empty() {
@@ -1582,9 +1569,9 @@ pub trait Transport {
 pub struct DirEntryInfo {
     /// The child's utf8 basename (no trailing slash).
     pub basename: Vec<u8>,
-    /// `"file"`, `"directory"`, `"symlink"`, `"tree-reference"`, or
-    /// an unknown kind.
-    pub kind: String,
+    /// Filesystem kind, or `None` for kinds dirstate doesn't track
+    /// (block / char / socket / fifo).
+    pub kind: Option<osutils::Kind>,
     /// Stat info from `lstat` on the child.
     pub stat: StatInfo,
     /// Absolute path of the child on disk (utf8 bytes).
@@ -2411,9 +2398,11 @@ impl DirState {
             }
 
             let (content_change, target_kind, target_exec) = if let Some(info) = path_info {
-                let target_kind_str: &str = info.kind.as_deref().unwrap_or("file");
-                match target_kind_str {
-                    "directory" => {
+                // Python defaults to `"file"` when the walker didn't
+                // supply a kind; preserve that (`None` → File).
+                let target_kind = info.kind.unwrap_or(osutils::Kind::File);
+                match target_kind {
+                    osutils::Kind::Directory => {
                         if path.is_none() {
                             let p = join_path(&old_dirname, &old_basename);
                             path = Some(p.clone());
@@ -2426,11 +2415,11 @@ impl DirState {
                         }
                         (
                             source_minikind != Kind::Directory,
-                            Some("directory".to_string()),
+                            Some(osutils::Kind::Directory),
                             false,
                         )
                     }
-                    "file" => {
+                    osutils::Kind::File => {
                         let cc = if source_minikind != Kind::File {
                             true
                         } else {
@@ -2460,31 +2449,22 @@ impl DirState {
                         } else {
                             target_details.executable
                         };
-                        (cc, Some("file".to_string()), te)
+                        (cc, Some(osutils::Kind::File), te)
                     }
-                    "symlink" => {
+                    osutils::Kind::Symlink => {
                         let cc = if source_minikind != Kind::Symlink {
                             true
                         } else {
                             link_or_sha1.as_deref()
                                 != Some(source_details_mut.fingerprint.as_slice())
                         };
-                        (cc, Some("symlink".to_string()), false)
+                        (cc, Some(osutils::Kind::Symlink), false)
                     }
-                    "tree-reference" => (
+                    osutils::Kind::TreeReference => (
                         source_minikind != Kind::TreeReference,
-                        Some("tree-reference".to_string()),
+                        Some(osutils::Kind::TreeReference),
                         false,
                     ),
-                    other => {
-                        if path.is_none() {
-                            path = Some(join_path(&old_dirname, &old_basename));
-                        }
-                        return Err(ProcessEntryError::BadFileKind {
-                            path: path.unwrap(),
-                            kind: other.to_string(),
-                        });
-                    }
                 }
             } else {
                 (true, None, false)
@@ -2552,7 +2532,7 @@ impl DirState {
                     target_parent_id,
                     old_basename: Some(old_basename),
                     new_basename: Some(entry_key.basename.clone()),
-                    source_kind: kind_for_minikind(source_minikind),
+                    source_kind: source_minikind.to_osutils_kind(),
                     target_kind,
                     source_exec: Some(source_exec),
                     target_exec: Some(target_exec),
@@ -2649,7 +2629,7 @@ impl DirState {
                     target_parent_id: None,
                     old_basename: Some(entry_key.basename.clone()),
                     new_basename: None,
-                    source_kind: kind_for_minikind(source_minikind),
+                    source_kind: source_minikind.to_osutils_kind(),
                     target_kind: None,
                     source_exec: Some(source_details_mut.executable),
                     target_exec: None,
@@ -2738,25 +2718,25 @@ impl DirState {
                     };
                     let root_path_info = root_stat.map(|stat| {
                         let mut kind = if stat.is_file() {
-                            "file".to_string()
+                            Some(osutils::Kind::File)
                         } else if stat.is_dir() {
-                            "directory".to_string()
+                            Some(osutils::Kind::Directory)
                         } else if stat.is_symlink() {
-                            "symlink".to_string()
+                            Some(osutils::Kind::Symlink)
                         } else {
-                            "unknown".to_string()
+                            None
                         };
-                        if kind == "directory"
+                        if kind == Some(osutils::Kind::Directory)
                             && pstate.supports_tree_reference
                             && transport
                                 .is_tree_reference_dir(&root_abspath)
                                 .unwrap_or(false)
                         {
-                            kind = "tree-reference".to_string();
+                            kind = Some(osutils::Kind::TreeReference);
                         }
                         ProcessPathInfo {
                             abspath: root_abspath.clone(),
-                            kind: Some(kind),
+                            kind,
                             stat,
                         }
                     });
@@ -2821,7 +2801,7 @@ impl DirState {
                     // absent on disk — we don't descend into it.
                     let skip_walk = root_path_info
                         .as_ref()
-                        .map(|p| p.kind.as_deref() == Some("tree-reference"))
+                        .map(|p| p.kind == Some(osutils::Kind::TreeReference))
                         .unwrap_or(true);
                     if skip_walk {
                         iter.phase = IterPhase::PickRoot;
@@ -2890,10 +2870,10 @@ impl DirState {
                     }
                     if supports_ref {
                         for e in entries.iter_mut() {
-                            if e.kind == "directory" {
-                                if transport.is_tree_reference_dir(&e.abspath).unwrap_or(false) {
-                                    e.kind = "tree-reference".to_string();
-                                }
+                            if e.kind == Some(osutils::Kind::Directory)
+                                && transport.is_tree_reference_dir(&e.abspath).unwrap_or(false)
+                            {
+                                e.kind = Some(osutils::Kind::TreeReference);
                             }
                         }
                     }
@@ -2950,7 +2930,7 @@ impl DirState {
                                 old_basename: None,
                                 new_basename: Some(pi.basename.clone()),
                                 source_kind: None,
-                                target_kind: Some(pi.kind.clone()),
+                                target_kind: pi.kind,
                                 source_exec: None,
                                 target_exec: Some(new_executable),
                             });
@@ -3076,7 +3056,7 @@ impl DirState {
                 } else {
                     let pi_rs = ProcessPathInfo {
                         abspath: pi.abspath.clone(),
-                        kind: Some(pi.kind.clone()),
+                        kind: pi.kind,
                         stat: pi.stat,
                     };
                     let (change, changed) =
@@ -3127,13 +3107,13 @@ impl DirState {
                             old_basename: None,
                             new_basename: Some(pi.basename.clone()),
                             source_kind: None,
-                            target_kind: Some(pi.kind.clone()),
+                            target_kind: pi.kind,
                             source_exec: None,
                             target_exec: Some(new_executable),
                         });
                     }
                     let pi = current_path_info.as_ref().unwrap();
-                    if pi.kind == "directory" {
+                    if pi.kind == Some(osutils::Kind::Directory) {
                         let child_rel = if walker_rel.is_empty() {
                             pi.basename.clone()
                         } else {
@@ -3148,7 +3128,7 @@ impl DirState {
                     }
                 }
                 let pi = current_path_info.as_ref().unwrap();
-                if pi.kind == "tree-reference" {
+                if pi.kind == Some(osutils::Kind::TreeReference) {
                     let child_rel = if walker_rel.is_empty() {
                         pi.basename.clone()
                     } else {
@@ -3262,8 +3242,8 @@ impl DirState {
             if changed == Some(true) {
                 if let Some(ref c) = change {
                     gather_result_for_consistency(pstate, c);
-                    if c.source_kind.as_deref() == Some("directory")
-                        && c.target_kind.as_deref() != Some("directory")
+                    if c.source_kind == Some(osutils::Kind::Directory)
+                        && c.target_kind != Some(osutils::Kind::Directory)
                     {
                         let entry_path = match pstate.source_index {
                             Some(si)
@@ -5059,7 +5039,7 @@ impl DirState {
         &mut self,
         path: &str,
         file_id: &[u8],
-        kind: &str,
+        kind: osutils::Kind,
         stat: Option<StatInfo>,
         fingerprint: &[u8],
     ) -> Result<(), AddError> {
@@ -5141,8 +5121,8 @@ impl DirState {
     /// for supplying the packed_stat bytes (use `pack_stat` on the
     /// `os.lstat` result, or `None` to substitute `NULLSTAT`).
     ///
-    /// `kind` is one of `"file"`, `"directory"`, `"symlink"`, or
-    /// `"tree-reference"` — anything else yields `AddError::UnknownKind`.
+    /// `kind` is the filesystem kind; ``osutils::Kind`` already
+    /// constrains it to the four valid variants.
     ///
     /// The method performs the same duplicate-id detection Python does:
     /// if `file_id` is already tracked at a live (non-absent) path it
@@ -5164,7 +5144,7 @@ impl DirState {
         dirname: &[u8],
         basename: &[u8],
         file_id: &[u8],
-        kind: &str,
+        kind: osutils::Kind,
         size: u64,
         packed_stat: &[u8],
         fingerprint: &[u8],
@@ -5218,15 +5198,10 @@ impl DirState {
                         p
                     };
                     let path_str = String::from_utf8_lossy(&path);
-                    let kind_str = match other {
-                        Kind::File => "file",
-                        Kind::Directory => "directory",
-                        Kind::Symlink => "symlink",
-                        Kind::TreeReference => "tree-reference",
-                        Kind::Absent | Kind::Relocated => {
-                            unreachable!("absent/relocated handled above")
-                        }
-                    };
+                    let kind_str = other
+                        .to_osutils_kind()
+                        .expect("absent/relocated handled above")
+                        .as_str();
                     return Err(AddError::DuplicateFileId {
                         file_id: file_id.to_vec(),
                         info: format!("{}:{}", kind_str, path_str),
@@ -5314,33 +5289,23 @@ impl DirState {
         // Build the tree-0 details. Python treats directories specially:
         // their fingerprint and size are always empty / zero, even if
         // the caller passes a value.
-        let minikind = match kind {
-            "file" => Kind::File,
-            "directory" => Kind::Directory,
-            "symlink" => Kind::Symlink,
-            "tree-reference" => Kind::TreeReference,
-            other => {
-                return Err(AddError::UnknownKind {
-                    kind: other.to_string(),
-                })
-            }
-        };
+        let minikind: Kind = kind.into();
         let tree0 = match kind {
-            "directory" => TreeData {
+            osutils::Kind::Directory => TreeData {
                 minikind,
                 fingerprint: Vec::new(),
                 size: 0,
                 executable: false,
                 packed_stat: packed_stat.to_vec(),
             },
-            "tree-reference" => TreeData {
+            osutils::Kind::TreeReference => TreeData {
                 minikind,
                 fingerprint: fingerprint.to_vec(),
                 size: 0,
                 executable: false,
                 packed_stat: packed_stat.to_vec(),
             },
-            _ => TreeData {
+            osutils::Kind::File | osutils::Kind::Symlink => TreeData {
                 minikind,
                 fingerprint: fingerprint.to_vec(),
                 size,
@@ -5417,7 +5382,7 @@ impl DirState {
             existing.trees[0] = trees.into_iter().next().unwrap();
         }
 
-        if kind == "directory" {
+        if kind == osutils::Kind::Directory {
             // Python: _ensure_block(block_index, entry_index, utf8path).
             // We need to pass coordinates of the entry we just inserted
             // / overwrote. Re-find it since insertion may have shifted.
@@ -7692,9 +7657,6 @@ pub enum AddError {
     /// The parent directory is not versioned. Mirrors Python's
     /// `NotVersionedError(path, self)`.
     NotVersioned { path: Vec<u8> },
-    /// An unknown kind string was supplied. Mirrors Python's
-    /// `BzrFormatsError(f"unknown kind {kind!r}")`.
-    UnknownKind { kind: String },
     /// The rename-from branch tried to re-add a file_id that was
     /// previously 'a' but the in-place insertion found an existing row
     /// with a non-absent tree-0 (should be unreachable post-normalisation).
@@ -7721,7 +7683,6 @@ impl std::fmt::Display for AddError {
                 write!(f, "adding already added path {:?}", path)
             }
             AddError::NotVersioned { path } => write!(f, "not versioned: {:?}", path),
-            AddError::UnknownKind { kind } => write!(f, "unknown kind {:?}", kind),
             AddError::AlreadyAddedAssertion { basename, file_id } => {
                 write!(f, "{:?}({:?}) already added", basename, file_id)
             }
@@ -10032,7 +9993,16 @@ mod dirstate_struct_tests {
         let mut state = add_fixture();
         let stat = b"x".repeat(32);
         state
-            .add(b"a", b"", b"a", b"fid-a", "file", 7, &stat, b"sha1")
+            .add(
+                b"a",
+                b"",
+                b"a",
+                b"fid-a",
+                osutils::Kind::File,
+                7,
+                &stat,
+                b"sha1",
+            )
             .expect("add");
         // Root-contents block (index 1) now has one entry.
         assert_eq!(state.dirblocks[1].entries.len(), 1);
@@ -10049,7 +10019,16 @@ mod dirstate_struct_tests {
         let mut state = add_fixture();
         let stat = b"x".repeat(32);
         state
-            .add(b"sub", b"", b"sub", b"fid-sub", "directory", 0, &stat, b"")
+            .add(
+                b"sub",
+                b"",
+                b"sub",
+                b"fid-sub",
+                osutils::Kind::Directory,
+                0,
+                &stat,
+                b"",
+            )
             .expect("add");
         // A new block for the directory 'sub' should now exist.
         let block_names: Vec<&[u8]> = state
@@ -10065,10 +10044,28 @@ mod dirstate_struct_tests {
         let mut state = add_fixture();
         let stat = b"x".repeat(32);
         state
-            .add(b"a", b"", b"a", b"fid-a", "file", 1, &stat, b"")
+            .add(
+                b"a",
+                b"",
+                b"a",
+                b"fid-a",
+                osutils::Kind::File,
+                1,
+                &stat,
+                b"",
+            )
             .expect("first add");
         let err = state
-            .add(b"b", b"", b"b", b"fid-a", "file", 1, &stat, b"")
+            .add(
+                b"b",
+                b"",
+                b"b",
+                b"fid-a",
+                osutils::Kind::File,
+                1,
+                &stat,
+                b"",
+            )
             .unwrap_err();
         assert!(matches!(err, AddError::DuplicateFileId { .. }));
     }
@@ -10078,22 +10075,30 @@ mod dirstate_struct_tests {
         let mut state = add_fixture();
         let stat = b"x".repeat(32);
         state
-            .add(b"a", b"", b"a", b"fid-a", "file", 1, &stat, b"")
+            .add(
+                b"a",
+                b"",
+                b"a",
+                b"fid-a",
+                osutils::Kind::File,
+                1,
+                &stat,
+                b"",
+            )
             .expect("first add");
         let err = state
-            .add(b"a", b"", b"a", b"fid-other", "file", 1, &stat, b"")
+            .add(
+                b"a",
+                b"",
+                b"a",
+                b"fid-other",
+                osutils::Kind::File,
+                1,
+                &stat,
+                b"",
+            )
             .unwrap_err();
         assert!(matches!(err, AddError::AlreadyAdded { .. }));
-    }
-
-    #[test]
-    fn add_unknown_kind_errors() {
-        let mut state = add_fixture();
-        let stat = b"x".repeat(32);
-        let err = state
-            .add(b"a", b"", b"a", b"fid-a", "pipe", 0, &stat, b"")
-            .unwrap_err();
-        assert!(matches!(err, AddError::UnknownKind { .. }));
     }
 
     #[test]
@@ -10108,7 +10113,7 @@ mod dirstate_struct_tests {
                 b"missing",
                 b"child",
                 b"fid-c",
-                "file",
+                osutils::Kind::File,
                 0,
                 &stat,
                 b"",
@@ -10156,7 +10161,7 @@ mod dirstate_struct_tests {
         let mut state = add_fixture();
         let stat = b"x".repeat(32);
         state
-            .add(b"b", b"", b"b", b"b-id", "file", 0, &stat, b"")
+            .add(b"b", b"", b"b", b"b-id", osutils::Kind::File, 0, &stat, b"")
             .expect("add");
 
         let inv_after_rename: Vec<(Vec<u8>, Vec<u8>, Kind, Vec<u8>, bool)> = vec![
@@ -10426,7 +10431,16 @@ mod dirstate_struct_tests {
         });
         let stat = b"x".repeat(32);
         state
-            .add(b"a-file", b"", b"a-file", b"file-id", "file", 0, &stat, b"")
+            .add(
+                b"a-file",
+                b"",
+                b"a-file",
+                b"file-id",
+                osutils::Kind::File,
+                0,
+                &stat,
+                b"",
+            )
             .expect("add");
         // The newly-added entry still has tree-1 = absent; make it
         // live so update_entry writes the sha.
@@ -10509,12 +10523,26 @@ mod dirstate_struct_tests {
         let stat = b"x".repeat(32);
         state
             .add(
-                b"alpha", b"", b"alpha", b"a-id", "file", 11, &stat, b"sha-a",
+                b"alpha",
+                b"",
+                b"alpha",
+                b"a-id",
+                osutils::Kind::File,
+                11,
+                &stat,
+                b"sha-a",
             )
             .expect("add alpha");
         state
             .add(
-                b"bravo", b"", b"bravo", b"b-id", "file", 22, &stat, b"sha-b",
+                b"bravo",
+                b"",
+                b"bravo",
+                b"b-id",
+                osutils::Kind::File,
+                22,
+                &stat,
+                b"sha-b",
             )
             .expect("add bravo");
 
@@ -10563,7 +10591,16 @@ mod dirstate_struct_tests {
         let mut state = add_fixture();
         let stat = b"x".repeat(32);
         state
-            .add(b"a-file", b"", b"a-file", b"file-id", "file", 0, &stat, b"")
+            .add(
+                b"a-file",
+                b"",
+                b"a-file",
+                b"file-id",
+                osutils::Kind::File,
+                0,
+                &stat,
+                b"",
+            )
             .expect("add");
 
         // One non-ghost parent tree that contains the same entries but with
@@ -10619,7 +10656,7 @@ mod dirstate_struct_tests {
         let mut state = add_fixture();
         let stat = b"x".repeat(32);
         state
-            .add(b"x", b"", b"x", b"x-id", "file", 0, &stat, b"")
+            .add(b"x", b"", b"x", b"x-id", osutils::Kind::File, 0, &stat, b"")
             .expect("add");
 
         state
@@ -10648,7 +10685,16 @@ mod dirstate_struct_tests {
         let mut state = add_fixture();
         let stat = b"x".repeat(32);
         state
-            .add(b"new-path", b"", b"new-path", b"fid", "file", 0, &stat, b"")
+            .add(
+                b"new-path",
+                b"",
+                b"new-path",
+                b"fid",
+                osutils::Kind::File,
+                0,
+                &stat,
+                b"",
+            )
             .expect("add");
 
         let root_details = TreeData {
@@ -12569,15 +12615,14 @@ mod dirstate_struct_tests {
                     continue;
                 }
                 let kind = if info.is_dir() {
-                    "directory"
+                    Some(osutils::Kind::Directory)
                 } else if info.is_file() {
-                    "file"
+                    Some(osutils::Kind::File)
                 } else if info.is_symlink() {
-                    "symlink"
+                    Some(osutils::Kind::Symlink)
                 } else {
-                    "unknown"
-                }
-                .to_string();
+                    None
+                };
                 let _ = link; // link metadata is available via read_link
                 out.push(DirEntryInfo {
                     basename: tail.to_vec(),

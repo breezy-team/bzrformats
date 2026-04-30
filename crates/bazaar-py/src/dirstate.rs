@@ -366,16 +366,17 @@ fn decode_minikind(bytes: &[u8]) -> PyResult<bazaar::dirstate::Kind> {
     })
 }
 
-/// Map a POSIX `st_mode` to the kind string dirstate uses.  Matches
-/// `bzrformats.osutils.file_kind_from_stat_mode`; anything other
-/// than file/dir/symlink falls through to `"unknown"` (the walker
-/// ignores those rows anyway).
-fn kind_from_mode(mode: u32) -> String {
+/// Map a POSIX `st_mode` to the dirstate kind.  Matches
+/// `bzrformats.osutils.file_kind_from_stat_mode`; block / char /
+/// socket / fifo kinds are reported as `None` (the walker ignores
+/// those rows).  Never returns `TreeReference` — that distinction
+/// comes from `is_tree_reference_dir`, not the stat mode.
+fn kind_from_mode(mode: u32) -> Option<osutils::Kind> {
     match mode & 0o170000 {
-        0o100000 => "file".to_string(),
-        0o040000 => "directory".to_string(),
-        0o120000 => "symlink".to_string(),
-        _ => "unknown".to_string(),
+        0o100000 => Some(osutils::Kind::File),
+        0o040000 => Some(osutils::Kind::Directory),
+        0o120000 => Some(osutils::Kind::Symlink),
+        _ => None,
     }
 }
 
@@ -963,12 +964,12 @@ fn dirstate_change_to_pytuple<'py>(
     let kind_tuple = PyTuple::new(
         py,
         [
-            match &change.source_kind {
-                Some(s) => PyString::new(py, s).into_any().unbind(),
+            match change.source_kind {
+                Some(k) => PyString::new(py, k.as_str()).into_any().unbind(),
                 None => py.None(),
             },
-            match &change.target_kind {
-                Some(s) => PyString::new(py, s).into_any().unbind(),
+            match change.target_kind {
+                Some(k) => PyString::new(py, k.as_str()).into_any().unbind(),
                 None => py.None(),
             },
         ],
@@ -1023,9 +1024,6 @@ fn add_error_to_py(py: Python<'_>, err: bazaar::dirstate::AddError) -> PyErr {
         }
         AddError::NotVersioned { path } => {
             NotVersionedError::new_err((PyBytes::new(py, &path).unbind(), ""))
-        }
-        AddError::UnknownKind { kind } => {
-            BzrFormatsError::new_err(format!("unknown kind {:?}", kind))
         }
         AddError::AlreadyAddedAssertion { basename, file_id } => {
             pyo3::exceptions::PyAssertionError::new_err(format!(
@@ -1582,10 +1580,10 @@ impl PyDirState {
             } else {
                 let pt = pi.cast::<PyTuple>()?;
                 let kind_obj = pt.get_item(2)?;
-                let kind = if kind_obj.is_none() {
+                let kind: Option<osutils::Kind> = if kind_obj.is_none() {
                     None
                 } else {
-                    Some(kind_obj.extract::<String>()?)
+                    Some(kind_obj.extract::<osutils::Kind>()?)
                 };
                 let stat_obj = pt.get_item(3)?;
                 let abspath: Vec<u8> = {
@@ -1665,11 +1663,6 @@ impl PyDirState {
                     let ds_mod = py.import("bzrformats.dirstate").unwrap();
                     let cls = ds_mod.getattr("DirstateCorrupt").unwrap();
                     PyErr::from_value(cls.call1(("<unknown>", msg)).unwrap())
-                }
-                bazaar::dirstate::ProcessEntryError::BadFileKind { path, kind } => {
-                    let errors_mod = py.import("bzrformats.errors").unwrap();
-                    let cls = errors_mod.getattr("BadFileKindError").unwrap();
-                    PyErr::from_value(cls.call1((PyBytes::new(py, &path), kind)).unwrap())
                 }
                 bazaar::dirstate::ProcessEntryError::Internal(msg) => {
                     pyo3::exceptions::PyAssertionError::new_err(msg)
@@ -2306,7 +2299,7 @@ impl PyDirState {
         dirname: &[u8],
         basename: &[u8],
         file_id: &[u8],
-        kind: &str,
+        kind: osutils::Kind,
         size: u64,
         packed_stat: &[u8],
         fingerprint: Option<&[u8]>,
@@ -2341,7 +2334,7 @@ impl PyDirState {
         py: Python<'_>,
         path: &str,
         file_id: &[u8],
-        kind: &str,
+        kind: osutils::Kind,
         stat: Option<&Bound<PyAny>>,
         fingerprint: &[u8],
     ) -> PyResult<()> {
@@ -3029,13 +3022,6 @@ impl IterChanges {
                 let ds_mod = py.import("bzrformats.dirstate")?;
                 let cls = ds_mod.getattr("DirstateCorrupt")?;
                 Err(PyErr::from_value(cls.call1(("<unknown>", msg))?))
-            }
-            Err(bazaar::dirstate::ProcessEntryError::BadFileKind { path, kind }) => {
-                let errors_mod = py.import("bzrformats.errors")?;
-                let cls = errors_mod.getattr("BadFileKindError")?;
-                Err(PyErr::from_value(
-                    cls.call1((PyBytes::new(py, &path), kind))?,
-                ))
             }
             Err(bazaar::dirstate::ProcessEntryError::Internal(msg)) => {
                 Err(pyo3::exceptions::PyAssertionError::new_err(msg))
