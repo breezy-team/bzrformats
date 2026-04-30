@@ -931,6 +931,35 @@ impl std::error::Error for TransportError {}
 /// mutates the lock state, the file contents, or both. Callers that
 /// need shared access should wrap an implementation in their own
 /// synchronisation primitive.
+/// Stat result returned by [`Transport::lstat`].  Mirrors the subset of
+/// `os.stat_result` fields that dirstate logic actually inspects:
+/// mode (for kind + executable), size, mtime/ctime (for the cutoff
+/// check), dev/ino (fed into `pack_stat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatInfo {
+    pub mode: u32,
+    pub size: u64,
+    pub mtime: i64,
+    pub ctime: i64,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl StatInfo {
+    /// Whether `mode` indicates a regular file (S_IFREG).
+    pub fn is_file(&self) -> bool {
+        self.mode & 0o170000 == 0o100000
+    }
+    /// Whether `mode` indicates a directory (S_IFDIR).
+    pub fn is_dir(&self) -> bool {
+        self.mode & 0o170000 == 0o040000
+    }
+    /// Whether `mode` indicates a symlink (S_IFLNK).
+    pub fn is_symlink(&self) -> bool {
+        self.mode & 0o170000 == 0o120000
+    }
+}
+
 pub trait Transport {
     /// Whether the backing file exists. Does not require a lock.
     fn exists(&self) -> Result<bool, TransportError>;
@@ -966,6 +995,18 @@ pub trait Transport {
     /// implementations should call `fdatasync(2)` or the platform
     /// equivalent.
     fn fdatasync(&mut self) -> Result<(), TransportError>;
+
+    /// Return the stat info for an absolute path in the working-tree
+    /// filesystem that the dirstate is tracking (not the dirstate
+    /// file itself).  `NoSuchFile` when the path is gone from disk.
+    /// Required by `DirState::update_entry` / `process_entry`, which
+    /// otherwise would couple the pure crate to `std::fs`.
+    fn lstat(&self, abspath: &[u8]) -> Result<StatInfo, TransportError>;
+
+    /// Return the target of the symlink at `abspath`.  `NoSuchFile`
+    /// when the path is gone; a generic error when the path is not a
+    /// symlink.
+    fn read_link(&self, abspath: &[u8]) -> Result<Vec<u8>, TransportError>;
 }
 
 /// Error returned while parsing the on-disk dirblock body of a dirstate
@@ -10182,9 +10223,13 @@ mod dirstate_struct_tests {
     /// In-memory [`Transport`] for tests and non-persistent use. Holds
     /// the file contents in a `Vec<u8>`; lock state is tracked
     /// explicitly so the tests can verify the state transitions.
+    /// Additionally maintains a simple `path -> (StatInfo, Option<symlink_target>)`
+    /// map so tests that exercise `lstat`/`read_link` can pre-seed
+    /// working-tree file metadata.
     struct MemoryTransport {
         contents: Option<Vec<u8>>,
         lock: Option<LockState>,
+        fs: std::collections::HashMap<Vec<u8>, (StatInfo, Option<Vec<u8>>)>,
     }
 
     impl MemoryTransport {
@@ -10192,6 +10237,7 @@ mod dirstate_struct_tests {
             Self {
                 contents: None,
                 lock: None,
+                fs: std::collections::HashMap::new(),
             }
         }
 
@@ -10199,7 +10245,13 @@ mod dirstate_struct_tests {
             Self {
                 contents: Some(bytes.to_vec()),
                 lock: None,
+                fs: std::collections::HashMap::new(),
             }
+        }
+
+        #[allow(dead_code)]
+        fn set_fs(&mut self, path: &[u8], info: StatInfo, symlink_target: Option<Vec<u8>>) {
+            self.fs.insert(path.to_vec(), (info, symlink_target));
         }
     }
 
@@ -10268,6 +10320,21 @@ mod dirstate_struct_tests {
             // No-op for in-memory transport; the call is still valid
             // so `DirState.save` can call it unconditionally.
             Ok(())
+        }
+
+        fn lstat(&self, abspath: &[u8]) -> Result<StatInfo, TransportError> {
+            self.fs.get(abspath).map(|(info, _)| *info).ok_or_else(|| {
+                TransportError::NotFound(String::from_utf8_lossy(abspath).into_owned())
+            })
+        }
+
+        fn read_link(&self, abspath: &[u8]) -> Result<Vec<u8>, TransportError> {
+            self.fs
+                .get(abspath)
+                .and_then(|(_, link)| link.clone())
+                .ok_or_else(|| {
+                    TransportError::NotFound(String::from_utf8_lossy(abspath).into_owned())
+                })
         }
     }
 

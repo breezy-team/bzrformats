@@ -137,6 +137,91 @@ impl bazaar::dirstate::Transport for PyFileTransport {
             Ok(())
         })
     }
+
+    fn lstat(
+        &self,
+        abspath: &[u8],
+    ) -> Result<bazaar::dirstate::StatInfo, bazaar::dirstate::TransportError> {
+        Python::attach(
+            |py| -> Result<bazaar::dirstate::StatInfo, bazaar::dirstate::TransportError> {
+                let os_mod = py.import("os").map_err(|e| Self::map_err(py, e))?;
+                let lstat_fn = os_mod.getattr("lstat").map_err(|e| Self::map_err(py, e))?;
+                let py_bytes = PyBytes::new(py, abspath);
+                let st = match lstat_fn.call1((py_bytes,)) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if e.is_instance_of::<pyo3::exceptions::PyFileNotFoundError>(py) {
+                            return Err(bazaar::dirstate::TransportError::NotFound(
+                                String::from_utf8_lossy(abspath).into_owned(),
+                            ));
+                        }
+                        return Err(Self::map_err(py, e));
+                    }
+                };
+                let mode: u32 = st
+                    .getattr("st_mode")
+                    .and_then(|v| v.extract())
+                    .map_err(|e| Self::map_err(py, e))?;
+                let size: u64 = st
+                    .getattr("st_size")
+                    .and_then(|v| v.extract())
+                    .map_err(|e| Self::map_err(py, e))?;
+                let mtime_f: f64 = st
+                    .getattr("st_mtime")
+                    .and_then(|v| v.extract())
+                    .map_err(|e| Self::map_err(py, e))?;
+                let ctime_f: f64 = st
+                    .getattr("st_ctime")
+                    .and_then(|v| v.extract())
+                    .map_err(|e| Self::map_err(py, e))?;
+                let dev: u64 = st
+                    .getattr("st_dev")
+                    .and_then(|v| v.extract())
+                    .map_err(|e| Self::map_err(py, e))?;
+                let ino: u64 = st
+                    .getattr("st_ino")
+                    .and_then(|v| v.extract())
+                    .map_err(|e| Self::map_err(py, e))?;
+                Ok(bazaar::dirstate::StatInfo {
+                    mode,
+                    size,
+                    mtime: mtime_f as i64,
+                    ctime: ctime_f as i64,
+                    dev,
+                    ino,
+                })
+            },
+        )
+    }
+
+    fn read_link(&self, abspath: &[u8]) -> Result<Vec<u8>, bazaar::dirstate::TransportError> {
+        Python::attach(|py| -> Result<Vec<u8>, bazaar::dirstate::TransportError> {
+            let os_mod = py.import("os").map_err(|e| Self::map_err(py, e))?;
+            let readlink_fn = os_mod
+                .getattr("readlink")
+                .map_err(|e| Self::map_err(py, e))?;
+            let py_bytes = PyBytes::new(py, abspath);
+            let target = match readlink_fn.call1((py_bytes,)) {
+                Ok(t) => t,
+                Err(e) => {
+                    if e.is_instance_of::<pyo3::exceptions::PyFileNotFoundError>(py) {
+                        return Err(bazaar::dirstate::TransportError::NotFound(
+                            String::from_utf8_lossy(abspath).into_owned(),
+                        ));
+                    }
+                    return Err(Self::map_err(py, e));
+                }
+            };
+            let bytes: Vec<u8> = match target.extract::<Vec<u8>>() {
+                Ok(b) => b,
+                Err(_) => {
+                    let s: String = target.extract().map_err(|e| Self::map_err(py, e))?;
+                    s.into_bytes()
+                }
+            };
+            Ok(bytes)
+        })
+    }
 }
 
 /// Build a `read_range(offset, len)` closure that seeks + reads on a
