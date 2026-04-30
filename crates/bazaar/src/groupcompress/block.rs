@@ -696,11 +696,11 @@ mod tests {
         // Content is not populated yet.
         assert!(b.content().is_none());
         // Partial decompression reveals at least the requested bytes.
-        b.ensure_content(Some(100));
+        b.ensure_content(Some(100)).unwrap();
         assert!(b.content().unwrap().len() >= 100);
         assert_eq!(&b.content().unwrap()[..100], &body[..100]);
         // Full decompression recovers the whole body.
-        b.ensure_content(None);
+        b.ensure_content(None).unwrap();
         assert_eq!(b.content(), Some(body.as_slice()));
     }
 
@@ -729,7 +729,7 @@ mod tests {
         // Reading it back should recover the same record payload.
         let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
         assert_eq!(parsed.content_length(), Some(record.len()));
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content(), Some(record.as_slice()));
     }
 
@@ -764,7 +764,7 @@ mod tests {
 
         let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
         assert!(parsed.content().is_none());
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content(), Some(record.as_slice()));
     }
 
@@ -781,9 +781,9 @@ mod tests {
         let raw = src.to_bytes();
 
         let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
-        parsed.ensure_content(Some(50));
+        parsed.ensure_content(Some(50)).unwrap();
         assert!(parsed.content().unwrap().len() >= 50);
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content(), Some(record.as_slice()));
     }
 
@@ -837,9 +837,9 @@ mod tests {
         let raw = src.to_bytes();
 
         let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
-        parsed.ensure_content(Some(50));
+        parsed.ensure_content(Some(50)).unwrap();
         assert!(parsed.has_z_content_decompressor());
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert!(!parsed.has_z_content_decompressor());
     }
 
@@ -856,13 +856,13 @@ mod tests {
         let raw = src.to_bytes();
 
         let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         let first = parsed.content().unwrap().to_vec();
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content().unwrap(), first.as_slice());
 
         // And a partial request below the current length is likewise a no-op.
-        parsed.ensure_content(Some(10));
+        parsed.ensure_content(Some(10)).unwrap();
         assert_eq!(parsed.content().unwrap(), first.as_slice());
     }
 
@@ -1015,7 +1015,7 @@ mod tests {
         src.to_bytes(); // force z_content population
 
         let mut parsed = GroupCompressBlock::from_bytes(src.to_bytes().as_slice()).unwrap();
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert!(parsed.content().is_some());
 
         // Now rebuild a fresh z_content for a different body and plug it in
@@ -1036,7 +1036,7 @@ mod tests {
             parsed.content().is_none(),
             "cached content should be cleared"
         );
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content(), Some(replacement_record.as_slice()));
     }
 
@@ -1056,7 +1056,7 @@ mod tests {
 
         let mut parsed = GroupCompressBlock::from_bytes(bytes.as_slice()).unwrap();
         assert_eq!(parsed.compressor(), Some(CompressorKind::Lzma));
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content(), Some(record.as_slice()));
     }
 }
