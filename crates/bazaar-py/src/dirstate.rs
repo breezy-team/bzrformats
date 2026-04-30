@@ -2759,6 +2759,63 @@ impl PyDirState {
         }
         Ok(out)
     }
+
+    /// Build a lazy `IterChanges` iterator.  Wraps the pure-crate
+    /// `IterChangesIter` state machine; call repeatedly via
+    /// `__next__` to drain one `DirstateInventoryChange`-shaped tuple
+    /// at a time.  Mirrors `ProcessEntryPython.iter_changes` but
+    /// without materialising the change list up front.
+    #[pyo3(signature = (
+        source_index,
+        target_index,
+        include_unchanged,
+        want_unversioned,
+        search_specific_files,
+        supports_tree_reference,
+        root_abspath,
+    ))]
+    fn iter_changes(
+        slf: Py<Self>,
+        py: Python<'_>,
+        source_index: Option<usize>,
+        target_index: usize,
+        include_unchanged: bool,
+        want_unversioned: bool,
+        search_specific_files: &Bound<PyAny>,
+        supports_tree_reference: bool,
+        root_abspath: &Bound<PyAny>,
+    ) -> PyResult<IterChanges> {
+        let search: std::collections::HashSet<Vec<u8>> = collect_bytes_set(search_specific_files)?;
+        let partial = !(search.len() == 1 && search.contains(&Vec::<u8>::new()));
+        let root_abspath_bytes: Vec<u8> = if let Ok(b) = root_abspath.extract::<Vec<u8>>() {
+            b
+        } else {
+            root_abspath.extract::<String>()?.into_bytes()
+        };
+        let pstate = bazaar::dirstate::ProcessEntryState {
+            source_index,
+            target_index,
+            include_unchanged,
+            want_unversioned,
+            partial,
+            supports_tree_reference,
+            root_abspath: root_abspath_bytes,
+            searched_specific_files: std::collections::HashSet::new(),
+            search_specific_files: search,
+            search_specific_file_parents: std::collections::HashSet::new(),
+            searched_exact_paths: std::collections::HashSet::new(),
+            seen_ids: std::collections::HashSet::new(),
+            new_dirname_to_file_id: std::collections::HashMap::new(),
+            old_dirname_to_file_id: std::collections::HashMap::new(),
+            last_source_parent: None,
+            last_target_parent: None,
+        };
+        Ok(IterChanges {
+            dirstate: slf.clone_ref(py),
+            iter: bazaar::dirstate::IterChangesIter::new(),
+            pstate,
+        })
+    }
 }
 
 impl PyDirState {
@@ -2855,6 +2912,125 @@ fn get_parents_line(py: Python, parent_ids: Vec<Vec<u8>>) -> PyResult<Bound<PyBy
         .collect::<Vec<&[u8]>>();
     let bs = bazaar::dirstate::get_parents_line(parent_ids.as_slice());
     Ok(PyBytes::new(py, bs.as_slice()))
+}
+
+/// Lazy iterator over the output of the pure-crate iter_changes walk.
+///
+/// The pyclass owns the walker state (`IterChangesIter`) and the
+/// per-iter `ProcessEntryState`; it borrows the underlying `DirState`
+/// via a `Py<PyDirState>` handle and re-acquires a mutable reference
+/// to it on every `__next__` call.  Filesystem calls dispatch through
+/// `PyFileTransport` wrapping `PyNone` — the transport's lstat /
+/// readlink / list_dir all go through `os.*` directly, so no file
+/// handle is required.
+#[pyclass]
+struct IterChanges {
+    dirstate: Py<PyDirState>,
+    iter: bazaar::dirstate::IterChangesIter,
+    pstate: bazaar::dirstate::ProcessEntryState,
+}
+
+#[pymethods]
+impl IterChanges {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<Self>) -> PyResult<Option<Py<PyAny>>> {
+        let py = slf.py();
+        let transport = PyFileTransport::new(
+            pyo3::types::PyNone::get(py).to_owned().into_any().unbind(),
+            bazaar::dirstate::LockState::Read,
+        );
+        let dirstate = slf.dirstate.clone_ref(py);
+        let IterChanges {
+            iter: ref mut iter_state,
+            ref mut pstate,
+            ..
+        } = *slf;
+        let result = {
+            let mut state_ref = dirstate.borrow_mut(py);
+            state_ref
+                .inner
+                .iter_changes_next(iter_state, pstate, &transport)
+        };
+        match result {
+            Ok(Some(change)) => {
+                let tup = dirstate_change_to_pytuple(py, &change)?;
+                let ds_mod = py.import("bzrformats.dirstate")?;
+                let cls = ds_mod.getattr("DirstateInventoryChange")?;
+                Ok(Some(cls.call1(tup)?.unbind()))
+            }
+            Ok(None) => Ok(None),
+            Err(bazaar::dirstate::ProcessEntryError::DirstateCorrupt(msg)) => {
+                let ds_mod = py.import("bzrformats.dirstate")?;
+                let cls = ds_mod.getattr("DirstateCorrupt")?;
+                Err(PyErr::from_value(cls.call1(("<unknown>", msg))?))
+            }
+            Err(bazaar::dirstate::ProcessEntryError::BadFileKind { path, kind }) => {
+                let errors_mod = py.import("bzrformats.errors")?;
+                let cls = errors_mod.getattr("BadFileKindError")?;
+                Err(PyErr::from_value(
+                    cls.call1((PyBytes::new(py, &path), kind))?,
+                ))
+            }
+            Err(bazaar::dirstate::ProcessEntryError::Internal(msg)) => {
+                Err(pyo3::exceptions::PyAssertionError::new_err(msg))
+            }
+        }
+    }
+
+    /// Read-only view of `search_specific_files` — the roots that
+    /// still have to be walked.  Used by Python callers that want to
+    /// peek at walker progress; mutation goes through the pure crate.
+    #[getter]
+    fn search_specific_files<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let out = pyo3::types::PySet::empty(py)?;
+        for p in &self.pstate.search_specific_files {
+            out.add(PyBytes::new(py, p))?;
+        }
+        Ok(out.into_any())
+    }
+
+    /// Read-only view of `searched_specific_files`.
+    #[getter]
+    fn searched_specific_files<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let out = pyo3::types::PySet::empty(py)?;
+        for p in &self.pstate.searched_specific_files {
+            out.add(PyBytes::new(py, p))?;
+        }
+        Ok(out.into_any())
+    }
+
+    /// Read-only view of `searched_exact_paths`.
+    #[getter]
+    fn searched_exact_paths<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let out = pyo3::types::PySet::empty(py)?;
+        for p in &self.pstate.searched_exact_paths {
+            out.add(PyBytes::new(py, p))?;
+        }
+        Ok(out.into_any())
+    }
+
+    /// Read-only view of `search_specific_file_parents`.
+    #[getter]
+    fn search_specific_file_parents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let out = pyo3::types::PySet::empty(py)?;
+        for p in &self.pstate.search_specific_file_parents {
+            out.add(PyBytes::new(py, p))?;
+        }
+        Ok(out.into_any())
+    }
+
+    /// Read-only view of `seen_ids`.
+    #[getter]
+    fn seen_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let out = pyo3::types::PySet::empty(py)?;
+        for p in &self.pstate.seen_ids {
+            out.add(PyBytes::new(py, p))?;
+        }
+        Ok(out.into_any())
+    }
 }
 
 #[pyclass]
@@ -2981,6 +3157,7 @@ pub fn _dirstate_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(get_parents_line))?;
     m.add_class::<IdIndex>()?;
     m.add_class::<PyDirState>()?;
+    m.add_class::<IterChanges>()?;
     m.add_wrapped(wrap_pyfunction!(inv_entry_to_details))?;
     m.add_wrapped(wrap_pyfunction!(get_output_lines))?;
 
