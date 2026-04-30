@@ -5,10 +5,6 @@
 //! only marshals the resulting `Vec<Dirblock>` into the list-of-tuples
 //! shape Python stores in `DirState._dirblocks`, and handles the
 //! surrounding file I/O and state-object mutation.
-//!
-//! `ProcessEntryC` still delegates to its Python counterpart since that
-//! interacts deeply with the Python `DirState` object; a future commit
-//! in the "lift DirState into Rust" series will replace it.
 
 use bazaar::dirstate::{
     entry_to_line as pure_entry_to_line, parse_dirblocks, Dirblock, DirblocksError, Entry,
@@ -132,80 +128,6 @@ pub fn _read_dirblocks(py: Python, state: &Bound<PyAny>) -> PyResult<()> {
     )?;
 
     Ok(())
-}
-
-/// Process entries for tree comparison.
-///
-/// This is a thin wrapper that delegates to the Python ProcessEntryPython
-/// class, since the implementation interacts deeply with the Python DirState
-/// object and the full tree comparison machinery.
-#[pyclass]
-pub struct ProcessEntryC {
-    inner: Py<PyAny>,
-}
-
-#[pymethods]
-impl ProcessEntryC {
-    #[new]
-    #[pyo3(signature = (include_unchanged, use_filesystem_for_exec, search_specific_files, state, source_index, target_index, want_unversioned, tree))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        py: Python,
-        include_unchanged: &Bound<PyAny>,
-        use_filesystem_for_exec: &Bound<PyAny>,
-        search_specific_files: &Bound<PyAny>,
-        state: &Bound<PyAny>,
-        source_index: &Bound<PyAny>,
-        target_index: &Bound<PyAny>,
-        want_unversioned: &Bound<PyAny>,
-        tree: &Bound<PyAny>,
-    ) -> PyResult<Self> {
-        let dirstate_mod = py.import("bzrformats.dirstate")?;
-        let process_entry_cls = dirstate_mod.getattr("ProcessEntryPython")?;
-        let inner = process_entry_cls.call1((
-            include_unchanged,
-            use_filesystem_for_exec,
-            search_specific_files,
-            state,
-            source_index,
-            target_index,
-            want_unversioned,
-            tree,
-        ))?;
-        Ok(ProcessEntryC {
-            inner: inner.into(),
-        })
-    }
-
-    fn __iter__(&self, py: Python) -> PyResult<Py<PyAny>> {
-        // Delegate to the inner Python object's iter_changes() generator so
-        // that `for x in process_entry_c` works.
-        let inner = self.inner.bind(py);
-        Ok(inner.call_method0("iter_changes")?.into())
-    }
-
-    fn iter_changes(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let inner = self.inner.bind(py);
-        Ok(inner.call_method0("iter_changes")?.into())
-    }
-
-    #[getter]
-    fn searched_specific_files(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let inner = self.inner.bind(py);
-        Ok(inner.getattr("searched_specific_files")?.into())
-    }
-
-    #[getter]
-    fn searched_exact_paths(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let inner = self.inner.bind(py);
-        Ok(inner.getattr("searched_exact_paths")?.into())
-    }
-
-    #[getter]
-    fn search_specific_files(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let inner = self.inner.bind(py);
-        Ok(inner.getattr("search_specific_files")?.into())
-    }
 }
 
 /// Extract a single Python entry tuple into a pure-Rust [`Entry`]. The
@@ -348,6 +270,5 @@ pub fn register(m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(_read_dirblocks, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(py_entry_to_line, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(py_dirblocks_to_entry_lines, m)?)?;
-    m.add_class::<ProcessEntryC>()?;
     Ok(())
 }

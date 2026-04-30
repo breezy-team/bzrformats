@@ -219,7 +219,6 @@ desired.
 """
 
 import bisect
-import codecs
 import contextlib
 import logging
 import os
@@ -1467,138 +1466,6 @@ class DirState:
             raise ObjectNotLocked(self)
 
 
-class ProcessEntryPython:
-    """Python implementation for processing directory state entries."""
-
-    __slots__ = [
-        "include_unchanged",
-        "last_source_parent",
-        "last_target_parent",
-        "new_dirname_to_file_id",
-        "old_dirname_to_file_id",
-        "partial",
-        "search_specific_file_parents",
-        "search_specific_files",
-        "searched_exact_paths",
-        "searched_specific_files",
-        "seen_ids",
-        "source_index",
-        "state",
-        "target_index",
-        "tree",
-        "use_filesystem_for_exec",
-        "utf8_decode",
-        "want_unversioned",
-    ]
-
-    def __init__(
-        self,
-        include_unchanged,
-        use_filesystem_for_exec,
-        search_specific_files,
-        state,
-        source_index,
-        target_index,
-        want_unversioned,
-        tree,
-    ):
-        """Initialize the ProcessEntryPython.
-
-        Args:
-            include_unchanged: Whether to include unchanged entries.
-            use_filesystem_for_exec: Whether to use filesystem for executable checks.
-            search_specific_files: Specific files to search for.
-            state: The dirstate being processed.
-            source_index: Index of the source tree.
-            target_index: Index of the target tree.
-            want_unversioned: Whether to include unversioned files.
-            tree: The tree object.
-        """
-        self.old_dirname_to_file_id = {}
-        self.new_dirname_to_file_id = {}
-        # Are we doing a partial iter_changes?
-        self.partial = search_specific_files != {""}
-        # Using a list so that we can access the values and change them in
-        # nested scope. Each one is [path, file_id, entry]
-        self.last_source_parent = [None, None]
-        self.last_target_parent = [None, None]
-        self.include_unchanged = include_unchanged
-        self.use_filesystem_for_exec = use_filesystem_for_exec
-        self.utf8_decode = codecs.utf_8_decode
-        # for all search_indexs in each path at or under each element of
-        # search_specific_files, if the detail is relocated: add the id, and
-        # add the relocated path as one to search if its not searched already.
-        # If the detail is not relocated, add the id.
-        self.searched_specific_files = set()
-        # When we search exact paths without expanding downwards, we record
-        # that here.
-        self.searched_exact_paths = set()
-        self.search_specific_files = search_specific_files
-        # The parents up to the root of the paths we are searching.
-        # After all normal paths are returned, these specific items are returned.
-        self.search_specific_file_parents = set()
-        # The ids we've sent out in the delta.
-        self.seen_ids = set()
-        self.state = state
-        self.source_index = source_index
-        self.target_index = target_index
-        if target_index != 0:
-            # A lot of code in here depends on target_index == 0
-            raise BzrFormatsError("unsupported target index")
-        self.want_unversioned = want_unversioned
-        self.tree = tree
-
-    def __iter__(self):
-        """Return iterator for processing entries."""
-        return self.iter_changes()
-
-    def iter_changes(self):
-        """Iterate over the changes.
-
-        Thin forwarder to the pure-crate IterChangesIter, which runs
-        the full walk, per-entry comparison, parent-consistency
-        gathering, and specific-file-parents drain as a single
-        state machine.  Yields :class:`DirstateInventoryChange`
-        tuples one at a time.
-        """
-        if self.state is None:
-            # Empty-state callers (the iterator-protocol regression
-            # test) only care that iterating an empty
-            # search_specific_files yields nothing.
-            if self.search_specific_files:
-                raise AssertionError(
-                    "iter_changes with state=None requires empty search_specific_files"
-                )
-            return
-        root_abspath = (
-            self.tree.abspath("").encode("utf8", "surrogateescape")
-            if self.tree is not None
-            else b""
-        )
-        supports_tree_reference = bool(
-            getattr(self.tree, "_repo_supports_tree_reference", False)
-        )
-        rs_iter = self.state._rs.iter_changes(
-            self.source_index,
-            self.target_index,
-            self.include_unchanged,
-            self.want_unversioned,
-            self.search_specific_files,
-            supports_tree_reference,
-            root_abspath,
-        )
-        try:
-            yield from rs_iter
-        finally:
-            # Surface the walker's final state back onto the Python
-            # instance for callers that inspect it after iteration.
-            self.searched_specific_files = rs_iter.searched_specific_files
-            self.search_specific_files = rs_iter.search_specific_files
-            self.searched_exact_paths = rs_iter.searched_exact_paths
-            self.search_specific_file_parents = rs_iter.search_specific_file_parents
-            self.seen_ids = rs_iter.seen_ids
-
-
 from ._bzr_rs import dirstate as _dirstate_rs
 
 DefaultSHA1Provider = _dirstate_rs.DefaultSHA1Provider
@@ -1616,4 +1483,3 @@ _inv_entry_to_details = _dirstate_rs.inv_entry_to_details
 _get_output_lines = _dirstate_rs.get_output_lines
 
 _read_dirblocks = _dirstate_rs._read_dirblocks
-_process_entry = _dirstate_rs.ProcessEntryC
