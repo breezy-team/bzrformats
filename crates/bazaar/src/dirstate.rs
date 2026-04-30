@@ -1586,6 +1586,78 @@ impl DirState {
             .map(|t| t.minikind)
     }
 
+    /// Record an observed sha1 for `key`'s tree-0 row when the file's
+    /// stat falls in the cacheable window.  Mirrors Python's
+    /// `DirState._observed_sha1`: silently ignores non-file kinds and
+    /// files whose mtime/ctime land after the cutoff.
+    ///
+    /// Takes the stat fields unpacked so callers can feed in whichever
+    /// shape they already have (Python's `os.stat_result`, Rust's
+    /// [`Metadata`], synthetic fixture data).
+    #[allow(clippy::too_many_arguments)]
+    pub fn observed_sha1(
+        &mut self,
+        key: &EntryKey,
+        sha1: &[u8],
+        st_mode: u32,
+        st_size: u64,
+        st_mtime: i64,
+        st_ctime: i64,
+        st_dev: u64,
+        st_ino: u64,
+    ) -> Result<(), UpdateEntryError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // S_IFREG (0o100000) after masking with S_IFMT.
+        if (st_mode & 0o170000) != 0o100000 {
+            return Ok(());
+        }
+
+        let now_secs: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff: i64 = self.cutoff_time.unwrap_or_else(|| {
+            let c = now_secs - 3;
+            self.cutoff_time = Some(c);
+            c
+        });
+
+        if st_mtime >= cutoff || st_ctime >= cutoff {
+            return Ok(());
+        }
+
+        let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
+        if !block_present {
+            return Err(UpdateEntryError::EntryNotFound);
+        }
+        let (entry_index, entry_present) =
+            find_entry_index(key, &self.dirblocks[block_index].entries);
+        if !entry_present {
+            return Err(UpdateEntryError::EntryNotFound);
+        }
+        let executable = self.dirblocks[block_index].entries[entry_index].trees[0].executable;
+        let packed_stat = pack_stat(
+            st_size,
+            st_mtime as u64,
+            st_ctime as u64,
+            st_dev,
+            st_ino,
+            st_mode,
+        )
+        .into_bytes();
+        self.dirblocks[block_index].entries[entry_index].trees[0] = TreeData {
+            minikind: b'f',
+            fingerprint: sha1.to_vec(),
+            size: st_size,
+            executable,
+            packed_stat,
+        };
+        self.packed_stat_index = None;
+        self.mark_modified(&[key.clone()], false);
+        Ok(())
+    }
+
     /// Refresh the tree-0 slot of `key` from the filesystem.  Mirrors
     /// Python's `py_update_entry`: if the stat hasn't changed since
     /// the last time we saved, re-use the cached link-or-sha1;

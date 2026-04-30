@@ -966,34 +966,28 @@ class DirState:
         """
         self._rs.after_delta_check_parents(list(parents), index)
 
-    def _observed_sha1(
-        self, entry, sha1, stat_value, _stat_to_minikind=_stat_to_minikind
-    ):
+    def _observed_sha1(self, entry, sha1, stat_value):
         """Note the sha1 of a file.
 
-        :param entry: The entry the sha1 is for.
-        :param sha1: The observed sha1.
-        :param stat_value: The os.lstat for the file.
+        Thin shim over DirStateRs.observed_sha1.
         """
-        try:
-            minikind = _stat_to_minikind[stat_value.st_mode & 0o170000]
-        except KeyError:
-            # Unhandled kind
-            return None
-        if minikind == b"f":
-            if self._cutoff_time is None:
-                self._sha_cutoff_time()
-            if (
-                stat_value.st_mtime < self._cutoff_time
-                and stat_value.st_ctime < self._cutoff_time
-            ):
-                executable = entry[1][0][3]
-                packed = pack_stat(stat_value)
-                entry[1][0] = (b"f", sha1, stat_value.st_size, executable, packed)
-                self._rs.set_tree0(
-                    entry[0], b"f", sha1, stat_value.st_size, executable, packed
-                )
-                self._mark_modified([entry])
+        self._rs.observed_sha1(
+            entry[0],
+            sha1,
+            stat_value.st_mode,
+            stat_value.st_size,
+            stat_value.st_mtime,
+            stat_value.st_ctime,
+            stat_value.st_dev,
+            stat_value.st_ino,
+        )
+        # Refresh the in-memory entry tuple so callers that hang on
+        # to the snapshot still see the new tree-0.
+        fresh = self._rs.get_entry(
+            0, path_utf8=osutils.pathjoin(entry[0][0], entry[0][1])
+        )
+        if fresh != (None, None):
+            entry[1][0] = fresh[1][0]
 
     def _sha_cutoff_time(self):
         """Return cutoff time.

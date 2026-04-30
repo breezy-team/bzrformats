@@ -915,6 +915,40 @@ impl PyDirState {
         })
     }
 
+    /// Record the observed sha1 for the entry at `key`.  Mirrors
+    /// Python's `DirState._observed_sha1`; the caller supplies the
+    /// stat fields unpacked from the existing `os.stat_result`.
+    #[pyo3(signature = (key, sha1, st_mode, st_size, st_mtime, st_ctime, st_dev, st_ino))]
+    fn observed_sha1(
+        &mut self,
+        key: &Bound<PyTuple>,
+        sha1: &[u8],
+        st_mode: u32,
+        st_size: u64,
+        st_mtime: f64,
+        st_ctime: f64,
+        st_dev: u64,
+        st_ino: u64,
+    ) -> PyResult<()> {
+        let entry_key = bazaar::dirstate::EntryKey {
+            dirname: key.get_item(0)?.extract()?,
+            basename: key.get_item(1)?.extract()?,
+            file_id: key.get_item(2)?.extract()?,
+        };
+        self.inner
+            .observed_sha1(
+                &entry_key,
+                sha1,
+                st_mode,
+                st_size,
+                st_mtime as i64,
+                st_ctime as i64,
+                st_dev,
+                st_ino,
+            )
+            .map_err(|e| pyo3::exceptions::PyKeyError::new_err(format!("observed_sha1: {}", e)))
+    }
+
     /// Refresh the tree-0 slot of the entry at `key` from the
     /// filesystem.  Mirrors Python's `py_update_entry`.
     /// `abspath` is the absolute path of the file on disk.
