@@ -66,17 +66,27 @@ class BzrFormatsError(Exception):
     def _format(self):
         s = getattr(self, "_preformatted_string", None)
         if s is not None:
-            # contains a preformatted message
+            # Contains a preformatted message.  Some callers pass
+            # bytes here (e.g. a raw revision id) or a tuple (e.g.
+            # a versionedfile key) — coerce so __str__ always
+            # returns str.
+            if isinstance(s, bytes):
+                return s.decode("utf-8", "replace")
+            if not isinstance(s, str):
+                return repr(s)
             return s
         err = None
         try:
             fmt = self._get_format_string()
             if fmt:
-                d = dict(self.__dict__)
-                s = fmt % d
-                # __str__() should always return a 'str' object
-                # never a 'unicode' object.
-                return s
+                # Coerce any bytes values to str so that `fmt % d`
+                # never produces a bytes string — __str__ must
+                # return `str`.
+                d = {
+                    k: (v.decode("utf-8", "replace") if isinstance(v, bytes) else v)
+                    for k, v in self.__dict__.items()
+                }
+                return fmt % d
         except Exception as e:
             err = e
         return "Unprintable exception {}: dict={!r}, fmt={!r}, error={!r}".format(
