@@ -5933,3 +5933,471 @@ fn iter_changes_specific_file_scope_with_unknown_path_yields_nothing() {
     );
     assert!(changes.is_empty(), "expected no changes; got {:?}", changes);
 }
+
+#[test]
+fn statinfo_is_file_only_for_regular_files() {
+    let regular = StatInfo {
+        mode: 0o100644,
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        dev: 0,
+        ino: 0,
+    };
+    assert!(regular.is_file());
+    assert!(!regular.is_dir());
+    assert!(!regular.is_symlink());
+}
+
+#[test]
+fn statinfo_is_dir_only_for_directories() {
+    let dir = StatInfo {
+        mode: 0o040755,
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        dev: 0,
+        ino: 0,
+    };
+    assert!(dir.is_dir());
+    assert!(!dir.is_file());
+    assert!(!dir.is_symlink());
+}
+
+#[test]
+fn statinfo_is_symlink_only_for_symlinks() {
+    let link = StatInfo {
+        mode: 0o120777,
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        dev: 0,
+        ino: 0,
+    };
+    assert!(link.is_symlink());
+    assert!(!link.is_file());
+    assert!(!link.is_dir());
+}
+
+#[test]
+fn statinfo_is_none_of_three_for_fifo_or_socket() {
+    // S_IFIFO = 0o010000 — neither file, dir, nor symlink.
+    let fifo = StatInfo {
+        mode: 0o010644,
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        dev: 0,
+        ino: 0,
+    };
+    assert!(!fifo.is_file());
+    assert!(!fifo.is_dir());
+    assert!(!fifo.is_symlink());
+}
+
+#[test]
+fn transport_error_from_io_not_found_maps_to_not_found_variant() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+    let te: TransportError = io_err.into();
+    assert!(
+        matches!(te, TransportError::NotFound(_)),
+        "expected NotFound; got {:?}",
+        te
+    );
+}
+
+#[test]
+fn transport_error_from_io_other_kinds_map_to_io_variant() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+    let te: TransportError = io_err.into();
+    match te {
+        TransportError::Io { kind, .. } => assert_eq!(kind, std::io::ErrorKind::PermissionDenied),
+        other => panic!("expected Io; got {:?}", other),
+    }
+}
+
+#[test]
+fn transport_error_display_covers_every_variant() {
+    let cases = [
+        TransportError::NotFound("p".into()),
+        TransportError::LockContention("p".into()),
+        TransportError::NotLocked,
+        TransportError::AlreadyLocked,
+        TransportError::Io {
+            kind: std::io::ErrorKind::Other,
+            message: "boom".into(),
+        },
+        TransportError::Other("x".into()),
+    ];
+    for err in cases {
+        let s = format!("{}", err);
+        assert!(!s.is_empty(), "empty display for {:?}", err);
+    }
+}
+
+#[test]
+fn default_sha1_provider_default_and_new_match() {
+    let _a = DefaultSHA1Provider::new();
+    let _b = DefaultSHA1Provider;
+    let _c: DefaultSHA1Provider = Default::default();
+}
+
+#[test]
+fn default_sha1_provider_sha1_matches_known_value() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("hello");
+    std::fs::write(&path, b"hello").expect("write");
+    let provider = DefaultSHA1Provider::new();
+    let sha = provider.sha1(&path).expect("sha1");
+    // sha1("hello") == aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d
+    assert_eq!(sha, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
+}
+
+#[test]
+fn default_sha1_provider_stat_and_sha1_returns_consistent_pair() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("data");
+    std::fs::write(&path, b"abc").expect("write");
+    let provider = DefaultSHA1Provider::new();
+    let (stat, sha) = provider.stat_and_sha1(&path).expect("stat_and_sha1");
+    assert_eq!(stat.size, 3);
+    assert!(stat.is_file());
+    assert_eq!(sha, "a9993e364706816aba3e25717850c26c9cd0d89d");
+}
+
+#[test]
+fn tree0_minikind_returns_file_for_present_entry() {
+    let mut state = add_fixture();
+    versioned_file_row(&mut state, b"a", b"fid-a", &file_stat(5, 2), b"sha");
+    let key = EntryKey {
+        dirname: b"".to_vec(),
+        basename: b"a".to_vec(),
+        file_id: b"fid-a".to_vec(),
+    };
+    assert_eq!(state.tree0_minikind(&key), Some(Kind::File));
+}
+
+#[test]
+fn tree0_minikind_returns_none_for_missing_entry() {
+    let state = add_fixture();
+    let key = EntryKey {
+        dirname: b"".to_vec(),
+        basename: b"missing".to_vec(),
+        file_id: b"missing-id".to_vec(),
+    };
+    assert_eq!(state.tree0_minikind(&key), None);
+}
+
+#[test]
+fn set_tree0_replaces_tree0_when_key_present() {
+    let mut state = add_fixture();
+    versioned_file_row(&mut state, b"a", b"fid-a", &file_stat(5, 2), b"sha");
+    let key = EntryKey {
+        dirname: b"".to_vec(),
+        basename: b"a".to_vec(),
+        file_id: b"fid-a".to_vec(),
+    };
+    let new_details = TreeData {
+        minikind: Kind::Symlink,
+        fingerprint: b"target".to_vec(),
+        size: 6,
+        executable: false,
+        packed_stat: b"y".repeat(32),
+    };
+    state
+        .set_tree0(&key, new_details.clone())
+        .expect("set_tree0");
+    let block = state
+        .dirblocks
+        .iter()
+        .find(|b| {
+            b.dirname.is_empty() && !b.entries.is_empty() && b.entries[0].key.basename == b"a"
+        })
+        .expect("entry block");
+    let row = block.entries.iter().find(|e| e.key == key).expect("row");
+    assert_eq!(row.trees[0], new_details);
+}
+
+#[test]
+fn set_tree0_returns_entry_not_found_when_block_present_but_no_entry() {
+    let mut state = add_fixture();
+    let key = EntryKey {
+        dirname: b"".to_vec(),
+        basename: b"missing".to_vec(),
+        file_id: b"x".to_vec(),
+    };
+    let details = TreeData {
+        minikind: Kind::File,
+        fingerprint: Vec::new(),
+        size: 0,
+        executable: false,
+        packed_stat: b"x".repeat(32),
+    };
+    let err = state.set_tree0(&key, details).unwrap_err();
+    assert!(
+        matches!(err, MakeAbsentError::EntryNotFound { .. }),
+        "got {:?}",
+        err
+    );
+}
+
+#[test]
+fn set_tree0_returns_block_not_found_when_dirblock_missing() {
+    let mut state = add_fixture();
+    let key = EntryKey {
+        dirname: b"no-such-dir".to_vec(),
+        basename: b"x".to_vec(),
+        file_id: b"x".to_vec(),
+    };
+    let details = TreeData {
+        minikind: Kind::File,
+        fingerprint: Vec::new(),
+        size: 0,
+        executable: false,
+        packed_stat: b"x".repeat(32),
+    };
+    let err = state.set_tree0(&key, details).unwrap_err();
+    assert!(
+        matches!(err, MakeAbsentError::BlockNotFound { .. }),
+        "got {:?}",
+        err
+    );
+}
+
+#[test]
+fn compute_sha_cutoff_time_caches_value() {
+    let mut state = add_fixture();
+    let first = state.compute_sha_cutoff_time();
+    assert_eq!(state.cutoff_time, Some(first));
+    // Second call may return a slightly later value (clock advances)
+    // but always overwrites the cache to the latest reading.
+    let second = state.compute_sha_cutoff_time();
+    assert_eq!(state.cutoff_time, Some(second));
+    assert!(second >= first);
+}
+
+#[test]
+fn observed_sha1_skips_non_regular_files() {
+    let mut state = add_fixture();
+    versioned_file_row(&mut state, b"a", b"fid-a", &file_stat(5, 2), b"sha");
+    let key = EntryKey {
+        dirname: b"".to_vec(),
+        basename: b"a".to_vec(),
+        file_id: b"fid-a".to_vec(),
+    };
+    // Directory mode should be a no-op.
+    let result = state
+        .observed_sha1(&key, b"newsha", 0o040755, 0, 0, 0, 0, 0)
+        .expect("observed_sha1");
+    assert!(result.is_none());
+}
+
+#[test]
+fn observed_sha1_skips_when_stat_falls_inside_uncacheable_window() {
+    let mut state = add_fixture();
+    versioned_file_row(&mut state, b"a", b"fid-a", &file_stat(5, 2), b"sha");
+    let key = EntryKey {
+        dirname: b"".to_vec(),
+        basename: b"a".to_vec(),
+        file_id: b"fid-a".to_vec(),
+    };
+    // Pin the cutoff to a known value and then feed mtime/ctime
+    // that fall *after* it — observed_sha1 should refuse to cache.
+    state.cutoff_time = Some(100);
+    let result = state
+        .observed_sha1(&key, b"newsha", 0o100644, 5, 200, 200, 1, 2)
+        .expect("observed_sha1");
+    assert!(
+        result.is_none(),
+        "expected None on racy stat; got {:?}",
+        result
+    );
+}
+
+#[test]
+fn observed_sha1_writes_tree0_for_cacheable_regular_file() {
+    let mut state = add_fixture();
+    versioned_file_row(&mut state, b"a", b"fid-a", &file_stat(5, 2), b"oldsha");
+    let key = EntryKey {
+        dirname: b"".to_vec(),
+        basename: b"a".to_vec(),
+        file_id: b"fid-a".to_vec(),
+    };
+    state.cutoff_time = Some(1000);
+    let result = state
+        .observed_sha1(&key, b"newsha", 0o100644, 5, 100, 100, 1, 2)
+        .expect("observed_sha1");
+    let new_tree0 = result.expect("expected Some(TreeData) on cacheable observe");
+    assert_eq!(new_tree0.minikind, Kind::File);
+    assert_eq!(new_tree0.fingerprint, b"newsha".to_vec());
+    assert_eq!(new_tree0.size, 5);
+    // The dirblock now reflects the new sha.
+    let block = &state
+        .dirblocks
+        .iter()
+        .find(|b| {
+            b.dirname.is_empty() && !b.entries.is_empty() && b.entries[0].key.basename == b"a"
+        })
+        .unwrap();
+    let row = &block.entries[0];
+    assert_eq!(row.trees[0].fingerprint, b"newsha".to_vec());
+}
+
+#[test]
+fn observed_sha1_returns_entry_not_found_for_unknown_key() {
+    let mut state = add_fixture();
+    state.cutoff_time = Some(1000);
+    let key = EntryKey {
+        dirname: b"".to_vec(),
+        basename: b"missing".to_vec(),
+        file_id: b"x".to_vec(),
+    };
+    let err = state
+        .observed_sha1(&key, b"sha", 0o100644, 0, 100, 100, 1, 2)
+        .unwrap_err();
+    assert!(
+        matches!(err, UpdateEntryError::EntryNotFound),
+        "got {:?}",
+        err
+    );
+}
+
+#[test]
+fn bootstrap_new_parent_slot_appends_one_absent_tree_per_row() {
+    let mut state = add_fixture();
+    versioned_file_row(&mut state, b"a", b"fid-a", &file_stat(5, 2), b"sha");
+    let pre_lens: Vec<usize> = state
+        .dirblocks
+        .iter()
+        .flat_map(|b| b.entries.iter().map(|e| e.trees.len()))
+        .collect();
+    state.bootstrap_new_parent_slot();
+    let post_lens: Vec<usize> = state
+        .dirblocks
+        .iter()
+        .flat_map(|b| b.entries.iter().map(|e| e.trees.len()))
+        .collect();
+    assert_eq!(post_lens.len(), pre_lens.len());
+    for (pre, post) in pre_lens.iter().zip(post_lens.iter()) {
+        assert_eq!(*post, pre + 1);
+    }
+    // Every newly-added slot is Absent.
+    for block in &state.dirblocks {
+        for entry in &block.entries {
+            let last = entry.trees.last().unwrap();
+            assert_eq!(last.minikind, Kind::Absent);
+            assert!(last.fingerprint.is_empty());
+        }
+    }
+}
+
+#[test]
+fn add_path_inserts_entry_using_path_string() {
+    let mut state = add_fixture();
+    state
+        .add_path("a", b"fid-a", osutils::Kind::File, None, b"")
+        .expect("add_path");
+    let row = state
+        .get_entry_by_path(0, b"a")
+        .expect("entry must exist after add_path");
+    assert_eq!(row.key.file_id, b"fid-a".to_vec());
+    assert_eq!(row.trees[0].minikind, Kind::File);
+}
+
+#[test]
+fn add_path_rejects_dot_basename() {
+    let mut state = add_fixture();
+    let err = state
+        .add_path(".", b"fid", osutils::Kind::File, None, b"")
+        .unwrap_err();
+    assert!(
+        matches!(err, AddError::InvalidEntryName { .. }),
+        "got {:?}",
+        err
+    );
+}
+
+#[test]
+fn add_path_rejects_dotdot_basename() {
+    let mut state = add_fixture();
+    let err = state
+        .add_path("sub/..", b"fid", osutils::Kind::File, None, b"")
+        .unwrap_err();
+    assert!(
+        matches!(err, AddError::InvalidEntryName { .. }),
+        "got {:?}",
+        err
+    );
+}
+
+#[test]
+fn apply_removals_makes_entry_absent() {
+    let mut state = add_fixture();
+    state
+        .add_path("a", b"fid-a", osutils::Kind::File, None, b"")
+        .expect("add_path");
+    state
+        .apply_removals(&[(b"fid-a".to_vec(), b"a".to_vec())])
+        .expect("apply_removals");
+    // After removal, the file_id no longer maps to a live entry.
+    let entry = state.get_entry_by_file_id(0, b"fid-a", false);
+    assert!(
+        matches!(entry, super::GetEntryResult::NotFound),
+        "expected NotFound; got {:?}",
+        entry
+    );
+}
+
+#[test]
+fn apply_removals_with_wrong_file_id_returns_invalid() {
+    let mut state = add_fixture();
+    state
+        .add_path("a", b"fid-a", osutils::Kind::File, None, b"")
+        .expect("add_path");
+    let err = state
+        .apply_removals(&[(b"wrong-id".to_vec(), b"a".to_vec())])
+        .unwrap_err();
+    assert!(
+        matches!(err, BasisApplyError::Invalid { .. }),
+        "got {:?}",
+        err
+    );
+}
+
+#[test]
+fn apply_removals_with_unknown_path_returns_invalid() {
+    let mut state = add_fixture();
+    let err = state
+        .apply_removals(&[(b"fid".to_vec(), b"missing".to_vec())])
+        .unwrap_err();
+    assert!(
+        matches!(err, BasisApplyError::Invalid { .. }),
+        "got {:?}",
+        err
+    );
+}
+
+#[test]
+fn validate_accepts_clean_fixture() {
+    let state = add_fixture();
+    state.validate().expect("clean fixture must validate");
+}
+
+#[test]
+fn validate_rejects_dirblock_not_starting_with_root() {
+    let mut state = add_fixture();
+    state.dirblocks[0].dirname = b"sub".to_vec();
+    assert!(state.validate().is_err());
+}
+
+#[test]
+fn iter_changes_iter_default_matches_new() {
+    let from_new = IterChangesIter::new();
+    let from_default: IterChangesIter = Default::default();
+    // No PartialEq, so check observable defaults — pending empty, no
+    // current root, root_processed false.
+    assert!(from_new.pending.is_empty());
+    assert!(from_default.pending.is_empty());
+    assert!(from_new.current_root.is_none());
+    assert!(from_default.current_root.is_none());
+}
