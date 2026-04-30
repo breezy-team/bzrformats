@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 pyo3::import_exception!(bzrformats.errors, NotVersionedError);
 pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
+pyo3::import_exception!(bzrformats.inventory, DuplicateFileId);
 
 // TODO(jelmer): Shared pyo3 utils?
 fn extract_path(object: &Bound<PyAny>) -> PyResult<PathBuf> {
@@ -1144,6 +1145,68 @@ impl PyDirState {
         {
             Ok(()) => Ok(()),
             Err(e) => Err(self.raise_basis_apply_error(py, e)),
+        }
+    }
+
+    /// Add a new tracked entry. Mirrors Python's `DirState.add` after
+    /// path normalisation: the caller hands in the already-normalised
+    /// utf8 path, its `(dirname, basename)` split, the file id, kind
+    /// string, size, packed_stat bytes, and fingerprint bytes.
+    ///
+    /// Raises `DuplicateFileId` when the file_id already lives at a
+    /// live path, a bare `Exception("adding already added path!")`
+    /// when a different file_id already occupies `(dirname,
+    /// basename)`, `NotVersionedError` when the parent dir is missing,
+    /// `BzrFormatsError` for unknown kinds, and `AssertionError` for
+    /// internal invariant violations.
+    #[allow(clippy::too_many_arguments)]
+    fn add(
+        &mut self,
+        py: Python<'_>,
+        utf8path: &[u8],
+        dirname: &[u8],
+        basename: &[u8],
+        file_id: &[u8],
+        kind: &str,
+        size: u64,
+        packed_stat: &[u8],
+        fingerprint: &[u8],
+    ) -> PyResult<()> {
+        match self.inner.add(
+            utf8path,
+            dirname,
+            basename,
+            file_id,
+            kind,
+            size,
+            packed_stat,
+            fingerprint,
+        ) {
+            Ok(()) => Ok(()),
+            Err(bazaar::dirstate::AddError::DuplicateFileId { file_id, info }) => Err(
+                DuplicateFileId::new_err((PyBytes::new(py, &file_id).unbind(), info)),
+            ),
+            Err(bazaar::dirstate::AddError::AlreadyAdded { path }) => {
+                Err(pyo3::exceptions::PyException::new_err(format!(
+                    "adding already added path! {:?}",
+                    path
+                )))
+            }
+            Err(bazaar::dirstate::AddError::NotVersioned { path }) => Err(
+                NotVersionedError::new_err((PyBytes::new(py, &path).unbind(), "")),
+            ),
+            Err(bazaar::dirstate::AddError::UnknownKind { kind }) => {
+                Err(BzrFormatsError::new_err(format!("unknown kind {:?}", kind)))
+            }
+            Err(bazaar::dirstate::AddError::AlreadyAddedAssertion { basename, file_id }) => {
+                Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                    " {:?}({:?}) already added",
+                    basename, file_id
+                )))
+            }
+            Err(bazaar::dirstate::AddError::Internal { reason }) => {
+                Err(pyo3::exceptions::PyAssertionError::new_err(reason))
+            }
         }
     }
 

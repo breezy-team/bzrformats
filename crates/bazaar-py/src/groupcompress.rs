@@ -1911,10 +1911,7 @@ fn unavailable_representation(
 /// `(index, group_start, group_end, basis_end, delta_end)`. `compression_parent`
 /// is always `None` and `method` is always `"group"`, so `__getitem__` exposes
 /// the 4-tuple `(index_memo, None, parents, ("group", None))`.
-#[pyclass(
-    name = "GCBuildDetails",
-    module = "bzrformats._bzr_rs.groupcompress"
-)]
+#[pyclass(name = "GCBuildDetails", module = "bzrformats._bzr_rs.groupcompress")]
 struct GCBuildDetails {
     parents: Py<PyAny>,
     index: Py<PyAny>,

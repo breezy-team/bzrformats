@@ -2697,6 +2697,311 @@ impl DirState {
         Ok(())
     }
 
+    /// Add a new tracked entry. Mirrors Python's `DirState.add` after
+    /// path normalisation: the caller is responsible for handing in
+    /// `utf8path` with its `dirname`/`basename` split already done, and
+    /// for supplying the packed_stat bytes (use `pack_stat` on the
+    /// `os.lstat` result, or `None` to substitute `NULLSTAT`).
+    ///
+    /// `kind` is one of `"file"`, `"directory"`, `"symlink"`, or
+    /// `"tree-reference"` — anything else yields `AddError::UnknownKind`.
+    ///
+    /// The method performs the same duplicate-id detection Python does:
+    /// if `file_id` is already tracked at a live (non-absent) path it
+    /// returns `AddError::DuplicateFileId`. If the file_id existed
+    /// previously at a different path marked absent, that old row is
+    /// rewritten as a relocation pointer to the new path via
+    /// [`DirState::update_minimal`], matching Python's `rename_from`
+    /// fix-up. In that case the resulting entry's parent-tree slot 0
+    /// stores a relocation row pointing back at the old path, so
+    /// history-aware tooling can still resolve the id.
+    ///
+    /// The target dirblock is created (`ensure_block`) if missing, and a
+    /// child block is ensured when the new entry is a directory — both
+    /// matching Python's post-insert `_ensure_block` call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add(
+        &mut self,
+        utf8path: &[u8],
+        dirname: &[u8],
+        basename: &[u8],
+        file_id: &[u8],
+        kind: &str,
+        size: u64,
+        packed_stat: &[u8],
+        fingerprint: &[u8],
+    ) -> Result<(), AddError> {
+        // Pre-flight: does this file_id already live somewhere?
+        // Python calls `_get_entry(0, fileid_utf8=file_id,
+        // include_deleted=True)` and branches on the result.
+        self.get_or_build_id_index();
+        let fid = FileId::from(&file_id.to_vec());
+        let candidates = self.id_index.as_ref().unwrap().get(&fid);
+
+        let mut rename_from: Option<(Vec<u8>, Vec<u8>)> = None;
+        for (cand_dir, cand_base, _cfid) in candidates {
+            let cand_key = EntryKey {
+                dirname: cand_dir.clone(),
+                basename: cand_base.clone(),
+                file_id: file_id.to_vec(),
+            };
+            let (cb_idx, cb_present) = find_block_index_from_key(&self.dirblocks, &cand_key);
+            if !cb_present {
+                continue;
+            }
+            let (ce_idx, ce_present) = find_entry_index(&cand_key, &self.dirblocks[cb_idx].entries);
+            if !ce_present {
+                continue;
+            }
+            let entry = &self.dirblocks[cb_idx].entries[ce_idx];
+            let tree0_kind = entry.trees.first().map(|t| t.minikind).unwrap_or(0);
+            match tree0_kind {
+                b'a' => {
+                    if cand_dir.as_slice() != dirname || cand_base.as_slice() != basename {
+                        rename_from = Some((cand_dir.clone(), cand_base.clone()));
+                    }
+                    break;
+                }
+                b'r' => {
+                    // The candidate row is a relocation pointer; keep
+                    // searching — the real home is elsewhere.
+                    continue;
+                }
+                other => {
+                    let kind_char = other as char;
+                    let path = if cand_dir.is_empty() {
+                        cand_base.clone()
+                    } else {
+                        let mut p = cand_dir.clone();
+                        p.push(b'/');
+                        p.extend_from_slice(&cand_base);
+                        p
+                    };
+                    let path_str = String::from_utf8_lossy(&path);
+                    let kind_str = match other {
+                        b'f' => "file",
+                        b'd' => "directory",
+                        b'l' => "symlink",
+                        b't' => "tree-reference",
+                        _ => {
+                            return Err(AddError::Internal {
+                                reason: format!(
+                                    "unexpected minikind {:?} in id_index row",
+                                    kind_char
+                                ),
+                            })
+                        }
+                    };
+                    return Err(AddError::DuplicateFileId {
+                        file_id: file_id.to_vec(),
+                        info: format!("{}:{}", kind_str, path_str),
+                    });
+                }
+            }
+        }
+
+        // Rename fix-up: the id used to live at rename_from but was
+        // marked absent. Python calls update_minimal to turn the old
+        // row into a relocation pointer to the new path.
+        if let Some((old_dir, old_base)) = rename_from.as_ref() {
+            let old_key = EntryKey {
+                dirname: old_dir.clone(),
+                basename: old_base.clone(),
+                file_id: file_id.to_vec(),
+            };
+            let reloc_details = TreeData {
+                minikind: b'r',
+                fingerprint: utf8path.to_vec(),
+                size: 0,
+                executable: false,
+                packed_stat: Vec::new(),
+            };
+            self.update_minimal(old_key, reloc_details, Some(b""), false)
+                .map_err(|e| AddError::Internal {
+                    reason: format!("rename-from update_minimal: {}", e),
+                })?;
+        }
+
+        // Find the block that should receive the new entry.
+        let first_key = EntryKey {
+            dirname: dirname.to_vec(),
+            basename: basename.to_vec(),
+            file_id: Vec::new(),
+        };
+        let (mut block_index, block_present) =
+            find_block_index_from_key(&self.dirblocks, &first_key);
+        if block_present {
+            // A block exists; walk entries at this basename and ensure
+            // none is live in tree 0.
+            let (mut entry_index, _) =
+                find_entry_index(&first_key, &self.dirblocks[block_index].entries);
+            let block = &self.dirblocks[block_index].entries;
+            while entry_index < block.len()
+                && block[entry_index].key.dirname == dirname
+                && block[entry_index].key.basename == basename
+            {
+                let t0 = block[entry_index]
+                    .trees
+                    .first()
+                    .map(|t| t.minikind)
+                    .unwrap_or(0);
+                if t0 != b'a' && t0 != b'r' {
+                    let mut path = dirname.to_vec();
+                    if !path.is_empty() {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(basename);
+                    return Err(AddError::AlreadyAdded { path });
+                }
+                entry_index += 1;
+            }
+        } else {
+            // Python: look up the parent directory; if absent, raise
+            // NotVersionedError. Otherwise ensure_block.
+            let (parent_dir, parent_base) = split_path_utf8(dirname);
+            let pbei = get_block_entry_index(&self.dirblocks, parent_dir, parent_base, 0);
+            if !pbei.path_present {
+                let mut path = dirname.to_vec();
+                if !path.is_empty() {
+                    path.push(b'/');
+                }
+                path.extend_from_slice(basename);
+                return Err(AddError::NotVersioned { path });
+            }
+            self.ensure_block(
+                pbei.block_index as isize,
+                pbei.entry_index as isize,
+                dirname,
+            )
+            .map_err(|e| AddError::Internal {
+                reason: format!("ensure_block failed: {:?}", e),
+            })?;
+            let (new_block_index, _) = find_block_index_from_key(&self.dirblocks, &first_key);
+            block_index = new_block_index;
+        }
+
+        // Build the tree-0 details. Python treats directories specially:
+        // their fingerprint and size are always empty / zero, even if
+        // the caller passes a value.
+        let minikind_byte = match kind {
+            "file" => b'f',
+            "directory" => b'd',
+            "symlink" => b'l',
+            "tree-reference" => b't',
+            other => {
+                return Err(AddError::UnknownKind {
+                    kind: other.to_string(),
+                })
+            }
+        };
+        let tree0 = match kind {
+            "directory" => TreeData {
+                minikind: minikind_byte,
+                fingerprint: Vec::new(),
+                size: 0,
+                executable: false,
+                packed_stat: packed_stat.to_vec(),
+            },
+            "tree-reference" => TreeData {
+                minikind: minikind_byte,
+                fingerprint: fingerprint.to_vec(),
+                size: 0,
+                executable: false,
+                packed_stat: packed_stat.to_vec(),
+            },
+            _ => TreeData {
+                minikind: minikind_byte,
+                fingerprint: fingerprint.to_vec(),
+                size,
+                executable: false,
+                packed_stat: packed_stat.to_vec(),
+            },
+        };
+
+        // Empty parent info: NULL_PARENT_DETAILS per present parent.
+        let num_present = self.num_present_parents();
+        let mut parent_info: Vec<TreeData> = (0..num_present)
+            .map(|_| TreeData {
+                minikind: b'a',
+                fingerprint: Vec::new(),
+                size: 0,
+                executable: false,
+                packed_stat: Vec::new(),
+            })
+            .collect();
+        if let Some((old_dir, old_base)) = rename_from {
+            // Replace parent_info[0] with a relocation pointer to the
+            // old path. Matches Python's
+            // `parent_info[0] = (b"r", old_path_utf8, 0, False, b"")`.
+            let old_path_utf8 = if old_dir.is_empty() {
+                old_base
+            } else {
+                let mut p = old_dir.clone();
+                p.push(b'/');
+                p.extend_from_slice(&old_base);
+                p
+            };
+            if let Some(p0) = parent_info.get_mut(0) {
+                *p0 = TreeData {
+                    minikind: b'r',
+                    fingerprint: old_path_utf8,
+                    size: 0,
+                    executable: false,
+                    packed_stat: Vec::new(),
+                };
+            }
+        }
+
+        let mut trees = vec![tree0];
+        trees.extend(parent_info);
+
+        let entry_key = EntryKey {
+            dirname: dirname.to_vec(),
+            basename: basename.to_vec(),
+            file_id: file_id.to_vec(),
+        };
+        let (entry_index, present) =
+            find_entry_index(&entry_key, &self.dirblocks[block_index].entries);
+        if !present {
+            self.dirblocks[block_index].entries.insert(
+                entry_index,
+                Entry {
+                    key: entry_key.clone(),
+                    trees,
+                },
+            );
+            if let Some(idx) = self.id_index.as_mut() {
+                idx.add((dirname, basename, &FileId::from(&file_id.to_vec())));
+            }
+        } else {
+            let existing = &mut self.dirblocks[block_index].entries[entry_index];
+            let current_t0 = existing.trees.first().map(|t| t.minikind).unwrap_or(0);
+            if current_t0 != b'a' {
+                return Err(AddError::AlreadyAddedAssertion {
+                    basename: basename.to_vec(),
+                    file_id: file_id.to_vec(),
+                });
+            }
+            // Overwrite tree-0 only; leave parent slots alone.
+            existing.trees[0] = trees.into_iter().next().unwrap();
+        }
+
+        if kind == "directory" {
+            // Python: _ensure_block(block_index, entry_index, utf8path).
+            // We need to pass coordinates of the entry we just inserted
+            // / overwrote. Re-find it since insertion may have shifted.
+            let (eb, _) = find_block_index_from_key(&self.dirblocks, &entry_key);
+            let (ei, _) = find_entry_index(&entry_key, &self.dirblocks[eb].entries);
+            self.ensure_block(eb as isize, ei as isize, utf8path)
+                .map_err(|e| AddError::Internal {
+                    reason: format!("child ensure_block failed: {:?}", e),
+                })?;
+        }
+
+        self.mark_modified(&[], false);
+        Ok(())
+    }
+
     /// Apply a sequence of "removals" to tree 0, mirroring Python's
     /// `DirState._apply_removals`. Each record is a
     /// `(file_id, path)` tuple; the method sorts them in reverse
@@ -4074,6 +4379,54 @@ impl std::fmt::Display for SplitRootError {
 }
 
 impl std::error::Error for SplitRootError {}
+
+/// Error returned by [`DirState::add`] when the requested add cannot be
+/// performed. Each variant mirrors one of the exceptions Python's
+/// `DirState.add` raises: the pyo3 layer translates them back.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AddError {
+    /// The file_id is already tracked at a live path. Mirrors Python's
+    /// `inventory.DuplicateFileId(file_id, info)`.
+    DuplicateFileId { file_id: Vec<u8>, info: String },
+    /// Adding at this `(dirname, basename)` would collide with a live
+    /// tree-0 row under a different file_id. Mirrors Python's
+    /// `Exception("adding already added path!")`.
+    AlreadyAdded { path: Vec<u8> },
+    /// The parent directory is not versioned. Mirrors Python's
+    /// `NotVersionedError(path, self)`.
+    NotVersioned { path: Vec<u8> },
+    /// An unknown kind string was supplied. Mirrors Python's
+    /// `BzrFormatsError(f"unknown kind {kind!r}")`.
+    UnknownKind { kind: String },
+    /// The rename-from branch tried to re-add a file_id that was
+    /// previously 'a' but the in-place insertion found an existing row
+    /// with a non-absent tree-0 (should be unreachable post-normalisation).
+    AlreadyAddedAssertion { basename: Vec<u8>, file_id: Vec<u8> },
+    /// An internal invariant violation surfaced from a helper call such
+    /// as [`DirState::update_minimal`] during the rename-from step.
+    Internal { reason: String },
+}
+
+impl std::fmt::Display for AddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddError::DuplicateFileId { file_id, info } => {
+                write!(f, "duplicate file_id {:?}: {}", file_id, info)
+            }
+            AddError::AlreadyAdded { path } => {
+                write!(f, "adding already added path {:?}", path)
+            }
+            AddError::NotVersioned { path } => write!(f, "not versioned: {:?}", path),
+            AddError::UnknownKind { kind } => write!(f, "unknown kind {:?}", kind),
+            AddError::AlreadyAddedAssertion { basename, file_id } => {
+                write!(f, "{:?}({:?}) already added", basename, file_id)
+            }
+            AddError::Internal { reason } => write!(f, "internal error: {}", reason),
+        }
+    }
+}
+
+impl std::error::Error for AddError {}
 
 /// Pure-function version of [`DirState::split_root_dirblock_into_contents`].
 /// Exposed so callers that are still building a `Vec<Dirblock>` outside of
@@ -6309,6 +6662,127 @@ mod dirstate_struct_tests {
             })
             .unwrap_err();
         assert!(matches!(err, MakeAbsentError::EntryNotFound { .. }));
+    }
+
+    /// A minimal root-only dirblock layout, used to test `add` paths
+    /// that insert new entries directly at the root.
+    fn add_fixture() -> DirState {
+        let mut state = fresh_state();
+        state.parents = vec![];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![Entry {
+                    key: EntryKey {
+                        dirname: Vec::new(),
+                        basename: Vec::new(),
+                        file_id: b"TREE_ROOT".to_vec(),
+                    },
+                    trees: vec![TreeData {
+                        minikind: b'd',
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: b"x".repeat(32),
+                    }],
+                }],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        state
+    }
+
+    #[test]
+    fn add_inserts_new_file_at_root() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"a", b"", b"a", b"fid-a", "file", 7, &stat, b"sha1")
+            .expect("add");
+        // Root-contents block (index 1) now has one entry.
+        assert_eq!(state.dirblocks[1].entries.len(), 1);
+        let entry = &state.dirblocks[1].entries[0];
+        assert_eq!(entry.key.basename, b"a");
+        assert_eq!(entry.key.file_id, b"fid-a");
+        assert_eq!(entry.trees[0].minikind, b'f');
+        assert_eq!(entry.trees[0].size, 7);
+        assert_eq!(entry.trees[0].fingerprint, b"sha1");
+    }
+
+    #[test]
+    fn add_directory_creates_child_block() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"sub", b"", b"sub", b"fid-sub", "directory", 0, &stat, b"")
+            .expect("add");
+        // A new block for the directory 'sub' should now exist.
+        let block_names: Vec<&[u8]> = state
+            .dirblocks
+            .iter()
+            .map(|b| b.dirname.as_slice())
+            .collect();
+        assert!(block_names.contains(&b"sub".as_slice()));
+    }
+
+    #[test]
+    fn add_duplicate_file_id_errors() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"a", b"", b"a", b"fid-a", "file", 1, &stat, b"")
+            .expect("first add");
+        let err = state
+            .add(b"b", b"", b"b", b"fid-a", "file", 1, &stat, b"")
+            .unwrap_err();
+        assert!(matches!(err, AddError::DuplicateFileId { .. }));
+    }
+
+    #[test]
+    fn add_second_path_same_basename_errors() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"a", b"", b"a", b"fid-a", "file", 1, &stat, b"")
+            .expect("first add");
+        let err = state
+            .add(b"a", b"", b"a", b"fid-other", "file", 1, &stat, b"")
+            .unwrap_err();
+        assert!(matches!(err, AddError::AlreadyAdded { .. }));
+    }
+
+    #[test]
+    fn add_unknown_kind_errors() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        let err = state
+            .add(b"a", b"", b"a", b"fid-a", "pipe", 0, &stat, b"")
+            .unwrap_err();
+        assert!(matches!(err, AddError::UnknownKind { .. }));
+    }
+
+    #[test]
+    fn add_parent_missing_errors_not_versioned() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        // There is no block for 'missing', and its parent ('') has no
+        // entry named 'missing' at tree 0.
+        let err = state
+            .add(
+                b"missing/child",
+                b"missing",
+                b"child",
+                b"fid-c",
+                "file",
+                0,
+                &stat,
+                b"",
+            )
+            .unwrap_err();
+        assert!(matches!(err, AddError::NotVersioned { .. }));
     }
 
     /// Build a TreeData that looks like Python's

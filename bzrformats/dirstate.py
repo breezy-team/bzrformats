@@ -237,7 +237,6 @@ from .errors import (
     InvalidNormalization,
     LockContention,
     LockNotHeld,
-    NotVersionedError,
     ObjectNotLocked,
 )
 from .osutils import _walkdirs_utf8, is_inside, is_inside_any, parent_directories
@@ -628,143 +627,40 @@ class DirState:
             or the referenced revision id for tree-references,
             or b'' for directories.
         """
-        # adding a file:
-        # find the block its in.
-        # find the location in the block.
-        # check its not there
-        # add it.
-        # ------- copied from inventory.ensure_normalized_name - keep synced.
-        # --- normalized_filename wants a unicode basename only, so get one.
+        # Normalize path + basename. The Rust side handles the rest.
         dirname, basename = osutils.split(path)
-        # we dont import normalized_filename directly because we want to be
-        # able to change the implementation at runtime for tests.
         norm_name, can_access = osutils.normalized_filename(basename)
         if norm_name != basename:
             if can_access:
                 basename = norm_name
             else:
                 raise InvalidNormalization(path)
-        # you should never have files called . or ..; just add the directory
-        # in the parent, or according to the special treatment for the root
         if basename == "." or basename == "..":
             raise inventory.InvalidEntryName(path)
-        # now that we've normalised, we need the correct utf8 path and
-        # dirname and basename elements. This single encode and split should be
-        # faster than three separate encodes.
         utf8path = (dirname + "/" + basename).strip("/").encode("utf8")
         dirname, basename = osutils.split(utf8path)
-        # uses __class__ for speed; the check is needed for safety
         if file_id.__class__ is not bytes:
             raise AssertionError(f"must be a utf8 file_id not {type(file_id)}")
-        # Make sure the file_id does not exist in this tree
-        rename_from = None
-        file_id_entry = self._get_entry(0, fileid_utf8=file_id, include_deleted=True)
-        if file_id_entry != (None, None):
-            if file_id_entry[1][0][0] == b"a":
-                if file_id_entry[0] != (dirname, basename, file_id):
-                    # set the old name's current operation to rename
-                    self.update_minimal(
-                        file_id_entry[0],
-                        b"r",
-                        path_utf8=b"",
-                        packed_stat=b"",
-                        fingerprint=utf8path,
-                    )
-                    rename_from = file_id_entry[0][0:2]
-            else:
-                path = osutils.pathjoin(file_id_entry[0][0], file_id_entry[0][1])
-                kind = DirState._minikind_to_kind[file_id_entry[1][0][0]]
-                info = f"{kind}:{path}"
-                raise inventory.DuplicateFileId(file_id, info)
-        first_key = (dirname, basename, b"")
-        block_index, present = self._find_block_index_from_key(first_key)
-        if present:
-            # check the path is not in the tree
-            block = self._dirblocks[block_index][1]
-            entry_index, _ = self._find_entry_index(first_key, block)
-            while (
-                entry_index < len(block)
-                and block[entry_index][0][0:2] == first_key[0:2]
-            ):
-                if block[entry_index][1][0][0] not in (b"a", b"r"):
-                    # this path is in the dirstate in the current tree.
-                    raise Exception("adding already added path!")
-                entry_index += 1
-        else:
-            # The block where we want to put the file is not present. But it
-            # might be because the directory was empty, or not loaded yet. Look
-            # for a parent entry, if not found, raise NotVersionedError
-            parent_dir, parent_base = osutils.split(dirname)
-            (
-                parent_block_idx,
-                parent_entry_idx,
-                _,
-                parent_present,
-            ) = self._get_block_entry_index(parent_dir, parent_base, 0)
-            if not parent_present:
-                raise NotVersionedError(path, str(self))
-            self._ensure_block(parent_block_idx, parent_entry_idx, dirname)
-        block = self._dirblocks[block_index][1]
-        entry_key = (dirname, basename, file_id)
         if stat is None:
             size = 0
             packed_stat = DirState.NULLSTAT
         else:
             size = stat.st_size
             packed_stat = pack_stat(stat)
-        parent_info = self._empty_parent_info()
-        minikind = DirState._kind_to_minikind[kind]
-        if rename_from is not None:
-            old_path_utf8 = b"%s/%s" % rename_from if rename_from[0] else rename_from[1]
-            parent_info[0] = (b"r", old_path_utf8, 0, False, b"")
-        if kind == "file":
-            entry_data = (
-                entry_key,
-                [
-                    (minikind, fingerprint, size, False, packed_stat),
-                ]
-                + parent_info,
-            )
-        elif kind == "directory":
-            entry_data = (
-                entry_key,
-                [
-                    (minikind, b"", 0, False, packed_stat),
-                ]
-                + parent_info,
-            )
-        elif kind == "symlink":
-            entry_data = (
-                entry_key,
-                [
-                    (minikind, fingerprint, size, False, packed_stat),
-                ]
-                + parent_info,
-            )
-        elif kind == "tree-reference":
-            entry_data = (
-                entry_key,
-                [
-                    (minikind, fingerprint, 0, False, packed_stat),
-                ]
-                + parent_info,
-            )
-        else:
-            raise BzrFormatsError(f"unknown kind {kind!r}")
-        entry_index, present = self._find_entry_index(entry_key, block)
-        if not present:
-            block.insert(entry_index, entry_data)
-        else:
-            if block[entry_index][1][0][0] != b"a":
-                raise AssertionError(f" {basename!r}({file_id!r}) already added")
-            block[entry_index][1][0] = entry_data[1][0]
-
-        if kind == "directory":
-            # insert a new dirblock
-            self._ensure_block(block_index, entry_index, utf8path)
-        self._mark_modified()
-        if self._id_index:
-            self._id_index.add(entry_key)
+        self._rs.dirblocks = self._dirblocks
+        self._rs.add(
+            utf8path,
+            dirname,
+            basename,
+            file_id,
+            kind,
+            size,
+            packed_stat,
+            fingerprint,
+        )
+        self._dirblocks = self._rs.dirblocks
+        if self._id_index is not None:
+            self._id_index.add((dirname, basename, file_id))
 
     def _bisect(self, paths):
         """Bisect through the disk structure for specific rows.
