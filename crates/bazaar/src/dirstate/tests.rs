@@ -6401,3 +6401,296 @@ fn iter_changes_iter_default_matches_new() {
     assert!(from_new.current_root.is_none());
     assert!(from_default.current_root.is_none());
 }
+
+#[test]
+fn bisect_error_display_covers_every_variant() {
+    let cases = [
+        BisectError::ReadError("ouch".into()),
+        BisectError::TooManySeeks,
+        BisectError::BadSize("not a number".into()),
+        BisectError::BadMinikind(b'?'),
+    ];
+    for err in cases {
+        let s = format!("{}", err);
+        assert!(!s.is_empty(), "empty display for {:?}", err);
+    }
+    // Spot-check the substrings so a reformat doesn't silently
+    // change downstream-visible diagnostic text.
+    assert_eq!(
+        format!("{}", BisectError::ReadError("oh no".into())),
+        "read error: oh no"
+    );
+    assert_eq!(format!("{}", BisectError::TooManySeeks), "too many seeks");
+    assert_eq!(
+        format!("{}", BisectError::BadSize("xyz".into())),
+        "bad size field: xyz"
+    );
+    assert!(format!("{}", BisectError::BadMinikind(b'q')).contains("invalid minikind"));
+}
+
+#[test]
+fn bisect_error_implements_std_error() {
+    fn assert_error<E: std::error::Error>(_: &E) {}
+    assert_error(&BisectError::TooManySeeks);
+}
+
+#[test]
+fn header_error_display_covers_every_variant() {
+    let cases = [
+        HeaderError::BadFormatLine(b"#bad\n".to_vec()),
+        HeaderError::MissingCrcLine(b"x\n".to_vec()),
+        HeaderError::BadCrc(b"abc".to_vec()),
+        HeaderError::MissingNumEntriesLine(b"x\n".to_vec()),
+        HeaderError::BadNumEntries(b"abc".to_vec()),
+        HeaderError::BadParentsLine,
+        HeaderError::BadGhostsLine,
+        HeaderError::UnexpectedEof,
+    ];
+    for err in cases {
+        let s = format!("{}", err);
+        assert!(!s.is_empty(), "empty display for {:?}", err);
+    }
+}
+
+#[test]
+fn header_error_equality_is_structural() {
+    assert_eq!(HeaderError::UnexpectedEof, HeaderError::UnexpectedEof);
+    assert_eq!(
+        HeaderError::BadCrc(b"x".to_vec()),
+        HeaderError::BadCrc(b"x".to_vec())
+    );
+    assert_ne!(
+        HeaderError::BadCrc(b"x".to_vec()),
+        HeaderError::BadCrc(b"y".to_vec())
+    );
+    assert_ne!(HeaderError::BadParentsLine, HeaderError::BadGhostsLine);
+}
+
+#[test]
+fn header_struct_equality_compares_all_fields() {
+    let a = Header {
+        crc_expected: 1,
+        num_entries: 0,
+        parents: vec![b"p".to_vec()],
+        ghosts: Vec::new(),
+        end_of_header: 80,
+    };
+    let b = Header {
+        crc_expected: 1,
+        num_entries: 0,
+        parents: vec![b"p".to_vec()],
+        ghosts: Vec::new(),
+        end_of_header: 80,
+    };
+    assert_eq!(a, b);
+    let c = Header {
+        crc_expected: 2,
+        num_entries: 0,
+        parents: vec![b"p".to_vec()],
+        ghosts: Vec::new(),
+        end_of_header: 80,
+    };
+    assert_ne!(a, c);
+}
+
+#[test]
+fn process_entry_error_display_covers_every_variant() {
+    let cases = [
+        ProcessEntryError::DirstateCorrupt("bad".into()),
+        ProcessEntryError::BadFileKind {
+            path: b"foo".to_vec(),
+            mode: 0o010644,
+        },
+        ProcessEntryError::Internal("boom".into()),
+    ];
+    for err in cases {
+        let s = format!("{}", err);
+        assert!(!s.is_empty(), "empty display for {:?}", err);
+    }
+    let pe = ProcessEntryError::BadFileKind {
+        path: b"sock".to_vec(),
+        mode: 0o140644,
+    };
+    let s = format!("{}", pe);
+    assert!(s.contains("bad file kind"), "got {:?}", s);
+    assert!(s.contains("sock"), "got {:?}", s);
+}
+
+#[test]
+fn ensure_block_error_display_includes_dirname() {
+    let s = format!("{}", EnsureBlockError::BadDirname(b"oops".to_vec()));
+    assert!(s.contains("bad dirname"), "got {:?}", s);
+    // Display formats Vec<u8> via {:?} so the bytes appear as their
+    // numeric debug list, not as a string literal.
+    let want = format!("{:?}", b"oops".to_vec());
+    assert!(s.contains(&want), "got {:?}", s);
+}
+
+#[test]
+fn split_root_error_display_covers_both_variants() {
+    let s = format!("{}", SplitRootError::MissingSentinels);
+    assert!(s.contains("sentinel"), "got {:?}", s);
+    let s = format!(
+        "{}",
+        SplitRootError::BadSecondSentinel {
+            dirname: b"foo".to_vec(),
+            entry_count: 3,
+        }
+    );
+    let want = format!("{:?}", b"foo".to_vec());
+    assert!(s.contains(&want), "got {:?}", s);
+    assert!(s.contains("3 entries"), "got {:?}", s);
+}
+
+#[test]
+fn entries_to_state_error_display_covers_every_variant() {
+    let s = format!("{}", EntriesToStateError::Empty);
+    assert_eq!(s, "new_entries is empty");
+    let s = format!(
+        "{}",
+        EntriesToStateError::MissingRootRow {
+            key: EntryKey {
+                dirname: b"x".to_vec(),
+                basename: b"y".to_vec(),
+                file_id: b"z".to_vec(),
+            }
+        }
+    );
+    assert!(s.contains("Missing root row"));
+    let s = format!(
+        "{}",
+        EntriesToStateError::SplitFailed(SplitRootError::MissingSentinels)
+    );
+    assert!(s.contains("split_root_dirblock_into_contents"));
+}
+
+#[test]
+fn make_absent_error_display_covers_every_variant() {
+    let key = EntryKey {
+        dirname: b"".to_vec(),
+        basename: b"a".to_vec(),
+        file_id: b"fid".to_vec(),
+    };
+    let cases = [
+        MakeAbsentError::BlockNotFound { key: key.clone() },
+        MakeAbsentError::EntryNotFound { key: key.clone() },
+        MakeAbsentError::UpdateBlockNotFound { key: key.clone() },
+        MakeAbsentError::UpdateEntryNotFound { key: key.clone() },
+        MakeAbsentError::BadRow { key },
+    ];
+    for err in cases {
+        let s = format!("{}", err);
+        assert!(!s.is_empty(), "empty display for {:?}", err);
+    }
+}
+
+#[test]
+fn update_entry_error_display_covers_every_variant() {
+    let cases = [
+        UpdateEntryError::EntryNotFound,
+        UpdateEntryError::UnexpectedKind(Kind::Relocated),
+        UpdateEntryError::Other("boom".into()),
+    ];
+    for err in cases {
+        let s = format!("{}", err);
+        assert!(s.starts_with("update_entry"), "got {:?}", s);
+    }
+    // The Io variant carries an io::Error, so build it separately.
+    let io_err = UpdateEntryError::Io(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+    let s = format!("{}", io_err);
+    assert!(s.starts_with("update_entry: i/o error"));
+}
+
+#[test]
+fn set_path_id_error_display_covers_both_variants() {
+    let s = format!("{}", SetPathIdError::NonRootPath);
+    assert!(s.contains("only supports the root path"));
+    let s = format!("{}", SetPathIdError::Internal { reason: "x".into() });
+    assert!(s.contains("internal error"));
+}
+
+#[test]
+fn add_error_display_covers_every_variant() {
+    let cases = [
+        AddError::DuplicateFileId {
+            file_id: b"f".to_vec(),
+            info: "info".into(),
+        },
+        AddError::AlreadyAdded {
+            path: b"a".to_vec(),
+        },
+        AddError::NotVersioned {
+            path: b"a".to_vec(),
+        },
+        AddError::AlreadyAddedAssertion {
+            basename: b"x".to_vec(),
+            file_id: b"f".to_vec(),
+        },
+        AddError::Internal { reason: "r".into() },
+        AddError::InvalidNormalization { path: "p".into() },
+        AddError::InvalidEntryName { name: ".".into() },
+    ];
+    for err in cases {
+        let s = format!("{}", err);
+        assert!(!s.is_empty(), "empty display for {:?}", err);
+    }
+}
+
+#[test]
+fn basis_apply_error_display_covers_every_variant() {
+    let cases = [
+        BasisApplyError::Invalid {
+            path: b"p".to_vec(),
+            file_id: b"f".to_vec(),
+            reason: "r".into(),
+        },
+        BasisApplyError::NotImplemented { reason: "r".into() },
+        BasisApplyError::Internal { reason: "r".into() },
+        BasisApplyError::NotVersioned {
+            path: b"p".to_vec(),
+        },
+        BasisApplyError::MismatchedEntryFileId {
+            new_path: b"p".to_vec(),
+            file_id: b"f".to_vec(),
+            entry_debug: "Entry".into(),
+        },
+        BasisApplyError::NewPathWithoutEntry {
+            new_path: b"p".to_vec(),
+            file_id: b"f".to_vec(),
+        },
+    ];
+    for err in cases {
+        let s = format!("{}", err);
+        assert!(!s.is_empty(), "empty display for {:?}", err);
+    }
+}
+
+#[test]
+fn validate_error_display_passes_message_through() {
+    let err = ValidateError("dirblocks broken".into());
+    assert_eq!(format!("{}", err), "dirblocks broken");
+}
+
+#[test]
+fn errors_implement_std_error() {
+    // Every dirstate error type should implement std::error::Error so
+    // downstream callers can box them into `Box<dyn Error>`.
+    fn assert_error<E: std::error::Error>(_: &E) {}
+    assert_error(&MakeAbsentError::BadRow {
+        key: EntryKey {
+            dirname: Vec::new(),
+            basename: Vec::new(),
+            file_id: Vec::new(),
+        },
+    });
+    assert_error(&SplitRootError::MissingSentinels);
+    assert_error(&UpdateEntryError::EntryNotFound);
+    assert_error(&SetPathIdError::NonRootPath);
+    assert_error(&AddError::AlreadyAdded { path: Vec::new() });
+    assert_error(&BasisApplyError::NotVersioned { path: Vec::new() });
+    assert_error(&ValidateError("x".into()));
+    assert_error(&EnsureBlockError::BadDirname(Vec::new()));
+    assert_error(&EntriesToStateError::Empty);
+    assert_error(&HeaderError::UnexpectedEof);
+    assert_error(&ProcessEntryError::Internal("x".into()));
+}
