@@ -25,8 +25,11 @@ tries to upgrade to a write lock).
 """
 
 import fcntl
+import logging
 
 from .errors import LockContention
+
+logger = logging.getLogger(__name__)
 
 # Per-filename tallies so we can detect in-process contention that fcntl's
 # per-process semantics would otherwise hide.
@@ -44,7 +47,13 @@ class ReadLock:
         """Acquire a shared read lock on *filename*."""
         self.filename = filename
         if filename in _write_locks:
-            raise LockContention(filename)
+            # Matches breezy's non-strict default: a read lock taken
+            # while the same process already holds a write lock isn't
+            # a hard error (fcntl's per-process semantics let it share
+            # the descriptor).  Log and carry on; the test harness
+            # relies on this to open a second reference WorkingTree
+            # through the same dirstate file.
+            logger.debug("Read lock taken w/ an open write lock on: %s", filename)
         self.f = open(filename, "rb")
         try:
             fcntl.lockf(self.f, fcntl.LOCK_SH | fcntl.LOCK_NB)
