@@ -222,6 +222,41 @@ impl bazaar::dirstate::Transport for PyFileTransport {
             Ok(bytes)
         })
     }
+
+    fn is_tree_reference_dir(
+        &self,
+        abspath: &[u8],
+    ) -> Result<bool, bazaar::dirstate::TransportError> {
+        // The "does this directory contain a nested tree" question is
+        // a breezy-side concept: only tree-reference-supporting
+        // formats answer True, and even then only when the directory
+        // carries its own `.bzr/`.  The pyo3 adapter dispatches via
+        // the bzrformats.osutils.isdir helper + a `.bzr` suffix —
+        // good enough to match breezy's
+        // `_directory_may_be_tree_reference` without pulling in a
+        // separate Python callback per call.
+        Python::attach(|py| -> Result<bool, bazaar::dirstate::TransportError> {
+            if abspath.is_empty() {
+                // Mirrors breezy's guard: the tree root is not a
+                // reference even when the repository supports
+                // tree references.
+                return Ok(false);
+            }
+            let osutils_mod = py
+                .import("bzrformats.osutils")
+                .map_err(|e| Self::map_err(py, e))?;
+            let isdir_fn = osutils_mod
+                .getattr("isdir")
+                .map_err(|e| Self::map_err(py, e))?;
+            let mut probe = abspath.to_vec();
+            probe.extend_from_slice(b"/.bzr");
+            let probe_bytes = PyBytes::new(py, &probe);
+            let result = isdir_fn
+                .call1((probe_bytes,))
+                .map_err(|e| Self::map_err(py, e))?;
+            result.extract::<bool>().map_err(|e| Self::map_err(py, e))
+        })
+    }
 }
 
 /// Build a `read_range(offset, len)` closure that seeks + reads on a

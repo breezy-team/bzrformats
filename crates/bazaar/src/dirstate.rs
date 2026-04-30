@@ -1234,6 +1234,20 @@ pub trait Transport {
     /// when the path is gone; a generic error when the path is not a
     /// symlink.
     fn read_link(&self, abspath: &[u8]) -> Result<Vec<u8>, TransportError>;
+
+    /// Whether the directory at `abspath` is a nested tree reference
+    /// (i.e. contains a `.bzr/` control directory).  Mirrors the
+    /// per-format `_directory_is_tree_reference` hook on breezy's
+    /// `WorkingTree`: the file format decides whether tree references
+    /// can exist at all, and a concrete directory qualifies iff it
+    /// carries its own `.bzr/`.  Consumers use this during
+    /// `iter_changes` to flip the on-disk `directory` kind to
+    /// `tree-reference` before handing the entry to
+    /// [`DirState::process_entry`].
+    ///
+    /// Formats that don't support tree references should implement
+    /// this as an unconditional `Ok(false)`.
+    fn is_tree_reference_dir(&self, abspath: &[u8]) -> Result<bool, TransportError>;
 }
 
 /// Error returned while parsing the on-disk dirblock body of a dirstate
@@ -11002,6 +11016,11 @@ mod dirstate_struct_tests {
                 .ok_or_else(|| {
                     TransportError::NotFound(String::from_utf8_lossy(abspath).into_owned())
                 })
+        }
+
+        fn is_tree_reference_dir(&self, _abspath: &[u8]) -> Result<bool, TransportError> {
+            // In-memory fixture has no concept of nested trees.
+            Ok(false)
         }
     }
 
