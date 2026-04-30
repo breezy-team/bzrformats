@@ -1248,6 +1248,36 @@ pub trait Transport {
     /// Formats that don't support tree references should implement
     /// this as an unconditional `Ok(false)`.
     fn is_tree_reference_dir(&self, abspath: &[u8]) -> Result<bool, TransportError>;
+
+    /// List the immediate children of directory `abspath`.  Used by
+    /// the pure-crate `iter_changes` walker.  Returns a vector of
+    /// per-child entries; the implementation does not guarantee any
+    /// particular order — the walker sorts.
+    ///
+    /// Each entry carries the child's utf8 basename, its kind
+    /// (`"file"`, `"directory"`, `"symlink"`, or `"tree-reference"`),
+    /// its [`StatInfo`] (from an `lstat`), and the absolute path of
+    /// the child on disk.  The walker re-uses the stat to avoid a
+    /// second syscall inside `process_entry`.
+    ///
+    /// `NoSuchFile` when `abspath` does not exist or is not a
+    /// directory.
+    fn list_dir(&self, abspath: &[u8]) -> Result<Vec<DirEntryInfo>, TransportError>;
+}
+
+/// One entry yielded by [`Transport::list_dir`] — mirrors the
+/// per-child tuple Python's `DirReader.read_dir` returns.
+#[derive(Debug, Clone)]
+pub struct DirEntryInfo {
+    /// The child's utf8 basename (no trailing slash).
+    pub basename: Vec<u8>,
+    /// `"file"`, `"directory"`, `"symlink"`, `"tree-reference"`, or
+    /// an unknown kind.
+    pub kind: String,
+    /// Stat info from `lstat` on the child.
+    pub stat: StatInfo,
+    /// Absolute path of the child on disk (utf8 bytes).
+    pub abspath: Vec<u8>,
 }
 
 /// Error returned while parsing the on-disk dirblock body of a dirstate
@@ -11021,6 +11051,11 @@ mod dirstate_struct_tests {
         fn is_tree_reference_dir(&self, _abspath: &[u8]) -> Result<bool, TransportError> {
             // In-memory fixture has no concept of nested trees.
             Ok(false)
+        }
+
+        fn list_dir(&self, _abspath: &[u8]) -> Result<Vec<DirEntryInfo>, TransportError> {
+            // In-memory transport does not model directory trees.
+            Ok(Vec::new())
         }
     }
 

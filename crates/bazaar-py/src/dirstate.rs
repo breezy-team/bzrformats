@@ -223,6 +223,102 @@ impl bazaar::dirstate::Transport for PyFileTransport {
         })
     }
 
+    fn list_dir(
+        &self,
+        abspath: &[u8],
+    ) -> Result<Vec<bazaar::dirstate::DirEntryInfo>, bazaar::dirstate::TransportError> {
+        Python::attach(
+            |py| -> Result<Vec<bazaar::dirstate::DirEntryInfo>, bazaar::dirstate::TransportError> {
+                let os_mod = py.import("os").map_err(|e| Self::map_err(py, e))?;
+                let scandir_fn = os_mod
+                    .getattr("scandir")
+                    .map_err(|e| Self::map_err(py, e))?;
+                let abs_bytes = PyBytes::new(py, abspath);
+                let iter = match scandir_fn.call1((abs_bytes,)) {
+                    Ok(it) => it,
+                    Err(e) => {
+                        if e.is_instance_of::<pyo3::exceptions::PyFileNotFoundError>(py) {
+                            return Err(bazaar::dirstate::TransportError::NotFound(
+                                String::from_utf8_lossy(abspath).into_owned(),
+                            ));
+                        }
+                        return Err(Self::map_err(py, e));
+                    }
+                };
+                let mut out: Vec<bazaar::dirstate::DirEntryInfo> = Vec::new();
+                for item in iter.try_iter().map_err(|e| Self::map_err(py, e))? {
+                    let entry = item.map_err(|e| Self::map_err(py, e))?;
+                    let name_bytes: Vec<u8> = {
+                        let n = entry.getattr("name").map_err(|e| Self::map_err(py, e))?;
+                        if let Ok(b) = n.extract::<Vec<u8>>() {
+                            b
+                        } else {
+                            n.extract::<String>()
+                                .map_err(|e| Self::map_err(py, e))?
+                                .into_bytes()
+                        }
+                    };
+                    let abspath_child: Vec<u8> = {
+                        let p = entry.getattr("path").map_err(|e| Self::map_err(py, e))?;
+                        if let Ok(b) = p.extract::<Vec<u8>>() {
+                            b
+                        } else {
+                            p.extract::<String>()
+                                .map_err(|e| Self::map_err(py, e))?
+                                .into_bytes()
+                        }
+                    };
+                    let kwargs = pyo3::types::PyDict::new(py);
+                    kwargs
+                        .set_item("follow_symlinks", false)
+                        .map_err(|e| Self::map_err(py, e))?;
+                    let stat_obj = entry
+                        .call_method("stat", (), Some(&kwargs))
+                        .map_err(|e| Self::map_err(py, e))?;
+                    let mode: u32 = stat_obj
+                        .getattr("st_mode")
+                        .and_then(|v| v.extract())
+                        .map_err(|e| Self::map_err(py, e))?;
+                    let size: u64 = stat_obj
+                        .getattr("st_size")
+                        .and_then(|v| v.extract())
+                        .map_err(|e| Self::map_err(py, e))?;
+                    let mtime_f: f64 = stat_obj
+                        .getattr("st_mtime")
+                        .and_then(|v| v.extract())
+                        .map_err(|e| Self::map_err(py, e))?;
+                    let ctime_f: f64 = stat_obj
+                        .getattr("st_ctime")
+                        .and_then(|v| v.extract())
+                        .map_err(|e| Self::map_err(py, e))?;
+                    let dev: u64 = stat_obj
+                        .getattr("st_dev")
+                        .and_then(|v| v.extract())
+                        .map_err(|e| Self::map_err(py, e))?;
+                    let ino: u64 = stat_obj
+                        .getattr("st_ino")
+                        .and_then(|v| v.extract())
+                        .map_err(|e| Self::map_err(py, e))?;
+                    let kind = kind_from_mode(mode);
+                    out.push(bazaar::dirstate::DirEntryInfo {
+                        basename: name_bytes,
+                        kind,
+                        stat: bazaar::dirstate::StatInfo {
+                            mode,
+                            size,
+                            mtime: mtime_f as i64,
+                            ctime: ctime_f as i64,
+                            dev,
+                            ino,
+                        },
+                        abspath: abspath_child,
+                    });
+                }
+                Ok(out)
+            },
+        )
+    }
+
     fn is_tree_reference_dir(
         &self,
         abspath: &[u8],
@@ -256,6 +352,19 @@ impl bazaar::dirstate::Transport for PyFileTransport {
                 .map_err(|e| Self::map_err(py, e))?;
             result.extract::<bool>().map_err(|e| Self::map_err(py, e))
         })
+    }
+}
+
+/// Map a POSIX `st_mode` to the kind string dirstate uses.  Matches
+/// `bzrformats.osutils.file_kind_from_stat_mode`; anything other
+/// than file/dir/symlink falls through to `"unknown"` (the walker
+/// ignores those rows anyway).
+fn kind_from_mode(mode: u32) -> String {
+    match mode & 0o170000 {
+        0o100000 => "file".to_string(),
+        0o040000 => "directory".to_string(),
+        0o120000 => "symlink".to_string(),
+        _ => "unknown".to_string(),
     }
 }
 
