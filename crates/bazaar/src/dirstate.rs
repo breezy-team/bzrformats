@@ -833,6 +833,229 @@ pub enum LockState {
     Write,
 }
 
+/// Filesystem snapshot for one path, as handed to
+/// [`DirState::process_entry`].  Mirrors the 5-tuple Python's
+/// `ProcessEntryPython` threads around internally:
+/// `(top_relpath, basename, kind, stat, abspath)`.
+#[derive(Debug, Clone)]
+pub struct ProcessPathInfo {
+    /// Absolute path of the file on disk (utf8 bytes).
+    pub abspath: Vec<u8>,
+    /// Filesystem kind ("file", "directory", "symlink",
+    /// "tree-reference"), or `None` when the path is missing.
+    pub kind: Option<String>,
+    /// Stat info for the path.
+    pub stat: StatInfo,
+}
+
+/// Mutable per-`iter_changes` state shared across
+/// [`DirState::process_entry`] calls.  Ports the instance fields
+/// Python's `ProcessEntryPython` carries: search / searched sets,
+/// parent-id caches, dirname-to-file-id maps.
+#[derive(Debug, Default)]
+pub struct ProcessEntryState {
+    /// `source_index` in the tree-data array; `None` means "compare
+    /// against a synthetic empty source" (new-tree mode).
+    pub source_index: Option<usize>,
+    /// `target_index` in the tree-data array; always concrete.
+    pub target_index: usize,
+    /// Whether unchanged entries should still yield a change tuple.
+    pub include_unchanged: bool,
+    /// Paths whose children have already been walked.
+    pub searched_specific_files: std::collections::HashSet<Vec<u8>>,
+    /// Paths whose children still need walking (driven by the
+    /// outer `iter_changes` loop).
+    pub search_specific_files: std::collections::HashSet<Vec<u8>>,
+    /// Cache: dirname → file_id for the *target* tree.
+    pub new_dirname_to_file_id: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    /// Cache: dirname → file_id for the *source* tree.
+    pub old_dirname_to_file_id: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    /// One-slot cache: (dirname, parent_file_id) for the source tree.
+    pub last_source_parent: Option<(Vec<u8>, Option<Vec<u8>>)>,
+    /// One-slot cache: (dirname, parent_file_id) for the target tree.
+    pub last_target_parent: Option<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+/// One row returned by [`DirState::process_entry`], mirroring Python's
+/// `DirstateInventoryChange` minus the utf8-decoding (Rust returns
+/// raw bytes; the pyo3 layer decodes with surrogateescape).
+#[derive(Debug, Clone)]
+pub struct DirstateChange {
+    pub file_id: Vec<u8>,
+    pub old_path: Option<Vec<u8>>,
+    pub new_path: Option<Vec<u8>>,
+    pub content_change: bool,
+    pub old_versioned: bool,
+    pub new_versioned: bool,
+    pub source_parent_id: Option<Vec<u8>>,
+    pub target_parent_id: Option<Vec<u8>>,
+    pub old_basename: Option<Vec<u8>>,
+    pub new_basename: Option<Vec<u8>>,
+    pub source_kind: Option<String>,
+    pub target_kind: Option<String>,
+    pub source_exec: Option<bool>,
+    pub target_exec: Option<bool>,
+}
+
+/// Error returned by [`DirState::process_entry`].
+#[derive(Debug)]
+pub enum ProcessEntryError {
+    DirstateCorrupt(String),
+    BadFileKind { path: Vec<u8>, kind: String },
+    Internal(String),
+}
+
+impl std::fmt::Display for ProcessEntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProcessEntryError::DirstateCorrupt(s) => write!(f, "dirstate corrupt: {}", s),
+            ProcessEntryError::BadFileKind { path, kind } => {
+                write!(f, "bad file kind {:?} for path {:?}", kind, path)
+            }
+            ProcessEntryError::Internal(s) => write!(f, "process_entry: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for ProcessEntryError {}
+
+fn null_parent_details() -> TreeData {
+    TreeData {
+        minikind: b'a',
+        fingerprint: Vec::new(),
+        size: 0,
+        executable: false,
+        packed_stat: Vec::new(),
+    }
+}
+
+fn join_path(dirname: &[u8], basename: &[u8]) -> Vec<u8> {
+    if dirname.is_empty() {
+        basename.to_vec()
+    } else {
+        let mut p = dirname.to_vec();
+        p.push(b'/');
+        p.extend_from_slice(basename);
+        p
+    }
+}
+
+/// Is `candidate` inside `parent` (or equal to it)?  Mirrors
+/// `osutils.is_inside`: `parent` is the prefix directory, `candidate`
+/// is the potentially-nested path.
+fn is_inside(parent: &[u8], candidate: &[u8]) -> bool {
+    if parent == candidate {
+        return true;
+    }
+    if parent.is_empty() {
+        return true;
+    }
+    candidate.len() > parent.len()
+        && candidate.starts_with(parent)
+        && candidate[parent.len()] == b'/'
+}
+
+fn kind_for_minikind(mk: u8) -> Option<String> {
+    match mk {
+        b'f' => Some("file".to_string()),
+        b'd' => Some("directory".to_string()),
+        b'l' => Some("symlink".to_string()),
+        b't' => Some("tree-reference".to_string()),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_parent_id(
+    dirblocks: &[Dirblock],
+    old_dirname: &[u8],
+    old_basename: &[u8],
+    entry_file_id: &[u8],
+    source_index: usize,
+    old_dirname_to_file_id: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    last_source_parent: &mut Option<(Vec<u8>, Option<Vec<u8>>)>,
+) -> Option<Vec<u8>> {
+    if !old_basename.is_empty()
+        && last_source_parent
+            .as_ref()
+            .map(|(d, _)| d.as_slice() == old_dirname)
+            .unwrap_or(false)
+    {
+        return last_source_parent.as_ref().and_then(|(_, id)| id.clone());
+    }
+    let cached = old_dirname_to_file_id.get(old_dirname).cloned();
+    let pid_raw = match cached {
+        Some(v) => Some(v),
+        None => {
+            let bei = get_block_entry_index(dirblocks, &[], old_dirname, source_index);
+            if bei.path_present {
+                Some(
+                    dirblocks[bei.block_index].entries[bei.entry_index]
+                        .key
+                        .file_id
+                        .clone(),
+                )
+            } else {
+                None
+            }
+        }
+    };
+    let pid = match pid_raw {
+        Some(v) if v == entry_file_id => None,
+        Some(v) => Some(v),
+        None => None,
+    };
+    *last_source_parent = Some((old_dirname.to_vec(), pid.clone()));
+    pid
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_target_parent_id(
+    dirblocks: &[Dirblock],
+    new_dirname: &[u8],
+    new_basename: &[u8],
+    entry_file_id: &[u8],
+    target_index: usize,
+    new_dirname_to_file_id: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    last_target_parent: &mut Option<(Vec<u8>, Option<Vec<u8>>)>,
+) -> Result<Option<Vec<u8>>, ProcessEntryError> {
+    if !new_basename.is_empty()
+        && last_target_parent
+            .as_ref()
+            .map(|(d, _)| d.as_slice() == new_dirname)
+            .unwrap_or(false)
+    {
+        return Ok(last_target_parent.as_ref().and_then(|(_, id)| id.clone()));
+    }
+    let cached = new_dirname_to_file_id.get(new_dirname).cloned();
+    let pid_raw = match cached {
+        Some(v) => Some(v),
+        None => {
+            let bei = get_block_entry_index(dirblocks, &[], new_dirname, target_index);
+            if bei.path_present {
+                Some(
+                    dirblocks[bei.block_index].entries[bei.entry_index]
+                        .key
+                        .file_id
+                        .clone(),
+                )
+            } else {
+                return Err(ProcessEntryError::Internal(format!(
+                    "Could not find target parent in wt: {:?}",
+                    new_dirname
+                )));
+            }
+        }
+    };
+    let pid = match pid_raw {
+        Some(v) if v == entry_file_id => None,
+        Some(v) => Some(v),
+        None => None,
+    };
+    *last_target_parent = Some((new_dirname.to_vec(), pid.clone()));
+    Ok(pid)
+}
+
 /// Errors returned by [`Transport`] operations.
 ///
 /// Variants are coarse on purpose: callers generally either propagate
@@ -1707,12 +1930,394 @@ impl DirState {
     /// the on-disk kind is not supported (e.g. block/char devices),
     /// when the row is a directory and the cached stat matches
     /// (nothing to report), or when we skip the sha because the
-    /// stat falls inside the "uncacheable" window.
+    /// Compare one dirstate entry against what's on disk (or nothing,
+    /// if the path is absent in the target) and yield a
+    /// [`DirstateChange`] describing any differences.  Ports Python's
+    /// `ProcessEntryPython._process_entry`.
     ///
-    /// The `abspath` must be an absolute path to the file on disk.
-    /// `stat_meta` is the result of a prior `lstat` on `abspath` —
-    /// the caller has to stat anyway, so we avoid a redundant syscall
-    /// here.
+    /// Returns `(None, None)` when the entry is uninteresting (no row
+    /// in either side of the comparison), `(None, Some(false))` when
+    /// both sides match and `pstate.include_unchanged` is off,
+    /// `(Some(change), Some(true))` for a real change, and
+    /// `(Some(change), Some(false))` for an unchanged-but-included
+    /// report.
+    pub fn process_entry(
+        &mut self,
+        pstate: &mut ProcessEntryState,
+        entry_key: &EntryKey,
+        entry_trees: &[TreeData],
+        path_info: Option<&ProcessPathInfo>,
+        transport: &dyn Transport,
+    ) -> Result<(Option<DirstateChange>, Option<bool>), ProcessEntryError> {
+        let source_details: TreeData = if let Some(idx) = pstate.source_index {
+            entry_trees
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(null_parent_details)
+        } else {
+            null_parent_details()
+        };
+        let target_idx = pstate.target_index;
+        let mut target_details: TreeData = entry_trees
+            .get(target_idx)
+            .cloned()
+            .unwrap_or_else(null_parent_details);
+        let mut target_minikind = target_details.minikind;
+
+        let fdlt = |k: u8| matches!(k, b'f' | b'd' | b'l' | b't');
+        let fdltr = |k: u8| matches!(k, b'f' | b'd' | b'l' | b't' | b'r');
+
+        // Step 1: if on disk and versioned in the target, refresh
+        // via update_entry (which may flip minikind e.g. d → t).
+        let mut link_or_sha1: Option<Vec<u8>> = None;
+        if let Some(info) = path_info {
+            if fdlt(target_minikind) {
+                if target_idx != 0 {
+                    return Err(ProcessEntryError::Internal(
+                        "update_entry requires target_index == 0".into(),
+                    ));
+                }
+                link_or_sha1 = self
+                    .update_entry(entry_key, &info.abspath, &info.stat, transport)
+                    .map_err(|e| ProcessEntryError::Internal(format!("update_entry: {}", e)))?;
+                let (bi, _) = find_block_index_from_key(&self.dirblocks, entry_key);
+                let (ei, _) = find_entry_index(entry_key, &self.dirblocks[bi].entries);
+                target_details = self.dirblocks[bi].entries[ei].trees[target_idx].clone();
+                target_minikind = target_details.minikind;
+            }
+        }
+
+        let file_id = entry_key.file_id.clone();
+        let mut source_minikind = source_details.minikind;
+        let mut source_details_mut = source_details.clone();
+
+        if fdltr(source_minikind) && fdlt(target_minikind) {
+            let mut old_dirname: Vec<u8>;
+            let mut old_basename: Vec<u8>;
+            let mut old_path: Option<Vec<u8>>;
+            let mut path: Option<Vec<u8>>;
+
+            if source_minikind == b'r' {
+                let src_path = source_details_mut.fingerprint.clone();
+                let already_inside = pstate
+                    .searched_specific_files
+                    .iter()
+                    .any(|p| is_inside(p.as_slice(), &src_path));
+                if !already_inside {
+                    pstate.search_specific_files.insert(src_path.clone());
+                }
+                old_path = Some(src_path.clone());
+                let (od, ob) = split_path_utf8(&src_path);
+                old_dirname = od.to_vec();
+                old_basename = ob.to_vec();
+                path = Some(join_path(&entry_key.dirname, &entry_key.basename));
+
+                let src_idx = pstate.source_index.ok_or_else(|| {
+                    ProcessEntryError::Internal("relocation with no source_index".into())
+                })?;
+                let bei =
+                    get_block_entry_index(&self.dirblocks, &old_dirname, &old_basename, src_idx);
+                let src = if bei.path_present {
+                    self.dirblocks[bei.block_index].entries[bei.entry_index]
+                        .trees
+                        .get(src_idx)
+                        .cloned()
+                } else {
+                    None
+                };
+                let src = src.ok_or_else(|| {
+                    ProcessEntryError::DirstateCorrupt(format!(
+                        "entry '{}/{}' is considered renamed from {:?} but source does not exist",
+                        String::from_utf8_lossy(&entry_key.dirname),
+                        String::from_utf8_lossy(&entry_key.basename),
+                        src_path,
+                    ))
+                })?;
+                source_details_mut = src;
+                source_minikind = source_details_mut.minikind;
+            } else {
+                old_dirname = entry_key.dirname.clone();
+                old_basename = entry_key.basename.clone();
+                old_path = None;
+                path = None;
+            }
+
+            let (content_change, target_kind, target_exec) = if let Some(info) = path_info {
+                let target_kind_str: &str = info.kind.as_deref().unwrap_or("file");
+                match target_kind_str {
+                    "directory" => {
+                        if path.is_none() {
+                            let p = join_path(&old_dirname, &old_basename);
+                            path = Some(p.clone());
+                            old_path = Some(p);
+                        }
+                        if let Some(p) = path.as_ref() {
+                            pstate
+                                .new_dirname_to_file_id
+                                .insert(p.clone(), file_id.clone());
+                        }
+                        (
+                            source_minikind != b'd',
+                            Some("directory".to_string()),
+                            false,
+                        )
+                    }
+                    "file" => {
+                        let cc = if source_minikind != b'f' {
+                            true
+                        } else {
+                            if link_or_sha1.is_none() {
+                                let path_buf = bytes_to_path(&info.abspath);
+                                let sha = self.sha1_provider.sha1(&path_buf).map_err(|e| {
+                                    ProcessEntryError::Internal(format!("sha1: {}", e))
+                                })?;
+                                let sha_bytes = sha.as_bytes().to_vec();
+                                let _ = self.observed_sha1(
+                                    entry_key,
+                                    &sha_bytes,
+                                    info.stat.mode,
+                                    info.stat.size,
+                                    info.stat.mtime,
+                                    info.stat.ctime,
+                                    info.stat.dev,
+                                    info.stat.ino,
+                                );
+                                link_or_sha1 = Some(sha_bytes);
+                            }
+                            link_or_sha1.as_deref()
+                                != Some(source_details_mut.fingerprint.as_slice())
+                        };
+                        let te = if self.use_filesystem_for_exec {
+                            (info.stat.mode & 0o100) != 0
+                        } else {
+                            target_details.executable
+                        };
+                        (cc, Some("file".to_string()), te)
+                    }
+                    "symlink" => {
+                        let cc = if source_minikind != b'l' {
+                            true
+                        } else {
+                            link_or_sha1.as_deref()
+                                != Some(source_details_mut.fingerprint.as_slice())
+                        };
+                        (cc, Some("symlink".to_string()), false)
+                    }
+                    "tree-reference" => (
+                        source_minikind != b't',
+                        Some("tree-reference".to_string()),
+                        false,
+                    ),
+                    other => {
+                        if path.is_none() {
+                            path = Some(join_path(&old_dirname, &old_basename));
+                        }
+                        return Err(ProcessEntryError::BadFileKind {
+                            path: path.unwrap(),
+                            kind: other.to_string(),
+                        });
+                    }
+                }
+            } else {
+                (true, None, false)
+            };
+
+            if source_minikind == b'd' {
+                if path.is_none() {
+                    let p = join_path(&old_dirname, &old_basename);
+                    path = Some(p.clone());
+                    old_path = Some(p);
+                }
+                if let Some(op) = old_path.as_ref() {
+                    pstate
+                        .old_dirname_to_file_id
+                        .insert(op.clone(), file_id.clone());
+                }
+            }
+
+            let source_parent_id = resolve_parent_id(
+                &self.dirblocks,
+                &old_dirname,
+                &old_basename,
+                &entry_key.file_id,
+                pstate.source_index.unwrap_or(0),
+                &pstate.old_dirname_to_file_id,
+                &mut pstate.last_source_parent,
+            );
+            let target_parent_id = resolve_target_parent_id(
+                &self.dirblocks,
+                &entry_key.dirname,
+                &entry_key.basename,
+                &entry_key.file_id,
+                target_idx,
+                &pstate.new_dirname_to_file_id,
+                &mut pstate.last_target_parent,
+            )?;
+
+            let source_exec = source_details_mut.executable;
+            let changed = content_change
+                || source_parent_id != target_parent_id
+                || old_basename != entry_key.basename
+                || source_exec != target_exec;
+
+            if !changed && !pstate.include_unchanged {
+                return Ok((None, Some(false)));
+            }
+
+            let (old_path_out, path_out) = match old_path {
+                Some(ref op) => (op.clone(), path.clone().unwrap_or_else(|| op.clone())),
+                None => {
+                    let p = join_path(&old_dirname, &old_basename);
+                    (p.clone(), p)
+                }
+            };
+
+            return Ok((
+                Some(DirstateChange {
+                    file_id: entry_key.file_id.clone(),
+                    old_path: Some(old_path_out),
+                    new_path: Some(path_out),
+                    content_change,
+                    old_versioned: true,
+                    new_versioned: true,
+                    source_parent_id,
+                    target_parent_id,
+                    old_basename: Some(old_basename),
+                    new_basename: Some(entry_key.basename.clone()),
+                    source_kind: kind_for_minikind(source_minikind),
+                    target_kind,
+                    source_exec: Some(source_exec),
+                    target_exec: Some(target_exec),
+                }),
+                Some(changed),
+            ));
+        }
+
+        if source_minikind == b'a' && fdlt(target_minikind) {
+            let path = join_path(&entry_key.dirname, &entry_key.basename);
+            let parent_bei =
+                get_block_entry_index(&self.dirblocks, &Vec::new(), &entry_key.dirname, target_idx);
+            let parent_id: Option<Vec<u8>> = if parent_bei.path_present {
+                let pid = self.dirblocks[parent_bei.block_index].entries[parent_bei.entry_index]
+                    .key
+                    .file_id
+                    .clone();
+                (pid != entry_key.file_id).then_some(pid)
+            } else {
+                None
+            };
+            if let Some(info) = path_info {
+                let te = if self.use_filesystem_for_exec {
+                    (info.stat.mode & 0o170000 == 0o100000) && (info.stat.mode & 0o100) != 0
+                } else {
+                    target_details.executable
+                };
+                return Ok((
+                    Some(DirstateChange {
+                        file_id: entry_key.file_id.clone(),
+                        old_path: None,
+                        new_path: Some(path),
+                        content_change: true,
+                        old_versioned: false,
+                        new_versioned: true,
+                        source_parent_id: None,
+                        target_parent_id: parent_id,
+                        old_basename: None,
+                        new_basename: Some(entry_key.basename.clone()),
+                        source_kind: None,
+                        target_kind: info.kind.clone(),
+                        source_exec: None,
+                        target_exec: Some(te),
+                    }),
+                    Some(true),
+                ));
+            } else {
+                return Ok((
+                    Some(DirstateChange {
+                        file_id: entry_key.file_id.clone(),
+                        old_path: None,
+                        new_path: Some(path),
+                        content_change: false,
+                        old_versioned: false,
+                        new_versioned: true,
+                        source_parent_id: None,
+                        target_parent_id: parent_id,
+                        old_basename: None,
+                        new_basename: Some(entry_key.basename.clone()),
+                        source_kind: None,
+                        target_kind: None,
+                        source_exec: None,
+                        target_exec: Some(false),
+                    }),
+                    Some(true),
+                ));
+            }
+        }
+
+        if fdlt(source_minikind) && target_minikind == b'a' {
+            let old_path = join_path(&entry_key.dirname, &entry_key.basename);
+            let src_idx = pstate.source_index.unwrap_or(0);
+            let parent_bei =
+                get_block_entry_index(&self.dirblocks, &Vec::new(), &entry_key.dirname, src_idx);
+            let parent_id: Option<Vec<u8>> = if parent_bei.path_present {
+                let pid = self.dirblocks[parent_bei.block_index].entries[parent_bei.entry_index]
+                    .key
+                    .file_id
+                    .clone();
+                (pid != entry_key.file_id).then_some(pid)
+            } else {
+                None
+            };
+            return Ok((
+                Some(DirstateChange {
+                    file_id: entry_key.file_id.clone(),
+                    old_path: Some(old_path),
+                    new_path: None,
+                    content_change: true,
+                    old_versioned: true,
+                    new_versioned: false,
+                    source_parent_id: parent_id,
+                    target_parent_id: None,
+                    old_basename: Some(entry_key.basename.clone()),
+                    new_basename: None,
+                    source_kind: kind_for_minikind(source_minikind),
+                    target_kind: None,
+                    source_exec: Some(source_details_mut.executable),
+                    target_exec: None,
+                }),
+                Some(true),
+            ));
+        }
+
+        if fdlt(source_minikind) && target_minikind == b'r' {
+            let tpath = target_details.fingerprint.clone();
+            let already_inside = pstate
+                .searched_specific_files
+                .iter()
+                .any(|p| is_inside(p.as_slice(), &tpath));
+            if !already_inside {
+                pstate.search_specific_files.insert(tpath);
+            }
+            return Ok((None, None));
+        }
+
+        let ra = |k: u8| matches!(k, b'r' | b'a');
+        if ra(source_minikind) && ra(target_minikind) {
+            return Ok((None, None));
+        }
+
+        Err(ProcessEntryError::Internal(format!(
+            "don't know how to compare source_minikind={:?}, target_minikind={:?}",
+            source_minikind, target_minikind
+        )))
+    }
+
+    /// Refresh the tree-0 slot of `key` from the filesystem.  Mirrors
+    /// Python's `py_update_entry`:
+    ///
+    /// Arguments are (key, abspath, stat, transport) — see the doc
+    /// comment on [`StatInfo`] for the stat fields, and the
+    /// [`Transport`] trait for read_link semantics.
     pub fn update_entry(
         &mut self,
         key: &EntryKey,
