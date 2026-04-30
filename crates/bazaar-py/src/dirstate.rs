@@ -139,6 +139,78 @@ impl bazaar::dirstate::Transport for PyFileTransport {
     }
 }
 
+/// Build a `read_range(offset, len)` closure that seeks + reads on a
+/// Python file-like object.  Used by the bisect entrypoints — the
+/// pure-Rust bisect only needs random byte access, not the full
+/// Transport contract.
+fn make_read_range(
+    state_file: &Bound<PyAny>,
+) -> impl FnMut(u64, usize) -> Result<Vec<u8>, bazaar::dirstate::BisectError> {
+    let file: Py<PyAny> = state_file.clone().unbind();
+    move |offset: u64, len: usize| -> Result<Vec<u8>, bazaar::dirstate::BisectError> {
+        Python::attach(|py| {
+            let f = file.bind(py);
+            f.call_method1("seek", (offset,))
+                .map_err(|e| bazaar::dirstate::BisectError::ReadError(e.to_string()))?;
+            let data = f
+                .call_method1("read", (len,))
+                .map_err(|e| bazaar::dirstate::BisectError::ReadError(e.to_string()))?;
+            let bytes = data.cast_into::<PyBytes>().map_err(|_| {
+                bazaar::dirstate::BisectError::ReadError(
+                    "state_file.read() did not return bytes".to_string(),
+                )
+            })?;
+            Ok(bytes.as_bytes().to_vec())
+        })
+    }
+}
+
+/// Convert the `bisect` / `bisect_dirblocks` result into a Python
+/// dict: `{path_bytes: [entry_tuple, ...]}` where `entry_tuple` has
+/// the same shape as `DirStateRs.dirblocks` entries.
+fn bisect_result_to_pydict<'py>(
+    py: Python<'py>,
+    found: &std::collections::HashMap<Vec<u8>, Vec<bazaar::dirstate::Entry>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    for (key, entries) in found {
+        let mut py_entries: Vec<Bound<PyAny>> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let key_tuple = PyTuple::new(
+                py,
+                [
+                    PyBytes::new(py, &entry.key.dirname).into_any(),
+                    PyBytes::new(py, &entry.key.basename).into_any(),
+                    PyBytes::new(py, &entry.key.file_id).into_any(),
+                ],
+            )?;
+            let mut tree_list: Vec<Bound<PyAny>> = Vec::with_capacity(entry.trees.len());
+            for t in &entry.trees {
+                let tup = PyTuple::new(
+                    py,
+                    [
+                        PyBytes::new(py, &[t.minikind]).into_any(),
+                        PyBytes::new(py, &t.fingerprint).into_any(),
+                        t.size.into_pyobject(py)?.into_any(),
+                        pyo3::types::PyBool::new(py, t.executable)
+                            .to_owned()
+                            .into_any(),
+                        PyBytes::new(py, &t.packed_stat).into_any(),
+                    ],
+                )?;
+                tree_list.push(tup.into_any());
+            }
+            let entry_tuple = PyTuple::new(
+                py,
+                [key_tuple.into_any(), PyList::new(py, tree_list)?.into_any()],
+            )?;
+            py_entries.push(entry_tuple.into_any());
+        }
+        out.set_item(PyBytes::new(py, key), PyList::new(py, py_entries)?)?;
+    }
+    Ok(out)
+}
+
 // TODO(jelmer): Shared pyo3 utils?
 fn extract_path(object: &Bound<PyAny>) -> PyResult<PathBuf> {
     if let Ok(path) = object.extract::<Vec<u8>>() {
@@ -841,6 +913,100 @@ impl PyDirState {
         self.inner.save_to(&mut transport).map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!("dirstate save failed: {:?}", e))
         })
+    }
+
+    /// Bisect for rows at the given paths. Mirrors Python's
+    /// `DirState._bisect`. `paths` is an iterable of `bytes`; returns
+    /// a `dict` mapping path → list of entries (same tuple shape as
+    /// `DirStateRs.dirblocks` entries). Requires the header to have
+    /// been read and the caller to hold a read (or write) lock on
+    /// `state_file`.
+    fn bisect<'py>(
+        &self,
+        py: Python<'py>,
+        state_file: &Bound<PyAny>,
+        file_size: u64,
+        paths: &Bound<PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rust_paths = collect_bytes_vec(paths)?;
+        let read_range = make_read_range(state_file);
+        let found = self
+            .inner
+            .bisect(rust_paths, file_size, read_range)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("bisect failed: {}", e)))?;
+        bisect_result_to_pydict(py, &found)
+    }
+
+    /// Bisect for all entries whose dirname is in `dir_list`.
+    /// Mirrors Python's `DirState._bisect_dirblocks`.
+    fn bisect_dirblocks<'py>(
+        &self,
+        py: Python<'py>,
+        state_file: &Bound<PyAny>,
+        file_size: u64,
+        dir_list: &Bound<PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rust_dirs = collect_bytes_vec(dir_list)?;
+        let read_range = make_read_range(state_file);
+        let found = self
+            .inner
+            .bisect_dirblocks(rust_dirs, file_size, read_range)
+            .map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!("bisect_dirblocks failed: {}", e))
+            })?;
+        bisect_result_to_pydict(py, &found)
+    }
+
+    /// Recursive bisect. Mirrors Python's `DirState._bisect_recursive`.
+    /// `paths` is an iterable of `bytes` paths; returns a `dict`
+    /// mapping `(dirname, basename, file_id)` to a list of
+    /// tree-data 5-tuples.
+    fn bisect_recursive<'py>(
+        &self,
+        py: Python<'py>,
+        state_file: &Bound<PyAny>,
+        file_size: u64,
+        paths: &Bound<PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rust_paths = collect_bytes_vec(paths)?;
+        let read_range = make_read_range(state_file);
+        let found = self
+            .inner
+            .bisect_recursive(rust_paths, file_size, read_range)
+            .map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!("bisect_recursive failed: {}", e))
+            })?;
+        let out = PyDict::new(py);
+        for ((dn, bn, fid), trees) in &found {
+            let key = PyTuple::new(
+                py,
+                [
+                    PyBytes::new(py, dn).into_any(),
+                    PyBytes::new(py, bn).into_any(),
+                    PyBytes::new(py, fid).into_any(),
+                ],
+            )?;
+            let tree_items: Vec<Bound<PyAny>> = trees
+                .iter()
+                .map(|t| {
+                    PyTuple::new(
+                        py,
+                        [
+                            PyBytes::new(py, &[t.minikind]).into_any(),
+                            PyBytes::new(py, &t.fingerprint).into_any(),
+                            t.size.into_pyobject(py)?.into_any(),
+                            pyo3::types::PyBool::new(py, t.executable)
+                                .to_owned()
+                                .into_any(),
+                            PyBytes::new(py, &t.packed_stat).into_any(),
+                        ],
+                    )
+                    .map(|tup| tup.into_any())
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            out.set_item(key, PyList::new(py, tree_items)?)?;
+        }
+        Ok(out)
     }
 
     /// Forget all in-memory state. Mirrors `DirState._wipe_state`.
