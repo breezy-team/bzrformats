@@ -1084,6 +1084,71 @@ fn resolve_target_parent_id(
     }
 }
 
+/// Return the last path component (utf8 bytes) of `path`.  Matches
+/// `osutils.splitpath(path)[-1]` — the basename of a path.
+fn splitpath_last(path: &[u8]) -> Vec<u8> {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => path[i + 1..].to_vec(),
+        None => path.to_vec(),
+    }
+}
+
+/// Build a `ProcessPathInfo` for `path_utf8`, or `None` when the path
+/// does not exist on disk.  Mirrors Python's `_path_info` helper on
+/// `ProcessEntryPython`.
+fn compute_path_info(
+    pstate: &ProcessEntryState,
+    transport: &dyn Transport,
+    path_utf8: &[u8],
+) -> Option<ProcessPathInfo> {
+    let abspath = join_path(&pstate.root_abspath, path_utf8);
+    let stat = match transport.lstat(&abspath) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    let mut kind = if stat.is_file() {
+        "file".to_string()
+    } else if stat.is_dir() {
+        "directory".to_string()
+    } else if stat.is_symlink() {
+        "symlink".to_string()
+    } else {
+        "unknown".to_string()
+    };
+    if kind == "directory"
+        && pstate.supports_tree_reference
+        && transport.is_tree_reference_dir(&abspath).unwrap_or(false)
+    {
+        kind = "tree-reference".to_string();
+    }
+    Some(ProcessPathInfo {
+        abspath,
+        kind: Some(kind),
+        stat,
+    })
+}
+
+/// Update `seen_ids` + `search_specific_file_parents` from a
+/// just-emitted `DirstateChange`.  Mirrors Python's
+/// `_gather_result_for_consistency`.
+fn gather_result_for_consistency(pstate: &mut ProcessEntryState, change: &DirstateChange) {
+    if !pstate.partial || change.file_id.is_empty() {
+        return;
+    }
+    pstate.seen_ids.insert(change.file_id.clone());
+    if let Some(ref new_path) = change.new_path {
+        if !new_path.is_empty() {
+            // Queue every ancestor directory, plus the root.
+            let mut path = new_path.clone();
+            while let Some(i) = path.iter().rposition(|&b| b == b'/') {
+                path.truncate(i);
+                pstate.search_specific_file_parents.insert(path.clone());
+            }
+            pstate.search_specific_file_parents.insert(Vec::new());
+        }
+    }
+}
+
 /// Errors returned by [`Transport`] operations.
 ///
 /// Variants are coarse on purpose: callers generally either propagate
@@ -1182,6 +1247,89 @@ impl std::error::Error for TransportError {}
 /// mutates the lock state, the file contents, or both. Callers that
 /// need shared access should wrap an implementation in their own
 /// synchronisation primitive.
+/// Lazy iterator state for [`DirState::iter_changes_next`].
+/// Holds enough information to resume the depth-first walk across
+/// calls, so callers (pyo3 included) can consume one change at a
+/// time without materialising the full change set upfront.
+///
+/// All fields are owned — no borrow on `DirState` or `Transport` —
+/// so the state can live inside a pyclass that re-borrows `DirState`
+/// on every `__next__` call.
+#[derive(Debug)]
+pub struct IterChangesIter {
+    phase: IterPhase,
+    /// When the state machine is walking a specific subtree, the
+    /// root currently being processed plus its absolute path on disk.
+    current_root: Option<(Vec<u8>, Vec<u8>)>,
+    /// Have we processed the dirstate entries + want_unversioned
+    /// emission for the root itself?
+    root_processed: bool,
+    /// Filesystem walker for the current root's subtree.
+    walker: Option<WalkDirsUtf8>,
+    /// Dirblock cursor under the current root — the block index in
+    /// `DirState.dirblocks`.
+    block_index: usize,
+    /// Staged walker yield that hasn't yet been consumed by the
+    /// merge loop.  Lazily filled on demand.
+    staged_walker_block: Option<(Vec<u8>, Vec<u8>, Vec<DirEntryInfo>)>,
+    /// Per-block merge cursors.  Reset every time we advance to a
+    /// new block/walker pair.
+    merge_entry_index: usize,
+    merge_path_index: usize,
+    merge_path_handled: bool,
+    merge_advance_entry: bool,
+    merge_advance_path: bool,
+    /// Changes buffered for emission.  One state-machine step can
+    /// produce several changes (e.g. a root walk that handles both
+    /// existing entries and a want_unversioned record) — we queue
+    /// them and drain one per `next_change` call.
+    pending: std::collections::VecDeque<DirstateChange>,
+    /// Set once iter_specific_file_parents drain has begun, so we
+    /// don't restart it.
+    parents_drain_started: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IterPhase {
+    /// Pull the next root from `search_specific_files`.
+    PickRoot,
+    /// Process the root path itself (entries + want_unversioned).
+    ProcessRoot,
+    /// Walk the root's subtree, merging walker output against
+    /// dirblocks.
+    WalkSubtree,
+    /// Drain `search_specific_file_parents`.
+    DrainParents,
+    /// Finished — `next_change` returns `Ok(None)`.
+    Done,
+}
+
+impl Default for IterChangesIter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IterChangesIter {
+    pub fn new() -> Self {
+        Self {
+            phase: IterPhase::PickRoot,
+            current_root: None,
+            root_processed: false,
+            walker: None,
+            block_index: 0,
+            staged_walker_block: None,
+            merge_entry_index: 0,
+            merge_path_index: 0,
+            merge_path_handled: false,
+            merge_advance_entry: true,
+            merge_advance_path: true,
+            pending: std::collections::VecDeque::new(),
+            parents_drain_started: false,
+        }
+    }
+}
+
 /// One directory block yielded by [`walkdirs_utf8`].  Mirrors the
 /// shape Python's `_walkdirs_utf8` yields: `((relroot, abspath),
 /// [DirEntryInfo, ...])`.  The entries are sorted by basename; the
@@ -1208,6 +1356,7 @@ pub struct WalkedDir {
 /// mutates the returned `entries` list before the next call to
 /// prune directories from the descent (matching how the Python
 /// walker mutates the yielded dirblock list in place).
+#[derive(Debug)]
 pub struct WalkDirsUtf8 {
     /// Stack of (relpath, abspath) pairs still to visit.  Most
     /// recently discovered directories are on top so the walk is
@@ -2485,6 +2634,636 @@ impl DirState {
             "don't know how to compare source_minikind={:?}, target_minikind={:?}",
             source_minikind, target_minikind
         )))
+    }
+
+    /// Advance the lazy iter_changes state machine and return the
+    /// next change to yield, or `Ok(None)` when the walk is done.
+    /// Mirrors Python's `ProcessEntryPython.iter_changes` generator:
+    /// call repeatedly to get one change at a time.
+    ///
+    /// Each call may emit 0 or more changes; leftover changes are
+    /// buffered on `iter.pending` so subsequent calls drain them
+    /// before resuming the walk.
+    pub fn iter_changes_next(
+        &mut self,
+        iter: &mut IterChangesIter,
+        pstate: &mut ProcessEntryState,
+        transport: &dyn Transport,
+    ) -> Result<Option<DirstateChange>, ProcessEntryError> {
+        loop {
+            if let Some(change) = iter.pending.pop_front() {
+                return Ok(Some(change));
+            }
+            match iter.phase {
+                IterPhase::PickRoot => {
+                    let next_root = pstate.search_specific_files.iter().next().cloned();
+                    match next_root {
+                        Some(root) => {
+                            pstate.search_specific_files.remove(&root);
+                            pstate.searched_specific_files.insert(root.clone());
+                            let abspath = join_path(&pstate.root_abspath, &root);
+                            iter.current_root = Some((root, abspath));
+                            iter.root_processed = false;
+                            iter.walker = None;
+                            iter.block_index = 0;
+                            iter.staged_walker_block = None;
+                            iter.phase = IterPhase::ProcessRoot;
+                        }
+                        None => {
+                            iter.phase = IterPhase::DrainParents;
+                        }
+                    }
+                }
+                IterPhase::ProcessRoot => {
+                    let (current_root, root_abspath) = iter
+                        .current_root
+                        .as_ref()
+                        .expect("current_root set")
+                        .clone();
+
+                    let root_stat = match transport.lstat(&root_abspath) {
+                        Ok(s) => Some(s),
+                        Err(TransportError::NotFound(_)) => None,
+                        Err(e) => {
+                            return Err(ProcessEntryError::Internal(format!(
+                                "lstat({}): {}",
+                                String::from_utf8_lossy(&root_abspath),
+                                e
+                            )))
+                        }
+                    };
+                    let root_path_info = root_stat.map(|stat| {
+                        let mut kind = if stat.is_file() {
+                            "file".to_string()
+                        } else if stat.is_dir() {
+                            "directory".to_string()
+                        } else if stat.is_symlink() {
+                            "symlink".to_string()
+                        } else {
+                            "unknown".to_string()
+                        };
+                        if kind == "directory"
+                            && pstate.supports_tree_reference
+                            && transport
+                                .is_tree_reference_dir(&root_abspath)
+                                .unwrap_or(false)
+                        {
+                            kind = "tree-reference".to_string();
+                        }
+                        ProcessPathInfo {
+                            abspath: root_abspath.clone(),
+                            kind: Some(kind),
+                            stat,
+                        }
+                    });
+
+                    let root_entries_owned: Vec<(EntryKey, Vec<TreeData>)> = self
+                        .entries_for_path(&current_root)
+                        .into_iter()
+                        .map(|e| (e.key.clone(), e.trees.clone()))
+                        .collect();
+                    if root_entries_owned.is_empty() && root_path_info.is_none() {
+                        iter.phase = IterPhase::PickRoot;
+                        continue;
+                    }
+                    let mut path_handled = false;
+                    for (ek, trees) in &root_entries_owned {
+                        let (change, changed) = self.process_entry(
+                            pstate,
+                            ek,
+                            trees,
+                            root_path_info.as_ref(),
+                            transport,
+                        )?;
+                        if changed.is_some() {
+                            path_handled = true;
+                            if changed == Some(true) {
+                                if let Some(ref c) = change {
+                                    gather_result_for_consistency(pstate, c);
+                                }
+                            }
+                            if changed == Some(true) || pstate.include_unchanged {
+                                if let Some(c) = change {
+                                    iter.pending.push_back(c);
+                                }
+                            }
+                        }
+                    }
+                    if pstate.want_unversioned && !path_handled {
+                        if let Some(ref info) = root_path_info {
+                            let new_executable =
+                                info.stat.is_file() && (info.stat.mode & 0o100) != 0;
+                            let basename = splitpath_last(&current_root);
+                            iter.pending.push_back(DirstateChange {
+                                file_id: Vec::new(),
+                                old_path: None,
+                                new_path: Some(current_root.clone()),
+                                content_change: true,
+                                old_versioned: false,
+                                new_versioned: false,
+                                source_parent_id: None,
+                                target_parent_id: None,
+                                old_basename: None,
+                                new_basename: Some(basename),
+                                source_kind: None,
+                                target_kind: info.kind.clone(),
+                                source_exec: None,
+                                target_exec: Some(new_executable),
+                            });
+                        }
+                    }
+
+                    // Stop here if the root is a tree-reference or
+                    // absent on disk — we don't descend into it.
+                    let skip_walk = root_path_info
+                        .as_ref()
+                        .map(|p| p.kind.as_deref() == Some("tree-reference"))
+                        .unwrap_or(true);
+                    if skip_walk {
+                        iter.phase = IterPhase::PickRoot;
+                        continue;
+                    }
+
+                    // Seed the subtree walker.
+                    iter.walker = Some(WalkDirsUtf8::new(&root_abspath, &current_root));
+                    let initial_key = EntryKey {
+                        dirname: current_root.clone(),
+                        basename: Vec::new(),
+                        file_id: Vec::new(),
+                    };
+                    let (mut bi, _) = find_block_index_from_key(&self.dirblocks, &initial_key);
+                    if bi == 0 {
+                        bi = 1;
+                    }
+                    iter.block_index = bi;
+                    iter.staged_walker_block = None;
+                    iter.merge_entry_index = 0;
+                    iter.merge_path_index = 0;
+                    iter.merge_path_handled = false;
+                    iter.merge_advance_entry = true;
+                    iter.merge_advance_path = true;
+                    iter.phase = IterPhase::WalkSubtree;
+                }
+                IterPhase::WalkSubtree => {
+                    self.iter_changes_step_walk(iter, pstate, transport)?;
+                }
+                IterPhase::DrainParents => {
+                    self.iter_changes_step_parents(iter, pstate, transport)?;
+                }
+                IterPhase::Done => return Ok(None),
+            }
+            // Any changes just queued become the next yielded value
+            // via the top-of-loop drain.
+        }
+    }
+
+    /// Advance one step of the `WalkSubtree` phase.  Exactly one
+    /// walker block + dirblock pair gets merged per call; if we
+    /// exhaust both under the current root, transition back to
+    /// `PickRoot`.
+    fn iter_changes_step_walk(
+        &mut self,
+        iter: &mut IterChangesIter,
+        pstate: &mut ProcessEntryState,
+        transport: &dyn Transport,
+    ) -> Result<(), ProcessEntryError> {
+        let current_root = iter
+            .current_root
+            .as_ref()
+            .expect("current_root set while walking")
+            .0
+            .clone();
+
+        // Pull the next walker block if we haven't cached one.
+        if iter.staged_walker_block.is_none() {
+            let walker = iter.walker.as_mut().expect("walker initialised");
+            let mut captured: Option<(Vec<u8>, Vec<u8>, Vec<DirEntryInfo>)> = None;
+            let supports_ref = pstate.supports_tree_reference;
+            let progressed = walker
+                .next_dir(transport, |rel, abs, entries| {
+                    if rel.is_empty() {
+                        entries.retain(|e| e.basename.as_slice() != b".bzr");
+                    }
+                    if supports_ref {
+                        for e in entries.iter_mut() {
+                            if e.kind == "directory" {
+                                if transport.is_tree_reference_dir(&e.abspath).unwrap_or(false) {
+                                    e.kind = "tree-reference".to_string();
+                                }
+                            }
+                        }
+                    }
+                    captured = Some((rel.to_vec(), abs.to_vec(), entries.clone()));
+                })
+                .map_err(|e| ProcessEntryError::Internal(format!("walkdirs: {}", e)))?;
+            iter.staged_walker_block = if progressed { captured } else { None };
+        }
+
+        let block_info = self
+            .dirblocks
+            .get(iter.block_index)
+            .filter(|b| is_inside(&current_root, &b.dirname))
+            .map(|b| (b.dirname.clone(), b.entries.clone()));
+
+        // Both exhausted → this root is done; back to PickRoot.
+        if iter.staged_walker_block.is_none() && block_info.is_none() {
+            iter.phase = IterPhase::PickRoot;
+            return Ok(());
+        }
+
+        // Resolve mis-aligned walker vs block: whichever is "earlier"
+        // gets consumed first.  This mirrors the Python _lt_by_dirs
+        // dispatch at the top of the merge loop.
+        if let (Some((walker_rel, _, walker_entries)), Some((block_dirname, _))) =
+            (iter.staged_walker_block.as_ref(), block_info.as_ref())
+        {
+            if walker_rel.as_slice() != block_dirname.as_slice() {
+                if cmp_by_dirs_bytes(walker_rel, block_dirname).is_lt() {
+                    // Walker has an unversioned directory the
+                    // dirstate doesn't know about.  Emit records
+                    // (if want_unversioned) and prune its subdirs
+                    // from the walker's recursion.
+                    if pstate.want_unversioned {
+                        for pi in walker_entries.iter() {
+                            let new_executable = pi.stat.is_file() && (pi.stat.mode & 0o100) != 0;
+                            let path = if walker_rel.is_empty() {
+                                pi.basename.clone()
+                            } else {
+                                let mut p = walker_rel.clone();
+                                p.push(b'/');
+                                p.extend_from_slice(&pi.basename);
+                                p
+                            };
+                            iter.pending.push_back(DirstateChange {
+                                file_id: Vec::new(),
+                                old_path: None,
+                                new_path: Some(path),
+                                content_change: true,
+                                old_versioned: false,
+                                new_versioned: false,
+                                source_parent_id: None,
+                                target_parent_id: None,
+                                old_basename: None,
+                                new_basename: Some(pi.basename.clone()),
+                                source_kind: None,
+                                target_kind: Some(pi.kind.clone()),
+                                source_exec: None,
+                                target_exec: Some(new_executable),
+                            });
+                        }
+                    }
+                    // Don't descend into unversioned directories.
+                    if let Some(walker) = iter.walker.as_mut() {
+                        walker.pending_subdirs.clear();
+                    }
+                    iter.staged_walker_block = None;
+                    return Ok(());
+                } else {
+                    // Dirstate knows about a block the walker didn't
+                    // visit (directory removed from disk).  Emit
+                    // removals for every live entry.
+                    let (_, block_entries) = block_info.unwrap();
+                    for entry in &block_entries {
+                        let (change, changed) =
+                            self.process_entry(pstate, &entry.key, &entry.trees, None, transport)?;
+                        if changed.is_some() {
+                            if changed == Some(true) {
+                                if let Some(ref c) = change {
+                                    gather_result_for_consistency(pstate, c);
+                                }
+                            }
+                            if changed == Some(true) || pstate.include_unchanged {
+                                if let Some(c) = change {
+                                    iter.pending.push_back(c);
+                                }
+                            }
+                        }
+                    }
+                    iter.block_index += 1;
+                    return Ok(());
+                }
+            }
+        }
+
+        // --- Aligned merge: same dirname on both sides (or one side empty) ---
+        let (_block_dirname, block_entries) = block_info.unwrap_or((Vec::new(), Vec::new()));
+        let walker_rel = iter
+            .staged_walker_block
+            .as_ref()
+            .map(|(rel, _, _)| rel.clone())
+            .unwrap_or_default();
+        let walker_entries = iter
+            .staged_walker_block
+            .as_ref()
+            .map(|(_, _, entries)| entries.clone())
+            .unwrap_or_default();
+
+        // Drain the inner merge loop one step at a time.  Unlike
+        // Python's tight `while current_entry or current_path_info`
+        // loop, we run the entire merge here — it's bounded by the
+        // dir contents and typically small.  Results queue onto
+        // iter.pending and surface one per outer next_change call.
+        let mut entry_index = iter.merge_entry_index;
+        let mut path_index = iter.merge_path_index;
+        let mut path_handled = iter.merge_path_handled;
+        let mut advance_entry = iter.merge_advance_entry;
+        let mut advance_path = iter.merge_advance_path;
+        let mut walker_local = walker_entries.clone();
+        loop {
+            let current_entry = block_entries.get(entry_index).cloned();
+            let current_path_info = if path_index < walker_local.len() {
+                Some(walker_local[path_index].clone())
+            } else {
+                None
+            };
+            if current_entry.is_none() && current_path_info.is_none() {
+                break;
+            }
+            if current_entry.is_none() {
+                // handled by want_unversioned below
+            } else if current_path_info.is_none() {
+                let ce = current_entry.as_ref().unwrap();
+                let (change, changed) =
+                    self.process_entry(pstate, &ce.key, &ce.trees, None, transport)?;
+                if changed.is_some() {
+                    if changed == Some(true) {
+                        if let Some(ref c) = change {
+                            gather_result_for_consistency(pstate, c);
+                        }
+                    }
+                    if changed == Some(true) || pstate.include_unchanged {
+                        if let Some(c) = change {
+                            iter.pending.push_back(c);
+                        }
+                    }
+                }
+            } else {
+                let ce = current_entry.as_ref().unwrap();
+                let pi = current_path_info.as_ref().unwrap();
+                let target0 = ce.trees.get(pstate.target_index).map(|t| t.minikind);
+                let mismatch =
+                    ce.key.basename != pi.basename || matches!(target0, Some(b'a') | Some(b'r'));
+                if mismatch {
+                    if pi.basename.as_slice() < ce.key.basename.as_slice() {
+                        advance_entry = false;
+                    } else {
+                        let path_info_absent: Option<&ProcessPathInfo> = None;
+                        let (change, changed) = self.process_entry(
+                            pstate,
+                            &ce.key,
+                            &ce.trees,
+                            path_info_absent,
+                            transport,
+                        )?;
+                        if changed.is_some() {
+                            if changed == Some(true) {
+                                if let Some(ref c) = change {
+                                    gather_result_for_consistency(pstate, c);
+                                }
+                            }
+                            if changed == Some(true) || pstate.include_unchanged {
+                                if let Some(c) = change {
+                                    iter.pending.push_back(c);
+                                }
+                            }
+                        }
+                        advance_path = false;
+                    }
+                } else {
+                    let pi_rs = ProcessPathInfo {
+                        abspath: pi.abspath.clone(),
+                        kind: Some(pi.kind.clone()),
+                        stat: pi.stat,
+                    };
+                    let (change, changed) =
+                        self.process_entry(pstate, &ce.key, &ce.trees, Some(&pi_rs), transport)?;
+                    if changed.is_some() {
+                        path_handled = true;
+                        if changed == Some(true) {
+                            if let Some(ref c) = change {
+                                gather_result_for_consistency(pstate, c);
+                            }
+                        }
+                        if changed == Some(true) || pstate.include_unchanged {
+                            if let Some(c) = change {
+                                iter.pending.push_back(c);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if advance_entry && current_entry.is_some() {
+                entry_index += 1;
+            } else {
+                advance_entry = true;
+            }
+            if advance_path && current_path_info.is_some() {
+                if !path_handled {
+                    if pstate.want_unversioned {
+                        let pi = current_path_info.as_ref().unwrap();
+                        let new_executable = pi.stat.is_file() && (pi.stat.mode & 0o100) != 0;
+                        let path = if walker_rel.is_empty() {
+                            pi.basename.clone()
+                        } else {
+                            let mut p = walker_rel.clone();
+                            p.push(b'/');
+                            p.extend_from_slice(&pi.basename);
+                            p
+                        };
+                        iter.pending.push_back(DirstateChange {
+                            file_id: Vec::new(),
+                            old_path: None,
+                            new_path: Some(path),
+                            content_change: true,
+                            old_versioned: false,
+                            new_versioned: false,
+                            source_parent_id: None,
+                            target_parent_id: None,
+                            old_basename: None,
+                            new_basename: Some(pi.basename.clone()),
+                            source_kind: None,
+                            target_kind: Some(pi.kind.clone()),
+                            source_exec: None,
+                            target_exec: Some(new_executable),
+                        });
+                    }
+                    let pi = current_path_info.as_ref().unwrap();
+                    if pi.kind == "directory" {
+                        let child_rel = if walker_rel.is_empty() {
+                            pi.basename.clone()
+                        } else {
+                            let mut p = walker_rel.clone();
+                            p.push(b'/');
+                            p.extend_from_slice(&pi.basename);
+                            p
+                        };
+                        if let Some(walker) = iter.walker.as_mut() {
+                            walker.pending_subdirs.retain(|(rel, _)| rel != &child_rel);
+                        }
+                    }
+                }
+                let pi = current_path_info.as_ref().unwrap();
+                if pi.kind == "tree-reference" {
+                    let child_rel = if walker_rel.is_empty() {
+                        pi.basename.clone()
+                    } else {
+                        let mut p = walker_rel.clone();
+                        p.push(b'/');
+                        p.extend_from_slice(&pi.basename);
+                        p
+                    };
+                    if let Some(walker) = iter.walker.as_mut() {
+                        walker.pending_subdirs.retain(|(rel, _)| rel != &child_rel);
+                    }
+                }
+                path_index += 1;
+                path_handled = false;
+                let _ = &mut walker_local;
+            } else {
+                advance_path = true;
+            }
+        }
+
+        iter.merge_entry_index = entry_index;
+        iter.merge_path_index = path_index;
+        iter.merge_path_handled = path_handled;
+        iter.merge_advance_entry = advance_entry;
+        iter.merge_advance_path = advance_path;
+        iter.block_index += 1;
+        iter.staged_walker_block = None;
+        // Reset merge cursors for the next block.
+        iter.merge_entry_index = 0;
+        iter.merge_path_index = 0;
+        iter.merge_path_handled = false;
+        iter.merge_advance_entry = true;
+        iter.merge_advance_path = true;
+        Ok(())
+    }
+
+    /// Advance one step of the `DrainParents` phase — equivalent to
+    /// Python's `_iter_specific_file_parents`.
+    fn iter_changes_step_parents(
+        &mut self,
+        iter: &mut IterChangesIter,
+        pstate: &mut ProcessEntryState,
+        transport: &dyn Transport,
+    ) -> Result<(), ProcessEntryError> {
+        let next = pstate.search_specific_file_parents.iter().next().cloned();
+        let path_utf8 = match next {
+            Some(p) => p,
+            None => {
+                iter.phase = IterPhase::Done;
+                return Ok(());
+            }
+        };
+        pstate.search_specific_file_parents.remove(&path_utf8);
+        if pstate
+            .searched_specific_files
+            .iter()
+            .any(|p| is_inside(p.as_slice(), &path_utf8))
+        {
+            return Ok(());
+        }
+        if pstate.searched_exact_paths.contains(&path_utf8) {
+            return Ok(());
+        }
+        let path_entries: Vec<(EntryKey, Vec<TreeData>)> = self
+            .entries_for_path(&path_utf8)
+            .into_iter()
+            .map(|e| (e.key.clone(), e.trees.clone()))
+            .collect();
+        let mut selected: Vec<(EntryKey, Vec<TreeData>)> = Vec::new();
+        let mut found_item = false;
+        for (ek, trees) in &path_entries {
+            let target = trees.get(pstate.target_index).map(|t| t.minikind);
+            let source = pstate
+                .source_index
+                .and_then(|i| trees.get(i))
+                .map(|t| t.minikind);
+            if !matches!(target, Some(b'a') | Some(b'r')) {
+                found_item = true;
+                selected.push((ek.clone(), trees.clone()));
+            } else if pstate.source_index.is_some() && !matches!(source, Some(b'a') | Some(b'r')) {
+                found_item = true;
+                if target == Some(b'a') {
+                    selected.push((ek.clone(), trees.clone()));
+                } else {
+                    let target_path = trees[pstate.target_index].fingerprint.clone();
+                    pstate.search_specific_file_parents.insert(target_path);
+                }
+            }
+        }
+        if !found_item {
+            return Err(ProcessEntryError::Internal(format!(
+                "Missing entry for specific path parent {:?}",
+                path_utf8
+            )));
+        }
+        let path_info = compute_path_info(pstate, transport, &path_utf8);
+        for (ek, trees) in &selected {
+            if pstate.seen_ids.contains(&ek.file_id) {
+                continue;
+            }
+            let (change, changed) =
+                self.process_entry(pstate, ek, trees, path_info.as_ref(), transport)?;
+            if changed.is_none() {
+                return Err(ProcessEntryError::Internal(format!(
+                    "entry<->path mismatch for specific path {:?}",
+                    path_utf8
+                )));
+            }
+            if changed == Some(true) {
+                if let Some(ref c) = change {
+                    gather_result_for_consistency(pstate, c);
+                    if c.source_kind.as_deref() == Some("directory")
+                        && c.target_kind.as_deref() != Some("directory")
+                    {
+                        let entry_path = match pstate.source_index {
+                            Some(si) if trees.get(si).map(|t| t.minikind) == Some(b'r') => {
+                                trees[si].fingerprint.clone()
+                            }
+                            _ => path_utf8.clone(),
+                        };
+                        let initial_key = EntryKey {
+                            dirname: entry_path.clone(),
+                            basename: Vec::new(),
+                            file_id: Vec::new(),
+                        };
+                        let (mut block_index, _) =
+                            find_block_index_from_key(&self.dirblocks, &initial_key);
+                        if block_index == 0 {
+                            block_index += 1;
+                        }
+                        if block_index < self.dirblocks.len() {
+                            let block = &self.dirblocks[block_index];
+                            if is_inside(&entry_path, &block.dirname) {
+                                for child in &block.entries {
+                                    let source_mk = pstate
+                                        .source_index
+                                        .and_then(|i| child.trees.get(i))
+                                        .map(|t| t.minikind);
+                                    if matches!(source_mk, Some(b'a') | Some(b'r')) {
+                                        continue;
+                                    }
+                                    let child_path =
+                                        join_path(&child.key.dirname, &child.key.basename);
+                                    pstate.search_specific_file_parents.insert(child_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if changed == Some(true) || pstate.include_unchanged {
+                if let Some(c) = change {
+                    iter.pending.push_back(c);
+                }
+            }
+        }
+        pstate.searched_exact_paths.insert(path_utf8);
+        let _ = iter.parents_drain_started;
+        Ok(())
     }
 
     /// Refresh the tree-0 slot of `key` from the filesystem.  Mirrors
@@ -9182,6 +9961,69 @@ mod dirstate_struct_tests {
             .unwrap()
         {}
         assert_eq!(visited, vec![b"".to_vec()], "pruned dir should not recurse");
+    }
+
+    #[test]
+    fn iter_changes_next_emits_unversioned_files() {
+        // In-memory filesystem with a single unversioned file at root;
+        // empty dirstate; want_unversioned=true.  The iterator should
+        // yield exactly one change (for the unversioned file).
+        let mut t = MemoryTransport::new();
+        let stat_dir = StatInfo {
+            mode: 0o040755,
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 1,
+        };
+        let stat_file = StatInfo {
+            mode: 0o100644,
+            size: 5,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 2,
+        };
+        t.set_fs(b"", stat_dir, None);
+        t.set_fs(b"a", stat_file, None);
+
+        let mut state = add_fixture();
+        let mut pstate = ProcessEntryState {
+            source_index: None,
+            target_index: 0,
+            include_unchanged: false,
+            want_unversioned: true,
+            partial: false,
+            supports_tree_reference: false,
+            root_abspath: Vec::new(),
+            searched_specific_files: std::collections::HashSet::new(),
+            search_specific_files: std::collections::HashSet::from([Vec::new()]),
+            search_specific_file_parents: std::collections::HashSet::new(),
+            searched_exact_paths: std::collections::HashSet::new(),
+            seen_ids: std::collections::HashSet::new(),
+            new_dirname_to_file_id: std::collections::HashMap::new(),
+            old_dirname_to_file_id: std::collections::HashMap::new(),
+            last_source_parent: None,
+            last_target_parent: None,
+        };
+        let mut iter = IterChangesIter::new();
+        let mut changes = Vec::new();
+        loop {
+            match state.iter_changes_next(&mut iter, &mut pstate, &t).unwrap() {
+                Some(c) => changes.push(c),
+                None => break,
+            }
+        }
+        // Expect: at least one change for `a` as unversioned.
+        let unversioned_for_a = changes
+            .iter()
+            .any(|c| c.new_path.as_deref() == Some(b"a" as &[u8]) && c.file_id.is_empty());
+        assert!(
+            unversioned_for_a,
+            "expected unversioned-file change for 'a'; got: {:?}",
+            changes
+        );
     }
 
     #[test]
