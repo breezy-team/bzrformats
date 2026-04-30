@@ -1688,10 +1688,8 @@ class DirState:
         that file_id appears in one of the trees.
         """
         if self._id_index is None:
-            id_index = IdIndex()
-            for key, _tree_details in self._iter_entries():
-                id_index.add(key)
-            self._id_index = id_index
+            self._id_index = IdIndex()
+            self._id_index.fill_from_state(self._rs)
         return self._id_index
 
     @classmethod
@@ -2011,11 +2009,9 @@ class DirState:
             fullscan,
         )
         if self._id_index is not None:
-            # Rebuild the cached IdIndex in place so callers holding a
-            # reference from a prior _get_id_index() call see the updates.
-            self._id_index.clear()
-            for key, _tree_details in self._iter_entries():
-                self._id_index.add(key)
+            # Keep callers' cached reference live by refilling from Rust's
+            # authoritative id_index, not by re-walking dirblocks.
+            self._id_index.fill_from_state(self._rs)
 
     def _validate(self):
         """Check that invariants on the dirblock are correct.

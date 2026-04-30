@@ -1847,6 +1847,17 @@ impl IdIndex {
         self.0.clear();
     }
 
+    /// Replace the contents of this IdIndex with the id_index Rust
+    /// already maintains for `state`.  Faster than walking dirblocks
+    /// from Python because it avoids marshalling the whole tree.
+    fn fill_from_state(&mut self, state: &mut PyDirState) {
+        self.0.clear();
+        let rust_index = state.inner.get_or_build_id_index();
+        for (dn, bn, fid) in rust_index.iter_all() {
+            self.0.add((dn, bn, fid));
+        }
+    }
+
     fn get<'a>(
         &self,
         py: Python<'a>,
