@@ -1107,11 +1107,7 @@ class DirState:
         self._read_header_if_needed()
         if len(self._rs.parents) < 1:
             return
-        # only require all dirblocks if we are doing a full-pass removal.
         self._read_dirblocks_if_needed()
-        # Sync dirblocks into the Rust wrapper, run the pure-Rust
-        # discard which mutates dirblocks + ghosts + parents, then
-        # sync the new dirblocks back into Python's mirror.
         self._rs.discard_merge_parents()
         self._id_index = None
 
@@ -1119,43 +1115,22 @@ class DirState:
         return [DirState.NULL_PARENT_DETAILS] * (len(self._parents) - len(self._ghosts))
 
     def _ensure_block(self, parent_block_index, parent_row_index, dirname):
-        """Ensure a block for dirname exists. See DirStateRs.ensure_block."""
-        block_index = self._rs.ensure_block(
-            parent_block_index, parent_row_index, dirname
-        )
-        # Rust may have inserted a new empty block; keep Python's
-        # mirror in sync so follow-up direct dirblocks access works.
-        return block_index
+        """Ensure a block for dirname exists."""
+        return self._rs.ensure_block(parent_block_index, parent_row_index, dirname)
 
     def _entries_to_current_state(self, new_entries):
-        """Load new_entries into self.dirblocks.
+        """Rebuild dirblocks from new_entries (sorted by path).
 
-        Process new_entries into the current state object, making them the active
-        state.  The entries are grouped together by directory to form dirblocks.
-
-        :param new_entries: A sorted list of entries. This function does not sort
-            to prevent unneeded overhead when callers have a sorted list already.
-        :return: Nothing.
+        :param new_entries: A sorted list of entries.
         """
-        # Pure-Rust implementation rebuilds the dirblocks from the
-        # sorted entry stream and runs split_root_dirblock_into_contents
-        # as the last step. Sync the result back into Python's mirror.
         self._rs.entries_to_current_state(new_entries)
 
     def _split_root_dirblock_into_contents(self):
-        """Split the root dirblocks into root and contents-of-root.
-
-        After parsing by path, we end up with root entries and contents-of-root
-        entries in the same block. This loop splits them out again.
-        """
+        """Split the root dirblocks into root and contents-of-root."""
         self._rs.split_root_dirblock_into_contents()
 
     def _entries_for_path(self, path):
         """Return a list with all the entries that match path for all ids."""
-        # Temporary sync boundary: push Python's dirblocks into the
-        # DirStateRs wrapper before calling the pure-Rust lookup. Both
-        # callers in iter_changes only read the returned entries, so
-        # the lack of live aliasing with self._dirblocks is invisible.
         return self._rs.entries_for_path(path)
 
     @staticmethod
@@ -1988,9 +1963,6 @@ class DirState:
             shrinking in length.
         """
         last_reference = self._rs.make_absent(current_old[0])
-        # Sync the (possibly-mutated) dirblocks back out; Rust also
-        # updated its own id_index cache, so invalidate Python's
-        # view to force a rebuild on next access.
         self._id_index = None
         return last_reference
 
