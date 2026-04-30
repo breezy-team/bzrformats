@@ -1701,6 +1701,186 @@ impl DirState {
         self.parents.len().saturating_sub(self.ghosts.len())
     }
 
+    /// Replace the parent trees. Mirrors Python's
+    /// `DirState.set_parent_trees`.
+    ///
+    /// `trees` gives the revision-id of every parent (including
+    /// ghosts) in order. `ghosts` is the list of revision-ids that
+    /// are ghosts — must be a subset of `trees`. `parent_tree_entries`
+    /// is one list per *non-ghost* parent tree, in the same order as
+    /// non-ghost parents appear in `trees`; each list is the result of
+    /// walking that tree via `iter_entries_by_dir` and mapping each
+    /// entry to `(path_utf8, file_id, minikind, fingerprint, size,
+    /// executable, tree_data)` (i.e. path/file_id plus the 5-tuple
+    /// returned by [`inv_entry_to_details`]).
+    ///
+    /// The method rebuilds the full dirblocks layout from: (a) the
+    /// current tree-0 rows already in `self.dirblocks` (non-absent,
+    /// non-relocated), and (b) the per-parent-tree entry lists.
+    /// Cross-tree relocation pointers are emitted in both the
+    /// vertical and horizontal axes, matching the legacy matrix
+    /// construction. Ghost parents occupy a tree slot but contribute
+    /// no entries — their slot is always `NULL_PARENT_DETAILS`.
+    pub fn set_parent_trees(
+        &mut self,
+        trees: Vec<Vec<u8>>,
+        ghosts: Vec<Vec<u8>>,
+        parent_tree_entries: Vec<Vec<(Vec<u8>, Vec<u8>, TreeData)>>,
+    ) -> Result<(), EntriesToStateError> {
+        let non_ghost_count = parent_tree_entries.len();
+        // All parent slots, including ghosts: each entry has
+        // `1 + non_ghost_count` tree slots.
+        let parent_count = non_ghost_count;
+
+        let mut by_path: std::collections::HashMap<EntryKey, Vec<TreeData>> =
+            std::collections::HashMap::new();
+        let mut id_index = IdIndex::new();
+
+        // Step 1: seed with existing tree-0 entries.
+        for block in self.dirblocks.iter() {
+            for entry in block.entries.iter() {
+                let mk = entry.trees.first().map(|t| t.minikind).unwrap_or(0);
+                if mk == b'a' || mk == b'r' {
+                    continue;
+                }
+                let mut row = Vec::with_capacity(1 + parent_count);
+                row.push(entry.trees[0].clone());
+                for _ in 0..parent_count {
+                    row.push(TreeData {
+                        minikind: b'a',
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: Vec::new(),
+                    });
+                }
+                id_index.add((
+                    entry.key.dirname.as_slice(),
+                    entry.key.basename.as_slice(),
+                    &FileId::from(&entry.key.file_id),
+                ));
+                by_path.insert(entry.key.clone(), row);
+            }
+        }
+
+        // Step 2: fold each non-ghost parent tree into the matrix.
+        for (index, tree_entries) in parent_tree_entries.into_iter().enumerate() {
+            let tree_index = index + 1;
+            let new_location_suffix_len = parent_count - tree_index;
+            for (path_utf8, file_id, details) in tree_entries {
+                let (dirname, basename) = split_path_utf8(&path_utf8);
+                let new_entry_key = EntryKey {
+                    dirname: dirname.to_vec(),
+                    basename: basename.to_vec(),
+                    file_id: file_id.clone(),
+                };
+
+                let fid = FileId::from(&file_id);
+                let entry_keys: Vec<(Vec<u8>, Vec<u8>, FileId)> = id_index.get(&fid);
+
+                // Vertical axis: every other path for this file_id in
+                // this tree gets a relocation pointer back to path_utf8.
+                for (e_dir, e_base, _e_fid) in &entry_keys {
+                    let ek = EntryKey {
+                        dirname: e_dir.clone(),
+                        basename: e_base.clone(),
+                        file_id: file_id.clone(),
+                    };
+                    if ek == new_entry_key {
+                        continue;
+                    }
+                    if let Some(row) = by_path.get_mut(&ek) {
+                        row[tree_index] = TreeData {
+                            minikind: b'r',
+                            fingerprint: path_utf8.clone(),
+                            size: 0,
+                            executable: false,
+                            packed_stat: Vec::new(),
+                        };
+                    }
+                }
+
+                // By-path consistency: insert into existing row or
+                // create a new one with relocation pointers for the
+                // earlier tree indexes.
+                let has_key = entry_keys.iter().any(|(d, b, _)| {
+                    d.as_slice() == new_entry_key.dirname.as_slice()
+                        && b.as_slice() == new_entry_key.basename.as_slice()
+                });
+                if has_key {
+                    by_path.get_mut(&new_entry_key).unwrap()[tree_index] = details;
+                } else {
+                    let mut new_details: Vec<TreeData> = Vec::with_capacity(1 + parent_count);
+                    for lookup_index in 0..tree_index {
+                        if entry_keys.is_empty() {
+                            new_details.push(TreeData {
+                                minikind: b'a',
+                                fingerprint: Vec::new(),
+                                size: 0,
+                                executable: false,
+                                packed_stat: Vec::new(),
+                            });
+                        } else {
+                            let a_key = &entry_keys[0];
+                            let ak = EntryKey {
+                                dirname: a_key.0.clone(),
+                                basename: a_key.1.clone(),
+                                file_id: file_id.clone(),
+                            };
+                            let look = &by_path[&ak][lookup_index];
+                            if look.minikind == b'r' || look.minikind == b'a' {
+                                new_details.push(look.clone());
+                            } else {
+                                let mut real_path = a_key.0.clone();
+                                if !real_path.is_empty() {
+                                    real_path.push(b'/');
+                                }
+                                real_path.extend_from_slice(&a_key.1);
+                                new_details.push(TreeData {
+                                    minikind: b'r',
+                                    fingerprint: real_path,
+                                    size: 0,
+                                    executable: false,
+                                    packed_stat: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    new_details.push(details);
+                    for _ in 0..new_location_suffix_len {
+                        new_details.push(TreeData {
+                            minikind: b'a',
+                            fingerprint: Vec::new(),
+                            size: 0,
+                            executable: false,
+                            packed_stat: Vec::new(),
+                        });
+                    }
+                    by_path.insert(new_entry_key.clone(), new_details);
+                    id_index.add((
+                        new_entry_key.dirname.as_slice(),
+                        new_entry_key.basename.as_slice(),
+                        &fid,
+                    ));
+                }
+            }
+        }
+
+        // Step 3: materialise the sorted entry list.
+        let mut new_entries: Vec<Entry> = by_path
+            .into_iter()
+            .map(|(key, trees)| Entry { key, trees })
+            .collect();
+        Self::sort_entries(&mut new_entries);
+        self.entries_to_current_state(new_entries)?;
+        self.parents = trees;
+        self.ghosts = ghosts;
+        self.mark_modified(&[], true);
+        self.id_index = Some(id_index);
+        self.packed_stat_index = None;
+        Ok(())
+    }
+
     /// Rebuild `self.dirblocks` from a pre-sorted, flat list of
     /// entries. Mirrors Python's `DirState._entries_to_current_state`.
     ///
@@ -7006,6 +7186,141 @@ mod dirstate_struct_tests {
         assert_eq!(new_root.key.file_id, b"new-id");
         assert_eq!(new_root.trees[0].minikind, b'd');
         assert_eq!(new_root.trees[0].packed_stat, original_packed_stat);
+    }
+
+    #[test]
+    fn set_parent_trees_simple_case() {
+        // Start from a tree with root + 'a-file' in tree-0.
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"a-file", b"", b"a-file", b"file-id", "file", 0, &stat, b"")
+            .expect("add");
+
+        // One non-ghost parent tree that contains the same entries but with
+        // different details (simulating a committed revision).
+        let details_root = TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: b"rev1".to_vec(),
+        };
+        let details_file = TreeData {
+            minikind: b'f',
+            fingerprint: b"sha1-parent".to_vec(),
+            size: 42,
+            executable: false,
+            packed_stat: b"rev1".to_vec(),
+        };
+        let parent_entries = vec![
+            (Vec::new(), b"TREE_ROOT".to_vec(), details_root.clone()),
+            (
+                b"a-file".to_vec(),
+                b"file-id".to_vec(),
+                details_file.clone(),
+            ),
+        ];
+
+        state
+            .set_parent_trees(vec![b"rev1".to_vec()], vec![], vec![parent_entries])
+            .expect("set_parent_trees");
+
+        // Root row should have tree-0 (directory) and tree-1 = details_root.
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"", 0);
+        assert!(bei.path_present);
+        let root = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(root.trees.len(), 2);
+        assert_eq!(root.trees[1], details_root);
+
+        // a-file row should have tree-0 (file) and tree-1 = details_file.
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"a-file", 0);
+        assert!(bei.path_present);
+        let file_entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(file_entry.trees.len(), 2);
+        assert_eq!(file_entry.trees[1], details_file);
+
+        assert_eq!(state.parents, vec![b"rev1".to_vec()]);
+        assert!(state.ghosts.is_empty());
+    }
+
+    #[test]
+    fn set_parent_trees_ghost_parent_has_no_entries() {
+        // Ghost parents occupy a tree slot but contribute no entries.
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"x", b"", b"x", b"x-id", "file", 0, &stat, b"")
+            .expect("add");
+
+        state
+            .set_parent_trees(
+                vec![b"ghost-rev".to_vec()],
+                vec![b"ghost-rev".to_vec()],
+                vec![], // no non-ghost parent trees
+            )
+            .expect("set_parent_trees");
+
+        // Only one tree slot (tree-0) per entry since there are no
+        // non-ghost parents.
+        for block in &state.dirblocks {
+            for entry in &block.entries {
+                assert_eq!(entry.trees.len(), 1);
+            }
+        }
+        assert_eq!(state.parents, vec![b"ghost-rev".to_vec()]);
+        assert_eq!(state.ghosts, vec![b"ghost-rev".to_vec()]);
+    }
+
+    #[test]
+    fn set_parent_trees_cross_path_relocation() {
+        // Parent tree has file-id at a different path than tree-0.
+        // Expect a relocation pointer in the new row.
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"new-path", b"", b"new-path", b"fid", "file", 0, &stat, b"")
+            .expect("add");
+
+        let root_details = TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: b"rev".to_vec(),
+        };
+        let file_details = TreeData {
+            minikind: b'f',
+            fingerprint: b"old-sha".to_vec(),
+            size: 7,
+            executable: false,
+            packed_stat: b"rev".to_vec(),
+        };
+        let parent_entries = vec![
+            (Vec::new(), b"TREE_ROOT".to_vec(), root_details),
+            (b"old-path".to_vec(), b"fid".to_vec(), file_details.clone()),
+        ];
+
+        state
+            .set_parent_trees(vec![b"rev".to_vec()], vec![], vec![parent_entries])
+            .expect("set_parent_trees");
+
+        // New path still has tree-0 (file) and tree-1 now holds a
+        // relocation pointer to old-path.
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"new-path", 0);
+        assert!(bei.path_present);
+        let new_entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(new_entry.trees[1].minikind, b'r');
+        assert_eq!(new_entry.trees[1].fingerprint, b"old-path");
+
+        // old-path exists as a row with tree-0 = relocation to new-path
+        // and tree-1 = the actual parent-tree details.
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"old-path", 1);
+        assert!(bei.path_present);
+        let old_entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(old_entry.trees[0].minikind, b'r');
+        assert_eq!(old_entry.trees[0].fingerprint, b"new-path");
+        assert_eq!(old_entry.trees[1], file_details);
     }
 
     #[test]

@@ -1902,177 +1902,29 @@ class DirState:
         :param ghosts: A list of the revision_ids that are ghosts at the time
             of setting.
         """
-        # TODO: generate a list of parent indexes to preserve to save
-        # processing specific parent trees. In the common case one tree will
-        # be preserved - the left most parent.
-        # TODO: if the parent tree is a dirstate, we might want to walk them
-        # all by path in parallel for 'optimal' common-case performance.
-        # generate new root row.
         self._read_dirblocks_if_needed()
-        # TODO future sketch: Examine the existing parents to generate a change
-        # map and then walk the new parent trees only, mapping them into the
-        # dirstate. Walk the dirstate at the same time to remove unreferenced
-        # entries.
-        # for now:
-        # sketch: loop over all entries in the dirstate, cherry picking
-        # entries from the parent trees, if they are not ghost trees.
-        # after we finish walking the dirstate, all entries not in the dirstate
-        # are deletes, so we want to append them to the end as per the design
-        # discussions. So do a set difference on ids with the parents to
-        # get deletes, and add them to the end.
-        # During the update process we need to answer the following questions:
-        # - find other keys containing a fileid in order to create cross-path
-        #   links. We dont't trivially use the inventory from other trees
-        #   because this leads to either double touching, or to accessing
-        #   missing keys,
-        # - find other keys containing a path
-        # We accumulate each entry via this dictionary, including the root
-        by_path = {}
-        id_index = IdIndex()
-        # we could do parallel iterators, but because file id data may be
-        # scattered throughout, we dont save on index overhead: we have to look
-        # at everything anyway. We can probably save cycles by reusing parent
-        # data and doing an incremental update when adding an additional
-        # parent, but for now the common cases are adding a new parent (merge),
-        # and replacing completely (commit), and commit is more common: so
-        # optimise merge later.
-
-        # ---- start generation of full tree mapping data
-        # what trees should we use?
-        parent_trees = [tree for rev_id, tree in trees if rev_id not in ghosts]
-        # how many trees do we end up with
-        parent_count = len(parent_trees)
-
-        # one: the current tree
-        for entry in self._iter_entries():
-            # skip entries not in the current tree
-            if entry[1][0][0] in (b"a", b"r"):  # absent, relocated
+        parent_ids = [rev_id for rev_id, _ in trees]
+        ghosts_list = list(ghosts)
+        # Flatten each non-ghost parent tree to the shape the Rust side
+        # expects: (path_utf8, file_id, details).  details is the
+        # 5-tuple produced by inv_entry_to_details.  iter_entries_by_dir
+        # already yields entries in the required order.
+        parent_tree_entries = []
+        for rev_id, tree in trees:
+            if rev_id in ghosts:
                 continue
-            by_path[entry[0]] = [entry[1][0]] + [
-                DirState.NULL_PARENT_DETAILS
-            ] * parent_count
-            # TODO: Possibly inline this, since we know it isn't present yet
-            #       id_index[entry[0][2]] = (entry[0],)
-            id_index.add(entry[0])
-
-        # now the parent trees:
-        for tree_index, tree in enumerate(parent_trees):
-            # the index is off by one, adjust it.
-            tree_index = tree_index + 1
-            # when we add new locations for a fileid we need these ranges for
-            # any fileid in this tree as we set the by_path[id] to:
-            # already_processed_tree_details + new_details + new_location_suffix
-            # the suffix is from tree_index+1:parent_count+1.
-            new_location_suffix = [DirState.NULL_PARENT_DETAILS] * (
-                parent_count - tree_index
-            )
-            # now stitch in all the entries from this tree
-            last_dirname = None
-            for path, entry in tree.iter_entries_by_dir():
-                # here we process each trees details for each item in the tree.
-                # we first update any existing entries for the id at other paths,
-                # then we either create or update the entry for the id at the
-                # right path, and finally we add (if needed) a mapping from
-                # file_id to this path. We do it in this order to allow us to
-                # avoid checking all known paths for the id when generating a
-                # new entry at this path: by adding the id->path mapping last,
-                # all the mappings are valid and have correct relocation
-                # records where needed.
-                file_id = entry.file_id
-                path_utf8 = path.encode("utf8")
-                dirname, basename = osutils.split(path_utf8)
-                if dirname == last_dirname:
-                    # Try to re-use objects as much as possible
-                    dirname = last_dirname
-                else:
-                    last_dirname = dirname
-                new_entry_key = (dirname, basename, file_id)
-                # tree index consistency: All other paths for this id in this tree
-                # index must point to the correct path.
-                entry_keys = id_index.get(file_id)
-                for entry_key in entry_keys:
-                    # TODO:PROFILING: It might be faster to just update
-                    # rather than checking if we need to, and then overwrite
-                    # the one we are located at.
-                    if entry_key != new_entry_key:
-                        # this file id is at a different path in one of the
-                        # other trees, so put absent pointers there
-                        # This is the vertical axis in the matrix, all pointing
-                        # to the real path.
-                        by_path[entry_key][tree_index] = (
-                            b"r",
-                            path_utf8,
-                            0,
-                            False,
-                            b"",
-                        )
-                # by path consistency: Insert into an existing path record
-                # (trivial), or add a new one with relocation pointers for the
-                # other tree indexes.
-                if new_entry_key in entry_keys:
-                    # there is already an entry where this data belongs, just
-                    # insert it.
-                    by_path[new_entry_key][tree_index] = _inv_entry_to_details(entry)
-                else:
-                    # add relocated entries to the horizontal axis - this row
-                    # mapping from path,id. We need to look up the correct path
-                    # for the indexes from 0 to tree_index -1
-                    new_details = []
-                    for lookup_index in range(tree_index):
-                        # boundary case: this is the first occurence of file_id
-                        # so there are no id_indexes, possibly take this out of
-                        # the loop?
-                        if not len(entry_keys):
-                            new_details.append(DirState.NULL_PARENT_DETAILS)
-                        else:
-                            # grab any one entry, use it to find the right path.
-                            a_key = next(iter(entry_keys))
-                            if by_path[a_key][lookup_index][0] in (b"r", b"a"):
-                                # its a pointer or missing statement, use it as
-                                # is.
-                                new_details.append(by_path[a_key][lookup_index])
-                            else:
-                                # we have the right key, make a pointer to it.
-                                real_path = (b"/".join(a_key[0:2])).strip(b"/")
-                                new_details.append((b"r", real_path, 0, False, b""))
-                    new_details.append(_inv_entry_to_details(entry))
-                    new_details.extend(new_location_suffix)
-                    by_path[new_entry_key] = new_details
-                    id_index.add(new_entry_key)
-        # --- end generation of full tree mappings
-
-        # sort and output all the entries
-        new_entries = self._sort_entries(by_path.items())
-        self._entries_to_current_state(new_entries)
-        self._parents = [rev_id for rev_id, tree in trees]
-        self._ghosts = list(ghosts)
-        self._mark_modified(header_modified=True)
-        self._id_index = id_index
-
-    @staticmethod
-    def _sort_entries(entry_list):
-        """Given a list of entries, sort them into the right order.
-
-        This is done when constructing a new dirstate from trees - normally we
-        try to keep everything in sorted blocks all the time, but sometimes
-        it's easier to sort after the fact.
-        """
-        # When sorting, we usually have 10x more entries than directories. (69k
-        # total entries, 4k directories). So cache the results of splitting.
-        # Saving time and objects.
-        split_dirs = {}
-
-        def _key(entry, _split_dirs=split_dirs):
-            # sort by: directory parts, file name, file id
-            dirpath, fname, file_id = entry[0]
-            try:
-                split = _split_dirs[dirpath]
-            except KeyError:
-                split = tuple(dirpath.split(b"/"))
-                _split_dirs[dirpath] = split
-            return (split, fname, file_id)
-
-        return sorted(entry_list, key=_key)
+            rows = []
+            for path, inv_entry in tree.iter_entries_by_dir():
+                rows.append(
+                    (
+                        path.encode("utf8"),
+                        inv_entry.file_id,
+                        _inv_entry_to_details(inv_entry),
+                    )
+                )
+            parent_tree_entries.append(rows)
+        self._rs.set_parent_trees(parent_ids, ghosts_list, parent_tree_entries)
+        self._id_index = None
 
     def set_state_from_inventory(self, new_inv):
         """Set new_inv as the current state.

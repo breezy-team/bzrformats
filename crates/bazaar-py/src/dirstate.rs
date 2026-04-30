@@ -1527,6 +1527,71 @@ impl PyDirState {
         }
     }
 
+    /// Replace the parent trees. Mirrors Python's
+    /// `DirState.set_parent_trees`. Input:
+    ///
+    /// - `trees`: iterable of `bytes` revision ids (one per parent,
+    ///   including ghosts), in order.
+    /// - `ghosts`: iterable of `bytes` revision ids that are ghosts.
+    /// - `parent_tree_entries`: iterable of lists — one list per
+    ///   non-ghost parent tree, in the same order as non-ghost parents
+    ///   appear in `trees`. Each list is a sequence of
+    ///   `(path_utf8, file_id, details)` tuples where `details` is the
+    ///   5-tuple returned by `inv_entry_to_details`:
+    ///   `(minikind_byte, fingerprint, size, executable, tree_data)`.
+    ///
+    /// Each inner list must be pre-sorted in `iter_entries_by_dir`
+    /// order (i.e. root first, then children in lexicographic order).
+    fn set_parent_trees(
+        &mut self,
+        trees: &Bound<PyAny>,
+        ghosts: &Bound<PyAny>,
+        parent_tree_entries: &Bound<PyAny>,
+    ) -> PyResult<()> {
+        let rust_trees = collect_bytes_vec(trees)?;
+        let rust_ghosts = collect_bytes_vec(ghosts)?;
+        let mut rust_entries: Vec<Vec<(Vec<u8>, Vec<u8>, bazaar::dirstate::TreeData)>> = Vec::new();
+        for tree_iter in parent_tree_entries.try_iter()? {
+            let tree = tree_iter?;
+            let mut tree_rows: Vec<(Vec<u8>, Vec<u8>, bazaar::dirstate::TreeData)> = Vec::new();
+            for row in tree.try_iter()? {
+                let tup = row?.cast_into::<PyTuple>()?;
+                if tup.len() != 3 {
+                    return Err(PyTypeError::new_err(
+                        "parent_tree_entries entries must be 3-tuples",
+                    ));
+                }
+                let path_utf8: Vec<u8> = tup.get_item(0)?.extract()?;
+                let file_id: Vec<u8> = tup.get_item(1)?.extract()?;
+                let details_tup = tup.get_item(2)?.cast_into::<PyTuple>()?;
+                if details_tup.len() != 5 {
+                    return Err(PyTypeError::new_err("details must be a 5-tuple"));
+                }
+                let minikind_bytes: Vec<u8> = details_tup.get_item(0)?.extract()?;
+                let minikind = minikind_bytes.first().copied().unwrap_or(0);
+                let fingerprint: Vec<u8> = details_tup.get_item(1)?.extract()?;
+                let size: u64 = details_tup.get_item(2)?.extract()?;
+                let executable: bool = details_tup.get_item(3)?.extract()?;
+                let packed_stat: Vec<u8> = details_tup.get_item(4)?.extract()?;
+                tree_rows.push((
+                    path_utf8,
+                    file_id,
+                    bazaar::dirstate::TreeData {
+                        minikind,
+                        fingerprint,
+                        size,
+                        executable,
+                        packed_stat,
+                    },
+                ));
+            }
+            rust_entries.push(tree_rows);
+        }
+        self.inner
+            .set_parent_trees(rust_trees, rust_ghosts, rust_entries)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
+    }
+
     /// Replace the entire in-memory state with `parent_ids` and
     /// `dirblocks` (both in the Python tuple shape), marking both the
     /// header and the dirblock data fully modified. Mirrors Python's
