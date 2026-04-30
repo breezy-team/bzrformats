@@ -1632,6 +1632,10 @@ impl IdIndex {
         Ok(())
     }
 
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
     fn get<'a>(
         &self,
         py: Python<'a>,

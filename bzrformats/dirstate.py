@@ -2566,7 +2566,12 @@ class DirState:
             fullscan,
         )
         self._dirblocks = self._rs.dirblocks
-        self._id_index = None
+        if self._id_index is not None:
+            # Rebuild the cached IdIndex in place so callers holding a
+            # reference from a prior _get_id_index() call see the updates.
+            self._id_index.clear()
+            for key, _tree_details in self._iter_entries():
+                self._id_index.add(key)
 
     def _validate(self):
         """Check that invariants on the dirblock are correct.

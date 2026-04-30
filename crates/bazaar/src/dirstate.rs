@@ -510,6 +510,10 @@ impl IdIndex {
     pub fn file_ids(&self) -> impl Iterator<Item = &FileId> {
         self.id_index.keys()
     }
+
+    pub fn clear(&mut self) {
+        self.id_index.clear();
+    }
 }
 
 /// Convert an inventory entry (from a revision tree) to state details.
