@@ -753,26 +753,6 @@ impl PyDirState {
         Ok(self.inner.find_block_index_from_key(&entry_key))
     }
 
-    /// Return the live tree-0 minikind (single byte) for `key`, or
-    /// `None` when no entry matches. Mirrors the pure-crate
-    /// `DirState::tree0_minikind`; used by `set_state_from_inventory`
-    /// to refresh its snapshot-based skip check.
-    fn tree0_minikind<'py>(
-        &self,
-        py: Python<'py>,
-        key: &Bound<PyTuple>,
-    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        let entry_key = bazaar::dirstate::EntryKey {
-            dirname: key.get_item(0)?.extract()?,
-            basename: key.get_item(1)?.extract()?,
-            file_id: key.get_item(2)?.extract()?,
-        };
-        Ok(self
-            .inner
-            .tree0_minikind(&entry_key)
-            .map(|b| PyBytes::new(py, &[b])))
-    }
-
     /// Overwrite the tree-0 slot of `key`'s entry with the provided
     /// details, without touching id_index, cross-references, or
     /// dirblock_state. Mirrors Python's old in-place
@@ -1524,6 +1504,38 @@ impl PyDirState {
         match self.inner.update_basis_apply_deletes(&rust_deletes) {
             Ok(()) => Ok(()),
             Err(e) => Err(self.raise_basis_apply_error(deletes.py(), e)),
+        }
+    }
+
+    /// Replace the current tree-0 state with entries from the given
+    /// inventory rows. Mirrors Python's
+    /// `DirState.set_state_from_inventory`. Input is an iterable of
+    /// `(path_utf8, file_id, minikind, fingerprint, executable)`
+    /// tuples in `iter_entries_by_dir` order.
+    fn set_state_from_inventory(
+        &mut self,
+        py: Python<'_>,
+        new_entries: &Bound<PyAny>,
+    ) -> PyResult<()> {
+        let mut rows: Vec<(Vec<u8>, Vec<u8>, u8, Vec<u8>, bool)> = Vec::new();
+        for item in new_entries.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            if tup.len() != 5 {
+                return Err(PyTypeError::new_err(
+                    "set_state_from_inventory entries must be 5-tuples",
+                ));
+            }
+            let path: Vec<u8> = tup.get_item(0)?.extract()?;
+            let file_id: Vec<u8> = tup.get_item(1)?.extract()?;
+            let minikind_bytes: Vec<u8> = tup.get_item(2)?.extract()?;
+            let minikind = minikind_bytes.first().copied().unwrap_or(0);
+            let fingerprint: Vec<u8> = tup.get_item(3)?.extract()?;
+            let executable: bool = tup.get_item(4)?.extract()?;
+            rows.push((path, file_id, minikind, fingerprint, executable));
+        }
+        match self.inner.set_state_from_inventory(rows) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 

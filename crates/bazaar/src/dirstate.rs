@@ -1701,6 +1701,158 @@ impl DirState {
         self.parents.len().saturating_sub(self.ghosts.len())
     }
 
+    /// Replace the entire tree-0 state with the rows produced by
+    /// walking `new_inv.iter_entries_by_dir()`. Mirrors Python's
+    /// `DirState.set_state_from_inventory`: zips the existing dirstate
+    /// entries (in iteration order) against the incoming inventory
+    /// entries, calling [`DirState::update_minimal`] and
+    /// [`DirState::make_absent`] to drive the dirstate into the new
+    /// shape.
+    ///
+    /// Each element of `new_entries` is a pre-sorted tuple
+    /// `(path_utf8, file_id, minikind, fingerprint, executable)`. The
+    /// caller is expected to have built it from
+    /// `iter_entries_by_dir`, which yields paths in the order the
+    /// dirstate needs. `fingerprint` is normally empty for non
+    /// tree-reference entries; the tree-reference case carries the
+    /// `reference_revision` bytes.
+    pub fn set_state_from_inventory(
+        &mut self,
+        new_entries: Vec<(Vec<u8>, Vec<u8>, u8, Vec<u8>, bool)>,
+    ) -> Result<(), BasisApplyError> {
+        fn cmp_by_dirs(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+            let mut ai = a.split(|&c| c == b'/');
+            let mut bi = b.split(|&c| c == b'/');
+            loop {
+                match (ai.next(), bi.next()) {
+                    (None, None) => return std::cmp::Ordering::Equal,
+                    (None, Some(_)) => return std::cmp::Ordering::Less,
+                    (Some(_), None) => return std::cmp::Ordering::Greater,
+                    (Some(x), Some(y)) => match x.cmp(y) {
+                        std::cmp::Ordering::Equal => continue,
+                        other => return other,
+                    },
+                }
+            }
+        }
+
+        // Snapshot the current tree-0 entries in dirstate iteration order,
+        // mirroring Python's `list(self._iter_entries())` call.
+        let old_entries: Vec<Entry> = self
+            .dirblocks
+            .iter()
+            .flat_map(|block| block.entries.iter().cloned())
+            .collect();
+
+        let mut old_iter = old_entries.into_iter();
+        let mut new_iter = new_entries.into_iter();
+        let mut current_old: Option<Entry> = old_iter.next();
+        let mut current_new: Option<(Vec<u8>, Vec<u8>, u8, Vec<u8>, bool)> = new_iter.next();
+
+        while current_new.is_some() || current_old.is_some() {
+            // Skip dead old rows: the live tree-0 minikind may differ
+            // from the snapshot because prior update_minimal calls in
+            // this loop could have rewritten it.
+            if let Some(ref old) = current_old {
+                let live = self.tree0_minikind(&old.key);
+                if matches!(live, None | Some(b'a') | Some(b'r')) {
+                    current_old = old_iter.next();
+                    continue;
+                }
+            }
+
+            // Materialise the new-entry split.
+            let new_split = current_new.as_ref().map(|(path, file_id, mk, fp, ex)| {
+                let (dn, bn) = split_path_utf8(path);
+                let new_key = EntryKey {
+                    dirname: dn.to_vec(),
+                    basename: bn.to_vec(),
+                    file_id: file_id.clone(),
+                };
+                (path.clone(), new_key, *mk, fp.clone(), *ex)
+            });
+
+            match (current_old.as_ref(), new_split.as_ref()) {
+                (None, Some((path, key, mk, fp, ex))) => {
+                    // Old is finished; insert the new entry.
+                    let tree0 = TreeData {
+                        minikind: *mk,
+                        fingerprint: fp.clone(),
+                        size: 0,
+                        executable: *ex,
+                        packed_stat: b"x".repeat(32),
+                    };
+                    self.update_minimal(key.clone(), tree0, Some(path), true)?;
+                    current_new = new_iter.next();
+                }
+                (Some(old), None) => {
+                    // New is finished; make the old entry absent.
+                    let key = old.key.clone();
+                    // Swallow EntryNotFound — a prior update_minimal
+                    // may have pruned the row already.
+                    if self.tree0_minikind(&key).is_some() {
+                        self.make_absent(&key)
+                            .map_err(|e| BasisApplyError::Internal {
+                                reason: format!("make_absent: {}", e),
+                            })?;
+                    }
+                    current_old = old_iter.next();
+                }
+                (Some(old), Some((path, key, mk, fp, ex))) => {
+                    if *key == old.key {
+                        // Same key; update in place if exec/minikind changed.
+                        let old_t0 = &old.trees[0];
+                        if old_t0.executable != *ex || old_t0.minikind != *mk {
+                            let tree0 = TreeData {
+                                minikind: *mk,
+                                fingerprint: fp.clone(),
+                                size: 0,
+                                executable: *ex,
+                                packed_stat: b"x".repeat(32),
+                            };
+                            self.update_minimal(key.clone(), tree0, Some(path), true)?;
+                        }
+                        current_old = old_iter.next();
+                        current_new = new_iter.next();
+                    } else {
+                        let new_before_old = match cmp_by_dirs(&key.dirname, &old.key.dirname) {
+                            std::cmp::Ordering::Less => true,
+                            std::cmp::Ordering::Greater => false,
+                            std::cmp::Ordering::Equal => {
+                                (key.basename.as_slice(), key.file_id.as_slice())
+                                    < (old.key.basename.as_slice(), old.key.file_id.as_slice())
+                            }
+                        };
+                        if new_before_old {
+                            let tree0 = TreeData {
+                                minikind: *mk,
+                                fingerprint: fp.clone(),
+                                size: 0,
+                                executable: *ex,
+                                packed_stat: b"x".repeat(32),
+                            };
+                            self.update_minimal(key.clone(), tree0, Some(path), true)?;
+                            current_new = new_iter.next();
+                        } else {
+                            let okey = old.key.clone();
+                            if self.tree0_minikind(&okey).is_some() {
+                                self.make_absent(&okey)
+                                    .map_err(|e| BasisApplyError::Internal {
+                                        reason: format!("make_absent: {}", e),
+                                    })?;
+                            }
+                            current_old = old_iter.next();
+                        }
+                    }
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+        self.mark_modified(&[], false);
+        self.id_index = None;
+        Ok(())
+    }
+
     /// Replace the parent trees. Mirrors Python's
     /// `DirState.set_parent_trees`.
     ///
@@ -7186,6 +7338,51 @@ mod dirstate_struct_tests {
         assert_eq!(new_root.key.file_id, b"new-id");
         assert_eq!(new_root.trees[0].minikind, b'd');
         assert_eq!(new_root.trees[0].packed_stat, original_packed_stat);
+    }
+
+    #[test]
+    fn set_state_from_inventory_rename_same_id_bug_395556() {
+        // Regression for the bug395556 scenario: start with root + 'b'
+        // (file-id b-id); then rename b -> a in the inventory.  After
+        // the second set_state_from_inventory the dirstate should hold
+        // root + 'a' (file-id b-id) with no stale 'b' row.
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"b", b"", b"b", b"b-id", "file", 0, &stat, b"")
+            .expect("add");
+
+        let inv_after_rename: Vec<(Vec<u8>, Vec<u8>, u8, Vec<u8>, bool)> = vec![
+            (Vec::new(), b"TREE_ROOT".to_vec(), b'd', Vec::new(), false),
+            (b"a".to_vec(), b"b-id".to_vec(), b'f', Vec::new(), false),
+        ];
+        state
+            .set_state_from_inventory(inv_after_rename)
+            .expect("set_state_from_inventory");
+
+        // Expect: root row, then 'a' with file_id b-id in the root
+        // contents block.  No live 'b' row.
+        let mut live_entries = Vec::new();
+        for block in &state.dirblocks {
+            for entry in &block.entries {
+                let t0 = entry.trees.first().map(|t| t.minikind).unwrap_or(0);
+                if t0 != b'a' && t0 != b'r' {
+                    live_entries.push((
+                        entry.key.dirname.clone(),
+                        entry.key.basename.clone(),
+                        entry.key.file_id.clone(),
+                        t0,
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            live_entries,
+            vec![
+                (Vec::new(), Vec::new(), b"TREE_ROOT".to_vec(), b'd'),
+                (Vec::new(), b"a".to_vec(), b"b-id".to_vec(), b'f'),
+            ]
+        );
     }
 
     #[test]
