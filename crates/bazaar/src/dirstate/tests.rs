@@ -1,4 +1,5 @@
 use super::*;
+use crate::RevisionId;
 
 #[test]
 fn new_matches_python_defaults() {
@@ -5137,4 +5138,312 @@ fn save_to_requires_write_lock() {
         state.save_to(&mut t).unwrap_err(),
         TransportError::Other(_)
     ));
+}
+
+fn decode_packed_stat(packed: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(packed)
+        .expect("decode pack_stat output")
+}
+
+#[test]
+fn pack_stat_zero_inputs_encode_to_24_zero_bytes() {
+    let packed = pack_stat(0, 0, 0, 0, 0, 0);
+    // base64 of 24 zero bytes with NO_PAD is 32 'A's.
+    assert_eq!(packed, "A".repeat(32));
+    assert_eq!(decode_packed_stat(&packed), vec![0u8; 24]);
+}
+
+#[test]
+fn pack_stat_layout_is_big_endian_six_fields() {
+    // Field order is size, mtime, ctime, dev, ino, mode — each
+    // serialised big-endian as four bytes.
+    let packed = pack_stat(
+        0x01020304, 0x05060708, 0x090a0b0c, 0x0d0e0f10, 0x11121314, 0x15161718,
+    );
+    let bytes = decode_packed_stat(&packed);
+    assert_eq!(bytes.len(), 24);
+    assert_eq!(&bytes[0..4], &[0x01, 0x02, 0x03, 0x04]);
+    assert_eq!(&bytes[4..8], &[0x05, 0x06, 0x07, 0x08]);
+    assert_eq!(&bytes[8..12], &[0x09, 0x0a, 0x0b, 0x0c]);
+    assert_eq!(&bytes[12..16], &[0x0d, 0x0e, 0x0f, 0x10]);
+    assert_eq!(&bytes[16..20], &[0x11, 0x12, 0x13, 0x14]);
+    assert_eq!(&bytes[20..24], &[0x15, 0x16, 0x17, 0x18]);
+}
+
+#[test]
+fn pack_stat_truncates_to_low_32_bits() {
+    // Inputs larger than 32 bits collapse to their low word.
+    let packed_lo = pack_stat(0x0000_0000_DEAD_BEEF, 0, 0, 0, 0, 0);
+    let packed_hi = pack_stat(0xFFFF_FFFF_DEAD_BEEF, 0, 0, 0, 0, 0);
+    assert_eq!(packed_lo, packed_hi);
+    let bytes = decode_packed_stat(&packed_lo);
+    assert_eq!(&bytes[0..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+}
+
+#[test]
+fn pack_stat_all_max_encodes_to_24_ff_bytes() {
+    let packed = pack_stat(u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u32::MAX);
+    assert_eq!(decode_packed_stat(&packed), vec![0xFFu8; 24]);
+}
+
+#[test]
+fn pack_stat_canonical_packed_stat_round_trips() {
+    // PACKED_STAT (used throughout these tests) is the canonical bzr
+    // fixture; decoding it back through the same big-endian
+    // size/mtime/ctime/dev/ino/mode layout and re-encoding must
+    // reproduce the byte-identical string.
+    let bytes = decode_packed_stat(std::str::from_utf8(PACKED_STAT).unwrap());
+    let read_be32 = |off: usize| {
+        ((bytes[off] as u64) << 24)
+            | ((bytes[off + 1] as u64) << 16)
+            | ((bytes[off + 2] as u64) << 8)
+            | (bytes[off + 3] as u64)
+    };
+    let size = read_be32(0);
+    let mtime = read_be32(4);
+    let ctime = read_be32(8);
+    let dev = read_be32(12);
+    let ino = read_be32(16);
+    let mode = read_be32(20) as u32;
+    let repacked = pack_stat(size, mtime, ctime, dev, ino, mode);
+    assert_eq!(repacked.as_bytes(), PACKED_STAT);
+}
+
+#[test]
+fn pack_stat_metadata_round_trips_via_real_filesystem() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("probe");
+    std::fs::write(&path, b"hello").expect("write probe");
+    let metadata = std::fs::metadata(&path).expect("metadata");
+    let packed = pack_stat_metadata(&metadata);
+    let bytes = decode_packed_stat(&packed);
+    assert_eq!(bytes.len(), 24);
+    // Size field: low 32 bits of metadata.len() — for "hello" that's 5.
+    assert_eq!(&bytes[0..4], &[0, 0, 0, 5]);
+}
+
+#[test]
+fn stat_to_kind_recognises_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let metadata = std::fs::metadata(dir.path()).expect("metadata");
+    assert_eq!(stat_to_kind(&metadata), Some(Kind::Directory));
+}
+
+#[test]
+fn stat_to_kind_recognises_regular_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("probe");
+    std::fs::write(&path, b"x").expect("write probe");
+    let metadata = std::fs::metadata(&path).expect("metadata");
+    assert_eq!(stat_to_kind(&metadata), Some(Kind::File));
+}
+
+#[test]
+#[cfg(unix)]
+fn stat_to_kind_recognises_symlink() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = dir.path().join("real");
+    std::fs::write(&target, b"x").expect("write target");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    // symlink_metadata, not metadata, so we don't follow the link.
+    let metadata = std::fs::symlink_metadata(&link).expect("metadata");
+    assert_eq!(stat_to_kind(&metadata), Some(Kind::Symlink));
+}
+
+#[test]
+fn id_index_get_is_empty_by_default() {
+    let idx = IdIndex::new();
+    assert!(idx.get(&FileId::from(&b"missing".to_vec())).is_empty());
+}
+
+#[test]
+fn id_index_add_and_get_round_trip() {
+    let mut idx = IdIndex::new();
+    let fid = FileId::from(&b"fid".to_vec());
+    idx.add((b"dir", b"name", &fid));
+    let got = idx.get(&fid);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, b"dir".to_vec());
+    assert_eq!(got[0].1, b"name".to_vec());
+    assert_eq!(got[0].2, fid);
+}
+
+#[test]
+fn id_index_add_records_duplicate_paths_for_one_id() {
+    // The same file_id can legitimately appear at two paths (one in
+    // the working tree, another in a parent tree it relocated from);
+    // both rows are kept.
+    let mut idx = IdIndex::new();
+    let fid = FileId::from(&b"fid".to_vec());
+    idx.add((b"old", b"name", &fid));
+    idx.add((b"new", b"name", &fid));
+    let got = idx.get(&fid);
+    assert_eq!(got.len(), 2);
+}
+
+#[test]
+fn id_index_remove_drops_only_matching_row() {
+    let mut idx = IdIndex::new();
+    let fid = FileId::from(&b"fid".to_vec());
+    idx.add((b"a", b"x", &fid));
+    idx.add((b"b", b"x", &fid));
+    idx.remove((b"a", b"x", &fid));
+    let got = idx.get(&fid);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, b"b".to_vec());
+}
+
+#[test]
+fn id_index_iter_all_yields_every_row_across_ids() {
+    let mut idx = IdIndex::new();
+    let fid_a = FileId::from(&b"a".to_vec());
+    let fid_b = FileId::from(&b"b".to_vec());
+    idx.add((b"d1", b"f1", &fid_a));
+    idx.add((b"d2", b"f2", &fid_a));
+    idx.add((b"d3", b"f3", &fid_b));
+    let count = idx.iter_all().count();
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn id_index_file_ids_yields_each_id_once() {
+    let mut idx = IdIndex::new();
+    let fid_a = FileId::from(&b"a".to_vec());
+    let fid_b = FileId::from(&b"b".to_vec());
+    idx.add((b"d1", b"f", &fid_a));
+    idx.add((b"d2", b"f", &fid_a));
+    idx.add((b"d3", b"f", &fid_b));
+    let mut ids: Vec<_> = idx.file_ids().cloned().collect();
+    ids.sort();
+    assert_eq!(ids, vec![fid_a, fid_b]);
+}
+
+#[test]
+fn id_index_clear_drops_everything() {
+    let mut idx = IdIndex::new();
+    let fid = FileId::from(&b"fid".to_vec());
+    idx.add((b"d", b"f", &fid));
+    idx.clear();
+    assert!(idx.get(&fid).is_empty());
+    assert_eq!(idx.iter_all().count(), 0);
+    assert_eq!(idx.file_ids().count(), 0);
+}
+
+#[test]
+fn inv_entry_to_details_root() {
+    let entry = InventoryEntry::Root {
+        file_id: FileId::from(&b"TREE_ROOT".to_vec()),
+        revision: Some(RevisionId::from(b"rev-1".as_ref())),
+    };
+    let (kind, fingerprint, size, executable, tree_data) = inv_entry_to_details(&entry);
+    assert_eq!(kind, Kind::Directory);
+    assert!(fingerprint.is_empty());
+    assert_eq!(size, 0);
+    assert!(!executable);
+    assert_eq!(tree_data, b"rev-1".to_vec());
+}
+
+#[test]
+fn inv_entry_to_details_directory_without_revision() {
+    let entry = InventoryEntry::Directory {
+        file_id: FileId::from(&b"d".to_vec()),
+        revision: None,
+        parent_id: FileId::from(&b"TREE_ROOT".to_vec()),
+        name: "sub".into(),
+    };
+    let (kind, fingerprint, size, executable, tree_data) = inv_entry_to_details(&entry);
+    assert_eq!(kind, Kind::Directory);
+    assert!(fingerprint.is_empty());
+    assert_eq!(size, 0);
+    assert!(!executable);
+    assert!(tree_data.is_empty());
+}
+
+#[test]
+fn inv_entry_to_details_file_with_sha_and_size() {
+    let entry = InventoryEntry::File {
+        file_id: FileId::from(&b"f".to_vec()),
+        revision: Some(RevisionId::from(b"rev-2".as_ref())),
+        parent_id: FileId::from(&b"TREE_ROOT".to_vec()),
+        name: "README".into(),
+        text_sha1: Some(b"deadbeef".to_vec()),
+        text_size: Some(42),
+        text_id: None,
+        executable: true,
+    };
+    let (kind, fingerprint, size, executable, tree_data) = inv_entry_to_details(&entry);
+    assert_eq!(kind, Kind::File);
+    assert_eq!(fingerprint, b"deadbeef".to_vec());
+    assert_eq!(size, 42);
+    assert!(executable);
+    assert_eq!(tree_data, b"rev-2".to_vec());
+}
+
+#[test]
+fn inv_entry_to_details_file_with_missing_sha_defaults_to_empty() {
+    let entry = InventoryEntry::File {
+        file_id: FileId::from(&b"f".to_vec()),
+        revision: None,
+        parent_id: FileId::from(&b"TREE_ROOT".to_vec()),
+        name: "README".into(),
+        text_sha1: None,
+        text_size: None,
+        text_id: None,
+        executable: false,
+    };
+    let (_, fingerprint, size, executable, _) = inv_entry_to_details(&entry);
+    assert!(fingerprint.is_empty());
+    assert_eq!(size, 0);
+    assert!(!executable);
+}
+
+#[test]
+fn inv_entry_to_details_link_uses_target_as_fingerprint() {
+    let entry = InventoryEntry::Link {
+        file_id: FileId::from(&b"l".to_vec()),
+        name: "ln".into(),
+        parent_id: FileId::from(&b"TREE_ROOT".to_vec()),
+        symlink_target: Some("../target".into()),
+        revision: Some(RevisionId::from(b"rev-3".as_ref())),
+    };
+    let (kind, fingerprint, size, executable, tree_data) = inv_entry_to_details(&entry);
+    assert_eq!(kind, Kind::Symlink);
+    assert_eq!(fingerprint, b"../target".to_vec());
+    assert_eq!(size, 0);
+    assert!(!executable);
+    assert_eq!(tree_data, b"rev-3".to_vec());
+}
+
+#[test]
+fn inv_entry_to_details_link_without_target_defaults_to_empty() {
+    let entry = InventoryEntry::Link {
+        file_id: FileId::from(&b"l".to_vec()),
+        name: "ln".into(),
+        parent_id: FileId::from(&b"TREE_ROOT".to_vec()),
+        symlink_target: None,
+        revision: None,
+    };
+    let (_, fingerprint, _, _, tree_data) = inv_entry_to_details(&entry);
+    assert!(fingerprint.is_empty());
+    assert!(tree_data.is_empty());
+}
+
+#[test]
+fn inv_entry_to_details_tree_reference_uses_reference_revision_as_fingerprint() {
+    let entry = InventoryEntry::TreeReference {
+        file_id: FileId::from(&b"tr".to_vec()),
+        revision: Some(RevisionId::from(b"outer".as_ref())),
+        reference_revision: Some(RevisionId::from(b"inner".as_ref())),
+        name: "subtree".into(),
+        parent_id: FileId::from(&b"TREE_ROOT".to_vec()),
+    };
+    let (kind, fingerprint, size, executable, tree_data) = inv_entry_to_details(&entry);
+    assert_eq!(kind, Kind::TreeReference);
+    assert_eq!(fingerprint, b"inner".to_vec());
+    assert_eq!(size, 0);
+    assert!(!executable);
+    assert_eq!(tree_data, b"outer".to_vec());
 }
