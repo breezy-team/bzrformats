@@ -232,7 +232,6 @@ from . import inventory, lock, osutils
 from .errors import (
     BzrFormatsError,
     InconsistentDelta,
-    InvalidNormalization,
     LockContention,
     LockNotHeld,
     ObjectNotLocked,
@@ -634,38 +633,14 @@ class DirState:
             or the referenced revision id for tree-references,
             or b'' for directories.
         """
-        # Normalize path + basename. The Rust side handles the rest.
-        dirname, basename = osutils.split(path)
-        norm_name, can_access = osutils.normalized_filename(basename)
-        if norm_name != basename:
-            if can_access:
-                basename = norm_name
-            else:
-                raise InvalidNormalization(path)
-        if basename == "." or basename == "..":
-            raise inventory.InvalidEntryName(path)
-        utf8path = (dirname + "/" + basename).strip("/").encode("utf8")
-        dirname, basename = osutils.split(utf8path)
         if file_id.__class__ is not bytes:
             raise AssertionError(f"must be a utf8 file_id not {type(file_id)}")
-        if stat is None:
-            size = 0
-            packed_stat = DirState.NULLSTAT
-        else:
-            size = stat.st_size
-            packed_stat = pack_stat(stat)
-        self._rs.add(
-            utf8path,
-            dirname,
-            basename,
-            file_id,
-            kind,
-            size,
-            packed_stat,
-            fingerprint,
-        )
-        if self._id_index is not None:
-            self._id_index.add((dirname, basename, file_id))
+        if isinstance(path, bytes):
+            path = path.decode("utf-8")
+        self._rs.add_path(path, file_id, kind, stat, fingerprint)
+        # Rust side updated its id_index; invalidate the Python mirror
+        # so the next access rebuilds from authoritative state.
+        self._id_index = None
 
     def _bisect(self, paths):
         """Bisect through the disk structure for specific rows.

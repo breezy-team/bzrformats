@@ -4994,6 +4994,95 @@ impl DirState {
         Ok(())
     }
 
+    /// High-level entry point mirroring Python's `DirState.add` from
+    /// the top: takes a `path` string (any of `""`, `"foo"`,
+    /// `"foo/bar"`), normalises the basename, validates `.`/`..`,
+    /// packs the stat, and dispatches to [`DirState::add`].
+    ///
+    /// Returns `AddError::InvalidNormalization` when NFC would point
+    /// at an inaccessible path, `AddError::InvalidEntryName` when the
+    /// basename is `.` or `..`.  Other failures bubble up from
+    /// [`DirState::add`].
+    pub fn add_path(
+        &mut self,
+        path: &str,
+        file_id: &[u8],
+        kind: &str,
+        stat: Option<StatInfo>,
+        fingerprint: &[u8],
+    ) -> Result<(), AddError> {
+        // Split the str-path into (dirname, basename).  Python uses
+        // `os.path.split` which splits on the last `/`.
+        let (dirname_s, basename_s) = match path.rfind('/') {
+            Some(idx) => (&path[..idx], &path[idx + 1..]),
+            None => ("", path),
+        };
+
+        // NFC-normalise the basename.  Inaccessible-after-normalisation
+        // is a hard error on Linux; on macOS the filesystem is the one
+        // doing the normalisation so the result is always accessible.
+        let basename_norm =
+            match osutils::path::normalized_filename(std::path::Path::new(basename_s)) {
+                Some((norm, accessible)) => {
+                    if norm.as_os_str() != std::ffi::OsStr::new(basename_s) && !accessible {
+                        return Err(AddError::InvalidNormalization {
+                            path: path.to_string(),
+                        });
+                    }
+                    norm.to_string_lossy().into_owned()
+                }
+                None => basename_s.to_string(),
+            };
+
+        if basename_norm == "." || basename_norm == ".." {
+            return Err(AddError::InvalidEntryName {
+                name: path.to_string(),
+            });
+        }
+
+        // Rejoin using the (possibly renormalised) basename, then
+        // strip leading/trailing `/` and take the utf8 bytes.  This
+        // matches the `(dirname + "/" + basename).strip("/").encode("utf8")`
+        // pass Python does before the utf8 split.
+        let mut rejoined = String::with_capacity(dirname_s.len() + 1 + basename_norm.len());
+        rejoined.push_str(dirname_s);
+        rejoined.push('/');
+        rejoined.push_str(&basename_norm);
+        let utf8path = rejoined.trim_matches('/').as_bytes().to_vec();
+
+        let (dirname_b, basename_b): (&[u8], &[u8]) =
+            match utf8path.iter().rposition(|&b| b == b'/') {
+                Some(idx) => (&utf8path[..idx], &utf8path[idx + 1..]),
+                None => (b"".as_slice(), utf8path.as_slice()),
+            };
+
+        let (size, packed_stat_owned) = match stat {
+            None => (0u64, vec![b'x'; 32]),
+            Some(st) => {
+                let packed = pack_stat(
+                    st.size,
+                    st.mtime as u64,
+                    st.ctime as u64,
+                    st.dev,
+                    st.ino,
+                    st.mode,
+                );
+                (st.size, packed.into_bytes())
+            }
+        };
+
+        self.add(
+            &utf8path,
+            dirname_b,
+            basename_b,
+            file_id,
+            kind,
+            size,
+            &packed_stat_owned,
+            fingerprint,
+        )
+    }
+
     /// Add a new tracked entry. Mirrors Python's `DirState.add` after
     /// path normalisation: the caller is responsible for handing in
     /// `utf8path` with its `dirname`/`basename` split already done, and
@@ -7432,6 +7521,13 @@ pub enum AddError {
     /// An internal invariant violation surfaced from a helper call such
     /// as [`DirState::update_minimal`] during the rename-from step.
     Internal { reason: String },
+    /// The basename is not unicode-normalized and the normalized form
+    /// would point at an inaccessible path.  Mirrors Python's
+    /// `InvalidNormalization(path)`.
+    InvalidNormalization { path: String },
+    /// The basename is `.` or `..`.  Mirrors Python's
+    /// `inventory.InvalidEntryName(path)`.
+    InvalidEntryName { name: String },
 }
 
 impl std::fmt::Display for AddError {
@@ -7449,6 +7545,10 @@ impl std::fmt::Display for AddError {
                 write!(f, "{:?}({:?}) already added", basename, file_id)
             }
             AddError::Internal { reason } => write!(f, "internal error: {}", reason),
+            AddError::InvalidNormalization { path } => {
+                write!(f, "path not unicode-normalized: {:?}", path)
+            }
+            AddError::InvalidEntryName { name } => write!(f, "invalid entry name: {:?}", name),
         }
     }
 }

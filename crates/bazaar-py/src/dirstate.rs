@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 
 pyo3::import_exception!(bzrformats.errors, NotVersionedError);
 pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
+pyo3::import_exception!(bzrformats.errors, InvalidNormalization);
 pyo3::import_exception!(bzrformats.inventory, DuplicateFileId);
+pyo3::import_exception!(bzrformats.inventory, InvalidEntryName);
 
 /// `bazaar::dirstate::Transport` adapter backed by a Python file-like
 /// object.  Used by `DirStateRs.save_to_file` so the pure-Rust
@@ -997,6 +999,35 @@ fn dirstate_change_to_pytuple<'py>(
             exec_tuple.into_any().unbind(),
         ],
     )
+}
+
+/// Convert an [`AddError`] to the Python exception that
+/// `DirState.add` would have raised.
+fn add_error_to_py(py: Python<'_>, err: bazaar::dirstate::AddError) -> PyErr {
+    use bazaar::dirstate::AddError;
+    match err {
+        AddError::DuplicateFileId { file_id, info } => {
+            DuplicateFileId::new_err((PyBytes::new(py, &file_id).unbind(), info))
+        }
+        AddError::AlreadyAdded { path } => {
+            pyo3::exceptions::PyException::new_err(format!("adding already added path! {:?}", path))
+        }
+        AddError::NotVersioned { path } => {
+            NotVersionedError::new_err((PyBytes::new(py, &path).unbind(), ""))
+        }
+        AddError::UnknownKind { kind } => {
+            BzrFormatsError::new_err(format!("unknown kind {:?}", kind))
+        }
+        AddError::AlreadyAddedAssertion { basename, file_id } => {
+            pyo3::exceptions::PyAssertionError::new_err(format!(
+                " {:?}({:?}) already added",
+                basename, file_id
+            ))
+        }
+        AddError::Internal { reason } => pyo3::exceptions::PyAssertionError::new_err(reason),
+        AddError::InvalidNormalization { path } => InvalidNormalization::new_err((path,)),
+        AddError::InvalidEntryName { name } => InvalidEntryName::new_err((name,)),
+    }
 }
 
 fn memory_state_to_py(state: bazaar::dirstate::MemoryState) -> i64 {
@@ -2249,30 +2280,47 @@ impl PyDirState {
             fingerprint.unwrap_or(b""),
         ) {
             Ok(()) => Ok(()),
-            Err(bazaar::dirstate::AddError::DuplicateFileId { file_id, info }) => Err(
-                DuplicateFileId::new_err((PyBytes::new(py, &file_id).unbind(), info)),
-            ),
-            Err(bazaar::dirstate::AddError::AlreadyAdded { path }) => {
-                Err(pyo3::exceptions::PyException::new_err(format!(
-                    "adding already added path! {:?}",
-                    path
-                )))
-            }
-            Err(bazaar::dirstate::AddError::NotVersioned { path }) => Err(
-                NotVersionedError::new_err((PyBytes::new(py, &path).unbind(), "")),
-            ),
-            Err(bazaar::dirstate::AddError::UnknownKind { kind }) => {
-                Err(BzrFormatsError::new_err(format!("unknown kind {:?}", kind)))
-            }
-            Err(bazaar::dirstate::AddError::AlreadyAddedAssertion { basename, file_id }) => {
-                Err(pyo3::exceptions::PyAssertionError::new_err(format!(
-                    " {:?}({:?}) already added",
-                    basename, file_id
-                )))
-            }
-            Err(bazaar::dirstate::AddError::Internal { reason }) => {
-                Err(pyo3::exceptions::PyAssertionError::new_err(reason))
-            }
+            Err(e) => Err(add_error_to_py(py, e)),
+        }
+    }
+
+    /// Add a new tracked entry starting from an unsplit, possibly
+    /// unnormalised path string.  Mirrors Python's full
+    /// `DirState.add` body: splits the path, NFC-normalises the
+    /// basename, rejects `.`/`..`, packs the stat tuple, and
+    /// dispatches to the pure-crate `add`.
+    ///
+    /// `stat` is either `None` (substitutes NULLSTAT) or any object
+    /// exposing `st_mode`/`st_size`/`st_mtime`/`st_ctime`/`st_dev`/
+    /// `st_ino` — matching `os.stat_result`.
+    #[pyo3(signature = (path, file_id, kind, stat, fingerprint))]
+    fn add_path(
+        &mut self,
+        py: Python<'_>,
+        path: &str,
+        file_id: &[u8],
+        kind: &str,
+        stat: Option<&Bound<PyAny>>,
+        fingerprint: &[u8],
+    ) -> PyResult<()> {
+        let stat_info: Option<bazaar::dirstate::StatInfo> = match stat {
+            None => None,
+            Some(s) if s.is_none() => None,
+            Some(s) => Some(bazaar::dirstate::StatInfo {
+                mode: s.getattr("st_mode")?.extract()?,
+                size: s.getattr("st_size")?.extract()?,
+                mtime: s.getattr("st_mtime")?.extract::<f64>()? as i64,
+                ctime: s.getattr("st_ctime")?.extract::<f64>()? as i64,
+                dev: s.getattr("st_dev")?.extract()?,
+                ino: s.getattr("st_ino")?.extract()?,
+            }),
+        };
+        match self
+            .inner
+            .add_path(path, file_id, kind, stat_info, fingerprint)
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(add_error_to_py(py, e)),
         }
     }
 
