@@ -121,6 +121,7 @@ impl std::fmt::Display for Kind {
 /// Extension methods for `Option<Kind>` that collapse the repeated
 /// `None | Some(Absent) | Some(Relocated)` pattern used throughout
 /// the tree-slot lookup sites.
+#[allow(clippy::wrong_self_convention)]
 pub trait OptionKindExt {
     /// True when the slot is missing, absent, or relocated — i.e.
     /// there is no live entry at this position in this tree.

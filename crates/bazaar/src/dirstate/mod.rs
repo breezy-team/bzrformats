@@ -1881,7 +1881,7 @@ impl DirState {
         };
         self.dirblocks[block_index].entries[entry_index].trees[0] = new_tree0.clone();
         self.packed_stat_index = None;
-        self.mark_modified(&[key.clone()], false);
+        self.mark_modified(std::slice::from_ref(key), false);
         Ok(Some(new_tree0))
     }
 
@@ -2179,7 +2179,7 @@ impl DirState {
                         old_basename: None,
                         new_basename: Some(entry_key.basename.clone()),
                         source_kind: None,
-                        target_kind: info.kind.clone(),
+                        target_kind: info.kind,
                         source_exec: None,
                         target_exec: Some(te),
                     }),
@@ -2395,7 +2395,7 @@ impl DirState {
                                 old_basename: None,
                                 new_basename: Some(basename),
                                 source_kind: None,
-                                target_kind: info.kind.clone(),
+                                target_kind: info.kind,
                                 source_exec: None,
                                 target_exec: Some(new_executable),
                             });
@@ -2996,7 +2996,7 @@ impl DirState {
         // implementation's if/elif chain has no arm for b't', so the
         // saved row is left intact and only mark_modified runs.
         if minikind == Kind::TreeReference {
-            self.mark_modified(&[key.clone()], false);
+            self.mark_modified(std::slice::from_ref(key), false);
             return Ok(None);
         }
 
@@ -3115,7 +3115,7 @@ impl DirState {
         }
 
         if worth_saving {
-            self.mark_modified(&[key.clone()], false);
+            self.mark_modified(std::slice::from_ref(key), false);
         }
 
         Ok(result)
@@ -3661,6 +3661,8 @@ impl DirState {
         // is almost certainly meant to be `parent_row_index`, but we
         // preserve the (tautological) behaviour so this port is strictly
         // observation-preserving.
+        // `parent_block_index` twice is intentional — see comment above.
+        #[allow(clippy::nonminimal_bool)]
         let sentinel_shortcut =
             parent_block_index == -1 && parent_block_index == -1 && dirname.is_empty();
         if !sentinel_shortcut {
@@ -11735,7 +11737,7 @@ mod dirstate_struct_tests {
         let mut state = fresh_state();
         state.dirblock_state = MemoryState::InMemoryUnmodified;
         let key = entry_key(b"", b"README", b"fid-readme");
-        state.mark_modified(&[key.clone()], false);
+        state.mark_modified(std::slice::from_ref(&key), false);
         assert_eq!(state.dirblock_state, MemoryState::InMemoryHashModified);
         assert!(state.known_hash_changes.contains(&key));
     }
