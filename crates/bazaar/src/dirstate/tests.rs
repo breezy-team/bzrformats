@@ -4071,6 +4071,79 @@ fn entry_to_line_round_trip_through_parse_dirblocks() {
 }
 
 #[test]
+fn dirblocks_to_entry_lines_empty() {
+    assert!(dirblocks_to_entry_lines(&[]).is_empty());
+}
+
+#[test]
+fn dirblocks_to_entry_lines_skips_empty_blocks() {
+    let nullstat = b"x".repeat(32);
+    let blocks = vec![
+        Dirblock {
+            dirname: Vec::new(),
+            entries: Vec::new(),
+        },
+        Dirblock {
+            dirname: b"sub".to_vec(),
+            entries: vec![Entry {
+                key: EntryKey {
+                    dirname: b"sub".to_vec(),
+                    basename: b"f".to_vec(),
+                    file_id: b"fid".to_vec(),
+                },
+                trees: vec![TreeData {
+                    minikind: Kind::File,
+                    fingerprint: b"sha1".to_vec(),
+                    size: 1,
+                    executable: false,
+                    packed_stat: nullstat.clone(),
+                }],
+            }],
+        },
+    ];
+    let lines = dirblocks_to_entry_lines(&blocks);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0], entry_to_line(&blocks[1].entries[0]));
+}
+
+#[test]
+fn dirblocks_to_entry_lines_preserves_order_across_blocks() {
+    let nullstat = b"x".repeat(32);
+    let make_entry = |basename: &[u8], file_id: &[u8]| Entry {
+        key: EntryKey {
+            dirname: b"".to_vec(),
+            basename: basename.to_vec(),
+            file_id: file_id.to_vec(),
+        },
+        trees: vec![TreeData {
+            minikind: Kind::File,
+            fingerprint: b"sha".to_vec(),
+            size: 1,
+            executable: false,
+            packed_stat: nullstat.clone(),
+        }],
+    };
+    let blocks = vec![
+        Dirblock {
+            dirname: b"a".to_vec(),
+            entries: vec![
+                make_entry(b"first", b"id-a1"),
+                make_entry(b"second", b"id-a2"),
+            ],
+        },
+        Dirblock {
+            dirname: b"b".to_vec(),
+            entries: vec![make_entry(b"only", b"id-b1")],
+        },
+    ];
+    let lines = dirblocks_to_entry_lines(&blocks);
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0], entry_to_line(&blocks[0].entries[0]));
+    assert_eq!(lines[1], entry_to_line(&blocks[0].entries[1]));
+    assert_eq!(lines[2], entry_to_line(&blocks[1].entries[0]));
+}
+
+#[test]
 fn dirstate_get_lines_matches_python_saved_bytes() {
     // The same single-entry layout we pinned earlier for
     // parse_dirblocks, but now produced by the Rust writer and

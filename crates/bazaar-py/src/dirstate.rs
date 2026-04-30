@@ -3328,8 +3328,7 @@ pub fn _dirstate_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(inv_entry_to_details))?;
     m.add_wrapped(wrap_pyfunction!(get_output_lines))?;
 
-    // Register dirstate helper functions (_read_dirblocks, entry_to_line,
-    // dirblocks_to_entry_lines).
+    // Register dirstate helper functions (_read_dirblocks, entry_to_line).
     crate::dirstate_helpers::register(&m)?;
 
     Ok(m)
