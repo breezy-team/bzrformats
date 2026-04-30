@@ -915,6 +915,26 @@ impl PyDirState {
         })
     }
 
+    /// Read the dirstate header out of `state_file` and populate the
+    /// header state (parents, ghosts, num_entries, end_of_header).
+    /// Mirrors `DirState._read_header`: reads five newline-delimited
+    /// lines from the current file position and leaves the file
+    /// pointer immediately after the fifth newline — the position
+    /// where the first dirblock record begins.  The caller must hold
+    /// a read or write lock and must have positioned the file at the
+    /// start of the header.
+    fn read_header_from_file(&mut self, state_file: &Bound<PyAny>) -> PyResult<()> {
+        let mut data: Vec<u8> = Vec::new();
+        for _ in 0..5 {
+            let line = state_file.call_method0("readline")?;
+            let bytes = line.cast_into::<PyBytes>()?;
+            data.extend_from_slice(bytes.as_bytes());
+        }
+        self.inner
+            .read_header(&data)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
+    }
+
     /// Bisect for rows at the given paths. Mirrors Python's
     /// `DirState._bisect`. `paths` is an iterable of `bytes`; returns
     /// a `dict` mapping path → list of entries (same tuple shape as

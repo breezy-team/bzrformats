@@ -1263,13 +1263,8 @@ class DirState:
             _read_dirblocks(self)
 
     def _read_header(self):
-        """This reads in the metadata header, and the parent ids.
-
-        After reading in, the file should be positioned at the null
-        just before the start of the first record in the file.
-        """
-        header_bytes = b"".join(self._state_file.readline() for _ in range(5))
-        self._rs.read_header(header_bytes)
+        """Read the metadata header and parent ids from the state file."""
+        self._rs.read_header_from_file(self._state_file)
 
     def _read_header_if_needed(self):
         """Read the header of the dirstate file if needed."""
