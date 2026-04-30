@@ -316,30 +316,52 @@ pub fn stat_to_minikind(metadata: &Metadata) -> char {
 pub const HEADER_FORMAT_2: &[u8] = b"#bazaar dirstate flat format 2\n";
 pub const HEADER_FORMAT_3: &[u8] = b"#bazaar dirstate flat format 3\n";
 
-#[derive(PartialEq, Eq, Debug)]
+/// The six entry-kinds dirstate tracks — the same set Python's
+/// `DirState._minikind_to_kind` maps to/from.  Variant discriminants
+/// are the on-disk "minikind" byte, so `kind as u8` produces the byte
+/// and [`Kind::from_minikind`] round-trips back.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
-    Absent,
-    File,
-    Directory,
-    Relocated,
-    Symlink,
-    TreeReference,
+    /// `b'a'` — absent in this tree.
+    Absent = b'a',
+    /// `b'f'` — a regular file; `fingerprint` is the sha1.
+    File = b'f',
+    /// `b'd'` — a directory; `fingerprint` is empty.
+    Directory = b'd',
+    /// `b'r'` — relocated; `fingerprint` is the target path.
+    Relocated = b'r',
+    /// `b'l'` — a symbolic link; `fingerprint` is the link target.
+    Symlink = b'l',
+    /// `b't'` — a tree reference; `fingerprint` is the referenced revision.
+    TreeReference = b't',
 }
 
 impl Kind {
-    pub fn to_char(&self) -> char {
-        match self {
-            Kind::Absent => 'a',
-            Kind::File => 'f',
-            Kind::Directory => 'd',
-            Kind::Relocated => 'r',
-            Kind::Symlink => 'l',
-            Kind::TreeReference => 't',
+    /// The one-byte on-disk code — what Python calls the "minikind".
+    #[inline]
+    pub fn to_minikind(self) -> u8 {
+        self as u8
+    }
+
+    /// Parse a minikind byte.  Returns the offending byte on failure
+    /// so callers can surface a meaningful error (corrupt dirstate /
+    /// parser input).
+    #[inline]
+    pub fn from_minikind(byte: u8) -> Result<Self, u8> {
+        match byte {
+            b'a' => Ok(Kind::Absent),
+            b'f' => Ok(Kind::File),
+            b'd' => Ok(Kind::Directory),
+            b'r' => Ok(Kind::Relocated),
+            b'l' => Ok(Kind::Symlink),
+            b't' => Ok(Kind::TreeReference),
+            other => Err(other),
         }
     }
 
-    pub fn to_byte(&self) -> u8 {
-        self.to_char() as u8
+    pub fn to_char(self) -> char {
+        self.to_minikind() as char
     }
 
     pub fn to_str(&self) -> &str {
@@ -351,6 +373,32 @@ impl Kind {
             Kind::Symlink => "symlink",
             Kind::TreeReference => "tree-reference",
         }
+    }
+
+    /// Whether this kind represents a real on-disk entity (`f`, `d`,
+    /// `l`, `t`) — the cases `process_entry` treats as "content in
+    /// this tree" as opposed to `a`bsent / `r`elocated.
+    #[inline]
+    pub fn is_fdlt(self) -> bool {
+        matches!(
+            self,
+            Kind::File | Kind::Directory | Kind::Symlink | Kind::TreeReference
+        )
+    }
+
+    /// `is_fdlt` plus relocation — anything except `a`bsent.  Used by
+    /// `process_entry` to decide whether the source side of a
+    /// comparison can contribute a visible change.
+    #[inline]
+    pub fn is_fdltr(self) -> bool {
+        !matches!(self, Kind::Absent)
+    }
+
+    /// Either `a`bsent or `r`elocated — the two kinds that mean
+    /// "this file is not really here".
+    #[inline]
+    pub fn is_absent_or_relocated(self) -> bool {
+        matches!(self, Kind::Absent | Kind::Relocated)
     }
 }
 
@@ -365,9 +413,9 @@ impl From<osutils::Kind> for Kind {
     }
 }
 
-impl ToString for Kind {
-    fn to_string(&self) -> String {
-        self.to_str().to_string()
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.to_str())
     }
 }
 
@@ -381,20 +429,6 @@ impl From<String> for Kind {
             "symlink" => Kind::Symlink,
             "tree-reference" => Kind::TreeReference,
             _ => panic!("Unknown kind: {}", s),
-        }
-    }
-}
-
-impl From<char> for Kind {
-    fn from(c: char) -> Self {
-        match c {
-            'a' => Kind::Absent,
-            'f' => Kind::File,
-            'd' => Kind::Directory,
-            'r' => Kind::Relocated,
-            'l' => Kind::Symlink,
-            't' => Kind::TreeReference,
-            _ => panic!("Unknown kind: {}", c),
         }
     }
 }
@@ -522,8 +556,8 @@ impl IdIndex {
 ///   inv_entry: An inventory entry whose sha1 and link targets can be
 ///     relied upon, and which has a revision set.
 /// Returns: A details tuple - the details for a single tree at a path id.
-pub fn inv_entry_to_details(e: &InventoryEntry) -> (u8, Vec<u8>, u64, bool, Vec<u8>) {
-    let minikind = Kind::from(e.kind()).to_byte();
+pub fn inv_entry_to_details(e: &InventoryEntry) -> (Kind, Vec<u8>, u64, bool, Vec<u8>) {
+    let minikind = Kind::from(e.kind());
     let tree_data = e
         .revision()
         .map_or_else(Vec::new, |r| r.as_bytes().to_vec());
@@ -786,14 +820,14 @@ fn parse_ghosts_field(line: &[u8]) -> Option<Vec<Vec<u8>>> {
 /// Per-tree record attached to an entry: `(minikind, fingerprint, size, executable, packed_stat)`.
 ///
 /// Mirrors the 5-tuple stored at `entry[1][tree_index]` in the Python
-/// `DirState`. `minikind` is a single byte such as `b'f'`, `b'd'`, `b'l'`,
-/// `b'a'`, `b'r'`, or `b't'`; `fingerprint` is the sha1 for files, the link
-/// target for symlinks, or the parent revision for tree references; `size` is
-/// the file size in bytes (0 for non-files); `packed_stat` is the base64
-/// `pack_stat` string, or `DirState.NULLSTAT` when no stat is cached.
+/// `DirState`. `fingerprint` is the sha1 for files, the link target
+/// for symlinks, or the parent revision for tree references; `size`
+/// is the file size in bytes (0 for non-files); `packed_stat` is the
+/// base64 `pack_stat` string, or `DirState.NULLSTAT` when no stat is
+/// cached.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeData {
-    pub minikind: u8,
+    pub minikind: Kind,
     pub fingerprint: Vec<u8>,
     pub size: u64,
     pub executable: bool,
@@ -945,7 +979,7 @@ impl std::error::Error for ProcessEntryError {}
 
 fn null_parent_details() -> TreeData {
     TreeData {
-        minikind: b'a',
+        minikind: Kind::Absent,
         fingerprint: Vec::new(),
         size: 0,
         executable: false,
@@ -979,13 +1013,13 @@ fn is_inside(parent: &[u8], candidate: &[u8]) -> bool {
         && candidate[parent.len()] == b'/'
 }
 
-fn kind_for_minikind(mk: u8) -> Option<String> {
+fn kind_for_minikind(mk: Kind) -> Option<String> {
     match mk {
-        b'f' => Some("file".to_string()),
-        b'd' => Some("directory".to_string()),
-        b'l' => Some("symlink".to_string()),
-        b't' => Some("tree-reference".to_string()),
-        _ => None,
+        Kind::File => Some("file".to_string()),
+        Kind::Directory => Some("directory".to_string()),
+        Kind::Symlink => Some("symlink".to_string()),
+        Kind::TreeReference => Some("tree-reference".to_string()),
+        Kind::Absent | Kind::Relocated => None,
     }
 }
 
@@ -1577,6 +1611,8 @@ pub enum DirblocksError {
     /// The number of parsed entries did not match the count declared by the
     /// header.
     WrongEntryCount { expected: usize, actual: usize },
+    /// The minikind byte wasn't one of the six valid codes.
+    InvalidMinikind(u8),
 }
 
 impl std::fmt::Display for DirblocksError {
@@ -1613,6 +1649,9 @@ impl std::fmt::Display for DirblocksError {
                     "We read the wrong number of entries. We expected to read {}, but read {}",
                     expected, actual
                 )
+            }
+            DirblocksError::InvalidMinikind(byte) => {
+                write!(f, "invalid minikind byte {:?}", byte)
             }
         }
     }
@@ -1735,12 +1774,11 @@ pub fn parse_dirblocks(
             // handling of the empty-field case (mirrors the pyo3 shim).
             let executable = !exec_bytes.is_empty() && exec_bytes[0] == b'y';
 
+            let minikind_byte = minikind_bytes.first().copied().unwrap_or(0);
+            let minikind =
+                Kind::from_minikind(minikind_byte).map_err(DirblocksError::InvalidMinikind)?;
             trees.push(TreeData {
-                // Python stores the minikind as a 1-byte `bytes` object
-                // but otherwise treats it opaquely; we store only the
-                // first byte and preserve the rest as part of the raw
-                // field should future code need it.
-                minikind: minikind_bytes.first().copied().unwrap_or(0),
+                minikind,
                 fingerprint: fingerprint_bytes.to_vec(),
                 size,
                 executable,
@@ -1788,7 +1826,7 @@ pub fn entry_to_line(entry: &Entry) -> Vec<u8> {
     out.extend_from_slice(&entry.key.file_id);
     for tree in &entry.trees {
         out.push(0);
-        out.push(tree.minikind);
+        out.push(tree.minikind.to_minikind());
         out.push(0);
         out.extend_from_slice(&tree.fingerprint);
         out.push(0);
@@ -1967,7 +2005,7 @@ impl DirState {
                 Some(t) => t,
                 None => continue,
             };
-            if tree0.minikind == b'f' {
+            if tree0.minikind == Kind::File {
                 // Python stores the mapping keyed by the packed_stat
                 // and with the fingerprint (the sha1) as the value.
                 index.insert(tree0.packed_stat.clone(), tree0.fingerprint.clone());
@@ -2159,7 +2197,7 @@ impl DirState {
     /// (notably `set_state_from_inventory`'s zipper-merge loop, which
     /// used to rely on Python-side tuple aliasing to observe mid-loop
     /// rewrites).
-    pub fn tree0_minikind(&self, key: &EntryKey) -> Option<u8> {
+    pub fn tree0_minikind(&self, key: &EntryKey) -> Option<Kind> {
         let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
         if !block_present {
             return None;
@@ -2243,7 +2281,7 @@ impl DirState {
         )
         .into_bytes();
         let new_tree0 = TreeData {
-            minikind: b'f',
+            minikind: Kind::File,
             fingerprint: sha1.to_vec(),
             size: st_size,
             executable,
@@ -2297,14 +2335,11 @@ impl DirState {
             .unwrap_or_else(null_parent_details);
         let mut target_minikind = target_details.minikind;
 
-        let fdlt = |k: u8| matches!(k, b'f' | b'd' | b'l' | b't');
-        let fdltr = |k: u8| matches!(k, b'f' | b'd' | b'l' | b't' | b'r');
-
         // Step 1: if on disk and versioned in the target, refresh
         // via update_entry (which may flip minikind e.g. d → t).
         let mut link_or_sha1: Option<Vec<u8>> = None;
         if let Some(info) = path_info {
-            if fdlt(target_minikind) {
+            if target_minikind.is_fdlt() {
                 if target_idx != 0 {
                     return Err(ProcessEntryError::Internal(
                         "update_entry requires target_index == 0".into(),
@@ -2324,13 +2359,13 @@ impl DirState {
         let mut source_minikind = source_details.minikind;
         let mut source_details_mut = source_details.clone();
 
-        if fdltr(source_minikind) && fdlt(target_minikind) {
+        if source_minikind.is_fdltr() && target_minikind.is_fdlt() {
             let mut old_dirname: Vec<u8>;
             let mut old_basename: Vec<u8>;
             let mut old_path: Option<Vec<u8>>;
             let mut path: Option<Vec<u8>>;
 
-            if source_minikind == b'r' {
+            if source_minikind == Kind::Relocated {
                 let src_path = source_details_mut.fingerprint.clone();
                 let already_inside = pstate
                     .searched_specific_files
@@ -2390,13 +2425,13 @@ impl DirState {
                                 .insert(p.clone(), file_id.clone());
                         }
                         (
-                            source_minikind != b'd',
+                            source_minikind != Kind::Directory,
                             Some("directory".to_string()),
                             false,
                         )
                     }
                     "file" => {
-                        let cc = if source_minikind != b'f' {
+                        let cc = if source_minikind != Kind::File {
                             true
                         } else {
                             if link_or_sha1.is_none() {
@@ -2428,7 +2463,7 @@ impl DirState {
                         (cc, Some("file".to_string()), te)
                     }
                     "symlink" => {
-                        let cc = if source_minikind != b'l' {
+                        let cc = if source_minikind != Kind::Symlink {
                             true
                         } else {
                             link_or_sha1.as_deref()
@@ -2437,7 +2472,7 @@ impl DirState {
                         (cc, Some("symlink".to_string()), false)
                     }
                     "tree-reference" => (
-                        source_minikind != b't',
+                        source_minikind != Kind::TreeReference,
                         Some("tree-reference".to_string()),
                         false,
                     ),
@@ -2455,7 +2490,7 @@ impl DirState {
                 (true, None, false)
             };
 
-            if source_minikind == b'd' {
+            if source_minikind == Kind::Directory {
                 if path.is_none() {
                     let p = join_path(&old_dirname, &old_basename);
                     path = Some(p.clone());
@@ -2526,7 +2561,7 @@ impl DirState {
             ));
         }
 
-        if source_minikind == b'a' && fdlt(target_minikind) {
+        if source_minikind == Kind::Absent && target_minikind.is_fdlt() {
             let path = join_path(&entry_key.dirname, &entry_key.basename);
             let (parent_dir, parent_base) = split_path_utf8(&entry_key.dirname);
             let parent_bei =
@@ -2588,7 +2623,7 @@ impl DirState {
             }
         }
 
-        if fdlt(source_minikind) && target_minikind == b'a' {
+        if source_minikind.is_fdlt() && target_minikind == Kind::Absent {
             let old_path = join_path(&entry_key.dirname, &entry_key.basename);
             let src_idx = pstate.source_index.unwrap_or(0);
             let (pdir, pbase) = split_path_utf8(&entry_key.dirname);
@@ -2623,7 +2658,7 @@ impl DirState {
             ));
         }
 
-        if fdlt(source_minikind) && target_minikind == b'r' {
+        if source_minikind.is_fdlt() && target_minikind == Kind::Relocated {
             let tpath = target_details.fingerprint.clone();
             let already_inside = pstate
                 .searched_specific_files
@@ -2635,8 +2670,7 @@ impl DirState {
             return Ok((None, None));
         }
 
-        let ra = |k: u8| matches!(k, b'r' | b'a');
-        if ra(source_minikind) && ra(target_minikind) {
+        if source_minikind.is_absent_or_relocated() && target_minikind.is_absent_or_relocated() {
             return Ok((None, None));
         }
 
@@ -3011,8 +3045,8 @@ impl DirState {
                 let ce = current_entry.as_ref().unwrap();
                 let pi = current_path_info.as_ref().unwrap();
                 let target0 = ce.trees.get(pstate.target_index).map(|t| t.minikind);
-                let mismatch =
-                    ce.key.basename != pi.basename || matches!(target0, Some(b'a') | Some(b'r'));
+                let mismatch = ce.key.basename != pi.basename
+                    || matches!(target0, Some(Kind::Absent) | Some(Kind::Relocated));
                 if mismatch {
                     if pi.basename.as_slice() < ce.key.basename.as_slice() {
                         advance_entry = false;
@@ -3191,12 +3225,14 @@ impl DirState {
                 .source_index
                 .and_then(|i| trees.get(i))
                 .map(|t| t.minikind);
-            if !matches!(target, Some(b'a') | Some(b'r')) {
+            if !matches!(target, Some(Kind::Absent) | Some(Kind::Relocated)) {
                 found_item = true;
                 selected.push((ek.clone(), trees.clone()));
-            } else if pstate.source_index.is_some() && !matches!(source, Some(b'a') | Some(b'r')) {
+            } else if pstate.source_index.is_some()
+                && !matches!(source, Some(Kind::Absent) | Some(Kind::Relocated))
+            {
                 found_item = true;
-                if target == Some(b'a') {
+                if target == Some(Kind::Absent) {
                     selected.push((ek.clone(), trees.clone()));
                 } else {
                     let target_path = trees[pstate.target_index].fingerprint.clone();
@@ -3230,7 +3266,9 @@ impl DirState {
                         && c.target_kind.as_deref() != Some("directory")
                     {
                         let entry_path = match pstate.source_index {
-                            Some(si) if trees.get(si).map(|t| t.minikind) == Some(b'r') => {
+                            Some(si)
+                                if trees.get(si).map(|t| t.minikind) == Some(Kind::Relocated) =>
+                            {
                                 trees[si].fingerprint.clone()
                             }
                             _ => path_utf8.clone(),
@@ -3253,7 +3291,10 @@ impl DirState {
                                         .source_index
                                         .and_then(|i| child.trees.get(i))
                                         .map(|t| t.minikind);
-                                    if matches!(source_mk, Some(b'a') | Some(b'r')) {
+                                    if matches!(
+                                        source_mk,
+                                        Some(Kind::Absent) | Some(Kind::Relocated)
+                                    ) {
                                         continue;
                                     }
                                     let child_path =
@@ -3294,12 +3335,12 @@ impl DirState {
         // 1. Derive minikind from st_mode.  Non-file/dir/symlink kinds
         //    are silently skipped (Python returns None via the
         //    KeyError branch).
-        let mut minikind: u8 = if stat.is_file() {
-            b'f'
+        let mut minikind: Kind = if stat.is_file() {
+            Kind::File
         } else if stat.is_dir() {
-            b'd'
+            Kind::Directory
         } else if stat.is_symlink() {
-            b'l'
+            Kind::Symlink
         } else {
             return Ok(None);
         };
@@ -3325,24 +3366,23 @@ impl DirState {
             return Err(UpdateEntryError::EntryNotFound);
         }
         let entry_len = self.dirblocks[block_index].entries[entry_index].trees.len();
-        let tree1_minikind: u8 = self.dirblocks[block_index].entries[entry_index]
+        let tree1_minikind: Option<Kind> = self.dirblocks[block_index].entries[entry_index]
             .trees
             .get(1)
-            .map(|t| t.minikind)
-            .unwrap_or(0);
+            .map(|t| t.minikind);
         let saved = self.dirblocks[block_index].entries[entry_index].trees[0].clone();
 
         // 3. A directory row that used to be a tree-reference keeps
         //    its 't' minikind even when the filesystem kind is plain
         //    directory (matches Python's special case).
-        if minikind == b'd' && saved.minikind == b't' {
-            minikind = b't';
+        if minikind == Kind::Directory && saved.minikind == Kind::TreeReference {
+            minikind = Kind::TreeReference;
         }
 
         // 4. Cache-hit path: same kind + same stat + same size → return
         //    saved link/sha1 without further I/O.
         if minikind == saved.minikind && packed_stat == saved.packed_stat {
-            if minikind == b'd' {
+            if minikind == Kind::Directory {
                 return Ok(None);
             }
             if saved.size == stat.size {
@@ -3370,19 +3410,19 @@ impl DirState {
         // Tree-references don't get a tree-0 rewrite: the Python
         // implementation's if/elif chain has no arm for b't', so the
         // saved row is left intact and only mark_modified runs.
-        if minikind == b't' {
+        if minikind == Kind::TreeReference {
             self.mark_modified(&[key.clone()], false);
             return Ok(None);
         }
 
         let new_tree0 = match minikind {
-            b'f' => {
+            Kind::File => {
                 let executable = if self.use_filesystem_for_exec {
                     (stat.mode & 0o100) != 0
                 } else {
                     saved.executable
                 };
-                if stat_is_cacheable && entry_len > 1 && tree1_minikind != b'a' {
+                if stat_is_cacheable && entry_len > 1 && tree1_minikind != Some(Kind::Absent) {
                     // SHA1Provider remains a pluggable indirection for
                     // content hashing (content filters).  Callers can
                     // install a provider that reads through their own
@@ -3395,7 +3435,7 @@ impl DirState {
                         .map_err(UpdateEntryError::Io)?;
                     result = Some(sha1.as_bytes().to_vec());
                     TreeData {
-                        minikind: b'f',
+                        minikind: Kind::File,
                         fingerprint: sha1.into_bytes(),
                         size: stat.size,
                         executable,
@@ -3404,7 +3444,7 @@ impl DirState {
                 } else {
                     worth_saving = false;
                     TreeData {
-                        minikind: b'f',
+                        minikind: Kind::File,
                         fingerprint: Vec::new(),
                         size: stat.size,
                         executable,
@@ -3412,22 +3452,22 @@ impl DirState {
                     }
                 }
             }
-            b'd' => {
-                if saved.minikind != b'd' {
+            Kind::Directory => {
+                if saved.minikind != Kind::Directory {
                     became_directory = true;
                 } else {
                     worth_saving = false;
                 }
                 TreeData {
-                    minikind: b'd',
+                    minikind: Kind::Directory,
                     fingerprint: Vec::new(),
                     size: 0,
                     executable: false,
                     packed_stat,
                 }
             }
-            b'l' => {
-                if saved.minikind == b'l' {
+            Kind::Symlink => {
+                if saved.minikind == Kind::Symlink {
                     worth_saving = false;
                 }
                 let target_bytes = transport.read_link(abspath).map_err(|e| match e {
@@ -3442,7 +3482,7 @@ impl DirState {
                 result = Some(target_bytes.clone());
                 if stat_is_cacheable {
                     TreeData {
-                        minikind: b'l',
+                        minikind: Kind::Symlink,
                         fingerprint: target_bytes,
                         size: stat.size,
                         executable: false,
@@ -3450,7 +3490,7 @@ impl DirState {
                     }
                 } else {
                     TreeData {
-                        minikind: b'l',
+                        minikind: Kind::Symlink,
                         fingerprint: Vec::new(),
                         size: stat.size,
                         executable: false,
@@ -3458,9 +3498,9 @@ impl DirState {
                     }
                 }
             }
-            _ => {
-                // Already handled via the fall-through in step 1; any
-                // other minikind here is an internal error.
+            Kind::Absent | Kind::Relocated | Kind::TreeReference => {
+                // TreeReference short-circuited above; Absent/Relocated
+                // never flow through `is_file()/is_dir()/is_symlink()`.
                 return Err(UpdateEntryError::UnexpectedKind(minikind));
             }
         };
@@ -3505,7 +3545,7 @@ impl DirState {
         for block in self.dirblocks.iter_mut() {
             for entry in block.entries.iter_mut() {
                 entry.trees.push(TreeData {
-                    minikind: b'a',
+                    minikind: Kind::Absent,
                     fingerprint: Vec::new(),
                     size: 0,
                     executable: false,
@@ -3628,7 +3668,7 @@ impl DirState {
     /// `reference_revision` bytes.
     pub fn set_state_from_inventory(
         &mut self,
-        new_entries: Vec<(Vec<u8>, Vec<u8>, u8, Vec<u8>, bool)>,
+        new_entries: Vec<(Vec<u8>, Vec<u8>, Kind, Vec<u8>, bool)>,
     ) -> Result<(), BasisApplyError> {
         fn cmp_by_dirs(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
             let mut ai = a.split(|&c| c == b'/');
@@ -3657,7 +3697,7 @@ impl DirState {
         let mut old_iter = old_entries.into_iter();
         let mut new_iter = new_entries.into_iter();
         let mut current_old: Option<Entry> = old_iter.next();
-        let mut current_new: Option<(Vec<u8>, Vec<u8>, u8, Vec<u8>, bool)> = new_iter.next();
+        let mut current_new: Option<(Vec<u8>, Vec<u8>, Kind, Vec<u8>, bool)> = new_iter.next();
 
         while current_new.is_some() || current_old.is_some() {
             // Skip dead old rows: the live tree-0 minikind may differ
@@ -3665,7 +3705,7 @@ impl DirState {
             // this loop could have rewritten it.
             if let Some(ref old) = current_old {
                 let live = self.tree0_minikind(&old.key);
-                if matches!(live, None | Some(b'a') | Some(b'r')) {
+                if matches!(live, None | Some(Kind::Absent) | Some(Kind::Relocated)) {
                     current_old = old_iter.next();
                     continue;
                 }
@@ -3801,15 +3841,18 @@ impl DirState {
         // Step 1: seed with existing tree-0 entries.
         for block in self.dirblocks.iter() {
             for entry in block.entries.iter() {
-                let mk = entry.trees.first().map(|t| t.minikind).unwrap_or(0);
-                if mk == b'a' || mk == b'r' {
+                let mk = match entry.trees.first().map(|t| t.minikind) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                if mk.is_absent_or_relocated() {
                     continue;
                 }
                 let mut row = Vec::with_capacity(1 + parent_count);
                 row.push(entry.trees[0].clone());
                 for _ in 0..parent_count {
                     row.push(TreeData {
-                        minikind: b'a',
+                        minikind: Kind::Absent,
                         fingerprint: Vec::new(),
                         size: 0,
                         executable: false,
@@ -3853,7 +3896,7 @@ impl DirState {
                     }
                     if let Some(row) = by_path.get_mut(&ek) {
                         row[tree_index] = TreeData {
-                            minikind: b'r',
+                            minikind: Kind::Relocated,
                             fingerprint: path_utf8.clone(),
                             size: 0,
                             executable: false,
@@ -3876,7 +3919,7 @@ impl DirState {
                     for lookup_index in 0..tree_index {
                         if entry_keys.is_empty() {
                             new_details.push(TreeData {
-                                minikind: b'a',
+                                minikind: Kind::Absent,
                                 fingerprint: Vec::new(),
                                 size: 0,
                                 executable: false,
@@ -3890,7 +3933,7 @@ impl DirState {
                                 file_id: file_id.clone(),
                             };
                             let look = &by_path[&ak][lookup_index];
-                            if look.minikind == b'r' || look.minikind == b'a' {
+                            if look.minikind == Kind::Relocated || look.minikind == Kind::Absent {
                                 new_details.push(look.clone());
                             } else {
                                 let mut real_path = a_key.0.clone();
@@ -3899,7 +3942,7 @@ impl DirState {
                                 }
                                 real_path.extend_from_slice(&a_key.1);
                                 new_details.push(TreeData {
-                                    minikind: b'r',
+                                    minikind: Kind::Relocated,
                                     fingerprint: real_path,
                                     size: 0,
                                     executable: false,
@@ -3911,7 +3954,7 @@ impl DirState {
                     new_details.push(details);
                     for _ in 0..new_location_suffix_len {
                         new_details.push(TreeData {
-                            minikind: b'a',
+                            minikind: Kind::Absent,
                             fingerprint: Vec::new(),
                             size: 0,
                             executable: false,
@@ -4088,16 +4131,19 @@ impl DirState {
 
         let first_parent_is_ghost = self.ghosts.contains(&self.parents[0]);
 
-        let dead_patterns: &[(u8, u8)] = &[(b'a', b'r'), (b'a', b'a'), (b'r', b'r'), (b'r', b'a')];
-
         for block in self.dirblocks.iter_mut() {
             let mut surviving: Vec<Entry> = Vec::with_capacity(block.entries.len());
             for entry in block.entries.drain(..) {
-                let tree0_kind = entry.trees.first().map(|t| t.minikind).unwrap_or(0);
-                let tree1_kind = entry.trees.get(1).map(|t| t.minikind).unwrap_or(0);
-                let is_dead = dead_patterns
-                    .iter()
-                    .any(|(a, b)| *a == tree0_kind && *b == tree1_kind);
+                let tree0_kind = entry.trees.first().map(|t| t.minikind);
+                let tree1_kind = entry.trees.get(1).map(|t| t.minikind);
+                // `is_dead` when both tree-0 and tree-1 are
+                // absent-or-relocated (the four `(a|r, a|r)` patterns
+                // Python's loop calls dead).
+                let is_dead = matches!(
+                    (tree0_kind, tree1_kind),
+                    (Some(a), Some(b))
+                        if a.is_absent_or_relocated() && b.is_absent_or_relocated()
+                );
                 if is_dead {
                     continue;
                 }
@@ -4108,7 +4154,7 @@ impl DirState {
                     // has exactly two tree slots after the discard.
                     new_entry.trees.truncate(1);
                     new_entry.trees.push(TreeData {
-                        minikind: b'a',
+                        minikind: Kind::Absent,
                         fingerprint: Vec::new(),
                         size: 0,
                         executable: false,
@@ -4170,13 +4216,9 @@ impl DirState {
                 match tree.minikind {
                     // Python's branches treat 'a' as "not present at any
                     // path" and everything else except 'r' as "still at
-                    // the original key". The `elif details[0] == b'r'`
-                    // clause inside the first branch is effectively
-                    // unreachable in Python because the outer
-                    // `if details[0] not in (b'a', b'r')` already excludes
-                    // 'r' — we mirror the intended split here.
-                    b'a' => {}
-                    b'r' => {
+                    // the original key".
+                    Kind::Absent => {}
+                    Kind::Relocated => {
                         // Relocated row: fingerprint holds the target
                         // path, file_id stays the same.
                         let (dirname, basename) = split_path_utf8(&tree.fingerprint);
@@ -4186,7 +4228,7 @@ impl DirState {
                             file_id: key.file_id.clone(),
                         });
                     }
-                    _ => {
+                    Kind::File | Kind::Directory | Kind::Symlink | Kind::TreeReference => {
                         remaining_keys.push(key.clone());
                     }
                 }
@@ -4238,13 +4280,13 @@ impl DirState {
                 .ok_or_else(|| MakeAbsentError::BadRow {
                     key: update_key.clone(),
                 })?;
-            if tree0.minikind == b'a' {
+            if tree0.minikind == Kind::Absent {
                 return Err(MakeAbsentError::BadRow {
                     key: update_key.clone(),
                 });
             }
             *tree0 = TreeData {
-                minikind: b'a',
+                minikind: Kind::Absent,
                 fingerprint: Vec::new(),
                 size: 0,
                 executable: false,
@@ -4359,21 +4401,20 @@ impl DirState {
             if entry_present {
                 // Update the existing entry's tree 1 slot.
                 let entry = &mut self.dirblocks[block_index].entries[entry_index];
-                let basis_kind = entry.trees.get(1).map(|t| t.minikind).unwrap_or(0);
-                match basis_kind {
-                    b'a' => {
+                match entry.trees.get(1).map(|t| t.minikind) {
+                    None | Some(Kind::Absent) => {
                         if entry.trees.len() >= 2 {
                             entry.trees[1] = add.new_details.clone();
                         } else {
                             entry.trees.push(add.new_details.clone());
                         }
                     }
-                    b'r' => {
+                    Some(Kind::Relocated) => {
                         return Err(BasisApplyError::NotImplemented {
                             reason: "basis entry is a relocation".to_string(),
                         });
                     }
-                    _ => {
+                    Some(_) => {
                         return Err(BasisApplyError::Invalid {
                             path: add.new_path.clone(),
                             file_id: add.file_id.clone(),
@@ -4407,8 +4448,11 @@ impl DirState {
                             ),
                         });
                     }
-                    let basis_kind = maybe.trees.get(1).map(|t| t.minikind).unwrap_or(0);
-                    if basis_kind != b'a' && basis_kind != b'r' {
+                    let basis_kind = maybe.trees.get(1).map(|t| t.minikind);
+                    if !matches!(
+                        basis_kind,
+                        None | Some(Kind::Absent) | Some(Kind::Relocated)
+                    ) {
                         return Err(BasisApplyError::Invalid {
                             path: add.new_path.clone(),
                             file_id: add.file_id.clone(),
@@ -4426,7 +4470,7 @@ impl DirState {
                     key: entry_key.clone(),
                     trees: vec![
                         TreeData {
-                            minikind: b'a',
+                            minikind: Kind::Absent,
                             fingerprint: Vec::new(),
                             size: 0,
                             executable: false,
@@ -4447,10 +4491,9 @@ impl DirState {
             let active_kind = self.dirblocks[block_index].entries[entry_index]
                 .trees
                 .first()
-                .map(|t| t.minikind)
-                .unwrap_or(0);
+                .map(|t| t.minikind);
 
-            if active_kind == b'a' {
+            if active_kind == Some(Kind::Absent) {
                 // Look up file_id via id_index; collect candidate
                 // (block, entry) coordinates before mutating, to
                 // keep the borrow checker happy.
@@ -4468,8 +4511,8 @@ impl DirState {
                     if candidate.key.file_id != add.file_id {
                         continue;
                     }
-                    let real_kind = candidate.trees.first().map(|t| t.minikind).unwrap_or(0);
-                    if real_kind == b'a' || real_kind == b'r' {
+                    let real_kind = candidate.trees.first().map(|t| t.minikind);
+                    if matches!(real_kind, None | Some(Kind::Absent) | Some(Kind::Relocated)) {
                         return Err(BasisApplyError::Invalid {
                             path: add.new_path.clone(),
                             file_id: add.file_id.clone(),
@@ -4496,7 +4539,7 @@ impl DirState {
                     {
                         let other = &mut self.dirblocks[other_block].entries[other_entry];
                         let new_tree1 = TreeData {
-                            minikind: b'r',
+                            minikind: Kind::Relocated,
                             fingerprint: add.new_path.clone(),
                             size: 0,
                             executable: false,
@@ -4513,7 +4556,7 @@ impl DirState {
                     {
                         let e = &mut self.dirblocks[block_index].entries[entry_index];
                         e.trees[0] = TreeData {
-                            minikind: b'r',
+                            minikind: Kind::Relocated,
                             fingerprint: active_path,
                             size: 0,
                             executable: false,
@@ -4521,7 +4564,7 @@ impl DirState {
                         };
                     }
                 }
-            } else if active_kind == b'r' {
+            } else if active_kind == Some(Kind::Relocated) {
                 return Err(BasisApplyError::NotImplemented {
                     reason: "active entry is a relocation".to_string(),
                 });
@@ -4529,7 +4572,7 @@ impl DirState {
 
             // If the new entry is a directory, ensure a child dirblock
             // for its path exists.
-            if add.new_details.minikind == b'd' {
+            if add.new_details.minikind == Kind::Directory {
                 // Use the (possibly-shifted) block_index + entry_index
                 // as the parent coordinates for the child dirblock.
                 self.ensure_block(block_index as isize, entry_index as isize, &add.new_path)
@@ -4577,8 +4620,7 @@ impl DirState {
                     reason: "This parent is not present.".to_string(),
                 });
             }
-            let kind = entry.trees.get(tree_index).map(|t| t.minikind).unwrap_or(0);
-            if kind != b'd' {
+            if entry.trees.get(tree_index).map(|t| t.minikind) != Some(Kind::Directory) {
                 return Err(BasisApplyError::Invalid {
                     path: dirname_utf8.clone(),
                     file_id: file_id.clone(),
@@ -4718,8 +4760,8 @@ impl DirState {
                     if candidate.key.dirname == key.dirname
                         && candidate.key.basename == key.basename
                     {
-                        let t0 = candidate.trees.first().map(|t| t.minikind).unwrap_or(0);
-                        if t0 != b'a' && t0 != b'r' {
+                        let t0 = candidate.trees.first().map(|t| t.minikind);
+                        if !matches!(t0, None | Some(Kind::Absent) | Some(Kind::Relocated)) {
                             let mut path = key.dirname.clone();
                             if !path.is_empty() {
                                 path.push(b'/');
@@ -4751,7 +4793,7 @@ impl DirState {
                 let mut trees = vec![tree0_details.clone()];
                 for _ in 0..self.num_present_parents() {
                     trees.push(TreeData {
-                        minikind: b'a',
+                        minikind: Kind::Absent,
                         fingerprint: Vec::new(),
                         size: 0,
                         executable: false,
@@ -4800,7 +4842,7 @@ impl DirState {
                     }
 
                     self.dirblocks[ob_idx].entries[oe_idx].trees[0] = TreeData {
-                        minikind: b'r',
+                        minikind: Kind::Relocated,
                         fingerprint: path_bytes.to_vec(),
                         size: 0,
                         executable: false,
@@ -4810,7 +4852,7 @@ impl DirState {
                     let all_dead = self.dirblocks[ob_idx].entries[oe_idx]
                         .trees
                         .iter()
-                        .all(|t| t.minikind == b'a' || t.minikind == b'r');
+                        .all(|t| t.minikind == Kind::Absent || t.minikind == Kind::Relocated);
                     if all_dead {
                         let removed_key = self.dirblocks[ob_idx].entries[oe_idx].key.clone();
                         self.dirblocks[ob_idx].entries.remove(oe_idx);
@@ -4865,7 +4907,9 @@ impl DirState {
                             .get(lookup_index)
                             .cloned();
                         match source_tree {
-                            Some(ref t) if t.minikind == b'a' || t.minikind == b'r' => {
+                            Some(ref t)
+                                if t.minikind == Kind::Absent || t.minikind == Kind::Relocated =>
+                            {
                                 trees.push(t.clone());
                             }
                             Some(_) => {
@@ -4875,7 +4919,7 @@ impl DirState {
                                 }
                                 ptr.extend_from_slice(&obasename);
                                 trees.push(TreeData {
-                                    minikind: b'r',
+                                    minikind: Kind::Relocated,
                                     fingerprint: ptr,
                                     size: 0,
                                     executable: false,
@@ -4884,7 +4928,7 @@ impl DirState {
                             }
                             None => {
                                 trees.push(TreeData {
-                                    minikind: b'a',
+                                    minikind: Kind::Absent,
                                     fingerprint: Vec::new(),
                                     size: 0,
                                     executable: false,
@@ -4963,7 +5007,7 @@ impl DirState {
                     });
                 }
                 self.dirblocks[ob_idx].entries[oe_idx].trees[0] = TreeData {
-                    minikind: b'r',
+                    minikind: Kind::Relocated,
                     fingerprint: path_bytes.to_vec(),
                     size: 0,
                     executable: false,
@@ -4974,7 +5018,7 @@ impl DirState {
 
         // If the new entry is a directory, ensure a child block
         // exists for its path.
-        if tree0_details.minikind == b'd' {
+        if tree0_details.minikind == Kind::Directory {
             let mut subdir_name = key.dirname.clone();
             if !subdir_name.is_empty() {
                 subdir_name.push(b'/');
@@ -5148,21 +5192,23 @@ impl DirState {
                 continue;
             }
             let entry = &self.dirblocks[cb_idx].entries[ce_idx];
-            let tree0_kind = entry.trees.first().map(|t| t.minikind).unwrap_or(0);
+            let tree0_kind = match entry.trees.first().map(|t| t.minikind) {
+                Some(k) => k,
+                None => continue,
+            };
             match tree0_kind {
-                b'a' => {
+                Kind::Absent => {
                     if cand_dir.as_slice() != dirname || cand_base.as_slice() != basename {
                         rename_from = Some((cand_dir.clone(), cand_base.clone()));
                     }
                     break;
                 }
-                b'r' => {
+                Kind::Relocated => {
                     // The candidate row is a relocation pointer; keep
                     // searching — the real home is elsewhere.
                     continue;
                 }
                 other => {
-                    let kind_char = other as char;
                     let path = if cand_dir.is_empty() {
                         cand_base.clone()
                     } else {
@@ -5173,17 +5219,12 @@ impl DirState {
                     };
                     let path_str = String::from_utf8_lossy(&path);
                     let kind_str = match other {
-                        b'f' => "file",
-                        b'd' => "directory",
-                        b'l' => "symlink",
-                        b't' => "tree-reference",
-                        _ => {
-                            return Err(AddError::Internal {
-                                reason: format!(
-                                    "unexpected minikind {:?} in id_index row",
-                                    kind_char
-                                ),
-                            })
+                        Kind::File => "file",
+                        Kind::Directory => "directory",
+                        Kind::Symlink => "symlink",
+                        Kind::TreeReference => "tree-reference",
+                        Kind::Absent | Kind::Relocated => {
+                            unreachable!("absent/relocated handled above")
                         }
                     };
                     return Err(AddError::DuplicateFileId {
@@ -5204,7 +5245,7 @@ impl DirState {
                 file_id: file_id.to_vec(),
             };
             let reloc_details = TreeData {
-                minikind: b'r',
+                minikind: Kind::Relocated,
                 fingerprint: utf8path.to_vec(),
                 size: 0,
                 executable: false,
@@ -5234,12 +5275,8 @@ impl DirState {
                 && block[entry_index].key.dirname == dirname
                 && block[entry_index].key.basename == basename
             {
-                let t0 = block[entry_index]
-                    .trees
-                    .first()
-                    .map(|t| t.minikind)
-                    .unwrap_or(0);
-                if t0 != b'a' && t0 != b'r' {
+                let t0 = block[entry_index].trees.first().map(|t| t.minikind);
+                if !matches!(t0, None | Some(Kind::Absent) | Some(Kind::Relocated)) {
                     let mut path = dirname.to_vec();
                     if !path.is_empty() {
                         path.push(b'/');
@@ -5277,11 +5314,11 @@ impl DirState {
         // Build the tree-0 details. Python treats directories specially:
         // their fingerprint and size are always empty / zero, even if
         // the caller passes a value.
-        let minikind_byte = match kind {
-            "file" => b'f',
-            "directory" => b'd',
-            "symlink" => b'l',
-            "tree-reference" => b't',
+        let minikind = match kind {
+            "file" => Kind::File,
+            "directory" => Kind::Directory,
+            "symlink" => Kind::Symlink,
+            "tree-reference" => Kind::TreeReference,
             other => {
                 return Err(AddError::UnknownKind {
                     kind: other.to_string(),
@@ -5290,21 +5327,21 @@ impl DirState {
         };
         let tree0 = match kind {
             "directory" => TreeData {
-                minikind: minikind_byte,
+                minikind,
                 fingerprint: Vec::new(),
                 size: 0,
                 executable: false,
                 packed_stat: packed_stat.to_vec(),
             },
             "tree-reference" => TreeData {
-                minikind: minikind_byte,
+                minikind,
                 fingerprint: fingerprint.to_vec(),
                 size: 0,
                 executable: false,
                 packed_stat: packed_stat.to_vec(),
             },
             _ => TreeData {
-                minikind: minikind_byte,
+                minikind,
                 fingerprint: fingerprint.to_vec(),
                 size,
                 executable: false,
@@ -5316,7 +5353,7 @@ impl DirState {
         let num_present = self.num_present_parents();
         let mut parent_info: Vec<TreeData> = (0..num_present)
             .map(|_| TreeData {
-                minikind: b'a',
+                minikind: Kind::Absent,
                 fingerprint: Vec::new(),
                 size: 0,
                 executable: false,
@@ -5337,7 +5374,7 @@ impl DirState {
             };
             if let Some(p0) = parent_info.get_mut(0) {
                 *p0 = TreeData {
-                    minikind: b'r',
+                    minikind: Kind::Relocated,
                     fingerprint: old_path_utf8,
                     size: 0,
                     executable: false,
@@ -5369,8 +5406,8 @@ impl DirState {
             }
         } else {
             let existing = &mut self.dirblocks[block_index].entries[entry_index];
-            let current_t0 = existing.trees.first().map(|t| t.minikind).unwrap_or(0);
-            if current_t0 != b'a' {
+            let current_t0 = existing.trees.first().map(|t| t.minikind);
+            if current_t0 != Some(Kind::Absent) {
                 return Err(AddError::AlreadyAddedAssertion {
                     basename: basename.to_vec(),
                     file_id: file_id.to_vec(),
@@ -5443,7 +5480,7 @@ impl DirState {
             .trees
             .iter()
             .skip(1)
-            .any(|t| t.minikind != b'a' && t.minikind != b'r');
+            .any(|t| t.minikind != Kind::Absent && t.minikind != Kind::Relocated);
         let packed_stat = if parents_keep_entry {
             Vec::new()
         } else {
@@ -5461,7 +5498,7 @@ impl DirState {
             file_id: new_id.to_vec(),
         };
         let tree0 = TreeData {
-            minikind: b'd',
+            minikind: Kind::Directory,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
@@ -5539,8 +5576,8 @@ impl DirState {
             if child_bei.dir_present {
                 let block = &self.dirblocks[child_bei.block_index];
                 for child in &block.entries {
-                    let t0 = child.trees.first().map(|t| t.minikind).unwrap_or(0);
-                    if t0 != b'a' && t0 != b'r' {
+                    let t0 = child.trees.first().map(|t| t.minikind);
+                    if !matches!(t0, None | Some(Kind::Absent) | Some(Kind::Relocated)) {
                         return Err(BasisApplyError::Invalid {
                             path: path.clone(),
                             file_id: file_id.clone(),
@@ -5635,20 +5672,20 @@ impl DirState {
             let mut absent_positions = 0usize;
             for (tree_index, tree_state) in entry.trees.iter().enumerate() {
                 let minikind = tree_state.minikind;
-                if minikind == b'a' || minikind == b'r' {
+                if minikind == Kind::Absent || minikind == Kind::Relocated {
                     absent_positions += 1;
                 }
                 if let Some((previous_path, previous_loc)) =
                     id_path_maps[tree_index].get(file_id.as_slice()).cloned()
                 {
-                    if minikind == b'a' {
+                    if minikind == Kind::Absent {
                         if previous_path.is_some() {
                             return Err(ValidateError(format!(
                                 "file {} absent but previously present",
                                 String::from_utf8_lossy(file_id)
                             )));
                         }
-                    } else if minikind == b'r' {
+                    } else if minikind == Kind::Relocated {
                         let target = tree_state.fingerprint.clone();
                         if previous_path.as_deref() != Some(target.as_slice()) {
                             return Err(ValidateError(format!(
@@ -5668,17 +5705,17 @@ impl DirState {
                     }
                 } else {
                     match minikind {
-                        b'a' => {
+                        Kind::Absent => {
                             id_path_maps[tree_index]
                                 .insert(file_id.to_vec(), (None, this_path.clone()));
                         }
-                        b'r' => {
+                        Kind::Relocated => {
                             id_path_maps[tree_index].insert(
                                 file_id.to_vec(),
                                 (Some(tree_state.fingerprint.clone()), this_path.clone()),
                             );
                         }
-                        _ => {
+                        Kind::File | Kind::Directory | Kind::Symlink | Kind::TreeReference => {
                             id_path_maps[tree_index].insert(
                                 file_id.to_vec(),
                                 (Some(this_path.clone()), this_path.clone()),
@@ -5746,12 +5783,8 @@ impl DirState {
                     this_path, tree_index
                 ))
             })?;
-        let parent_minikind = parent
-            .trees
-            .get(tree_index)
-            .map(|t| t.minikind)
-            .unwrap_or(0);
-        if parent_minikind != b'd' {
+        let parent_minikind = parent.trees.get(tree_index).map(|t| t.minikind);
+        if parent_minikind != Some(Kind::Directory) {
             return Err(ValidateError(format!(
                 "parent entry for {:?} is not a directory",
                 this_path
@@ -5864,7 +5897,7 @@ impl DirState {
         let mut parents_set: BTreeSet<(Vec<u8>, Vec<u8>)> = BTreeSet::new();
         let mut new_ids: Vec<Vec<u8>> = Vec::new();
 
-        let details_to_tree_data = |d: &(u8, Vec<u8>, u64, bool, Vec<u8>)| TreeData {
+        let details_to_tree_data = |d: &(Kind, Vec<u8>, u64, bool, Vec<u8>)| TreeData {
             minikind: d.0,
             fingerprint: d.1.clone(),
             size: d.2,
@@ -5948,7 +5981,7 @@ impl DirState {
                             source_path[op.len() + 1..].to_vec()
                         };
                         let child_tree1 = child.trees.get(1).cloned().unwrap_or(TreeData {
-                            minikind: 0,
+                            minikind: Kind::Absent,
                             fingerprint: Vec::new(),
                             size: 0,
                             executable: false,
@@ -6016,11 +6049,11 @@ impl DirState {
             let (np_bytes, parent_id, minikind, executable, fingerprint): (
                 Option<Vec<u8>>,
                 Option<Vec<u8>>,
-                u8,
+                Kind,
                 bool,
                 Vec<u8>,
             ) = match row.new_path.as_deref() {
-                None => (None, None, b'a', false, Vec::new()),
+                None => (None, None, Kind::Absent, false, Vec::new()),
                 Some(p) => {
                     let entry = row.new_entry.as_ref().ok_or_else(|| {
                         BasisApplyError::NewPathWithoutEntry {
@@ -6031,7 +6064,11 @@ impl DirState {
                     let pid = entry.parent_id().map(|fid| fid.as_bytes().to_vec());
                     let details = inv_entry_to_details(entry);
                     let mk = details.0;
-                    let fp = if mk == b't' { details.1 } else { Vec::new() };
+                    let fp = if mk == Kind::TreeReference {
+                        details.1
+                    } else {
+                        Vec::new()
+                    };
                     let ex = details.3;
                     (Some(p.as_bytes().to_vec()), pid, mk, ex, fp)
                 }
@@ -6052,7 +6089,7 @@ impl DirState {
     pub fn update_by_delta(&mut self, entries: Vec<FlatDeltaEntry>) -> Result<(), BasisApplyError> {
         use std::collections::{BTreeSet, HashMap};
 
-        let mut insertions: HashMap<Vec<u8>, (EntryKey, u8, bool, Vec<u8>, Vec<u8>)> =
+        let mut insertions: HashMap<Vec<u8>, (EntryKey, Kind, bool, Vec<u8>, Vec<u8>)> =
             HashMap::new();
         let mut removals: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut parents_set: BTreeSet<(Vec<u8>, Vec<u8>)> = BTreeSet::new();
@@ -6111,7 +6148,7 @@ impl DirState {
                     let child_dirname = child.key.dirname.clone();
                     let child_basename = child.key.basename.clone();
                     let child_tree0 = child.trees.first();
-                    let child_minikind = child_tree0.map(|t| t.minikind).unwrap_or(0);
+                    let child_minikind = child_tree0.map(|t| t.minikind).unwrap_or(Kind::Absent);
                     let child_fingerprint = child_tree0
                         .map(|t| t.fingerprint.clone())
                         .unwrap_or_default();
@@ -6156,7 +6193,7 @@ impl DirState {
             .map(|(fid, path)| (fid, path))
             .collect();
         self.apply_removals(&removals_vec)?;
-        let insertions_vec: Vec<(EntryKey, u8, bool, Vec<u8>, Vec<u8>)> =
+        let insertions_vec: Vec<(EntryKey, Kind, bool, Vec<u8>, Vec<u8>)> =
             insertions.into_values().collect();
         self.apply_insertions(insertions_vec)?;
         let parents_vec: Vec<(Vec<u8>, Vec<u8>)> = parents_set.into_iter().collect();
@@ -6172,7 +6209,7 @@ impl DirState {
     /// `except NotVersionedError: self._raise_invalid(..., "Missing parent")`.
     pub fn apply_insertions(
         &mut self,
-        adds: Vec<(EntryKey, u8, bool, Vec<u8>, Vec<u8>)>,
+        adds: Vec<(EntryKey, Kind, bool, Vec<u8>, Vec<u8>)>,
     ) -> Result<(), BasisApplyError> {
         let mut sorted = adds;
         sorted.sort_by(|a, b| {
@@ -6235,8 +6272,11 @@ impl DirState {
                     reason: "changed entry considered not present".to_string(),
                 });
             }
-            let tree1_kind = entry.trees.get(1).map(|t| t.minikind).unwrap_or(0);
-            if tree1_kind == b'a' || tree1_kind == b'r' {
+            let tree1_kind = entry.trees.get(1).map(|t| t.minikind);
+            if matches!(
+                tree1_kind,
+                None | Some(Kind::Absent) | Some(Kind::Relocated)
+            ) {
                 return Err(BasisApplyError::Invalid {
                     path: new_path.clone(),
                     file_id: file_id.clone(),
@@ -6289,11 +6329,11 @@ impl DirState {
                     reason: "basis tree does not contain removed entry".to_string(),
                 });
             }
-            let (active_kind, old_kind, entry_file_id) = {
+            let (active_kind, old_kind, entry_file_id): (Option<Kind>, Option<Kind>, Vec<u8>) = {
                 let entry = &self.dirblocks[bei.block_index].entries[bei.entry_index];
                 (
-                    entry.trees.first().map(|t| t.minikind).unwrap_or(0),
-                    entry.trees.get(1).map(|t| t.minikind).unwrap_or(0),
+                    entry.trees.first().map(|t| t.minikind),
+                    entry.trees.get(1).map(|t| t.minikind),
                     entry.key.file_id.clone(),
                 )
             };
@@ -6310,8 +6350,11 @@ impl DirState {
             // needed.
             let mut dir_block_index: Option<usize> = None;
 
-            if active_kind == b'a' || active_kind == b'r' {
-                if active_kind == b'r' {
+            if matches!(
+                active_kind,
+                None | Some(Kind::Absent) | Some(Kind::Relocated)
+            ) {
+                if active_kind == Some(Kind::Relocated) {
                     // Follow the tree-0 relocation pointer and
                     // clear the target's tree-1 slot.
                     let active_path = self.dirblocks[bei.block_index].entries[bei.entry_index]
@@ -6327,21 +6370,21 @@ impl DirState {
                             reason: "Dirstate did not have matching rename entries".to_string(),
                         });
                     }
-                    let (a_t0, a_t1) = {
+                    let (a_t0, a_t1): (Option<Kind>, Option<Kind>) = {
                         let ae = &self.dirblocks[abei.block_index].entries[abei.entry_index];
                         (
-                            ae.trees.first().map(|t| t.minikind).unwrap_or(0),
-                            ae.trees.get(1).map(|t| t.minikind).unwrap_or(0),
+                            ae.trees.first().map(|t| t.minikind),
+                            ae.trees.get(1).map(|t| t.minikind),
                         )
                     };
-                    if a_t1 != b'r' {
+                    if a_t1 != Some(Kind::Relocated) {
                         return Err(BasisApplyError::Invalid {
                             path: old_path.clone(),
                             file_id: file_id.clone(),
                             reason: "Dirstate did not have matching rename entries".to_string(),
                         });
                     }
-                    if a_t0 == b'a' || a_t0 == b'r' {
+                    if !matches!(a_t0, Some(k) if k.is_fdlt()) {
                         return Err(BasisApplyError::Invalid {
                             path: old_path.clone(),
                             file_id: file_id.clone(),
@@ -6351,7 +6394,7 @@ impl DirState {
                     }
                     let ae = &mut self.dirblocks[abei.block_index].entries[abei.entry_index];
                     let null = TreeData {
-                        minikind: b'a',
+                        minikind: Kind::Absent,
                         fingerprint: Vec::new(),
                         size: 0,
                         executable: false,
@@ -6368,7 +6411,7 @@ impl DirState {
                     .entries
                     .remove(bei.entry_index);
 
-                if old_kind == b'd' {
+                if old_kind == Some(Kind::Directory) {
                     let dirblock_key = EntryKey {
                         dirname: old_path.clone(),
                         basename: Vec::new(),
@@ -6387,7 +6430,7 @@ impl DirState {
             } else {
                 let entry = &mut self.dirblocks[bei.block_index].entries[bei.entry_index];
                 let null = TreeData {
-                    minikind: b'a',
+                    minikind: Kind::Absent,
                     fingerprint: Vec::new(),
                     size: 0,
                     executable: false,
@@ -6408,8 +6451,11 @@ impl DirState {
             if let Some(db_index) = dir_block_index {
                 let block = &self.dirblocks[db_index];
                 for child in &block.entries {
-                    let child_tree1 = child.trees.get(1).map(|t| t.minikind).unwrap_or(0);
-                    if child_tree1 != b'a' && child_tree1 != b'r' {
+                    let child_tree1 = child.trees.get(1).map(|t| t.minikind);
+                    if !matches!(
+                        child_tree1,
+                        None | Some(Kind::Absent) | Some(Kind::Relocated)
+                    ) {
                         return Err(BasisApplyError::Invalid {
                             path: old_path.clone(),
                             file_id: file_id.clone(),
@@ -6431,12 +6477,11 @@ impl DirState {
     /// the `fileid_utf8` branch of Python's `DirState._get_entry`.
     ///
     /// If `include_deleted` is true, an entry whose tree data is
-    /// absent (`b'a'`) is returned rather than hidden. Returns
-    /// [`GetEntryResult::NotFound`] if no key for `file_id` exists in
-    /// the id index, [`GetEntryResult::Entry`] with the located entry
-    /// key on success, or [`GetEntryResult::InvalidMinikind`] if a
-    /// tree-data row has a minikind that is neither live nor
-    /// absent/relocated (mirroring the `AssertionError` Python raises).
+    /// absent (`Kind::Absent`) is returned rather than hidden.
+    /// Returns [`GetEntryResult::NotFound`] if no key for `file_id`
+    /// exists in the id index, or [`GetEntryResult::Entry`] with the
+    /// located entry key on success.  Unknown minikinds are impossible
+    /// by construction — [`Kind`] only parses the six valid codes.
     ///
     /// The result is returned as an owned [`EntryKey`] rather than a
     /// borrow because the caller may need to keep `self` borrowable
@@ -6495,28 +6540,22 @@ impl DirState {
                     continue;
                 };
                 match tree.minikind {
-                    b'f' | b'd' | b'l' | b't' => {
+                    k if k.is_fdlt() => {
                         return GetEntryResult::Entry(entry.key.clone());
                     }
-                    b'a' => {
+                    Kind::Absent => {
                         if include_deleted {
                             return GetEntryResult::Entry(entry.key.clone());
                         }
                         return GetEntryResult::NotFound;
                     }
-                    b'r' => {
+                    Kind::Relocated => {
                         // Follow the relocation by recursing via the
                         // `real_path` fingerprint.
                         relocation_target = Some(tree.fingerprint.clone());
                         break;
                     }
-                    other => {
-                        return GetEntryResult::InvalidMinikind {
-                            key: entry.key.clone(),
-                            tree_index,
-                            minikind: other,
-                        };
-                    }
+                    _ => unreachable!(),
                 }
             }
             match relocation_target {
@@ -6564,7 +6603,7 @@ impl DirState {
         let present_in_row = entry
             .trees
             .iter()
-            .any(|t| t.minikind != b'a' && t.minikind != b'r');
+            .any(|t| t.minikind != Kind::Absent && t.minikind != Kind::Relocated);
         if present_in_row {
             return false;
         }
@@ -6704,11 +6743,11 @@ impl DirState {
                         .trees
                         .get(tree_index)
                         .map(|t| t.minikind)
-                        .unwrap_or(b'a');
-                    if kind != b'a' && kind != b'r' {
+                        .unwrap_or(Kind::Absent);
+                    if !kind.is_absent_or_relocated() {
                         out.push(entry.clone());
                     }
-                    if kind == b'd' {
+                    if kind == Kind::Directory {
                         // Build `dirname/basename` for the recursion.
                         let next_path = if entry.key.dirname.is_empty() {
                             entry.key.basename.clone()
@@ -6826,7 +6865,7 @@ impl DirState {
                     let mut is_dir = false;
                     for tree_info in &entry.trees {
                         match tree_info.minikind {
-                            b'd' => {
+                            Kind::Directory => {
                                 if is_dir {
                                     continue;
                                 }
@@ -6840,7 +6879,7 @@ impl DirState {
                                     pending_dirs.push(path);
                                 }
                             }
-                            b'r' => {
+                            Kind::Relocated => {
                                 let (dn, _bn) = split_path_utf8(&tree_info.fingerprint);
                                 if pending_dirs.iter().any(|p| p == dn) {
                                     continue;
@@ -6852,7 +6891,7 @@ impl DirState {
                                     let _ = dn_vec; // silence warning
                                 }
                             }
-                            _ => {}
+                            Kind::Absent | Kind::File | Kind::Symlink | Kind::TreeReference => {}
                         }
                     }
                 }
@@ -6913,6 +6952,8 @@ pub enum BisectError {
     TooManySeeks,
     /// An entry row's size field could not be parsed as an integer.
     BadSize(String),
+    /// An entry row's minikind field wasn't one of the six valid codes.
+    BadMinikind(u8),
 }
 
 impl std::fmt::Display for BisectError {
@@ -6921,6 +6962,7 @@ impl std::fmt::Display for BisectError {
             BisectError::ReadError(s) => write!(f, "read error: {}", s),
             BisectError::TooManySeeks => write!(f, "too many seeks"),
             BisectError::BadSize(s) => write!(f, "bad size field: {}", s),
+            BisectError::BadMinikind(b) => write!(f, "invalid minikind byte {:?}", b),
         }
     }
 }
@@ -7146,7 +7188,8 @@ fn fields_to_entry(fields: &[Vec<u8>], num_present_parents: usize) -> Result<Ent
     let mut trees = Vec::with_capacity(tree_count);
     for t in 0..tree_count {
         let base = 3 + 5 * t;
-        let minikind = fields[base].first().copied().unwrap_or(0);
+        let minikind_byte = fields[base].first().copied().unwrap_or(0);
+        let minikind = Kind::from_minikind(minikind_byte).map_err(BisectError::BadMinikind)?;
         let fingerprint = fields[base + 1].clone();
         let size_str = std::str::from_utf8(&fields[base + 2])
             .map_err(|e| BisectError::BadSize(e.to_string()))?;
@@ -7379,7 +7422,7 @@ pub struct FlatDeltaEntry {
     pub new_path: Option<Vec<u8>>,
     pub file_id: Vec<u8>,
     pub parent_id: Option<Vec<u8>>,
-    pub minikind: u8,
+    pub minikind: Kind,
     pub executable: bool,
     pub fingerprint: Vec<u8>,
 }
@@ -7395,7 +7438,7 @@ pub struct FlatBasisDeltaEntry {
     pub new_path: Option<Vec<u8>>,
     pub file_id: Vec<u8>,
     pub parent_id: Option<Vec<u8>>,
-    pub details: Option<(u8, Vec<u8>, u64, bool, Vec<u8>)>,
+    pub details: Option<(Kind, Vec<u8>, u64, bool, Vec<u8>)>,
 }
 
 /// Error returned by [`DirState::validate`]. A single descriptive
@@ -7540,7 +7583,7 @@ pub enum UpdateEntryError {
     /// No dirstate entry matches the given key.
     EntryNotFound,
     /// The key's entry has a minikind we do not know how to refresh.
-    UnexpectedKind(u8),
+    UnexpectedKind(Kind),
     /// Filesystem I/O error while reading the file contents for a
     /// sha1, reading a symlink target, or similar.
     Io(std::io::Error),
@@ -7807,15 +7850,6 @@ pub enum GetEntryResult {
     /// [`DirState::find_block_index_from_key`] +
     /// [`DirState::find_entry_index`] if the caller needs the trees.
     Entry(EntryKey),
-    /// An entry's tree data had a minikind that is neither live
-    /// (`b'f'`/`b'd'`/`b'l'`/`b't'`) nor absent/relocated
-    /// (`b'a'`/`b'r'`). Mirrors Python's `AssertionError` for the
-    /// "invalid minikind" case.
-    InvalidMinikind {
-        key: EntryKey,
-        tree_index: usize,
-        minikind: u8,
-    },
 }
 
 /// Result of [`get_block_entry_index`]: the four-tuple Python returns,
@@ -7871,7 +7905,7 @@ pub fn get_block_entry_index(
         && block[entry_index].key.basename == key.basename
     {
         if let Some(tree) = block[entry_index].trees.get(tree_index) {
-            if tree.minikind != b'a' && tree.minikind != b'r' {
+            if tree.minikind != Kind::Absent && tree.minikind != Kind::Relocated {
                 return BlockEntryIndex {
                     block_index,
                     entry_index,
@@ -8134,7 +8168,7 @@ mod dirstate_struct_tests {
         assert_eq!(entry.key.file_id, b"TREE_ROOT".to_vec());
         assert_eq!(entry.trees.len(), 1);
         let tree = &entry.trees[0];
-        assert_eq!(tree.minikind, b'd');
+        assert_eq!(tree.minikind, Kind::Directory);
         assert_eq!(tree.fingerprint, Vec::<u8>::new());
         assert_eq!(tree.size, 0);
         assert!(!tree.executable);
@@ -8253,7 +8287,7 @@ mod dirstate_struct_tests {
         assert_eq!(blocks[0].entries.len(), 1);
         let entry = &blocks[0].entries[0];
         assert_eq!(entry.key.file_id, b"TREE_ROOT".to_vec());
-        assert_eq!(entry.trees[0].minikind, b'd');
+        assert_eq!(entry.trees[0].minikind, Kind::Directory);
         assert_eq!(entry.trees[0].packed_stat, b"x".repeat(32));
     }
 
@@ -8265,7 +8299,7 @@ mod dirstate_struct_tests {
                 file_id: file_id.to_vec(),
             },
             trees: vec![TreeData {
-                minikind: b'f',
+                minikind: Kind::File,
                 fingerprint: Vec::new(),
                 size: 0,
                 executable: false,
@@ -8408,7 +8442,7 @@ mod dirstate_struct_tests {
         blocks
     }
 
-    fn tree(minikind: u8) -> TreeData {
+    fn tree(minikind: Kind) -> TreeData {
         TreeData {
             minikind,
             fingerprint: Vec::new(),
@@ -8547,9 +8581,9 @@ mod dirstate_struct_tests {
     #[test]
     fn find_entry_index_exact_and_insertion() {
         let block = vec![
-            entry_with_trees(b"dir", b"a", b"fid-a", vec![tree(b'f')]),
-            entry_with_trees(b"dir", b"b", b"fid-b", vec![tree(b'f')]),
-            entry_with_trees(b"dir", b"c", b"fid-c", vec![tree(b'f')]),
+            entry_with_trees(b"dir", b"a", b"fid-a", vec![tree(Kind::File)]),
+            entry_with_trees(b"dir", b"b", b"fid-b", vec![tree(Kind::File)]),
+            entry_with_trees(b"dir", b"c", b"fid-c", vec![tree(Kind::File)]),
         ];
         let hit = EntryKey {
             dirname: b"dir".to_vec(),
@@ -8575,7 +8609,12 @@ mod dirstate_struct_tests {
     fn get_block_entry_index_finds_live_entry() {
         let blocks = make_dirblocks(vec![(
             b"dir",
-            vec![entry_with_trees(b"dir", b"a", b"fid-a", vec![tree(b'f')])],
+            vec![entry_with_trees(
+                b"dir",
+                b"a",
+                b"fid-a",
+                vec![tree(Kind::File)],
+            )],
         )]);
         let bei = get_block_entry_index(&blocks, b"dir", b"a", 0);
         assert_eq!(bei.block_index, 2);
@@ -8600,8 +8639,8 @@ mod dirstate_struct_tests {
         let blocks = make_dirblocks(vec![(
             b"dir",
             vec![
-                entry_with_trees(b"dir", b"a", b"fid-absent", vec![tree(b'a')]),
-                entry_with_trees(b"dir", b"a", b"fid-live", vec![tree(b'f')]),
+                entry_with_trees(b"dir", b"a", b"fid-absent", vec![tree(Kind::Absent)]),
+                entry_with_trees(b"dir", b"a", b"fid-live", vec![tree(Kind::File)]),
             ],
         )]);
         let bei = get_block_entry_index(&blocks, b"dir", b"a", 0);
@@ -8618,8 +8657,8 @@ mod dirstate_struct_tests {
         let blocks = make_dirblocks(vec![(
             b"dir",
             vec![
-                entry_with_trees(b"dir", b"a", b"fid-1", vec![tree(b'a')]),
-                entry_with_trees(b"dir", b"a", b"fid-2", vec![tree(b'r')]),
+                entry_with_trees(b"dir", b"a", b"fid-1", vec![tree(Kind::Absent)]),
+                entry_with_trees(b"dir", b"a", b"fid-2", vec![tree(Kind::Relocated)]),
             ],
         )]);
         let bei = get_block_entry_index(&blocks, b"dir", b"a", 0);
@@ -8633,7 +8672,7 @@ mod dirstate_struct_tests {
     /// Null-sha matching Python's test fixtures.
     const NULL_SHA: &[u8] = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 
-    fn stat_tree(minikind: u8) -> TreeData {
+    fn stat_tree(minikind: Kind) -> TreeData {
         TreeData {
             minikind,
             fingerprint: Vec::new(),
@@ -8645,7 +8684,7 @@ mod dirstate_struct_tests {
 
     fn file_tree(size: u64) -> TreeData {
         TreeData {
-            minikind: b'f',
+            minikind: Kind::File,
             fingerprint: NULL_SHA.to_vec(),
             size,
             executable: false,
@@ -8665,7 +8704,7 @@ mod dirstate_struct_tests {
                     b"",
                     b"",
                     b"a-root-value",
-                    vec![stat_tree(b'd')],
+                    vec![stat_tree(Kind::Directory)],
                 )],
             },
             Dirblock {
@@ -8674,7 +8713,7 @@ mod dirstate_struct_tests {
                     b"",
                     b"subdir",
                     b"subdir-id",
-                    vec![stat_tree(b'd')],
+                    vec![stat_tree(Kind::Directory)],
                 )],
             },
         ];
@@ -8694,15 +8733,15 @@ mod dirstate_struct_tests {
                     b"",
                     b"",
                     b"a-root-value",
-                    vec![stat_tree(b'd')],
+                    vec![stat_tree(Kind::Directory)],
                 )],
             },
             // Block 1: contents of root — a, b (both dirs), c, d (files).
             Dirblock {
                 dirname: Vec::new(),
                 entries: vec![
-                    entry_with_trees(b"", b"a", b"a-dir", vec![stat_tree(b'd')]),
-                    entry_with_trees(b"", b"b", b"b-dir", vec![stat_tree(b'd')]),
+                    entry_with_trees(b"", b"a", b"a-dir", vec![stat_tree(Kind::Directory)]),
+                    entry_with_trees(b"", b"b", b"b-dir", vec![stat_tree(Kind::Directory)]),
                     entry_with_trees(b"", b"c", b"c-file", vec![file_tree(10)]),
                     entry_with_trees(b"", b"d", b"d-file", vec![file_tree(20)]),
                 ],
@@ -8711,7 +8750,7 @@ mod dirstate_struct_tests {
             Dirblock {
                 dirname: b"a".to_vec(),
                 entries: vec![
-                    entry_with_trees(b"a", b"e", b"e-dir", vec![stat_tree(b'd')]),
+                    entry_with_trees(b"a", b"e", b"e-dir", vec![stat_tree(Kind::Directory)]),
                     entry_with_trees(b"a", b"f", b"f-file", vec![file_tree(30)]),
                 ],
             },
@@ -8738,42 +8777,42 @@ mod dirstate_struct_tests {
         let mut state = fresh_state();
         state.parents = vec![b"parent".to_vec()];
         let stat_current = TreeData {
-            minikind: b'd',
+            minikind: Kind::Directory,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
             packed_stat: PACKED_STAT.to_vec(),
         };
         let stat_parent_dir = TreeData {
-            minikind: b'd',
+            minikind: Kind::Directory,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
             packed_stat: b"parent-revid".to_vec(),
         };
         let null_parent = TreeData {
-            minikind: b'a',
+            minikind: Kind::Absent,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
             packed_stat: Vec::new(),
         };
         let file_cur = |size: u64| TreeData {
-            minikind: b'f',
+            minikind: Kind::File,
             fingerprint: NULL_SHA.to_vec(),
             size,
             executable: false,
             packed_stat: PACKED_STAT.to_vec(),
         };
         let file_parent = |fingerprint: &[u8], size: u64| TreeData {
-            minikind: b'f',
+            minikind: Kind::File,
             fingerprint: fingerprint.to_vec(),
             size,
             executable: false,
             packed_stat: b"parent-revid".to_vec(),
         };
         let relocated = |to: &[u8]| TreeData {
-            minikind: b'r',
+            minikind: Kind::Relocated,
             fingerprint: to.to_vec(),
             size: 0,
             executable: false,
@@ -8957,8 +8996,18 @@ mod dirstate_struct_tests {
     #[test]
     fn maybe_remove_row_keeps_row_with_any_live_tree() {
         let mut entries = vec![
-            entry_with_trees(b"", b"a", b"fid-a", vec![tree(b'f'), tree(b'a')]),
-            entry_with_trees(b"", b"b", b"fid-b", vec![tree(b'a'), tree(b'a')]),
+            entry_with_trees(
+                b"",
+                b"a",
+                b"fid-a",
+                vec![tree(Kind::File), tree(Kind::Absent)],
+            ),
+            entry_with_trees(
+                b"",
+                b"b",
+                b"fid-b",
+                vec![tree(Kind::Absent), tree(Kind::Absent)],
+            ),
         ];
         let mut id_index = IdIndex::new();
         let fid_a = FileId::from(&b"fid-a".to_vec());
@@ -8973,8 +9022,13 @@ mod dirstate_struct_tests {
     #[test]
     fn maybe_remove_row_drops_row_when_all_trees_dead() {
         let mut entries = vec![
-            entry_with_trees(b"", b"a", b"fid-a", vec![tree(b'f')]),
-            entry_with_trees(b"", b"b", b"fid-b", vec![tree(b'a'), tree(b'r')]),
+            entry_with_trees(b"", b"a", b"fid-a", vec![tree(Kind::File)]),
+            entry_with_trees(
+                b"",
+                b"b",
+                b"fid-b",
+                vec![tree(Kind::Absent), tree(Kind::Relocated)],
+            ),
         ];
         let mut id_index = IdIndex::new();
         let fid_a = FileId::from(&b"fid-a".to_vec());
@@ -9284,7 +9338,7 @@ mod dirstate_struct_tests {
     /// Python-style `present_dir` tuple: `(b"d", b"", 0, False, NULLSTAT)`.
     fn dmp_present_dir() -> TreeData {
         TreeData {
-            minikind: b'd',
+            minikind: Kind::Directory,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
@@ -9295,7 +9349,7 @@ mod dirstate_struct_tests {
     /// Python-style `present_file` tuple: `(b"f", b"", 0, False, NULLSTAT)`.
     fn dmp_present_file() -> TreeData {
         TreeData {
-            minikind: b'f',
+            minikind: Kind::File,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
@@ -9306,7 +9360,7 @@ mod dirstate_struct_tests {
     /// Python-style `NULL_PARENT_DETAILS`: `(b"a", b"", 0, False, b"")`.
     fn dmp_absent() -> TreeData {
         TreeData {
-            minikind: b'a',
+            minikind: Kind::Absent,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
@@ -9318,7 +9372,7 @@ mod dirstate_struct_tests {
     /// `(b"r", real_path, 0, False, b"")`.
     fn dmp_relocated(real_path: &[u8]) -> TreeData {
         TreeData {
-            minikind: b'r',
+            minikind: Kind::Relocated,
             fingerprint: real_path.to_vec(),
             size: 0,
             executable: false,
@@ -9646,8 +9700,8 @@ mod dirstate_struct_tests {
         assert!(state.ghosts.is_empty());
         let root = &state.dirblocks[0].entries[0];
         assert_eq!(root.trees.len(), 2);
-        assert_eq!(root.trees[0].minikind, b'd');
-        assert_eq!(root.trees[1].minikind, b'a');
+        assert_eq!(root.trees[0].minikind, Kind::Directory);
+        assert_eq!(root.trees[1].minikind, Kind::Absent);
         assert!(root.trees[1].fingerprint.is_empty());
         assert!(root.trees[1].packed_stat.is_empty());
     }
@@ -9655,7 +9709,7 @@ mod dirstate_struct_tests {
     /// A tree-row builder that lets tests set a non-default fingerprint
     /// on a single row — needed to exercise the relocation branch of
     /// `make_absent`, which uses the fingerprint as the target path.
-    fn tree_with_fingerprint(minikind: u8, fingerprint: &[u8]) -> TreeData {
+    fn tree_with_fingerprint(minikind: Kind, fingerprint: &[u8]) -> TreeData {
         TreeData {
             minikind,
             fingerprint: fingerprint.to_vec(),
@@ -9698,7 +9752,7 @@ mod dirstate_struct_tests {
             b"dir",
             b"a",
             b"fid-a",
-            vec![tree(b'f')],
+            vec![tree(Kind::File)],
         )]);
         // Prime the id_index cache.
         let fid = FileId::from(&b"fid-a".to_vec());
@@ -9727,7 +9781,7 @@ mod dirstate_struct_tests {
             b"dir",
             b"a",
             b"fid-a",
-            vec![tree(b'f'), tree(b'd')],
+            vec![tree(Kind::File), tree(Kind::Directory)],
         )]);
 
         let last_reference = state
@@ -9740,10 +9794,10 @@ mod dirstate_struct_tests {
         assert!(!last_reference);
         assert_eq!(state.dirblocks[2].entries.len(), 1);
         let entry = &state.dirblocks[2].entries[0];
-        assert_eq!(entry.trees[0].minikind, b'a');
+        assert_eq!(entry.trees[0].minikind, Kind::Absent);
         assert!(entry.trees[0].fingerprint.is_empty());
         assert!(entry.trees[0].packed_stat.is_empty());
-        assert_eq!(entry.trees[1].minikind, b'd');
+        assert_eq!(entry.trees[1].minikind, Kind::Directory);
     }
 
     /// A relocated parent row promotes the relocation target to a
@@ -9760,9 +9814,17 @@ mod dirstate_struct_tests {
                 b"dir",
                 b"a",
                 b"fid-a",
-                vec![tree(b'f'), tree_with_fingerprint(b'r', b"dir/b")],
+                vec![
+                    tree(Kind::File),
+                    tree_with_fingerprint(Kind::Relocated, b"dir/b"),
+                ],
             ),
-            entry_with_trees(b"dir", b"b", b"fid-a", vec![tree(b'f'), tree(b'f')]),
+            entry_with_trees(
+                b"dir",
+                b"b",
+                b"fid-a",
+                vec![tree(Kind::File), tree(Kind::File)],
+            ),
         ]);
         // Prime the id_index; make_absent should remove dir/a from it.
         let fid = FileId::from(&b"fid-a".to_vec());
@@ -9782,8 +9844,8 @@ mod dirstate_struct_tests {
         assert_eq!(state.dirblocks[2].entries[0].key.basename, b"b".to_vec());
         // dir/b's tree 0 flipped to absent; tree 1 stayed intact.
         let survivor = &state.dirblocks[2].entries[0];
-        assert_eq!(survivor.trees[0].minikind, b'a');
-        assert_eq!(survivor.trees[1].minikind, b'f');
+        assert_eq!(survivor.trees[0].minikind, Kind::Absent);
+        assert_eq!(survivor.trees[1].minikind, Kind::File);
         assert_eq!(state.id_index.as_ref().unwrap().get(&fid).len(), 1);
     }
 
@@ -9796,7 +9858,7 @@ mod dirstate_struct_tests {
             b"dir",
             b"a",
             b"fid-a",
-            vec![tree(b'f'), tree(b'a')],
+            vec![tree(Kind::File), tree(Kind::Absent)],
         )]);
         let last_reference = state
             .make_absent(&EntryKey {
@@ -9816,22 +9878,22 @@ mod dirstate_struct_tests {
         // packed_stat and valued by their fingerprint (sha1).
         let mut state = fresh_state();
         let f1 = TreeData {
-            minikind: b'f',
+            minikind: Kind::File,
             fingerprint: b"sha-f1".to_vec(),
             size: 10,
             executable: false,
             packed_stat: b"stat-f1".to_vec(),
         };
         let f2 = TreeData {
-            minikind: b'f',
+            minikind: Kind::File,
             fingerprint: b"sha-f2".to_vec(),
             size: 20,
             executable: true,
             packed_stat: b"stat-f2".to_vec(),
         };
-        let dir = tree(b'd');
+        let dir = tree(Kind::Directory);
         let symlink = TreeData {
-            minikind: b'l',
+            minikind: Kind::Symlink,
             fingerprint: b"target".to_vec(),
             size: 0,
             executable: false,
@@ -9848,7 +9910,7 @@ mod dirstate_struct_tests {
                     entry_with_trees(b"", b"a", b"fid-a", vec![f1.clone()]),
                     entry_with_trees(b"", b"b", b"fid-b", vec![f2.clone()]),
                     entry_with_trees(b"", b"c", b"fid-c", vec![symlink]),
-                    entry_with_trees(b"", b"d", b"fid-d", vec![tree(b'a')]),
+                    entry_with_trees(b"", b"d", b"fid-d", vec![tree(Kind::Absent)]),
                 ],
             },
         ];
@@ -9864,7 +9926,12 @@ mod dirstate_struct_tests {
         state.dirblocks = vec![
             Dirblock {
                 dirname: Vec::new(),
-                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(Kind::Directory)],
+                )],
             },
             Dirblock {
                 dirname: Vec::new(),
@@ -9873,7 +9940,7 @@ mod dirstate_struct_tests {
                     b"a",
                     b"fid-a",
                     vec![TreeData {
-                        minikind: b'f',
+                        minikind: Kind::File,
                         fingerprint: b"sha-a".to_vec(),
                         size: 1,
                         executable: false,
@@ -9917,7 +9984,7 @@ mod dirstate_struct_tests {
             b"dir",
             b"a",
             b"fid-a",
-            vec![tree(b'f')],
+            vec![tree(Kind::File)],
         )]);
         let err = state
             .make_absent(&EntryKey {
@@ -9944,7 +10011,7 @@ mod dirstate_struct_tests {
                         file_id: b"TREE_ROOT".to_vec(),
                     },
                     trees: vec![TreeData {
-                        minikind: b'd',
+                        minikind: Kind::Directory,
                         fingerprint: Vec::new(),
                         size: 0,
                         executable: false,
@@ -9972,7 +10039,7 @@ mod dirstate_struct_tests {
         let entry = &state.dirblocks[1].entries[0];
         assert_eq!(entry.key.basename, b"a");
         assert_eq!(entry.key.file_id, b"fid-a");
-        assert_eq!(entry.trees[0].minikind, b'f');
+        assert_eq!(entry.trees[0].minikind, Kind::File);
         assert_eq!(entry.trees[0].size, 7);
         assert_eq!(entry.trees[0].fingerprint, b"sha1");
     }
@@ -10076,7 +10143,7 @@ mod dirstate_struct_tests {
         assert_eq!(state.dirblocks[0].entries.len(), 1);
         let new_root = &state.dirblocks[0].entries[0];
         assert_eq!(new_root.key.file_id, b"new-id");
-        assert_eq!(new_root.trees[0].minikind, b'd');
+        assert_eq!(new_root.trees[0].minikind, Kind::Directory);
         assert_eq!(new_root.trees[0].packed_stat, original_packed_stat);
     }
 
@@ -10092,9 +10159,21 @@ mod dirstate_struct_tests {
             .add(b"b", b"", b"b", b"b-id", "file", 0, &stat, b"")
             .expect("add");
 
-        let inv_after_rename: Vec<(Vec<u8>, Vec<u8>, u8, Vec<u8>, bool)> = vec![
-            (Vec::new(), b"TREE_ROOT".to_vec(), b'd', Vec::new(), false),
-            (b"a".to_vec(), b"b-id".to_vec(), b'f', Vec::new(), false),
+        let inv_after_rename: Vec<(Vec<u8>, Vec<u8>, Kind, Vec<u8>, bool)> = vec![
+            (
+                Vec::new(),
+                b"TREE_ROOT".to_vec(),
+                Kind::Directory,
+                Vec::new(),
+                false,
+            ),
+            (
+                b"a".to_vec(),
+                b"b-id".to_vec(),
+                Kind::File,
+                Vec::new(),
+                false,
+            ),
         ];
         state
             .set_state_from_inventory(inv_after_rename)
@@ -10105,22 +10184,28 @@ mod dirstate_struct_tests {
         let mut live_entries = Vec::new();
         for block in &state.dirblocks {
             for entry in &block.entries {
-                let t0 = entry.trees.first().map(|t| t.minikind).unwrap_or(0);
-                if t0 != b'a' && t0 != b'r' {
-                    live_entries.push((
-                        entry.key.dirname.clone(),
-                        entry.key.basename.clone(),
-                        entry.key.file_id.clone(),
-                        t0,
-                    ));
-                }
+                let t0 = match entry.trees.first().map(|t| t.minikind) {
+                    Some(k) if !k.is_absent_or_relocated() => k,
+                    _ => continue,
+                };
+                live_entries.push((
+                    entry.key.dirname.clone(),
+                    entry.key.basename.clone(),
+                    entry.key.file_id.clone(),
+                    t0,
+                ));
             }
         }
         assert_eq!(
             live_entries,
             vec![
-                (Vec::new(), Vec::new(), b"TREE_ROOT".to_vec(), b'd'),
-                (Vec::new(), b"a".to_vec(), b"b-id".to_vec(), b'f'),
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    b"TREE_ROOT".to_vec(),
+                    Kind::Directory
+                ),
+                (Vec::new(), b"a".to_vec(), b"b-id".to_vec(), Kind::File),
             ]
         );
     }
@@ -10333,7 +10418,7 @@ mod dirstate_struct_tests {
         // in "initial add" mode and we skip the sha computation.
         state.parents = vec![b"parent-rev".to_vec()];
         state.dirblocks[0].entries[0].trees.push(TreeData {
-            minikind: b'd',
+            minikind: Kind::Directory,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
@@ -10347,7 +10432,7 @@ mod dirstate_struct_tests {
         // live so update_entry writes the sha.
         let bei = state.get_block_entry_index(b"", b"a-file", 0);
         state.dirblocks[bei.block_index].entries[bei.entry_index].trees[1] = TreeData {
-            minikind: b'f',
+            minikind: Kind::File,
             fingerprint: b"parent-sha".to_vec(),
             size: 0,
             executable: false,
@@ -10484,14 +10569,14 @@ mod dirstate_struct_tests {
         // One non-ghost parent tree that contains the same entries but with
         // different details (simulating a committed revision).
         let details_root = TreeData {
-            minikind: b'd',
+            minikind: Kind::Directory,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
             packed_stat: b"rev1".to_vec(),
         };
         let details_file = TreeData {
-            minikind: b'f',
+            minikind: Kind::File,
             fingerprint: b"sha1-parent".to_vec(),
             size: 42,
             executable: false,
@@ -10567,14 +10652,14 @@ mod dirstate_struct_tests {
             .expect("add");
 
         let root_details = TreeData {
-            minikind: b'd',
+            minikind: Kind::Directory,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
             packed_stat: b"rev".to_vec(),
         };
         let file_details = TreeData {
-            minikind: b'f',
+            minikind: Kind::File,
             fingerprint: b"old-sha".to_vec(),
             size: 7,
             executable: false,
@@ -10594,7 +10679,7 @@ mod dirstate_struct_tests {
         let bei = get_block_entry_index(&state.dirblocks, b"", b"new-path", 0);
         assert!(bei.path_present);
         let new_entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
-        assert_eq!(new_entry.trees[1].minikind, b'r');
+        assert_eq!(new_entry.trees[1].minikind, Kind::Relocated);
         assert_eq!(new_entry.trees[1].fingerprint, b"old-path");
 
         // old-path exists as a row with tree-0 = relocation to new-path
@@ -10602,7 +10687,7 @@ mod dirstate_struct_tests {
         let bei = get_block_entry_index(&state.dirblocks, b"", b"old-path", 1);
         assert!(bei.path_present);
         let old_entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
-        assert_eq!(old_entry.trees[0].minikind, b'r');
+        assert_eq!(old_entry.trees[0].minikind, Kind::Relocated);
         assert_eq!(old_entry.trees[0].fingerprint, b"new-path");
         assert_eq!(old_entry.trees[1], file_details);
     }
@@ -10613,7 +10698,7 @@ mod dirstate_struct_tests {
         // Add a parent tree that still references the root row.
         state.parents = vec![b"parent-rev".to_vec()];
         state.dirblocks[0].entries[0].trees.push(TreeData {
-            minikind: b'd',
+            minikind: Kind::Directory,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
@@ -10635,7 +10720,7 @@ mod dirstate_struct_tests {
     /// `(minikind, fingerprint, size, executable, packed_stat)`
     /// tuple — more convenient than the raw `tree()` helper when a
     /// test needs to set specific size/fingerprint fields.
-    fn basis_details(minikind: u8, fingerprint: &[u8], size: u64, executable: bool) -> TreeData {
+    fn basis_details(minikind: Kind, fingerprint: &[u8], size: u64, executable: bool) -> TreeData {
         TreeData {
             minikind,
             fingerprint: fingerprint.to_vec(),
@@ -10647,7 +10732,7 @@ mod dirstate_struct_tests {
 
     fn null_parent_details() -> TreeData {
         TreeData {
-            minikind: b'a',
+            minikind: Kind::Absent,
             fingerprint: Vec::new(),
             size: 0,
             executable: false,
@@ -10662,7 +10747,7 @@ mod dirstate_struct_tests {
     fn basis_adds_fixture_one_file() -> DirState {
         let mut state = fresh_state();
         state.parents = vec![b"parent-id".to_vec()];
-        let tree0 = basis_details(b'f', b"sha-r", 10, false);
+        let tree0 = basis_details(Kind::File, b"sha-r", 10, false);
         let tree1 = null_parent_details();
         state.dirblocks = vec![
             Dirblock {
@@ -10671,7 +10756,7 @@ mod dirstate_struct_tests {
                     b"",
                     b"",
                     b"TREE_ROOT",
-                    vec![tree(b'd'), tree(b'd')],
+                    vec![tree(Kind::Directory), tree(Kind::Directory)],
                 )],
             },
             Dirblock {
@@ -10698,7 +10783,7 @@ mod dirstate_struct_tests {
             old_path: None,
             new_path: b"a.txt".to_vec(),
             file_id: b"fid-a".to_vec(),
-            new_details: basis_details(b'f', b"sha-a", 7, false),
+            new_details: basis_details(Kind::File, b"sha-a", 7, false),
             real_add: true,
         }];
         state.update_basis_apply_adds(&mut adds).expect("apply");
@@ -10707,8 +10792,8 @@ mod dirstate_struct_tests {
         assert_eq!(block.entries.len(), 2);
         assert_eq!(block.entries[0].key.basename, b"README".to_vec());
         assert_eq!(block.entries[1].key.basename, b"a.txt".to_vec());
-        assert_eq!(block.entries[1].trees[0].minikind, b'a');
-        assert_eq!(block.entries[1].trees[1].minikind, b'f');
+        assert_eq!(block.entries[1].trees[0].minikind, Kind::Absent);
+        assert_eq!(block.entries[1].trees[1].minikind, Kind::File);
         assert_eq!(block.entries[1].trees[1].fingerprint, b"sha-a".to_vec());
     }
 
@@ -10721,7 +10806,7 @@ mod dirstate_struct_tests {
             old_path: None,
             new_path: b"README".to_vec(),
             file_id: b"fid-readme".to_vec(),
-            new_details: basis_details(b'f', b"sha-updated", 42, true),
+            new_details: basis_details(Kind::File, b"sha-updated", 42, true),
             real_add: true,
         }];
         state.update_basis_apply_adds(&mut adds).expect("apply");
@@ -10742,13 +10827,14 @@ mod dirstate_struct_tests {
         // trying to add a new entry at the same path flags it as
         // InconsistentDelta rather than silently overwriting.
         let mut state = basis_adds_fixture_one_file();
-        state.dirblocks[1].entries[0].trees[1] = basis_details(b'f', b"sha-existing", 11, false);
+        state.dirblocks[1].entries[0].trees[1] =
+            basis_details(Kind::File, b"sha-existing", 11, false);
 
         let mut adds = vec![BasisAdd {
             old_path: None,
             new_path: b"README".to_vec(),
             file_id: b"fid-readme".to_vec(),
-            new_details: basis_details(b'f', b"sha-new", 22, false),
+            new_details: basis_details(Kind::File, b"sha-new", 22, false),
             real_add: true,
         }];
         let err = state.update_basis_apply_adds(&mut adds).unwrap_err();
@@ -10772,7 +10858,7 @@ mod dirstate_struct_tests {
             old_path: Some(b"some/old".to_vec()),
             new_path: b"new.txt".to_vec(),
             file_id: b"fid-new".to_vec(),
-            new_details: basis_details(b'f', b"sha", 0, false),
+            new_details: basis_details(Kind::File, b"sha", 0, false),
             real_add: true,
         }];
         let err = state.update_basis_apply_adds(&mut adds).unwrap_err();
@@ -10785,8 +10871,8 @@ mod dirstate_struct_tests {
         // new tree-1 value; tree 0 is left alone.
         let mut state = fresh_state();
         state.parents = vec![b"parent-id".to_vec()];
-        let tree0 = basis_details(b'f', b"sha-r", 10, false);
-        let tree1 = basis_details(b'f', b"sha-old", 10, false);
+        let tree0 = basis_details(Kind::File, b"sha-r", 10, false);
+        let tree1 = basis_details(Kind::File, b"sha-old", 10, false);
         state.dirblocks = vec![
             Dirblock {
                 dirname: Vec::new(),
@@ -10794,7 +10880,7 @@ mod dirstate_struct_tests {
                     b"",
                     b"",
                     b"TREE_ROOT",
-                    vec![tree(b'd'), tree(b'd')],
+                    vec![tree(Kind::Directory), tree(Kind::Directory)],
                 )],
             },
             Dirblock {
@@ -10808,7 +10894,7 @@ mod dirstate_struct_tests {
             },
         ];
 
-        let new_details = basis_details(b'f', b"sha-updated", 99, true);
+        let new_details = basis_details(Kind::File, b"sha-updated", 99, true);
         let changes = vec![(
             b"README".to_vec(),
             b"README".to_vec(),
@@ -10835,7 +10921,7 @@ mod dirstate_struct_tests {
             b"README".to_vec(),
             b"README".to_vec(),
             b"fid-readme".to_vec(),
-            basis_details(b'f', b"sha", 1, false),
+            basis_details(Kind::File, b"sha", 1, false),
         )];
         let err = state.update_basis_apply_changes(&changes).unwrap_err();
         assert!(matches!(err, BasisApplyError::Invalid { .. }));
@@ -10848,7 +10934,7 @@ mod dirstate_struct_tests {
         let mut state = fresh_state();
         state.parents = vec![b"parent-id".to_vec()];
         let t0 = null_parent_details();
-        let t1 = basis_details(b'f', b"sha", 1, false);
+        let t1 = basis_details(Kind::File, b"sha", 1, false);
         state.dirblocks = vec![
             Dirblock {
                 dirname: Vec::new(),
@@ -10856,7 +10942,7 @@ mod dirstate_struct_tests {
                     b"",
                     b"",
                     b"TREE_ROOT",
-                    vec![tree(b'd'), tree(b'd')],
+                    vec![tree(Kind::Directory), tree(Kind::Directory)],
                 )],
             },
             Dirblock {
@@ -10887,7 +10973,7 @@ mod dirstate_struct_tests {
         // README has tree 0 live and tree 1 live; a non-real-delete
         // (split rename) should nullify tree 1 but keep the row.
         let mut state = basis_adds_fixture_one_file();
-        state.dirblocks[1].entries[0].trees[1] = basis_details(b'f', b"sha-old", 10, false);
+        state.dirblocks[1].entries[0].trees[1] = basis_details(Kind::File, b"sha-old", 10, false);
 
         let deletes = vec![(
             b"README".to_vec(),
@@ -10899,7 +10985,7 @@ mod dirstate_struct_tests {
             .update_basis_apply_deletes(&deletes)
             .expect("apply_deletes");
         let entry = &state.dirblocks[1].entries[0];
-        assert_eq!(entry.trees[1].minikind, b'a');
+        assert_eq!(entry.trees[1].minikind, Kind::Absent);
         assert!(entry.trees[1].fingerprint.is_empty());
     }
 
@@ -10955,7 +11041,7 @@ mod dirstate_struct_tests {
                     b"",
                     b"",
                     b"TREE_ROOT",
-                    vec![tree(b'd'), tree(b'd')],
+                    vec![tree(Kind::Directory), tree(Kind::Directory)],
                 )],
             },
             Dirblock {
@@ -10969,14 +11055,14 @@ mod dirstate_struct_tests {
                 old_path: None,
                 new_path: b"dir/child".to_vec(),
                 file_id: b"fid-child".to_vec(),
-                new_details: basis_details(b'f', b"sha-c", 1, false),
+                new_details: basis_details(Kind::File, b"sha-c", 1, false),
                 real_add: true,
             },
             BasisAdd {
                 old_path: None,
                 new_path: b"dir".to_vec(),
                 file_id: b"fid-dir".to_vec(),
-                new_details: basis_details(b'd', b"", 0, false),
+                new_details: basis_details(Kind::Directory, b"", 0, false),
                 real_add: true,
             },
         ];
@@ -11007,7 +11093,12 @@ mod dirstate_struct_tests {
         state.dirblocks = vec![
             Dirblock {
                 dirname: Vec::new(),
-                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(Kind::Directory)],
+                )],
             },
             Dirblock {
                 dirname: Vec::new(),
@@ -11026,7 +11117,7 @@ mod dirstate_struct_tests {
             new_path: Some(b"README".to_vec()),
             file_id: b"fid-r".to_vec(),
             parent_id: Some(b"TREE_ROOT".to_vec()),
-            minikind: b'f',
+            minikind: Kind::File,
             executable: false,
             fingerprint: Vec::new(),
         }];
@@ -11035,7 +11126,7 @@ mod dirstate_struct_tests {
         let bei = get_block_entry_index(&state.dirblocks, b"", b"README", 0);
         assert!(bei.path_present);
         let entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
-        assert_eq!(entry.trees[0].minikind, b'f');
+        assert_eq!(entry.trees[0].minikind, Kind::File);
         assert_eq!(entry.key.file_id, b"fid-r".to_vec());
     }
 
@@ -11048,7 +11139,7 @@ mod dirstate_struct_tests {
             b"",
             b"README",
             b"fid-existing",
-            vec![tree(b'f')],
+            vec![tree(Kind::File)],
         ));
 
         let entries = vec![FlatDeltaEntry {
@@ -11056,7 +11147,7 @@ mod dirstate_struct_tests {
             new_path: Some(b"OTHER".to_vec()),
             file_id: b"fid-existing".to_vec(),
             parent_id: Some(b"TREE_ROOT".to_vec()),
-            minikind: b'f',
+            minikind: Kind::File,
             executable: false,
             fingerprint: Vec::new(),
         }];
@@ -11080,7 +11171,7 @@ mod dirstate_struct_tests {
                 new_path: Some(b"a".to_vec()),
                 file_id: b"fid-dup".to_vec(),
                 parent_id: Some(b"TREE_ROOT".to_vec()),
-                minikind: b'f',
+                minikind: Kind::File,
                 executable: false,
                 fingerprint: Vec::new(),
             },
@@ -11089,7 +11180,7 @@ mod dirstate_struct_tests {
                 new_path: Some(b"b".to_vec()),
                 file_id: b"fid-dup".to_vec(),
                 parent_id: Some(b"TREE_ROOT".to_vec()),
-                minikind: b'f',
+                minikind: Kind::File,
                 executable: false,
                 fingerprint: Vec::new(),
             },
@@ -11112,15 +11203,30 @@ mod dirstate_struct_tests {
         state.dirblocks = vec![
             Dirblock {
                 dirname: Vec::new(),
-                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(Kind::Directory)],
+                )],
             },
             Dirblock {
                 dirname: Vec::new(),
-                entries: vec![entry_with_trees(b"", b"a", b"a-dir", vec![tree(b'd')])],
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"a",
+                    b"a-dir",
+                    vec![tree(Kind::Directory)],
+                )],
             },
             Dirblock {
                 dirname: b"a".to_vec(),
-                entries: vec![entry_with_trees(b"a", b"f", b"f-file", vec![tree(b'f')])],
+                entries: vec![entry_with_trees(
+                    b"a",
+                    b"f",
+                    b"f-file",
+                    vec![tree(Kind::File)],
+                )],
             },
         ];
 
@@ -11129,7 +11235,7 @@ mod dirstate_struct_tests {
             new_path: Some(b"z".to_vec()),
             file_id: b"a-dir".to_vec(),
             parent_id: Some(b"TREE_ROOT".to_vec()),
-            minikind: b'd',
+            minikind: Kind::Directory,
             executable: false,
             fingerprint: Vec::new(),
         }];
@@ -11167,7 +11273,7 @@ mod dirstate_struct_tests {
                     b"",
                     b"",
                     b"TREE_ROOT",
-                    vec![tree(b'd'), tree(b'd')],
+                    vec![tree(Kind::Directory), tree(Kind::Directory)],
                 )],
             },
             Dirblock {
@@ -11177,8 +11283,8 @@ mod dirstate_struct_tests {
                     b"README",
                     b"fid-readme",
                     vec![
-                        basis_details(b'f', b"sha-cur", 10, false),
-                        basis_details(b'f', b"sha-old", 10, false),
+                        basis_details(Kind::File, b"sha-cur", 10, false),
+                        basis_details(Kind::File, b"sha-old", 10, false),
                     ],
                 )],
             },
@@ -11196,7 +11302,13 @@ mod dirstate_struct_tests {
             new_path: Some(b"README".to_vec()),
             file_id: b"fid-readme".to_vec(),
             parent_id: Some(b"TREE_ROOT".to_vec()),
-            details: Some((b'f', b"sha-new".to_vec(), 20, false, b"new-revid".to_vec())),
+            details: Some((
+                Kind::File,
+                b"sha-new".to_vec(),
+                20,
+                false,
+                b"new-revid".to_vec(),
+            )),
         }];
         state
             .update_basis_by_delta(entries, b"new-revid".to_vec())
@@ -11220,7 +11332,13 @@ mod dirstate_struct_tests {
             new_path: Some(b"NEWFILE".to_vec()),
             file_id: b"fid-new".to_vec(),
             parent_id: Some(b"TREE_ROOT".to_vec()),
-            details: Some((b'f', b"sha-new".to_vec(), 5, false, b"new-revid".to_vec())),
+            details: Some((
+                Kind::File,
+                b"sha-new".to_vec(),
+                5,
+                false,
+                b"new-revid".to_vec(),
+            )),
         }];
         state
             .update_basis_by_delta(entries, b"new-revid".to_vec())
@@ -11229,7 +11347,7 @@ mod dirstate_struct_tests {
         let bei = get_block_entry_index(&state.dirblocks, b"", b"NEWFILE", 1);
         assert!(bei.path_present);
         let entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
-        assert_eq!(entry.trees[1].minikind, b'f');
+        assert_eq!(entry.trees[1].minikind, Kind::File);
         assert_eq!(entry.key.file_id, b"fid-new".to_vec());
     }
 
@@ -11249,7 +11367,7 @@ mod dirstate_struct_tests {
                     b"",
                     b"",
                     b"TREE_ROOT",
-                    vec![tree(b'd'), tree(b'd')],
+                    vec![tree(Kind::Directory), tree(Kind::Directory)],
                 )],
             },
             Dirblock {
@@ -11258,7 +11376,7 @@ mod dirstate_struct_tests {
                     b"",
                     b"a",
                     b"a-dir",
-                    vec![tree(b'd'), tree(b'd')],
+                    vec![tree(Kind::Directory), tree(Kind::Directory)],
                 )],
             },
             Dirblock {
@@ -11268,8 +11386,8 @@ mod dirstate_struct_tests {
                     b"f",
                     b"f-file",
                     vec![
-                        basis_details(b'f', b"sha-cur-f", 3, false),
-                        basis_details(b'f', b"sha-old-f", 3, false),
+                        basis_details(Kind::File, b"sha-cur-f", 3, false),
+                        basis_details(Kind::File, b"sha-old-f", 3, false),
                     ],
                 )],
             },
@@ -11280,7 +11398,7 @@ mod dirstate_struct_tests {
             new_path: Some(b"z".to_vec()),
             file_id: b"a-dir".to_vec(),
             parent_id: Some(b"TREE_ROOT".to_vec()),
-            details: Some((b'd', Vec::new(), 0, false, b"new-revid".to_vec())),
+            details: Some((Kind::Directory, Vec::new(), 0, false, b"new-revid".to_vec())),
         }];
         state
             .update_basis_by_delta(entries, b"new-revid".to_vec())
@@ -11588,7 +11706,12 @@ mod dirstate_struct_tests {
         );
         state.dirblocks = make_dirblocks(vec![(
             b"dir",
-            vec![entry_with_trees(b"dir", b"a", b"fid-a", vec![tree(b'f')])],
+            vec![entry_with_trees(
+                b"dir",
+                b"a",
+                b"fid-a",
+                vec![tree(Kind::File)],
+            )],
         )]);
         let key = EntryKey {
             dirname: b"dir".to_vec(),
@@ -11613,7 +11736,7 @@ mod dirstate_struct_tests {
                 file_id: b"fid-readme".to_vec(),
             },
             trees: vec![TreeData {
-                minikind: b'f',
+                minikind: Kind::File,
                 fingerprint: b"sha1value".to_vec(),
                 size: 42,
                 executable: true,
@@ -11638,14 +11761,14 @@ mod dirstate_struct_tests {
             },
             trees: vec![
                 TreeData {
-                    minikind: b'f',
+                    minikind: Kind::File,
                     fingerprint: b"cur".to_vec(),
                     size: 7,
                     executable: false,
                     packed_stat: nullstat.clone(),
                 },
                 TreeData {
-                    minikind: b'a',
+                    minikind: Kind::Absent,
                     fingerprint: b"".to_vec(),
                     size: 0,
                     executable: false,
@@ -11676,14 +11799,14 @@ mod dirstate_struct_tests {
             },
             trees: vec![
                 TreeData {
-                    minikind: b'd',
+                    minikind: Kind::Directory,
                     fingerprint: Vec::new(),
                     size: 0,
                     executable: false,
                     packed_stat: PACKED_STAT.to_vec(),
                 },
                 TreeData {
-                    minikind: b'a',
+                    minikind: Kind::Absent,
                     fingerprint: b"dirname/basename".to_vec(),
                     size: 0,
                     executable: false,
@@ -11712,21 +11835,21 @@ mod dirstate_struct_tests {
             },
             trees: vec![
                 TreeData {
-                    minikind: b'd',
+                    minikind: Kind::Directory,
                     fingerprint: Vec::new(),
                     size: 0,
                     executable: false,
                     packed_stat: PACKED_STAT.to_vec(),
                 },
                 TreeData {
-                    minikind: b'd',
+                    minikind: Kind::Directory,
                     fingerprint: Vec::new(),
                     size: 0,
                     executable: false,
                     packed_stat: b"rev_id".to_vec(),
                 },
                 TreeData {
-                    minikind: b'a',
+                    minikind: Kind::Absent,
                     fingerprint: b"dirname/basename".to_vec(),
                     size: 0,
                     executable: false,
@@ -11757,7 +11880,7 @@ mod dirstate_struct_tests {
                         file_id: b"TREE_ROOT".to_vec(),
                     },
                     trees: vec![TreeData {
-                        minikind: b'd',
+                        minikind: Kind::Directory,
                         fingerprint: Vec::new(),
                         size: 0,
                         executable: false,
@@ -11774,7 +11897,7 @@ mod dirstate_struct_tests {
                         file_id: b"fid-readme".to_vec(),
                     },
                     trees: vec![TreeData {
-                        minikind: b'f',
+                        minikind: Kind::File,
                         fingerprint: b"sha1".to_vec(),
                         size: 10,
                         executable: true,
@@ -11837,7 +11960,7 @@ mod dirstate_struct_tests {
                         file_id: b"TREE_ROOT".to_vec(),
                     },
                     trees: vec![TreeData {
-                        minikind: b'd',
+                        minikind: Kind::Directory,
                         fingerprint: Vec::new(),
                         size: 0,
                         executable: false,
@@ -11886,14 +12009,14 @@ mod dirstate_struct_tests {
                     },
                     trees: vec![
                         TreeData {
-                            minikind: b'd',
+                            minikind: Kind::Directory,
                             fingerprint: Vec::new(),
                             size: 0,
                             executable: false,
                             packed_stat: nullstat.clone(),
                         },
                         TreeData {
-                            minikind: b'd',
+                            minikind: Kind::Directory,
                             fingerprint: Vec::new(),
                             size: 0,
                             executable: false,
@@ -11912,14 +12035,14 @@ mod dirstate_struct_tests {
                     },
                     trees: vec![
                         TreeData {
-                            minikind: b'f',
+                            minikind: Kind::File,
                             fingerprint: b"sha-cur".to_vec(),
                             size: 10,
                             executable: true,
                             packed_stat: nullstat.clone(),
                         },
                         TreeData {
-                            minikind: b'f',
+                            minikind: Kind::File,
                             fingerprint: b"sha-par".to_vec(),
                             size: 8,
                             executable: false,
@@ -12043,7 +12166,7 @@ mod dirstate_struct_tests {
                 file_id: file_id.to_vec(),
             },
             trees: vec![TreeData {
-                minikind: b'd',
+                minikind: Kind::Directory,
                 fingerprint: Vec::new(),
                 size: 0,
                 executable: false,
@@ -12093,7 +12216,7 @@ mod dirstate_struct_tests {
                 basename: b"README".to_vec(),
                 file_id: b"fid".to_vec(),
             },
-            trees: vec![tree(b'f')],
+            trees: vec![tree(Kind::File)],
         };
         match state.entries_to_current_state(vec![entry]) {
             Err(EntriesToStateError::MissingRootRow { key }) => {
@@ -12130,11 +12253,21 @@ mod dirstate_struct_tests {
         state.dirblocks = vec![
             Dirblock {
                 dirname: Vec::new(),
-                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(Kind::Directory)],
+                )],
             },
             Dirblock {
                 dirname: Vec::new(),
-                entries: vec![entry_with_trees(b"", b"sub", b"fid-sub", vec![tree(b'd')])],
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"sub",
+                    b"fid-sub",
+                    vec![tree(Kind::Directory)],
+                )],
             },
         ];
         // Parent entry at block 1, row 0 has basename "sub"; "sub"
@@ -12153,11 +12286,21 @@ mod dirstate_struct_tests {
         state.dirblocks = vec![
             Dirblock {
                 dirname: Vec::new(),
-                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(Kind::Directory)],
+                )],
             },
             Dirblock {
                 dirname: Vec::new(),
-                entries: vec![entry_with_trees(b"", b"sub", b"fid-sub", vec![tree(b'd')])],
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"sub",
+                    b"fid-sub",
+                    vec![tree(Kind::Directory)],
+                )],
             },
             Dirblock {
                 dirname: b"sub".to_vec(),
@@ -12175,11 +12318,21 @@ mod dirstate_struct_tests {
         state.dirblocks = vec![
             Dirblock {
                 dirname: Vec::new(),
-                entries: vec![entry_with_trees(b"", b"", b"TREE_ROOT", vec![tree(b'd')])],
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"",
+                    b"TREE_ROOT",
+                    vec![tree(Kind::Directory)],
+                )],
             },
             Dirblock {
                 dirname: Vec::new(),
-                entries: vec![entry_with_trees(b"", b"sub", b"fid-sub", vec![tree(b'd')])],
+                entries: vec![entry_with_trees(
+                    b"",
+                    b"sub",
+                    b"fid-sub",
+                    vec![tree(Kind::Directory)],
+                )],
             },
         ];
         // dirname "other" does not end with parent basename "sub".
@@ -12548,7 +12701,7 @@ mod dirstate_struct_tests {
                         file_id: b"TREE_ROOT".to_vec(),
                     },
                     trees: vec![TreeData {
-                        minikind: b'd',
+                        minikind: Kind::Directory,
                         fingerprint: Vec::new(),
                         size: 0,
                         executable: false,
@@ -12592,7 +12745,7 @@ mod dirstate_struct_tests {
                         file_id: b"TREE_ROOT".to_vec(),
                     },
                     trees: vec![TreeData {
-                        minikind: b'd',
+                        minikind: Kind::Directory,
                         fingerprint: Vec::new(),
                         size: 0,
                         executable: false,

@@ -62,7 +62,7 @@ pub(crate) fn dirblocks_to_py<'py>(
                 let tree_tuple = PyTuple::new(
                     py,
                     [
-                        PyBytes::new(py, &[tree.minikind]).into_any(),
+                        PyBytes::new(py, &[tree.minikind.to_minikind()]).into_any(),
                         PyBytes::new(py, &tree.fingerprint).into_any(),
                         tree.size.into_pyobject(py)?.into_any(),
                         tree.executable.into_pyobject(py)?.to_owned().into_any(),
@@ -247,7 +247,14 @@ pub(crate) fn entry_from_py(py_entry: &Bound<PyAny>) -> PyResult<Entry> {
         let tree = tree?;
         let tree_tuple = tree.cast::<PyTuple>()?;
         let minikind_bytes: Vec<u8> = tree_tuple.get_item(0)?.extract()?;
-        let minikind = minikind_bytes.first().copied().unwrap_or(0);
+        let minikind =
+            bazaar::dirstate::Kind::from_minikind(minikind_bytes.first().copied().unwrap_or(0))
+                .map_err(|b| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid minikind byte {:?}",
+                        b
+                    ))
+                })?;
         let fingerprint: Vec<u8> = tree_tuple.get_item(1)?.extract()?;
         // Legacy Python dirblocks tolerated 3-tuple relocation rows
         // `(b"r", target_path, target_file_id)` alongside the normal
