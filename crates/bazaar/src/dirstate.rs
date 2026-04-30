@@ -1158,6 +1158,106 @@ impl std::error::Error for TransportError {}
 /// mutates the lock state, the file contents, or both. Callers that
 /// need shared access should wrap an implementation in their own
 /// synchronisation primitive.
+/// One directory block yielded by [`walkdirs_utf8`].  Mirrors the
+/// shape Python's `_walkdirs_utf8` yields: `((relroot, abspath),
+/// [DirEntryInfo, ...])`.  The entries are sorted by basename; the
+/// caller may mutate the list (remove entries to skip recursion)
+/// before the walker proceeds.
+#[derive(Debug, Clone)]
+pub struct WalkedDir {
+    /// Utf8 relative path of this directory, relative to the walk's
+    /// `prefix`.  Empty for the top of the walk.
+    pub relpath: Vec<u8>,
+    /// Absolute path of this directory on disk.
+    pub abspath: Vec<u8>,
+    /// Per-child entries (sorted by basename).  Each entry's
+    /// `basename` field is the child's basename (not its relpath
+    /// relative to `walk.prefix`).  The walker reads each child's
+    /// full relpath as `relpath + '/' + basename` when it recurses.
+    pub entries: Vec<DirEntryInfo>,
+}
+
+/// Iterator-like helper for depth-first directory walks modeled on
+/// Python's `_walkdirs_utf8`.  Call [`WalkDirsUtf8::next_dir`]
+/// repeatedly; it yields `Some(WalkedDir)` per directory in
+/// depth-first order and `None` when the walk completes.  The caller
+/// mutates the returned `entries` list before the next call to
+/// prune directories from the descent (matching how the Python
+/// walker mutates the yielded dirblock list in place).
+pub struct WalkDirsUtf8<'t> {
+    transport: &'t dyn Transport,
+    /// Stack of (relpath, abspath) pairs still to visit.  Most
+    /// recently discovered directories are on top so the walk is
+    /// depth-first matching Python's behaviour.
+    pending: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Last-yielded directory's children, filtered down to surviving
+    /// subdirectories that still need recursion.  Reset on every
+    /// call to `next_dir`.
+    pending_subdirs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Set when `next_dir` has at least one block still to push.
+    last_abspath: Option<Vec<u8>>,
+}
+
+impl<'t> WalkDirsUtf8<'t> {
+    /// Start a walk rooted at `root_abspath`.  `prefix` is the utf8
+    /// relpath that should precede every yielded child's relpath
+    /// (matching Python's `prefix` argument to `_walkdirs_utf8`).
+    pub fn new(root_abspath: &[u8], prefix: &[u8], transport: &'t dyn Transport) -> Self {
+        Self {
+            transport,
+            pending: vec![(prefix.to_vec(), root_abspath.to_vec())],
+            pending_subdirs: Vec::new(),
+            last_abspath: None,
+        }
+    }
+
+    /// Yield the next directory block.  Returns `Ok(None)` when the
+    /// walk is done.  `callback` is invoked with the yielded block
+    /// and a mutable slice of its entries so the caller can prune
+    /// subdirectories before recursion.  The caller's mutation
+    /// semantics mirror the Python walker: an entry removed from the
+    /// slice will not be recursed into.
+    pub fn next_dir<F>(&mut self, mut callback: F) -> Result<bool, TransportError>
+    where
+        F: FnMut(&[u8], &[u8], &mut Vec<DirEntryInfo>),
+    {
+        // Promote subdirectories discovered on the previous iteration
+        // into the pending stack, in reverse order so `pop` yields
+        // them in forward (alphabetical) order.
+        while let Some(entry) = self.pending_subdirs.pop() {
+            self.pending.push(entry);
+        }
+        let (relpath, abspath) = match self.pending.pop() {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+
+        let mut entries = self.transport.list_dir(&abspath)?;
+        entries.sort_by(|a, b| a.basename.cmp(&b.basename));
+        callback(&relpath, &abspath, &mut entries);
+
+        // Collect surviving directory entries into pending_subdirs
+        // for the *next* next_dir call to push.  We reverse so the
+        // depth-first traversal lands in alphabetical order.
+        let mut subdirs: Vec<(Vec<u8>, Vec<u8>)> = entries
+            .iter()
+            .filter(|e| e.kind == "directory")
+            .map(|e| {
+                let mut child_relpath = relpath.clone();
+                if !child_relpath.is_empty() {
+                    child_relpath.push(b'/');
+                }
+                child_relpath.extend_from_slice(&e.basename);
+                (child_relpath, e.abspath.clone())
+            })
+            .collect();
+        subdirs.reverse();
+        self.pending_subdirs = subdirs;
+        self.last_abspath = Some(abspath);
+        Ok(true)
+    }
+}
+
 /// Stat result returned by [`Transport::lstat`].  Mirrors the subset of
 /// `os.stat_result` fields that dirstate logic actually inspects:
 /// mode (for kind + executable), size, mtime/ctime (for the cutoff
@@ -8981,6 +9081,84 @@ mod dirstate_struct_tests {
     }
 
     #[test]
+    fn walkdirs_utf8_visits_depth_first() {
+        // Build a fake filesystem: /root + children (a [file], b [dir with b/c file], f [file])
+        let mut t = MemoryTransport::new();
+        let stat_dir = StatInfo {
+            mode: 0o040755,
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 1,
+        };
+        let stat_file = StatInfo {
+            mode: 0o100644,
+            size: 3,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 2,
+        };
+        t.set_fs(b"", stat_dir, None);
+        t.set_fs(b"a", stat_file, None);
+        t.set_fs(b"b", stat_dir, None);
+        t.set_fs(b"b/c", stat_file, None);
+        t.set_fs(b"f", stat_file, None);
+
+        let mut walker = WalkDirsUtf8::new(b"", b"", &t);
+        let mut visited: Vec<Vec<u8>> = Vec::new();
+        while walker
+            .next_dir(|_rel, abspath, _entries| {
+                visited.push(abspath.to_vec());
+            })
+            .unwrap()
+        {}
+        assert_eq!(
+            visited,
+            vec![b"".to_vec(), b"b".to_vec()],
+            "expected only directories visited in depth-first order"
+        );
+    }
+
+    #[test]
+    fn walkdirs_utf8_skips_pruned_subdirectories() {
+        // Same tree but callback removes `b` from the dirblock, so
+        // the walk never recurses into it.
+        let mut t = MemoryTransport::new();
+        let stat_dir = StatInfo {
+            mode: 0o040755,
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 1,
+        };
+        let stat_file = StatInfo {
+            mode: 0o100644,
+            size: 3,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 2,
+        };
+        t.set_fs(b"", stat_dir, None);
+        t.set_fs(b"b", stat_dir, None);
+        t.set_fs(b"b/c", stat_file, None);
+
+        let mut walker = WalkDirsUtf8::new(b"", b"", &t);
+        let mut visited: Vec<Vec<u8>> = Vec::new();
+        while walker
+            .next_dir(|_rel, abspath, entries| {
+                visited.push(abspath.to_vec());
+                entries.retain(|e| e.basename != b"b");
+            })
+            .unwrap()
+        {}
+        assert_eq!(visited, vec![b"".to_vec()], "pruned dir should not recurse");
+    }
+
+    #[test]
     fn update_entry_refreshes_sha_after_content_change() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
@@ -11053,9 +11231,56 @@ mod dirstate_struct_tests {
             Ok(false)
         }
 
-        fn list_dir(&self, _abspath: &[u8]) -> Result<Vec<DirEntryInfo>, TransportError> {
-            // In-memory transport does not model directory trees.
-            Ok(Vec::new())
+        fn list_dir(&self, abspath: &[u8]) -> Result<Vec<DirEntryInfo>, TransportError> {
+            // Iterate self.fs and collect direct children.  A path is
+            // a direct child of `abspath` when it starts with the
+            // prefix and the remainder contains no slash.  Treats
+            // `abspath == b""` as the root.
+            let prefix: Vec<u8> = if abspath.is_empty() {
+                Vec::new()
+            } else {
+                let mut p = abspath.to_vec();
+                p.push(b'/');
+                p
+            };
+            let mut out = Vec::new();
+            let mut found_dir = abspath.is_empty();
+            for (path, (info, link)) in &self.fs {
+                if path.as_slice() == abspath {
+                    found_dir = true;
+                    continue;
+                }
+                if !path.starts_with(&prefix) {
+                    continue;
+                }
+                let tail = &path[prefix.len()..];
+                if tail.iter().any(|&b| b == b'/') {
+                    continue;
+                }
+                let kind = if info.is_dir() {
+                    "directory"
+                } else if info.is_file() {
+                    "file"
+                } else if info.is_symlink() {
+                    "symlink"
+                } else {
+                    "unknown"
+                }
+                .to_string();
+                let _ = link; // link metadata is available via read_link
+                out.push(DirEntryInfo {
+                    basename: tail.to_vec(),
+                    kind,
+                    stat: *info,
+                    abspath: path.clone(),
+                });
+            }
+            if !found_dir {
+                return Err(TransportError::NotFound(
+                    String::from_utf8_lossy(abspath).into_owned(),
+                ));
+            }
+            Ok(out)
         }
     }
 
