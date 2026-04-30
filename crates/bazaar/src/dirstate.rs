@@ -6779,7 +6779,7 @@ impl DirState {
         F: FnMut(u64, usize) -> Result<Vec<u8>, BisectError>,
     {
         bisect_bytes(
-            self.end_of_header.unwrap_or(0) as u64,
+            self.end_of_header.unwrap_or(0),
             file_size,
             self.num_present_parents(),
             paths,
@@ -6800,7 +6800,7 @@ impl DirState {
         F: FnMut(u64, usize) -> Result<Vec<u8>, BisectError>,
     {
         bisect_bytes(
-            self.end_of_header.unwrap_or(0) as u64,
+            self.end_of_header.unwrap_or(0),
             file_size,
             self.num_present_parents(),
             dir_list,
@@ -6833,7 +6833,7 @@ impl DirState {
 
         // Seed: run bisect() on the initial path list.
         let mut newly_found = bisect_bytes(
-            self.end_of_header.unwrap_or(0) as u64,
+            self.end_of_header.unwrap_or(0),
             file_size,
             self.num_present_parents(),
             paths,
@@ -6893,7 +6893,7 @@ impl DirState {
             pending_dirs.dedup();
 
             newly_found = bisect_bytes(
-                self.end_of_header.unwrap_or(0) as u64,
+                self.end_of_header.unwrap_or(0),
                 file_size,
                 self.num_present_parents(),
                 paths_to_search,
@@ -6901,7 +6901,7 @@ impl DirState {
                 &mut read_range,
             )?;
             let dir_results = bisect_bytes(
-                self.end_of_header.unwrap_or(0) as u64,
+                self.end_of_header.unwrap_or(0),
                 file_size,
                 self.num_present_parents(),
                 pending_dirs.clone(),
