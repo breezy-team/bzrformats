@@ -1400,12 +1400,11 @@ class DirState:
                 stat_value.st_mtime < self._cutoff_time
                 and stat_value.st_ctime < self._cutoff_time
             ):
-                entry[1][0] = (
-                    b"f",
-                    sha1,
-                    stat_value.st_size,
-                    entry[1][0][3],
-                    pack_stat(stat_value),
+                executable = entry[1][0][3]
+                packed = pack_stat(stat_value)
+                entry[1][0] = (b"f", sha1, stat_value.st_size, executable, packed)
+                self._rs.set_tree0(
+                    entry[0], b"f", sha1, stat_value.st_size, executable, packed
                 )
                 self._mark_modified([entry])
 
@@ -2118,11 +2117,19 @@ class DirState:
                 return None
 
         while current_new or current_old:
-            # skip entries in old that are not really there
-            if current_old and current_old[1][0][0] in (b"a", b"r"):
-                # relocated or absent
-                current_old = advance(old_iterator)
-                continue
+            # Skip entries in old that are not really there.
+            #
+            # ``current_old`` is a snapshot entry captured before the
+            # loop started; prior ``update_minimal`` calls may already
+            # have rewritten its tree-0 slot to ``r`` (relocation) or
+            # dropped the row entirely.  Ask the live dirstate for the
+            # current tree-0 minikind instead of trusting the stale
+            # snapshot.
+            if current_old:
+                live_minikind = self._rs.tree0_minikind(current_old[0])
+                if live_minikind is None or live_minikind in (b"a", b"r"):
+                    current_old = advance(old_iterator)
+                    continue
             if current_new:
                 # convert new into dirblock style
                 new_path_utf8 = current_new[0].encode("utf8")
@@ -2430,9 +2437,21 @@ def py_update_entry(
             return saved_link_or_sha1
 
     # If we have gotten this far, that means that we need to actually
-    # process this entry.
+    # process this entry.  Each branch updates the tree-0 slot of an
+    # existing entry (no structural change, no cross-reference
+    # rewrite); push the new details through state._rs.set_tree0 so
+    # the Rust-owned dirblocks mirror sees it, and also mutate the
+    # ``entry`` snapshot tuple so callers that read back from it see
+    # the update.
     link_or_sha1 = None
     worth_saving = True
+
+    def _write_tree0(minikind_out, fingerprint, size, executable, packed):
+        entry[1][0] = (minikind_out, fingerprint, size, executable, packed)
+        state._rs.set_tree0(
+            entry[0], minikind_out, fingerprint, size, executable, packed
+        )
+
     if minikind == b"f":
         executable = state._is_executable(stat_value.st_mode, saved_executable)
         if state._cutoff_time is None:
@@ -2450,19 +2469,15 @@ def py_update_entry(
             # are calculated at the same time, so checking just the size
             # gains nothing w.r.t. performance.
             link_or_sha1 = state._sha1_file(abspath)
-            entry[1][0] = (
-                b"f",
-                link_or_sha1,
-                stat_value.st_size,
-                executable,
-                packed_stat,
+            _write_tree0(
+                b"f", link_or_sha1, stat_value.st_size, executable, packed_stat
             )
         else:
-            entry[1][0] = (b"f", b"", stat_value.st_size, executable, DirState.NULLSTAT)
+            _write_tree0(b"f", b"", stat_value.st_size, executable, DirState.NULLSTAT)
             worth_saving = False
     elif minikind == b"d":
         link_or_sha1 = None
-        entry[1][0] = (b"d", b"", 0, False, packed_stat)
+        _write_tree0(b"d", b"", 0, False, packed_stat)
         if saved_minikind != b"d":
             # This changed from something into a directory. Make sure we
             # have a directory block for it. This doesn't happen very
@@ -2488,9 +2503,9 @@ def py_update_entry(
             stat_value.st_mtime < state._cutoff_time
             and stat_value.st_ctime < state._cutoff_time
         ):
-            entry[1][0] = (b"l", link_or_sha1, stat_value.st_size, False, packed_stat)
+            _write_tree0(b"l", link_or_sha1, stat_value.st_size, False, packed_stat)
         else:
-            entry[1][0] = (b"l", b"", stat_value.st_size, False, DirState.NULLSTAT)
+            _write_tree0(b"l", b"", stat_value.st_size, False, DirState.NULLSTAT)
     if worth_saving:
         state._mark_modified([entry])
     return link_or_sha1

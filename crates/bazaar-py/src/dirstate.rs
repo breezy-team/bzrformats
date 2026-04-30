@@ -753,6 +753,58 @@ impl PyDirState {
         Ok(self.inner.find_block_index_from_key(&entry_key))
     }
 
+    /// Return the live tree-0 minikind (single byte) for `key`, or
+    /// `None` when no entry matches. Mirrors the pure-crate
+    /// `DirState::tree0_minikind`; used by `set_state_from_inventory`
+    /// to refresh its snapshot-based skip check.
+    fn tree0_minikind<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<PyTuple>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let entry_key = bazaar::dirstate::EntryKey {
+            dirname: key.get_item(0)?.extract()?,
+            basename: key.get_item(1)?.extract()?,
+            file_id: key.get_item(2)?.extract()?,
+        };
+        Ok(self
+            .inner
+            .tree0_minikind(&entry_key)
+            .map(|b| PyBytes::new(py, &[b])))
+    }
+
+    /// Overwrite the tree-0 slot of `key`'s entry with the provided
+    /// details, without touching id_index, cross-references, or
+    /// dirblock_state. Mirrors Python's old in-place
+    /// `entry[1][0] = (...)` mutation used by `update_entry`'s
+    /// hash-refresh path.
+    #[pyo3(signature = (key, minikind, fingerprint, size, executable, packed_stat))]
+    fn set_tree0(
+        &mut self,
+        key: &Bound<PyTuple>,
+        minikind: &[u8],
+        fingerprint: &[u8],
+        size: u64,
+        executable: bool,
+        packed_stat: &[u8],
+    ) -> PyResult<()> {
+        let entry_key = bazaar::dirstate::EntryKey {
+            dirname: key.get_item(0)?.extract()?,
+            basename: key.get_item(1)?.extract()?,
+            file_id: key.get_item(2)?.extract()?,
+        };
+        let details = bazaar::dirstate::TreeData {
+            minikind: minikind.first().copied().unwrap_or(0),
+            fingerprint: fingerprint.to_vec(),
+            size,
+            executable,
+            packed_stat: packed_stat.to_vec(),
+        };
+        self.inner
+            .set_tree0(&entry_key, details)
+            .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))
+    }
+
     /// Find the entry index within `block` for `key`. Mirrors Python's
     /// `DirState._find_entry_index`. `block` is the
     /// `self._dirblocks[block_index][1]` list.
@@ -1170,7 +1222,7 @@ impl PyDirState {
         kind: &str,
         size: u64,
         packed_stat: &[u8],
-        fingerprint: &[u8],
+        fingerprint: Option<&[u8]>,
     ) -> PyResult<()> {
         match self.inner.add(
             utf8path,
@@ -1180,7 +1232,7 @@ impl PyDirState {
             kind,
             size,
             packed_stat,
-            fingerprint,
+            fingerprint.unwrap_or(b""),
         ) {
             Ok(()) => Ok(()),
             Err(bazaar::dirstate::AddError::DuplicateFileId { file_id, info }) => Err(

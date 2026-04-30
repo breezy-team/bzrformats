@@ -1542,6 +1542,50 @@ impl DirState {
         self.packed_stat_index = None;
     }
 
+    /// Overwrite the tree-0 slot of the entry at `key` with the given
+    /// details. Returns an error if `key` is not present; otherwise
+    /// does no other bookkeeping — no id_index changes, no cross-ref
+    /// rewrites, no state bump. This is the narrow primitive the
+    /// `py_update_entry` hash-refresh path needs: callers that want
+    /// structural changes should use [`DirState::update_minimal`] or
+    /// [`DirState::add`].
+    pub fn set_tree0(&mut self, key: &EntryKey, details: TreeData) -> Result<(), MakeAbsentError> {
+        let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
+        if !block_present {
+            return Err(MakeAbsentError::BlockNotFound { key: key.clone() });
+        }
+        let (entry_index, entry_present) =
+            find_entry_index(key, &self.dirblocks[block_index].entries);
+        if !entry_present {
+            return Err(MakeAbsentError::EntryNotFound { key: key.clone() });
+        }
+        self.dirblocks[block_index].entries[entry_index].trees[0] = details;
+        self.packed_stat_index = None;
+        Ok(())
+    }
+
+    /// Return the live tree-0 minikind for `key`, or `None` when no
+    /// entry with that key is present. Used by callers that need to
+    /// refresh a stale snapshot against current dirblock contents
+    /// (notably `set_state_from_inventory`'s zipper-merge loop, which
+    /// used to rely on Python-side tuple aliasing to observe mid-loop
+    /// rewrites).
+    pub fn tree0_minikind(&self, key: &EntryKey) -> Option<u8> {
+        let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
+        if !block_present {
+            return None;
+        }
+        let (entry_index, entry_present) =
+            find_entry_index(key, &self.dirblocks[block_index].entries);
+        if !entry_present {
+            return None;
+        }
+        self.dirblocks[block_index].entries[entry_index]
+            .trees
+            .first()
+            .map(|t| t.minikind)
+    }
+
     /// Append a `NULL_PARENT_DETAILS` row to every entry's tree slot
     /// list. Mirrors Python's inline loop in `update_basis_by_delta`:
     /// when the current dirstate has no parents and a new parent is
