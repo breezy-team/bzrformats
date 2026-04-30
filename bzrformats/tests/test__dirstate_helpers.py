@@ -502,9 +502,6 @@ class TestUsingCompiledIfAvailable(TestCase):
     def test__read_dirblocks(self):
         self.assertIs(_dirstate_rs._read_dirblocks, dirstate._read_dirblocks)
 
-    def test_update_entry(self):
-        self.assertIs(_dirstate_rs.update_entry, dirstate.update_entry)
-
     def test_process_entry(self):
         self.assertIs(_dirstate_rs.ProcessEntryC, dirstate._process_entry)
 

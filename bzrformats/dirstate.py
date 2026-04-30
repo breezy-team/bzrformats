@@ -225,7 +225,7 @@ import logging
 import os
 import stat
 
-from . import inventory, lock, osutils
+from . import inventory, lock
 from .errors import (
     BzrFormatsError,
     LockContention,
@@ -1467,24 +1467,6 @@ class DirState:
             raise ObjectNotLocked(self)
 
 
-def py_update_entry(state, entry, abspath, stat_value):
-    """Update the entry based on what is actually on disk.
-
-    Thin shim: delegates to DirStateRs.update_entry.  Mirrors Python's
-    historical in-place entry-tuple mutation by rebuilding entry[1][0]
-    from the new tree-0 Rust wrote.
-    """
-    if isinstance(abspath, str):
-        abspath = abspath.encode("utf-8")
-    link_or_sha1 = state._rs.update_entry(entry[0], abspath, stat_value)
-    # Refresh the in-memory entry tuple so legacy callers that hang
-    # on to the snapshot still see the new tree-0.
-    fresh = state._rs.get_entry(0, path_utf8=osutils.pathjoin(entry[0][0], entry[0][1]))
-    if fresh != (None, None):
-        entry[1][0] = fresh[1][0]
-    return link_or_sha1
-
-
 class ProcessEntryPython:
     """Python implementation for processing directory state entries."""
 
@@ -1634,5 +1616,4 @@ _inv_entry_to_details = _dirstate_rs.inv_entry_to_details
 _get_output_lines = _dirstate_rs.get_output_lines
 
 _read_dirblocks = _dirstate_rs._read_dirblocks
-update_entry = _dirstate_rs.update_entry
 _process_entry = _dirstate_rs.ProcessEntryC

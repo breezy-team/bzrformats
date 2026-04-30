@@ -6,10 +6,9 @@
 //! shape Python stores in `DirState._dirblocks`, and handles the
 //! surrounding file I/O and state-object mutation.
 //!
-//! `update_entry` and `ProcessEntryC` still delegate to their Python
-//! counterparts since those interact deeply with the Python `DirState`
-//! object; future commits in the "lift DirState into Rust" series will
-//! replace them.
+//! `ProcessEntryC` still delegates to its Python counterpart since that
+//! interacts deeply with the Python `DirState` object; a future commit
+//! in the "lift DirState into Rust" series will replace it.
 
 use bazaar::dirstate::{
     entry_to_line as pure_entry_to_line, parse_dirblocks, Dirblock, DirblocksError, Entry,
@@ -133,24 +132,6 @@ pub fn _read_dirblocks(py: Python, state: &Bound<PyAny>) -> PyResult<()> {
     )?;
 
     Ok(())
-}
-
-/// Update the entry based on what is actually on disk.
-///
-/// This delegates to the Python `py_update_entry` implementation in dirstate.py
-/// since it interacts deeply with the DirState object's internal state.
-#[pyfunction]
-pub fn update_entry(
-    py: Python,
-    state: &Bound<PyAny>,
-    entry: &Bound<PyAny>,
-    abspath: &Bound<PyAny>,
-    stat_value: &Bound<PyAny>,
-) -> PyResult<Py<PyAny>> {
-    let dirstate_mod = py.import("bzrformats.dirstate")?;
-    let py_update_entry = dirstate_mod.getattr("py_update_entry")?;
-    let result = py_update_entry.call1((state, entry, abspath, stat_value))?;
-    Ok(result.into())
 }
 
 /// Process entries for tree comparison.
@@ -365,7 +346,6 @@ fn py_dirblocks_to_entry_lines<'py>(
 /// Register the dirstate helper functions into the given module.
 pub fn register(m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(_read_dirblocks, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(update_entry, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(py_entry_to_line, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(py_dirblocks_to_entry_lines, m)?)?;
     m.add_class::<ProcessEntryC>()?;
