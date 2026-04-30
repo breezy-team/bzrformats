@@ -651,6 +651,210 @@ fn collect_bytes_vec(obj: &Bound<PyAny>) -> PyResult<Vec<Vec<u8>>> {
     Ok(out)
 }
 
+/// Collect a Python `set[bytes]` (or any iterable of bytes) into a
+/// `HashSet<Vec<u8>>`.
+fn collect_bytes_set(obj: &Bound<PyAny>) -> PyResult<std::collections::HashSet<Vec<u8>>> {
+    let mut out = std::collections::HashSet::new();
+    for item in obj.try_iter()? {
+        out.insert(item?.extract::<Vec<u8>>()?);
+    }
+    Ok(out)
+}
+
+/// Collect a Python `dict[bytes, bytes]` into a `HashMap<Vec<u8>, Vec<u8>>`.
+fn collect_bytes_map(d: &Bound<PyDict>) -> PyResult<std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+    let mut out = std::collections::HashMap::new();
+    for (k, v) in d.iter() {
+        out.insert(k.extract::<Vec<u8>>()?, v.extract::<Vec<u8>>()?);
+    }
+    Ok(out)
+}
+
+/// Decode a Python `[dirname_or_none, file_id_or_none]` list into the
+/// `Option<(Vec<u8>, Option<Vec<u8>>)>` shape
+/// [`bazaar::dirstate::ProcessEntryState::last_source_parent`] uses.
+fn decode_last_parent(lst: &Bound<PyList>) -> PyResult<Option<(Vec<u8>, Option<Vec<u8>>)>> {
+    if lst.len() < 2 {
+        return Ok(None);
+    }
+    let d = lst.get_item(0)?;
+    if d.is_none() {
+        return Ok(None);
+    }
+    let dirname: Vec<u8> = d.extract()?;
+    let f = lst.get_item(1)?;
+    let file_id: Option<Vec<u8>> = if f.is_none() {
+        None
+    } else {
+        Some(f.extract()?)
+    };
+    Ok(Some((dirname, file_id)))
+}
+
+/// Replace the contents of `target` with `source` — used when the
+/// pure-crate process_entry added new entries to its `search_specific_files`
+/// set that Python's ProcessEntryPython.search_specific_files needs to
+/// see.
+fn write_back_bytes_set(
+    target: &Bound<PyAny>,
+    source: &std::collections::HashSet<Vec<u8>>,
+) -> PyResult<()> {
+    target.call_method0("clear")?;
+    for item in source {
+        target.call_method1("add", (PyBytes::new(target.py(), item),))?;
+    }
+    Ok(())
+}
+
+fn write_back_bytes_map(
+    target: &Bound<PyDict>,
+    source: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+) -> PyResult<()> {
+    target.clear();
+    let py = target.py();
+    for (k, v) in source {
+        target.set_item(PyBytes::new(py, k), PyBytes::new(py, v))?;
+    }
+    Ok(())
+}
+
+fn write_back_last_parent(
+    target: &Bound<PyList>,
+    source: &Option<(Vec<u8>, Option<Vec<u8>>)>,
+) -> PyResult<()> {
+    let py = target.py();
+    while target.len() < 2 {
+        target.append(py.None())?;
+    }
+    match source {
+        Some((dn, fid)) => {
+            target.set_item(0, PyBytes::new(py, dn))?;
+            target.set_item(
+                1,
+                match fid {
+                    Some(b) => PyBytes::new(py, b).into_any(),
+                    None => py.None().into_bound(py),
+                },
+            )?;
+        }
+        None => {
+            target.set_item(0, py.None())?;
+            target.set_item(1, py.None())?;
+        }
+    }
+    Ok(())
+}
+
+/// Convert a Rust [`bazaar::dirstate::DirstateChange`] into the 9-tuple
+/// Python's `DirstateInventoryChange` constructor accepts, with path
+/// fields utf8-decoded using `surrogateescape`.
+fn dirstate_change_to_pytuple<'py>(
+    py: Python<'py>,
+    change: &bazaar::dirstate::DirstateChange,
+) -> PyResult<Bound<'py, PyTuple>> {
+    fn decode_bytes<'py>(py: Python<'py>, b: &Option<Vec<u8>>) -> PyResult<Py<PyAny>> {
+        match b {
+            None => Ok(py.None()),
+            Some(v) => {
+                // utf8 decode with surrogateescape, matching
+                // self.utf8_decode(..., "surrogateescape") in Python.
+                let py_bytes = PyBytes::new(py, v);
+                let s = py_bytes
+                    .call_method1("decode", ("utf-8", "surrogateescape"))?
+                    .unbind();
+                Ok(s)
+            }
+        }
+    }
+
+    let path_tuple = PyTuple::new(
+        py,
+        [
+            decode_bytes(py, &change.old_path)?,
+            decode_bytes(py, &change.new_path)?,
+        ],
+    )?;
+    let versioned_tuple = PyTuple::new(
+        py,
+        [
+            pyo3::types::PyBool::new(py, change.old_versioned)
+                .to_owned()
+                .into_any(),
+            pyo3::types::PyBool::new(py, change.new_versioned)
+                .to_owned()
+                .into_any(),
+        ],
+    )?;
+    let parent_tuple = PyTuple::new(
+        py,
+        [
+            match &change.source_parent_id {
+                Some(v) => PyBytes::new(py, v).into_any().unbind(),
+                None => py.None(),
+            },
+            match &change.target_parent_id {
+                Some(v) => PyBytes::new(py, v).into_any().unbind(),
+                None => py.None(),
+            },
+        ],
+    )?;
+    let name_tuple = PyTuple::new(
+        py,
+        [
+            decode_bytes(py, &change.old_basename)?,
+            decode_bytes(py, &change.new_basename)?,
+        ],
+    )?;
+    let kind_tuple = PyTuple::new(
+        py,
+        [
+            match &change.source_kind {
+                Some(s) => PyString::new(py, s).into_any().unbind(),
+                None => py.None(),
+            },
+            match &change.target_kind {
+                Some(s) => PyString::new(py, s).into_any().unbind(),
+                None => py.None(),
+            },
+        ],
+    )?;
+    let exec_tuple = PyTuple::new(
+        py,
+        [
+            match change.source_exec {
+                Some(b) => pyo3::types::PyBool::new(py, b)
+                    .to_owned()
+                    .into_any()
+                    .unbind(),
+                None => py.None(),
+            },
+            match change.target_exec {
+                Some(b) => pyo3::types::PyBool::new(py, b)
+                    .to_owned()
+                    .into_any()
+                    .unbind(),
+                None => py.None(),
+            },
+        ],
+    )?;
+    PyTuple::new(
+        py,
+        [
+            PyBytes::new(py, &change.file_id).into_any().unbind(),
+            path_tuple.into_any().unbind(),
+            pyo3::types::PyBool::new(py, change.content_change)
+                .to_owned()
+                .into_any()
+                .unbind(),
+            versioned_tuple.into_any().unbind(),
+            parent_tuple.into_any().unbind(),
+            name_tuple.into_any().unbind(),
+            kind_tuple.into_any().unbind(),
+            exec_tuple.into_any().unbind(),
+        ],
+    )
+}
+
 fn memory_state_to_py(state: bazaar::dirstate::MemoryState) -> i64 {
     use bazaar::dirstate::MemoryState;
     match state {
@@ -1092,6 +1296,176 @@ impl PyDirState {
                 other => pyo3::exceptions::PyRuntimeError::new_err(other.to_string()),
             })?;
         Ok(result.map(|v| PyBytes::new(py, &v)))
+    }
+
+    /// Compare one dirstate entry against what's on disk (or against
+    /// "absent on disk" when `path_info` is None).  Mirrors Python's
+    /// `ProcessEntryPython._process_entry`.
+    ///
+    /// Returns `(change_tuple | None, changed_or_None)`.  The change
+    /// tuple is the 9-field record Python's `DirstateInventoryChange`
+    /// constructor takes (with utf8 path fields already decoded on the
+    /// Rust side using surrogateescape).
+    ///
+    /// Caller-owned state dict/sets (passed in and mutated in place):
+    /// `searched_specific_files`, `search_specific_files`,
+    /// `old_dirname_to_file_id`, `new_dirname_to_file_id`,
+    /// `last_source_parent`, `last_target_parent`.
+    #[pyo3(signature = (
+        entry,
+        path_info,
+        source_index,
+        target_index,
+        include_unchanged,
+        searched_specific_files,
+        search_specific_files,
+        old_dirname_to_file_id,
+        new_dirname_to_file_id,
+        last_source_parent,
+        last_target_parent,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn process_entry<'py>(
+        &mut self,
+        py: Python<'py>,
+        entry: &Bound<PyAny>,
+        path_info: Option<&Bound<PyAny>>,
+        source_index: Option<usize>,
+        target_index: usize,
+        include_unchanged: bool,
+        searched_specific_files: &Bound<PyAny>,
+        search_specific_files: &Bound<PyAny>,
+        old_dirname_to_file_id: &Bound<PyDict>,
+        new_dirname_to_file_id: &Bound<PyDict>,
+        last_source_parent: &Bound<PyList>,
+        last_target_parent: &Bound<PyList>,
+    ) -> PyResult<(Option<Bound<'py, PyTuple>>, Option<bool>)> {
+        // Decode the entry tuple: ((dirname, basename, file_id),
+        // [tree_tuple, ...]).
+        let entry_tup = entry.cast::<PyTuple>()?;
+        let key_tup = entry_tup.get_item(0)?.cast_into::<PyTuple>()?;
+        let entry_key = bazaar::dirstate::EntryKey {
+            dirname: key_tup.get_item(0)?.extract()?,
+            basename: key_tup.get_item(1)?.extract()?,
+            file_id: key_tup.get_item(2)?.extract()?,
+        };
+        let trees_any = entry_tup.get_item(1)?;
+        let mut entry_trees: Vec<bazaar::dirstate::TreeData> = Vec::new();
+        for t in trees_any.try_iter()? {
+            let tt = t?.cast_into::<PyTuple>()?;
+            let mk_bytes: Vec<u8> = tt.get_item(0)?.extract()?;
+            entry_trees.push(bazaar::dirstate::TreeData {
+                minikind: mk_bytes.first().copied().unwrap_or(0),
+                fingerprint: tt.get_item(1)?.extract()?,
+                size: tt.get_item(2)?.extract()?,
+                executable: tt.get_item(3)?.extract()?,
+                packed_stat: tt.get_item(4)?.extract()?,
+            });
+        }
+
+        // Decode path_info. The 5-tuple shape Python uses is
+        // (top_relpath, basename, kind, stat, abspath).
+        let path_info_rs: Option<bazaar::dirstate::ProcessPathInfo> = if let Some(pi) = path_info {
+            if pi.is_none() {
+                None
+            } else {
+                let pt = pi.cast::<PyTuple>()?;
+                let kind_obj = pt.get_item(2)?;
+                let kind = if kind_obj.is_none() {
+                    None
+                } else {
+                    Some(kind_obj.extract::<String>()?)
+                };
+                let stat_obj = pt.get_item(3)?;
+                let abspath: Vec<u8> = {
+                    let a = pt.get_item(4)?;
+                    if let Ok(b) = a.extract::<Vec<u8>>() {
+                        b
+                    } else {
+                        a.extract::<String>()?.into_bytes()
+                    }
+                };
+                let stat = bazaar::dirstate::StatInfo {
+                    mode: stat_obj.getattr("st_mode")?.extract()?,
+                    size: stat_obj.getattr("st_size")?.extract()?,
+                    mtime: stat_obj.getattr("st_mtime")?.extract::<f64>()? as i64,
+                    ctime: stat_obj.getattr("st_ctime")?.extract::<f64>()? as i64,
+                    dev: stat_obj.getattr("st_dev")?.extract()?,
+                    ino: stat_obj.getattr("st_ino")?.extract()?,
+                };
+                Some(bazaar::dirstate::ProcessPathInfo {
+                    abspath,
+                    kind,
+                    stat,
+                })
+            }
+        } else {
+            None
+        };
+
+        // Build state from the Python-owned containers.
+        let mut pstate = bazaar::dirstate::ProcessEntryState {
+            source_index,
+            target_index,
+            include_unchanged,
+            searched_specific_files: collect_bytes_set(searched_specific_files)?,
+            search_specific_files: collect_bytes_set(search_specific_files)?,
+            new_dirname_to_file_id: collect_bytes_map(new_dirname_to_file_id)?,
+            old_dirname_to_file_id: collect_bytes_map(old_dirname_to_file_id)?,
+            last_source_parent: decode_last_parent(last_source_parent)?,
+            last_target_parent: decode_last_parent(last_target_parent)?,
+        };
+
+        // Transport: PyFileTransport is the only implementor we have
+        // on the pyo3 side, and process_entry only calls lstat /
+        // read_link on it (both go through os.* directly rather than
+        // the underlying file handle).  A dummy PyNone handle is
+        // therefore safe here.
+        let transport = PyFileTransport::new(
+            pyo3::types::PyNone::get(py).to_owned().into_any().unbind(),
+            bazaar::dirstate::LockState::Read,
+        );
+
+        let (change, changed) = self
+            .inner
+            .process_entry(
+                &mut pstate,
+                &entry_key,
+                &entry_trees,
+                path_info_rs.as_ref(),
+                &transport,
+            )
+            .map_err(|e| match e {
+                bazaar::dirstate::ProcessEntryError::DirstateCorrupt(msg) => {
+                    // `bzrformats.dirstate` re-exports its own
+                    // DirstateCorrupt subclass; breezy tests catch
+                    // that specific class, not the generic one in
+                    // bzrformats.errors.
+                    let ds_mod = py.import("bzrformats.dirstate").unwrap();
+                    let cls = ds_mod.getattr("DirstateCorrupt").unwrap();
+                    PyErr::from_value(cls.call1(("<unknown>", msg)).unwrap())
+                }
+                bazaar::dirstate::ProcessEntryError::BadFileKind { path, kind } => {
+                    let errors_mod = py.import("bzrformats.errors").unwrap();
+                    let cls = errors_mod.getattr("BadFileKindError").unwrap();
+                    PyErr::from_value(cls.call1((PyBytes::new(py, &path), kind)).unwrap())
+                }
+                bazaar::dirstate::ProcessEntryError::Internal(msg) => {
+                    pyo3::exceptions::PyAssertionError::new_err(msg)
+                }
+            })?;
+
+        // Write back mutable state to the Python containers.
+        write_back_bytes_set(search_specific_files, &pstate.search_specific_files)?;
+        write_back_bytes_map(old_dirname_to_file_id, &pstate.old_dirname_to_file_id)?;
+        write_back_bytes_map(new_dirname_to_file_id, &pstate.new_dirname_to_file_id)?;
+        write_back_last_parent(last_source_parent, &pstate.last_source_parent)?;
+        write_back_last_parent(last_target_parent, &pstate.last_target_parent)?;
+
+        let change_tuple = change
+            .map(|c| dirstate_change_to_pytuple(py, &c))
+            .transpose()?;
+        Ok((change_tuple, changed))
     }
 
     /// Read the dirstate header out of `state_file` and populate the

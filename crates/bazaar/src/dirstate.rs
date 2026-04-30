@@ -987,7 +987,8 @@ fn resolve_parent_id(
     let pid_raw = match cached {
         Some(v) => Some(v),
         None => {
-            let bei = get_block_entry_index(dirblocks, &[], old_dirname, source_index);
+            let (pdir, pbase) = split_path_utf8(old_dirname);
+            let bei = get_block_entry_index(dirblocks, pdir, pbase, source_index);
             if bei.path_present {
                 Some(
                     dirblocks[bei.block_index].entries[bei.entry_index]
@@ -1000,13 +1001,14 @@ fn resolve_parent_id(
             }
         }
     };
-    let pid = match pid_raw {
+    match pid_raw {
         Some(v) if v == entry_file_id => None,
-        Some(v) => Some(v),
+        Some(v) => {
+            *last_source_parent = Some((old_dirname.to_vec(), Some(v.clone())));
+            Some(v)
+        }
         None => None,
-    };
-    *last_source_parent = Some((old_dirname.to_vec(), pid.clone()));
-    pid
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1031,7 +1033,8 @@ fn resolve_target_parent_id(
     let pid_raw = match cached {
         Some(v) => Some(v),
         None => {
-            let bei = get_block_entry_index(dirblocks, &[], new_dirname, target_index);
+            let (pdir, pbase) = split_path_utf8(new_dirname);
+            let bei = get_block_entry_index(dirblocks, pdir, pbase, target_index);
             if bei.path_present {
                 Some(
                     dirblocks[bei.block_index].entries[bei.entry_index]
@@ -1047,13 +1050,14 @@ fn resolve_target_parent_id(
             }
         }
     };
-    let pid = match pid_raw {
-        Some(v) if v == entry_file_id => None,
-        Some(v) => Some(v),
-        None => None,
-    };
-    *last_target_parent = Some((new_dirname.to_vec(), pid.clone()));
-    Ok(pid)
+    match pid_raw {
+        Some(v) if v == entry_file_id => Ok(None),
+        Some(v) => {
+            *last_target_parent = Some((new_dirname.to_vec(), Some(v.clone())));
+            Ok(Some(v))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Errors returned by [`Transport`] operations.
@@ -2195,8 +2199,9 @@ impl DirState {
 
         if source_minikind == b'a' && fdlt(target_minikind) {
             let path = join_path(&entry_key.dirname, &entry_key.basename);
+            let (parent_dir, parent_base) = split_path_utf8(&entry_key.dirname);
             let parent_bei =
-                get_block_entry_index(&self.dirblocks, &Vec::new(), &entry_key.dirname, target_idx);
+                get_block_entry_index(&self.dirblocks, parent_dir, parent_base, target_idx);
             let parent_id: Option<Vec<u8>> = if parent_bei.path_present {
                 let pid = self.dirblocks[parent_bei.block_index].entries[parent_bei.entry_index]
                     .key
@@ -2257,8 +2262,8 @@ impl DirState {
         if fdlt(source_minikind) && target_minikind == b'a' {
             let old_path = join_path(&entry_key.dirname, &entry_key.basename);
             let src_idx = pstate.source_index.unwrap_or(0);
-            let parent_bei =
-                get_block_entry_index(&self.dirblocks, &Vec::new(), &entry_key.dirname, src_idx);
+            let (pdir, pbase) = split_path_utf8(&entry_key.dirname);
+            let parent_bei = get_block_entry_index(&self.dirblocks, pdir, pbase, src_idx);
             let parent_id: Option<Vec<u8>> = if parent_bei.path_present {
                 let pid = self.dirblocks[parent_bei.block_index].entries[parent_bei.entry_index]
                     .key
