@@ -3002,6 +3002,86 @@ impl DirState {
         Ok(())
     }
 
+    /// Change the file id of the root path. Mirrors Python's
+    /// `DirState.set_path_id`, which only supports `path=b""`.
+    ///
+    /// Python's original implementation called `_make_absent` on the
+    /// old root entry (which mutated the shared tree-0 slot to
+    /// NULL_PARENT_DETAILS when parent trees kept the entry alive)
+    /// and then called `update_minimal` with
+    /// `packed_stat=entry[1][0][4]`. The packed_stat observed by
+    /// `update_minimal` therefore depended on whether the mutation
+    /// had reset it: empty bytes when parents held the entry alive,
+    /// the original stat otherwise. This port reproduces that rule
+    /// explicitly.
+    pub fn set_path_id(&mut self, path: &[u8], new_id: &[u8]) -> Result<(), SetPathIdError> {
+        if !path.is_empty() {
+            return Err(SetPathIdError::NonRootPath);
+        }
+
+        // Locate the current root entry in tree 0. Python's
+        // `_get_entry(0, path_utf8=b"")` lookup.
+        let bei = get_block_entry_index(&self.dirblocks, b"", b"", 0);
+        if !bei.path_present {
+            // Root entry must exist; if it does not, the dirstate is
+            // malformed — report it rather than silently no-op.
+            return Err(SetPathIdError::Internal {
+                reason: "root entry missing".to_string(),
+            });
+        }
+        let entry = &self.dirblocks[bei.block_index].entries[bei.entry_index];
+        if entry.key.file_id == new_id {
+            return Ok(());
+        }
+
+        // Capture the data we need before make_absent mutates state.
+        let old_key = entry.key.clone();
+        let original_packed_stat = entry
+            .trees
+            .first()
+            .map(|t| t.packed_stat.clone())
+            .unwrap_or_default();
+        // If any parent tree kept the entry alive (minikind not in
+        // {a, r}), the legacy code's make_absent-in-place mutation
+        // reset packed_stat to empty bytes; update_minimal then stored
+        // NULLSTAT in the new row. Preserve that observable behaviour.
+        let parents_keep_entry = entry
+            .trees
+            .iter()
+            .skip(1)
+            .any(|t| t.minikind != b'a' && t.minikind != b'r');
+        let packed_stat = if parents_keep_entry {
+            Vec::new()
+        } else {
+            original_packed_stat
+        };
+
+        self.make_absent(&old_key)
+            .map_err(|e| SetPathIdError::Internal {
+                reason: format!("make_absent: {}", e),
+            })?;
+
+        let new_key = EntryKey {
+            dirname: Vec::new(),
+            basename: Vec::new(),
+            file_id: new_id.to_vec(),
+        };
+        let tree0 = TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat,
+        };
+        self.update_minimal(new_key, tree0, Some(b""), false)
+            .map_err(|e| SetPathIdError::Internal {
+                reason: format!("update_minimal: {}", e),
+            })?;
+
+        self.mark_modified(&[], false);
+        Ok(())
+    }
+
     /// Apply a sequence of "removals" to tree 0, mirroring Python's
     /// `DirState._apply_removals`. Each record is a
     /// `(file_id, path)` tuple; the method sorts them in reverse
@@ -4379,6 +4459,30 @@ impl std::fmt::Display for SplitRootError {
 }
 
 impl std::error::Error for SplitRootError {}
+
+/// Error returned by [`DirState::set_path_id`]. Mirrors the exceptions
+/// Python's `DirState.set_path_id` raises.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetPathIdError {
+    /// Only `set_path_id("", new_id)` is supported — Python raises
+    /// `NotImplementedError` for any non-root path.
+    NonRootPath,
+    /// Internal invariant violation surfaced by a helper call. Includes
+    /// the MakeAbsentError / BasisApplyError description, mapped to
+    /// Python's `AssertionError`.
+    Internal { reason: String },
+}
+
+impl std::fmt::Display for SetPathIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetPathIdError::NonRootPath => write!(f, "set_path_id only supports the root path"),
+            SetPathIdError::Internal { reason } => write!(f, "internal error: {}", reason),
+        }
+    }
+}
+
+impl std::error::Error for SetPathIdError {}
 
 /// Error returned by [`DirState::add`] when the requested add cannot be
 /// performed. Each variant mirrors one of the exceptions Python's
@@ -6783,6 +6887,60 @@ mod dirstate_struct_tests {
             )
             .unwrap_err();
         assert!(matches!(err, AddError::NotVersioned { .. }));
+    }
+
+    #[test]
+    fn set_path_id_rejects_non_root_path() {
+        let mut state = add_fixture();
+        let err = state.set_path_id(b"foo", b"new-id").unwrap_err();
+        assert!(matches!(err, SetPathIdError::NonRootPath));
+    }
+
+    #[test]
+    fn set_path_id_unchanged_id_is_noop() {
+        let mut state = add_fixture();
+        let before = state.dirblocks.clone();
+        state.set_path_id(b"", b"TREE_ROOT").expect("same-id noop");
+        assert_eq!(state.dirblocks, before);
+    }
+
+    #[test]
+    fn set_path_id_rewrites_root_and_preserves_packed_stat() {
+        let mut state = add_fixture();
+        // The root row's packed_stat is `b"x".repeat(32)` per
+        // add_fixture; no parent trees keep the entry alive, so the
+        // new row should carry the same packed_stat.
+        let original_packed_stat = state.dirblocks[0].entries[0].trees[0].packed_stat.clone();
+        state.set_path_id(b"", b"new-id").expect("set_path_id");
+        assert_eq!(state.dirblocks[0].entries.len(), 1);
+        let new_root = &state.dirblocks[0].entries[0];
+        assert_eq!(new_root.key.file_id, b"new-id");
+        assert_eq!(new_root.trees[0].minikind, b'd');
+        assert_eq!(new_root.trees[0].packed_stat, original_packed_stat);
+    }
+
+    #[test]
+    fn set_path_id_zeroes_packed_stat_when_parents_retain_entry() {
+        let mut state = add_fixture();
+        // Add a parent tree that still references the root row.
+        state.parents = vec![b"parent-rev".to_vec()];
+        state.dirblocks[0].entries[0].trees.push(TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: Vec::new(),
+        });
+        state.set_path_id(b"", b"new-id").expect("set_path_id");
+        let new_root = state
+            .dirblocks
+            .iter()
+            .flat_map(|b| b.entries.iter())
+            .find(|e| e.key.file_id == b"new-id")
+            .expect("new root entry");
+        // With parents holding the old row alive, Python's in-place
+        // mutation produced an empty packed_stat on the replacement.
+        assert_eq!(new_root.trees[0].packed_stat, b"");
     }
 
     /// Build a TreeData that looks like Python's

@@ -1210,6 +1210,22 @@ impl PyDirState {
         }
     }
 
+    /// Change the file id of the root path. Mirrors Python's
+    /// `DirState.set_path_id` for `path=b""` — any other path raises
+    /// `NotImplementedError`. Returns silently when `new_id` already
+    /// matches the current root id.
+    fn set_path_id(&mut self, path: &[u8], new_id: &[u8]) -> PyResult<()> {
+        match self.inner.set_path_id(path, new_id) {
+            Ok(()) => Ok(()),
+            Err(bazaar::dirstate::SetPathIdError::NonRootPath) => Err(
+                pyo3::exceptions::PyNotImplementedError::new_err("set_path_id non-root path"),
+            ),
+            Err(bazaar::dirstate::SetPathIdError::Internal { reason }) => {
+                Err(pyo3::exceptions::PyAssertionError::new_err(reason))
+            }
+        }
+    }
+
     /// Apply a sequence of "removals" to tree 0. Mirrors Python's
     /// `DirState._apply_removals`. Input is a Python iterable of
     /// `(file_id, path)` 2-tuples, matching the caller pattern

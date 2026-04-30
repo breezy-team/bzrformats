@@ -2025,22 +2025,12 @@ class DirState:
             file id (not unicode, and not None).
         """
         self._read_dirblocks_if_needed()
-        if len(path):
-            # TODO: logic not written
-            raise NotImplementedError(self.set_path_id)
-        # TODO: check new id is unique
-        entry = self._get_entry(0, path_utf8=path)
-        if entry[0][2] == new_id:
-            # Nothing to change.
-            return
         if not isinstance(new_id, bytes):
             raise AssertionError(f"must be a utf8 file_id not {type(new_id)}")
-        # mark the old path absent, and insert a new root path
-        self._make_absent(entry)
-        self.update_minimal(
-            (b"", b"", new_id), b"d", path_utf8=b"", packed_stat=entry[1][0][4]
-        )
-        self._mark_modified()
+        self._rs.dirblocks = self._dirblocks
+        self._rs.set_path_id(path, new_id)
+        self._dirblocks = self._rs.dirblocks
+        self._id_index = None
 
     def set_parent_trees(self, trees, ghosts):
         """Set the parent trees for the dirstate.
