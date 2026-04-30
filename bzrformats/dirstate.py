@@ -224,8 +224,6 @@ import contextlib
 import logging
 import os
 import stat
-import sys
-from stat import S_IEXEC
 
 from . import inventory, lock, osutils
 from .errors import (
@@ -931,37 +929,6 @@ class DirState:
         undetectably modified and so can't be cached.
         """
         return self._rs.compute_sha_cutoff_time()
-
-    @staticmethod
-    def _lstat(abspath, entry):
-        """Return the os.lstat value for this path."""
-        return os.lstat(abspath)
-
-    def _is_executable(self, mode, old_executable):
-        """Is this file executable?"""
-        if self._use_filesystem_for_exec:
-            return bool(S_IEXEC & mode)
-        else:
-            return old_executable
-
-    @staticmethod
-    def _read_link(abspath, old_link):
-        """Read the target of a symlink."""
-        # TODO: jam 200700301 On Win32, this could just return the value
-        #       already in memory. However, this really needs to be done at a
-        #       higher level, because there either won't be anything on disk,
-        #       or the thing on disk will be a file.
-        if isinstance(abspath, str):
-            # abspath is defined as the path to pass to lstat. readlink is
-            # buggy in python < 2.6 (it doesn't encode unicode path into FS
-            # encoding), so we need to encode ourselves knowing that unicode
-            # paths are produced by UnicodeDirReader on purpose.
-            abspath = os.fsencode(abspath)
-        target = os.readlink(abspath)
-        if sys.getfilesystemencoding() not in ("utf-8", "ascii"):
-            # Change encoding if needed
-            target = os.fsdecode(target).encode("UTF-8")
-        return target
 
     def get_ghosts(self):
         """Return a list of the parent tree revision ids that are ghosts."""
