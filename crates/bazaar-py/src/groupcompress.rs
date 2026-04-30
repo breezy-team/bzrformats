@@ -354,8 +354,9 @@ impl GroupCompressBlock {
 
     #[pyo3(signature = (size = None))]
     fn _ensure_content(&mut self, size: Option<usize>) -> PyResult<()> {
-        self.inner.ensure_content(size);
-        Ok(())
+        self.inner
+            .ensure_content(size)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     #[pyo3(signature = (include_text = None))]
@@ -1348,8 +1349,10 @@ impl LazyGroupContentManager {
     /// inner block content has been decompressed up to `_last_byte`.
     fn _prepare_for_extract(&self, py: Python<'_>) -> PyResult<()> {
         let mut block = self.block.borrow_mut(py);
-        block.inner.ensure_content(Some(self.last_byte as usize));
-        Ok(())
+        block
+            .inner
+            .ensure_content(Some(self.last_byte as usize))
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     #[classmethod]

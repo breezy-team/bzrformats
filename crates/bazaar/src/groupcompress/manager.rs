@@ -185,8 +185,10 @@ pub struct FactoryState {
 pub fn trim_block(
     block: &mut crate::groupcompress::block::GroupCompressBlock,
     last_byte: usize,
-) -> Result<crate::groupcompress::block::GroupCompressBlock, &'static str> {
-    block.ensure_content(Some(last_byte));
+) -> Result<crate::groupcompress::block::GroupCompressBlock, String> {
+    block
+        .ensure_content(Some(last_byte))
+        .map_err(|e| e.to_string())?;
     let content = block.content().ok_or("block has no content")?;
     let trimmed = content[..last_byte].to_vec();
     let mut new = crate::groupcompress::block::GroupCompressBlock::new();

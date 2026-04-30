@@ -243,7 +243,7 @@ impl GroupCompressBlock {
     ///
     /// # Arguments
     /// * `num_bytes` - Ensure that we have extracted at least num_bytes of content. If None, consume everything
-    pub fn ensure_content(&mut self, num_bytes: Option<usize>) {
+    pub fn ensure_content(&mut self, num_bytes: Option<usize>) -> Result<(), Error> {
         assert!(
             self.content_length.is_some(),
             "self.content_length should never be None"
@@ -293,7 +293,7 @@ impl GroupCompressBlock {
             if self.content.as_ref().unwrap().len() >= self.content_length.unwrap_or(0) {
                 self.z_content_decompressor = None;
             }
-            return;
+            return Ok(());
         }
 
         num_bytes -= self.content.as_ref().unwrap().len();
@@ -302,8 +302,7 @@ impl GroupCompressBlock {
         self.z_content_decompressor
             .as_mut()
             .unwrap()
-            .read_exact(&mut buf)
-            .unwrap();
+            .read_exact(&mut buf)?;
         self.content.as_mut().unwrap().extend(buf);
 
         // If we've now pulled out the whole thing, drop the streaming
@@ -312,6 +311,7 @@ impl GroupCompressBlock {
         if self.content.as_ref().unwrap().len() >= self.content_length.unwrap_or(0) {
             self.z_content_decompressor = None;
         }
+        Ok(())
     }
 
     #[allow(clippy::len_without_is_empty)]
@@ -406,7 +406,7 @@ impl GroupCompressBlock {
         if start == 0 && end == 0 {
             return Ok(vec![]);
         }
-        self.ensure_content(Some(end));
+        self.ensure_content(Some(end))?;
 
         let content = self.content.as_ref().unwrap();
         if end > content.len() || start >= end {
@@ -541,7 +541,7 @@ impl GroupCompressBlock {
     /// `Insert { length, text }`.
     pub fn dump(&mut self, include_text: Option<bool>) -> Result<Vec<DumpInfo>, Error> {
         let include_text = include_text.unwrap_or(false);
-        self.ensure_content(None);
+        self.ensure_content(None)?;
         let mut result = vec![];
         let mut content = self.content.as_ref().unwrap().as_slice();
         while !content.is_empty() {
