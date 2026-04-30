@@ -237,7 +237,6 @@ from .errors import (
     LockNotHeld,
     ObjectNotLocked,
 )
-from .osutils import is_inside, is_inside_any, parent_directories
 
 logger = logging.getLogger("bzrformats.dirstate")
 evil_logger = logging.getLogger("bzrformats.evil")
@@ -1656,61 +1655,18 @@ class ProcessEntryPython:
         self.want_unversioned = want_unversioned
         self.tree = tree
 
-    def _process_entry(self, entry, path_info, pathjoin=osutils.pathjoin):
-        """Compare an entry and real disk to generate delta information.
-
-        Delegates the decision tree to Rust; state sets/dicts are
-        threaded through and mutated in place.
-        """
-        change_tuple, changed = self.state._rs.process_entry(
-            entry,
-            path_info,
-            self.source_index,
-            self.target_index,
-            self.include_unchanged,
-            self.searched_specific_files,
-            self.search_specific_files,
-            self.old_dirname_to_file_id,
-            self.new_dirname_to_file_id,
-            self.last_source_parent,
-            self.last_target_parent,
-        )
-        if change_tuple is None:
-            return None, changed
-        return DirstateInventoryChange(*change_tuple), changed
-
     def __iter__(self):
         """Return iterator for processing entries."""
         return self.iter_changes()
-
-    def _gather_result_for_consistency(self, result):
-        """Check a result we will yield to make sure we are consistent later.
-
-        This gathers result's parents into a set to output later.
-
-        :param result: A result tuple.
-        """
-        if not self.partial or not result.file_id:
-            return
-        self.seen_ids.add(result.file_id)
-        new_path = result.path[1]
-        if new_path:
-            # Not the root and not a delete: queue up the parents of the path.
-            self.search_specific_file_parents.update(
-                p.encode("utf8", "surrogateescape")
-                for p in parent_directories(new_path)
-            )
-            # Add the root directory which parent_directories does not
-            # provide.
-            self.search_specific_file_parents.add(b"")
 
     def iter_changes(self):
         """Iterate over the changes.
 
         Thin forwarder to the pure-crate IterChangesIter, which runs
-        the full walk + ``_gather_result_for_consistency`` +
-        ``_iter_specific_file_parents`` state machine and yields
-        :class:`DirstateInventoryChange` tuples one at a time.
+        the full walk, per-entry comparison, parent-consistency
+        gathering, and specific-file-parents drain as a single
+        state machine.  Yields :class:`DirstateInventoryChange`
+        tuples one at a time.
         """
         if self.state is None:
             # Empty-state callers (the iterator-protocol regression
@@ -1748,129 +1704,6 @@ class ProcessEntryPython:
             self.searched_exact_paths = rs_iter.searched_exact_paths
             self.search_specific_file_parents = rs_iter.search_specific_file_parents
             self.seen_ids = rs_iter.seen_ids
-
-    def _iter_specific_file_parents(self):
-        """Iter over the specific file parents."""
-        while self.search_specific_file_parents:
-            # Process the parent directories for the paths we were iterating.
-            # Even in extremely large trees this should be modest, so currently
-            # no attempt is made to optimise.
-            path_utf8 = self.search_specific_file_parents.pop()
-            if is_inside_any(self.searched_specific_files, path_utf8):
-                # We've examined this path.
-                continue
-            if path_utf8 in self.searched_exact_paths:
-                # We've examined this path.
-                continue
-            path_entries = self.state._entries_for_path(path_utf8)
-            # We need either one or two entries. If the path in
-            # self.target_index has moved (so the entry in source_index is in
-            # 'ar') then we need to also look for the entry for this path in
-            # self.source_index, to output the appropriate delete-or-rename.
-            selected_entries = []
-            found_item = False
-            for candidate_entry in path_entries:
-                # Find entries present in target at this path:
-                if candidate_entry[1][self.target_index][0] not in (b"a", b"r"):
-                    found_item = True
-                    selected_entries.append(candidate_entry)
-                # Find entries present in source at this path:
-                elif self.source_index is not None and candidate_entry[1][
-                    self.source_index
-                ][0] not in (b"a", b"r"):
-                    found_item = True
-                    if candidate_entry[1][self.target_index][0] == b"a":
-                        # Deleted, emit it here.
-                        selected_entries.append(candidate_entry)
-                    else:
-                        # renamed, emit it when we process the directory it
-                        # ended up at.
-                        self.search_specific_file_parents.add(
-                            candidate_entry[1][self.target_index][1]
-                        )
-            if not found_item:
-                raise AssertionError(
-                    "Missing entry for specific path parent {!r}, {!r}".format(
-                        path_utf8, path_entries
-                    )
-                )
-            path_info = self._path_info(path_utf8, path_utf8.decode("utf8"))
-            for entry in selected_entries:
-                if entry[0][2] in self.seen_ids:
-                    continue
-                result, changed = self._process_entry(entry, path_info)
-                if changed is None:
-                    raise AssertionError(
-                        "Got entry<->path mismatch for specific path "
-                        f"{path_utf8!r} entry {entry!r} path_info {path_info!r} "
-                    )
-                # Only include changes - we're outside the users requested
-                # expansion.
-                if changed:
-                    self._gather_result_for_consistency(result)
-                    if result.kind[0] == "directory" and result.kind[1] != "directory":
-                        # This stopped being a directory, the old children have
-                        # to be included.
-                        if entry[1][self.source_index][0] == b"r":
-                            # renamed, take the source path
-                            entry_path_utf8 = entry[1][self.source_index][1]
-                        else:
-                            entry_path_utf8 = path_utf8
-                        initial_key = (entry_path_utf8, b"", b"")
-                        block_index, _ = self.state._find_block_index_from_key(
-                            initial_key
-                        )
-                        if block_index == 0:
-                            # The children of the root are in block index 1.
-                            block_index += 1
-                        current_block = None
-                        if block_index < len(self.state._dirblocks):
-                            current_block = self.state._dirblocks[block_index]
-                            if not is_inside(entry_path_utf8, current_block[0]):
-                                # No entries for this directory at all.
-                                current_block = None
-                        if current_block is not None:
-                            for entry in current_block[1]:
-                                if entry[1][self.source_index][0] in (b"a", b"r"):
-                                    # Not in the source tree, so doesn't have to be
-                                    # included.
-                                    continue
-                                # Path of the entry itself.
-
-                                self.search_specific_file_parents.add(
-                                    osutils.pathjoin(*entry[0][:2])
-                                )
-                if changed or self.include_unchanged:
-                    yield result
-            self.searched_exact_paths.add(path_utf8)
-
-    def _path_info(self, utf8_path, unicode_path):
-        """Generate path_info for unicode_path.
-
-        :return: None if unicode_path does not exist, or a path_info tuple.
-        """
-        abspath = self.tree.abspath(unicode_path)
-        try:
-            stat = os.lstat(abspath)
-        except FileNotFoundError:
-            # the path does not exist.
-            return None
-        utf8_basename = utf8_path.rsplit(b"/", 1)[-1]
-        dir_info = (
-            utf8_path,
-            utf8_basename,
-            osutils.file_kind_from_stat_mode(stat.st_mode),
-            stat,
-            abspath,
-        )
-        if dir_info[2] == "directory":
-            if self.tree._directory_is_tree_reference(unicode_path):
-                self.root_dir_info = (
-                    self.root_dir_info[:2]
-                    + ("tree-reference",)
-                    + self.root_dir_info[3:]
-                )
-        return dir_info
 
 
 from ._bzr_rs import dirstate as _dirstate_rs
