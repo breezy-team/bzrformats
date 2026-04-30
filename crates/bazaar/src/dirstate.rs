@@ -5775,6 +5775,59 @@ impl DirState {
     ///   4. Replace `parents[0]` with `new_revid`.
     ///   5. Apply the pre-flattened, pre-sorted delta.
     ///   6. Mark modified and clear id_index.
+    /// High-level entry point taking a native
+    /// [`crate::inventory_delta::InventoryDelta`] directly — does the
+    /// per-row file_id validation + inv_entry flattening Python's
+    /// shim used to do before calling into Rust, then dispatches to
+    /// [`DirState::update_basis_by_delta`].
+    pub fn update_basis_by_delta_from_inventory_delta(
+        &mut self,
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revid: Vec<u8>,
+    ) -> Result<(), BasisApplyError> {
+        let mut flat: Vec<FlatBasisDeltaEntry> = Vec::with_capacity(delta.len());
+        for row in delta.iter() {
+            let file_id_bytes = row.file_id.as_bytes().to_vec();
+
+            if let Some(ref entry) = row.new_entry {
+                if entry.file_id().as_bytes() != row.file_id.as_bytes() {
+                    let new_path_bytes = row.new_path.as_deref().unwrap_or("").as_bytes().to_vec();
+                    return Err(BasisApplyError::MismatchedEntryFileId {
+                        new_path: new_path_bytes,
+                        file_id: file_id_bytes,
+                        entry_debug: format!("{:?}", entry),
+                    });
+                }
+            }
+
+            let (np_bytes, parent_id): (Option<Vec<u8>>, Option<Vec<u8>>) =
+                match row.new_path.as_deref() {
+                    None => (None, None),
+                    Some(p) => {
+                        let entry = row.new_entry.as_ref().ok_or_else(|| {
+                            BasisApplyError::NewPathWithoutEntry {
+                                new_path: p.as_bytes().to_vec(),
+                                file_id: file_id_bytes.clone(),
+                            }
+                        })?;
+                        let pid = entry.parent_id().map(|fid| fid.as_bytes().to_vec());
+                        (Some(p.as_bytes().to_vec()), pid)
+                    }
+                };
+            let op_bytes: Option<Vec<u8>> = row.old_path.as_deref().map(|p| p.as_bytes().to_vec());
+            let details = row.new_entry.as_ref().map(|e| inv_entry_to_details(e));
+
+            flat.push(FlatBasisDeltaEntry {
+                old_path: op_bytes,
+                new_path: np_bytes,
+                file_id: file_id_bytes,
+                parent_id,
+                details,
+            });
+        }
+        self.update_basis_by_delta(flat, new_revid)
+    }
+
     pub fn update_basis_by_delta(
         &mut self,
         entries: Vec<FlatBasisDeltaEntry>,
@@ -5948,6 +6001,54 @@ impl DirState {
     /// 4. calls `check_delta_ids_absent`, `apply_removals`,
     ///    `apply_insertions`, and `after_delta_check_parents` in
     ///    order — matching Python's try/except block exactly.
+    /// High-level entry point taking a native
+    /// [`crate::inventory_delta::InventoryDelta`] directly — does the
+    /// per-row flattening Python's shim used to do and dispatches to
+    /// [`DirState::update_by_delta`].
+    pub fn update_by_delta_from_inventory_delta(
+        &mut self,
+        delta: &crate::inventory_delta::InventoryDelta,
+    ) -> Result<(), BasisApplyError> {
+        let mut flat: Vec<FlatDeltaEntry> = Vec::with_capacity(delta.len());
+        for row in delta.iter() {
+            let file_id_bytes = row.file_id.as_bytes().to_vec();
+            let op_bytes: Option<Vec<u8>> = row.old_path.as_deref().map(|p| p.as_bytes().to_vec());
+            let (np_bytes, parent_id, minikind, executable, fingerprint): (
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                u8,
+                bool,
+                Vec<u8>,
+            ) = match row.new_path.as_deref() {
+                None => (None, None, b'a', false, Vec::new()),
+                Some(p) => {
+                    let entry = row.new_entry.as_ref().ok_or_else(|| {
+                        BasisApplyError::NewPathWithoutEntry {
+                            new_path: p.as_bytes().to_vec(),
+                            file_id: file_id_bytes.clone(),
+                        }
+                    })?;
+                    let pid = entry.parent_id().map(|fid| fid.as_bytes().to_vec());
+                    let details = inv_entry_to_details(entry);
+                    let mk = details.0;
+                    let fp = if mk == b't' { details.1 } else { Vec::new() };
+                    let ex = details.3;
+                    (Some(p.as_bytes().to_vec()), pid, mk, ex, fp)
+                }
+            };
+            flat.push(FlatDeltaEntry {
+                old_path: op_bytes,
+                new_path: np_bytes,
+                file_id: file_id_bytes,
+                parent_id,
+                minikind,
+                executable,
+                fingerprint,
+            });
+        }
+        self.update_by_delta(flat)
+    }
+
     pub fn update_by_delta(&mut self, entries: Vec<FlatDeltaEntry>) -> Result<(), BasisApplyError> {
         use std::collections::{BTreeSet, HashMap};
 
@@ -7251,6 +7352,19 @@ pub enum BasisApplyError {
     /// `NotVersionedError` raised from `_find_block` when called
     /// without `add_if_missing`.
     NotVersioned { path: Vec<u8> },
+    /// An `InventoryDeltaEntry` supplied a `new_entry` whose
+    /// `file_id` disagrees with the delta row's own `file_id`.
+    /// Python raises this as `InconsistentDelta(new_path, file_id,
+    /// "mismatched entry file_id …")`.
+    MismatchedEntryFileId {
+        new_path: Vec<u8>,
+        file_id: Vec<u8>,
+        entry_debug: String,
+    },
+    /// The delta row has `new_path` but no accompanying `new_entry`.
+    /// Python raises this as `InconsistentDelta(new_path, file_id,
+    /// "new_path with no entry")`.
+    NewPathWithoutEntry { new_path: Vec<u8>, file_id: Vec<u8> },
 }
 
 /// A pre-flattened inventory-delta row passed to
@@ -7316,6 +7430,22 @@ impl std::fmt::Display for BasisApplyError {
             BasisApplyError::Internal { reason } => write!(f, "internal error: {}", reason),
             BasisApplyError::NotVersioned { path } => {
                 write!(f, "not versioned: {:?}", path)
+            }
+            BasisApplyError::MismatchedEntryFileId {
+                new_path,
+                file_id,
+                entry_debug,
+            } => write!(
+                f,
+                "mismatched entry file_id at {:?} ({:?}): {}",
+                new_path, file_id, entry_debug
+            ),
+            BasisApplyError::NewPathWithoutEntry { new_path, file_id } => {
+                write!(
+                    f,
+                    "new_path with no entry at {:?} ({:?})",
+                    new_path, file_id
+                )
             }
         }
     }

@@ -2392,112 +2392,43 @@ impl PyDirState {
             .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))
     }
 
-    /// Apply a pre-flattened inventory delta to tree 1. Mirrors
-    /// Python's `DirState.update_basis_by_delta`. Input is a Python
-    /// iterable of 5-tuples:
-    /// `(old_path, new_path, file_id, parent_id, details)` where
-    /// `details` is either None (delete) or the 5-tuple returned by
-    /// `inv_entry_to_details`: `(minikind, fingerprint, size,
-    /// executable, tree_data)`.
-    ///
-    /// The caller is responsible for pre-sorting and checking the
-    /// delta. Rust handles the rest: discard_merge_parents, ghost
-    /// rejection, new-parent bootstrap, parent[0] replacement,
-    /// delta application, and marking the dirstate modified.
+    /// Apply an inventory delta to tree 1.  Mirrors Python's
+    /// `DirState.update_basis_by_delta` end-to-end: takes the raw
+    /// `InventoryDelta` pyclass directly (no Python-side flattening),
+    /// validates each row's `file_id` against its `new_entry`, and
+    /// dispatches to the Rust applier.
     fn update_basis_by_delta(
         &mut self,
-        entries: &Bound<PyAny>,
+        py: Python<'_>,
+        delta: &crate::inventory::InventoryDelta,
         new_revid: Vec<u8>,
     ) -> PyResult<()> {
-        let mut rust_entries: Vec<bazaar::dirstate::FlatBasisDeltaEntry> = Vec::new();
-        for item in entries.try_iter()? {
-            let tup = item?.cast_into::<PyTuple>()?;
-            if tup.len() != 5 {
-                return Err(PyTypeError::new_err(
-                    "update_basis_by_delta entries must be 5-tuples",
-                ));
-            }
-            let old_path: Option<Vec<u8>> = tup.get_item(0)?.extract()?;
-            let new_path: Option<Vec<u8>> = tup.get_item(1)?.extract()?;
-            let file_id: Vec<u8> = tup.get_item(2)?.extract()?;
-            let parent_id: Option<Vec<u8>> = tup.get_item(3)?.extract()?;
-            let details_obj = tup.get_item(4)?;
-            let details = if details_obj.is_none() {
-                None
-            } else {
-                let dtup = details_obj.cast_into::<PyTuple>()?;
-                if dtup.len() != 5 {
-                    return Err(PyTypeError::new_err("details must be a 5-tuple or None"));
-                }
-                let mk_bytes: Vec<u8> = dtup.get_item(0)?.extract()?;
-                let mk = *mk_bytes
-                    .first()
-                    .ok_or_else(|| PyTypeError::new_err("minikind must be non-empty"))?;
-                let fp: Vec<u8> = dtup.get_item(1)?.extract()?;
-                let sz: u64 = dtup.get_item(2)?.extract()?;
-                let ex: bool = dtup.get_item(3)?.extract()?;
-                let td: Vec<u8> = dtup.get_item(4)?.extract()?;
-                Some((mk, fp, sz, ex, td))
-            };
-            rust_entries.push(bazaar::dirstate::FlatBasisDeltaEntry {
-                old_path,
-                new_path,
-                file_id,
-                parent_id,
-                details,
-            });
-        }
-        match self.inner.update_basis_by_delta(rust_entries, new_revid) {
+        match self
+            .inner
+            .update_basis_by_delta_from_inventory_delta(&delta.0, new_revid)
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.inner.changes_aborted = true;
-                Err(self.raise_basis_apply_error(entries.py(), e))
+                Err(self.raise_basis_apply_error(py, e))
             }
         }
     }
 
     /// Apply a pre-flattened inventory delta to tree 0. Mirrors
     /// Python's `DirState.update_by_delta`. Input is a Python
-    /// iterable of 7-tuples:
-    /// `(old_path, new_path, file_id, parent_id, minikind,
-    /// executable, fingerprint)` with `old_path`, `new_path`, and
-    /// `parent_id` optional (None for missing). Python handles delta
-    /// `.check()`/`.sort()` and `inv_entry` attribute extraction
-    /// before calling this method.
-    fn update_by_delta(&mut self, entries: &Bound<PyAny>) -> PyResult<()> {
-        let mut rust_entries: Vec<bazaar::dirstate::FlatDeltaEntry> = Vec::new();
-        for item in entries.try_iter()? {
-            let tup = item?.cast_into::<PyTuple>()?;
-            if tup.len() != 7 {
-                return Err(PyTypeError::new_err(
-                    "update_by_delta entries must be 7-tuples",
-                ));
-            }
-            let old_path: Option<Vec<u8>> = tup.get_item(0)?.extract()?;
-            let new_path: Option<Vec<u8>> = tup.get_item(1)?.extract()?;
-            let file_id: Vec<u8> = tup.get_item(2)?.extract()?;
-            let parent_id: Option<Vec<u8>> = tup.get_item(3)?.extract()?;
-            let minikind_bytes: Vec<u8> = tup.get_item(4)?.extract()?;
-            let minikind = *minikind_bytes
-                .first()
-                .ok_or_else(|| PyTypeError::new_err("minikind must be non-empty"))?;
-            let executable: bool = tup.get_item(5)?.extract()?;
-            let fingerprint: Vec<u8> = tup.get_item(6)?.extract()?;
-            rust_entries.push(bazaar::dirstate::FlatDeltaEntry {
-                old_path,
-                new_path,
-                file_id,
-                parent_id,
-                minikind,
-                executable,
-                fingerprint,
-            });
-        }
-        match self.inner.update_by_delta(rust_entries) {
+    /// Apply an inventory delta to tree 0.  Takes an `InventoryDelta`
+    /// pyclass; Rust does the per-row flattening and dispatch.
+    fn update_by_delta(
+        &mut self,
+        py: Python<'_>,
+        delta: &crate::inventory::InventoryDelta,
+    ) -> PyResult<()> {
+        match self.inner.update_by_delta_from_inventory_delta(&delta.0) {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.inner.changes_aborted = true;
-                Err(self.raise_basis_apply_error(entries.py(), e))
+                Err(self.raise_basis_apply_error(py, e))
             }
         }
     }
@@ -2929,6 +2860,45 @@ impl PyDirState {
             }
             bazaar::dirstate::BasisApplyError::NotVersioned { path } => {
                 NotVersionedError::new_err((PyBytes::new(py, &path).unbind(), ""))
+            }
+            bazaar::dirstate::BasisApplyError::MismatchedEntryFileId {
+                new_path,
+                file_id,
+                entry_debug,
+            } => {
+                self.inner.changes_aborted = true;
+                let errors_mod = match py.import("bzrformats.errors") {
+                    Ok(m) => m,
+                    Err(e) => return e,
+                };
+                let cls = match errors_mod.getattr("InconsistentDelta") {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                let path_bytes = PyBytes::new(py, &new_path);
+                let file_id_bytes = PyBytes::new(py, &file_id);
+                let reason = format!("mismatched entry file_id {}", entry_debug);
+                match cls.call1((path_bytes, file_id_bytes, reason)) {
+                    Ok(instance) => PyErr::from_value(instance),
+                    Err(e) => e,
+                }
+            }
+            bazaar::dirstate::BasisApplyError::NewPathWithoutEntry { new_path, file_id } => {
+                self.inner.changes_aborted = true;
+                let errors_mod = match py.import("bzrformats.errors") {
+                    Ok(m) => m,
+                    Err(e) => return e,
+                };
+                let cls = match errors_mod.getattr("InconsistentDelta") {
+                    Ok(c) => c,
+                    Err(e) => return e,
+                };
+                let path_bytes = PyBytes::new(py, &new_path);
+                let file_id_bytes = PyBytes::new(py, &file_id);
+                match cls.call1((path_bytes, file_id_bytes, "new_path with no entry")) {
+                    Ok(instance) => PyErr::from_value(instance),
+                    Err(e) => e,
+                }
             }
         }
     }

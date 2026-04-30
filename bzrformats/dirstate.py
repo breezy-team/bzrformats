@@ -231,7 +231,6 @@ from stat import S_IEXEC
 from . import inventory, lock, osutils
 from .errors import (
     BzrFormatsError,
-    InconsistentDelta,
     LockContention,
     LockNotHeld,
     ObjectNotLocked,
@@ -804,29 +803,7 @@ class DirState:
         self._read_dirblocks_if_needed()
         delta.check()
         delta.sort()
-        flat = []
-        for old_path, new_path, file_id, inv_entry in delta:
-            if not isinstance(file_id, bytes):
-                raise AssertionError(f"must be a utf8 file_id not {type(file_id)}")
-            op = old_path.encode("utf-8") if old_path is not None else None
-            if new_path is not None:
-                if inv_entry is None:
-                    self._raise_invalid(new_path, file_id, "new_path with no entry")
-                np = new_path.encode("utf-8")
-                parent_id = inv_entry.parent_id
-                minikind = DirState._kind_to_minikind[inv_entry.kind]
-                fingerprint = (
-                    (inv_entry.reference_revision or b"") if minikind == b"t" else b""
-                )
-                executable = inv_entry.executable
-            else:
-                np = None
-                parent_id = None
-                minikind = b"a"
-                fingerprint = b""
-                executable = False
-            flat.append((op, np, file_id, parent_id, minikind, executable, fingerprint))
-        self._rs.update_by_delta(flat)
+        self._rs.update_by_delta(delta)
         self._id_index = None
 
     def _apply_removals(self, removals):
@@ -855,28 +832,7 @@ class DirState:
         self._read_dirblocks_if_needed()
         delta.check()
         delta.sort()
-        inv_to_entry = _inv_entry_to_details
-        flat = []
-        for old_path, new_path, file_id, inv_entry in delta:
-            if file_id.__class__ is not bytes:
-                raise AssertionError(f"must be a utf8 file_id not {type(file_id)}")
-            if inv_entry is not None and file_id != inv_entry.file_id:
-                self._raise_invalid(
-                    new_path, file_id, f"mismatched entry file_id {inv_entry!r}"
-                )
-            if new_path is None:
-                np = None
-                parent_id = None
-            else:
-                if inv_entry is None:
-                    self._raise_invalid(new_path, file_id, "new_path with no entry")
-                np = new_path.encode("utf-8")
-                parent_id = inv_entry.parent_id
-            op = None if old_path is None else old_path.encode("utf-8")
-            details = None if inv_entry is None else inv_to_entry(inv_entry)
-            flat.append((op, np, file_id, parent_id, details))
-
-        self._rs.update_basis_by_delta(flat, new_revid)
+        self._rs.update_basis_by_delta(delta, new_revid)
         self._id_index = None
 
     def _check_delta_ids_absent(self, new_ids, tree_index):
@@ -884,10 +840,6 @@ class DirState:
         if not new_ids:
             return
         self._rs.check_delta_ids_absent(list(new_ids), tree_index)
-
-    def _raise_invalid(self, path, file_id, reason):
-        self._changes_aborted = True
-        raise InconsistentDelta(path, file_id, reason)
 
     def _update_basis_apply_adds(self, adds):
         """Apply a sequence of adds to tree 1 during update_basis_by_delta.
