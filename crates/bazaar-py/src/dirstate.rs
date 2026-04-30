@@ -1547,13 +1547,23 @@ impl PyDirState {
             None
         };
 
-        // Build state from the Python-owned containers.
+        // Build state from the Python-owned containers.  iter_changes
+        // uses a richer ProcessEntryState; for process_entry (which
+        // is called per-entry by Python's ProcessEntryPython loop)
+        // the walk-only fields are unused.
         let mut pstate = bazaar::dirstate::ProcessEntryState {
             source_index,
             target_index,
             include_unchanged,
+            want_unversioned: false,
+            partial: false,
+            supports_tree_reference: false,
+            root_abspath: Vec::new(),
             searched_specific_files: collect_bytes_set(searched_specific_files)?,
             search_specific_files: collect_bytes_set(search_specific_files)?,
+            search_specific_file_parents: std::collections::HashSet::new(),
+            searched_exact_paths: std::collections::HashSet::new(),
+            seen_ids: std::collections::HashSet::new(),
             new_dirname_to_file_id: collect_bytes_map(new_dirname_to_file_id)?,
             old_dirname_to_file_id: collect_bytes_map(old_dirname_to_file_id)?,
             last_source_parent: decode_last_parent(last_source_parent)?,

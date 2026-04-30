@@ -861,11 +861,35 @@ pub struct ProcessEntryState {
     pub target_index: usize,
     /// Whether unchanged entries should still yield a change tuple.
     pub include_unchanged: bool,
+    /// Whether the iter_changes caller wants reports for paths on
+    /// disk that aren't in either source or target dirstate trees.
+    pub want_unversioned: bool,
+    /// Partial iter_changes: true when the caller supplied a
+    /// narrower set of paths than `{b""}`.  Used by
+    /// `_gather_result_for_consistency` to decide whether to queue
+    /// parent-directory bookkeeping.
+    pub partial: bool,
+    /// Whether the current working-tree format supports tree
+    /// references.  When false, `is_tree_reference_dir` is never
+    /// called during the walk.
+    pub supports_tree_reference: bool,
+    /// Absolute path of the working-tree root on disk.  Used to
+    /// join `root + relpath` into an absolute path that `Transport`
+    /// methods can accept.  Filled at `iter_changes` call time.
+    pub root_abspath: Vec<u8>,
     /// Paths whose children have already been walked.
     pub searched_specific_files: std::collections::HashSet<Vec<u8>>,
     /// Paths whose children still need walking (driven by the
     /// outer `iter_changes` loop).
     pub search_specific_files: std::collections::HashSet<Vec<u8>>,
+    /// Parent directories we need to re-visit after the main walk
+    /// — populated by `_gather_result_for_consistency` when a
+    /// partial iter_changes produces a relocated entry.
+    pub search_specific_file_parents: std::collections::HashSet<Vec<u8>>,
+    /// Paths we've examined via `_iter_specific_file_parents`.
+    pub searched_exact_paths: std::collections::HashSet<Vec<u8>>,
+    /// File ids we've already yielded during the main walk.
+    pub seen_ids: std::collections::HashSet<Vec<u8>>,
     /// Cache: dirname → file_id for the *target* tree.
     pub new_dirname_to_file_id: std::collections::HashMap<Vec<u8>, Vec<u8>>,
     /// Cache: dirname → file_id for the *source* tree.
@@ -1184,40 +1208,43 @@ pub struct WalkedDir {
 /// mutates the returned `entries` list before the next call to
 /// prune directories from the descent (matching how the Python
 /// walker mutates the yielded dirblock list in place).
-pub struct WalkDirsUtf8<'t> {
-    transport: &'t dyn Transport,
+pub struct WalkDirsUtf8 {
     /// Stack of (relpath, abspath) pairs still to visit.  Most
     /// recently discovered directories are on top so the walk is
     /// depth-first matching Python's behaviour.
-    pending: Vec<(Vec<u8>, Vec<u8>)>,
+    pub pending: Vec<(Vec<u8>, Vec<u8>)>,
     /// Last-yielded directory's children, filtered down to surviving
     /// subdirectories that still need recursion.  Reset on every
     /// call to `next_dir`.
-    pending_subdirs: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Set when `next_dir` has at least one block still to push.
-    last_abspath: Option<Vec<u8>>,
+    pub pending_subdirs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-impl<'t> WalkDirsUtf8<'t> {
+impl WalkDirsUtf8 {
     /// Start a walk rooted at `root_abspath`.  `prefix` is the utf8
     /// relpath that should precede every yielded child's relpath
     /// (matching Python's `prefix` argument to `_walkdirs_utf8`).
-    pub fn new(root_abspath: &[u8], prefix: &[u8], transport: &'t dyn Transport) -> Self {
+    pub fn new(root_abspath: &[u8], prefix: &[u8]) -> Self {
         Self {
-            transport,
             pending: vec![(prefix.to_vec(), root_abspath.to_vec())],
             pending_subdirs: Vec::new(),
-            last_abspath: None,
         }
     }
 
-    /// Yield the next directory block.  Returns `Ok(None)` when the
+    /// Yield the next directory block.  Returns `Ok(false)` when the
     /// walk is done.  `callback` is invoked with the yielded block
     /// and a mutable slice of its entries so the caller can prune
     /// subdirectories before recursion.  The caller's mutation
     /// semantics mirror the Python walker: an entry removed from the
     /// slice will not be recursed into.
-    pub fn next_dir<F>(&mut self, mut callback: F) -> Result<bool, TransportError>
+    ///
+    /// Takes the [`Transport`] per call rather than storing a
+    /// borrow so callers can embed the walker in longer-lived
+    /// iterator state.
+    pub fn next_dir<F>(
+        &mut self,
+        transport: &dyn Transport,
+        mut callback: F,
+    ) -> Result<bool, TransportError>
     where
         F: FnMut(&[u8], &[u8], &mut Vec<DirEntryInfo>),
     {
@@ -1232,7 +1259,7 @@ impl<'t> WalkDirsUtf8<'t> {
             None => return Ok(false),
         };
 
-        let mut entries = self.transport.list_dir(&abspath)?;
+        let mut entries = transport.list_dir(&abspath)?;
         entries.sort_by(|a, b| a.basename.cmp(&b.basename));
         callback(&relpath, &abspath, &mut entries);
 
@@ -1253,7 +1280,6 @@ impl<'t> WalkDirsUtf8<'t> {
             .collect();
         subdirs.reverse();
         self.pending_subdirs = subdirs;
-        self.last_abspath = Some(abspath);
         Ok(true)
     }
 }
@@ -9106,10 +9132,10 @@ mod dirstate_struct_tests {
         t.set_fs(b"b/c", stat_file, None);
         t.set_fs(b"f", stat_file, None);
 
-        let mut walker = WalkDirsUtf8::new(b"", b"", &t);
+        let mut walker = WalkDirsUtf8::new(b"", b"");
         let mut visited: Vec<Vec<u8>> = Vec::new();
         while walker
-            .next_dir(|_rel, abspath, _entries| {
+            .next_dir(&t, |_rel, abspath, _entries| {
                 visited.push(abspath.to_vec());
             })
             .unwrap()
@@ -9146,10 +9172,10 @@ mod dirstate_struct_tests {
         t.set_fs(b"b", stat_dir, None);
         t.set_fs(b"b/c", stat_file, None);
 
-        let mut walker = WalkDirsUtf8::new(b"", b"", &t);
+        let mut walker = WalkDirsUtf8::new(b"", b"");
         let mut visited: Vec<Vec<u8>> = Vec::new();
         while walker
-            .next_dir(|_rel, abspath, entries| {
+            .next_dir(&t, |_rel, abspath, entries| {
                 visited.push(abspath.to_vec());
                 entries.retain(|e| e.basename != b"b");
             })
