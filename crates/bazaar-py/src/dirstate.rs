@@ -16,6 +16,129 @@ pyo3::import_exception!(bzrformats.errors, NotVersionedError);
 pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
 pyo3::import_exception!(bzrformats.inventory, DuplicateFileId);
 
+/// `bazaar::dirstate::Transport` adapter backed by a Python file-like
+/// object.  Used by `DirStateRs.save_to_file` so the pure-Rust
+/// `DirState::save_to` flow can handle the write+fdatasync+state
+/// bookkeeping while Python retains ownership of the file descriptor
+/// and the OS-level lock (both managed by `bzrformats.lock`).
+///
+/// The adapter is *told* its lock state at construction time — it
+/// does not acquire or release locks itself.  Callers should hold a
+/// write lock through `bzrformats.lock.WriteLock` (or the temporary
+/// upgrade dance inside `ReadLock.temporary_write_lock`) before
+/// creating one with `LockState::Write`.
+struct PyFileTransport {
+    file: Py<PyAny>,
+    lock_state: Option<bazaar::dirstate::LockState>,
+}
+
+impl PyFileTransport {
+    fn new(file: Py<PyAny>, lock_state: bazaar::dirstate::LockState) -> Self {
+        Self {
+            file,
+            lock_state: Some(lock_state),
+        }
+    }
+
+    fn map_err(py: Python<'_>, err: PyErr) -> bazaar::dirstate::TransportError {
+        bazaar::dirstate::TransportError::Other(err.value(py).to_string())
+    }
+}
+
+impl bazaar::dirstate::Transport for PyFileTransport {
+    fn exists(&self) -> Result<bool, bazaar::dirstate::TransportError> {
+        // The caller already has an open fd; the file exists by
+        // construction.
+        Ok(true)
+    }
+
+    fn lock_read(&mut self) -> Result<(), bazaar::dirstate::TransportError> {
+        if self.lock_state.is_some() {
+            return Err(bazaar::dirstate::TransportError::AlreadyLocked);
+        }
+        self.lock_state = Some(bazaar::dirstate::LockState::Read);
+        Ok(())
+    }
+
+    fn lock_write(&mut self) -> Result<(), bazaar::dirstate::TransportError> {
+        if self.lock_state.is_some() {
+            return Err(bazaar::dirstate::TransportError::AlreadyLocked);
+        }
+        self.lock_state = Some(bazaar::dirstate::LockState::Write);
+        Ok(())
+    }
+
+    fn unlock(&mut self) -> Result<(), bazaar::dirstate::TransportError> {
+        if self.lock_state.is_none() {
+            return Err(bazaar::dirstate::TransportError::NotLocked);
+        }
+        self.lock_state = None;
+        Ok(())
+    }
+
+    fn lock_state(&self) -> Option<bazaar::dirstate::LockState> {
+        self.lock_state
+    }
+
+    fn read_all(&mut self) -> Result<Vec<u8>, bazaar::dirstate::TransportError> {
+        if self.lock_state.is_none() {
+            return Err(bazaar::dirstate::TransportError::NotLocked);
+        }
+        Python::attach(|py| -> Result<Vec<u8>, bazaar::dirstate::TransportError> {
+            let f = self.file.bind(py);
+            f.call_method1("seek", (0,))
+                .map_err(|e| Self::map_err(py, e))?;
+            let data = f.call_method0("read").map_err(|e| Self::map_err(py, e))?;
+            let bytes = data.cast_into::<PyBytes>().map_err(|_| {
+                bazaar::dirstate::TransportError::Other(
+                    "file.read() did not return bytes".to_string(),
+                )
+            })?;
+            Ok(bytes.as_bytes().to_vec())
+        })
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), bazaar::dirstate::TransportError> {
+        if self.lock_state != Some(bazaar::dirstate::LockState::Write) {
+            return Err(bazaar::dirstate::TransportError::Other(
+                "write_all requires a write lock".to_string(),
+            ));
+        }
+        Python::attach(|py| -> Result<(), bazaar::dirstate::TransportError> {
+            let f = self.file.bind(py);
+            f.call_method1("seek", (0,))
+                .map_err(|e| Self::map_err(py, e))?;
+            let py_bytes = PyBytes::new(py, bytes);
+            f.call_method1("write", (py_bytes,))
+                .map_err(|e| Self::map_err(py, e))?;
+            f.call_method0("truncate")
+                .map_err(|e| Self::map_err(py, e))?;
+            f.call_method0("flush").map_err(|e| Self::map_err(py, e))?;
+            Ok(())
+        })
+    }
+
+    fn fdatasync(&mut self) -> Result<(), bazaar::dirstate::TransportError> {
+        Python::attach(|py| -> Result<(), bazaar::dirstate::TransportError> {
+            let osutils_mod = py
+                .import("bzrformats.osutils")
+                .map_err(|e| Self::map_err(py, e))?;
+            let fdatasync_fn = osutils_mod
+                .getattr("fdatasync")
+                .map_err(|e| Self::map_err(py, e))?;
+            let fileno = self
+                .file
+                .bind(py)
+                .call_method0("fileno")
+                .map_err(|e| Self::map_err(py, e))?;
+            fdatasync_fn
+                .call1((fileno,))
+                .map_err(|e| Self::map_err(py, e))?;
+            Ok(())
+        })
+    }
+}
+
 // TODO(jelmer): Shared pyo3 utils?
 fn extract_path(object: &Bound<PyAny>) -> PyResult<PathBuf> {
     if let Ok(path) = object.extract::<Vec<u8>>() {
@@ -700,6 +823,24 @@ impl PyDirState {
     /// `DirState._worth_saving`.
     fn worth_saving(&self) -> bool {
         self.inner.worth_saving()
+    }
+
+    /// Persist the in-memory state to the given Python file-like
+    /// object, assuming the caller already holds a write lock.
+    /// Mirrors the `try` block inside Python's `DirState.save`:
+    /// serialises get_lines, seeks to 0, writes, truncates, flushes,
+    /// optionally fdatasyncs, and marks the dirstate unmodified.
+    /// Returns `True` if the state was actually written, `False` if
+    /// an early-return gate (`changes_aborted` / not-worth-saving)
+    /// prevented it.
+    fn save_to_file(&mut self, state_file: &Bound<PyAny>) -> PyResult<bool> {
+        let mut transport = PyFileTransport::new(
+            state_file.clone().unbind(),
+            bazaar::dirstate::LockState::Write,
+        );
+        self.inner.save_to(&mut transport).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("dirstate save failed: {:?}", e))
+        })
     }
 
     /// Forget all in-memory state. Mirrors `DirState._wipe_state`.

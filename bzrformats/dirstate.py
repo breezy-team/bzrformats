@@ -1787,50 +1787,29 @@ class DirState:
         start over, to allow for fine grained read lock duration, so 'status'
         wont block 'commit' - for example.
         """
+        # Python-side responsibility: drive the read→write lock-upgrade
+        # dance (bzrformats.lock owns the OS lock).  Rust does the
+        # serialise / write / truncate / flush / fdatasync / state
+        # bookkeeping through save_to_file.
         if self._changes_aborted:
-            # Should this be a warning? For now, I'm expecting that places that
-            # mark it inconsistent will warn, making a warning here redundant.
             logger.debug("Not saving DirState because _changes_aborted is set.")
             return
-        # TODO: Since we now distinguish IN_MEMORY_MODIFIED from
-        #       IN_MEMORY_HASH_MODIFIED, we should only fail quietly if we fail
-        #       to save an IN_MEMORY_HASH_MODIFIED, and fail *noisily* if we
-        #       fail to save IN_MEMORY_MODIFIED
         if not self._worth_saving():
             return
 
         grabbed_write_lock = False
         if self._lock_state != "w":
             grabbed_write_lock, new_lock = self._lock_token.temporary_write_lock()
-            # Switch over to the new lock, as the old one may be closed.
-            # TODO: jam 20070315 We should validate the disk file has
-            #       not changed contents, since temporary_write_lock may
-            #       not be an atomic operation.
             self._lock_token = new_lock
             self._state_file = new_lock.f
             if not grabbed_write_lock:
-                # We couldn't grab a write lock, so we switch back to a read one
                 return
         try:
-            lines = self.get_lines()
-            self._state_file.seek(0)
-            self._state_file.writelines(lines)
-            self._state_file.truncate()
-            self._state_file.flush()
-            self._maybe_fdatasync()
-            self._mark_unmodified()
+            self._rs.save_to_file(self._state_file)
         finally:
             if grabbed_write_lock:
                 self._lock_token = self._lock_token.restore_read_lock()
                 self._state_file = self._lock_token.f
-                # TODO: jam 20070315 We should validate the disk file has
-                #       not changed contents. Since restore_read_lock may
-                #       not be an atomic operation.
-
-    def _maybe_fdatasync(self):
-        """Flush to disk if possible and if not configured off."""
-        if self._fdatasync:
-            osutils.fdatasync(self._state_file.fileno())
 
     def _worth_saving(self):
         """Is it worth saving the dirstate or not?"""
