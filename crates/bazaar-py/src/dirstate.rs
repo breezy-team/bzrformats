@@ -915,6 +915,51 @@ impl PyDirState {
         })
     }
 
+    /// Refresh the tree-0 slot of the entry at `key` from the
+    /// filesystem.  Mirrors Python's `py_update_entry`.
+    /// `abspath` is the absolute path of the file on disk.
+    /// `stat_value` is a Python `os.stat_result` (usually produced by
+    /// `os.lstat`).  Returns the sha1 hex or symlink target as
+    /// `bytes`, or `None` when the cache matches / the on-disk kind
+    /// is unsupported / the stat falls in the uncacheable window.
+    fn update_entry<'py>(
+        &mut self,
+        py: Python<'py>,
+        key: &Bound<PyTuple>,
+        abspath: &Bound<PyAny>,
+        stat_value: &Bound<PyAny>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let entry_key = bazaar::dirstate::EntryKey {
+            dirname: key.get_item(0)?.extract()?,
+            basename: key.get_item(1)?.extract()?,
+            file_id: key.get_item(2)?.extract()?,
+        };
+        // Re-stat on the Rust side: `stat_value` might be any
+        // os.stat_result shape, but we need a std::fs::Metadata.
+        // abspath is normally bytes (utf8-encoded filesystem path).
+        let path = extract_path(abspath)?;
+        // Python already did the lstat; stat_value carries the result
+        // but extracting attribute by attribute is brittle.  Re-stat
+        // in Rust — the cost is one syscall we already paid for in
+        // Python, and it lets us use the platform-native Metadata.
+        let _ = stat_value;
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+        let result = self
+            .inner
+            .update_entry(&entry_key, path.as_path(), &meta)
+            .map_err(|e| match e {
+                bazaar::dirstate::UpdateEntryError::EntryNotFound => {
+                    pyo3::exceptions::PyKeyError::new_err("update_entry: entry not found")
+                }
+                bazaar::dirstate::UpdateEntryError::Io(io) => {
+                    pyo3::exceptions::PyOSError::new_err(io.to_string())
+                }
+                other => pyo3::exceptions::PyRuntimeError::new_err(other.to_string()),
+            })?;
+        Ok(result.map(|v| PyBytes::new(py, &v)))
+    }
+
     /// Read the dirstate header out of `state_file` and populate the
     /// header state (parents, ghosts, num_entries, end_of_header).
     /// Mirrors `DirState._read_header`: reads five newline-delimited

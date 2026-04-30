@@ -1562,122 +1562,21 @@ class DirState:
             raise ObjectNotLocked(self)
 
 
-def py_update_entry(
-    state, entry, abspath, stat_value, _stat_to_minikind=DirState._stat_to_minikind
-):
+def py_update_entry(state, entry, abspath, stat_value):
     """Update the entry based on what is actually on disk.
 
-    This function only calculates the sha if it needs to - if the entry is
-    uncachable, or clearly different to the first parent's entry, no sha
-    is calculated, and None is returned.
-
-    :param state: The dirstate this entry is in.
-    :param entry: This is the dirblock entry for the file in question.
-    :param abspath: The path on disk for this file.
-    :param stat_value: The stat value done on the path.
-    :return: None, or The sha1 hexdigest of the file (40 bytes) or link
-        target of a symlink.
+    Thin shim: delegates to DirStateRs.update_entry.  Mirrors Python's
+    historical in-place entry-tuple mutation by rebuilding entry[1][0]
+    from the new tree-0 Rust wrote.
     """
-    try:
-        minikind = _stat_to_minikind[stat_value.st_mode & 0o170000]
-    except KeyError:
-        # Unhandled kind
-        return None
-    packed_stat = pack_stat(stat_value)
-    (
-        saved_minikind,
-        saved_link_or_sha1,
-        saved_file_size,
-        saved_executable,
-        saved_packed_stat,
-    ) = entry[1][0]
-    if not isinstance(saved_minikind, bytes):
-        raise TypeError(saved_minikind)
-
-    if minikind == b"d" and saved_minikind == b"t":
-        minikind = b"t"
-    if minikind == saved_minikind and packed_stat == saved_packed_stat:
-        # The stat hasn't changed since we saved, so we can re-use the
-        # saved sha hash.
-        if minikind == b"d":
-            return None
-
-        # size should also be in packed_stat
-        if saved_file_size == stat_value.st_size:
-            return saved_link_or_sha1
-
-    # If we have gotten this far, that means that we need to actually
-    # process this entry.  Each branch updates the tree-0 slot of an
-    # existing entry (no structural change, no cross-reference
-    # rewrite); push the new details through state._rs.set_tree0 so
-    # the Rust-owned dirblocks mirror sees it, and also mutate the
-    # ``entry`` snapshot tuple so callers that read back from it see
-    # the update.
-    link_or_sha1 = None
-    worth_saving = True
-
-    def _write_tree0(minikind_out, fingerprint, size, executable, packed):
-        entry[1][0] = (minikind_out, fingerprint, size, executable, packed)
-        state._rs.set_tree0(
-            entry[0], minikind_out, fingerprint, size, executable, packed
-        )
-
-    if minikind == b"f":
-        executable = state._is_executable(stat_value.st_mode, saved_executable)
-        if state._cutoff_time is None:
-            state._sha_cutoff_time()
-        if (
-            stat_value.st_mtime < state._cutoff_time
-            and stat_value.st_ctime < state._cutoff_time
-            and len(entry[1]) > 1
-            and entry[1][1][0] != b"a"
-        ):
-            # Could check for size changes for further optimised
-            # avoidance of sha1's. However the most prominent case of
-            # over-shaing is during initial add, which this catches.
-            # Besides, if content filtering happens, size and sha
-            # are calculated at the same time, so checking just the size
-            # gains nothing w.r.t. performance.
-            link_or_sha1 = state._sha1_file(abspath)
-            _write_tree0(
-                b"f", link_or_sha1, stat_value.st_size, executable, packed_stat
-            )
-        else:
-            _write_tree0(b"f", b"", stat_value.st_size, executable, DirState.NULLSTAT)
-            worth_saving = False
-    elif minikind == b"d":
-        link_or_sha1 = None
-        _write_tree0(b"d", b"", 0, False, packed_stat)
-        if saved_minikind != b"d":
-            # This changed from something into a directory. Make sure we
-            # have a directory block for it. This doesn't happen very
-            # often, so this doesn't have to be super fast.
-            (
-                block_index,
-                entry_index,
-                _dir_present,
-                _file_present,
-            ) = state._get_block_entry_index(entry[0][0], entry[0][1], 0)
-            state._ensure_block(
-                block_index, entry_index, osutils.pathjoin(entry[0][0], entry[0][1])
-            )
-        else:
-            worth_saving = False
-    elif minikind == b"l":
-        if saved_minikind == b"l":
-            worth_saving = False
-        link_or_sha1 = state._read_link(abspath, saved_link_or_sha1)
-        if state._cutoff_time is None:
-            state._sha_cutoff_time()
-        if (
-            stat_value.st_mtime < state._cutoff_time
-            and stat_value.st_ctime < state._cutoff_time
-        ):
-            _write_tree0(b"l", link_or_sha1, stat_value.st_size, False, packed_stat)
-        else:
-            _write_tree0(b"l", b"", stat_value.st_size, False, DirState.NULLSTAT)
-    if worth_saving:
-        state._mark_modified([entry])
+    if isinstance(abspath, str):
+        abspath = abspath.encode("utf-8")
+    link_or_sha1 = state._rs.update_entry(entry[0], abspath, stat_value)
+    # Refresh the in-memory entry tuple so legacy callers that hang
+    # on to the snapshot still see the new tree-0.
+    fresh = state._rs.get_entry(0, path_utf8=osutils.pathjoin(entry[0][0], entry[0][1]))
+    if fresh != (None, None):
+        entry[1][0] = fresh[1][0]
     return link_or_sha1
 
 

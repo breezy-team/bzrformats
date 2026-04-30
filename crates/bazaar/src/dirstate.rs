@@ -1586,6 +1586,232 @@ impl DirState {
             .map(|t| t.minikind)
     }
 
+    /// Refresh the tree-0 slot of `key` from the filesystem.  Mirrors
+    /// Python's `py_update_entry`: if the stat hasn't changed since
+    /// the last time we saved, re-use the cached link-or-sha1;
+    /// otherwise read the file (or symlink) and rewrite the tree-0
+    /// slot.  Returns the sha1 hex or symlink target, or `None` when
+    /// the on-disk kind is not supported (e.g. block/char devices),
+    /// when the row is a directory and the cached stat matches
+    /// (nothing to report), or when we skip the sha because the
+    /// stat falls inside the "uncacheable" window.
+    ///
+    /// The `abspath` must be an absolute path to the file on disk.
+    /// `stat_meta` is the result of a prior `lstat` on `abspath` —
+    /// the caller has to stat anyway, so we avoid a redundant syscall
+    /// here.
+    pub fn update_entry(
+        &mut self,
+        key: &EntryKey,
+        abspath: &Path,
+        stat_meta: &Metadata,
+    ) -> Result<Option<Vec<u8>>, UpdateEntryError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // 1. Derive minikind from st_mode.  Non-file/dir/symlink kinds
+        //    are silently skipped (Python returns None via the
+        //    KeyError branch).
+        let file_type = stat_meta.file_type();
+        let mut minikind: u8 = if file_type.is_file() {
+            b'f'
+        } else if file_type.is_dir() {
+            b'd'
+        } else if file_type.is_symlink() {
+            b'l'
+        } else {
+            return Ok(None);
+        };
+
+        let packed_stat = pack_stat_metadata(stat_meta).into_bytes();
+
+        // 2. Fetch the saved tree-0 row (need a clone, we'll mutate it).
+        let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
+        if !block_present {
+            return Err(UpdateEntryError::EntryNotFound);
+        }
+        let (entry_index, entry_present) =
+            find_entry_index(key, &self.dirblocks[block_index].entries);
+        if !entry_present {
+            return Err(UpdateEntryError::EntryNotFound);
+        }
+        let entry_len = self.dirblocks[block_index].entries[entry_index].trees.len();
+        let tree1_minikind: u8 = self.dirblocks[block_index].entries[entry_index]
+            .trees
+            .get(1)
+            .map(|t| t.minikind)
+            .unwrap_or(0);
+        let saved = self.dirblocks[block_index].entries[entry_index].trees[0].clone();
+
+        // 3. A directory row that used to be a tree-reference keeps
+        //    its 't' minikind even when the filesystem kind is plain
+        //    directory (matches Python's special case).
+        if minikind == b'd' && saved.minikind == b't' {
+            minikind = b't';
+        }
+
+        // 4. Cache-hit path: same kind + same stat + same size → return
+        //    saved link/sha1 without further I/O.
+        if minikind == saved.minikind && packed_stat == saved.packed_stat {
+            if minikind == b'd' {
+                return Ok(None);
+            }
+            if saved.size == stat_meta.len() {
+                return Ok(Some(saved.fingerprint.clone()));
+            }
+        }
+
+        // 5. Cache miss — rewrite the row.
+        let now_secs: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff: i64 = self.cutoff_time.unwrap_or_else(|| {
+            let c = now_secs - 3;
+            self.cutoff_time = Some(c);
+            c
+        });
+
+        let mtime_secs: i64 = metadata_mtime_secs(stat_meta);
+        let ctime_secs: i64 = metadata_ctime_secs(stat_meta);
+        let stat_is_cacheable = mtime_secs < cutoff && ctime_secs < cutoff;
+
+        let mut result: Option<Vec<u8>> = None;
+        let mut worth_saving = true;
+        let mut became_directory = false;
+
+        // Tree-references don't get a tree-0 rewrite: the Python
+        // implementation's if/elif chain has no arm for b't', so the
+        // saved row is left intact and only mark_modified runs.
+        if minikind == b't' {
+            self.mark_modified(&[key.clone()], false);
+            return Ok(None);
+        }
+
+        let new_tree0 = match minikind {
+            b'f' => {
+                let executable = if self.use_filesystem_for_exec {
+                    #[cfg(unix)]
+                    {
+                        (stat_meta.mode() & 0o100) != 0
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        saved.executable
+                    }
+                } else {
+                    saved.executable
+                };
+                if stat_is_cacheable && entry_len > 1 && tree1_minikind != b'a' {
+                    let sha1 = self
+                        .sha1_provider
+                        .sha1(abspath)
+                        .map_err(UpdateEntryError::Io)?;
+                    result = Some(sha1.as_bytes().to_vec());
+                    TreeData {
+                        minikind: b'f',
+                        fingerprint: sha1.into_bytes(),
+                        size: stat_meta.len(),
+                        executable,
+                        packed_stat,
+                    }
+                } else {
+                    worth_saving = false;
+                    TreeData {
+                        minikind: b'f',
+                        fingerprint: Vec::new(),
+                        size: stat_meta.len(),
+                        executable,
+                        packed_stat: b"x".repeat(32),
+                    }
+                }
+            }
+            b'd' => {
+                if saved.minikind != b'd' {
+                    became_directory = true;
+                } else {
+                    worth_saving = false;
+                }
+                TreeData {
+                    minikind: b'd',
+                    fingerprint: Vec::new(),
+                    size: 0,
+                    executable: false,
+                    packed_stat,
+                }
+            }
+            b'l' => {
+                if saved.minikind == b'l' {
+                    worth_saving = false;
+                }
+                let target = std::fs::read_link(abspath).map_err(UpdateEntryError::Io)?;
+                let target_bytes = {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::ffi::OsStringExt;
+                        target.into_os_string().into_vec()
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        target.into_os_string().into_string().unwrap().into_bytes()
+                    }
+                };
+                result = Some(target_bytes.clone());
+                if stat_is_cacheable {
+                    TreeData {
+                        minikind: b'l',
+                        fingerprint: target_bytes,
+                        size: stat_meta.len(),
+                        executable: false,
+                        packed_stat,
+                    }
+                } else {
+                    TreeData {
+                        minikind: b'l',
+                        fingerprint: Vec::new(),
+                        size: stat_meta.len(),
+                        executable: false,
+                        packed_stat: b"x".repeat(32),
+                    }
+                }
+            }
+            _ => {
+                // Already handled via the fall-through in step 1; any
+                // other minikind here is an internal error.
+                return Err(UpdateEntryError::UnexpectedKind(minikind));
+            }
+        };
+
+        self.dirblocks[block_index].entries[entry_index].trees[0] = new_tree0;
+        self.packed_stat_index = None;
+
+        if became_directory {
+            // A former file/symlink is now a directory; ensure the
+            // child dirblock exists.
+            let (dirname_parent, basename_parent) = (key.dirname.clone(), key.basename.clone());
+            let parent_bei =
+                get_block_entry_index(&self.dirblocks, &dirname_parent, &basename_parent, 0);
+            if parent_bei.path_present {
+                let mut subdir = dirname_parent.clone();
+                if !subdir.is_empty() {
+                    subdir.push(b'/');
+                }
+                subdir.extend_from_slice(&basename_parent);
+                self.ensure_block(
+                    parent_bei.block_index as isize,
+                    parent_bei.entry_index as isize,
+                    &subdir,
+                )
+                .map_err(|e| UpdateEntryError::Other(format!("ensure_block: {:?}", e)))?;
+            }
+        }
+
+        if worth_saving {
+            self.mark_modified(&[key.clone()], false);
+        }
+
+        Ok(result)
+    }
+
     /// Append a `NULL_PARENT_DETAILS` row to every entry's tree slot
     /// list. Mirrors Python's inline loop in `update_basis_by_delta`:
     /// when the current dirstate has no parents and a new parent is
@@ -5405,6 +5631,64 @@ impl std::fmt::Display for SplitRootError {
 
 impl std::error::Error for SplitRootError {}
 
+/// Error returned by [`DirState::update_entry`].
+#[derive(Debug)]
+pub enum UpdateEntryError {
+    /// No dirstate entry matches the given key.
+    EntryNotFound,
+    /// The key's entry has a minikind we do not know how to refresh.
+    UnexpectedKind(u8),
+    /// Filesystem I/O error while reading the file contents for a
+    /// sha1, reading a symlink target, or similar.
+    Io(std::io::Error),
+    /// Catch-all for other unexpected failures (e.g. an internal
+    /// invariant violated during the post-update `ensure_block`).
+    Other(String),
+}
+
+impl std::fmt::Display for UpdateEntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateEntryError::EntryNotFound => f.write_str("update_entry: entry not found"),
+            UpdateEntryError::UnexpectedKind(k) => {
+                write!(f, "update_entry: unexpected minikind {:?}", k)
+            }
+            UpdateEntryError::Io(e) => write!(f, "update_entry: i/o error: {}", e),
+            UpdateEntryError::Other(s) => write!(f, "update_entry: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for UpdateEntryError {}
+
+/// Seconds-since-epoch from a [`Metadata::modified`] reading.  Returns
+/// 0 when the platform does not carry the information.
+fn metadata_mtime_secs(m: &Metadata) -> i64 {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Seconds-since-epoch from the filesystem's "changed" timestamp.  On
+/// Unix we read `st_ctime` directly; on other platforms we fall back
+/// to `created()` which is the closest analogue.
+fn metadata_ctime_secs(m: &Metadata) -> i64 {
+    #[cfg(unix)]
+    {
+        m.ctime()
+    }
+    #[cfg(not(unix))]
+    {
+        m.created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+}
+
 /// Error returned by [`DirState::set_path_id`]. Mirrors the exceptions
 /// Python's `DirState.set_path_id` raises.
 #[derive(Debug, PartialEq, Eq)]
@@ -7907,6 +8191,68 @@ mod dirstate_struct_tests {
                 (Vec::new(), b"a".to_vec(), b"b-id".to_vec(), b'f'),
             ]
         );
+    }
+
+    #[test]
+    fn update_entry_refreshes_sha_after_content_change() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let fpath = dir.path().join("a-file");
+        {
+            let mut f = std::fs::File::create(&fpath).unwrap();
+            f.write_all(b"first content\n").unwrap();
+        }
+
+        let mut state = add_fixture();
+        // Give the dirstate a committed parent so update_entry's
+        // "stat-cacheable and tree-1 is live" branch runs and the sha
+        // actually gets written.  Without a parent the row is still
+        // in "initial add" mode and we skip the sha computation.
+        state.parents = vec![b"parent-rev".to_vec()];
+        state.dirblocks[0].entries[0].trees.push(TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: Vec::new(),
+        });
+        let stat = b"x".repeat(32);
+        state
+            .add(b"a-file", b"", b"a-file", b"file-id", "file", 0, &stat, b"")
+            .expect("add");
+        // The newly-added entry still has tree-1 = absent; make it
+        // live so update_entry writes the sha.
+        let bei = state.get_block_entry_index(b"", b"a-file", 0);
+        state.dirblocks[bei.block_index].entries[bei.entry_index].trees[1] = TreeData {
+            minikind: b'f',
+            fingerprint: b"parent-sha".to_vec(),
+            size: 0,
+            executable: false,
+            packed_stat: Vec::new(),
+        };
+        // Set cutoff_time so the on-disk stat is considered cacheable.
+        state.cutoff_time = Some(i64::MAX);
+
+        let meta = std::fs::symlink_metadata(&fpath).unwrap();
+        let key = EntryKey {
+            dirname: Vec::new(),
+            basename: b"a-file".to_vec(),
+            file_id: b"file-id".to_vec(),
+        };
+        let result = state
+            .update_entry(&key, fpath.as_path(), &meta)
+            .expect("update_entry");
+        let sha = result.expect("file should yield a sha");
+        // Sha of "first content\n".
+        assert_eq!(
+            std::str::from_utf8(&sha).unwrap(),
+            "c0a245ade45b97366321074bb27a39a6ae1dc4fc"
+        );
+        // Tree-0 row should now carry that same sha.
+        let bei = state.get_block_entry_index(b"", b"a-file", 0);
+        assert!(bei.path_present);
+        let entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(entry.trees[0].fingerprint, sha);
     }
 
     #[test]
