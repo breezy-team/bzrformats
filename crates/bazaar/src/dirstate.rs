@@ -428,6 +428,31 @@ impl Kind {
     }
 }
 
+/// Extension methods for `Option<Kind>` that collapse the repeated
+/// `None | Some(Absent) | Some(Relocated)` pattern used throughout
+/// the tree-slot lookup sites.
+pub trait OptionKindExt {
+    /// True when the slot is missing, absent, or relocated — i.e.
+    /// there is no live entry at this position in this tree.
+    fn is_not_live(self) -> bool;
+    /// True when the slot holds a live entry (`f`/`d`/`l`/`t`).
+    fn is_live(self) -> bool;
+}
+
+impl OptionKindExt for Option<Kind> {
+    #[inline]
+    fn is_not_live(self) -> bool {
+        match self {
+            None | Some(Kind::Absent) | Some(Kind::Relocated) => true,
+            Some(_) => false,
+        }
+    }
+    #[inline]
+    fn is_live(self) -> bool {
+        !self.is_not_live()
+    }
+}
+
 impl std::fmt::Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.to_str())
@@ -849,6 +874,22 @@ pub struct EntryKey {
 pub struct Entry {
     pub key: EntryKey,
     pub trees: Vec<TreeData>,
+}
+
+impl Entry {
+    /// Minikind of the slot at `tree_index`, or `None` when the
+    /// entry has fewer tree slots than that index.
+    #[inline]
+    pub fn tree_kind(&self, tree_index: usize) -> Option<Kind> {
+        self.trees.get(tree_index).map(|t| t.minikind)
+    }
+
+    /// Minikind of the current (tree-0) slot.  Shorthand for
+    /// ``entry.tree_kind(0)``.
+    #[inline]
+    pub fn tree0_kind(&self) -> Option<Kind> {
+        self.tree_kind(0)
+    }
 }
 
 /// A directory block: all entries whose `dirname` equals `dirname`, in sort
@@ -2347,8 +2388,8 @@ impl DirState {
         let mut source_details_mut = source_details.clone();
 
         if source_minikind.is_fdltr() && target_minikind.is_fdlt() {
-            let mut old_dirname: Vec<u8>;
-            let mut old_basename: Vec<u8>;
+            let old_dirname: Vec<u8>;
+            let old_basename: Vec<u8>;
             let mut old_path: Option<Vec<u8>>;
             let mut path: Option<Vec<u8>>;
 
@@ -3684,8 +3725,7 @@ impl DirState {
             // from the snapshot because prior update_minimal calls in
             // this loop could have rewritten it.
             if let Some(ref old) = current_old {
-                let live = self.tree0_minikind(&old.key);
-                if matches!(live, None | Some(Kind::Absent) | Some(Kind::Relocated)) {
+                if self.tree0_minikind(&old.key).is_not_live() {
                     current_old = old_iter.next();
                     continue;
                 }
@@ -4428,11 +4468,7 @@ impl DirState {
                             ),
                         });
                     }
-                    let basis_kind = maybe.trees.get(1).map(|t| t.minikind);
-                    if !matches!(
-                        basis_kind,
-                        None | Some(Kind::Absent) | Some(Kind::Relocated)
-                    ) {
+                    if maybe.trees.get(1).map(|t| t.minikind).is_live() {
                         return Err(BasisApplyError::Invalid {
                             path: add.new_path.clone(),
                             file_id: add.file_id.clone(),
@@ -4491,8 +4527,7 @@ impl DirState {
                     if candidate.key.file_id != add.file_id {
                         continue;
                     }
-                    let real_kind = candidate.trees.first().map(|t| t.minikind);
-                    if matches!(real_kind, None | Some(Kind::Absent) | Some(Kind::Relocated)) {
+                    if candidate.trees.first().map(|t| t.minikind).is_not_live() {
                         return Err(BasisApplyError::Invalid {
                             path: add.new_path.clone(),
                             file_id: add.file_id.clone(),
@@ -4740,8 +4775,7 @@ impl DirState {
                     if candidate.key.dirname == key.dirname
                         && candidate.key.basename == key.basename
                     {
-                        let t0 = candidate.trees.first().map(|t| t.minikind);
-                        if !matches!(t0, None | Some(Kind::Absent) | Some(Kind::Relocated)) {
+                        if candidate.trees.first().map(|t| t.minikind).is_live() {
                             let mut path = key.dirname.clone();
                             if !path.is_empty() {
                                 path.push(b'/');
@@ -5250,8 +5284,12 @@ impl DirState {
                 && block[entry_index].key.dirname == dirname
                 && block[entry_index].key.basename == basename
             {
-                let t0 = block[entry_index].trees.first().map(|t| t.minikind);
-                if !matches!(t0, None | Some(Kind::Absent) | Some(Kind::Relocated)) {
+                if block[entry_index]
+                    .trees
+                    .first()
+                    .map(|t| t.minikind)
+                    .is_live()
+                {
                     let mut path = dirname.to_vec();
                     if !path.is_empty() {
                         path.push(b'/');
@@ -5541,8 +5579,7 @@ impl DirState {
             if child_bei.dir_present {
                 let block = &self.dirblocks[child_bei.block_index];
                 for child in &block.entries {
-                    let t0 = child.trees.first().map(|t| t.minikind);
-                    if !matches!(t0, None | Some(Kind::Absent) | Some(Kind::Relocated)) {
+                    if child.trees.first().map(|t| t.minikind).is_live() {
                         return Err(BasisApplyError::Invalid {
                             path: path.clone(),
                             file_id: file_id.clone(),
@@ -6237,11 +6274,7 @@ impl DirState {
                     reason: "changed entry considered not present".to_string(),
                 });
             }
-            let tree1_kind = entry.trees.get(1).map(|t| t.minikind);
-            if matches!(
-                tree1_kind,
-                None | Some(Kind::Absent) | Some(Kind::Relocated)
-            ) {
+            if entry.trees.get(1).map(|t| t.minikind).is_not_live() {
                 return Err(BasisApplyError::Invalid {
                     path: new_path.clone(),
                     file_id: file_id.clone(),
@@ -6315,10 +6348,7 @@ impl DirState {
             // needed.
             let mut dir_block_index: Option<usize> = None;
 
-            if matches!(
-                active_kind,
-                None | Some(Kind::Absent) | Some(Kind::Relocated)
-            ) {
+            if active_kind.is_not_live() {
                 if active_kind == Some(Kind::Relocated) {
                     // Follow the tree-0 relocation pointer and
                     // clear the target's tree-1 slot.
@@ -6416,11 +6446,7 @@ impl DirState {
             if let Some(db_index) = dir_block_index {
                 let block = &self.dirblocks[db_index];
                 for child in &block.entries {
-                    let child_tree1 = child.trees.get(1).map(|t| t.minikind);
-                    if !matches!(
-                        child_tree1,
-                        None | Some(Kind::Absent) | Some(Kind::Relocated)
-                    ) {
+                    if child.trees.get(1).map(|t| t.minikind).is_live() {
                         return Err(BasisApplyError::Invalid {
                             path: old_path.clone(),
                             file_id: file_id.clone(),
@@ -7041,7 +7067,7 @@ where
             BisectMode::Dirnames => bisect_bytes_left(&cur_keys, &first_key),
         };
         let pre: Vec<Vec<u8>> = cur_keys[..first_loc].to_vec();
-        let mut post: Vec<Vec<u8>> = cur_keys[first_loc..].to_vec();
+        let post: Vec<Vec<u8>> = cur_keys[first_loc..].to_vec();
         let mut after = start;
 
         let mut pre_out = pre;
@@ -7592,6 +7618,7 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 fn metadata_mtime_secs(m: &Metadata) -> i64 {
     m.modified()
         .ok()
@@ -7603,6 +7630,7 @@ fn metadata_mtime_secs(m: &Metadata) -> i64 {
 /// Seconds-since-epoch from the filesystem's "changed" timestamp.  On
 /// Unix we read `st_ctime` directly; on other platforms we fall back
 /// to `created()` which is the closest analogue.
+#[cfg(test)]
 fn metadata_ctime_secs(m: &Metadata) -> i64 {
     #[cfg(unix)]
     {
