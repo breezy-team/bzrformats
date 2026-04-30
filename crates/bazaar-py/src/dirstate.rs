@@ -1379,12 +1379,15 @@ impl PyDirState {
         })
     }
 
-    /// Record the observed sha1 for the entry at `key`.  Mirrors
-    /// Python's `DirState._observed_sha1`; the caller supplies the
-    /// stat fields unpacked from the existing `os.stat_result`.
+    /// Record the observed sha1 for the entry at `key` and return the
+    /// updated tree-0 5-tuple (or `None` if no update was recorded —
+    /// non-regular file, or uncacheable mtime/ctime).  Mirrors
+    /// Python's `DirState._observed_sha1` including the write-back
+    /// the Python side used to do with a second `get_entry` call.
     #[pyo3(signature = (key, sha1, st_mode, st_size, st_mtime, st_ctime, st_dev, st_ino))]
-    fn observed_sha1(
+    fn observed_sha1<'py>(
         &mut self,
+        py: Python<'py>,
         key: &Bound<PyTuple>,
         sha1: &[u8],
         st_mode: u32,
@@ -1393,13 +1396,14 @@ impl PyDirState {
         st_ctime: f64,
         st_dev: u64,
         st_ino: u64,
-    ) -> PyResult<()> {
+    ) -> PyResult<Option<Bound<'py, PyTuple>>> {
         let entry_key = bazaar::dirstate::EntryKey {
             dirname: key.get_item(0)?.extract()?,
             basename: key.get_item(1)?.extract()?,
             file_id: key.get_item(2)?.extract()?,
         };
-        self.inner
+        let updated = self
+            .inner
             .observed_sha1(
                 &entry_key,
                 sha1,
@@ -1410,7 +1414,22 @@ impl PyDirState {
                 st_dev,
                 st_ino,
             )
-            .map_err(|e| pyo3::exceptions::PyKeyError::new_err(format!("observed_sha1: {}", e)))
+            .map_err(|e| pyo3::exceptions::PyKeyError::new_err(format!("observed_sha1: {}", e)))?;
+        match updated {
+            None => Ok(None),
+            Some(td) => Ok(Some(PyTuple::new(
+                py,
+                [
+                    PyBytes::new(py, &[td.minikind]).into_any(),
+                    PyBytes::new(py, &td.fingerprint).into_any(),
+                    td.size.into_pyobject(py)?.into_any(),
+                    pyo3::types::PyBool::new(py, td.executable)
+                        .to_owned()
+                        .into_any(),
+                    PyBytes::new(py, &td.packed_stat).into_any(),
+                ],
+            )?)),
+        }
     }
 
     /// Refresh the tree-0 slot of the entry at `key` from the

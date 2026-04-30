@@ -948,7 +948,7 @@ class DirState:
         st_size / st_mtime / st_ctime — fall back to zero for the
         device/inode fields in that case.
         """
-        self._rs.observed_sha1(
+        new_tree0 = self._rs.observed_sha1(
             entry[0],
             sha1,
             stat_value.st_mode,
@@ -958,11 +958,8 @@ class DirState:
             getattr(stat_value, "st_dev", 0),
             getattr(stat_value, "st_ino", 0),
         )
-        fresh = self._rs.get_entry(
-            0, path_utf8=osutils.pathjoin(entry[0][0], entry[0][1])
-        )
-        if fresh != (None, None):
-            entry[1][0] = fresh[1][0]
+        if new_tree0 is not None:
+            entry[1][0] = new_tree0
 
     def _sha_cutoff_time(self):
         """Return cutoff time.

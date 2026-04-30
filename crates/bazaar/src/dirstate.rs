@@ -2183,6 +2183,13 @@ impl DirState {
     /// Takes the stat fields unpacked so callers can feed in whichever
     /// shape they already have (Python's `os.stat_result`, Rust's
     /// [`Metadata`], synthetic fixture data).
+    /// Record the observed sha1 for the entry at `key` and return the
+    /// new tree-0 `TreeData` so callers that hold a mirror of the
+    /// entry row (e.g. Python tuple) can write it back in place
+    /// without a second lookup.
+    ///
+    /// Returns `Ok(None)` when no update happened — non-regular-file,
+    /// or the stat falls inside the uncacheable window.
     #[allow(clippy::too_many_arguments)]
     pub fn observed_sha1(
         &mut self,
@@ -2194,12 +2201,12 @@ impl DirState {
         st_ctime: i64,
         st_dev: u64,
         st_ino: u64,
-    ) -> Result<(), UpdateEntryError> {
+    ) -> Result<Option<TreeData>, UpdateEntryError> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         // S_IFREG (0o100000) after masking with S_IFMT.
         if (st_mode & 0o170000) != 0o100000 {
-            return Ok(());
+            return Ok(None);
         }
 
         let now_secs: i64 = SystemTime::now()
@@ -2213,7 +2220,7 @@ impl DirState {
         });
 
         if st_mtime >= cutoff || st_ctime >= cutoff {
-            return Ok(());
+            return Ok(None);
         }
 
         let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
@@ -2235,16 +2242,17 @@ impl DirState {
             st_mode,
         )
         .into_bytes();
-        self.dirblocks[block_index].entries[entry_index].trees[0] = TreeData {
+        let new_tree0 = TreeData {
             minikind: b'f',
             fingerprint: sha1.to_vec(),
             size: st_size,
             executable,
             packed_stat,
         };
+        self.dirblocks[block_index].entries[entry_index].trees[0] = new_tree0.clone();
         self.packed_stat_index = None;
         self.mark_modified(&[key.clone()], false);
-        Ok(())
+        Ok(Some(new_tree0))
     }
 
     /// Refresh the tree-0 slot of `key` from the filesystem.  Mirrors
