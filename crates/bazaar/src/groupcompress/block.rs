@@ -243,7 +243,7 @@ impl GroupCompressBlock {
     ///
     /// # Arguments
     /// * `num_bytes` - Ensure that we have extracted at least num_bytes of content. If None, consume everything
-    pub fn ensure_content(&mut self, num_bytes: Option<usize>) {
+    pub fn ensure_content(&mut self, num_bytes: Option<usize>) -> Result<(), Error> {
         assert!(
             self.content_length.is_some(),
             "self.content_length should never be None"
@@ -293,7 +293,7 @@ impl GroupCompressBlock {
             if self.content.as_ref().unwrap().len() >= self.content_length.unwrap_or(0) {
                 self.z_content_decompressor = None;
             }
-            return;
+            return Ok(());
         }
 
         num_bytes -= self.content.as_ref().unwrap().len();
@@ -302,8 +302,7 @@ impl GroupCompressBlock {
         self.z_content_decompressor
             .as_mut()
             .unwrap()
-            .read_exact(&mut buf)
-            .unwrap();
+            .read_exact(&mut buf)?;
         self.content.as_mut().unwrap().extend(buf);
 
         // If we've now pulled out the whole thing, drop the streaming
@@ -312,6 +311,7 @@ impl GroupCompressBlock {
         if self.content.as_ref().unwrap().len() >= self.content_length.unwrap_or(0) {
             self.z_content_decompressor = None;
         }
+        Ok(())
     }
 
     #[allow(clippy::len_without_is_empty)]
@@ -406,7 +406,7 @@ impl GroupCompressBlock {
         if start == 0 && end == 0 {
             return Ok(vec![]);
         }
-        self.ensure_content(Some(end));
+        self.ensure_content(Some(end))?;
 
         let content = self.content.as_ref().unwrap();
         if end > content.len() || start >= end {
@@ -541,7 +541,7 @@ impl GroupCompressBlock {
     /// `Insert { length, text }`.
     pub fn dump(&mut self, include_text: Option<bool>) -> Result<Vec<DumpInfo>, Error> {
         let include_text = include_text.unwrap_or(false);
-        self.ensure_content(None);
+        self.ensure_content(None)?;
         let mut result = vec![];
         let mut content = self.content.as_ref().unwrap().as_slice();
         while !content.is_empty() {
@@ -696,11 +696,11 @@ mod tests {
         // Content is not populated yet.
         assert!(b.content().is_none());
         // Partial decompression reveals at least the requested bytes.
-        b.ensure_content(Some(100));
+        b.ensure_content(Some(100)).unwrap();
         assert!(b.content().unwrap().len() >= 100);
         assert_eq!(&b.content().unwrap()[..100], &body[..100]);
         // Full decompression recovers the whole body.
-        b.ensure_content(None);
+        b.ensure_content(None).unwrap();
         assert_eq!(b.content(), Some(body.as_slice()));
     }
 
@@ -729,7 +729,7 @@ mod tests {
         // Reading it back should recover the same record payload.
         let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
         assert_eq!(parsed.content_length(), Some(record.len()));
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content(), Some(record.as_slice()));
     }
 
@@ -764,7 +764,7 @@ mod tests {
 
         let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
         assert!(parsed.content().is_none());
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content(), Some(record.as_slice()));
     }
 
@@ -781,9 +781,9 @@ mod tests {
         let raw = src.to_bytes();
 
         let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
-        parsed.ensure_content(Some(50));
+        parsed.ensure_content(Some(50)).unwrap();
         assert!(parsed.content().unwrap().len() >= 50);
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content(), Some(record.as_slice()));
     }
 
@@ -837,9 +837,9 @@ mod tests {
         let raw = src.to_bytes();
 
         let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
-        parsed.ensure_content(Some(50));
+        parsed.ensure_content(Some(50)).unwrap();
         assert!(parsed.has_z_content_decompressor());
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert!(!parsed.has_z_content_decompressor());
     }
 
@@ -856,13 +856,13 @@ mod tests {
         let raw = src.to_bytes();
 
         let mut parsed = GroupCompressBlock::from_bytes(raw.as_slice()).unwrap();
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         let first = parsed.content().unwrap().to_vec();
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content().unwrap(), first.as_slice());
 
         // And a partial request below the current length is likewise a no-op.
-        parsed.ensure_content(Some(10));
+        parsed.ensure_content(Some(10)).unwrap();
         assert_eq!(parsed.content().unwrap(), first.as_slice());
     }
 
@@ -1015,7 +1015,7 @@ mod tests {
         src.to_bytes(); // force z_content population
 
         let mut parsed = GroupCompressBlock::from_bytes(src.to_bytes().as_slice()).unwrap();
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert!(parsed.content().is_some());
 
         // Now rebuild a fresh z_content for a different body and plug it in
@@ -1036,7 +1036,7 @@ mod tests {
             parsed.content().is_none(),
             "cached content should be cleared"
         );
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content(), Some(replacement_record.as_slice()));
     }
 
@@ -1056,7 +1056,7 @@ mod tests {
 
         let mut parsed = GroupCompressBlock::from_bytes(bytes.as_slice()).unwrap();
         assert_eq!(parsed.compressor(), Some(CompressorKind::Lzma));
-        parsed.ensure_content(None);
+        parsed.ensure_content(None).unwrap();
         assert_eq!(parsed.content(), Some(record.as_slice()));
     }
 }
