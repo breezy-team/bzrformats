@@ -910,7 +910,7 @@ fn delta_err_to_py_err(py: Python, e: InventoryDeltaInconsistency) -> PyErr {
 }
 
 #[pyclass]
-struct InventoryDelta(bazaar::inventory_delta::InventoryDelta);
+pub(crate) struct InventoryDelta(pub(crate) bazaar::inventory_delta::InventoryDelta);
 
 #[pymethods]
 impl InventoryDelta {

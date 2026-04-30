@@ -510,6 +510,10 @@ impl IdIndex {
     pub fn file_ids(&self) -> impl Iterator<Item = &FileId> {
         self.id_index.keys()
     }
+
+    pub fn clear(&mut self) {
+        self.id_index.clear();
+    }
 }
 
 /// Convert an inventory entry (from a revision tree) to state details.
@@ -829,6 +833,322 @@ pub enum LockState {
     Write,
 }
 
+/// Filesystem snapshot for one path, as handed to
+/// [`DirState::process_entry`].  Mirrors the 5-tuple Python's
+/// `ProcessEntryPython` threads around internally:
+/// `(top_relpath, basename, kind, stat, abspath)`.
+#[derive(Debug, Clone)]
+pub struct ProcessPathInfo {
+    /// Absolute path of the file on disk (utf8 bytes).
+    pub abspath: Vec<u8>,
+    /// Filesystem kind ("file", "directory", "symlink",
+    /// "tree-reference"), or `None` when the path is missing.
+    pub kind: Option<String>,
+    /// Stat info for the path.
+    pub stat: StatInfo,
+}
+
+/// Mutable per-`iter_changes` state shared across
+/// [`DirState::process_entry`] calls.  Ports the instance fields
+/// Python's `ProcessEntryPython` carries: search / searched sets,
+/// parent-id caches, dirname-to-file-id maps.
+#[derive(Debug, Default)]
+pub struct ProcessEntryState {
+    /// `source_index` in the tree-data array; `None` means "compare
+    /// against a synthetic empty source" (new-tree mode).
+    pub source_index: Option<usize>,
+    /// `target_index` in the tree-data array; always concrete.
+    pub target_index: usize,
+    /// Whether unchanged entries should still yield a change tuple.
+    pub include_unchanged: bool,
+    /// Whether the iter_changes caller wants reports for paths on
+    /// disk that aren't in either source or target dirstate trees.
+    pub want_unversioned: bool,
+    /// Partial iter_changes: true when the caller supplied a
+    /// narrower set of paths than `{b""}`.  Used by
+    /// `_gather_result_for_consistency` to decide whether to queue
+    /// parent-directory bookkeeping.
+    pub partial: bool,
+    /// Whether the current working-tree format supports tree
+    /// references.  When false, `is_tree_reference_dir` is never
+    /// called during the walk.
+    pub supports_tree_reference: bool,
+    /// Absolute path of the working-tree root on disk.  Used to
+    /// join `root + relpath` into an absolute path that `Transport`
+    /// methods can accept.  Filled at `iter_changes` call time.
+    pub root_abspath: Vec<u8>,
+    /// Paths whose children have already been walked.
+    pub searched_specific_files: std::collections::HashSet<Vec<u8>>,
+    /// Paths whose children still need walking (driven by the
+    /// outer `iter_changes` loop).
+    pub search_specific_files: std::collections::HashSet<Vec<u8>>,
+    /// Parent directories we need to re-visit after the main walk
+    /// — populated by `_gather_result_for_consistency` when a
+    /// partial iter_changes produces a relocated entry.
+    pub search_specific_file_parents: std::collections::HashSet<Vec<u8>>,
+    /// Paths we've examined via `_iter_specific_file_parents`.
+    pub searched_exact_paths: std::collections::HashSet<Vec<u8>>,
+    /// File ids we've already yielded during the main walk.
+    pub seen_ids: std::collections::HashSet<Vec<u8>>,
+    /// Cache: dirname → file_id for the *target* tree.
+    pub new_dirname_to_file_id: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    /// Cache: dirname → file_id for the *source* tree.
+    pub old_dirname_to_file_id: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    /// One-slot cache: (dirname, parent_file_id) for the source tree.
+    pub last_source_parent: Option<(Vec<u8>, Option<Vec<u8>>)>,
+    /// One-slot cache: (dirname, parent_file_id) for the target tree.
+    pub last_target_parent: Option<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+/// One row returned by [`DirState::process_entry`], mirroring Python's
+/// `DirstateInventoryChange` minus the utf8-decoding (Rust returns
+/// raw bytes; the pyo3 layer decodes with surrogateescape).
+#[derive(Debug, Clone)]
+pub struct DirstateChange {
+    pub file_id: Vec<u8>,
+    pub old_path: Option<Vec<u8>>,
+    pub new_path: Option<Vec<u8>>,
+    pub content_change: bool,
+    pub old_versioned: bool,
+    pub new_versioned: bool,
+    pub source_parent_id: Option<Vec<u8>>,
+    pub target_parent_id: Option<Vec<u8>>,
+    pub old_basename: Option<Vec<u8>>,
+    pub new_basename: Option<Vec<u8>>,
+    pub source_kind: Option<String>,
+    pub target_kind: Option<String>,
+    pub source_exec: Option<bool>,
+    pub target_exec: Option<bool>,
+}
+
+/// Error returned by [`DirState::process_entry`].
+#[derive(Debug)]
+pub enum ProcessEntryError {
+    DirstateCorrupt(String),
+    BadFileKind { path: Vec<u8>, kind: String },
+    Internal(String),
+}
+
+impl std::fmt::Display for ProcessEntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProcessEntryError::DirstateCorrupt(s) => write!(f, "dirstate corrupt: {}", s),
+            ProcessEntryError::BadFileKind { path, kind } => {
+                write!(f, "bad file kind {:?} for path {:?}", kind, path)
+            }
+            ProcessEntryError::Internal(s) => write!(f, "process_entry: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for ProcessEntryError {}
+
+fn null_parent_details() -> TreeData {
+    TreeData {
+        minikind: b'a',
+        fingerprint: Vec::new(),
+        size: 0,
+        executable: false,
+        packed_stat: Vec::new(),
+    }
+}
+
+fn join_path(dirname: &[u8], basename: &[u8]) -> Vec<u8> {
+    if dirname.is_empty() {
+        basename.to_vec()
+    } else {
+        let mut p = dirname.to_vec();
+        p.push(b'/');
+        p.extend_from_slice(basename);
+        p
+    }
+}
+
+/// Is `candidate` inside `parent` (or equal to it)?  Mirrors
+/// `osutils.is_inside`: `parent` is the prefix directory, `candidate`
+/// is the potentially-nested path.
+fn is_inside(parent: &[u8], candidate: &[u8]) -> bool {
+    if parent == candidate {
+        return true;
+    }
+    if parent.is_empty() {
+        return true;
+    }
+    candidate.len() > parent.len()
+        && candidate.starts_with(parent)
+        && candidate[parent.len()] == b'/'
+}
+
+fn kind_for_minikind(mk: u8) -> Option<String> {
+    match mk {
+        b'f' => Some("file".to_string()),
+        b'd' => Some("directory".to_string()),
+        b'l' => Some("symlink".to_string()),
+        b't' => Some("tree-reference".to_string()),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_parent_id(
+    dirblocks: &[Dirblock],
+    old_dirname: &[u8],
+    old_basename: &[u8],
+    entry_file_id: &[u8],
+    source_index: usize,
+    old_dirname_to_file_id: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    last_source_parent: &mut Option<(Vec<u8>, Option<Vec<u8>>)>,
+) -> Option<Vec<u8>> {
+    if !old_basename.is_empty()
+        && last_source_parent
+            .as_ref()
+            .map(|(d, _)| d.as_slice() == old_dirname)
+            .unwrap_or(false)
+    {
+        return last_source_parent.as_ref().and_then(|(_, id)| id.clone());
+    }
+    let cached = old_dirname_to_file_id.get(old_dirname).cloned();
+    let pid_raw = match cached {
+        Some(v) => Some(v),
+        None => {
+            let (pdir, pbase) = split_path_utf8(old_dirname);
+            let bei = get_block_entry_index(dirblocks, pdir, pbase, source_index);
+            if bei.path_present {
+                Some(
+                    dirblocks[bei.block_index].entries[bei.entry_index]
+                        .key
+                        .file_id
+                        .clone(),
+                )
+            } else {
+                None
+            }
+        }
+    };
+    match pid_raw {
+        Some(v) if v == entry_file_id => None,
+        Some(v) => {
+            *last_source_parent = Some((old_dirname.to_vec(), Some(v.clone())));
+            Some(v)
+        }
+        None => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_target_parent_id(
+    dirblocks: &[Dirblock],
+    new_dirname: &[u8],
+    new_basename: &[u8],
+    entry_file_id: &[u8],
+    target_index: usize,
+    new_dirname_to_file_id: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    last_target_parent: &mut Option<(Vec<u8>, Option<Vec<u8>>)>,
+) -> Result<Option<Vec<u8>>, ProcessEntryError> {
+    if !new_basename.is_empty()
+        && last_target_parent
+            .as_ref()
+            .map(|(d, _)| d.as_slice() == new_dirname)
+            .unwrap_or(false)
+    {
+        return Ok(last_target_parent.as_ref().and_then(|(_, id)| id.clone()));
+    }
+    let cached = new_dirname_to_file_id.get(new_dirname).cloned();
+    let pid_raw = match cached {
+        Some(v) => Some(v),
+        None => {
+            let (pdir, pbase) = split_path_utf8(new_dirname);
+            let bei = get_block_entry_index(dirblocks, pdir, pbase, target_index);
+            if bei.path_present {
+                Some(
+                    dirblocks[bei.block_index].entries[bei.entry_index]
+                        .key
+                        .file_id
+                        .clone(),
+                )
+            } else {
+                return Err(ProcessEntryError::Internal(format!(
+                    "Could not find target parent in wt: {:?}",
+                    new_dirname
+                )));
+            }
+        }
+    };
+    match pid_raw {
+        Some(v) if v == entry_file_id => Ok(None),
+        Some(v) => {
+            *last_target_parent = Some((new_dirname.to_vec(), Some(v.clone())));
+            Ok(Some(v))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Return the last path component (utf8 bytes) of `path`.  Matches
+/// `osutils.splitpath(path)[-1]` — the basename of a path.
+fn splitpath_last(path: &[u8]) -> Vec<u8> {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => path[i + 1..].to_vec(),
+        None => path.to_vec(),
+    }
+}
+
+/// Build a `ProcessPathInfo` for `path_utf8`, or `None` when the path
+/// does not exist on disk.  Mirrors Python's `_path_info` helper on
+/// `ProcessEntryPython`.
+fn compute_path_info(
+    pstate: &ProcessEntryState,
+    transport: &dyn Transport,
+    path_utf8: &[u8],
+) -> Option<ProcessPathInfo> {
+    let abspath = join_path(&pstate.root_abspath, path_utf8);
+    let stat = match transport.lstat(&abspath) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    let mut kind = if stat.is_file() {
+        "file".to_string()
+    } else if stat.is_dir() {
+        "directory".to_string()
+    } else if stat.is_symlink() {
+        "symlink".to_string()
+    } else {
+        "unknown".to_string()
+    };
+    if kind == "directory"
+        && pstate.supports_tree_reference
+        && transport.is_tree_reference_dir(&abspath).unwrap_or(false)
+    {
+        kind = "tree-reference".to_string();
+    }
+    Some(ProcessPathInfo {
+        abspath,
+        kind: Some(kind),
+        stat,
+    })
+}
+
+/// Update `seen_ids` + `search_specific_file_parents` from a
+/// just-emitted `DirstateChange`.  Mirrors Python's
+/// `_gather_result_for_consistency`.
+fn gather_result_for_consistency(pstate: &mut ProcessEntryState, change: &DirstateChange) {
+    if !pstate.partial || change.file_id.is_empty() {
+        return;
+    }
+    pstate.seen_ids.insert(change.file_id.clone());
+    if let Some(ref new_path) = change.new_path {
+        if !new_path.is_empty() {
+            // Queue every ancestor directory, plus the root.
+            let mut path = new_path.clone();
+            while let Some(i) = path.iter().rposition(|&b| b == b'/') {
+                path.truncate(i);
+                pstate.search_specific_file_parents.insert(path.clone());
+            }
+            pstate.search_specific_file_parents.insert(Vec::new());
+        }
+    }
+}
+
 /// Errors returned by [`Transport`] operations.
 ///
 /// Variants are coarse on purpose: callers generally either propagate
@@ -927,6 +1247,223 @@ impl std::error::Error for TransportError {}
 /// mutates the lock state, the file contents, or both. Callers that
 /// need shared access should wrap an implementation in their own
 /// synchronisation primitive.
+/// Lazy iterator state for [`DirState::iter_changes_next`].
+/// Holds enough information to resume the depth-first walk across
+/// calls, so callers (pyo3 included) can consume one change at a
+/// time without materialising the full change set upfront.
+///
+/// All fields are owned — no borrow on `DirState` or `Transport` —
+/// so the state can live inside a pyclass that re-borrows `DirState`
+/// on every `__next__` call.
+#[derive(Debug)]
+pub struct IterChangesIter {
+    phase: IterPhase,
+    /// When the state machine is walking a specific subtree, the
+    /// root currently being processed plus its absolute path on disk.
+    current_root: Option<(Vec<u8>, Vec<u8>)>,
+    /// Have we processed the dirstate entries + want_unversioned
+    /// emission for the root itself?
+    root_processed: bool,
+    /// Filesystem walker for the current root's subtree.
+    walker: Option<WalkDirsUtf8>,
+    /// Dirblock cursor under the current root — the block index in
+    /// `DirState.dirblocks`.
+    block_index: usize,
+    /// Staged walker yield that hasn't yet been consumed by the
+    /// merge loop.  Lazily filled on demand.
+    staged_walker_block: Option<(Vec<u8>, Vec<u8>, Vec<DirEntryInfo>)>,
+    /// Per-block merge cursors.  Reset every time we advance to a
+    /// new block/walker pair.
+    merge_entry_index: usize,
+    merge_path_index: usize,
+    merge_path_handled: bool,
+    merge_advance_entry: bool,
+    merge_advance_path: bool,
+    /// Changes buffered for emission.  One state-machine step can
+    /// produce several changes (e.g. a root walk that handles both
+    /// existing entries and a want_unversioned record) — we queue
+    /// them and drain one per `next_change` call.
+    pending: std::collections::VecDeque<DirstateChange>,
+    /// Set once iter_specific_file_parents drain has begun, so we
+    /// don't restart it.
+    parents_drain_started: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IterPhase {
+    /// Pull the next root from `search_specific_files`.
+    PickRoot,
+    /// Process the root path itself (entries + want_unversioned).
+    ProcessRoot,
+    /// Walk the root's subtree, merging walker output against
+    /// dirblocks.
+    WalkSubtree,
+    /// Drain `search_specific_file_parents`.
+    DrainParents,
+    /// Finished — `next_change` returns `Ok(None)`.
+    Done,
+}
+
+impl Default for IterChangesIter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IterChangesIter {
+    pub fn new() -> Self {
+        Self {
+            phase: IterPhase::PickRoot,
+            current_root: None,
+            root_processed: false,
+            walker: None,
+            block_index: 0,
+            staged_walker_block: None,
+            merge_entry_index: 0,
+            merge_path_index: 0,
+            merge_path_handled: false,
+            merge_advance_entry: true,
+            merge_advance_path: true,
+            pending: std::collections::VecDeque::new(),
+            parents_drain_started: false,
+        }
+    }
+}
+
+/// One directory block yielded by [`walkdirs_utf8`].  Mirrors the
+/// shape Python's `_walkdirs_utf8` yields: `((relroot, abspath),
+/// [DirEntryInfo, ...])`.  The entries are sorted by basename; the
+/// caller may mutate the list (remove entries to skip recursion)
+/// before the walker proceeds.
+#[derive(Debug, Clone)]
+pub struct WalkedDir {
+    /// Utf8 relative path of this directory, relative to the walk's
+    /// `prefix`.  Empty for the top of the walk.
+    pub relpath: Vec<u8>,
+    /// Absolute path of this directory on disk.
+    pub abspath: Vec<u8>,
+    /// Per-child entries (sorted by basename).  Each entry's
+    /// `basename` field is the child's basename (not its relpath
+    /// relative to `walk.prefix`).  The walker reads each child's
+    /// full relpath as `relpath + '/' + basename` when it recurses.
+    pub entries: Vec<DirEntryInfo>,
+}
+
+/// Iterator-like helper for depth-first directory walks modeled on
+/// Python's `_walkdirs_utf8`.  Call [`WalkDirsUtf8::next_dir`]
+/// repeatedly; it yields `Some(WalkedDir)` per directory in
+/// depth-first order and `None` when the walk completes.  The caller
+/// mutates the returned `entries` list before the next call to
+/// prune directories from the descent (matching how the Python
+/// walker mutates the yielded dirblock list in place).
+#[derive(Debug)]
+pub struct WalkDirsUtf8 {
+    /// Stack of (relpath, abspath) pairs still to visit.  Most
+    /// recently discovered directories are on top so the walk is
+    /// depth-first matching Python's behaviour.
+    pub pending: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Last-yielded directory's children, filtered down to surviving
+    /// subdirectories that still need recursion.  Reset on every
+    /// call to `next_dir`.
+    pub pending_subdirs: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl WalkDirsUtf8 {
+    /// Start a walk rooted at `root_abspath`.  `prefix` is the utf8
+    /// relpath that should precede every yielded child's relpath
+    /// (matching Python's `prefix` argument to `_walkdirs_utf8`).
+    pub fn new(root_abspath: &[u8], prefix: &[u8]) -> Self {
+        Self {
+            pending: vec![(prefix.to_vec(), root_abspath.to_vec())],
+            pending_subdirs: Vec::new(),
+        }
+    }
+
+    /// Yield the next directory block.  Returns `Ok(false)` when the
+    /// walk is done.  `callback` is invoked with the yielded block
+    /// and a mutable slice of its entries so the caller can prune
+    /// subdirectories before recursion.  The caller's mutation
+    /// semantics mirror the Python walker: an entry removed from the
+    /// slice will not be recursed into.
+    ///
+    /// Takes the [`Transport`] per call rather than storing a
+    /// borrow so callers can embed the walker in longer-lived
+    /// iterator state.
+    pub fn next_dir<F>(
+        &mut self,
+        transport: &dyn Transport,
+        mut callback: F,
+    ) -> Result<bool, TransportError>
+    where
+        F: FnMut(&[u8], &[u8], &mut Vec<DirEntryInfo>),
+    {
+        // Promote subdirectories discovered on the previous iteration
+        // into the pending stack.  `pending_subdirs` is in forward
+        // (byte-sorted) order; drain it in reverse so the
+        // smallest-named child lands on top of the stack and
+        // `pop()` below yields it first — depth-first, alphabetical.
+        for entry in self.pending_subdirs.drain(..).rev() {
+            self.pending.push(entry);
+        }
+        let (relpath, abspath) = match self.pending.pop() {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+
+        let mut entries = transport.list_dir(&abspath)?;
+        entries.sort_by(|a, b| a.basename.cmp(&b.basename));
+        callback(&relpath, &abspath, &mut entries);
+
+        // Collect surviving directory entries into `pending_subdirs`
+        // in forward (byte-sorted) order.  The promotion loop above
+        // runs in that same order on the next call, which puts the
+        // last-named child on top of the stack — so `pop` yields
+        // the first-named child first.
+        self.pending_subdirs = entries
+            .iter()
+            .filter(|e| e.kind == "directory")
+            .map(|e| {
+                let mut child_relpath = relpath.clone();
+                if !child_relpath.is_empty() {
+                    child_relpath.push(b'/');
+                }
+                child_relpath.extend_from_slice(&e.basename);
+                (child_relpath, e.abspath.clone())
+            })
+            .collect();
+        Ok(true)
+    }
+}
+
+/// Stat result returned by [`Transport::lstat`].  Mirrors the subset of
+/// `os.stat_result` fields that dirstate logic actually inspects:
+/// mode (for kind + executable), size, mtime/ctime (for the cutoff
+/// check), dev/ino (fed into `pack_stat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatInfo {
+    pub mode: u32,
+    pub size: u64,
+    pub mtime: i64,
+    pub ctime: i64,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl StatInfo {
+    /// Whether `mode` indicates a regular file (S_IFREG).
+    pub fn is_file(&self) -> bool {
+        self.mode & 0o170000 == 0o100000
+    }
+    /// Whether `mode` indicates a directory (S_IFDIR).
+    pub fn is_dir(&self) -> bool {
+        self.mode & 0o170000 == 0o040000
+    }
+    /// Whether `mode` indicates a symlink (S_IFLNK).
+    pub fn is_symlink(&self) -> bool {
+        self.mode & 0o170000 == 0o120000
+    }
+}
+
 pub trait Transport {
     /// Whether the backing file exists. Does not require a lock.
     fn exists(&self) -> Result<bool, TransportError>;
@@ -962,6 +1499,62 @@ pub trait Transport {
     /// implementations should call `fdatasync(2)` or the platform
     /// equivalent.
     fn fdatasync(&mut self) -> Result<(), TransportError>;
+
+    /// Return the stat info for an absolute path in the working-tree
+    /// filesystem that the dirstate is tracking (not the dirstate
+    /// file itself).  `NoSuchFile` when the path is gone from disk.
+    /// Required by `DirState::update_entry` / `process_entry`, which
+    /// otherwise would couple the pure crate to `std::fs`.
+    fn lstat(&self, abspath: &[u8]) -> Result<StatInfo, TransportError>;
+
+    /// Return the target of the symlink at `abspath`.  `NoSuchFile`
+    /// when the path is gone; a generic error when the path is not a
+    /// symlink.
+    fn read_link(&self, abspath: &[u8]) -> Result<Vec<u8>, TransportError>;
+
+    /// Whether the directory at `abspath` is a nested tree reference
+    /// (i.e. contains a `.bzr/` control directory).  Mirrors the
+    /// per-format `_directory_is_tree_reference` hook on breezy's
+    /// `WorkingTree`: the file format decides whether tree references
+    /// can exist at all, and a concrete directory qualifies iff it
+    /// carries its own `.bzr/`.  Consumers use this during
+    /// `iter_changes` to flip the on-disk `directory` kind to
+    /// `tree-reference` before handing the entry to
+    /// [`DirState::process_entry`].
+    ///
+    /// Formats that don't support tree references should implement
+    /// this as an unconditional `Ok(false)`.
+    fn is_tree_reference_dir(&self, abspath: &[u8]) -> Result<bool, TransportError>;
+
+    /// List the immediate children of directory `abspath`.  Used by
+    /// the pure-crate `iter_changes` walker.  Returns a vector of
+    /// per-child entries; the implementation does not guarantee any
+    /// particular order — the walker sorts.
+    ///
+    /// Each entry carries the child's utf8 basename, its kind
+    /// (`"file"`, `"directory"`, `"symlink"`, or `"tree-reference"`),
+    /// its [`StatInfo`] (from an `lstat`), and the absolute path of
+    /// the child on disk.  The walker re-uses the stat to avoid a
+    /// second syscall inside `process_entry`.
+    ///
+    /// `NoSuchFile` when `abspath` does not exist or is not a
+    /// directory.
+    fn list_dir(&self, abspath: &[u8]) -> Result<Vec<DirEntryInfo>, TransportError>;
+}
+
+/// One entry yielded by [`Transport::list_dir`] — mirrors the
+/// per-child tuple Python's `DirReader.read_dir` returns.
+#[derive(Debug, Clone)]
+pub struct DirEntryInfo {
+    /// The child's utf8 basename (no trailing slash).
+    pub basename: Vec<u8>,
+    /// `"file"`, `"directory"`, `"symlink"`, `"tree-reference"`, or
+    /// an unknown kind.
+    pub kind: String,
+    /// Stat info from `lstat` on the child.
+    pub stat: StatInfo,
+    /// Absolute path of the child on disk (utf8 bytes).
+    pub abspath: Vec<u8>,
 }
 
 /// Error returned while parsing the on-disk dirblock body of a dirstate
@@ -1538,6 +2131,1390 @@ impl DirState {
         self.packed_stat_index = None;
     }
 
+    /// Overwrite the tree-0 slot of the entry at `key` with the given
+    /// details. Returns an error if `key` is not present; otherwise
+    /// does no other bookkeeping — no id_index changes, no cross-ref
+    /// rewrites, no state bump. This is the narrow primitive the
+    /// `py_update_entry` hash-refresh path needs: callers that want
+    /// structural changes should use [`DirState::update_minimal`] or
+    /// [`DirState::add`].
+    pub fn set_tree0(&mut self, key: &EntryKey, details: TreeData) -> Result<(), MakeAbsentError> {
+        let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
+        if !block_present {
+            return Err(MakeAbsentError::BlockNotFound { key: key.clone() });
+        }
+        let (entry_index, entry_present) =
+            find_entry_index(key, &self.dirblocks[block_index].entries);
+        if !entry_present {
+            return Err(MakeAbsentError::EntryNotFound { key: key.clone() });
+        }
+        self.dirblocks[block_index].entries[entry_index].trees[0] = details;
+        self.packed_stat_index = None;
+        Ok(())
+    }
+
+    /// Return the live tree-0 minikind for `key`, or `None` when no
+    /// entry with that key is present. Used by callers that need to
+    /// refresh a stale snapshot against current dirblock contents
+    /// (notably `set_state_from_inventory`'s zipper-merge loop, which
+    /// used to rely on Python-side tuple aliasing to observe mid-loop
+    /// rewrites).
+    pub fn tree0_minikind(&self, key: &EntryKey) -> Option<u8> {
+        let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
+        if !block_present {
+            return None;
+        }
+        let (entry_index, entry_present) =
+            find_entry_index(key, &self.dirblocks[block_index].entries);
+        if !entry_present {
+            return None;
+        }
+        self.dirblocks[block_index].entries[entry_index]
+            .trees
+            .first()
+            .map(|t| t.minikind)
+    }
+
+    /// Record an observed sha1 for `key`'s tree-0 row when the file's
+    /// stat falls in the cacheable window.  Mirrors Python's
+    /// `DirState._observed_sha1`: silently ignores non-file kinds and
+    /// files whose mtime/ctime land after the cutoff.
+    ///
+    /// Takes the stat fields unpacked so callers can feed in whichever
+    /// shape they already have (Python's `os.stat_result`, Rust's
+    /// [`Metadata`], synthetic fixture data).
+    /// Record the observed sha1 for the entry at `key` and return the
+    /// new tree-0 `TreeData` so callers that hold a mirror of the
+    /// entry row (e.g. Python tuple) can write it back in place
+    /// without a second lookup.
+    ///
+    /// Returns `Ok(None)` when no update happened — non-regular-file,
+    /// or the stat falls inside the uncacheable window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observed_sha1(
+        &mut self,
+        key: &EntryKey,
+        sha1: &[u8],
+        st_mode: u32,
+        st_size: u64,
+        st_mtime: i64,
+        st_ctime: i64,
+        st_dev: u64,
+        st_ino: u64,
+    ) -> Result<Option<TreeData>, UpdateEntryError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // S_IFREG (0o100000) after masking with S_IFMT.
+        if (st_mode & 0o170000) != 0o100000 {
+            return Ok(None);
+        }
+
+        let now_secs: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff: i64 = self.cutoff_time.unwrap_or_else(|| {
+            let c = now_secs - 3;
+            self.cutoff_time = Some(c);
+            c
+        });
+
+        if st_mtime >= cutoff || st_ctime >= cutoff {
+            return Ok(None);
+        }
+
+        let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
+        if !block_present {
+            return Err(UpdateEntryError::EntryNotFound);
+        }
+        let (entry_index, entry_present) =
+            find_entry_index(key, &self.dirblocks[block_index].entries);
+        if !entry_present {
+            return Err(UpdateEntryError::EntryNotFound);
+        }
+        let executable = self.dirblocks[block_index].entries[entry_index].trees[0].executable;
+        let packed_stat = pack_stat(
+            st_size,
+            st_mtime as u64,
+            st_ctime as u64,
+            st_dev,
+            st_ino,
+            st_mode,
+        )
+        .into_bytes();
+        let new_tree0 = TreeData {
+            minikind: b'f',
+            fingerprint: sha1.to_vec(),
+            size: st_size,
+            executable,
+            packed_stat,
+        };
+        self.dirblocks[block_index].entries[entry_index].trees[0] = new_tree0.clone();
+        self.packed_stat_index = None;
+        self.mark_modified(&[key.clone()], false);
+        Ok(Some(new_tree0))
+    }
+
+    /// Refresh the tree-0 slot of `key` from the filesystem.  Mirrors
+    /// Python's `py_update_entry`: if the stat hasn't changed since
+    /// the last time we saved, re-use the cached link-or-sha1;
+    /// otherwise read the file (or symlink) and rewrite the tree-0
+    /// slot.  Returns the sha1 hex or symlink target, or `None` when
+    /// the on-disk kind is not supported (e.g. block/char devices),
+    /// when the row is a directory and the cached stat matches
+    /// (nothing to report), or when we skip the sha because the
+    /// Compare one dirstate entry against what's on disk (or nothing,
+    /// if the path is absent in the target) and yield a
+    /// [`DirstateChange`] describing any differences.  Ports Python's
+    /// `ProcessEntryPython._process_entry`.
+    ///
+    /// Returns `(None, None)` when the entry is uninteresting (no row
+    /// in either side of the comparison), `(None, Some(false))` when
+    /// both sides match and `pstate.include_unchanged` is off,
+    /// `(Some(change), Some(true))` for a real change, and
+    /// `(Some(change), Some(false))` for an unchanged-but-included
+    /// report.
+    pub fn process_entry(
+        &mut self,
+        pstate: &mut ProcessEntryState,
+        entry_key: &EntryKey,
+        entry_trees: &[TreeData],
+        path_info: Option<&ProcessPathInfo>,
+        transport: &dyn Transport,
+    ) -> Result<(Option<DirstateChange>, Option<bool>), ProcessEntryError> {
+        let source_details: TreeData = if let Some(idx) = pstate.source_index {
+            entry_trees
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(null_parent_details)
+        } else {
+            null_parent_details()
+        };
+        let target_idx = pstate.target_index;
+        let mut target_details: TreeData = entry_trees
+            .get(target_idx)
+            .cloned()
+            .unwrap_or_else(null_parent_details);
+        let mut target_minikind = target_details.minikind;
+
+        let fdlt = |k: u8| matches!(k, b'f' | b'd' | b'l' | b't');
+        let fdltr = |k: u8| matches!(k, b'f' | b'd' | b'l' | b't' | b'r');
+
+        // Step 1: if on disk and versioned in the target, refresh
+        // via update_entry (which may flip minikind e.g. d → t).
+        let mut link_or_sha1: Option<Vec<u8>> = None;
+        if let Some(info) = path_info {
+            if fdlt(target_minikind) {
+                if target_idx != 0 {
+                    return Err(ProcessEntryError::Internal(
+                        "update_entry requires target_index == 0".into(),
+                    ));
+                }
+                link_or_sha1 = self
+                    .update_entry(entry_key, &info.abspath, &info.stat, transport)
+                    .map_err(|e| ProcessEntryError::Internal(format!("update_entry: {}", e)))?;
+                let (bi, _) = find_block_index_from_key(&self.dirblocks, entry_key);
+                let (ei, _) = find_entry_index(entry_key, &self.dirblocks[bi].entries);
+                target_details = self.dirblocks[bi].entries[ei].trees[target_idx].clone();
+                target_minikind = target_details.minikind;
+            }
+        }
+
+        let file_id = entry_key.file_id.clone();
+        let mut source_minikind = source_details.minikind;
+        let mut source_details_mut = source_details.clone();
+
+        if fdltr(source_minikind) && fdlt(target_minikind) {
+            let mut old_dirname: Vec<u8>;
+            let mut old_basename: Vec<u8>;
+            let mut old_path: Option<Vec<u8>>;
+            let mut path: Option<Vec<u8>>;
+
+            if source_minikind == b'r' {
+                let src_path = source_details_mut.fingerprint.clone();
+                let already_inside = pstate
+                    .searched_specific_files
+                    .iter()
+                    .any(|p| is_inside(p.as_slice(), &src_path));
+                if !already_inside {
+                    pstate.search_specific_files.insert(src_path.clone());
+                }
+                old_path = Some(src_path.clone());
+                let (od, ob) = split_path_utf8(&src_path);
+                old_dirname = od.to_vec();
+                old_basename = ob.to_vec();
+                path = Some(join_path(&entry_key.dirname, &entry_key.basename));
+
+                let src_idx = pstate.source_index.ok_or_else(|| {
+                    ProcessEntryError::Internal("relocation with no source_index".into())
+                })?;
+                let bei =
+                    get_block_entry_index(&self.dirblocks, &old_dirname, &old_basename, src_idx);
+                let src = if bei.path_present {
+                    self.dirblocks[bei.block_index].entries[bei.entry_index]
+                        .trees
+                        .get(src_idx)
+                        .cloned()
+                } else {
+                    None
+                };
+                let src = src.ok_or_else(|| {
+                    ProcessEntryError::DirstateCorrupt(format!(
+                        "entry '{}/{}' is considered renamed from {:?} but source does not exist",
+                        String::from_utf8_lossy(&entry_key.dirname),
+                        String::from_utf8_lossy(&entry_key.basename),
+                        src_path,
+                    ))
+                })?;
+                source_details_mut = src;
+                source_minikind = source_details_mut.minikind;
+            } else {
+                old_dirname = entry_key.dirname.clone();
+                old_basename = entry_key.basename.clone();
+                old_path = None;
+                path = None;
+            }
+
+            let (content_change, target_kind, target_exec) = if let Some(info) = path_info {
+                let target_kind_str: &str = info.kind.as_deref().unwrap_or("file");
+                match target_kind_str {
+                    "directory" => {
+                        if path.is_none() {
+                            let p = join_path(&old_dirname, &old_basename);
+                            path = Some(p.clone());
+                            old_path = Some(p);
+                        }
+                        if let Some(p) = path.as_ref() {
+                            pstate
+                                .new_dirname_to_file_id
+                                .insert(p.clone(), file_id.clone());
+                        }
+                        (
+                            source_minikind != b'd',
+                            Some("directory".to_string()),
+                            false,
+                        )
+                    }
+                    "file" => {
+                        let cc = if source_minikind != b'f' {
+                            true
+                        } else {
+                            if link_or_sha1.is_none() {
+                                let path_buf = bytes_to_path(&info.abspath);
+                                let sha = self.sha1_provider.sha1(&path_buf).map_err(|e| {
+                                    ProcessEntryError::Internal(format!("sha1: {}", e))
+                                })?;
+                                let sha_bytes = sha.as_bytes().to_vec();
+                                let _ = self.observed_sha1(
+                                    entry_key,
+                                    &sha_bytes,
+                                    info.stat.mode,
+                                    info.stat.size,
+                                    info.stat.mtime,
+                                    info.stat.ctime,
+                                    info.stat.dev,
+                                    info.stat.ino,
+                                );
+                                link_or_sha1 = Some(sha_bytes);
+                            }
+                            link_or_sha1.as_deref()
+                                != Some(source_details_mut.fingerprint.as_slice())
+                        };
+                        let te = if self.use_filesystem_for_exec {
+                            (info.stat.mode & 0o100) != 0
+                        } else {
+                            target_details.executable
+                        };
+                        (cc, Some("file".to_string()), te)
+                    }
+                    "symlink" => {
+                        let cc = if source_minikind != b'l' {
+                            true
+                        } else {
+                            link_or_sha1.as_deref()
+                                != Some(source_details_mut.fingerprint.as_slice())
+                        };
+                        (cc, Some("symlink".to_string()), false)
+                    }
+                    "tree-reference" => (
+                        source_minikind != b't',
+                        Some("tree-reference".to_string()),
+                        false,
+                    ),
+                    other => {
+                        if path.is_none() {
+                            path = Some(join_path(&old_dirname, &old_basename));
+                        }
+                        return Err(ProcessEntryError::BadFileKind {
+                            path: path.unwrap(),
+                            kind: other.to_string(),
+                        });
+                    }
+                }
+            } else {
+                (true, None, false)
+            };
+
+            if source_minikind == b'd' {
+                if path.is_none() {
+                    let p = join_path(&old_dirname, &old_basename);
+                    path = Some(p.clone());
+                    old_path = Some(p);
+                }
+                if let Some(op) = old_path.as_ref() {
+                    pstate
+                        .old_dirname_to_file_id
+                        .insert(op.clone(), file_id.clone());
+                }
+            }
+
+            let source_parent_id = resolve_parent_id(
+                &self.dirblocks,
+                &old_dirname,
+                &old_basename,
+                &entry_key.file_id,
+                pstate.source_index.unwrap_or(0),
+                &pstate.old_dirname_to_file_id,
+                &mut pstate.last_source_parent,
+            );
+            let target_parent_id = resolve_target_parent_id(
+                &self.dirblocks,
+                &entry_key.dirname,
+                &entry_key.basename,
+                &entry_key.file_id,
+                target_idx,
+                &pstate.new_dirname_to_file_id,
+                &mut pstate.last_target_parent,
+            )?;
+
+            let source_exec = source_details_mut.executable;
+            let changed = content_change
+                || source_parent_id != target_parent_id
+                || old_basename != entry_key.basename
+                || source_exec != target_exec;
+
+            if !changed && !pstate.include_unchanged {
+                return Ok((None, Some(false)));
+            }
+
+            let (old_path_out, path_out) = match old_path {
+                Some(ref op) => (op.clone(), path.clone().unwrap_or_else(|| op.clone())),
+                None => {
+                    let p = join_path(&old_dirname, &old_basename);
+                    (p.clone(), p)
+                }
+            };
+
+            return Ok((
+                Some(DirstateChange {
+                    file_id: entry_key.file_id.clone(),
+                    old_path: Some(old_path_out),
+                    new_path: Some(path_out),
+                    content_change,
+                    old_versioned: true,
+                    new_versioned: true,
+                    source_parent_id,
+                    target_parent_id,
+                    old_basename: Some(old_basename),
+                    new_basename: Some(entry_key.basename.clone()),
+                    source_kind: kind_for_minikind(source_minikind),
+                    target_kind,
+                    source_exec: Some(source_exec),
+                    target_exec: Some(target_exec),
+                }),
+                Some(changed),
+            ));
+        }
+
+        if source_minikind == b'a' && fdlt(target_minikind) {
+            let path = join_path(&entry_key.dirname, &entry_key.basename);
+            let (parent_dir, parent_base) = split_path_utf8(&entry_key.dirname);
+            let parent_bei =
+                get_block_entry_index(&self.dirblocks, parent_dir, parent_base, target_idx);
+            let parent_id: Option<Vec<u8>> = if parent_bei.path_present {
+                let pid = self.dirblocks[parent_bei.block_index].entries[parent_bei.entry_index]
+                    .key
+                    .file_id
+                    .clone();
+                (pid != entry_key.file_id).then_some(pid)
+            } else {
+                None
+            };
+            if let Some(info) = path_info {
+                let te = if self.use_filesystem_for_exec {
+                    (info.stat.mode & 0o170000 == 0o100000) && (info.stat.mode & 0o100) != 0
+                } else {
+                    target_details.executable
+                };
+                return Ok((
+                    Some(DirstateChange {
+                        file_id: entry_key.file_id.clone(),
+                        old_path: None,
+                        new_path: Some(path),
+                        content_change: true,
+                        old_versioned: false,
+                        new_versioned: true,
+                        source_parent_id: None,
+                        target_parent_id: parent_id,
+                        old_basename: None,
+                        new_basename: Some(entry_key.basename.clone()),
+                        source_kind: None,
+                        target_kind: info.kind.clone(),
+                        source_exec: None,
+                        target_exec: Some(te),
+                    }),
+                    Some(true),
+                ));
+            } else {
+                return Ok((
+                    Some(DirstateChange {
+                        file_id: entry_key.file_id.clone(),
+                        old_path: None,
+                        new_path: Some(path),
+                        content_change: false,
+                        old_versioned: false,
+                        new_versioned: true,
+                        source_parent_id: None,
+                        target_parent_id: parent_id,
+                        old_basename: None,
+                        new_basename: Some(entry_key.basename.clone()),
+                        source_kind: None,
+                        target_kind: None,
+                        source_exec: None,
+                        target_exec: Some(false),
+                    }),
+                    Some(true),
+                ));
+            }
+        }
+
+        if fdlt(source_minikind) && target_minikind == b'a' {
+            let old_path = join_path(&entry_key.dirname, &entry_key.basename);
+            let src_idx = pstate.source_index.unwrap_or(0);
+            let (pdir, pbase) = split_path_utf8(&entry_key.dirname);
+            let parent_bei = get_block_entry_index(&self.dirblocks, pdir, pbase, src_idx);
+            let parent_id: Option<Vec<u8>> = if parent_bei.path_present {
+                let pid = self.dirblocks[parent_bei.block_index].entries[parent_bei.entry_index]
+                    .key
+                    .file_id
+                    .clone();
+                (pid != entry_key.file_id).then_some(pid)
+            } else {
+                None
+            };
+            return Ok((
+                Some(DirstateChange {
+                    file_id: entry_key.file_id.clone(),
+                    old_path: Some(old_path),
+                    new_path: None,
+                    content_change: true,
+                    old_versioned: true,
+                    new_versioned: false,
+                    source_parent_id: parent_id,
+                    target_parent_id: None,
+                    old_basename: Some(entry_key.basename.clone()),
+                    new_basename: None,
+                    source_kind: kind_for_minikind(source_minikind),
+                    target_kind: None,
+                    source_exec: Some(source_details_mut.executable),
+                    target_exec: None,
+                }),
+                Some(true),
+            ));
+        }
+
+        if fdlt(source_minikind) && target_minikind == b'r' {
+            let tpath = target_details.fingerprint.clone();
+            let already_inside = pstate
+                .searched_specific_files
+                .iter()
+                .any(|p| is_inside(p.as_slice(), &tpath));
+            if !already_inside {
+                pstate.search_specific_files.insert(tpath);
+            }
+            return Ok((None, None));
+        }
+
+        let ra = |k: u8| matches!(k, b'r' | b'a');
+        if ra(source_minikind) && ra(target_minikind) {
+            return Ok((None, None));
+        }
+
+        Err(ProcessEntryError::Internal(format!(
+            "don't know how to compare source_minikind={:?}, target_minikind={:?}",
+            source_minikind, target_minikind
+        )))
+    }
+
+    /// Advance the lazy iter_changes state machine and return the
+    /// next change to yield, or `Ok(None)` when the walk is done.
+    /// Mirrors Python's `ProcessEntryPython.iter_changes` generator:
+    /// call repeatedly to get one change at a time.
+    ///
+    /// Each call may emit 0 or more changes; leftover changes are
+    /// buffered on `iter.pending` so subsequent calls drain them
+    /// before resuming the walk.
+    pub fn iter_changes_next(
+        &mut self,
+        iter: &mut IterChangesIter,
+        pstate: &mut ProcessEntryState,
+        transport: &dyn Transport,
+    ) -> Result<Option<DirstateChange>, ProcessEntryError> {
+        loop {
+            if let Some(change) = iter.pending.pop_front() {
+                return Ok(Some(change));
+            }
+            match iter.phase {
+                IterPhase::PickRoot => {
+                    let next_root = pstate.search_specific_files.iter().next().cloned();
+                    match next_root {
+                        Some(root) => {
+                            pstate.search_specific_files.remove(&root);
+                            pstate.searched_specific_files.insert(root.clone());
+                            let abspath = join_path(&pstate.root_abspath, &root);
+                            iter.current_root = Some((root, abspath));
+                            iter.root_processed = false;
+                            iter.walker = None;
+                            iter.block_index = 0;
+                            iter.staged_walker_block = None;
+                            iter.phase = IterPhase::ProcessRoot;
+                        }
+                        None => {
+                            iter.phase = IterPhase::DrainParents;
+                        }
+                    }
+                }
+                IterPhase::ProcessRoot => {
+                    let (current_root, root_abspath) = iter
+                        .current_root
+                        .as_ref()
+                        .expect("current_root set")
+                        .clone();
+
+                    let root_stat = match transport.lstat(&root_abspath) {
+                        Ok(s) => Some(s),
+                        Err(TransportError::NotFound(_)) => None,
+                        Err(e) => {
+                            return Err(ProcessEntryError::Internal(format!(
+                                "lstat({}): {}",
+                                String::from_utf8_lossy(&root_abspath),
+                                e
+                            )))
+                        }
+                    };
+                    let root_path_info = root_stat.map(|stat| {
+                        let mut kind = if stat.is_file() {
+                            "file".to_string()
+                        } else if stat.is_dir() {
+                            "directory".to_string()
+                        } else if stat.is_symlink() {
+                            "symlink".to_string()
+                        } else {
+                            "unknown".to_string()
+                        };
+                        if kind == "directory"
+                            && pstate.supports_tree_reference
+                            && transport
+                                .is_tree_reference_dir(&root_abspath)
+                                .unwrap_or(false)
+                        {
+                            kind = "tree-reference".to_string();
+                        }
+                        ProcessPathInfo {
+                            abspath: root_abspath.clone(),
+                            kind: Some(kind),
+                            stat,
+                        }
+                    });
+
+                    let root_entries_owned: Vec<(EntryKey, Vec<TreeData>)> = self
+                        .entries_for_path(&current_root)
+                        .into_iter()
+                        .map(|e| (e.key.clone(), e.trees.clone()))
+                        .collect();
+                    if root_entries_owned.is_empty() && root_path_info.is_none() {
+                        iter.phase = IterPhase::PickRoot;
+                        continue;
+                    }
+                    let mut path_handled = false;
+                    for (ek, trees) in &root_entries_owned {
+                        let (change, changed) = self.process_entry(
+                            pstate,
+                            ek,
+                            trees,
+                            root_path_info.as_ref(),
+                            transport,
+                        )?;
+                        if changed.is_some() {
+                            path_handled = true;
+                            if changed == Some(true) {
+                                if let Some(ref c) = change {
+                                    gather_result_for_consistency(pstate, c);
+                                }
+                            }
+                            if changed == Some(true) || pstate.include_unchanged {
+                                if let Some(c) = change {
+                                    iter.pending.push_back(c);
+                                }
+                            }
+                        }
+                    }
+                    if pstate.want_unversioned && !path_handled {
+                        if let Some(ref info) = root_path_info {
+                            let new_executable =
+                                info.stat.is_file() && (info.stat.mode & 0o100) != 0;
+                            let basename = splitpath_last(&current_root);
+                            iter.pending.push_back(DirstateChange {
+                                file_id: Vec::new(),
+                                old_path: None,
+                                new_path: Some(current_root.clone()),
+                                content_change: true,
+                                old_versioned: false,
+                                new_versioned: false,
+                                source_parent_id: None,
+                                target_parent_id: None,
+                                old_basename: None,
+                                new_basename: Some(basename),
+                                source_kind: None,
+                                target_kind: info.kind.clone(),
+                                source_exec: None,
+                                target_exec: Some(new_executable),
+                            });
+                        }
+                    }
+
+                    // Stop here if the root is a tree-reference or
+                    // absent on disk — we don't descend into it.
+                    let skip_walk = root_path_info
+                        .as_ref()
+                        .map(|p| p.kind.as_deref() == Some("tree-reference"))
+                        .unwrap_or(true);
+                    if skip_walk {
+                        iter.phase = IterPhase::PickRoot;
+                        continue;
+                    }
+
+                    // Seed the subtree walker.
+                    iter.walker = Some(WalkDirsUtf8::new(&root_abspath, &current_root));
+                    let initial_key = EntryKey {
+                        dirname: current_root.clone(),
+                        basename: Vec::new(),
+                        file_id: Vec::new(),
+                    };
+                    let (mut bi, _) = find_block_index_from_key(&self.dirblocks, &initial_key);
+                    if bi == 0 {
+                        bi = 1;
+                    }
+                    iter.block_index = bi;
+                    iter.staged_walker_block = None;
+                    iter.merge_entry_index = 0;
+                    iter.merge_path_index = 0;
+                    iter.merge_path_handled = false;
+                    iter.merge_advance_entry = true;
+                    iter.merge_advance_path = true;
+                    iter.phase = IterPhase::WalkSubtree;
+                }
+                IterPhase::WalkSubtree => {
+                    self.iter_changes_step_walk(iter, pstate, transport)?;
+                }
+                IterPhase::DrainParents => {
+                    self.iter_changes_step_parents(iter, pstate, transport)?;
+                }
+                IterPhase::Done => return Ok(None),
+            }
+            // Any changes just queued become the next yielded value
+            // via the top-of-loop drain.
+        }
+    }
+
+    /// Advance one step of the `WalkSubtree` phase.  Exactly one
+    /// walker block + dirblock pair gets merged per call; if we
+    /// exhaust both under the current root, transition back to
+    /// `PickRoot`.
+    fn iter_changes_step_walk(
+        &mut self,
+        iter: &mut IterChangesIter,
+        pstate: &mut ProcessEntryState,
+        transport: &dyn Transport,
+    ) -> Result<(), ProcessEntryError> {
+        let current_root = iter
+            .current_root
+            .as_ref()
+            .expect("current_root set while walking")
+            .0
+            .clone();
+
+        // Pull the next walker block if we haven't cached one.
+        if iter.staged_walker_block.is_none() {
+            let walker = iter.walker.as_mut().expect("walker initialised");
+            let mut captured: Option<(Vec<u8>, Vec<u8>, Vec<DirEntryInfo>)> = None;
+            let supports_ref = pstate.supports_tree_reference;
+            let progressed = walker
+                .next_dir(transport, |rel, abs, entries| {
+                    if rel.is_empty() {
+                        entries.retain(|e| e.basename.as_slice() != b".bzr");
+                    }
+                    if supports_ref {
+                        for e in entries.iter_mut() {
+                            if e.kind == "directory" {
+                                if transport.is_tree_reference_dir(&e.abspath).unwrap_or(false) {
+                                    e.kind = "tree-reference".to_string();
+                                }
+                            }
+                        }
+                    }
+                    captured = Some((rel.to_vec(), abs.to_vec(), entries.clone()));
+                })
+                .map_err(|e| ProcessEntryError::Internal(format!("walkdirs: {}", e)))?;
+            iter.staged_walker_block = if progressed { captured } else { None };
+        }
+
+        let block_info = self
+            .dirblocks
+            .get(iter.block_index)
+            .filter(|b| is_inside(&current_root, &b.dirname))
+            .map(|b| (b.dirname.clone(), b.entries.clone()));
+
+        // Both exhausted → this root is done; back to PickRoot.
+        if iter.staged_walker_block.is_none() && block_info.is_none() {
+            iter.phase = IterPhase::PickRoot;
+            return Ok(());
+        }
+
+        // Resolve mis-aligned walker vs block: whichever is "earlier"
+        // gets consumed first.  This mirrors the Python _lt_by_dirs
+        // dispatch at the top of the merge loop.
+        if let (Some((walker_rel, _, walker_entries)), Some((block_dirname, _))) =
+            (iter.staged_walker_block.as_ref(), block_info.as_ref())
+        {
+            if walker_rel.as_slice() != block_dirname.as_slice() {
+                if cmp_by_dirs_bytes(walker_rel, block_dirname).is_lt() {
+                    // Walker has an unversioned directory the
+                    // dirstate doesn't know about.  Emit records
+                    // (if want_unversioned) and prune its subdirs
+                    // from the walker's recursion.
+                    if pstate.want_unversioned {
+                        for pi in walker_entries.iter() {
+                            let new_executable = pi.stat.is_file() && (pi.stat.mode & 0o100) != 0;
+                            let path = if walker_rel.is_empty() {
+                                pi.basename.clone()
+                            } else {
+                                let mut p = walker_rel.clone();
+                                p.push(b'/');
+                                p.extend_from_slice(&pi.basename);
+                                p
+                            };
+                            iter.pending.push_back(DirstateChange {
+                                file_id: Vec::new(),
+                                old_path: None,
+                                new_path: Some(path),
+                                content_change: true,
+                                old_versioned: false,
+                                new_versioned: false,
+                                source_parent_id: None,
+                                target_parent_id: None,
+                                old_basename: None,
+                                new_basename: Some(pi.basename.clone()),
+                                source_kind: None,
+                                target_kind: Some(pi.kind.clone()),
+                                source_exec: None,
+                                target_exec: Some(new_executable),
+                            });
+                        }
+                    }
+                    // Don't descend into unversioned directories.
+                    if let Some(walker) = iter.walker.as_mut() {
+                        walker.pending_subdirs.clear();
+                    }
+                    iter.staged_walker_block = None;
+                    return Ok(());
+                } else {
+                    // Dirstate knows about a block the walker didn't
+                    // visit (directory removed from disk).  Emit
+                    // removals for every live entry.
+                    let (_, block_entries) = block_info.unwrap();
+                    for entry in &block_entries {
+                        let (change, changed) =
+                            self.process_entry(pstate, &entry.key, &entry.trees, None, transport)?;
+                        if changed.is_some() {
+                            if changed == Some(true) {
+                                if let Some(ref c) = change {
+                                    gather_result_for_consistency(pstate, c);
+                                }
+                            }
+                            if changed == Some(true) || pstate.include_unchanged {
+                                if let Some(c) = change {
+                                    iter.pending.push_back(c);
+                                }
+                            }
+                        }
+                    }
+                    iter.block_index += 1;
+                    return Ok(());
+                }
+            }
+        }
+
+        // --- Aligned merge: same dirname on both sides (or one side empty) ---
+        let (_block_dirname, block_entries) = block_info.unwrap_or((Vec::new(), Vec::new()));
+        let walker_rel = iter
+            .staged_walker_block
+            .as_ref()
+            .map(|(rel, _, _)| rel.clone())
+            .unwrap_or_default();
+        let walker_entries = iter
+            .staged_walker_block
+            .as_ref()
+            .map(|(_, _, entries)| entries.clone())
+            .unwrap_or_default();
+
+        // Drain the inner merge loop one step at a time.  Unlike
+        // Python's tight `while current_entry or current_path_info`
+        // loop, we run the entire merge here — it's bounded by the
+        // dir contents and typically small.  Results queue onto
+        // iter.pending and surface one per outer next_change call.
+        let mut entry_index = iter.merge_entry_index;
+        let mut path_index = iter.merge_path_index;
+        let mut path_handled = iter.merge_path_handled;
+        let mut advance_entry = iter.merge_advance_entry;
+        let mut advance_path = iter.merge_advance_path;
+        let mut walker_local = walker_entries.clone();
+        loop {
+            let current_entry = block_entries.get(entry_index).cloned();
+            let current_path_info = if path_index < walker_local.len() {
+                Some(walker_local[path_index].clone())
+            } else {
+                None
+            };
+            if current_entry.is_none() && current_path_info.is_none() {
+                break;
+            }
+            if current_entry.is_none() {
+                // handled by want_unversioned below
+            } else if current_path_info.is_none() {
+                let ce = current_entry.as_ref().unwrap();
+                let (change, changed) =
+                    self.process_entry(pstate, &ce.key, &ce.trees, None, transport)?;
+                if changed.is_some() {
+                    if changed == Some(true) {
+                        if let Some(ref c) = change {
+                            gather_result_for_consistency(pstate, c);
+                        }
+                    }
+                    if changed == Some(true) || pstate.include_unchanged {
+                        if let Some(c) = change {
+                            iter.pending.push_back(c);
+                        }
+                    }
+                }
+            } else {
+                let ce = current_entry.as_ref().unwrap();
+                let pi = current_path_info.as_ref().unwrap();
+                let target0 = ce.trees.get(pstate.target_index).map(|t| t.minikind);
+                let mismatch =
+                    ce.key.basename != pi.basename || matches!(target0, Some(b'a') | Some(b'r'));
+                if mismatch {
+                    if pi.basename.as_slice() < ce.key.basename.as_slice() {
+                        advance_entry = false;
+                    } else {
+                        let path_info_absent: Option<&ProcessPathInfo> = None;
+                        let (change, changed) = self.process_entry(
+                            pstate,
+                            &ce.key,
+                            &ce.trees,
+                            path_info_absent,
+                            transport,
+                        )?;
+                        if changed.is_some() {
+                            if changed == Some(true) {
+                                if let Some(ref c) = change {
+                                    gather_result_for_consistency(pstate, c);
+                                }
+                            }
+                            if changed == Some(true) || pstate.include_unchanged {
+                                if let Some(c) = change {
+                                    iter.pending.push_back(c);
+                                }
+                            }
+                        }
+                        advance_path = false;
+                    }
+                } else {
+                    let pi_rs = ProcessPathInfo {
+                        abspath: pi.abspath.clone(),
+                        kind: Some(pi.kind.clone()),
+                        stat: pi.stat,
+                    };
+                    let (change, changed) =
+                        self.process_entry(pstate, &ce.key, &ce.trees, Some(&pi_rs), transport)?;
+                    if changed.is_some() {
+                        path_handled = true;
+                        if changed == Some(true) {
+                            if let Some(ref c) = change {
+                                gather_result_for_consistency(pstate, c);
+                            }
+                        }
+                        if changed == Some(true) || pstate.include_unchanged {
+                            if let Some(c) = change {
+                                iter.pending.push_back(c);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if advance_entry && current_entry.is_some() {
+                entry_index += 1;
+            } else {
+                advance_entry = true;
+            }
+            if advance_path && current_path_info.is_some() {
+                if !path_handled {
+                    if pstate.want_unversioned {
+                        let pi = current_path_info.as_ref().unwrap();
+                        let new_executable = pi.stat.is_file() && (pi.stat.mode & 0o100) != 0;
+                        let path = if walker_rel.is_empty() {
+                            pi.basename.clone()
+                        } else {
+                            let mut p = walker_rel.clone();
+                            p.push(b'/');
+                            p.extend_from_slice(&pi.basename);
+                            p
+                        };
+                        iter.pending.push_back(DirstateChange {
+                            file_id: Vec::new(),
+                            old_path: None,
+                            new_path: Some(path),
+                            content_change: true,
+                            old_versioned: false,
+                            new_versioned: false,
+                            source_parent_id: None,
+                            target_parent_id: None,
+                            old_basename: None,
+                            new_basename: Some(pi.basename.clone()),
+                            source_kind: None,
+                            target_kind: Some(pi.kind.clone()),
+                            source_exec: None,
+                            target_exec: Some(new_executable),
+                        });
+                    }
+                    let pi = current_path_info.as_ref().unwrap();
+                    if pi.kind == "directory" {
+                        let child_rel = if walker_rel.is_empty() {
+                            pi.basename.clone()
+                        } else {
+                            let mut p = walker_rel.clone();
+                            p.push(b'/');
+                            p.extend_from_slice(&pi.basename);
+                            p
+                        };
+                        if let Some(walker) = iter.walker.as_mut() {
+                            walker.pending_subdirs.retain(|(rel, _)| rel != &child_rel);
+                        }
+                    }
+                }
+                let pi = current_path_info.as_ref().unwrap();
+                if pi.kind == "tree-reference" {
+                    let child_rel = if walker_rel.is_empty() {
+                        pi.basename.clone()
+                    } else {
+                        let mut p = walker_rel.clone();
+                        p.push(b'/');
+                        p.extend_from_slice(&pi.basename);
+                        p
+                    };
+                    if let Some(walker) = iter.walker.as_mut() {
+                        walker.pending_subdirs.retain(|(rel, _)| rel != &child_rel);
+                    }
+                }
+                path_index += 1;
+                path_handled = false;
+                let _ = &mut walker_local;
+            } else {
+                advance_path = true;
+            }
+        }
+
+        iter.merge_entry_index = entry_index;
+        iter.merge_path_index = path_index;
+        iter.merge_path_handled = path_handled;
+        iter.merge_advance_entry = advance_entry;
+        iter.merge_advance_path = advance_path;
+        iter.block_index += 1;
+        iter.staged_walker_block = None;
+        // Reset merge cursors for the next block.
+        iter.merge_entry_index = 0;
+        iter.merge_path_index = 0;
+        iter.merge_path_handled = false;
+        iter.merge_advance_entry = true;
+        iter.merge_advance_path = true;
+        Ok(())
+    }
+
+    /// Advance one step of the `DrainParents` phase — equivalent to
+    /// Python's `_iter_specific_file_parents`.
+    fn iter_changes_step_parents(
+        &mut self,
+        iter: &mut IterChangesIter,
+        pstate: &mut ProcessEntryState,
+        transport: &dyn Transport,
+    ) -> Result<(), ProcessEntryError> {
+        let next = pstate.search_specific_file_parents.iter().next().cloned();
+        let path_utf8 = match next {
+            Some(p) => p,
+            None => {
+                iter.phase = IterPhase::Done;
+                return Ok(());
+            }
+        };
+        pstate.search_specific_file_parents.remove(&path_utf8);
+        if pstate
+            .searched_specific_files
+            .iter()
+            .any(|p| is_inside(p.as_slice(), &path_utf8))
+        {
+            return Ok(());
+        }
+        if pstate.searched_exact_paths.contains(&path_utf8) {
+            return Ok(());
+        }
+        let path_entries: Vec<(EntryKey, Vec<TreeData>)> = self
+            .entries_for_path(&path_utf8)
+            .into_iter()
+            .map(|e| (e.key.clone(), e.trees.clone()))
+            .collect();
+        let mut selected: Vec<(EntryKey, Vec<TreeData>)> = Vec::new();
+        let mut found_item = false;
+        for (ek, trees) in &path_entries {
+            let target = trees.get(pstate.target_index).map(|t| t.minikind);
+            let source = pstate
+                .source_index
+                .and_then(|i| trees.get(i))
+                .map(|t| t.minikind);
+            if !matches!(target, Some(b'a') | Some(b'r')) {
+                found_item = true;
+                selected.push((ek.clone(), trees.clone()));
+            } else if pstate.source_index.is_some() && !matches!(source, Some(b'a') | Some(b'r')) {
+                found_item = true;
+                if target == Some(b'a') {
+                    selected.push((ek.clone(), trees.clone()));
+                } else {
+                    let target_path = trees[pstate.target_index].fingerprint.clone();
+                    pstate.search_specific_file_parents.insert(target_path);
+                }
+            }
+        }
+        if !found_item {
+            return Err(ProcessEntryError::Internal(format!(
+                "Missing entry for specific path parent {:?}",
+                path_utf8
+            )));
+        }
+        let path_info = compute_path_info(pstate, transport, &path_utf8);
+        for (ek, trees) in &selected {
+            if pstate.seen_ids.contains(&ek.file_id) {
+                continue;
+            }
+            let (change, changed) =
+                self.process_entry(pstate, ek, trees, path_info.as_ref(), transport)?;
+            if changed.is_none() {
+                return Err(ProcessEntryError::Internal(format!(
+                    "entry<->path mismatch for specific path {:?}",
+                    path_utf8
+                )));
+            }
+            if changed == Some(true) {
+                if let Some(ref c) = change {
+                    gather_result_for_consistency(pstate, c);
+                    if c.source_kind.as_deref() == Some("directory")
+                        && c.target_kind.as_deref() != Some("directory")
+                    {
+                        let entry_path = match pstate.source_index {
+                            Some(si) if trees.get(si).map(|t| t.minikind) == Some(b'r') => {
+                                trees[si].fingerprint.clone()
+                            }
+                            _ => path_utf8.clone(),
+                        };
+                        let initial_key = EntryKey {
+                            dirname: entry_path.clone(),
+                            basename: Vec::new(),
+                            file_id: Vec::new(),
+                        };
+                        let (mut block_index, _) =
+                            find_block_index_from_key(&self.dirblocks, &initial_key);
+                        if block_index == 0 {
+                            block_index += 1;
+                        }
+                        if block_index < self.dirblocks.len() {
+                            let block = &self.dirblocks[block_index];
+                            if is_inside(&entry_path, &block.dirname) {
+                                for child in &block.entries {
+                                    let source_mk = pstate
+                                        .source_index
+                                        .and_then(|i| child.trees.get(i))
+                                        .map(|t| t.minikind);
+                                    if matches!(source_mk, Some(b'a') | Some(b'r')) {
+                                        continue;
+                                    }
+                                    let child_path =
+                                        join_path(&child.key.dirname, &child.key.basename);
+                                    pstate.search_specific_file_parents.insert(child_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if changed == Some(true) || pstate.include_unchanged {
+                if let Some(c) = change {
+                    iter.pending.push_back(c);
+                }
+            }
+        }
+        pstate.searched_exact_paths.insert(path_utf8);
+        let _ = iter.parents_drain_started;
+        Ok(())
+    }
+
+    /// Refresh the tree-0 slot of `key` from the filesystem.  Mirrors
+    /// Python's `py_update_entry`:
+    ///
+    /// Arguments are (key, abspath, stat, transport) — see the doc
+    /// comment on [`StatInfo`] for the stat fields, and the
+    /// [`Transport`] trait for read_link semantics.
+    pub fn update_entry(
+        &mut self,
+        key: &EntryKey,
+        abspath: &[u8],
+        stat: &StatInfo,
+        transport: &dyn Transport,
+    ) -> Result<Option<Vec<u8>>, UpdateEntryError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // 1. Derive minikind from st_mode.  Non-file/dir/symlink kinds
+        //    are silently skipped (Python returns None via the
+        //    KeyError branch).
+        let mut minikind: u8 = if stat.is_file() {
+            b'f'
+        } else if stat.is_dir() {
+            b'd'
+        } else if stat.is_symlink() {
+            b'l'
+        } else {
+            return Ok(None);
+        };
+
+        let packed_stat = pack_stat(
+            stat.size,
+            stat.mtime as u64,
+            stat.ctime as u64,
+            stat.dev,
+            stat.ino,
+            stat.mode,
+        )
+        .into_bytes();
+
+        // 2. Fetch the saved tree-0 row (need a clone, we'll mutate it).
+        let (block_index, block_present) = find_block_index_from_key(&self.dirblocks, key);
+        if !block_present {
+            return Err(UpdateEntryError::EntryNotFound);
+        }
+        let (entry_index, entry_present) =
+            find_entry_index(key, &self.dirblocks[block_index].entries);
+        if !entry_present {
+            return Err(UpdateEntryError::EntryNotFound);
+        }
+        let entry_len = self.dirblocks[block_index].entries[entry_index].trees.len();
+        let tree1_minikind: u8 = self.dirblocks[block_index].entries[entry_index]
+            .trees
+            .get(1)
+            .map(|t| t.minikind)
+            .unwrap_or(0);
+        let saved = self.dirblocks[block_index].entries[entry_index].trees[0].clone();
+
+        // 3. A directory row that used to be a tree-reference keeps
+        //    its 't' minikind even when the filesystem kind is plain
+        //    directory (matches Python's special case).
+        if minikind == b'd' && saved.minikind == b't' {
+            minikind = b't';
+        }
+
+        // 4. Cache-hit path: same kind + same stat + same size → return
+        //    saved link/sha1 without further I/O.
+        if minikind == saved.minikind && packed_stat == saved.packed_stat {
+            if minikind == b'd' {
+                return Ok(None);
+            }
+            if saved.size == stat.size {
+                return Ok(Some(saved.fingerprint.clone()));
+            }
+        }
+
+        // 5. Cache miss — rewrite the row.
+        let now_secs: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff: i64 = self.cutoff_time.unwrap_or_else(|| {
+            let c = now_secs - 3;
+            self.cutoff_time = Some(c);
+            c
+        });
+
+        let stat_is_cacheable = stat.mtime < cutoff && stat.ctime < cutoff;
+
+        let mut result: Option<Vec<u8>> = None;
+        let mut worth_saving = true;
+        let mut became_directory = false;
+
+        // Tree-references don't get a tree-0 rewrite: the Python
+        // implementation's if/elif chain has no arm for b't', so the
+        // saved row is left intact and only mark_modified runs.
+        if minikind == b't' {
+            self.mark_modified(&[key.clone()], false);
+            return Ok(None);
+        }
+
+        let new_tree0 = match minikind {
+            b'f' => {
+                let executable = if self.use_filesystem_for_exec {
+                    (stat.mode & 0o100) != 0
+                } else {
+                    saved.executable
+                };
+                if stat_is_cacheable && entry_len > 1 && tree1_minikind != b'a' {
+                    // SHA1Provider remains a pluggable indirection for
+                    // content hashing (content filters).  Callers can
+                    // install a provider that reads through their own
+                    // layer; DefaultSHA1Provider is a thin wrapper
+                    // over `sha_file_by_name`.
+                    let path_buf = bytes_to_path(abspath);
+                    let sha1 = self
+                        .sha1_provider
+                        .sha1(&path_buf)
+                        .map_err(UpdateEntryError::Io)?;
+                    result = Some(sha1.as_bytes().to_vec());
+                    TreeData {
+                        minikind: b'f',
+                        fingerprint: sha1.into_bytes(),
+                        size: stat.size,
+                        executable,
+                        packed_stat,
+                    }
+                } else {
+                    worth_saving = false;
+                    TreeData {
+                        minikind: b'f',
+                        fingerprint: Vec::new(),
+                        size: stat.size,
+                        executable,
+                        packed_stat: b"x".repeat(32),
+                    }
+                }
+            }
+            b'd' => {
+                if saved.minikind != b'd' {
+                    became_directory = true;
+                } else {
+                    worth_saving = false;
+                }
+                TreeData {
+                    minikind: b'd',
+                    fingerprint: Vec::new(),
+                    size: 0,
+                    executable: false,
+                    packed_stat,
+                }
+            }
+            b'l' => {
+                if saved.minikind == b'l' {
+                    worth_saving = false;
+                }
+                let target_bytes = transport.read_link(abspath).map_err(|e| match e {
+                    TransportError::Io { kind, message } => {
+                        UpdateEntryError::Io(std::io::Error::new(kind, message))
+                    }
+                    TransportError::NotFound(p) => {
+                        UpdateEntryError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, p))
+                    }
+                    other => UpdateEntryError::Other(other.to_string()),
+                })?;
+                result = Some(target_bytes.clone());
+                if stat_is_cacheable {
+                    TreeData {
+                        minikind: b'l',
+                        fingerprint: target_bytes,
+                        size: stat.size,
+                        executable: false,
+                        packed_stat,
+                    }
+                } else {
+                    TreeData {
+                        minikind: b'l',
+                        fingerprint: Vec::new(),
+                        size: stat.size,
+                        executable: false,
+                        packed_stat: b"x".repeat(32),
+                    }
+                }
+            }
+            _ => {
+                // Already handled via the fall-through in step 1; any
+                // other minikind here is an internal error.
+                return Err(UpdateEntryError::UnexpectedKind(minikind));
+            }
+        };
+
+        self.dirblocks[block_index].entries[entry_index].trees[0] = new_tree0;
+        self.packed_stat_index = None;
+
+        if became_directory {
+            // A former file/symlink is now a directory; ensure the
+            // child dirblock exists.
+            let (dirname_parent, basename_parent) = (key.dirname.clone(), key.basename.clone());
+            let parent_bei =
+                get_block_entry_index(&self.dirblocks, &dirname_parent, &basename_parent, 0);
+            if parent_bei.path_present {
+                let mut subdir = dirname_parent.clone();
+                if !subdir.is_empty() {
+                    subdir.push(b'/');
+                }
+                subdir.extend_from_slice(&basename_parent);
+                self.ensure_block(
+                    parent_bei.block_index as isize,
+                    parent_bei.entry_index as isize,
+                    &subdir,
+                )
+                .map_err(|e| UpdateEntryError::Other(format!("ensure_block: {:?}", e)))?;
+            }
+        }
+
+        if worth_saving {
+            self.mark_modified(&[key.clone()], false);
+        }
+
+        Ok(result)
+    }
+
+    /// Append a `NULL_PARENT_DETAILS` row to every entry's tree slot
+    /// list. Mirrors Python's inline loop in `update_basis_by_delta`:
+    /// when the current dirstate has no parents and a new parent is
+    /// being introduced, each row needs space for the new parent's
+    /// tree-1 slot before `update_basis_by_delta` can fill it in.
+    pub fn bootstrap_new_parent_slot(&mut self) {
+        for block in self.dirblocks.iter_mut() {
+            for entry in block.entries.iter_mut() {
+                entry.trees.push(TreeData {
+                    minikind: b'a',
+                    fingerprint: Vec::new(),
+                    size: 0,
+                    executable: false,
+                    packed_stat: Vec::new(),
+                });
+            }
+        }
+    }
+
     /// Forget all in-memory state, returning the object to the same
     /// shape a freshly constructed [`DirState`] has before any load.
     /// Mirrors Python's `DirState._wipe_state`.
@@ -1632,6 +3609,338 @@ impl DirState {
     /// parents minus ghost parents.
     pub fn num_present_parents(&self) -> usize {
         self.parents.len().saturating_sub(self.ghosts.len())
+    }
+
+    /// Replace the entire tree-0 state with the rows produced by
+    /// walking `new_inv.iter_entries_by_dir()`. Mirrors Python's
+    /// `DirState.set_state_from_inventory`: zips the existing dirstate
+    /// entries (in iteration order) against the incoming inventory
+    /// entries, calling [`DirState::update_minimal`] and
+    /// [`DirState::make_absent`] to drive the dirstate into the new
+    /// shape.
+    ///
+    /// Each element of `new_entries` is a pre-sorted tuple
+    /// `(path_utf8, file_id, minikind, fingerprint, executable)`. The
+    /// caller is expected to have built it from
+    /// `iter_entries_by_dir`, which yields paths in the order the
+    /// dirstate needs. `fingerprint` is normally empty for non
+    /// tree-reference entries; the tree-reference case carries the
+    /// `reference_revision` bytes.
+    pub fn set_state_from_inventory(
+        &mut self,
+        new_entries: Vec<(Vec<u8>, Vec<u8>, u8, Vec<u8>, bool)>,
+    ) -> Result<(), BasisApplyError> {
+        fn cmp_by_dirs(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+            let mut ai = a.split(|&c| c == b'/');
+            let mut bi = b.split(|&c| c == b'/');
+            loop {
+                match (ai.next(), bi.next()) {
+                    (None, None) => return std::cmp::Ordering::Equal,
+                    (None, Some(_)) => return std::cmp::Ordering::Less,
+                    (Some(_), None) => return std::cmp::Ordering::Greater,
+                    (Some(x), Some(y)) => match x.cmp(y) {
+                        std::cmp::Ordering::Equal => continue,
+                        other => return other,
+                    },
+                }
+            }
+        }
+
+        // Snapshot the current tree-0 entries in dirstate iteration order,
+        // mirroring Python's `list(self._iter_entries())` call.
+        let old_entries: Vec<Entry> = self
+            .dirblocks
+            .iter()
+            .flat_map(|block| block.entries.iter().cloned())
+            .collect();
+
+        let mut old_iter = old_entries.into_iter();
+        let mut new_iter = new_entries.into_iter();
+        let mut current_old: Option<Entry> = old_iter.next();
+        let mut current_new: Option<(Vec<u8>, Vec<u8>, u8, Vec<u8>, bool)> = new_iter.next();
+
+        while current_new.is_some() || current_old.is_some() {
+            // Skip dead old rows: the live tree-0 minikind may differ
+            // from the snapshot because prior update_minimal calls in
+            // this loop could have rewritten it.
+            if let Some(ref old) = current_old {
+                let live = self.tree0_minikind(&old.key);
+                if matches!(live, None | Some(b'a') | Some(b'r')) {
+                    current_old = old_iter.next();
+                    continue;
+                }
+            }
+
+            // Materialise the new-entry split.
+            let new_split = current_new.as_ref().map(|(path, file_id, mk, fp, ex)| {
+                let (dn, bn) = split_path_utf8(path);
+                let new_key = EntryKey {
+                    dirname: dn.to_vec(),
+                    basename: bn.to_vec(),
+                    file_id: file_id.clone(),
+                };
+                (path.clone(), new_key, *mk, fp.clone(), *ex)
+            });
+
+            match (current_old.as_ref(), new_split.as_ref()) {
+                (None, Some((path, key, mk, fp, ex))) => {
+                    // Old is finished; insert the new entry.
+                    let tree0 = TreeData {
+                        minikind: *mk,
+                        fingerprint: fp.clone(),
+                        size: 0,
+                        executable: *ex,
+                        packed_stat: b"x".repeat(32),
+                    };
+                    self.update_minimal(key.clone(), tree0, Some(path), true)?;
+                    current_new = new_iter.next();
+                }
+                (Some(old), None) => {
+                    // New is finished; make the old entry absent.
+                    let key = old.key.clone();
+                    // Swallow EntryNotFound — a prior update_minimal
+                    // may have pruned the row already.
+                    if self.tree0_minikind(&key).is_some() {
+                        self.make_absent(&key)
+                            .map_err(|e| BasisApplyError::Internal {
+                                reason: format!("make_absent: {}", e),
+                            })?;
+                    }
+                    current_old = old_iter.next();
+                }
+                (Some(old), Some((path, key, mk, fp, ex))) => {
+                    if *key == old.key {
+                        // Same key; update in place if exec/minikind changed.
+                        let old_t0 = &old.trees[0];
+                        if old_t0.executable != *ex || old_t0.minikind != *mk {
+                            let tree0 = TreeData {
+                                minikind: *mk,
+                                fingerprint: fp.clone(),
+                                size: 0,
+                                executable: *ex,
+                                packed_stat: b"x".repeat(32),
+                            };
+                            self.update_minimal(key.clone(), tree0, Some(path), true)?;
+                        }
+                        current_old = old_iter.next();
+                        current_new = new_iter.next();
+                    } else {
+                        let new_before_old = match cmp_by_dirs(&key.dirname, &old.key.dirname) {
+                            std::cmp::Ordering::Less => true,
+                            std::cmp::Ordering::Greater => false,
+                            std::cmp::Ordering::Equal => {
+                                (key.basename.as_slice(), key.file_id.as_slice())
+                                    < (old.key.basename.as_slice(), old.key.file_id.as_slice())
+                            }
+                        };
+                        if new_before_old {
+                            let tree0 = TreeData {
+                                minikind: *mk,
+                                fingerprint: fp.clone(),
+                                size: 0,
+                                executable: *ex,
+                                packed_stat: b"x".repeat(32),
+                            };
+                            self.update_minimal(key.clone(), tree0, Some(path), true)?;
+                            current_new = new_iter.next();
+                        } else {
+                            let okey = old.key.clone();
+                            if self.tree0_minikind(&okey).is_some() {
+                                self.make_absent(&okey)
+                                    .map_err(|e| BasisApplyError::Internal {
+                                        reason: format!("make_absent: {}", e),
+                                    })?;
+                            }
+                            current_old = old_iter.next();
+                        }
+                    }
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+        self.mark_modified(&[], false);
+        self.id_index = None;
+        Ok(())
+    }
+
+    /// Replace the parent trees. Mirrors Python's
+    /// `DirState.set_parent_trees`.
+    ///
+    /// `trees` gives the revision-id of every parent (including
+    /// ghosts) in order. `ghosts` is the list of revision-ids that
+    /// are ghosts — must be a subset of `trees`. `parent_tree_entries`
+    /// is one list per *non-ghost* parent tree, in the same order as
+    /// non-ghost parents appear in `trees`; each list is the result of
+    /// walking that tree via `iter_entries_by_dir` and mapping each
+    /// entry to `(path_utf8, file_id, minikind, fingerprint, size,
+    /// executable, tree_data)` (i.e. path/file_id plus the 5-tuple
+    /// returned by [`inv_entry_to_details`]).
+    ///
+    /// The method rebuilds the full dirblocks layout from: (a) the
+    /// current tree-0 rows already in `self.dirblocks` (non-absent,
+    /// non-relocated), and (b) the per-parent-tree entry lists.
+    /// Cross-tree relocation pointers are emitted in both the
+    /// vertical and horizontal axes, matching the legacy matrix
+    /// construction. Ghost parents occupy a tree slot but contribute
+    /// no entries — their slot is always `NULL_PARENT_DETAILS`.
+    pub fn set_parent_trees(
+        &mut self,
+        trees: Vec<Vec<u8>>,
+        ghosts: Vec<Vec<u8>>,
+        parent_tree_entries: Vec<Vec<(Vec<u8>, Vec<u8>, TreeData)>>,
+    ) -> Result<(), EntriesToStateError> {
+        let non_ghost_count = parent_tree_entries.len();
+        // All parent slots, including ghosts: each entry has
+        // `1 + non_ghost_count` tree slots.
+        let parent_count = non_ghost_count;
+
+        let mut by_path: std::collections::HashMap<EntryKey, Vec<TreeData>> =
+            std::collections::HashMap::new();
+        let mut id_index = IdIndex::new();
+
+        // Step 1: seed with existing tree-0 entries.
+        for block in self.dirblocks.iter() {
+            for entry in block.entries.iter() {
+                let mk = entry.trees.first().map(|t| t.minikind).unwrap_or(0);
+                if mk == b'a' || mk == b'r' {
+                    continue;
+                }
+                let mut row = Vec::with_capacity(1 + parent_count);
+                row.push(entry.trees[0].clone());
+                for _ in 0..parent_count {
+                    row.push(TreeData {
+                        minikind: b'a',
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: Vec::new(),
+                    });
+                }
+                id_index.add((
+                    entry.key.dirname.as_slice(),
+                    entry.key.basename.as_slice(),
+                    &FileId::from(&entry.key.file_id),
+                ));
+                by_path.insert(entry.key.clone(), row);
+            }
+        }
+
+        // Step 2: fold each non-ghost parent tree into the matrix.
+        for (index, tree_entries) in parent_tree_entries.into_iter().enumerate() {
+            let tree_index = index + 1;
+            let new_location_suffix_len = parent_count - tree_index;
+            for (path_utf8, file_id, details) in tree_entries {
+                let (dirname, basename) = split_path_utf8(&path_utf8);
+                let new_entry_key = EntryKey {
+                    dirname: dirname.to_vec(),
+                    basename: basename.to_vec(),
+                    file_id: file_id.clone(),
+                };
+
+                let fid = FileId::from(&file_id);
+                let entry_keys: Vec<(Vec<u8>, Vec<u8>, FileId)> = id_index.get(&fid);
+
+                // Vertical axis: every other path for this file_id in
+                // this tree gets a relocation pointer back to path_utf8.
+                for (e_dir, e_base, _e_fid) in &entry_keys {
+                    let ek = EntryKey {
+                        dirname: e_dir.clone(),
+                        basename: e_base.clone(),
+                        file_id: file_id.clone(),
+                    };
+                    if ek == new_entry_key {
+                        continue;
+                    }
+                    if let Some(row) = by_path.get_mut(&ek) {
+                        row[tree_index] = TreeData {
+                            minikind: b'r',
+                            fingerprint: path_utf8.clone(),
+                            size: 0,
+                            executable: false,
+                            packed_stat: Vec::new(),
+                        };
+                    }
+                }
+
+                // By-path consistency: insert into existing row or
+                // create a new one with relocation pointers for the
+                // earlier tree indexes.
+                let has_key = entry_keys.iter().any(|(d, b, _)| {
+                    d.as_slice() == new_entry_key.dirname.as_slice()
+                        && b.as_slice() == new_entry_key.basename.as_slice()
+                });
+                if has_key {
+                    by_path.get_mut(&new_entry_key).unwrap()[tree_index] = details;
+                } else {
+                    let mut new_details: Vec<TreeData> = Vec::with_capacity(1 + parent_count);
+                    for lookup_index in 0..tree_index {
+                        if entry_keys.is_empty() {
+                            new_details.push(TreeData {
+                                minikind: b'a',
+                                fingerprint: Vec::new(),
+                                size: 0,
+                                executable: false,
+                                packed_stat: Vec::new(),
+                            });
+                        } else {
+                            let a_key = &entry_keys[0];
+                            let ak = EntryKey {
+                                dirname: a_key.0.clone(),
+                                basename: a_key.1.clone(),
+                                file_id: file_id.clone(),
+                            };
+                            let look = &by_path[&ak][lookup_index];
+                            if look.minikind == b'r' || look.minikind == b'a' {
+                                new_details.push(look.clone());
+                            } else {
+                                let mut real_path = a_key.0.clone();
+                                if !real_path.is_empty() {
+                                    real_path.push(b'/');
+                                }
+                                real_path.extend_from_slice(&a_key.1);
+                                new_details.push(TreeData {
+                                    minikind: b'r',
+                                    fingerprint: real_path,
+                                    size: 0,
+                                    executable: false,
+                                    packed_stat: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    new_details.push(details);
+                    for _ in 0..new_location_suffix_len {
+                        new_details.push(TreeData {
+                            minikind: b'a',
+                            fingerprint: Vec::new(),
+                            size: 0,
+                            executable: false,
+                            packed_stat: Vec::new(),
+                        });
+                    }
+                    by_path.insert(new_entry_key.clone(), new_details);
+                    id_index.add((
+                        new_entry_key.dirname.as_slice(),
+                        new_entry_key.basename.as_slice(),
+                        &fid,
+                    ));
+                }
+            }
+        }
+
+        // Step 3: materialise the sorted entry list.
+        let mut new_entries: Vec<Entry> = by_path
+            .into_iter()
+            .map(|(key, trees)| Entry { key, trees })
+            .collect();
+        Self::sort_entries(&mut new_entries);
+        self.entries_to_current_state(new_entries)?;
+        self.parents = trees;
+        self.ghosts = ghosts;
+        self.mark_modified(&[], true);
+        self.id_index = Some(id_index);
+        self.packed_stat_index = None;
+        Ok(())
     }
 
     /// Rebuild `self.dirblocks` from a pre-sorted, flat list of
@@ -2693,6 +5002,480 @@ impl DirState {
         Ok(())
     }
 
+    /// High-level entry point mirroring Python's `DirState.add` from
+    /// the top: takes a `path` string (any of `""`, `"foo"`,
+    /// `"foo/bar"`), normalises the basename, validates `.`/`..`,
+    /// packs the stat, and dispatches to [`DirState::add`].
+    ///
+    /// Returns `AddError::InvalidNormalization` when NFC would point
+    /// at an inaccessible path, `AddError::InvalidEntryName` when the
+    /// basename is `.` or `..`.  Other failures bubble up from
+    /// [`DirState::add`].
+    pub fn add_path(
+        &mut self,
+        path: &str,
+        file_id: &[u8],
+        kind: &str,
+        stat: Option<StatInfo>,
+        fingerprint: &[u8],
+    ) -> Result<(), AddError> {
+        // Split the str-path into (dirname, basename).  Python uses
+        // `os.path.split` which splits on the last `/`.
+        let (dirname_s, basename_s) = match path.rfind('/') {
+            Some(idx) => (&path[..idx], &path[idx + 1..]),
+            None => ("", path),
+        };
+
+        // NFC-normalise the basename.  Inaccessible-after-normalisation
+        // is a hard error on Linux; on macOS the filesystem is the one
+        // doing the normalisation so the result is always accessible.
+        let basename_norm =
+            match osutils::path::normalized_filename(std::path::Path::new(basename_s)) {
+                Some((norm, accessible)) => {
+                    if norm.as_os_str() != std::ffi::OsStr::new(basename_s) && !accessible {
+                        return Err(AddError::InvalidNormalization {
+                            path: path.to_string(),
+                        });
+                    }
+                    norm.to_string_lossy().into_owned()
+                }
+                None => basename_s.to_string(),
+            };
+
+        if basename_norm == "." || basename_norm == ".." {
+            return Err(AddError::InvalidEntryName {
+                name: path.to_string(),
+            });
+        }
+
+        // Rejoin using the (possibly renormalised) basename, then
+        // strip leading/trailing `/` and take the utf8 bytes.  This
+        // matches the `(dirname + "/" + basename).strip("/").encode("utf8")`
+        // pass Python does before the utf8 split.
+        let mut rejoined = String::with_capacity(dirname_s.len() + 1 + basename_norm.len());
+        rejoined.push_str(dirname_s);
+        rejoined.push('/');
+        rejoined.push_str(&basename_norm);
+        let utf8path = rejoined.trim_matches('/').as_bytes().to_vec();
+
+        let (dirname_b, basename_b): (&[u8], &[u8]) =
+            match utf8path.iter().rposition(|&b| b == b'/') {
+                Some(idx) => (&utf8path[..idx], &utf8path[idx + 1..]),
+                None => (b"".as_slice(), utf8path.as_slice()),
+            };
+
+        let (size, packed_stat_owned) = match stat {
+            None => (0u64, vec![b'x'; 32]),
+            Some(st) => {
+                let packed = pack_stat(
+                    st.size,
+                    st.mtime as u64,
+                    st.ctime as u64,
+                    st.dev,
+                    st.ino,
+                    st.mode,
+                );
+                (st.size, packed.into_bytes())
+            }
+        };
+
+        self.add(
+            &utf8path,
+            dirname_b,
+            basename_b,
+            file_id,
+            kind,
+            size,
+            &packed_stat_owned,
+            fingerprint,
+        )
+    }
+
+    /// Add a new tracked entry. Mirrors Python's `DirState.add` after
+    /// path normalisation: the caller is responsible for handing in
+    /// `utf8path` with its `dirname`/`basename` split already done, and
+    /// for supplying the packed_stat bytes (use `pack_stat` on the
+    /// `os.lstat` result, or `None` to substitute `NULLSTAT`).
+    ///
+    /// `kind` is one of `"file"`, `"directory"`, `"symlink"`, or
+    /// `"tree-reference"` — anything else yields `AddError::UnknownKind`.
+    ///
+    /// The method performs the same duplicate-id detection Python does:
+    /// if `file_id` is already tracked at a live (non-absent) path it
+    /// returns `AddError::DuplicateFileId`. If the file_id existed
+    /// previously at a different path marked absent, that old row is
+    /// rewritten as a relocation pointer to the new path via
+    /// [`DirState::update_minimal`], matching Python's `rename_from`
+    /// fix-up. In that case the resulting entry's parent-tree slot 0
+    /// stores a relocation row pointing back at the old path, so
+    /// history-aware tooling can still resolve the id.
+    ///
+    /// The target dirblock is created (`ensure_block`) if missing, and a
+    /// child block is ensured when the new entry is a directory — both
+    /// matching Python's post-insert `_ensure_block` call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add(
+        &mut self,
+        utf8path: &[u8],
+        dirname: &[u8],
+        basename: &[u8],
+        file_id: &[u8],
+        kind: &str,
+        size: u64,
+        packed_stat: &[u8],
+        fingerprint: &[u8],
+    ) -> Result<(), AddError> {
+        // Pre-flight: does this file_id already live somewhere?
+        // Python calls `_get_entry(0, fileid_utf8=file_id,
+        // include_deleted=True)` and branches on the result.
+        self.get_or_build_id_index();
+        let fid = FileId::from(&file_id.to_vec());
+        let candidates = self.id_index.as_ref().unwrap().get(&fid);
+
+        let mut rename_from: Option<(Vec<u8>, Vec<u8>)> = None;
+        for (cand_dir, cand_base, _cfid) in candidates {
+            let cand_key = EntryKey {
+                dirname: cand_dir.clone(),
+                basename: cand_base.clone(),
+                file_id: file_id.to_vec(),
+            };
+            let (cb_idx, cb_present) = find_block_index_from_key(&self.dirblocks, &cand_key);
+            if !cb_present {
+                continue;
+            }
+            let (ce_idx, ce_present) = find_entry_index(&cand_key, &self.dirblocks[cb_idx].entries);
+            if !ce_present {
+                continue;
+            }
+            let entry = &self.dirblocks[cb_idx].entries[ce_idx];
+            let tree0_kind = entry.trees.first().map(|t| t.minikind).unwrap_or(0);
+            match tree0_kind {
+                b'a' => {
+                    if cand_dir.as_slice() != dirname || cand_base.as_slice() != basename {
+                        rename_from = Some((cand_dir.clone(), cand_base.clone()));
+                    }
+                    break;
+                }
+                b'r' => {
+                    // The candidate row is a relocation pointer; keep
+                    // searching — the real home is elsewhere.
+                    continue;
+                }
+                other => {
+                    let kind_char = other as char;
+                    let path = if cand_dir.is_empty() {
+                        cand_base.clone()
+                    } else {
+                        let mut p = cand_dir.clone();
+                        p.push(b'/');
+                        p.extend_from_slice(&cand_base);
+                        p
+                    };
+                    let path_str = String::from_utf8_lossy(&path);
+                    let kind_str = match other {
+                        b'f' => "file",
+                        b'd' => "directory",
+                        b'l' => "symlink",
+                        b't' => "tree-reference",
+                        _ => {
+                            return Err(AddError::Internal {
+                                reason: format!(
+                                    "unexpected minikind {:?} in id_index row",
+                                    kind_char
+                                ),
+                            })
+                        }
+                    };
+                    return Err(AddError::DuplicateFileId {
+                        file_id: file_id.to_vec(),
+                        info: format!("{}:{}", kind_str, path_str),
+                    });
+                }
+            }
+        }
+
+        // Rename fix-up: the id used to live at rename_from but was
+        // marked absent. Python calls update_minimal to turn the old
+        // row into a relocation pointer to the new path.
+        if let Some((old_dir, old_base)) = rename_from.as_ref() {
+            let old_key = EntryKey {
+                dirname: old_dir.clone(),
+                basename: old_base.clone(),
+                file_id: file_id.to_vec(),
+            };
+            let reloc_details = TreeData {
+                minikind: b'r',
+                fingerprint: utf8path.to_vec(),
+                size: 0,
+                executable: false,
+                packed_stat: Vec::new(),
+            };
+            self.update_minimal(old_key, reloc_details, Some(b""), false)
+                .map_err(|e| AddError::Internal {
+                    reason: format!("rename-from update_minimal: {}", e),
+                })?;
+        }
+
+        // Find the block that should receive the new entry.
+        let first_key = EntryKey {
+            dirname: dirname.to_vec(),
+            basename: basename.to_vec(),
+            file_id: Vec::new(),
+        };
+        let (mut block_index, block_present) =
+            find_block_index_from_key(&self.dirblocks, &first_key);
+        if block_present {
+            // A block exists; walk entries at this basename and ensure
+            // none is live in tree 0.
+            let (mut entry_index, _) =
+                find_entry_index(&first_key, &self.dirblocks[block_index].entries);
+            let block = &self.dirblocks[block_index].entries;
+            while entry_index < block.len()
+                && block[entry_index].key.dirname == dirname
+                && block[entry_index].key.basename == basename
+            {
+                let t0 = block[entry_index]
+                    .trees
+                    .first()
+                    .map(|t| t.minikind)
+                    .unwrap_or(0);
+                if t0 != b'a' && t0 != b'r' {
+                    let mut path = dirname.to_vec();
+                    if !path.is_empty() {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(basename);
+                    return Err(AddError::AlreadyAdded { path });
+                }
+                entry_index += 1;
+            }
+        } else {
+            // Python: look up the parent directory; if absent, raise
+            // NotVersionedError. Otherwise ensure_block.
+            let (parent_dir, parent_base) = split_path_utf8(dirname);
+            let pbei = get_block_entry_index(&self.dirblocks, parent_dir, parent_base, 0);
+            if !pbei.path_present {
+                let mut path = dirname.to_vec();
+                if !path.is_empty() {
+                    path.push(b'/');
+                }
+                path.extend_from_slice(basename);
+                return Err(AddError::NotVersioned { path });
+            }
+            self.ensure_block(
+                pbei.block_index as isize,
+                pbei.entry_index as isize,
+                dirname,
+            )
+            .map_err(|e| AddError::Internal {
+                reason: format!("ensure_block failed: {:?}", e),
+            })?;
+            let (new_block_index, _) = find_block_index_from_key(&self.dirblocks, &first_key);
+            block_index = new_block_index;
+        }
+
+        // Build the tree-0 details. Python treats directories specially:
+        // their fingerprint and size are always empty / zero, even if
+        // the caller passes a value.
+        let minikind_byte = match kind {
+            "file" => b'f',
+            "directory" => b'd',
+            "symlink" => b'l',
+            "tree-reference" => b't',
+            other => {
+                return Err(AddError::UnknownKind {
+                    kind: other.to_string(),
+                })
+            }
+        };
+        let tree0 = match kind {
+            "directory" => TreeData {
+                minikind: minikind_byte,
+                fingerprint: Vec::new(),
+                size: 0,
+                executable: false,
+                packed_stat: packed_stat.to_vec(),
+            },
+            "tree-reference" => TreeData {
+                minikind: minikind_byte,
+                fingerprint: fingerprint.to_vec(),
+                size: 0,
+                executable: false,
+                packed_stat: packed_stat.to_vec(),
+            },
+            _ => TreeData {
+                minikind: minikind_byte,
+                fingerprint: fingerprint.to_vec(),
+                size,
+                executable: false,
+                packed_stat: packed_stat.to_vec(),
+            },
+        };
+
+        // Empty parent info: NULL_PARENT_DETAILS per present parent.
+        let num_present = self.num_present_parents();
+        let mut parent_info: Vec<TreeData> = (0..num_present)
+            .map(|_| TreeData {
+                minikind: b'a',
+                fingerprint: Vec::new(),
+                size: 0,
+                executable: false,
+                packed_stat: Vec::new(),
+            })
+            .collect();
+        if let Some((old_dir, old_base)) = rename_from {
+            // Replace parent_info[0] with a relocation pointer to the
+            // old path. Matches Python's
+            // `parent_info[0] = (b"r", old_path_utf8, 0, False, b"")`.
+            let old_path_utf8 = if old_dir.is_empty() {
+                old_base
+            } else {
+                let mut p = old_dir.clone();
+                p.push(b'/');
+                p.extend_from_slice(&old_base);
+                p
+            };
+            if let Some(p0) = parent_info.get_mut(0) {
+                *p0 = TreeData {
+                    minikind: b'r',
+                    fingerprint: old_path_utf8,
+                    size: 0,
+                    executable: false,
+                    packed_stat: Vec::new(),
+                };
+            }
+        }
+
+        let mut trees = vec![tree0];
+        trees.extend(parent_info);
+
+        let entry_key = EntryKey {
+            dirname: dirname.to_vec(),
+            basename: basename.to_vec(),
+            file_id: file_id.to_vec(),
+        };
+        let (entry_index, present) =
+            find_entry_index(&entry_key, &self.dirblocks[block_index].entries);
+        if !present {
+            self.dirblocks[block_index].entries.insert(
+                entry_index,
+                Entry {
+                    key: entry_key.clone(),
+                    trees,
+                },
+            );
+            if let Some(idx) = self.id_index.as_mut() {
+                idx.add((dirname, basename, &FileId::from(&file_id.to_vec())));
+            }
+        } else {
+            let existing = &mut self.dirblocks[block_index].entries[entry_index];
+            let current_t0 = existing.trees.first().map(|t| t.minikind).unwrap_or(0);
+            if current_t0 != b'a' {
+                return Err(AddError::AlreadyAddedAssertion {
+                    basename: basename.to_vec(),
+                    file_id: file_id.to_vec(),
+                });
+            }
+            // Overwrite tree-0 only; leave parent slots alone.
+            existing.trees[0] = trees.into_iter().next().unwrap();
+        }
+
+        if kind == "directory" {
+            // Python: _ensure_block(block_index, entry_index, utf8path).
+            // We need to pass coordinates of the entry we just inserted
+            // / overwrote. Re-find it since insertion may have shifted.
+            let (eb, _) = find_block_index_from_key(&self.dirblocks, &entry_key);
+            let (ei, _) = find_entry_index(&entry_key, &self.dirblocks[eb].entries);
+            self.ensure_block(eb as isize, ei as isize, utf8path)
+                .map_err(|e| AddError::Internal {
+                    reason: format!("child ensure_block failed: {:?}", e),
+                })?;
+        }
+
+        self.mark_modified(&[], false);
+        Ok(())
+    }
+
+    /// Change the file id of the root path. Mirrors Python's
+    /// `DirState.set_path_id`, which only supports `path=b""`.
+    ///
+    /// Python's original implementation called `_make_absent` on the
+    /// old root entry (which mutated the shared tree-0 slot to
+    /// NULL_PARENT_DETAILS when parent trees kept the entry alive)
+    /// and then called `update_minimal` with
+    /// `packed_stat=entry[1][0][4]`. The packed_stat observed by
+    /// `update_minimal` therefore depended on whether the mutation
+    /// had reset it: empty bytes when parents held the entry alive,
+    /// the original stat otherwise. This port reproduces that rule
+    /// explicitly.
+    pub fn set_path_id(&mut self, path: &[u8], new_id: &[u8]) -> Result<(), SetPathIdError> {
+        if !path.is_empty() {
+            return Err(SetPathIdError::NonRootPath);
+        }
+
+        // Locate the current root entry in tree 0. Python's
+        // `_get_entry(0, path_utf8=b"")` lookup.
+        let bei = get_block_entry_index(&self.dirblocks, b"", b"", 0);
+        if !bei.path_present {
+            // Root entry must exist; if it does not, the dirstate is
+            // malformed — report it rather than silently no-op.
+            return Err(SetPathIdError::Internal {
+                reason: "root entry missing".to_string(),
+            });
+        }
+        let entry = &self.dirblocks[bei.block_index].entries[bei.entry_index];
+        if entry.key.file_id == new_id {
+            return Ok(());
+        }
+
+        // Capture the data we need before make_absent mutates state.
+        let old_key = entry.key.clone();
+        let original_packed_stat = entry
+            .trees
+            .first()
+            .map(|t| t.packed_stat.clone())
+            .unwrap_or_default();
+        // If any parent tree kept the entry alive (minikind not in
+        // {a, r}), the legacy code's make_absent-in-place mutation
+        // reset packed_stat to empty bytes; update_minimal then stored
+        // NULLSTAT in the new row. Preserve that observable behaviour.
+        let parents_keep_entry = entry
+            .trees
+            .iter()
+            .skip(1)
+            .any(|t| t.minikind != b'a' && t.minikind != b'r');
+        let packed_stat = if parents_keep_entry {
+            Vec::new()
+        } else {
+            original_packed_stat
+        };
+
+        self.make_absent(&old_key)
+            .map_err(|e| SetPathIdError::Internal {
+                reason: format!("make_absent: {}", e),
+            })?;
+
+        let new_key = EntryKey {
+            dirname: Vec::new(),
+            basename: Vec::new(),
+            file_id: new_id.to_vec(),
+        };
+        let tree0 = TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat,
+        };
+        self.update_minimal(new_key, tree0, Some(b""), false)
+            .map_err(|e| SetPathIdError::Internal {
+                reason: format!("update_minimal: {}", e),
+            })?;
+
+        self.mark_modified(&[], false);
+        Ok(())
+    }
+
     /// Apply a sequence of "removals" to tree 0, mirroring Python's
     /// `DirState._apply_removals`. Each record is a
     /// `(file_id, path)` tuple; the method sorts them in reverse
@@ -2977,20 +5760,99 @@ impl DirState {
         Ok(())
     }
 
-    /// Apply a pre-flattened inventory delta to tree 1. Mirrors
-    /// Python's `DirState.update_basis_by_delta` — the sibling of
+    /// Rebase the basis tree onto `new_revid`. Mirrors Python's
+    /// `DirState.update_basis_by_delta` — the sibling of
     /// [`DirState::update_by_delta`] that rebases the basis tree.
     ///
-    /// Prerequisites the caller must handle: calling
-    /// `discard_merge_parents`, setting the parent slot to
-    /// `new_revid` (via `set_parent_at` / `append_parent`), and
-    /// bootstrapping per-entry tree-1 slots when the dirstate had
-    /// zero parents. The ghost-parents check is also a caller
-    /// concern — this method takes a pre-sorted, pre-checked delta.
-    ///
-    /// On success, the caller should mark the dirstate modified
-    /// (header included) and invalidate its id_index cache.
+    /// This encapsulates the full Python entrypoint:
+    ///   1. `discard_merge_parents()` to drop all parents past the first.
+    ///   2. Ghost-check: returns [`BasisApplyError::NotImplemented`]
+    ///      when any ghost parent remains, matching Python's
+    ///      `NotImplementedError`.
+    ///   3. When the dirstate has no parents, extend every entry's
+    ///      tree list with a `NULL_PARENT_DETAILS` row and append
+    ///      `new_revid` to `parents`.
+    ///   4. Replace `parents[0]` with `new_revid`.
+    ///   5. Apply the pre-flattened, pre-sorted delta.
+    ///   6. Mark modified and clear id_index.
+    /// High-level entry point taking a native
+    /// [`crate::inventory_delta::InventoryDelta`] directly — does the
+    /// per-row file_id validation + inv_entry flattening Python's
+    /// shim used to do before calling into Rust, then dispatches to
+    /// [`DirState::update_basis_by_delta`].
+    pub fn update_basis_by_delta_from_inventory_delta(
+        &mut self,
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revid: Vec<u8>,
+    ) -> Result<(), BasisApplyError> {
+        let mut flat: Vec<FlatBasisDeltaEntry> = Vec::with_capacity(delta.len());
+        for row in delta.iter() {
+            let file_id_bytes = row.file_id.as_bytes().to_vec();
+
+            if let Some(ref entry) = row.new_entry {
+                if entry.file_id().as_bytes() != row.file_id.as_bytes() {
+                    let new_path_bytes = row.new_path.as_deref().unwrap_or("").as_bytes().to_vec();
+                    return Err(BasisApplyError::MismatchedEntryFileId {
+                        new_path: new_path_bytes,
+                        file_id: file_id_bytes,
+                        entry_debug: format!("{:?}", entry),
+                    });
+                }
+            }
+
+            let (np_bytes, parent_id): (Option<Vec<u8>>, Option<Vec<u8>>) =
+                match row.new_path.as_deref() {
+                    None => (None, None),
+                    Some(p) => {
+                        let entry = row.new_entry.as_ref().ok_or_else(|| {
+                            BasisApplyError::NewPathWithoutEntry {
+                                new_path: p.as_bytes().to_vec(),
+                                file_id: file_id_bytes.clone(),
+                            }
+                        })?;
+                        let pid = entry.parent_id().map(|fid| fid.as_bytes().to_vec());
+                        (Some(p.as_bytes().to_vec()), pid)
+                    }
+                };
+            let op_bytes: Option<Vec<u8>> = row.old_path.as_deref().map(|p| p.as_bytes().to_vec());
+            let details = row.new_entry.as_ref().map(|e| inv_entry_to_details(e));
+
+            flat.push(FlatBasisDeltaEntry {
+                old_path: op_bytes,
+                new_path: np_bytes,
+                file_id: file_id_bytes,
+                parent_id,
+                details,
+            });
+        }
+        self.update_basis_by_delta(flat, new_revid)
+    }
+
     pub fn update_basis_by_delta(
+        &mut self,
+        entries: Vec<FlatBasisDeltaEntry>,
+        new_revid: Vec<u8>,
+    ) -> Result<(), BasisApplyError> {
+        self.discard_merge_parents();
+        if !self.ghosts.is_empty() {
+            return Err(BasisApplyError::NotImplemented {
+                reason: "update_basis_by_delta with ghost parents".to_string(),
+            });
+        }
+        if self.parents.is_empty() {
+            self.bootstrap_new_parent_slot();
+            self.parents.push(new_revid.clone());
+        }
+        self.parents[0] = new_revid;
+        let result = self.update_basis_by_delta_inner(entries);
+        if result.is_ok() {
+            self.mark_modified(&[], true);
+            self.id_index = None;
+        }
+        result
+    }
+
+    fn update_basis_by_delta_inner(
         &mut self,
         entries: Vec<FlatBasisDeltaEntry>,
     ) -> Result<(), BasisApplyError> {
@@ -3139,6 +6001,54 @@ impl DirState {
     /// 4. calls `check_delta_ids_absent`, `apply_removals`,
     ///    `apply_insertions`, and `after_delta_check_parents` in
     ///    order — matching Python's try/except block exactly.
+    /// High-level entry point taking a native
+    /// [`crate::inventory_delta::InventoryDelta`] directly — does the
+    /// per-row flattening Python's shim used to do and dispatches to
+    /// [`DirState::update_by_delta`].
+    pub fn update_by_delta_from_inventory_delta(
+        &mut self,
+        delta: &crate::inventory_delta::InventoryDelta,
+    ) -> Result<(), BasisApplyError> {
+        let mut flat: Vec<FlatDeltaEntry> = Vec::with_capacity(delta.len());
+        for row in delta.iter() {
+            let file_id_bytes = row.file_id.as_bytes().to_vec();
+            let op_bytes: Option<Vec<u8>> = row.old_path.as_deref().map(|p| p.as_bytes().to_vec());
+            let (np_bytes, parent_id, minikind, executable, fingerprint): (
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                u8,
+                bool,
+                Vec<u8>,
+            ) = match row.new_path.as_deref() {
+                None => (None, None, b'a', false, Vec::new()),
+                Some(p) => {
+                    let entry = row.new_entry.as_ref().ok_or_else(|| {
+                        BasisApplyError::NewPathWithoutEntry {
+                            new_path: p.as_bytes().to_vec(),
+                            file_id: file_id_bytes.clone(),
+                        }
+                    })?;
+                    let pid = entry.parent_id().map(|fid| fid.as_bytes().to_vec());
+                    let details = inv_entry_to_details(entry);
+                    let mk = details.0;
+                    let fp = if mk == b't' { details.1 } else { Vec::new() };
+                    let ex = details.3;
+                    (Some(p.as_bytes().to_vec()), pid, mk, ex, fp)
+                }
+            };
+            flat.push(FlatDeltaEntry {
+                old_path: op_bytes,
+                new_path: np_bytes,
+                file_id: file_id_bytes,
+                parent_id,
+                minikind,
+                executable,
+                fingerprint,
+            });
+        }
+        self.update_by_delta(flat)
+    }
+
     pub fn update_by_delta(&mut self, entries: Vec<FlatDeltaEntry>) -> Result<(), BasisApplyError> {
         use std::collections::{BTreeSet, HashMap};
 
@@ -3815,6 +6725,530 @@ impl DirState {
         }
         out
     }
+
+    /// Bisect the on-disk dirstate for rows at the given paths.
+    /// Mirrors Python's `DirState._bisect`.
+    ///
+    /// `read_range(offset, len)` must return the bytes at `[offset,
+    /// offset+len)` from the dirstate file. `file_size` is the full
+    /// file length (used to bound the initial bisect window). The
+    /// caller must have already loaded the header (so
+    /// `end_of_header` and `num_present_parents()` are populated)
+    /// and must hold a read or write lock on the file.
+    ///
+    /// Returns a map from `path_utf8` → list of entries at that path
+    /// (an entry is the usual `(key, [tree_data, ...])` shape).
+    /// Missing paths do not appear in the map.
+    pub fn bisect<F>(
+        &self,
+        paths: Vec<Vec<u8>>,
+        file_size: u64,
+        mut read_range: F,
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Entry>>, BisectError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, BisectError>,
+    {
+        bisect_bytes(
+            self.end_of_header.unwrap_or(0) as u64,
+            file_size,
+            self.num_present_parents(),
+            paths,
+            BisectMode::Paths,
+            &mut read_range,
+        )
+    }
+
+    /// Bisect the on-disk dirstate for every entry whose dirname is
+    /// in `dir_list`. Mirrors Python's `DirState._bisect_dirblocks`.
+    pub fn bisect_dirblocks<F>(
+        &self,
+        dir_list: Vec<Vec<u8>>,
+        file_size: u64,
+        mut read_range: F,
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Entry>>, BisectError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, BisectError>,
+    {
+        bisect_bytes(
+            self.end_of_header.unwrap_or(0) as u64,
+            file_size,
+            self.num_present_parents(),
+            dir_list,
+            BisectMode::Dirnames,
+            &mut read_range,
+        )
+    }
+
+    /// Recursive variant of `bisect`: for every path in `paths` find
+    /// the row and, if it is a directory, recursively bisect for its
+    /// children. Renames are followed via the fingerprint pointer.
+    /// Mirrors `DirState._bisect_recursive`.
+    ///
+    /// Returns a map from `(dirname, basename, file_id)` → list of
+    /// tree-data rows.
+    #[allow(clippy::type_complexity)]
+    pub fn bisect_recursive<F>(
+        &self,
+        paths: Vec<Vec<u8>>,
+        file_size: u64,
+        mut read_range: F,
+    ) -> Result<std::collections::HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), Vec<TreeData>>, BisectError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, BisectError>,
+    {
+        use std::collections::{HashMap, HashSet};
+        let mut found: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), Vec<TreeData>> = HashMap::new();
+        let mut found_dir_names: HashSet<(Vec<u8>, Vec<u8>)> = HashSet::new();
+        let mut processed_dirs: HashSet<Vec<u8>> = HashSet::new();
+
+        // Seed: run bisect() on the initial path list.
+        let mut newly_found = bisect_bytes(
+            self.end_of_header.unwrap_or(0) as u64,
+            file_size,
+            self.num_present_parents(),
+            paths,
+            BisectMode::Paths,
+            &mut read_range,
+        )?;
+
+        while !newly_found.is_empty() {
+            let mut pending_dirs: Vec<Vec<u8>> = Vec::new();
+            let mut paths_to_search: Vec<Vec<u8>> = Vec::new();
+            for entries in newly_found.values() {
+                for entry in entries {
+                    let key = (
+                        entry.key.dirname.clone(),
+                        entry.key.basename.clone(),
+                        entry.key.file_id.clone(),
+                    );
+                    found.insert(key.clone(), entry.trees.clone());
+                    found_dir_names.insert((entry.key.dirname.clone(), entry.key.basename.clone()));
+                    let mut is_dir = false;
+                    for tree_info in &entry.trees {
+                        match tree_info.minikind {
+                            b'd' => {
+                                if is_dir {
+                                    continue;
+                                }
+                                is_dir = true;
+                                let mut path = entry.key.dirname.clone();
+                                if !path.is_empty() {
+                                    path.push(b'/');
+                                }
+                                path.extend_from_slice(&entry.key.basename);
+                                if !processed_dirs.contains(&path) {
+                                    pending_dirs.push(path);
+                                }
+                            }
+                            b'r' => {
+                                let (dn, _bn) = split_path_utf8(&tree_info.fingerprint);
+                                if pending_dirs.iter().any(|p| p == dn) {
+                                    continue;
+                                }
+                                let dn_vec = dn.to_vec();
+                                let (rdn, rbn) = split_path_utf8(&tree_info.fingerprint);
+                                if !found_dir_names.contains(&(rdn.to_vec(), rbn.to_vec())) {
+                                    paths_to_search.push(tree_info.fingerprint.clone());
+                                    let _ = dn_vec; // silence warning
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            paths_to_search.sort();
+            paths_to_search.dedup();
+            pending_dirs.sort();
+            pending_dirs.dedup();
+
+            newly_found = bisect_bytes(
+                self.end_of_header.unwrap_or(0) as u64,
+                file_size,
+                self.num_present_parents(),
+                paths_to_search,
+                BisectMode::Paths,
+                &mut read_range,
+            )?;
+            let dir_results = bisect_bytes(
+                self.end_of_header.unwrap_or(0) as u64,
+                file_size,
+                self.num_present_parents(),
+                pending_dirs.clone(),
+                BisectMode::Dirnames,
+                &mut read_range,
+            )?;
+            for (k, v) in dir_results {
+                newly_found.insert(k, v);
+            }
+            for d in pending_dirs {
+                processed_dirs.insert(d);
+            }
+        }
+
+        Ok(found)
+    }
+}
+
+/// Shared bisect mode: match by full path (dirname/basename) or by
+/// dirname only.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum BisectMode {
+    /// Input keys are `dirname/basename` strings; match against the
+    /// concatenation `fields[1]/fields[2]` (or `fields[2]` if
+    /// `fields[1]` is empty).  Used by `bisect`.
+    Paths,
+    /// Input keys are dirnames; match against `fields[1]` directly.
+    /// Used by `bisect_dirblocks`.
+    Dirnames,
+}
+
+/// Error returned by the bisect primitives.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BisectError {
+    /// The caller's `read_range` closure reported a failure.
+    ReadError(String),
+    /// The bisect loop exceeded its safety counter.  Mirrors Python's
+    /// `BzrFormatsError("Too many seeks, most likely a bug.")`.
+    TooManySeeks,
+    /// An entry row's size field could not be parsed as an integer.
+    BadSize(String),
+}
+
+impl std::fmt::Display for BisectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BisectError::ReadError(s) => write!(f, "read error: {}", s),
+            BisectError::TooManySeeks => write!(f, "too many seeks"),
+            BisectError::BadSize(s) => write!(f, "bad size field: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for BisectError {}
+
+fn bisect_bytes<F>(
+    end_of_header: u64,
+    file_size: u64,
+    num_present_parents: usize,
+    keys: Vec<Vec<u8>>,
+    mode: BisectMode,
+    read_range: &mut F,
+) -> Result<std::collections::HashMap<Vec<u8>, Vec<Entry>>, BisectError>
+where
+    F: FnMut(u64, usize) -> Result<Vec<u8>, BisectError>,
+{
+    let mut found: std::collections::HashMap<Vec<u8>, Vec<Entry>> =
+        std::collections::HashMap::new();
+    if keys.is_empty() || file_size == 0 {
+        return Ok(found);
+    }
+
+    // Each entry has one extra trailing empty field because of the
+    // terminating newline-NUL split: fields_per_entry accounts for the
+    // trailing `\n` slot already, and we need one more for the empty
+    // leading field produced by the record separator. The Python code
+    // keeps them in the same count constant.
+    let entry_field_count = fields_per_entry(num_present_parents) + 1;
+
+    // Sort keys so the bisect_left/right calls below can rely on
+    // ordered input.  (Python callers sort beforehand; we defensively
+    // sort too.)
+    let mut sorted_keys: Vec<Vec<u8>> = keys;
+    sorted_keys.sort();
+    sorted_keys.dedup();
+
+    let max_count = 30 * sorted_keys.len();
+    let mut count = 0usize;
+
+    let low0 = end_of_header;
+    let high0 = file_size.saturating_sub(1);
+    let mut pending: Vec<(u64, u64, Vec<Vec<u8>>)> = vec![(low0, high0, sorted_keys)];
+    let mut page_size: usize = BISECT_PAGE_SIZE;
+
+    while let Some((low, high, cur_keys)) = pending.pop() {
+        if cur_keys.is_empty() || low >= high {
+            continue;
+        }
+
+        count += 1;
+        if count > max_count {
+            return Err(BisectError::TooManySeeks);
+        }
+
+        // `mid` biases toward reading from the *start* of a page-sized
+        // window, matching Python's `(low + high - page_size) // 2`
+        // calculation.
+        let mid_i = ((low + high) as i64 - page_size as i64) / 2;
+        let mid = if mid_i < low as i64 {
+            low
+        } else {
+            mid_i as u64
+        };
+        let read_size = std::cmp::min(page_size as u64, (high - mid) + 1) as usize;
+        let block = read_range(mid, read_size)?;
+
+        let entries: Vec<&[u8]> = block.split(|&b| b == b'\n').collect();
+
+        if entries.len() < 2 {
+            page_size *= 2;
+            pending.push((low, high, cur_keys));
+            continue;
+        }
+
+        let mut start = mid;
+        let mut first_entry_num: usize = 0;
+        let mut first_fields: Vec<&[u8]> = entries[0].split(|&b| b == 0u8).collect();
+        if first_fields.len() < entry_field_count {
+            start += entries[0].len() as u64 + 1;
+            first_entry_num = 1;
+            first_fields = entries[1].split(|&b| b == 0u8).collect();
+        }
+
+        let first_threshold = match mode {
+            BisectMode::Paths => 2,
+            BisectMode::Dirnames => 1,
+        };
+        if first_fields.len() <= first_threshold {
+            page_size *= 2;
+            pending.push((low, high, cur_keys));
+            continue;
+        }
+
+        let first_key: Vec<u8> = match mode {
+            BisectMode::Paths => {
+                if !first_fields[1].is_empty() {
+                    let mut p = first_fields[1].to_vec();
+                    p.push(b'/');
+                    p.extend_from_slice(first_fields[2]);
+                    p
+                } else {
+                    first_fields[2].to_vec()
+                }
+            }
+            BisectMode::Dirnames => first_fields[1].to_vec(),
+        };
+
+        let first_loc = match mode {
+            BisectMode::Paths => bisect_path_left_bytes(&cur_keys, &first_key),
+            BisectMode::Dirnames => bisect_bytes_left(&cur_keys, &first_key),
+        };
+        let pre: Vec<Vec<u8>> = cur_keys[..first_loc].to_vec();
+        let mut post: Vec<Vec<u8>> = cur_keys[first_loc..].to_vec();
+        let mut after = start;
+
+        let mut pre_out = pre;
+        let mut post_out = post;
+        if !post_out.is_empty() && first_fields.len() >= entry_field_count {
+            let mut last_entry_num = entries.len() - 1;
+            let mut last_fields: Vec<&[u8]> =
+                entries[last_entry_num].split(|&b| b == 0u8).collect();
+            if last_fields.len() < entry_field_count {
+                after = mid + (block.len() as u64) - (entries[entries.len() - 1].len() as u64);
+                last_entry_num -= 1;
+                last_fields = entries[last_entry_num].split(|&b| b == 0u8).collect();
+            } else {
+                after = mid + block.len() as u64;
+            }
+
+            let last_key: Vec<u8> = match mode {
+                BisectMode::Paths => {
+                    if !last_fields[1].is_empty() {
+                        let mut p = last_fields[1].to_vec();
+                        p.push(b'/');
+                        p.extend_from_slice(last_fields[2]);
+                        p
+                    } else {
+                        last_fields[2].to_vec()
+                    }
+                }
+                BisectMode::Dirnames => last_fields[1].to_vec(),
+            };
+
+            let last_loc = match mode {
+                BisectMode::Paths => bisect_path_right_bytes(&post_out, &last_key),
+                BisectMode::Dirnames => bisect_bytes_right(&post_out, &last_key),
+            };
+            let middle: Vec<Vec<u8>> = post_out[..last_loc].to_vec();
+            post_out = post_out[last_loc..].to_vec();
+
+            if !middle.is_empty() {
+                if middle.first() == Some(&first_key) {
+                    pre_out.push(first_key.clone());
+                }
+                if middle.last() == Some(&last_key) {
+                    post_out.insert(0, last_key.clone());
+                }
+
+                // Map keys in this page to their parsed field rows.
+                let mut page_paths: std::collections::HashMap<Vec<u8>, Vec<Vec<Vec<u8>>>> =
+                    std::collections::HashMap::new();
+                page_paths
+                    .entry(first_key.clone())
+                    .or_default()
+                    .push(first_fields.iter().map(|s| s.to_vec()).collect());
+                if last_entry_num != first_entry_num {
+                    page_paths
+                        .entry(last_key.clone())
+                        .or_default()
+                        .push(last_fields.iter().map(|s| s.to_vec()).collect());
+                }
+                for num in (first_entry_num + 1)..last_entry_num {
+                    let fields: Vec<&[u8]> = entries[num].split(|&b| b == 0u8).collect();
+                    let key: Vec<u8> = match mode {
+                        BisectMode::Paths => {
+                            if !fields[1].is_empty() {
+                                let mut p = fields[1].to_vec();
+                                p.push(b'/');
+                                p.extend_from_slice(fields[2]);
+                                p
+                            } else {
+                                fields[2].to_vec()
+                            }
+                        }
+                        BisectMode::Dirnames => fields[1].to_vec(),
+                    };
+                    page_paths
+                        .entry(key)
+                        .or_default()
+                        .push(fields.iter().map(|s| s.to_vec()).collect());
+                }
+
+                for key in &middle {
+                    if let Some(rows) = page_paths.get(key) {
+                        for row in rows {
+                            let entry = fields_to_entry(&row[1..], num_present_parents)?;
+                            found.entry(key.clone()).or_default().push(entry);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !post_out.is_empty() {
+            pending.push((after, high, post_out));
+        }
+        if !pre_out.is_empty() {
+            pending.push((low, start.saturating_sub(1), pre_out));
+        }
+    }
+
+    Ok(found)
+}
+
+fn fields_to_entry(fields: &[Vec<u8>], num_present_parents: usize) -> Result<Entry, BisectError> {
+    let key = EntryKey {
+        dirname: fields[0].clone(),
+        basename: fields[1].clone(),
+        file_id: fields[2].clone(),
+    };
+    let tree_count = 1 + num_present_parents;
+    let mut trees = Vec::with_capacity(tree_count);
+    for t in 0..tree_count {
+        let base = 3 + 5 * t;
+        let minikind = fields[base].first().copied().unwrap_or(0);
+        let fingerprint = fields[base + 1].clone();
+        let size_str = std::str::from_utf8(&fields[base + 2])
+            .map_err(|e| BisectError::BadSize(e.to_string()))?;
+        let size: u64 = size_str
+            .parse()
+            .map_err(|e: std::num::ParseIntError| BisectError::BadSize(e.to_string()))?;
+        let executable = fields[base + 3].first() == Some(&b'y');
+        let packed_stat = fields[base + 4].clone();
+        trees.push(TreeData {
+            minikind,
+            fingerprint,
+            size,
+            executable,
+            packed_stat,
+        });
+    }
+    Ok(Entry { key, trees })
+}
+
+fn bisect_bytes_left(keys: &[Vec<u8>], needle: &[u8]) -> usize {
+    let mut lo = 0;
+    let mut hi = keys.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if keys[mid].as_slice() < needle {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+fn bisect_bytes_right(keys: &[Vec<u8>], needle: &[u8]) -> usize {
+    let mut lo = 0;
+    let mut hi = keys.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if needle < keys[mid].as_slice() {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// Byte-slice variants of `bisect_path_left` / `bisect_path_right`
+/// that compare by dirblock (component-wise split on `/`), used by
+/// the bisect parser.
+fn bisect_path_left_bytes(keys: &[Vec<u8>], needle: &[u8]) -> usize {
+    let mut lo = 0;
+    let mut hi = keys.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if cmp_path_by_dirblock(&keys[mid], needle).is_lt() {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+fn bisect_path_right_bytes(keys: &[Vec<u8>], needle: &[u8]) -> usize {
+    let mut lo = 0;
+    let mut hi = keys.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if cmp_path_by_dirblock(needle, &keys[mid]).is_lt() {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+fn cmp_path_by_dirblock(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (a_dir, a_base) = split_path_utf8(a);
+    let (b_dir, b_base) = split_path_utf8(b);
+    let dir_ord = cmp_by_dirs_bytes(a_dir, b_dir);
+    if dir_ord != std::cmp::Ordering::Equal {
+        return dir_ord;
+    }
+    a_base.cmp(b_base)
+}
+
+fn cmp_by_dirs_bytes(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let mut ai = a.split(|&c| c == b'/');
+    let mut bi = b.split(|&c| c == b'/');
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => match x.cmp(y) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            },
+        }
+    }
 }
 
 /// Error returned by [`DirState::ensure_block`] when the requested
@@ -3918,6 +7352,19 @@ pub enum BasisApplyError {
     /// `NotVersionedError` raised from `_find_block` when called
     /// without `add_if_missing`.
     NotVersioned { path: Vec<u8> },
+    /// An `InventoryDeltaEntry` supplied a `new_entry` whose
+    /// `file_id` disagrees with the delta row's own `file_id`.
+    /// Python raises this as `InconsistentDelta(new_path, file_id,
+    /// "mismatched entry file_id …")`.
+    MismatchedEntryFileId {
+        new_path: Vec<u8>,
+        file_id: Vec<u8>,
+        entry_debug: String,
+    },
+    /// The delta row has `new_path` but no accompanying `new_entry`.
+    /// Python raises this as `InconsistentDelta(new_path, file_id,
+    /// "new_path with no entry")`.
+    NewPathWithoutEntry { new_path: Vec<u8>, file_id: Vec<u8> },
 }
 
 /// A pre-flattened inventory-delta row passed to
@@ -3983,6 +7430,22 @@ impl std::fmt::Display for BasisApplyError {
             BasisApplyError::Internal { reason } => write!(f, "internal error: {}", reason),
             BasisApplyError::NotVersioned { path } => {
                 write!(f, "not versioned: {:?}", path)
+            }
+            BasisApplyError::MismatchedEntryFileId {
+                new_path,
+                file_id,
+                entry_debug,
+            } => write!(
+                f,
+                "mismatched entry file_id at {:?} ({:?}): {}",
+                new_path, file_id, entry_debug
+            ),
+            BasisApplyError::NewPathWithoutEntry { new_path, file_id } => {
+                write!(
+                    f,
+                    "new_path with no entry at {:?} ({:?})",
+                    new_path, file_id
+                )
             }
         }
     }
@@ -4070,6 +7533,165 @@ impl std::fmt::Display for SplitRootError {
 }
 
 impl std::error::Error for SplitRootError {}
+
+/// Error returned by [`DirState::update_entry`].
+#[derive(Debug)]
+pub enum UpdateEntryError {
+    /// No dirstate entry matches the given key.
+    EntryNotFound,
+    /// The key's entry has a minikind we do not know how to refresh.
+    UnexpectedKind(u8),
+    /// Filesystem I/O error while reading the file contents for a
+    /// sha1, reading a symlink target, or similar.
+    Io(std::io::Error),
+    /// Catch-all for other unexpected failures (e.g. an internal
+    /// invariant violated during the post-update `ensure_block`).
+    Other(String),
+}
+
+impl std::fmt::Display for UpdateEntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateEntryError::EntryNotFound => f.write_str("update_entry: entry not found"),
+            UpdateEntryError::UnexpectedKind(k) => {
+                write!(f, "update_entry: unexpected minikind {:?}", k)
+            }
+            UpdateEntryError::Io(e) => write!(f, "update_entry: i/o error: {}", e),
+            UpdateEntryError::Other(s) => write!(f, "update_entry: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for UpdateEntryError {}
+
+/// Seconds-since-epoch from a [`Metadata::modified`] reading.  Returns
+/// 0 when the platform does not carry the information.
+/// Convert a byte-encoded filesystem path into a `PathBuf`.  On unix
+/// this is a zero-copy `OsString::from_vec`; on other platforms we
+/// fall back to utf8 decoding.  Callers that hold a `&[u8]` from the
+/// Transport contract use this to talk to `SHA1Provider::sha1` which
+/// still takes a `&Path`.
+fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+fn metadata_mtime_secs(m: &Metadata) -> i64 {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Seconds-since-epoch from the filesystem's "changed" timestamp.  On
+/// Unix we read `st_ctime` directly; on other platforms we fall back
+/// to `created()` which is the closest analogue.
+fn metadata_ctime_secs(m: &Metadata) -> i64 {
+    #[cfg(unix)]
+    {
+        m.ctime()
+    }
+    #[cfg(not(unix))]
+    {
+        m.created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+}
+
+/// Error returned by [`DirState::set_path_id`]. Mirrors the exceptions
+/// Python's `DirState.set_path_id` raises.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetPathIdError {
+    /// Only `set_path_id("", new_id)` is supported — Python raises
+    /// `NotImplementedError` for any non-root path.
+    NonRootPath,
+    /// Internal invariant violation surfaced by a helper call. Includes
+    /// the MakeAbsentError / BasisApplyError description, mapped to
+    /// Python's `AssertionError`.
+    Internal { reason: String },
+}
+
+impl std::fmt::Display for SetPathIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetPathIdError::NonRootPath => write!(f, "set_path_id only supports the root path"),
+            SetPathIdError::Internal { reason } => write!(f, "internal error: {}", reason),
+        }
+    }
+}
+
+impl std::error::Error for SetPathIdError {}
+
+/// Error returned by [`DirState::add`] when the requested add cannot be
+/// performed. Each variant mirrors one of the exceptions Python's
+/// `DirState.add` raises: the pyo3 layer translates them back.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AddError {
+    /// The file_id is already tracked at a live path. Mirrors Python's
+    /// `inventory.DuplicateFileId(file_id, info)`.
+    DuplicateFileId { file_id: Vec<u8>, info: String },
+    /// Adding at this `(dirname, basename)` would collide with a live
+    /// tree-0 row under a different file_id. Mirrors Python's
+    /// `Exception("adding already added path!")`.
+    AlreadyAdded { path: Vec<u8> },
+    /// The parent directory is not versioned. Mirrors Python's
+    /// `NotVersionedError(path, self)`.
+    NotVersioned { path: Vec<u8> },
+    /// An unknown kind string was supplied. Mirrors Python's
+    /// `BzrFormatsError(f"unknown kind {kind!r}")`.
+    UnknownKind { kind: String },
+    /// The rename-from branch tried to re-add a file_id that was
+    /// previously 'a' but the in-place insertion found an existing row
+    /// with a non-absent tree-0 (should be unreachable post-normalisation).
+    AlreadyAddedAssertion { basename: Vec<u8>, file_id: Vec<u8> },
+    /// An internal invariant violation surfaced from a helper call such
+    /// as [`DirState::update_minimal`] during the rename-from step.
+    Internal { reason: String },
+    /// The basename is not unicode-normalized and the normalized form
+    /// would point at an inaccessible path.  Mirrors Python's
+    /// `InvalidNormalization(path)`.
+    InvalidNormalization { path: String },
+    /// The basename is `.` or `..`.  Mirrors Python's
+    /// `inventory.InvalidEntryName(path)`.
+    InvalidEntryName { name: String },
+}
+
+impl std::fmt::Display for AddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddError::DuplicateFileId { file_id, info } => {
+                write!(f, "duplicate file_id {:?}: {}", file_id, info)
+            }
+            AddError::AlreadyAdded { path } => {
+                write!(f, "adding already added path {:?}", path)
+            }
+            AddError::NotVersioned { path } => write!(f, "not versioned: {:?}", path),
+            AddError::UnknownKind { kind } => write!(f, "unknown kind {:?}", kind),
+            AddError::AlreadyAddedAssertion { basename, file_id } => {
+                write!(f, "{:?}({:?}) already added", basename, file_id)
+            }
+            AddError::Internal { reason } => write!(f, "internal error: {}", reason),
+            AddError::InvalidNormalization { path } => {
+                write!(f, "path not unicode-normalized: {:?}", path)
+            }
+            AddError::InvalidEntryName { name } => write!(f, "invalid entry name: {:?}", name),
+        }
+    }
+}
+
+impl std::error::Error for AddError {}
 
 /// Pure-function version of [`DirState::split_root_dirblock_into_contents`].
 /// Exposed so callers that are still building a `Vec<Dirblock>` outside of
@@ -6307,6 +9929,708 @@ mod dirstate_struct_tests {
         assert!(matches!(err, MakeAbsentError::EntryNotFound { .. }));
     }
 
+    /// A minimal root-only dirblock layout, used to test `add` paths
+    /// that insert new entries directly at the root.
+    fn add_fixture() -> DirState {
+        let mut state = fresh_state();
+        state.parents = vec![];
+        state.dirblocks = vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![Entry {
+                    key: EntryKey {
+                        dirname: Vec::new(),
+                        basename: Vec::new(),
+                        file_id: b"TREE_ROOT".to_vec(),
+                    },
+                    trees: vec![TreeData {
+                        minikind: b'd',
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: b"x".repeat(32),
+                    }],
+                }],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ];
+        state
+    }
+
+    #[test]
+    fn add_inserts_new_file_at_root() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"a", b"", b"a", b"fid-a", "file", 7, &stat, b"sha1")
+            .expect("add");
+        // Root-contents block (index 1) now has one entry.
+        assert_eq!(state.dirblocks[1].entries.len(), 1);
+        let entry = &state.dirblocks[1].entries[0];
+        assert_eq!(entry.key.basename, b"a");
+        assert_eq!(entry.key.file_id, b"fid-a");
+        assert_eq!(entry.trees[0].minikind, b'f');
+        assert_eq!(entry.trees[0].size, 7);
+        assert_eq!(entry.trees[0].fingerprint, b"sha1");
+    }
+
+    #[test]
+    fn add_directory_creates_child_block() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"sub", b"", b"sub", b"fid-sub", "directory", 0, &stat, b"")
+            .expect("add");
+        // A new block for the directory 'sub' should now exist.
+        let block_names: Vec<&[u8]> = state
+            .dirblocks
+            .iter()
+            .map(|b| b.dirname.as_slice())
+            .collect();
+        assert!(block_names.contains(&b"sub".as_slice()));
+    }
+
+    #[test]
+    fn add_duplicate_file_id_errors() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"a", b"", b"a", b"fid-a", "file", 1, &stat, b"")
+            .expect("first add");
+        let err = state
+            .add(b"b", b"", b"b", b"fid-a", "file", 1, &stat, b"")
+            .unwrap_err();
+        assert!(matches!(err, AddError::DuplicateFileId { .. }));
+    }
+
+    #[test]
+    fn add_second_path_same_basename_errors() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"a", b"", b"a", b"fid-a", "file", 1, &stat, b"")
+            .expect("first add");
+        let err = state
+            .add(b"a", b"", b"a", b"fid-other", "file", 1, &stat, b"")
+            .unwrap_err();
+        assert!(matches!(err, AddError::AlreadyAdded { .. }));
+    }
+
+    #[test]
+    fn add_unknown_kind_errors() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        let err = state
+            .add(b"a", b"", b"a", b"fid-a", "pipe", 0, &stat, b"")
+            .unwrap_err();
+        assert!(matches!(err, AddError::UnknownKind { .. }));
+    }
+
+    #[test]
+    fn add_parent_missing_errors_not_versioned() {
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        // There is no block for 'missing', and its parent ('') has no
+        // entry named 'missing' at tree 0.
+        let err = state
+            .add(
+                b"missing/child",
+                b"missing",
+                b"child",
+                b"fid-c",
+                "file",
+                0,
+                &stat,
+                b"",
+            )
+            .unwrap_err();
+        assert!(matches!(err, AddError::NotVersioned { .. }));
+    }
+
+    #[test]
+    fn set_path_id_rejects_non_root_path() {
+        let mut state = add_fixture();
+        let err = state.set_path_id(b"foo", b"new-id").unwrap_err();
+        assert!(matches!(err, SetPathIdError::NonRootPath));
+    }
+
+    #[test]
+    fn set_path_id_unchanged_id_is_noop() {
+        let mut state = add_fixture();
+        let before = state.dirblocks.clone();
+        state.set_path_id(b"", b"TREE_ROOT").expect("same-id noop");
+        assert_eq!(state.dirblocks, before);
+    }
+
+    #[test]
+    fn set_path_id_rewrites_root_and_preserves_packed_stat() {
+        let mut state = add_fixture();
+        // The root row's packed_stat is `b"x".repeat(32)` per
+        // add_fixture; no parent trees keep the entry alive, so the
+        // new row should carry the same packed_stat.
+        let original_packed_stat = state.dirblocks[0].entries[0].trees[0].packed_stat.clone();
+        state.set_path_id(b"", b"new-id").expect("set_path_id");
+        assert_eq!(state.dirblocks[0].entries.len(), 1);
+        let new_root = &state.dirblocks[0].entries[0];
+        assert_eq!(new_root.key.file_id, b"new-id");
+        assert_eq!(new_root.trees[0].minikind, b'd');
+        assert_eq!(new_root.trees[0].packed_stat, original_packed_stat);
+    }
+
+    #[test]
+    fn set_state_from_inventory_rename_same_id_bug_395556() {
+        // Regression for the bug395556 scenario: start with root + 'b'
+        // (file-id b-id); then rename b -> a in the inventory.  After
+        // the second set_state_from_inventory the dirstate should hold
+        // root + 'a' (file-id b-id) with no stale 'b' row.
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"b", b"", b"b", b"b-id", "file", 0, &stat, b"")
+            .expect("add");
+
+        let inv_after_rename: Vec<(Vec<u8>, Vec<u8>, u8, Vec<u8>, bool)> = vec![
+            (Vec::new(), b"TREE_ROOT".to_vec(), b'd', Vec::new(), false),
+            (b"a".to_vec(), b"b-id".to_vec(), b'f', Vec::new(), false),
+        ];
+        state
+            .set_state_from_inventory(inv_after_rename)
+            .expect("set_state_from_inventory");
+
+        // Expect: root row, then 'a' with file_id b-id in the root
+        // contents block.  No live 'b' row.
+        let mut live_entries = Vec::new();
+        for block in &state.dirblocks {
+            for entry in &block.entries {
+                let t0 = entry.trees.first().map(|t| t.minikind).unwrap_or(0);
+                if t0 != b'a' && t0 != b'r' {
+                    live_entries.push((
+                        entry.key.dirname.clone(),
+                        entry.key.basename.clone(),
+                        entry.key.file_id.clone(),
+                        t0,
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            live_entries,
+            vec![
+                (Vec::new(), Vec::new(), b"TREE_ROOT".to_vec(), b'd'),
+                (Vec::new(), b"a".to_vec(), b"b-id".to_vec(), b'f'),
+            ]
+        );
+    }
+
+    #[test]
+    fn walkdirs_utf8_visits_depth_first() {
+        // Build a fake filesystem: /root + children (a [file], b [dir with b/c file], f [file])
+        let mut t = MemoryTransport::new();
+        let stat_dir = StatInfo {
+            mode: 0o040755,
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 1,
+        };
+        let stat_file = StatInfo {
+            mode: 0o100644,
+            size: 3,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 2,
+        };
+        t.set_fs(b"", stat_dir, None);
+        t.set_fs(b"a", stat_file, None);
+        t.set_fs(b"b", stat_dir, None);
+        t.set_fs(b"b/c", stat_file, None);
+        t.set_fs(b"f", stat_file, None);
+
+        let mut walker = WalkDirsUtf8::new(b"", b"");
+        let mut visited: Vec<Vec<u8>> = Vec::new();
+        while walker
+            .next_dir(&t, |_rel, abspath, _entries| {
+                visited.push(abspath.to_vec());
+            })
+            .unwrap()
+        {}
+        assert_eq!(
+            visited,
+            vec![b"".to_vec(), b"b".to_vec()],
+            "expected only directories visited in depth-first order"
+        );
+    }
+
+    #[test]
+    fn walkdirs_utf8_skips_pruned_subdirectories() {
+        // Same tree but callback removes `b` from the dirblock, so
+        // the walk never recurses into it.
+        let mut t = MemoryTransport::new();
+        let stat_dir = StatInfo {
+            mode: 0o040755,
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 1,
+        };
+        let stat_file = StatInfo {
+            mode: 0o100644,
+            size: 3,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 2,
+        };
+        t.set_fs(b"", stat_dir, None);
+        t.set_fs(b"b", stat_dir, None);
+        t.set_fs(b"b/c", stat_file, None);
+
+        let mut walker = WalkDirsUtf8::new(b"", b"");
+        let mut visited: Vec<Vec<u8>> = Vec::new();
+        while walker
+            .next_dir(&t, |_rel, abspath, entries| {
+                visited.push(abspath.to_vec());
+                entries.retain(|e| e.basename != b"b");
+            })
+            .unwrap()
+        {}
+        assert_eq!(visited, vec![b"".to_vec()], "pruned dir should not recurse");
+    }
+
+    #[test]
+    fn walkdirs_utf8_depth_first_across_siblings() {
+        // Root contains two sibling dirs `a` and `a-b`.  The walker
+        // should visit `a`, recurse into `a/b`, then visit `a-b` —
+        // i.e. depth-first in byte-sorted order.  Regression for a
+        // pending-stack reversal that flipped sibling order after
+        // the first level.
+        let mut t = MemoryTransport::new();
+        let dir = StatInfo {
+            mode: 0o040755,
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 1,
+        };
+        let file = StatInfo {
+            mode: 0o100644,
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 2,
+        };
+        t.set_fs(b"", dir, None);
+        t.set_fs(b"a", dir, None);
+        t.set_fs(b"a/b", dir, None);
+        t.set_fs(b"a/b/foo", file, None);
+        t.set_fs(b"a-b", dir, None);
+        t.set_fs(b"a-b/bar", file, None);
+
+        let mut walker = WalkDirsUtf8::new(b"", b"");
+        let mut visited: Vec<Vec<u8>> = Vec::new();
+        while walker
+            .next_dir(&t, |rel, _abs, _entries| {
+                visited.push(rel.to_vec());
+            })
+            .unwrap()
+        {}
+        assert_eq!(
+            visited,
+            vec![
+                b"".to_vec(),
+                b"a".to_vec(),
+                b"a/b".to_vec(),
+                b"a-b".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn iter_changes_next_emits_unversioned_files() {
+        // In-memory filesystem with a single unversioned file at root;
+        // empty dirstate; want_unversioned=true.  The iterator should
+        // yield exactly one change (for the unversioned file).
+        let mut t = MemoryTransport::new();
+        let stat_dir = StatInfo {
+            mode: 0o040755,
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 1,
+        };
+        let stat_file = StatInfo {
+            mode: 0o100644,
+            size: 5,
+            mtime: 0,
+            ctime: 0,
+            dev: 1,
+            ino: 2,
+        };
+        t.set_fs(b"", stat_dir, None);
+        t.set_fs(b"a", stat_file, None);
+
+        let mut state = add_fixture();
+        let mut pstate = ProcessEntryState {
+            source_index: None,
+            target_index: 0,
+            include_unchanged: false,
+            want_unversioned: true,
+            partial: false,
+            supports_tree_reference: false,
+            root_abspath: Vec::new(),
+            searched_specific_files: std::collections::HashSet::new(),
+            search_specific_files: std::collections::HashSet::from([Vec::new()]),
+            search_specific_file_parents: std::collections::HashSet::new(),
+            searched_exact_paths: std::collections::HashSet::new(),
+            seen_ids: std::collections::HashSet::new(),
+            new_dirname_to_file_id: std::collections::HashMap::new(),
+            old_dirname_to_file_id: std::collections::HashMap::new(),
+            last_source_parent: None,
+            last_target_parent: None,
+        };
+        let mut iter = IterChangesIter::new();
+        let mut changes = Vec::new();
+        loop {
+            match state.iter_changes_next(&mut iter, &mut pstate, &t).unwrap() {
+                Some(c) => changes.push(c),
+                None => break,
+            }
+        }
+        // Expect: at least one change for `a` as unversioned.
+        let unversioned_for_a = changes
+            .iter()
+            .any(|c| c.new_path.as_deref() == Some(b"a" as &[u8]) && c.file_id.is_empty());
+        assert!(
+            unversioned_for_a,
+            "expected unversioned-file change for 'a'; got: {:?}",
+            changes
+        );
+    }
+
+    #[test]
+    fn update_entry_refreshes_sha_after_content_change() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let fpath = dir.path().join("a-file");
+        {
+            let mut f = std::fs::File::create(&fpath).unwrap();
+            f.write_all(b"first content\n").unwrap();
+        }
+
+        let mut state = add_fixture();
+        // Give the dirstate a committed parent so update_entry's
+        // "stat-cacheable and tree-1 is live" branch runs and the sha
+        // actually gets written.  Without a parent the row is still
+        // in "initial add" mode and we skip the sha computation.
+        state.parents = vec![b"parent-rev".to_vec()];
+        state.dirblocks[0].entries[0].trees.push(TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: Vec::new(),
+        });
+        let stat = b"x".repeat(32);
+        state
+            .add(b"a-file", b"", b"a-file", b"file-id", "file", 0, &stat, b"")
+            .expect("add");
+        // The newly-added entry still has tree-1 = absent; make it
+        // live so update_entry writes the sha.
+        let bei = state.get_block_entry_index(b"", b"a-file", 0);
+        state.dirblocks[bei.block_index].entries[bei.entry_index].trees[1] = TreeData {
+            minikind: b'f',
+            fingerprint: b"parent-sha".to_vec(),
+            size: 0,
+            executable: false,
+            packed_stat: Vec::new(),
+        };
+        // Set cutoff_time so the on-disk stat is considered cacheable.
+        state.cutoff_time = Some(i64::MAX);
+
+        let meta = std::fs::symlink_metadata(&fpath).unwrap();
+        let stat_info = StatInfo {
+            mode: {
+                #[cfg(unix)]
+                {
+                    meta.mode()
+                }
+                #[cfg(not(unix))]
+                {
+                    0o100644
+                }
+            },
+            size: meta.len(),
+            mtime: metadata_mtime_secs(&meta),
+            ctime: metadata_ctime_secs(&meta),
+            dev: {
+                #[cfg(unix)]
+                {
+                    meta.dev()
+                }
+                #[cfg(not(unix))]
+                {
+                    0
+                }
+            },
+            ino: {
+                #[cfg(unix)]
+                {
+                    meta.ino()
+                }
+                #[cfg(not(unix))]
+                {
+                    0
+                }
+            },
+        };
+        let key = EntryKey {
+            dirname: Vec::new(),
+            basename: b"a-file".to_vec(),
+            file_id: b"file-id".to_vec(),
+        };
+        let abspath_bytes = fpath.as_os_str().as_encoded_bytes().to_vec();
+        let transport = MemoryTransport::new();
+        let result = state
+            .update_entry(&key, &abspath_bytes, &stat_info, &transport)
+            .expect("update_entry");
+        let sha = result.expect("file should yield a sha");
+        // Sha of "first content\n".
+        assert_eq!(
+            std::str::from_utf8(&sha).unwrap(),
+            "c0a245ade45b97366321074bb27a39a6ae1dc4fc"
+        );
+        // Tree-0 row should now carry that same sha.
+        let bei = state.get_block_entry_index(b"", b"a-file", 0);
+        assert!(bei.path_present);
+        let entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(entry.trees[0].fingerprint, sha);
+    }
+
+    #[test]
+    fn bisect_roundtrips_via_get_lines() {
+        // Populate a dirstate, serialise it via get_lines, then bisect
+        // the serialised byte stream for a known path.  Exercises the
+        // full read pipeline (header, entry row parsing, bisect).
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(
+                b"alpha", b"", b"alpha", b"a-id", "file", 11, &stat, b"sha-a",
+            )
+            .expect("add alpha");
+        state
+            .add(
+                b"bravo", b"", b"bravo", b"b-id", "file", 22, &stat, b"sha-b",
+            )
+            .expect("add bravo");
+
+        let lines = state.get_lines();
+        let buf: Vec<u8> = lines.into_iter().flatten().collect();
+
+        // Extract end_of_header just like the Python header reader:
+        // it is the byte offset of the NUL right after the fifth
+        // newline.  read_header handles that for us.
+        let mut reader = DirState::new(
+            "/tmp/fake",
+            Box::new(DefaultSHA1Provider::new()),
+            0,
+            true,
+            false,
+        );
+        reader.read_header(&buf).expect("read_header");
+        reader.dirblock_state = MemoryState::NotInMemory;
+
+        // Build a read_range closure over the buffer.
+        let buf_clone = buf.clone();
+        let read_range = move |offset: u64, len: usize| -> Result<Vec<u8>, BisectError> {
+            let start = offset as usize;
+            let end = std::cmp::min(start + len, buf_clone.len());
+            if start > buf_clone.len() {
+                return Ok(Vec::new());
+            }
+            Ok(buf_clone[start..end].to_vec())
+        };
+
+        let file_size = buf.len() as u64;
+        let found = reader
+            .bisect(vec![b"bravo".to_vec()], file_size, read_range)
+            .expect("bisect");
+        let bravo = found.get(b"bravo".as_slice()).expect("bravo present");
+        assert_eq!(bravo.len(), 1);
+        assert_eq!(bravo[0].key.basename, b"bravo");
+        assert_eq!(bravo[0].key.file_id, b"b-id");
+        assert_eq!(bravo[0].trees[0].size, 22);
+        assert_eq!(bravo[0].trees[0].fingerprint, b"sha-b");
+    }
+
+    #[test]
+    fn set_parent_trees_simple_case() {
+        // Start from a tree with root + 'a-file' in tree-0.
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"a-file", b"", b"a-file", b"file-id", "file", 0, &stat, b"")
+            .expect("add");
+
+        // One non-ghost parent tree that contains the same entries but with
+        // different details (simulating a committed revision).
+        let details_root = TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: b"rev1".to_vec(),
+        };
+        let details_file = TreeData {
+            minikind: b'f',
+            fingerprint: b"sha1-parent".to_vec(),
+            size: 42,
+            executable: false,
+            packed_stat: b"rev1".to_vec(),
+        };
+        let parent_entries = vec![
+            (Vec::new(), b"TREE_ROOT".to_vec(), details_root.clone()),
+            (
+                b"a-file".to_vec(),
+                b"file-id".to_vec(),
+                details_file.clone(),
+            ),
+        ];
+
+        state
+            .set_parent_trees(vec![b"rev1".to_vec()], vec![], vec![parent_entries])
+            .expect("set_parent_trees");
+
+        // Root row should have tree-0 (directory) and tree-1 = details_root.
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"", 0);
+        assert!(bei.path_present);
+        let root = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(root.trees.len(), 2);
+        assert_eq!(root.trees[1], details_root);
+
+        // a-file row should have tree-0 (file) and tree-1 = details_file.
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"a-file", 0);
+        assert!(bei.path_present);
+        let file_entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(file_entry.trees.len(), 2);
+        assert_eq!(file_entry.trees[1], details_file);
+
+        assert_eq!(state.parents, vec![b"rev1".to_vec()]);
+        assert!(state.ghosts.is_empty());
+    }
+
+    #[test]
+    fn set_parent_trees_ghost_parent_has_no_entries() {
+        // Ghost parents occupy a tree slot but contribute no entries.
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"x", b"", b"x", b"x-id", "file", 0, &stat, b"")
+            .expect("add");
+
+        state
+            .set_parent_trees(
+                vec![b"ghost-rev".to_vec()],
+                vec![b"ghost-rev".to_vec()],
+                vec![], // no non-ghost parent trees
+            )
+            .expect("set_parent_trees");
+
+        // Only one tree slot (tree-0) per entry since there are no
+        // non-ghost parents.
+        for block in &state.dirblocks {
+            for entry in &block.entries {
+                assert_eq!(entry.trees.len(), 1);
+            }
+        }
+        assert_eq!(state.parents, vec![b"ghost-rev".to_vec()]);
+        assert_eq!(state.ghosts, vec![b"ghost-rev".to_vec()]);
+    }
+
+    #[test]
+    fn set_parent_trees_cross_path_relocation() {
+        // Parent tree has file-id at a different path than tree-0.
+        // Expect a relocation pointer in the new row.
+        let mut state = add_fixture();
+        let stat = b"x".repeat(32);
+        state
+            .add(b"new-path", b"", b"new-path", b"fid", "file", 0, &stat, b"")
+            .expect("add");
+
+        let root_details = TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: b"rev".to_vec(),
+        };
+        let file_details = TreeData {
+            minikind: b'f',
+            fingerprint: b"old-sha".to_vec(),
+            size: 7,
+            executable: false,
+            packed_stat: b"rev".to_vec(),
+        };
+        let parent_entries = vec![
+            (Vec::new(), b"TREE_ROOT".to_vec(), root_details),
+            (b"old-path".to_vec(), b"fid".to_vec(), file_details.clone()),
+        ];
+
+        state
+            .set_parent_trees(vec![b"rev".to_vec()], vec![], vec![parent_entries])
+            .expect("set_parent_trees");
+
+        // New path still has tree-0 (file) and tree-1 now holds a
+        // relocation pointer to old-path.
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"new-path", 0);
+        assert!(bei.path_present);
+        let new_entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(new_entry.trees[1].minikind, b'r');
+        assert_eq!(new_entry.trees[1].fingerprint, b"old-path");
+
+        // old-path exists as a row with tree-0 = relocation to new-path
+        // and tree-1 = the actual parent-tree details.
+        let bei = get_block_entry_index(&state.dirblocks, b"", b"old-path", 1);
+        assert!(bei.path_present);
+        let old_entry = &state.dirblocks[bei.block_index].entries[bei.entry_index];
+        assert_eq!(old_entry.trees[0].minikind, b'r');
+        assert_eq!(old_entry.trees[0].fingerprint, b"new-path");
+        assert_eq!(old_entry.trees[1], file_details);
+    }
+
+    #[test]
+    fn set_path_id_zeroes_packed_stat_when_parents_retain_entry() {
+        let mut state = add_fixture();
+        // Add a parent tree that still references the root row.
+        state.parents = vec![b"parent-rev".to_vec()];
+        state.dirblocks[0].entries[0].trees.push(TreeData {
+            minikind: b'd',
+            fingerprint: Vec::new(),
+            size: 0,
+            executable: false,
+            packed_stat: Vec::new(),
+        });
+        state.set_path_id(b"", b"new-id").expect("set_path_id");
+        let new_root = state
+            .dirblocks
+            .iter()
+            .flat_map(|b| b.entries.iter())
+            .find(|e| e.key.file_id == b"new-id")
+            .expect("new root entry");
+        // With parents holding the old row alive, Python's in-place
+        // mutation produced an empty packed_stat on the replacement.
+        assert_eq!(new_root.trees[0].packed_stat, b"");
+    }
+
     /// Build a TreeData that looks like Python's
     /// `(minikind, fingerprint, size, executable, packed_stat)`
     /// tuple — more convenient than the raw `tree()` helper when a
@@ -6875,7 +11199,7 @@ mod dirstate_struct_tests {
             details: Some((b'f', b"sha-new".to_vec(), 20, false, b"new-revid".to_vec())),
         }];
         state
-            .update_basis_by_delta(entries)
+            .update_basis_by_delta(entries, b"new-revid".to_vec())
             .expect("update_basis_by_delta");
 
         let bei = get_block_entry_index(&state.dirblocks, b"", b"README", 1);
@@ -6899,7 +11223,7 @@ mod dirstate_struct_tests {
             details: Some((b'f', b"sha-new".to_vec(), 5, false, b"new-revid".to_vec())),
         }];
         state
-            .update_basis_by_delta(entries)
+            .update_basis_by_delta(entries, b"new-revid".to_vec())
             .expect("update_basis_by_delta");
 
         let bei = get_block_entry_index(&state.dirblocks, b"", b"NEWFILE", 1);
@@ -6959,7 +11283,7 @@ mod dirstate_struct_tests {
             details: Some((b'd', Vec::new(), 0, false, b"new-revid".to_vec())),
         }];
         state
-            .update_basis_by_delta(entries)
+            .update_basis_by_delta(entries, b"new-revid".to_vec())
             .expect("update_basis_by_delta");
 
         // Tree 1: a and a/f should no longer be live.
@@ -6993,7 +11317,7 @@ mod dirstate_struct_tests {
             details: None,
         }];
         state
-            .update_basis_by_delta(entries)
+            .update_basis_by_delta(entries, b"new-revid".to_vec())
             .expect("update_basis_by_delta");
 
         // After delete: tree 1 for README is absent.
@@ -7946,9 +12270,13 @@ mod dirstate_struct_tests {
     /// In-memory [`Transport`] for tests and non-persistent use. Holds
     /// the file contents in a `Vec<u8>`; lock state is tracked
     /// explicitly so the tests can verify the state transitions.
+    /// Additionally maintains a simple `path -> (StatInfo, Option<symlink_target>)`
+    /// map so tests that exercise `lstat`/`read_link` can pre-seed
+    /// working-tree file metadata.
     struct MemoryTransport {
         contents: Option<Vec<u8>>,
         lock: Option<LockState>,
+        fs: std::collections::HashMap<Vec<u8>, (StatInfo, Option<Vec<u8>>)>,
     }
 
     impl MemoryTransport {
@@ -7956,6 +12284,7 @@ mod dirstate_struct_tests {
             Self {
                 contents: None,
                 lock: None,
+                fs: std::collections::HashMap::new(),
             }
         }
 
@@ -7963,7 +12292,13 @@ mod dirstate_struct_tests {
             Self {
                 contents: Some(bytes.to_vec()),
                 lock: None,
+                fs: std::collections::HashMap::new(),
             }
+        }
+
+        #[allow(dead_code)]
+        fn set_fs(&mut self, path: &[u8], info: StatInfo, symlink_target: Option<Vec<u8>>) {
+            self.fs.insert(path.to_vec(), (info, symlink_target));
         }
     }
 
@@ -8032,6 +12367,78 @@ mod dirstate_struct_tests {
             // No-op for in-memory transport; the call is still valid
             // so `DirState.save` can call it unconditionally.
             Ok(())
+        }
+
+        fn lstat(&self, abspath: &[u8]) -> Result<StatInfo, TransportError> {
+            self.fs.get(abspath).map(|(info, _)| *info).ok_or_else(|| {
+                TransportError::NotFound(String::from_utf8_lossy(abspath).into_owned())
+            })
+        }
+
+        fn read_link(&self, abspath: &[u8]) -> Result<Vec<u8>, TransportError> {
+            self.fs
+                .get(abspath)
+                .and_then(|(_, link)| link.clone())
+                .ok_or_else(|| {
+                    TransportError::NotFound(String::from_utf8_lossy(abspath).into_owned())
+                })
+        }
+
+        fn is_tree_reference_dir(&self, _abspath: &[u8]) -> Result<bool, TransportError> {
+            // In-memory fixture has no concept of nested trees.
+            Ok(false)
+        }
+
+        fn list_dir(&self, abspath: &[u8]) -> Result<Vec<DirEntryInfo>, TransportError> {
+            // Iterate self.fs and collect direct children.  A path is
+            // a direct child of `abspath` when it starts with the
+            // prefix and the remainder contains no slash.  Treats
+            // `abspath == b""` as the root.
+            let prefix: Vec<u8> = if abspath.is_empty() {
+                Vec::new()
+            } else {
+                let mut p = abspath.to_vec();
+                p.push(b'/');
+                p
+            };
+            let mut out = Vec::new();
+            let mut found_dir = abspath.is_empty();
+            for (path, (info, link)) in &self.fs {
+                if path.as_slice() == abspath {
+                    found_dir = true;
+                    continue;
+                }
+                if !path.starts_with(&prefix) {
+                    continue;
+                }
+                let tail = &path[prefix.len()..];
+                if tail.iter().any(|&b| b == b'/') {
+                    continue;
+                }
+                let kind = if info.is_dir() {
+                    "directory"
+                } else if info.is_file() {
+                    "file"
+                } else if info.is_symlink() {
+                    "symlink"
+                } else {
+                    "unknown"
+                }
+                .to_string();
+                let _ = link; // link metadata is available via read_link
+                out.push(DirEntryInfo {
+                    basename: tail.to_vec(),
+                    kind,
+                    stat: *info,
+                    abspath: path.clone(),
+                });
+            }
+            if !found_dir {
+                return Err(TransportError::NotFound(
+                    String::from_utf8_lossy(abspath).into_owned(),
+                ));
+            }
+            Ok(out)
         }
     }
 
