@@ -1,49 +1,15 @@
 use crate::inventory::Entry as InventoryEntry;
 use crate::FileId;
-use osutils::sha::{sha_file, sha_file_by_name};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+#[cfg(test)]
 use std::fs::Metadata;
 #[cfg(all(unix, test))]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-pub trait SHA1Provider: Send + Sync {
-    fn sha1(&self, path: &Path) -> std::io::Result<String>;
-
-    fn stat_and_sha1(&self, path: &Path) -> std::io::Result<(Metadata, String)>;
-}
-
-/// A SHA1Provider that reads directly from the filesystem."""
-pub struct DefaultSHA1Provider;
-
-impl DefaultSHA1Provider {
-    pub fn new() -> DefaultSHA1Provider {
-        DefaultSHA1Provider {}
-    }
-}
-
-impl Default for DefaultSHA1Provider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SHA1Provider for DefaultSHA1Provider {
-    /// Return the sha1 of a file given its absolute path.
-    fn sha1(&self, path: &Path) -> std::io::Result<String> {
-        sha_file_by_name(path)
-    }
-
-    /// Return the stat and sha1 of a file given its absolute path.
-    fn stat_and_sha1(&self, path: &Path) -> std::io::Result<(Metadata, String)> {
-        let mut f = File::open(path)?;
-        let stat = f.metadata()?;
-        let sha1 = sha_file(&mut f)?;
-        Ok((stat, sha1))
-    }
-}
+mod sha1;
+pub use sha1::{DefaultSHA1Provider, SHA1Provider};
 
 mod pack_stat;
 pub use pack_stat::{pack_stat, pack_stat_metadata, stat_to_minikind};
