@@ -1542,6 +1542,25 @@ impl DirState {
         self.packed_stat_index = None;
     }
 
+    /// Append a `NULL_PARENT_DETAILS` row to every entry's tree slot
+    /// list. Mirrors Python's inline loop in `update_basis_by_delta`:
+    /// when the current dirstate has no parents and a new parent is
+    /// being introduced, each row needs space for the new parent's
+    /// tree-1 slot before `update_basis_by_delta` can fill it in.
+    pub fn bootstrap_new_parent_slot(&mut self) {
+        for block in self.dirblocks.iter_mut() {
+            for entry in block.entries.iter_mut() {
+                entry.trees.push(TreeData {
+                    minikind: b'a',
+                    fingerprint: Vec::new(),
+                    size: 0,
+                    executable: false,
+                    packed_stat: Vec::new(),
+                });
+            }
+        }
+    }
+
     /// Forget all in-memory state, returning the object to the same
     /// shape a freshly constructed [`DirState`] has before any load.
     /// Mirrors Python's `DirState._wipe_state`.
@@ -3366,20 +3385,46 @@ impl DirState {
         Ok(())
     }
 
-    /// Apply a pre-flattened inventory delta to tree 1. Mirrors
-    /// Python's `DirState.update_basis_by_delta` — the sibling of
+    /// Rebase the basis tree onto `new_revid`. Mirrors Python's
+    /// `DirState.update_basis_by_delta` — the sibling of
     /// [`DirState::update_by_delta`] that rebases the basis tree.
     ///
-    /// Prerequisites the caller must handle: calling
-    /// `discard_merge_parents`, setting the parent slot to
-    /// `new_revid` (via `set_parent_at` / `append_parent`), and
-    /// bootstrapping per-entry tree-1 slots when the dirstate had
-    /// zero parents. The ghost-parents check is also a caller
-    /// concern — this method takes a pre-sorted, pre-checked delta.
-    ///
-    /// On success, the caller should mark the dirstate modified
-    /// (header included) and invalidate its id_index cache.
+    /// This encapsulates the full Python entrypoint:
+    ///   1. `discard_merge_parents()` to drop all parents past the first.
+    ///   2. Ghost-check: returns [`BasisApplyError::NotImplemented`]
+    ///      when any ghost parent remains, matching Python's
+    ///      `NotImplementedError`.
+    ///   3. When the dirstate has no parents, extend every entry's
+    ///      tree list with a `NULL_PARENT_DETAILS` row and append
+    ///      `new_revid` to `parents`.
+    ///   4. Replace `parents[0]` with `new_revid`.
+    ///   5. Apply the pre-flattened, pre-sorted delta.
+    ///   6. Mark modified and clear id_index.
     pub fn update_basis_by_delta(
+        &mut self,
+        entries: Vec<FlatBasisDeltaEntry>,
+        new_revid: Vec<u8>,
+    ) -> Result<(), BasisApplyError> {
+        self.discard_merge_parents();
+        if !self.ghosts.is_empty() {
+            return Err(BasisApplyError::NotImplemented {
+                reason: "update_basis_by_delta with ghost parents".to_string(),
+            });
+        }
+        if self.parents.is_empty() {
+            self.bootstrap_new_parent_slot();
+            self.parents.push(new_revid.clone());
+        }
+        self.parents[0] = new_revid;
+        let result = self.update_basis_by_delta_inner(entries);
+        if result.is_ok() {
+            self.mark_modified(&[], true);
+            self.id_index = None;
+        }
+        result
+    }
+
+    fn update_basis_by_delta_inner(
         &mut self,
         entries: Vec<FlatBasisDeltaEntry>,
     ) -> Result<(), BasisApplyError> {
@@ -7511,7 +7556,7 @@ mod dirstate_struct_tests {
             details: Some((b'f', b"sha-new".to_vec(), 20, false, b"new-revid".to_vec())),
         }];
         state
-            .update_basis_by_delta(entries)
+            .update_basis_by_delta(entries, b"new-revid".to_vec())
             .expect("update_basis_by_delta");
 
         let bei = get_block_entry_index(&state.dirblocks, b"", b"README", 1);
@@ -7535,7 +7580,7 @@ mod dirstate_struct_tests {
             details: Some((b'f', b"sha-new".to_vec(), 5, false, b"new-revid".to_vec())),
         }];
         state
-            .update_basis_by_delta(entries)
+            .update_basis_by_delta(entries, b"new-revid".to_vec())
             .expect("update_basis_by_delta");
 
         let bei = get_block_entry_index(&state.dirblocks, b"", b"NEWFILE", 1);
@@ -7595,7 +7640,7 @@ mod dirstate_struct_tests {
             details: Some((b'd', Vec::new(), 0, false, b"new-revid".to_vec())),
         }];
         state
-            .update_basis_by_delta(entries)
+            .update_basis_by_delta(entries, b"new-revid".to_vec())
             .expect("update_basis_by_delta");
 
         // Tree 1: a and a/f should no longer be live.
@@ -7629,7 +7674,7 @@ mod dirstate_struct_tests {
             details: None,
         }];
         state
-            .update_basis_by_delta(entries)
+            .update_basis_by_delta(entries, b"new-revid".to_vec())
             .expect("update_basis_by_delta");
 
         // After delete: tree 1 for README is absent.

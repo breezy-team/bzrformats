@@ -233,7 +233,6 @@ from .errors import (
     BadFileKindError,
     BzrFormatsError,
     InconsistentDelta,
-    InconsistentDeltaDelta,
     InvalidNormalization,
     LockContention,
     LockNotHeld,
@@ -472,17 +471,16 @@ class DirState:
             for executable bit information
         """
         # All scalar state and the parents/ghosts lists live on the
-        # Rust-side DirStateRs wrapper; Python still owns the dirblocks,
-        # the id_index, the packed-stat/split-path caches, the lock
-        # plumbing, and the sha1 provider because those haven't been
-        # migrated yet.
+        # Rust-side DirStateRs wrapper owns the dirblocks, parents,
+        # ghosts and id_index.  Python still owns the packed-stat /
+        # split-path caches, the lock plumbing, and the sha1 provider
+        # because those haven't been migrated yet.
         self._rs = _dirstate_rs.DirStateRs(
             path,
             worth_saving_limit=worth_saving_limit,
             use_filesystem_for_exec=use_filesystem_for_exec,
             fdatasync=fdatasync,
         )
-        self._dirblocks = []
         self._state_file = None
         self._lock_token = None
         self._lock_state = None
@@ -491,11 +489,8 @@ class DirState:
         self._bisect_page_size = DirState.BISECT_PAGE_SIZE
         self._sha1_provider = sha1_provider
         self._sha1_file = self._sha1_provider.sha1
-        # These two attributes provide a simple cache for lookups into the
-        # dirstate in-memory vectors. By probing respectively for the last
-        # block, and for the next entry, we save nearly 2 bisections per path
-        # during commit.
-        self._last_block_index = None
+        # A simple cache for lookups into dirblock entries: by probing
+        # for the next entry, we save a bisection per path during commit.
         self._last_entry_index = None
 
     # ---- Rust-backed scalar attributes ----
@@ -590,6 +585,21 @@ class DirState:
     def _ghosts(self, value):
         self._rs.ghosts = value
 
+    @property
+    def _dirblocks(self):
+        """Read-through view of the Rust-owned dirblocks.
+
+        Each access marshals a fresh snapshot of the dirblocks out of
+        Rust, so references held across a dirstate mutation go stale.
+        Callers that need fresh data must re-access ``state._dirblocks``
+        after any mutation.
+        """
+        return self._rs.dirblocks
+
+    @_dirblocks.setter
+    def _dirblocks(self, value):
+        self._rs.dirblocks = value
+
     def __repr__(self):
         """Return string representation of the dirstate."""
         return f"{self.__class__.__name__}({self._filename!r})"
@@ -647,7 +657,6 @@ class DirState:
         else:
             size = stat.st_size
             packed_stat = pack_stat(stat)
-        self._rs.dirblocks = self._dirblocks
         self._rs.add(
             utf8path,
             dirname,
@@ -658,7 +667,6 @@ class DirState:
             packed_stat,
             fingerprint,
         )
-        self._dirblocks = self._rs.dirblocks
         if self._id_index is not None:
             self._id_index.add((dirname, basename, file_id))
 
@@ -1104,9 +1112,7 @@ class DirState:
         # Sync dirblocks into the Rust wrapper, run the pure-Rust
         # discard which mutates dirblocks + ghosts + parents, then
         # sync the new dirblocks back into Python's mirror.
-        self._rs.dirblocks = self._dirblocks
         self._rs.discard_merge_parents()
-        self._dirblocks = self._rs.dirblocks
         self._id_index = None
 
     def _empty_parent_info(self):
@@ -1114,13 +1120,11 @@ class DirState:
 
     def _ensure_block(self, parent_block_index, parent_row_index, dirname):
         """Ensure a block for dirname exists. See DirStateRs.ensure_block."""
-        self._rs.dirblocks = self._dirblocks
         block_index = self._rs.ensure_block(
             parent_block_index, parent_row_index, dirname
         )
         # Rust may have inserted a new empty block; keep Python's
         # mirror in sync so follow-up direct dirblocks access works.
-        self._dirblocks = self._rs.dirblocks
         return block_index
 
     def _entries_to_current_state(self, new_entries):
@@ -1137,7 +1141,6 @@ class DirState:
         # sorted entry stream and runs split_root_dirblock_into_contents
         # as the last step. Sync the result back into Python's mirror.
         self._rs.entries_to_current_state(new_entries)
-        self._dirblocks = self._rs.dirblocks
 
     def _split_root_dirblock_into_contents(self):
         """Split the root dirblocks into root and contents-of-root.
@@ -1145,9 +1148,7 @@ class DirState:
         After parsing by path, we end up with root entries and contents-of-root
         entries in the same block. This loop splits them out again.
         """
-        self._rs.dirblocks = self._dirblocks
         self._rs.split_root_dirblock_into_contents()
-        self._dirblocks = self._rs.dirblocks
 
     def _entries_for_path(self, path):
         """Return a list with all the entries that match path for all ids."""
@@ -1155,7 +1156,6 @@ class DirState:
         # DirStateRs wrapper before calling the pure-Rust lookup. Both
         # callers in iter_changes only read the returned entries, so
         # the lack of live aliasing with self._dirblocks is invisible.
-        self._rs.dirblocks = self._dirblocks
         return self._rs.entries_for_path(path)
 
     @staticmethod
@@ -1174,38 +1174,7 @@ class DirState:
 
         :return: The block index, True if the block for the key is present.
         """
-        # Not delegated to DirStateRs.find_block_index_from_key yet:
-        # this helper is called in tight loops inside add /
-        # update_minimal / _get_entry, and per-call dirblocks syncing
-        # turned the full test suite from 45s into 110s. Delegation
-        # has to wait until _dirblocks ownership flips to Rust once
-        # and for all.
-        if key[0:2] == (b"", b""):
-            return 0, True
-        if self._last_block_index is not None:
-            try:
-                last_block_dirname = self._dirblocks[self._last_block_index][0]
-            except IndexError:
-                last_block_dirname = None
-            if last_block_dirname == key[0]:
-                return self._last_block_index, True
-        block_index = bisect_dirblock(
-            self._dirblocks, key[0], 1, cache=self._split_path_cache
-        )
-        # _right returns one-past-where-key is so we have to subtract
-        # one to use it. we use _right here because there are two
-        # b'' blocks - the root, and the contents of root
-        # we always have a minimum of 2 in self._dirblocks: root and
-        # root-contents, and for b'', we get 2 back, so this is
-        # simple and correct:
-        present = (
-            block_index < len(self._dirblocks)
-            and self._dirblocks[block_index][0] == key[0]
-        )
-        self._last_block_index = block_index
-        # Reset the entry index cache to the beginning of the block.
-        self._last_entry_index = -1
-        return block_index, present
+        return self._rs.find_block_index_from_key(key)
 
     def _find_entry_index(self, key, block):
         """Find the entry index for a key in a block.
@@ -1297,26 +1266,15 @@ class DirState:
                 fingerprint = b""
                 executable = False
             flat.append((op, np, file_id, parent_id, minikind, executable, fingerprint))
-        self._rs.dirblocks = self._dirblocks
-        try:
-            self._rs.update_by_delta(flat)
-        except BzrFormatsError as e:
-            if "integrity error" not in str(e):
-                raise
-            raise InconsistentDeltaDelta(delta, f"error from _get_entry. {e}") from e
-        self._dirblocks = self._rs.dirblocks
+        self._rs.update_by_delta(flat)
         self._id_index = None
 
     def _apply_removals(self, removals):
-        self._rs.dirblocks = self._dirblocks
         self._rs.apply_removals(list(removals))
-        self._dirblocks = self._rs.dirblocks
         self._id_index = None
 
     def _apply_insertions(self, adds):
-        self._rs.dirblocks = self._dirblocks
         self._rs.apply_insertions(list(adds))
-        self._dirblocks = self._rs.dirblocks
         self._id_index = None
 
     def update_basis_by_delta(self, delta, new_revid):
@@ -1335,18 +1293,6 @@ class DirState:
             the changes from the current left most parent revision to new_revid.
         """
         self._read_dirblocks_if_needed()
-        self._discard_merge_parents()
-        if self._ghosts != []:
-            raise NotImplementedError(self.update_basis_by_delta)
-        if len(self._parents) == 0:
-            # setup a blank tree, the most simple way.
-            empty_parent = DirState.NULL_PARENT_DETAILS
-            for entry in self._iter_entries():
-                entry[1].append(empty_parent)
-            self._rs.append_parent(new_revid)
-
-        self._rs.set_parent_at(0, new_revid)
-
         delta.check()
         delta.sort()
         inv_to_entry = _inv_entry_to_details
@@ -1370,22 +1316,13 @@ class DirState:
             details = None if inv_entry is None else inv_to_entry(inv_entry)
             flat.append((op, np, file_id, parent_id, details))
 
-        self._rs.dirblocks = self._dirblocks
-        try:
-            self._rs.update_basis_by_delta(flat)
-        except BzrFormatsError as e:
-            if "integrity error" not in str(e):
-                raise
-            raise InconsistentDeltaDelta(delta, f"error from _get_entry. {e}") from e
-        self._dirblocks = self._rs.dirblocks
-        self._mark_modified(header_modified=True)
+        self._rs.update_basis_by_delta(flat, new_revid)
         self._id_index = None
 
     def _check_delta_ids_absent(self, new_ids, tree_index):
         """Check that none of the file_ids in new_ids are present in a tree."""
         if not new_ids:
             return
-        self._rs.dirblocks = self._dirblocks
         self._rs.check_delta_ids_absent(list(new_ids), tree_index)
 
     def _raise_invalid(self, path, file_id, reason):
@@ -1403,11 +1340,9 @@ class DirState:
             is False when the add is the second half of a remove-and-reinsert
             pair created to handle renames and deletes.
         """
-        self._rs.dirblocks = self._dirblocks
         self._rs.update_basis_apply_adds(adds)
         # Rust may have inserted entries and/or dirblocks; pull the
         # rewritten state back into Python's mirror.
-        self._dirblocks = self._rs.dirblocks
         self._id_index = None
 
     def _update_basis_apply_changes(self, changes):
@@ -1416,9 +1351,7 @@ class DirState:
         :param changes: A sequence of changes. Each change is a tuple:
             (path_utf8, path_utf8, file_id, (entry_details))
         """
-        self._rs.dirblocks = self._dirblocks
         self._rs.update_basis_apply_changes(changes)
-        self._dirblocks = self._rs.dirblocks
         self._id_index = None
 
     def _update_basis_apply_deletes(self, deletes):
@@ -1433,9 +1366,7 @@ class DirState:
             rather than the rename handling logic temporarily deleting a path
             during the replacement of a parent.
         """
-        self._rs.dirblocks = self._dirblocks
         self._rs.update_basis_apply_deletes(deletes)
-        self._dirblocks = self._rs.dirblocks
         self._id_index = None
 
     def _after_delta_check_parents(self, parents, index):
@@ -1446,7 +1377,6 @@ class DirState:
             and be a directory.
         :param index: The column in the dirstate to check for parents in.
         """
-        self._rs.dirblocks = self._dirblocks
         self._rs.after_delta_check_parents(list(parents), index)
 
     def _observed_sha1(
@@ -1542,7 +1472,6 @@ class DirState:
         # DirStateRs wrapper before calling the pure-Rust serialiser.
         # Goes away once every dirblock writer has migrated and
         # self._dirblocks is no longer the source of truth.
-        self._rs.dirblocks = self._dirblocks
         return self._rs.get_lines()
 
     def _get_fields_to_entry(self):
@@ -1674,7 +1603,6 @@ class DirState:
             tree present there.
         """
         self._read_dirblocks_if_needed()
-        self._rs.dirblocks = self._dirblocks
         return self._rs.get_block_entry_index(dirname, basename, tree_index)
 
     def _get_entry(
@@ -1698,76 +1626,17 @@ class DirState:
             (absent) paths.
         :return: The dirstate entry tuple for path, or (None, None)
         """
-        # NOTE: not delegated to DirStateRs.get_entry. This helper is
-        # called in hot paths inside iter_changes, _process_entry, and
-        # add; per-call dirblocks syncing more than doubled the full
-        # test suite runtime (46s → 108s). Delegation has to wait
-        # until _dirblocks ownership flips to Rust wholesale.
         self._read_dirblocks_if_needed()
-        if path_utf8 is not None:
-            if not isinstance(path_utf8, bytes):
-                raise BzrFormatsError(
-                    f"path_utf8 is not bytes: {type(path_utf8)} {path_utf8!r}"
-                )
-            # path lookups are faster
-            dirname, basename = osutils.split(path_utf8)
-            (
-                block_index,
-                entry_index,
-                _dir_present,
-                file_present,
-            ) = self._get_block_entry_index(dirname, basename, tree_index)
-            if not file_present:
-                return None, None
-            entry = self._dirblocks[block_index][1][entry_index]
-            if not (entry[0][2] and entry[1][tree_index][0] not in (b"a", b"r")):
-                raise AssertionError("unversioned entry?")
-            if fileid_utf8 and entry[0][2] != fileid_utf8:
-                self._changes_aborted = True
-                raise BzrFormatsError(
-                    "integrity error ? : mismatching tree_index, file_id and path"
-                )
-            return entry
-        else:
-            possible_keys = self._get_id_index().get(fileid_utf8)
-            if not possible_keys:
-                return None, None
-            for key in possible_keys:
-                block_index, present = self._find_block_index_from_key(key)
-                # strange, probably indicates an out of date
-                # id index - for now, allow this.
-                if not present:
-                    continue
-                # WARNING: DO not change this code to use _get_block_entry_index
-                # as that function is not suitable: it does not use the key
-                # to lookup, and thus the wrong coordinates are returned.
-                block = self._dirblocks[block_index][1]
-                entry_index, present = self._find_entry_index(key, block)
-                if present:
-                    entry = self._dirblocks[block_index][1][entry_index]
-                    # TODO: We might want to assert that entry[0][2] ==
-                    #       fileid_utf8.
-                    # GZ 2017-06-09: Hoist set of minkinds somewhere
-                    if entry[1][tree_index][0] in {b"f", b"d", b"l", b"t"}:
-                        # this is the result we are looking for: the
-                        # real home of this file_id in this tree.
-                        return entry
-                    if entry[1][tree_index][0] == b"a":
-                        # there is no home for this entry in this tree
-                        if include_deleted:
-                            return entry
-                        return None, None
-                    if entry[1][tree_index][0] != b"r":
-                        raise AssertionError(
-                            "entry {!r} has invalid minikind {!r} for tree {!r}".format(
-                                entry, entry[1][tree_index][0], tree_index
-                            )
-                        )
-                    real_path = entry[1][tree_index][1]
-                    return self._get_entry(
-                        tree_index, fileid_utf8=fileid_utf8, path_utf8=real_path
-                    )
-            return None, None
+        if path_utf8 is not None and not isinstance(path_utf8, bytes):
+            raise BzrFormatsError(
+                f"path_utf8 is not bytes: {type(path_utf8)} {path_utf8!r}"
+            )
+        return self._rs.get_entry(
+            tree_index,
+            fileid_utf8=fileid_utf8,
+            path_utf8=path_utf8,
+            include_deleted=include_deleted,
+        )
 
     @classmethod
     def initialize(cls, path, sha1_provider=None):
@@ -1826,7 +1695,6 @@ class DirState:
         # update_basis_by_delta only read them, so the aliasing
         # difference from the previous `yield entry` version is
         # invisible to callers.
-        self._rs.dirblocks = self._dirblocks
         return iter(self._rs.iter_child_entries(tree_index, path_utf8))
 
     def _iter_entries(self):
@@ -1931,7 +1799,6 @@ class DirState:
 
     def sha1_from_stat(self, path, stat_result):
         """Find a sha1 given a stat lookup."""
-        self._rs.dirblocks = self._dirblocks
         return self._rs.sha1_from_packed_stat(pack_stat(stat_result))
 
     def save(self):
@@ -2011,9 +1878,6 @@ class DirState:
         # Rust side absorbs parent_ids and dirblocks, marks both states
         # fully modified, and clears its id_index cache.
         self._rs.set_data(parent_ids, dirblocks)
-        # Python still keeps its own _dirblocks mirror in sync with
-        # the Rust side until it migrates.
-        self._dirblocks = dirblocks
         self._id_index = None
 
     def set_path_id(self, path, new_id):
@@ -2027,9 +1891,7 @@ class DirState:
         self._read_dirblocks_if_needed()
         if not isinstance(new_id, bytes):
             raise AssertionError(f"must be a utf8 file_id not {type(new_id)}")
-        self._rs.dirblocks = self._dirblocks
         self._rs.set_path_id(path, new_id)
-        self._dirblocks = self._rs.dirblocks
         self._id_index = None
 
     def set_parent_trees(self, trees, ghosts):
@@ -2397,12 +2259,10 @@ class DirState:
             that is, if the underlying block has had the entry removed, thus
             shrinking in length.
         """
-        self._rs.dirblocks = self._dirblocks
         last_reference = self._rs.make_absent(current_old[0])
         # Sync the (possibly-mutated) dirblocks back out; Rust also
         # updated its own id_index cache, so invalidate Python's
         # view to force a rebuild on next access.
-        self._dirblocks = self._rs.dirblocks
         self._id_index = None
         return last_reference
 
@@ -2440,7 +2300,6 @@ class DirState:
         If packed_stat and fingerprint are not given, they're invalidated in
         the entry.
         """
-        self._rs.dirblocks = self._dirblocks
         self._rs.update_minimal(
             key,
             minikind,
@@ -2451,7 +2310,6 @@ class DirState:
             path_utf8,
             fullscan,
         )
-        self._dirblocks = self._rs.dirblocks
         if self._id_index is not None:
             # Rebuild the cached IdIndex in place so callers holding a
             # reference from a prior _get_id_index() call see the updates.
@@ -2468,18 +2326,14 @@ class DirState:
         This must be called with a lock held.
         """
         self._read_dirblocks_if_needed()
-        self._rs.dirblocks = self._dirblocks
         self._rs.validate()
 
     def _wipe_state(self):
         """Forget all state information about the dirstate."""
         # Rust side wipes header/dirblock state, changes_aborted,
-        # parents, ghosts, dirblocks (now empty on the Rust side),
-        # id_index (on the Rust side), end_of_header, cutoff_time.
+        # parents, ghosts, dirblocks, id_index, end_of_header,
+        # cutoff_time.
         self._rs.wipe_state()
-        # Python still owns these caches and the authoritative
-        # _dirblocks mirror; reset them explicitly until they migrate.
-        self._dirblocks = []
         self._id_index = None
         self._split_path_cache = {}
 

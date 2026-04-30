@@ -1267,12 +1267,15 @@ impl PyDirState {
     /// `inv_entry_to_details`: `(minikind, fingerprint, size,
     /// executable, tree_data)`.
     ///
-    /// The caller is responsible for: running delta.check()/.sort(),
-    /// rejecting ghost parents, calling `discard_merge_parents`,
-    /// setting the parent slot to new_revid (via set_parent_at /
-    /// append_parent), and bootstrapping per-entry tree-1 slots
-    /// when the dirstate had zero parents.
-    fn update_basis_by_delta(&mut self, entries: &Bound<PyAny>) -> PyResult<()> {
+    /// The caller is responsible for pre-sorting and checking the
+    /// delta. Rust handles the rest: discard_merge_parents, ghost
+    /// rejection, new-parent bootstrap, parent[0] replacement,
+    /// delta application, and marking the dirstate modified.
+    fn update_basis_by_delta(
+        &mut self,
+        entries: &Bound<PyAny>,
+        new_revid: Vec<u8>,
+    ) -> PyResult<()> {
         let mut rust_entries: Vec<bazaar::dirstate::FlatBasisDeltaEntry> = Vec::new();
         for item in entries.try_iter()? {
             let tup = item?.cast_into::<PyTuple>()?;
@@ -1311,7 +1314,7 @@ impl PyDirState {
                 details,
             });
         }
-        match self.inner.update_basis_by_delta(rust_entries) {
+        match self.inner.update_basis_by_delta(rust_entries, new_revid) {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.inner.changes_aborted = true;
