@@ -17,12 +17,21 @@
 """File locking for bzrformats.
 
 Uses fcntl.lockf which has per-process semantics: multiple file descriptors
-within the same process can share a lock on the same file.
+within the same process can share a lock on the same file.  Because of that
+semantic we also maintain in-process bookkeeping so callers can detect lock
+contention between lock objects living in the same interpreter (e.g. a
+second DirState opening the same dirstate file read-only while the first
+tries to upgrade to a write lock).
 """
 
 import fcntl
 
 from .errors import LockContention
+
+# Per-filename tallies so we can detect in-process contention that fcntl's
+# per-process semantics would otherwise hide.
+_read_locks: dict[str, int] = {}
+_write_locks: set[str] = set()
 
 
 class ReadLock:
@@ -34,6 +43,8 @@ class ReadLock:
     def __init__(self, filename):
         """Acquire a shared read lock on *filename*."""
         self.filename = filename
+        if filename in _write_locks:
+            raise LockContention(filename)
         self.f = open(filename, "rb")
         try:
             fcntl.lockf(self.f, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -43,11 +54,17 @@ class ReadLock:
         except OSError:
             self.f.close()
             raise
+        _read_locks[filename] = _read_locks.get(filename, 0) + 1
 
     def unlock(self):
         """Release the lock and close the file."""
         fcntl.lockf(self.f, fcntl.LOCK_UN)
         self.f.close()
+        count = _read_locks.get(self.filename, 0)
+        if count <= 1:
+            _read_locks.pop(self.filename, None)
+        else:
+            _read_locks[self.filename] = count - 1
 
     def temporary_write_lock(self):
         """Try to upgrade to a write lock.
@@ -55,8 +72,19 @@ class ReadLock:
         Returns ``(True, write_lock)`` if the upgrade succeeded, or
         ``(False, self)`` if it failed (read lock is re-acquired).
         """
+        # fcntl.lockf has per-process semantics: a write lock in the same
+        # process would happily coexist with an unrelated read lock on the
+        # same file.  Refuse the upgrade whenever another in-process reader
+        # is holding the file, matching legacy breezy behaviour.
+        if _read_locks.get(self.filename, 0) > 1:
+            return False, self
         fcntl.lockf(self.f, fcntl.LOCK_UN)
         self.f.close()
+        count = _read_locks.get(self.filename, 0)
+        if count <= 1:
+            _read_locks.pop(self.filename, None)
+        else:
+            _read_locks[self.filename] = count - 1
         try:
             wl = WriteLock(self.filename)
             return True, wl
@@ -64,6 +92,7 @@ class ReadLock:
             # Re-acquire read lock
             self.f = open(self.filename, "rb")
             fcntl.lockf(self.f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            _read_locks[self.filename] = _read_locks.get(self.filename, 0) + 1
             return False, self
 
 
@@ -77,6 +106,8 @@ class WriteLock:
     def __init__(self, filename):
         """Acquire an exclusive write lock on *filename*."""
         self.filename = filename
+        if filename in _write_locks or _read_locks.get(filename, 0) > 0:
+            raise LockContention(filename)
         try:
             self.f = open(filename, "rb+")
         except FileNotFoundError:
@@ -89,16 +120,19 @@ class WriteLock:
         except OSError:
             self.f.close()
             raise
+        _write_locks.add(filename)
 
     def unlock(self):
         """Release the lock and close the file."""
         fcntl.lockf(self.f, fcntl.LOCK_UN)
         self.f.close()
+        _write_locks.discard(self.filename)
 
     def restore_read_lock(self):
         """Downgrade to a read lock, returning a new :class:`ReadLock`."""
         fcntl.lockf(self.f, fcntl.LOCK_UN)
         self.f.close()
+        _write_locks.discard(self.filename)
         return ReadLock(self.filename)
 
 
