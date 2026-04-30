@@ -5447,3 +5447,489 @@ fn inv_entry_to_details_tree_reference_uses_reference_revision_as_fingerprint() 
     assert!(!executable);
     assert_eq!(tree_data, b"outer".to_vec());
 }
+
+#[test]
+fn fields_per_entry_zero_parents_yields_nine() {
+    // 3 key fields + 5*1 tree_data fields + 1 trailing newline slot.
+    assert_eq!(fields_per_entry(0), 9);
+}
+
+#[test]
+fn fields_per_entry_grows_by_five_per_parent() {
+    assert_eq!(fields_per_entry(1), 14);
+    assert_eq!(fields_per_entry(2), 19);
+    assert_eq!(fields_per_entry(7), 44);
+}
+
+#[test]
+fn get_parents_line_empty() {
+    assert_eq!(get_parents_line(&[]), b"0".to_vec());
+}
+
+#[test]
+fn get_parents_line_single() {
+    let parents: &[&[u8]] = &[b"rev-1"];
+    assert_eq!(get_parents_line(parents), b"1\0rev-1".to_vec());
+}
+
+#[test]
+fn get_parents_line_multiple() {
+    let parents: &[&[u8]] = &[b"rev-1", b"rev-2", b"rev-3"];
+    assert_eq!(
+        get_parents_line(parents),
+        b"3\0rev-1\0rev-2\0rev-3".to_vec()
+    );
+}
+
+#[test]
+fn get_ghosts_line_empty() {
+    assert_eq!(get_ghosts_line(&[]), b"0".to_vec());
+}
+
+#[test]
+fn get_ghosts_line_one() {
+    let ghosts: &[&[u8]] = &[b"ghost-rev"];
+    assert_eq!(get_ghosts_line(ghosts), b"1\0ghost-rev".to_vec());
+}
+
+#[test]
+fn get_output_lines_round_trips_via_read_header() {
+    let parents_bytes = get_parents_line(&[b"parent-rev".as_slice()]);
+    let ghosts_bytes = get_ghosts_line(&[b"ghost-rev".as_slice()]);
+    let chunks = get_output_lines(vec![&parents_bytes, &ghosts_bytes]);
+    let blob: Vec<u8> = chunks.into_iter().flatten().collect();
+    let header = read_header(&blob).expect("round-trip header");
+    assert_eq!(header.parents, vec![b"parent-rev".to_vec()]);
+    assert_eq!(header.ghosts, vec![b"ghost-rev".to_vec()]);
+    // num_entries = lines.len() - 3, and we passed 2 lines so
+    // get_output_lines reports zero entries.
+    assert_eq!(header.num_entries, 0);
+}
+
+#[test]
+fn get_output_lines_emits_format3_banner_first() {
+    let parents = get_parents_line(&[]);
+    let ghosts = get_ghosts_line(&[]);
+    let chunks = get_output_lines(vec![&parents, &ghosts]);
+    assert_eq!(chunks[0], HEADER_FORMAT_3.to_vec());
+    assert!(chunks[1].starts_with(b"crc32: "));
+    assert!(chunks[2].starts_with(b"num_entries: "));
+}
+
+#[test]
+fn kind_minikind_round_trip() {
+    for k in [
+        Kind::Absent,
+        Kind::File,
+        Kind::Directory,
+        Kind::Relocated,
+        Kind::Symlink,
+        Kind::TreeReference,
+    ] {
+        let byte = k.to_minikind();
+        assert_eq!(Kind::from_minikind(byte).unwrap(), k);
+    }
+}
+
+#[test]
+fn kind_minikind_byte_values_match_python() {
+    assert_eq!(Kind::Absent.to_minikind(), b'a');
+    assert_eq!(Kind::File.to_minikind(), b'f');
+    assert_eq!(Kind::Directory.to_minikind(), b'd');
+    assert_eq!(Kind::Relocated.to_minikind(), b'r');
+    assert_eq!(Kind::Symlink.to_minikind(), b'l');
+    assert_eq!(Kind::TreeReference.to_minikind(), b't');
+}
+
+#[test]
+fn kind_from_minikind_rejects_unknown_byte() {
+    assert_eq!(Kind::from_minikind(b'x'), Err(b'x'));
+    assert_eq!(Kind::from_minikind(0), Err(0));
+    assert_eq!(Kind::from_minikind(0xFF), Err(0xFF));
+}
+
+#[test]
+fn kind_to_char_matches_minikind() {
+    assert_eq!(Kind::File.to_char(), 'f');
+    assert_eq!(Kind::Directory.to_char(), 'd');
+    assert_eq!(Kind::Symlink.to_char(), 'l');
+    assert_eq!(Kind::TreeReference.to_char(), 't');
+    assert_eq!(Kind::Absent.to_char(), 'a');
+    assert_eq!(Kind::Relocated.to_char(), 'r');
+}
+
+#[test]
+fn kind_as_str_and_display_match() {
+    let cases = [
+        (Kind::Absent, "absent"),
+        (Kind::File, "file"),
+        (Kind::Directory, "directory"),
+        (Kind::Relocated, "relocated"),
+        (Kind::Symlink, "symlink"),
+        (Kind::TreeReference, "tree-reference"),
+    ];
+    for (kind, name) in cases {
+        assert_eq!(kind.as_str(), name);
+        assert_eq!(format!("{}", kind), name);
+    }
+}
+
+#[test]
+fn kind_is_fdlt_excludes_absent_and_relocated() {
+    assert!(Kind::File.is_fdlt());
+    assert!(Kind::Directory.is_fdlt());
+    assert!(Kind::Symlink.is_fdlt());
+    assert!(Kind::TreeReference.is_fdlt());
+    assert!(!Kind::Absent.is_fdlt());
+    assert!(!Kind::Relocated.is_fdlt());
+}
+
+#[test]
+fn kind_is_fdltr_excludes_only_absent() {
+    assert!(Kind::File.is_fdltr());
+    assert!(Kind::Directory.is_fdltr());
+    assert!(Kind::Symlink.is_fdltr());
+    assert!(Kind::TreeReference.is_fdltr());
+    assert!(Kind::Relocated.is_fdltr());
+    assert!(!Kind::Absent.is_fdltr());
+}
+
+#[test]
+fn kind_is_absent_or_relocated_only_those_two() {
+    assert!(Kind::Absent.is_absent_or_relocated());
+    assert!(Kind::Relocated.is_absent_or_relocated());
+    assert!(!Kind::File.is_absent_or_relocated());
+    assert!(!Kind::Directory.is_absent_or_relocated());
+    assert!(!Kind::Symlink.is_absent_or_relocated());
+    assert!(!Kind::TreeReference.is_absent_or_relocated());
+}
+
+#[test]
+fn kind_to_osutils_kind_maps_real_kinds() {
+    assert_eq!(Kind::File.to_osutils_kind(), Some(osutils::Kind::File));
+    assert_eq!(
+        Kind::Directory.to_osutils_kind(),
+        Some(osutils::Kind::Directory)
+    );
+    assert_eq!(
+        Kind::Symlink.to_osutils_kind(),
+        Some(osutils::Kind::Symlink)
+    );
+    assert_eq!(
+        Kind::TreeReference.to_osutils_kind(),
+        Some(osutils::Kind::TreeReference)
+    );
+    assert_eq!(Kind::Absent.to_osutils_kind(), None);
+    assert_eq!(Kind::Relocated.to_osutils_kind(), None);
+}
+
+#[test]
+fn kind_from_osutils_kind_maps_all_four() {
+    assert_eq!(Kind::from(osutils::Kind::File), Kind::File);
+    assert_eq!(Kind::from(osutils::Kind::Directory), Kind::Directory);
+    assert_eq!(Kind::from(osutils::Kind::Symlink), Kind::Symlink);
+    assert_eq!(
+        Kind::from(osutils::Kind::TreeReference),
+        Kind::TreeReference
+    );
+}
+
+#[test]
+fn option_kind_is_live_only_for_real_kinds() {
+    assert!(Some(Kind::File).is_live());
+    assert!(Some(Kind::Directory).is_live());
+    assert!(Some(Kind::Symlink).is_live());
+    assert!(Some(Kind::TreeReference).is_live());
+    assert!(!Some(Kind::Absent).is_live());
+    assert!(!Some(Kind::Relocated).is_live());
+    let none: Option<Kind> = None;
+    assert!(!none.is_live());
+}
+
+#[test]
+fn option_kind_is_not_live_is_complement_of_is_live() {
+    for k in [
+        Some(Kind::File),
+        Some(Kind::Directory),
+        Some(Kind::Symlink),
+        Some(Kind::TreeReference),
+        Some(Kind::Absent),
+        Some(Kind::Relocated),
+        None,
+    ] {
+        assert_eq!(k.is_live(), !k.is_not_live());
+    }
+}
+
+fn run_iter_changes(
+    state: &mut DirState,
+    transport: &dyn Transport,
+    want_unversioned: bool,
+    include_unchanged: bool,
+    search_specific_files: std::collections::HashSet<Vec<u8>>,
+) -> Vec<DirstateChange> {
+    let mut pstate = ProcessEntryState {
+        source_index: None,
+        target_index: 0,
+        include_unchanged,
+        want_unversioned,
+        partial: search_specific_files.iter().any(|p| !p.is_empty()),
+        supports_tree_reference: false,
+        root_abspath: Vec::new(),
+        searched_specific_files: std::collections::HashSet::new(),
+        search_specific_files,
+        search_specific_file_parents: std::collections::HashSet::new(),
+        searched_exact_paths: std::collections::HashSet::new(),
+        seen_ids: std::collections::HashSet::new(),
+        new_dirname_to_file_id: std::collections::HashMap::new(),
+        old_dirname_to_file_id: std::collections::HashMap::new(),
+        last_source_parent: None,
+        last_target_parent: None,
+    };
+    let mut iter = IterChangesIter::new();
+    let mut out = Vec::new();
+    while let Some(change) = state
+        .iter_changes_next(&mut iter, &mut pstate, transport)
+        .unwrap()
+    {
+        out.push(change);
+    }
+    out
+}
+
+fn dir_stat() -> StatInfo {
+    StatInfo {
+        mode: 0o040755,
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        dev: 1,
+        ino: 1,
+    }
+}
+
+fn file_stat(size: u64, ino: u64) -> StatInfo {
+    StatInfo {
+        mode: 0o100644,
+        size,
+        mtime: 0,
+        ctime: 0,
+        dev: 1,
+        ino,
+    }
+}
+
+fn versioned_file_row(
+    state: &mut DirState,
+    basename: &[u8],
+    file_id: &[u8],
+    on_disk_stat: &StatInfo,
+    fingerprint: &[u8],
+) {
+    let packed_stat = pack_stat(
+        on_disk_stat.size,
+        on_disk_stat.mtime as u64,
+        on_disk_stat.ctime as u64,
+        on_disk_stat.dev,
+        on_disk_stat.ino,
+        on_disk_stat.mode,
+    )
+    .into_bytes();
+    state
+        .add(
+            basename,
+            b"",
+            basename,
+            file_id,
+            osutils::Kind::File,
+            on_disk_stat.size,
+            &packed_stat,
+            fingerprint,
+        )
+        .expect("add versioned row");
+}
+
+// `run_iter_changes` runs the iterator with `source_index=None`,
+// which compares each entry against a synthetic empty source — so
+// every versioned row is reported as "added" rather than "unchanged".
+// These tests pin the structural emissions (root entry, unversioned
+// gating, scoping) and rely on `iter_changes_next_emits_unversioned_files`
+// for the simpler unversioned-emission case.
+
+#[test]
+fn iter_changes_empty_state_empty_fs_yields_only_root() {
+    let mut t = MemoryTransport::new();
+    t.set_fs(b"", dir_stat(), None);
+    let mut state = add_fixture();
+    let changes = run_iter_changes(
+        &mut state,
+        &t,
+        false,
+        false,
+        std::collections::HashSet::from([Vec::new()]),
+    );
+    assert_eq!(
+        changes.len(),
+        1,
+        "expected only the root; got {:?}",
+        changes
+    );
+    assert_eq!(changes[0].file_id, b"TREE_ROOT".to_vec());
+    assert!(changes[0].new_versioned);
+}
+
+#[test]
+fn iter_changes_unversioned_file_suppressed_when_want_unversioned_false() {
+    let mut t = MemoryTransport::new();
+    t.set_fs(b"", dir_stat(), None);
+    t.set_fs(b"unv", file_stat(3, 2), None);
+    let mut state = add_fixture();
+    let changes = run_iter_changes(
+        &mut state,
+        &t,
+        false,
+        false,
+        std::collections::HashSet::from([Vec::new()]),
+    );
+    assert!(
+        !changes.iter().any(|c| !c.new_versioned),
+        "want_unversioned=false should suppress unversioned entries; got {:?}",
+        changes
+    );
+    // Only the root TREE_ROOT survives.
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].file_id, b"TREE_ROOT".to_vec());
+}
+
+#[test]
+fn iter_changes_unversioned_file_emitted_when_want_unversioned_true() {
+    // Regression-pinning variant of iter_changes_next_emits_unversioned_files
+    // that asserts the *exact* shape rather than just presence.
+    let mut t = MemoryTransport::new();
+    t.set_fs(b"", dir_stat(), None);
+    t.set_fs(b"unv", file_stat(3, 2), None);
+    let mut state = add_fixture();
+    let changes = run_iter_changes(
+        &mut state,
+        &t,
+        true,
+        false,
+        std::collections::HashSet::from([Vec::new()]),
+    );
+    let unversioned: Vec<_> = changes.iter().filter(|c| !c.new_versioned).collect();
+    assert_eq!(
+        unversioned.len(),
+        1,
+        "expected one unversioned change; got {:?}",
+        changes
+    );
+    assert_eq!(unversioned[0].new_path.as_deref(), Some(b"unv" as &[u8]));
+    assert!(unversioned[0].file_id.is_empty());
+}
+
+#[test]
+fn iter_changes_versioned_file_present_emits_added_entry() {
+    let mut t = MemoryTransport::new();
+    let f_stat = file_stat(5, 2);
+    t.set_fs(b"", dir_stat(), None);
+    t.set_fs(b"a", f_stat, None);
+
+    let mut state = add_fixture();
+    versioned_file_row(&mut state, b"a", b"fid-a", &f_stat, b"sha1");
+
+    let changes = run_iter_changes(
+        &mut state,
+        &t,
+        false,
+        false,
+        std::collections::HashSet::from([Vec::new()]),
+    );
+    let entry = changes
+        .iter()
+        .find(|c| c.file_id == b"fid-a")
+        .unwrap_or_else(|| panic!("expected fid-a change; got {:?}", changes));
+    assert_eq!(entry.new_path.as_deref(), Some(b"a" as &[u8]));
+    assert!(entry.new_versioned);
+    // source_index=None means there is no source path.
+    assert!(entry.old_path.is_none());
+    assert!(!entry.old_versioned);
+}
+
+#[test]
+fn iter_changes_versioned_file_missing_on_disk_still_emits_entry() {
+    let mut t = MemoryTransport::new();
+    t.set_fs(b"", dir_stat(), None);
+    // `a` is intentionally absent from the in-memory fs — it's
+    // versioned but disappeared.
+
+    let saved_stat = file_stat(5, 99);
+    let mut state = add_fixture();
+    versioned_file_row(&mut state, b"a", b"fid-a", &saved_stat, b"sha1");
+
+    let changes = run_iter_changes(
+        &mut state,
+        &t,
+        false,
+        false,
+        std::collections::HashSet::from([Vec::new()]),
+    );
+    let entry = changes
+        .iter()
+        .find(|c| c.file_id == b"fid-a")
+        .unwrap_or_else(|| panic!("expected fid-a in changes; got {:?}", changes));
+    // target row is still versioned (it's in dirstate); on-disk
+    // absence shows up as `target_kind == None` because path_info
+    // was None.
+    assert!(entry.new_versioned);
+    assert!(entry.target_kind.is_none());
+}
+
+#[test]
+fn iter_changes_specific_file_scope_skips_siblings() {
+    let mut t = MemoryTransport::new();
+    t.set_fs(b"", dir_stat(), None);
+    t.set_fs(b"a", file_stat(5, 2), None);
+    t.set_fs(b"b", file_stat(99, 3), None);
+
+    let saved = file_stat(5, 2);
+    let mut state = add_fixture();
+    versioned_file_row(&mut state, b"a", b"fid-a", &saved, b"sha1-a");
+    versioned_file_row(&mut state, b"b", b"fid-b", &saved, b"sha1-b");
+
+    let changes = run_iter_changes(
+        &mut state,
+        &t,
+        false,
+        false,
+        std::collections::HashSet::from([b"a".to_vec()]),
+    );
+    assert!(
+        !changes.iter().any(|c| c.file_id == b"fid-b"),
+        "scope b\"a\" should not report b\"b\"; got {:?}",
+        changes
+    );
+    assert!(
+        changes.iter().any(|c| c.file_id == b"fid-a"),
+        "expected fid-a to be included in scope; got {:?}",
+        changes
+    );
+}
+
+#[test]
+fn iter_changes_specific_file_scope_with_unknown_path_yields_nothing() {
+    // Scope to a path that exists neither on disk nor in the
+    // dirstate; PickRoot should skip the empty entry list +
+    // missing path_info combination and the iterator should
+    // terminate without emitting changes.
+    let mut t = MemoryTransport::new();
+    t.set_fs(b"", dir_stat(), None);
+    let mut state = add_fixture();
+    let changes = run_iter_changes(
+        &mut state,
+        &t,
+        false,
+        false,
+        std::collections::HashSet::from([b"missing".to_vec()]),
+    );
+    assert!(changes.is_empty(), "expected no changes; got {:?}", changes);
+}
