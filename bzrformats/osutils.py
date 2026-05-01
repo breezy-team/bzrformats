@@ -24,6 +24,11 @@ import sys
 import unicodedata
 
 
+def isdir(path):
+    """Return True if the given path exists and is a directory."""
+    return os.path.isdir(path)
+
+
 def split(path):
     """Split a pathname into directory and basename parts."""
     if isinstance(path, bytes):

@@ -17,6 +17,25 @@
 """Errors specific to bzrformats."""
 
 
+def _coerce_bytes(value):
+    """Recursively convert ``bytes`` to ``str`` inside formatting
+    arguments so ``fmt % d`` and ``repr(...)`` never produce a bytes
+    string in error messages.
+
+    Uses ``repr()`` (which produces a ``b'...'`` literal) so the
+    underlying byte sequence is reversible — a previous version
+    used ``decode("utf-8", "replace")`` which silently mojibaked
+    binary payloads (file_ids, sha1 digests).
+    """
+    if isinstance(value, bytes):
+        return repr(value)
+    if isinstance(value, tuple):
+        return tuple(_coerce_bytes(item) for item in value)
+    if isinstance(value, list):
+        return [_coerce_bytes(item) for item in value]
+    return value
+
+
 class BzrFormatsError(Exception):
     """Base class for errors raised by bzrformats.
 
@@ -67,25 +86,25 @@ class BzrFormatsError(Exception):
         s = getattr(self, "_preformatted_string", None)
         if s is not None:
             # Contains a preformatted message.  Some callers pass
-            # bytes here (e.g. a raw revision id) or a tuple (e.g.
-            # a versionedfile key) — coerce so __str__ always
-            # returns str.
+            # bytes (e.g. a raw revision id) or a tuple of bytes
+            # (e.g. a versionedfile key) — coerce those documented
+            # offenders so __str__ always returns str, and let any
+            # other non-str type bubble up as a TypeError so a
+            # genuinely broken caller still surfaces.
             if isinstance(s, bytes):
-                return s.decode("utf-8", "replace")
-            if not isinstance(s, str):
                 return repr(s)
+            if isinstance(s, tuple):
+                return repr(_coerce_bytes(s))
             return s
         err = None
         try:
             fmt = self._get_format_string()
             if fmt:
-                # Coerce any bytes values to str so that `fmt % d`
-                # never produces a bytes string — __str__ must
-                # return `str`.
-                d = {
-                    k: (v.decode("utf-8", "replace") if isinstance(v, bytes) else v)
-                    for k, v in self.__dict__.items()
-                }
+                # Coerce any bytes values (and bytes nested inside
+                # tuples — versionedfile keys are tuples of bytes) to
+                # str so ``fmt % d`` never produces a bytes string;
+                # __str__ must return str.
+                d = {k: _coerce_bytes(v) for k, v in self.__dict__.items()}
                 return fmt % d
         except Exception as e:
             err = e
@@ -180,18 +199,6 @@ class KnitHeaderError(BzrFormatsError):
         """Initialize with the bad header line."""
         super().__init__()
         self.badline = badline
-
-
-class DirstateCorrupt(BzrFormatsError):
-    """The dirstate file appears to be corrupt."""
-
-    _fmt = "The dirstate file (%(state)s) appears to be corrupt: %(msg)s"
-
-    def __init__(self, state, msg):
-        """Initialize with the state file path and corruption message."""
-        super().__init__()
-        self.state = state
-        self.msg = msg
 
 
 # Index errors

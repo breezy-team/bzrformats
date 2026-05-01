@@ -12,7 +12,7 @@ mod sha1;
 pub use sha1::{DefaultSHA1Provider, SHA1Provider};
 
 mod pack_stat;
-pub use pack_stat::{pack_stat, pack_stat_metadata, stat_to_minikind};
+pub use pack_stat::{pack_stat, pack_stat_metadata, stat_to_kind};
 
 mod path;
 pub use path::{bisect_path_left, bisect_path_right, lt_by_dirs, lt_path_by_dirblock};
@@ -33,10 +33,10 @@ mod id_index;
 pub use id_index::{inv_entry_to_details, IdIndex};
 
 mod iter_changes;
+use iter_changes::IterPhase;
 pub use iter_changes::{
     DirstateChange, IterChangesIter, ProcessEntryError, ProcessEntryState, ProcessPathInfo,
 };
-use iter_changes::IterPhase;
 
 fn null_parent_details() -> TreeData {
     TreeData {
@@ -185,11 +185,11 @@ fn compute_path_info(
     pstate: &ProcessEntryState,
     transport: &dyn Transport,
     path_utf8: &[u8],
-) -> Option<ProcessPathInfo> {
+) -> Result<Option<ProcessPathInfo>, ProcessEntryError> {
     let abspath = join_path(&pstate.root_abspath, path_utf8);
     let stat = match transport.lstat(&abspath) {
         Ok(s) => s,
-        Err(_) => return None,
+        Err(_) => return Ok(None),
     };
     let mut kind = if stat.is_file() {
         Some(osutils::Kind::File)
@@ -200,17 +200,28 @@ fn compute_path_info(
     } else {
         None
     };
+    // The tree root itself is never a tree-reference (mirrors Python's
+    // `_directory_may_be_tree_reference`: `return relpath and ...`).
     if kind == Some(osutils::Kind::Directory)
         && pstate.supports_tree_reference
-        && transport.is_tree_reference_dir(&abspath).unwrap_or(false)
+        && !path_utf8.is_empty()
     {
-        kind = Some(osutils::Kind::TreeReference);
+        let is_ref = transport.is_tree_reference_dir(&abspath).map_err(|e| {
+            ProcessEntryError::Internal(format!(
+                "is_tree_reference_dir({}): {}",
+                String::from_utf8_lossy(&abspath),
+                e
+            ))
+        })?;
+        if is_ref {
+            kind = Some(osutils::Kind::TreeReference);
+        }
     }
-    Some(ProcessPathInfo {
+    Ok(Some(ProcessPathInfo {
         abspath,
         kind,
         stat,
-    })
+    }))
 }
 
 /// Update `seen_ids` + `search_specific_file_parents` from a
@@ -237,43 +248,8 @@ fn gather_result_for_consistency(pstate: &mut ProcessEntryState, change: &Dirsta
 mod transport;
 pub use transport::{DirEntryInfo, StatInfo, Transport, TransportError};
 
-/// Single-file backing store for a [`DirState`].
-///
-/// Unlike `bazaar::transport::Transport` (the knit-side path-keyed byte
-/// store), a dirstate transport represents exactly one file held open
-/// across a lock. Operations:
-///
-/// * [`Transport::exists`] — whether the backing file exists. Used by
-///   `on_file` to decide whether to create a fresh dirstate.
-/// * [`Transport::lock_read`] / [`Transport::lock_write`] — acquire
-///   a lock on the backing file. Explicit rather than RAII; the
-///   caller must pair each lock with an `unlock`. Re-locking while
-///   already locked returns `AlreadyLocked`.
-/// * [`Transport::unlock`] — release the current lock. No-op on the
-///   lock side if the underlying store doesn't need lock objects, but
-///   the trait still expects the state transition.
-/// * [`Transport::lock_state`] — observe the current lock state.
-/// * [`Transport::read_all`] — return the full file contents. Requires
-///   a read or write lock. The returned bytes are owned; callers parse
-///   in memory (no streaming `readline` — the pure-Rust `read_header`
-///   operates on a byte slice).
-/// * [`Transport::write_all`] — replace the full file contents,
-///   truncating any trailing bytes from the previous version. Requires
-///   a write lock. Implementations are expected to flush before
-///   returning, but are not required to fdatasync — call
-///   [`Transport::fdatasync`] for that.
-/// * [`Transport::fdatasync`] — force the current contents to durable
-///   storage. Optional no-op for stores where fsync has no meaning
-///   (e.g. in-memory tests); the trait method exists so `DirState.save`
-///   can call it unconditionally.
-///
-/// The `&mut self` receivers are deliberate: every operation either
-/// mutates the lock state, the file contents, or both. Callers that
-/// need shared access should wrap an implementation in their own
-/// synchronisation primitive.
 mod walker;
 pub use walker::{WalkDirsUtf8, WalkedDir};
-
 
 mod parser;
 pub use parser::{dirblocks_to_entry_lines, entry_to_line, parse_dirblocks, DirblocksError};
@@ -635,6 +611,27 @@ impl DirState {
             .map(|t| t.minikind)
     }
 
+    /// Compute and cache the SHA cutoff time: the boundary mtime/ctime
+    /// such that files newer than this are considered "racy" and skip
+    /// the cached-sha optimisation.  Mirrors Python's
+    /// `DirState._sha_cutoff_time`: returns `now - 3` and stores it on
+    /// the instance so subsequent calls (within the same lock window)
+    /// reuse the same value rather than re-reading the wall clock.
+    ///
+    /// The 3-second window is the legacy bzr value, picked so that
+    /// stats made within a typical filesystem timestamp resolution
+    /// of "now" are not trusted.
+    pub fn compute_sha_cutoff_time(&mut self) -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_secs: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let c = now_secs - 3;
+        self.cutoff_time = Some(c);
+        c
+    }
+
     /// Record an observed sha1 for `key`'s tree-0 row when the file's
     /// stat falls in the cacheable window.  Mirrors Python's
     /// `DirState._observed_sha1`: silently ignores non-file kinds and
@@ -662,22 +659,14 @@ impl DirState {
         st_dev: u64,
         st_ino: u64,
     ) -> Result<Option<TreeData>, UpdateEntryError> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         // S_IFREG (0o100000) after masking with S_IFMT.
         if (st_mode & 0o170000) != 0o100000 {
             return Ok(None);
         }
 
-        let now_secs: i64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let cutoff: i64 = self.cutoff_time.unwrap_or_else(|| {
-            let c = now_secs - 3;
-            self.cutoff_time = Some(c);
-            c
-        });
+        let cutoff: i64 = self
+            .cutoff_time
+            .unwrap_or_else(|| self.compute_sha_cutoff_time());
 
         if st_mtime >= cutoff || st_ctime >= cutoff {
             return Ok(None);
@@ -833,9 +822,17 @@ impl DirState {
             }
 
             let (content_change, target_kind, target_exec) = if let Some(info) = path_info {
-                // Python defaults to `"file"` when the walker didn't
-                // supply a kind; preserve that (`None` → File).
-                let target_kind = info.kind.unwrap_or(osutils::Kind::File);
+                // Walker reports `kind = None` for fifo / socket /
+                // block / char device — kinds dirstate can't track
+                // and that we must not try to sha1 (opening a fifo
+                // for reading blocks).  Surface
+                // `BadFileKindError` to callers; mirrors how the
+                // original Python dirstate fails out via
+                // `entry_factory[kind]` lookup.
+                let target_kind = info.kind.ok_or_else(|| ProcessEntryError::BadFileKind {
+                    path: info.abspath.clone(),
+                    mode: info.stat.mode,
+                })?;
                 match target_kind {
                     osutils::Kind::Directory => {
                         if path.is_none() {
@@ -1151,30 +1148,43 @@ impl DirState {
                             )))
                         }
                     };
-                    let root_path_info = root_stat.map(|stat| {
-                        let mut kind = if stat.is_file() {
-                            Some(osutils::Kind::File)
-                        } else if stat.is_dir() {
-                            Some(osutils::Kind::Directory)
-                        } else if stat.is_symlink() {
-                            Some(osutils::Kind::Symlink)
-                        } else {
-                            None
-                        };
-                        if kind == Some(osutils::Kind::Directory)
-                            && pstate.supports_tree_reference
-                            && transport
-                                .is_tree_reference_dir(&root_abspath)
-                                .unwrap_or(false)
-                        {
-                            kind = Some(osutils::Kind::TreeReference);
+                    let root_path_info = match root_stat {
+                        None => None,
+                        Some(stat) => {
+                            let mut kind = if stat.is_file() {
+                                Some(osutils::Kind::File)
+                            } else if stat.is_dir() {
+                                Some(osutils::Kind::Directory)
+                            } else if stat.is_symlink() {
+                                Some(osutils::Kind::Symlink)
+                            } else {
+                                None
+                            };
+                            // The tree root itself is never a tree-reference.
+                            if kind == Some(osutils::Kind::Directory)
+                                && pstate.supports_tree_reference
+                                && !current_root.is_empty()
+                            {
+                                let is_ref = transport
+                                    .is_tree_reference_dir(&root_abspath)
+                                    .map_err(|e| {
+                                        ProcessEntryError::Internal(format!(
+                                            "is_tree_reference_dir({}): {}",
+                                            String::from_utf8_lossy(&root_abspath),
+                                            e
+                                        ))
+                                    })?;
+                                if is_ref {
+                                    kind = Some(osutils::Kind::TreeReference);
+                                }
+                            }
+                            Some(ProcessPathInfo {
+                                abspath: root_abspath.clone(),
+                                kind,
+                                stat,
+                            })
                         }
-                        ProcessPathInfo {
-                            abspath: root_abspath.clone(),
-                            kind,
-                            stat,
-                        }
-                    });
+                    };
 
                     let root_entries_owned: Vec<(EntryKey, Vec<TreeData>)> = self
                         .entries_for_path(&current_root)
@@ -1232,29 +1242,51 @@ impl DirState {
                         }
                     }
 
-                    // Stop here if the root is a tree-reference or
-                    // absent on disk — we don't descend into it.
-                    let skip_walk = root_path_info
+                    // Decide whether to seed the on-disk walker.  We
+                    // only walk the filesystem when the root exists on
+                    // disk and is a plain directory; tree-references,
+                    // regular files, symlinks, and missing paths all
+                    // skip the walker.  Mirrors Python's catching of
+                    // `ENOENT/ENOTDIR/EINVAL` from the first
+                    // `_walkdirs_utf8` step.
+                    //
+                    // The dirblock side of the walk still runs even if
+                    // the disk side is absent: a deleted directory
+                    // whose children remain in the source dirblocks
+                    // (e.g. ``specific_files=["b"]`` when ``b`` and
+                    // ``b/c`` were both removed) needs them reported.
+                    let walk_disk = root_path_info
                         .as_ref()
-                        .map(|p| p.kind == Some(osutils::Kind::TreeReference))
-                        .unwrap_or(true);
-                    if skip_walk {
-                        iter.phase = IterPhase::PickRoot;
-                        continue;
-                    }
-
-                    // Seed the subtree walker.
-                    iter.walker = Some(WalkDirsUtf8::new(&root_abspath, &current_root));
+                        .map(|p| p.kind == Some(osutils::Kind::Directory))
+                        .unwrap_or(false);
                     let initial_key = EntryKey {
                         dirname: current_root.clone(),
                         basename: Vec::new(),
                         file_id: Vec::new(),
                     };
-                    let (mut bi, _) = find_block_index_from_key(&self.dirblocks, &initial_key);
-                    if bi == 0 {
-                        bi = 1;
+                    let (mut bi_check, _) =
+                        find_block_index_from_key(&self.dirblocks, &initial_key);
+                    if bi_check == 0 {
+                        bi_check = 1;
                     }
-                    iter.block_index = bi;
+                    let has_dirblocks = self
+                        .dirblocks
+                        .get(bi_check)
+                        .map(|b| is_inside(&current_root, &b.dirname))
+                        .unwrap_or(false);
+                    if !walk_disk && !has_dirblocks {
+                        iter.phase = IterPhase::PickRoot;
+                        continue;
+                    }
+
+                    // Seed the subtree walker (disk-side only when
+                    // the root actually exists as a directory).
+                    iter.walker = if walk_disk {
+                        Some(WalkDirsUtf8::new(&root_abspath, &current_root))
+                    } else {
+                        None
+                    };
+                    iter.block_index = bi_check;
                     iter.staged_walker_block = None;
                     iter.merge_entry_index = 0;
                     iter.merge_path_index = 0;
@@ -1293,11 +1325,16 @@ impl DirState {
             .0
             .clone();
 
-        // Pull the next walker block if we haven't cached one.
-        if iter.staged_walker_block.is_none() {
+        // Pull the next walker block if we haven't cached one. The
+        // walker is only seeded when the root exists on disk; for a
+        // pure dirblock-only walk (e.g. a deleted specific-file dir
+        // whose source-side children still need reporting) `walker`
+        // is `None` and `staged_walker_block` stays `None`.
+        if iter.staged_walker_block.is_none() && iter.walker.is_some() {
             let walker = iter.walker.as_mut().expect("walker initialised");
             let mut captured: Option<(Vec<u8>, Vec<u8>, Vec<DirEntryInfo>)> = None;
             let supports_ref = pstate.supports_tree_reference;
+            let mut tref_err: Option<(Vec<u8>, TransportError)> = None;
             let progressed = walker
                 .next_dir(transport, |rel, abs, entries| {
                     if rel.is_empty() {
@@ -1305,16 +1342,30 @@ impl DirState {
                     }
                     if supports_ref {
                         for e in entries.iter_mut() {
-                            if e.kind == Some(osutils::Kind::Directory)
-                                && transport.is_tree_reference_dir(&e.abspath).unwrap_or(false)
-                            {
-                                e.kind = Some(osutils::Kind::TreeReference);
+                            if e.kind != Some(osutils::Kind::Directory) {
+                                continue;
+                            }
+                            match transport.is_tree_reference_dir(&e.abspath) {
+                                Ok(true) => e.kind = Some(osutils::Kind::TreeReference),
+                                Ok(false) => {}
+                                Err(err) => {
+                                    if tref_err.is_none() {
+                                        tref_err = Some((e.abspath.clone(), err));
+                                    }
+                                }
                             }
                         }
                     }
                     captured = Some((rel.to_vec(), abs.to_vec(), entries.clone()));
                 })
                 .map_err(|e| ProcessEntryError::Internal(format!("walkdirs: {}", e)))?;
+            if let Some((path, err)) = tref_err {
+                return Err(ProcessEntryError::Internal(format!(
+                    "is_tree_reference_dir({}): {}",
+                    String::from_utf8_lossy(&path),
+                    err
+                )));
+            }
             iter.staged_walker_block = if progressed { captured } else { None };
         }
 
@@ -1381,7 +1432,10 @@ impl DirState {
                     // Dirstate knows about a block the walker didn't
                     // visit (directory removed from disk).  Emit
                     // removals for every live entry.
-                    let (_, block_entries) = block_info.unwrap();
+                    let block_entries: Vec<_> = block_info
+                        .as_ref()
+                        .map(|(_, e)| e.clone())
+                        .unwrap_or_default();
                     for entry in &block_entries {
                         let (change, changed) =
                             self.process_entry(pstate, &entry.key, &entry.trees, None, transport)?;
@@ -1430,74 +1484,16 @@ impl DirState {
         let mut walker_local = walker_entries.clone();
         loop {
             let current_entry = block_entries.get(entry_index).cloned();
-            let current_path_info = if path_index < walker_local.len() {
-                Some(walker_local[path_index].clone())
-            } else {
-                None
-            };
-            if current_entry.is_none() && current_path_info.is_none() {
-                break;
-            }
-            if current_entry.is_none() {
-                // handled by want_unversioned below
-            } else if current_path_info.is_none() {
-                let ce = current_entry.as_ref().unwrap();
-                let (change, changed) =
-                    self.process_entry(pstate, &ce.key, &ce.trees, None, transport)?;
-                if changed.is_some() {
-                    if changed == Some(true) {
-                        if let Some(ref c) = change {
-                            gather_result_for_consistency(pstate, c);
-                        }
-                    }
-                    if changed == Some(true) || pstate.include_unchanged {
-                        if let Some(c) = change {
-                            iter.pending.push_back(c);
-                        }
-                    }
+            let current_path_info = walker_local.get(path_index).cloned();
+            match (&current_entry, &current_path_info) {
+                (None, None) => break,
+                (None, _) => {
+                    // handled by want_unversioned below
                 }
-            } else {
-                let ce = current_entry.as_ref().unwrap();
-                let pi = current_path_info.as_ref().unwrap();
-                let target0 = ce.trees.get(pstate.target_index).map(|t| t.minikind);
-                let mismatch = ce.key.basename != pi.basename
-                    || matches!(target0, Some(Kind::Absent) | Some(Kind::Relocated));
-                if mismatch {
-                    if pi.basename.as_slice() < ce.key.basename.as_slice() {
-                        advance_entry = false;
-                    } else {
-                        let path_info_absent: Option<&ProcessPathInfo> = None;
-                        let (change, changed) = self.process_entry(
-                            pstate,
-                            &ce.key,
-                            &ce.trees,
-                            path_info_absent,
-                            transport,
-                        )?;
-                        if changed.is_some() {
-                            if changed == Some(true) {
-                                if let Some(ref c) = change {
-                                    gather_result_for_consistency(pstate, c);
-                                }
-                            }
-                            if changed == Some(true) || pstate.include_unchanged {
-                                if let Some(c) = change {
-                                    iter.pending.push_back(c);
-                                }
-                            }
-                        }
-                        advance_path = false;
-                    }
-                } else {
-                    let pi_rs = ProcessPathInfo {
-                        abspath: pi.abspath.clone(),
-                        kind: pi.kind,
-                        stat: pi.stat,
-                    };
+                (Some(ce), None) => {
                     let (change, changed) =
-                        self.process_entry(pstate, &ce.key, &ce.trees, Some(&pi_rs), transport)?;
+                        self.process_entry(pstate, &ce.key, &ce.trees, None, transport)?;
                     if changed.is_some() {
-                        path_handled = true;
                         if changed == Some(true) {
                             if let Some(ref c) = change {
                                 gather_result_for_consistency(pstate, c);
@@ -1510,6 +1506,64 @@ impl DirState {
                         }
                     }
                 }
+                (Some(ce), Some(pi)) => {
+                    let target0 = ce.trees.get(pstate.target_index).map(|t| t.minikind);
+                    let mismatch = ce.key.basename != pi.basename
+                        || matches!(target0, Some(Kind::Absent) | Some(Kind::Relocated));
+                    if mismatch {
+                        if pi.basename.as_slice() < ce.key.basename.as_slice() {
+                            advance_entry = false;
+                        } else {
+                            let path_info_absent: Option<&ProcessPathInfo> = None;
+                            let (change, changed) = self.process_entry(
+                                pstate,
+                                &ce.key,
+                                &ce.trees,
+                                path_info_absent,
+                                transport,
+                            )?;
+                            if changed.is_some() {
+                                if changed == Some(true) {
+                                    if let Some(ref c) = change {
+                                        gather_result_for_consistency(pstate, c);
+                                    }
+                                }
+                                if changed == Some(true) || pstate.include_unchanged {
+                                    if let Some(c) = change {
+                                        iter.pending.push_back(c);
+                                    }
+                                }
+                            }
+                            advance_path = false;
+                        }
+                    } else {
+                        let pi_rs = ProcessPathInfo {
+                            abspath: pi.abspath.clone(),
+                            kind: pi.kind,
+                            stat: pi.stat,
+                        };
+                        let (change, changed) = self.process_entry(
+                            pstate,
+                            &ce.key,
+                            &ce.trees,
+                            Some(&pi_rs),
+                            transport,
+                        )?;
+                        if changed.is_some() {
+                            path_handled = true;
+                            if changed == Some(true) {
+                                if let Some(ref c) = change {
+                                    gather_result_for_consistency(pstate, c);
+                                }
+                            }
+                            if changed == Some(true) || pstate.include_unchanged {
+                                if let Some(c) = change {
+                                    iter.pending.push_back(c);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             if advance_entry && current_entry.is_some() {
@@ -1517,11 +1571,11 @@ impl DirState {
             } else {
                 advance_entry = true;
             }
-            if advance_path && current_path_info.is_some() {
+            if let (true, Some(pi)) = (advance_path, current_path_info.as_ref()) {
                 if !path_handled {
                     if pstate.want_unversioned {
-                        let pi = current_path_info.as_ref().unwrap();
-                        let new_executable = pi.stat.is_file() && (pi.stat.mode & 0o100) != 0;
+                        let new_executable =
+                            pi.stat.is_file() && (pi.stat.mode & 0o100) != 0;
                         let path = if walker_rel.is_empty() {
                             pi.basename.clone()
                         } else {
@@ -1547,7 +1601,6 @@ impl DirState {
                             target_exec: Some(new_executable),
                         });
                     }
-                    let pi = current_path_info.as_ref().unwrap();
                     if pi.kind == Some(osutils::Kind::Directory) {
                         let child_rel = if walker_rel.is_empty() {
                             pi.basename.clone()
@@ -1562,7 +1615,6 @@ impl DirState {
                         }
                     }
                 }
-                let pi = current_path_info.as_ref().unwrap();
                 if pi.kind == Some(osutils::Kind::TreeReference) {
                     let child_rel = if walker_rel.is_empty() {
                         pi.basename.clone()
@@ -1661,7 +1713,7 @@ impl DirState {
                 path_utf8
             )));
         }
-        let path_info = compute_path_info(pstate, transport, &path_utf8);
+        let path_info = compute_path_info(pstate, transport, &path_utf8)?;
         for (ek, trees) in &selected {
             if pstate.seen_ids.contains(&ek.file_id) {
                 continue;
@@ -2485,16 +2537,15 @@ impl DirState {
             return Ok(1);
         }
         // Python's assertion: dirname must end with the parent entry's
-        // basename. The Python source guards the lookup with a
+        // basename.  The Python source guards the lookup with
         // `(parent_block_index == -1 and parent_block_index == -1 and
-        //   dirname == b"")` short-circuit — the second `parent_block_index`
-        // is almost certainly meant to be `parent_row_index`, but we
-        // preserve the (tautological) behaviour so this port is strictly
-        // observation-preserving.
-        // `parent_block_index` twice is intentional — see comment above.
-        #[allow(clippy::nonminimal_bool)]
-        let sentinel_shortcut =
-            parent_block_index == -1 && parent_block_index == -1 && dirname.is_empty();
+        //   dirname == b"")` — the duplicate `parent_block_index`
+        // appears to be a typo for `parent_row_index`, but the duplicate
+        // collapses to a single check anyway, so the actually-observable
+        // condition is `parent_block_index == -1 && dirname.is_empty()`.
+        // We preserve the observable behaviour without carrying the
+        // typo forward.
+        let sentinel_shortcut = parent_block_index == -1 && dirname.is_empty();
         if !sentinel_shortcut {
             let parent_basename = self
                 .dirblocks
@@ -2803,13 +2854,13 @@ impl DirState {
             let (entry_index, entry_present) =
                 find_entry_index(&entry_key, &self.dirblocks[block_index].entries);
 
-            if add.real_add && add.old_path.is_some() {
+            if let (true, Some(old_path)) = (add.real_add, add.old_path.as_ref()) {
                 return Err(BasisApplyError::Invalid {
                     path: add.new_path.clone(),
                     file_id: add.file_id.clone(),
                     reason: format!(
                         "considered a real add but still had old_path at {:?}",
-                        add.old_path.as_ref().unwrap()
+                        old_path
                     ),
                 });
             }
@@ -5325,12 +5376,11 @@ use bisect::{bisect_bytes, cmp_by_dirs_bytes, BisectMode};
 // ``BisectMode`` / ``cmp_by_dirs_bytes`` picks them up through the
 // module-local ``use`` above.
 
-
 mod errors;
 pub use errors::{
-    AddError, BasisAdd, BasisApplyError, EnsureBlockError, EntriesToStateError, FlatBasisDeltaEntry,
-    FlatDeltaEntry, MakeAbsentError, SetPathIdError, SplitRootError, UpdateEntryError,
-    ValidateError,
+    AddError, BasisAdd, BasisApplyError, EnsureBlockError, EntriesToStateError,
+    FlatBasisDeltaEntry, FlatDeltaEntry, MakeAbsentError, SetPathIdError, SplitRootError,
+    UpdateEntryError, ValidateError,
 };
 
 /// Seconds-since-epoch from a [`Metadata::modified`] reading.  Returns
@@ -5380,7 +5430,6 @@ fn metadata_ctime_secs(m: &Metadata) -> i64 {
             .unwrap_or(0)
     }
 }
-
 
 /// Pure-function version of [`DirState::split_root_dirblock_into_contents`].
 /// Exposed so callers that are still building a `Vec<Dirblock>` outside of
@@ -5592,7 +5641,6 @@ pub fn split_root_dirblock_into_contents(dirblocks: &mut [Dirblock]) -> Result<(
     dirblocks[1].entries = contents_of_root;
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests;

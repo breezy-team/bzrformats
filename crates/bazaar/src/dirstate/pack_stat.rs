@@ -1,27 +1,30 @@
 //! Stat-packing: the base64-encoded 24-byte record dirstate stores
 //! per entry as a fingerprint of the filesystem `lstat` result.
 
+use crate::dirstate::Kind;
 use base64::Engine;
 use std::fs::Metadata;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn epoch_secs(t: std::io::Result<SystemTime>) -> u64 {
+    // `metadata.created()` is unsupported on several Linux filesystems
+    // (notably ext4 without `st_birthtime`); fall back to the epoch so
+    // we behave like Python's `os.stat_result` whose `st_ctime` is
+    // always populated. Same fallback for `modified()` for symmetry.
+    t.ok()
+        .and_then(|st| st.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[cfg(unix)]
 pub fn pack_stat_metadata(metadata: &Metadata) -> String {
     pack_stat(
         metadata.len(),
-        metadata
-            .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-        metadata
-            .created()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        epoch_secs(metadata.modified()),
+        epoch_secs(metadata.created()),
         metadata.dev(),
         metadata.ino(),
         metadata.mode(),
@@ -32,18 +35,8 @@ pub fn pack_stat_metadata(metadata: &Metadata) -> String {
 pub fn pack_stat_metadata(metadata: &Metadata) -> String {
     pack_stat(
         metadata.len(),
-        metadata
-            .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-        metadata
-            .created()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        epoch_secs(metadata.modified()),
+        epoch_secs(metadata.created()),
         0,
         0,
         0,
@@ -87,15 +80,19 @@ pub fn pack_stat(size: u64, mtime: u64, ctime: u64, dev: u64, ino: u64, mode: u3
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(packed_data)
 }
 
-pub fn stat_to_minikind(metadata: &Metadata) -> char {
+/// Map a [`Metadata`] entry to the dirstate [`Kind`] it represents,
+/// returning `None` for kinds dirstate cannot track (FIFOs, sockets,
+/// block / char devices). Callers should surface a `BadFileKindError`
+/// in that case rather than substitute a default.
+pub fn stat_to_kind(metadata: &Metadata) -> Option<Kind> {
     let file_type = metadata.file_type();
     if file_type.is_dir() {
-        'd'
+        Some(Kind::Directory)
     } else if file_type.is_file() {
-        'f'
+        Some(Kind::File)
     } else if file_type.is_symlink() {
-        'l'
+        Some(Kind::Symlink)
     } else {
-        panic!("Unsupported file type");
+        None
     }
 }

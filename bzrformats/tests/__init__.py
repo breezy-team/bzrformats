@@ -428,6 +428,7 @@ def load_tests(loader, basic_tests, pattern):
         "test_inv",
         "test_inventory_delta",
         "test_knit",
+        "test_lock",
         "test_pack",
         "test_rio",
         "test_serializer",

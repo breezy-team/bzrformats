@@ -5,11 +5,6 @@
 //! only marshals the resulting `Vec<Dirblock>` into the list-of-tuples
 //! shape Python stores in `DirState._dirblocks`, and handles the
 //! surrounding file I/O and state-object mutation.
-//!
-//! `update_entry` and `ProcessEntryC` still delegate to their Python
-//! counterparts since those interact deeply with the Python `DirState`
-//! object; future commits in the "lift DirState into Rust" series will
-//! replace them.
 
 use bazaar::dirstate::{
     entry_to_line as pure_entry_to_line, parse_dirblocks, Dirblock, DirblocksError, Entry,
@@ -135,98 +130,6 @@ pub fn _read_dirblocks(py: Python, state: &Bound<PyAny>) -> PyResult<()> {
     Ok(())
 }
 
-/// Update the entry based on what is actually on disk.
-///
-/// This delegates to the Python `py_update_entry` implementation in dirstate.py
-/// since it interacts deeply with the DirState object's internal state.
-#[pyfunction]
-pub fn update_entry(
-    py: Python,
-    state: &Bound<PyAny>,
-    entry: &Bound<PyAny>,
-    abspath: &Bound<PyAny>,
-    stat_value: &Bound<PyAny>,
-) -> PyResult<Py<PyAny>> {
-    let dirstate_mod = py.import("bzrformats.dirstate")?;
-    let py_update_entry = dirstate_mod.getattr("py_update_entry")?;
-    let result = py_update_entry.call1((state, entry, abspath, stat_value))?;
-    Ok(result.into())
-}
-
-/// Process entries for tree comparison.
-///
-/// This is a thin wrapper that delegates to the Python ProcessEntryPython
-/// class, since the implementation interacts deeply with the Python DirState
-/// object and the full tree comparison machinery.
-#[pyclass]
-pub struct ProcessEntryC {
-    inner: Py<PyAny>,
-}
-
-#[pymethods]
-impl ProcessEntryC {
-    #[new]
-    #[pyo3(signature = (include_unchanged, use_filesystem_for_exec, search_specific_files, state, source_index, target_index, want_unversioned, tree))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        py: Python,
-        include_unchanged: &Bound<PyAny>,
-        use_filesystem_for_exec: &Bound<PyAny>,
-        search_specific_files: &Bound<PyAny>,
-        state: &Bound<PyAny>,
-        source_index: &Bound<PyAny>,
-        target_index: &Bound<PyAny>,
-        want_unversioned: &Bound<PyAny>,
-        tree: &Bound<PyAny>,
-    ) -> PyResult<Self> {
-        let dirstate_mod = py.import("bzrformats.dirstate")?;
-        let process_entry_cls = dirstate_mod.getattr("ProcessEntryPython")?;
-        let inner = process_entry_cls.call1((
-            include_unchanged,
-            use_filesystem_for_exec,
-            search_specific_files,
-            state,
-            source_index,
-            target_index,
-            want_unversioned,
-            tree,
-        ))?;
-        Ok(ProcessEntryC {
-            inner: inner.into(),
-        })
-    }
-
-    fn __iter__(&self, py: Python) -> PyResult<Py<PyAny>> {
-        // Delegate to the inner Python object's iter_changes() generator so
-        // that `for x in process_entry_c` works.
-        let inner = self.inner.bind(py);
-        Ok(inner.call_method0("iter_changes")?.into())
-    }
-
-    fn iter_changes(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let inner = self.inner.bind(py);
-        Ok(inner.call_method0("iter_changes")?.into())
-    }
-
-    #[getter]
-    fn searched_specific_files(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let inner = self.inner.bind(py);
-        Ok(inner.getattr("searched_specific_files")?.into())
-    }
-
-    #[getter]
-    fn searched_exact_paths(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let inner = self.inner.bind(py);
-        Ok(inner.getattr("searched_exact_paths")?.into())
-    }
-
-    #[getter]
-    fn search_specific_files(&self, py: Python) -> PyResult<Py<PyAny>> {
-        let inner = self.inner.bind(py);
-        Ok(inner.getattr("search_specific_files")?.into())
-    }
-}
-
 /// Extract a single Python entry tuple into a pure-Rust [`Entry`]. The
 /// Python shape is
 /// `((dirname, basename, file_id), [(minikind, fingerprint, size, executable, packed_stat), ...])`
@@ -247,29 +150,38 @@ pub(crate) fn entry_from_py(py_entry: &Bound<PyAny>) -> PyResult<Entry> {
         let tree = tree?;
         let tree_tuple = tree.cast::<PyTuple>()?;
         let minikind_bytes: Vec<u8> = tree_tuple.get_item(0)?.extract()?;
-        let minikind =
-            bazaar::dirstate::Kind::from_minikind(minikind_bytes.first().copied().unwrap_or(0))
-                .map_err(|b| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "invalid minikind byte {:?}",
-                        b
-                    ))
-                })?;
+        let minikind_byte = minikind_bytes
+            .first()
+            .copied()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("empty minikind"))?;
+        let minikind = bazaar::dirstate::Kind::from_minikind(minikind_byte).map_err(|b| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid minikind byte {:?}", b))
+        })?;
         let fingerprint: Vec<u8> = tree_tuple.get_item(1)?.extract()?;
         // Legacy Python dirblocks tolerated 3-tuple relocation rows
         // `(b"r", target_path, target_file_id)` alongside the normal
         // 5-tuple shape, since nothing in the Python code path accessed
-        // slots 2/3/4 on `b'r'` / `b'a'` entries. Production writers
-        // always emit 5-tuples, but accept the shorter shape so
-        // long-standing callers (and their test fixtures) keep working.
+        // slots 2/3/4 on `b'r'` / `b'a'` entries.  Production writers
+        // always emit 5-tuples; only accept the shorter shape for the
+        // two minikinds where it is actually meaningful, so a malformed
+        // 3-tuple for a normal entry still rejects.
         let (size, executable, packed_stat) = if tree_tuple.len() >= 5 {
             (
                 tree_tuple.get_item(2)?.extract::<u64>()?,
                 tree_tuple.get_item(3)?.extract::<bool>()?,
                 tree_tuple.get_item(4)?.extract::<Vec<u8>>()?,
             )
-        } else {
+        } else if matches!(
+            minikind,
+            bazaar::dirstate::Kind::Relocated | bazaar::dirstate::Kind::Absent
+        ) {
             (0u64, false, Vec::new())
+        } else {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "entry tuple too short for minikind {:?}: got {} items, expected 5",
+                minikind,
+                tree_tuple.len(),
+            )));
         };
         trees.push(TreeData {
             minikind,
@@ -323,42 +235,9 @@ fn py_entry_to_line<'py>(
     Ok(PyBytes::new(py, &bytes))
 }
 
-/// Serialise every entry across every dirblock into a list of
-/// NUL-delimited lines, one per entry in iteration order. Replaces the
-/// `map(self._entry_to_line, self._iter_entries())` loop inside
-/// `DirState.get_lines` with a single pyo3 call that walks the Python
-/// `_dirblocks` list once.
-///
-/// Input shape matches Python's `_dirblocks`:
-/// `[(dirname_bytes, [entry_tuple, ...]), ...]` where each `entry_tuple`
-/// is `((dirname, basename, file_id), [(minikind, fingerprint, size, executable, packed_stat), ...])`.
-#[pyfunction]
-#[pyo3(name = "dirblocks_to_entry_lines")]
-fn py_dirblocks_to_entry_lines<'py>(
-    py: Python<'py>,
-    dirblocks: &Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyList>> {
-    let out = PyList::empty(py);
-    for block in dirblocks.try_iter()? {
-        let block = block?;
-        let block_tuple = block.cast::<PyTuple>()?;
-        let entries = block_tuple.get_item(1)?;
-        for entry in entries.try_iter()? {
-            let entry = entry?;
-            let rust_entry = entry_from_py(&entry)?;
-            let bytes = pure_entry_to_line(&rust_entry);
-            out.append(PyBytes::new(py, &bytes))?;
-        }
-    }
-    Ok(out)
-}
-
 /// Register the dirstate helper functions into the given module.
 pub fn register(m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(_read_dirblocks, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(update_entry, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(py_entry_to_line, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(py_dirblocks_to_entry_lines, m)?)?;
-    m.add_class::<ProcessEntryC>()?;
     Ok(())
 }

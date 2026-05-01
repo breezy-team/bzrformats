@@ -50,7 +50,7 @@ impl Kind {
         self.to_minikind() as char
     }
 
-    pub fn to_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Kind::Absent => "absent",
             Kind::File => "file",
@@ -114,7 +114,7 @@ impl From<osutils::Kind> for Kind {
 
 impl std::fmt::Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.to_str())
+        f.write_str(self.as_str())
     }
 }
 

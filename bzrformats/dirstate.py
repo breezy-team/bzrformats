@@ -219,16 +219,12 @@ desired.
 """
 
 import bisect
-import codecs
 import contextlib
 import logging
 import os
 import stat
-import sys
-import time
-from stat import S_IEXEC
 
-from . import inventory, lock, osutils
+from . import inventory, lock
 from .errors import (
     BzrFormatsError,
     LockContention,
@@ -473,6 +469,7 @@ class DirState:
         # because those haven't been migrated yet.
         self._rs = _dirstate_rs.DirStateRs(
             path,
+            sha1_provider=sha1_provider,
             worth_saving_limit=worth_saving_limit,
             use_filesystem_for_exec=use_filesystem_for_exec,
             fdatasync=fdatasync,
@@ -637,9 +634,10 @@ class DirState:
         if isinstance(path, bytes):
             path = path.decode("utf-8")
         self._rs.add_path(path, file_id, kind, stat, fingerprint)
-        # Rust side updated its id_index; invalidate the Python mirror
-        # so the next access rebuilds from authoritative state.
-        self._id_index = None
+        # Refill the cached IdIndex in place so callers that hold the
+        # reference returned by ``_get_id_index`` see the new entry.
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _bisect(self, paths):
         """Bisect through the disk structure for specific rows.
@@ -652,7 +650,7 @@ class DirState:
         if self._dirblock_state != DirState.NOT_IN_MEMORY:
             raise AssertionError(f"bad dirblock state {self._dirblock_state!r}")
         file_size = os.fstat(self._state_file.fileno()).st_size
-        return self._rs.bisect(self._state_file, file_size, paths)
+        return self._rs.bisect(self, self._state_file, file_size, paths)
 
     def _bisect_dirblocks(self, dir_list):
         """Bisect through the disk structure to find entries in given dirs.
@@ -665,7 +663,7 @@ class DirState:
         if self._dirblock_state != DirState.NOT_IN_MEMORY:
             raise AssertionError(f"bad dirblock state {self._dirblock_state!r}")
         file_size = os.fstat(self._state_file.fileno()).st_size
-        return self._rs.bisect_dirblocks(self._state_file, file_size, dir_list)
+        return self._rs.bisect_dirblocks(self, self._state_file, file_size, dir_list)
 
     def _bisect_recursive(self, paths):
         """Bisect for entries for all paths and their children.
@@ -678,7 +676,7 @@ class DirState:
         if self._dirblock_state != DirState.NOT_IN_MEMORY:
             raise AssertionError(f"bad dirblock state {self._dirblock_state!r}")
         file_size = os.fstat(self._state_file.fileno()).st_size
-        return self._rs.bisect_recursive(self._state_file, file_size, paths)
+        return self._rs.bisect_recursive(self, self._state_file, file_size, paths)
 
     def _discard_merge_parents(self):
         """Discard any parents trees beyond the first.
@@ -693,7 +691,8 @@ class DirState:
             return
         self._read_dirblocks_if_needed()
         self._rs.discard_merge_parents()
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _empty_parent_info(self):
         return [DirState.NULL_PARENT_DETAILS] * (len(self._parents) - len(self._ghosts))
@@ -723,10 +722,7 @@ class DirState:
 
         :param entry: An entry_tuple as defined in the module docstring.
         """
-        # The actual implementation is rebound at the bottom of this
-        # module to `_dirstate_rs.entry_to_line`; this definition exists
-        # only so tooling and sphinx autodoc see a method on `DirState`.
-        raise AssertionError("_entry_to_line should be rebound from _dirstate_rs")
+        return _dirstate_rs.entry_to_line(entry)
 
     def _find_block_index_from_key(self, key):
         """Find the dirblock index for a key.
@@ -776,7 +772,6 @@ class DirState:
             with contextlib.ExitStack() as exit_stack:
                 exit_stack.enter_context(tree.lock_read())
                 parent_ids = tree.get_parent_ids()
-                len(parent_ids)
                 parent_trees = []
                 for parent_id in parent_ids:
                     parent_tree = tree.branch.repository.revision_tree(parent_id)
@@ -804,15 +799,18 @@ class DirState:
         delta.check()
         delta.sort()
         self._rs.update_by_delta(delta)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _apply_removals(self, removals):
         self._rs.apply_removals(list(removals))
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _apply_insertions(self, adds):
         self._rs.apply_insertions(list(adds))
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def update_basis_by_delta(self, delta, new_revid):
         """Update the parents of this tree after a commit.
@@ -833,7 +831,8 @@ class DirState:
         delta.check()
         delta.sort()
         self._rs.update_basis_by_delta(delta, new_revid)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _check_delta_ids_absent(self, new_ids, tree_index):
         """Check that none of the file_ids in new_ids are present in a tree."""
@@ -853,9 +852,8 @@ class DirState:
             pair created to handle renames and deletes.
         """
         self._rs.update_basis_apply_adds(adds)
-        # Rust may have inserted entries and/or dirblocks; pull the
-        # rewritten state back into Python's mirror.
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _update_basis_apply_changes(self, changes):
         """Apply a sequence of changes to tree 1 during update_basis_by_delta.
@@ -864,7 +862,8 @@ class DirState:
             (path_utf8, path_utf8, file_id, (entry_details))
         """
         self._rs.update_basis_apply_changes(changes)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _update_basis_apply_deletes(self, deletes):
         """Apply a sequence of deletes to tree 1 during update_basis_by_delta.
@@ -879,7 +878,8 @@ class DirState:
             during the replacement of a parent.
         """
         self._rs.update_basis_apply_deletes(deletes)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def _after_delta_check_parents(self, parents, index):
         """Check that parents required by the delta are all intact.
@@ -899,7 +899,15 @@ class DirState:
         breezy.filters.FilteredStat) that only carries st_mode /
         st_size / st_mtime / st_ctime — fall back to zero for the
         device/inode fields in that case.
+
+        Callers may pass an unversioned-path entry (``(None, None)``);
+        in that case there is no row to update and we silently do
+        nothing, matching Python ``DirState._observed_sha1``'s no-op
+        behaviour for those paths (its cutoff_time guard skips fresh
+        files before it would dereference ``entry[1][0]``).
         """
+        if entry[0] is None:
+            return
         new_tree0 = self._rs.observed_sha1(
             entry[0],
             sha1,
@@ -919,43 +927,7 @@ class DirState:
         Files modified more recently than this time are at risk of being
         undetectably modified and so can't be cached.
         """
-        # Cache the cutoff time as long as we hold a lock.
-        # time.time() isn't super expensive (approx 3.38us), but
-        # when you call it 50,000 times it adds up.
-        # For comparison, os.lstat() costs 7.2us if it is hot.
-        self._cutoff_time = int(time.time()) - 3
-        return self._cutoff_time
-
-    @staticmethod
-    def _lstat(abspath, entry):
-        """Return the os.lstat value for this path."""
-        return os.lstat(abspath)
-
-    def _is_executable(self, mode, old_executable):
-        """Is this file executable?"""
-        if self._use_filesystem_for_exec:
-            return bool(S_IEXEC & mode)
-        else:
-            return old_executable
-
-    @staticmethod
-    def _read_link(abspath, old_link):
-        """Read the target of a symlink."""
-        # TODO: jam 200700301 On Win32, this could just return the value
-        #       already in memory. However, this really needs to be done at a
-        #       higher level, because there either won't be anything on disk,
-        #       or the thing on disk will be a file.
-        if isinstance(abspath, str):
-            # abspath is defined as the path to pass to lstat. readlink is
-            # buggy in python < 2.6 (it doesn't encode unicode path into FS
-            # encoding), so we need to encode ourselves knowing that unicode
-            # paths are produced by UnicodeDirReader on purpose.
-            abspath = os.fsencode(abspath)
-        target = os.readlink(abspath)
-        if sys.getfilesystemencoding() not in ("utf-8", "ascii"):
-            # Change encoding if needed
-            target = os.fsdecode(target).encode("UTF-8")
-        return target
+        return self._rs.compute_sha_cutoff_time()
 
     def get_ghosts(self):
         """Return a list of the parent tree revision ids that are ghosts."""
@@ -1105,14 +1077,22 @@ class DirState:
         docstring of bzrformats.dirstate.
         """
         self._read_dirblocks_if_needed()
-        for directory in self._dirblocks:
-            yield from directory[1]
+        # Materialise the entry list once on the Rust side; reading
+        # ``self._dirblocks`` would re-marshal every block on every
+        # outer-loop iteration of any caller doing ``for e in
+        # state._iter_entries(): for d in state._dirblocks: ...``.
+        return iter(self._rs.entries())
 
     def _get_id_index(self):
         """Get an id index of self._dirblocks.
 
         This maps from file_id => [(directory, name, file_id)] entries where
         that file_id appears in one of the trees.
+
+        Callers may hold the returned object across mutations and expect
+        to see fresh state — the original bzr contract.  We therefore
+        cache a Python-side IdIndex on ``self._id_index`` and refill it
+        from Rust's authoritative index in every mutating method.
         """
         if self._id_index is None:
             self._id_index = IdIndex()
@@ -1181,7 +1161,7 @@ class DirState:
 
     def _read_header(self):
         """Read the metadata header and parent ids from the state file."""
-        self._rs.read_header_from_file(self._state_file)
+        self._rs.read_header_from_file(self, self._state_file)
 
     def _read_header_if_needed(self):
         """Read the header of the dirstate file if needed."""
@@ -1251,7 +1231,8 @@ class DirState:
         # Rust side absorbs parent_ids and dirblocks, marks both states
         # fully modified, and clears its id_index cache.
         self._rs.set_data(parent_ids, dirblocks)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def set_path_id(self, path, new_id):
         """Change the id of path to new_id in the current working tree.
@@ -1265,7 +1246,8 @@ class DirState:
         if not isinstance(new_id, bytes):
             raise AssertionError(f"must be a utf8 file_id not {type(new_id)}")
         self._rs.set_path_id(path, new_id)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def set_parent_trees(self, trees, ghosts):
         """Set the parent trees for the dirstate.
@@ -1298,7 +1280,8 @@ class DirState:
                 )
             parent_tree_entries.append(rows)
         self._rs.set_parent_trees(parent_ids, ghosts_list, parent_tree_entries)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def set_state_from_inventory(self, new_inv):
         """Set new_inv as the current state.
@@ -1333,7 +1316,8 @@ class DirState:
                 )
             )
         self._rs.set_state_from_inventory(rows)
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def set_state_from_scratch(self, working_inv, parent_trees, parent_ghosts):
         """Wipe the currently stored state and set it to something new.
@@ -1362,7 +1346,8 @@ class DirState:
             shrinking in length.
         """
         last_reference = self._rs.make_absent(current_old[0])
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
         return last_reference
 
     def update_minimal(
@@ -1431,7 +1416,8 @@ class DirState:
         # parents, ghosts, dirblocks, id_index, end_of_header,
         # cutoff_time.
         self._rs.wipe_state()
-        self._id_index = None
+        if self._id_index is not None:
+            self._id_index.fill_from_state(self._rs)
 
     def lock_read(self):
         """Acquire a read lock on the dirstate."""
@@ -1480,156 +1466,6 @@ class DirState:
             raise ObjectNotLocked(self)
 
 
-def py_update_entry(state, entry, abspath, stat_value):
-    """Update the entry based on what is actually on disk.
-
-    Thin shim: delegates to DirStateRs.update_entry.  Mirrors Python's
-    historical in-place entry-tuple mutation by rebuilding entry[1][0]
-    from the new tree-0 Rust wrote.
-    """
-    if isinstance(abspath, str):
-        abspath = abspath.encode("utf-8")
-    link_or_sha1 = state._rs.update_entry(entry[0], abspath, stat_value)
-    # Refresh the in-memory entry tuple so legacy callers that hang
-    # on to the snapshot still see the new tree-0.
-    fresh = state._rs.get_entry(0, path_utf8=osutils.pathjoin(entry[0][0], entry[0][1]))
-    if fresh != (None, None):
-        entry[1][0] = fresh[1][0]
-    return link_or_sha1
-
-
-class ProcessEntryPython:
-    """Python implementation for processing directory state entries."""
-
-    __slots__ = [
-        "include_unchanged",
-        "last_source_parent",
-        "last_target_parent",
-        "new_dirname_to_file_id",
-        "old_dirname_to_file_id",
-        "partial",
-        "search_specific_file_parents",
-        "search_specific_files",
-        "searched_exact_paths",
-        "searched_specific_files",
-        "seen_ids",
-        "source_index",
-        "state",
-        "target_index",
-        "tree",
-        "use_filesystem_for_exec",
-        "utf8_decode",
-        "want_unversioned",
-    ]
-
-    def __init__(
-        self,
-        include_unchanged,
-        use_filesystem_for_exec,
-        search_specific_files,
-        state,
-        source_index,
-        target_index,
-        want_unversioned,
-        tree,
-    ):
-        """Initialize the ProcessEntryPython.
-
-        Args:
-            include_unchanged: Whether to include unchanged entries.
-            use_filesystem_for_exec: Whether to use filesystem for executable checks.
-            search_specific_files: Specific files to search for.
-            state: The dirstate being processed.
-            source_index: Index of the source tree.
-            target_index: Index of the target tree.
-            want_unversioned: Whether to include unversioned files.
-            tree: The tree object.
-        """
-        self.old_dirname_to_file_id = {}
-        self.new_dirname_to_file_id = {}
-        # Are we doing a partial iter_changes?
-        self.partial = search_specific_files != {""}
-        # Using a list so that we can access the values and change them in
-        # nested scope. Each one is [path, file_id, entry]
-        self.last_source_parent = [None, None]
-        self.last_target_parent = [None, None]
-        self.include_unchanged = include_unchanged
-        self.use_filesystem_for_exec = use_filesystem_for_exec
-        self.utf8_decode = codecs.utf_8_decode
-        # for all search_indexs in each path at or under each element of
-        # search_specific_files, if the detail is relocated: add the id, and
-        # add the relocated path as one to search if its not searched already.
-        # If the detail is not relocated, add the id.
-        self.searched_specific_files = set()
-        # When we search exact paths without expanding downwards, we record
-        # that here.
-        self.searched_exact_paths = set()
-        self.search_specific_files = search_specific_files
-        # The parents up to the root of the paths we are searching.
-        # After all normal paths are returned, these specific items are returned.
-        self.search_specific_file_parents = set()
-        # The ids we've sent out in the delta.
-        self.seen_ids = set()
-        self.state = state
-        self.source_index = source_index
-        self.target_index = target_index
-        if target_index != 0:
-            # A lot of code in here depends on target_index == 0
-            raise BzrFormatsError("unsupported target index")
-        self.want_unversioned = want_unversioned
-        self.tree = tree
-
-    def __iter__(self):
-        """Return iterator for processing entries."""
-        return self.iter_changes()
-
-    def iter_changes(self):
-        """Iterate over the changes.
-
-        Thin forwarder to the pure-crate IterChangesIter, which runs
-        the full walk, per-entry comparison, parent-consistency
-        gathering, and specific-file-parents drain as a single
-        state machine.  Yields :class:`DirstateInventoryChange`
-        tuples one at a time.
-        """
-        if self.state is None:
-            # Empty-state callers (the iterator-protocol regression
-            # test) only care that iterating an empty
-            # search_specific_files yields nothing.
-            if self.search_specific_files:
-                raise AssertionError(
-                    "iter_changes with state=None requires empty search_specific_files"
-                )
-            return
-        root_abspath = (
-            self.tree.abspath("").encode("utf8", "surrogateescape")
-            if self.tree is not None
-            else b""
-        )
-        supports_tree_reference = bool(
-            getattr(self.tree, "_repo_supports_tree_reference", False)
-        )
-        rs_iter = self.state._rs.iter_changes(
-            self.source_index,
-            self.target_index,
-            self.include_unchanged,
-            self.want_unversioned,
-            self.search_specific_files,
-            supports_tree_reference,
-            root_abspath,
-        )
-        try:
-            yield from rs_iter
-        finally:
-            # Surface the walker's final state back onto the Python
-            # instance for callers that inspect it after iteration.
-            self.searched_specific_files = rs_iter.searched_specific_files
-            self.search_specific_files = rs_iter.search_specific_files
-            self.searched_exact_paths = rs_iter.searched_exact_paths
-            self.search_specific_file_parents = rs_iter.search_specific_file_parents
-            self.seen_ids = rs_iter.seen_ids
-
-
 from ._bzr_rs import dirstate as _dirstate_rs
 
 DefaultSHA1Provider = _dirstate_rs.DefaultSHA1Provider
@@ -1647,6 +1483,3 @@ _inv_entry_to_details = _dirstate_rs.inv_entry_to_details
 _get_output_lines = _dirstate_rs.get_output_lines
 
 _read_dirblocks = _dirstate_rs._read_dirblocks
-update_entry = _dirstate_rs.update_entry
-_process_entry = _dirstate_rs.ProcessEntryC
-DirState._entry_to_line = staticmethod(_dirstate_rs.entry_to_line)

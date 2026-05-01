@@ -121,11 +121,39 @@ impl std::error::Error for TransportError {}
 
 /// Single-file backing store for a [`DirState`].
 ///
-/// The dirstate reads and writes one on-disk file; callers hand in a
-/// `Transport` that knows where that file lives and how to lock it.
-/// The real-filesystem backend is a thin wrapper over `std::fs`;
-/// tests use a `MemoryTransport`, and the pyo3 layer uses a
-/// `PyFileTransport` that delegates to a Python file-like object.
+/// Unlike `bazaar::transport::Transport` (the knit-side path-keyed
+/// byte store), a dirstate transport represents exactly one file held
+/// open across a lock.  The real-filesystem backend is a thin wrapper
+/// over `std::fs`; tests use a `MemoryTransport`, and the pyo3 layer
+/// uses a `PyFileTransport` that delegates to a Python file-like
+/// object.  Operations:
+///
+/// * [`Transport::exists`] — whether the backing file exists.  Used
+///   by `on_file` to decide whether to create a fresh dirstate.
+/// * [`Transport::lock_read`] / [`Transport::lock_write`] — acquire
+///   a lock on the backing file.  Explicit rather than RAII; the
+///   caller must pair each lock with an `unlock`.  Re-locking while
+///   already locked returns `AlreadyLocked`.
+/// * [`Transport::unlock`] — release the current lock.
+/// * [`Transport::lock_state`] — observe the current lock state.
+/// * [`Transport::read_all`] — return the full file contents.
+///   Requires a read or write lock.  The returned bytes are owned;
+///   callers parse in memory (no streaming `readline` — the pure-Rust
+///   `read_header` operates on a byte slice).
+/// * [`Transport::write_all`] — replace the full file contents,
+///   truncating any trailing bytes from the previous version.
+///   Requires a write lock.  Implementations are expected to flush
+///   before returning, but are not required to fdatasync — call
+///   [`Transport::fdatasync`] for that.
+/// * [`Transport::fdatasync`] — force the current contents to durable
+///   storage.  Optional no-op for stores where fsync has no meaning
+///   (e.g. in-memory tests); the trait method exists so
+///   `DirState.save` can call it unconditionally.
+///
+/// The `&mut self` receivers are deliberate: every operation either
+/// mutates the lock state, the file contents, or both.  Callers that
+/// need shared access should wrap an implementation in their own
+/// synchronisation primitive.
 pub trait Transport {
     /// Whether the backing file exists. Does not require a lock.
     fn exists(&self) -> Result<bool, TransportError>;

@@ -100,6 +100,14 @@ pub struct DirstateChange {
 #[derive(Debug)]
 pub enum ProcessEntryError {
     DirstateCorrupt(String),
+    /// On-disk path exists but isn't a kind dirstate can represent
+    /// (FIFO, socket, block / char device, etc.). Carries the path
+    /// and the raw st_mode so callers can format
+    /// `BadFileKindError` for the user.
+    BadFileKind {
+        path: Vec<u8>,
+        mode: u32,
+    },
     Internal(String),
 }
 
@@ -107,6 +115,12 @@ impl std::fmt::Display for ProcessEntryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProcessEntryError::DirstateCorrupt(s) => write!(f, "dirstate corrupt: {}", s),
+            ProcessEntryError::BadFileKind { path, mode } => write!(
+                f,
+                "bad file kind for {}: mode {:o}",
+                String::from_utf8_lossy(path),
+                mode
+            ),
             ProcessEntryError::Internal(s) => write!(f, "process_entry: {}", s),
         }
     }

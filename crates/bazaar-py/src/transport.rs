@@ -17,6 +17,9 @@ use pyo3::types::{PyBytes, PyTuple};
 /// the adapter holds an unbound `Py<PyAny>` so the wrapper itself can
 /// be moved around freely. Each call re-attaches to a `Python<'_>` to
 /// dispatch the underlying method.
+// TODO: not yet wired up to a Python entry point; will be used once
+// pure-Rust knit code accepts a Transport trait object directly.
+#[allow(dead_code)]
 pub struct PyTransport(Py<PyAny>);
 
 impl PyTransport {
@@ -24,6 +27,7 @@ impl PyTransport {
     /// implements the duck-typed Python `Transport` interface knit
     /// reads/writes use; mismatches surface as `TransportError::Other`
     /// at call time.
+    #[allow(dead_code)]
     pub fn new(obj: Bound<'_, PyAny>) -> Self {
         Self(obj.unbind())
     }
@@ -33,6 +37,7 @@ impl PyTransport {
 /// `NoSuchFile` exception class to [`TransportError::NoSuchFile`] and
 /// everything else to [`TransportError::Other`] with the exception's
 /// `repr()`.
+#[allow(dead_code)]
 fn map_py_err(py: Python<'_>, err: PyErr) -> TransportError {
     pyo3::import_exception!(bzrformats.errors, NoSuchFile);
     if err.is_instance_of::<NoSuchFile>(py) {

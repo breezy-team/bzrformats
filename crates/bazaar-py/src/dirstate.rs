@@ -8,15 +8,15 @@ use pyo3::wrap_pyfunction;
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pyo3::import_exception!(bzrformats.errors, NotVersionedError);
 pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
 pyo3::import_exception!(bzrformats.errors, InvalidNormalization);
+pyo3::import_exception!(bzrformats.errors, BadFileKindError);
 pyo3::import_exception!(bzrformats.inventory, DuplicateFileId);
 pyo3::import_exception!(bzrformats.inventory, InvalidEntryName);
+pyo3::import_exception!(bzrformats.dirstate, DirstateCorrupt);
 
 /// `bazaar::dirstate::Transport` adapter backed by a Python file-like
 /// object.  Used by `DirStateRs.save_to_file` so the pure-Rust
@@ -214,13 +214,9 @@ impl bazaar::dirstate::Transport for PyFileTransport {
                     return Err(Self::map_err(py, e));
                 }
             };
-            let bytes: Vec<u8> = match target.extract::<Vec<u8>>() {
-                Ok(b) => b,
-                Err(_) => {
-                    let s: String = target.extract().map_err(|e| Self::map_err(py, e))?;
-                    s.into_bytes()
-                }
-            };
+            // os.readlink(bytes) returns bytes per the Python docs; if it
+            // ever returns str, that's the caller's bug to fix.
+            let bytes: Vec<u8> = target.extract().map_err(|e| Self::map_err(py, e))?;
             Ok(bytes)
         })
     }
@@ -250,26 +246,16 @@ impl bazaar::dirstate::Transport for PyFileTransport {
                 let mut out: Vec<bazaar::dirstate::DirEntryInfo> = Vec::new();
                 for item in iter.try_iter().map_err(|e| Self::map_err(py, e))? {
                     let entry = item.map_err(|e| Self::map_err(py, e))?;
-                    let name_bytes: Vec<u8> = {
-                        let n = entry.getattr("name").map_err(|e| Self::map_err(py, e))?;
-                        if let Ok(b) = n.extract::<Vec<u8>>() {
-                            b
-                        } else {
-                            n.extract::<String>()
-                                .map_err(|e| Self::map_err(py, e))?
-                                .into_bytes()
-                        }
-                    };
-                    let abspath_child: Vec<u8> = {
-                        let p = entry.getattr("path").map_err(|e| Self::map_err(py, e))?;
-                        if let Ok(b) = p.extract::<Vec<u8>>() {
-                            b
-                        } else {
-                            p.extract::<String>()
-                                .map_err(|e| Self::map_err(py, e))?
-                                .into_bytes()
-                        }
-                    };
+                    // os.scandir(bytes) yields DirEntry whose name/path are
+                    // bytes; we always pass bytes above, so trust that.
+                    let name_bytes: Vec<u8> = entry
+                        .getattr("name")
+                        .and_then(|n| n.extract())
+                        .map_err(|e| Self::map_err(py, e))?;
+                    let abspath_child: Vec<u8> = entry
+                        .getattr("path")
+                        .and_then(|p| p.extract())
+                        .map_err(|e| Self::map_err(py, e))?;
                     let kwargs = pyo3::types::PyDict::new(py);
                     kwargs
                         .set_item("follow_symlinks", false)
@@ -358,10 +344,15 @@ impl bazaar::dirstate::Transport for PyFileTransport {
 }
 
 /// Decode a minikind from the first byte of a Python-supplied
-/// `bytes` object, raising `ValueError` on an unknown byte.  Used by
-/// every pyo3 entry that accepts a minikind slice from Python.
+/// `bytes` object, raising `ValueError` on an empty slice or unknown
+/// byte.  Used by every pyo3 entry that accepts a minikind slice from
+/// Python.
 fn decode_minikind(bytes: &[u8]) -> PyResult<bazaar::dirstate::Kind> {
-    bazaar::dirstate::Kind::from_minikind(bytes.first().copied().unwrap_or(0)).map_err(|b| {
+    let byte = bytes
+        .first()
+        .copied()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("empty minikind"))?;
+    bazaar::dirstate::Kind::from_minikind(byte).map_err(|b| {
         pyo3::exceptions::PyValueError::new_err(format!("invalid minikind byte {:?}", b))
     })
 }
@@ -377,6 +368,44 @@ fn kind_from_mode(mode: u32) -> Option<osutils::Kind> {
         0o040000 => Some(osutils::Kind::Directory),
         0o120000 => Some(osutils::Kind::Symlink),
         _ => None,
+    }
+}
+
+/// Spell out the kind name for an `st_mode`, matching breezy's
+/// `_readdir_py._formats` mapping.  Used to format
+/// `BadFileKindError` payloads for kinds the dirstate can't track.
+fn kind_name_from_mode(mode: u32) -> &'static str {
+    match mode & 0o170000 {
+        0o010000 => "fifo",
+        0o020000 => "chardev",
+        0o040000 => "directory",
+        0o060000 => "block",
+        0o100000 => "file",
+        0o120000 => "symlink",
+        0o140000 => "socket",
+        _ => "unknown",
+    }
+}
+
+/// Build a `bzrformats.errors.BadFileKindError` for `path` (utf-8
+/// bytes) and the raw stat mode.  Surfaces the kinds the walker
+/// cannot represent (fifo, socket, …) without coupling the pure
+/// crate to the Python error class.
+fn bad_file_kind_error(_py: Python<'_>, path: &[u8], mode: u32) -> PyErr {
+    let path_str = String::from_utf8_lossy(path).into_owned();
+    let kind = kind_name_from_mode(mode);
+    BadFileKindError::new_err((path_str, kind))
+}
+
+/// Translate a `BisectError` into the appropriate Python exception:
+/// genuine I/O failures become `OSError`, anything else (bad minikind,
+/// bad size field, too many seeks while parsing) is dirstate corruption
+/// and is raised as `DirstateCorrupt(state, msg)` so callers can catch
+/// a single class for "the dirstate is unreadable".
+fn bisect_err_to_py(state: &Bound<PyAny>, err: bazaar::dirstate::BisectError) -> PyErr {
+    match err {
+        bazaar::dirstate::BisectError::ReadError(s) => pyo3::exceptions::PyOSError::new_err(s),
+        other => DirstateCorrupt::new_err((state.clone().unbind(), other.to_string())),
     }
 }
 
@@ -531,8 +560,8 @@ fn bisect_path_left(paths: Vec<Bound<PyAny>>, path: &Bound<PyAny>) -> PyResult<u
     let path = extract_path(path)?;
     let paths = paths
         .iter()
-        .map(|x| extract_path(x).unwrap())
-        .collect::<Vec<PathBuf>>();
+        .map(extract_path)
+        .collect::<PyResult<Vec<PathBuf>>>()?;
     let offset = bazaar::dirstate::bisect_path_left(
         paths
             .iter()
@@ -567,8 +596,8 @@ fn bisect_path_right(paths: Vec<Bound<PyAny>>, path: &Bound<PyAny>) -> PyResult<
     let path = extract_path(path)?;
     let paths = paths
         .iter()
-        .map(|x| extract_path(x).unwrap())
-        .collect::<Vec<PathBuf>>();
+        .map(extract_path)
+        .collect::<PyResult<Vec<PathBuf>>>()?;
     let offset = bazaar::dirstate::bisect_path_right(
         paths
             .iter()
@@ -632,7 +661,7 @@ fn bisect_dirblock(
 
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let dirblock = dirblocks.get_item(mid)?.downcast_into::<PyTuple>()?;
+        let dirblock = dirblocks.get_item(mid)?.cast_into::<PyTuple>()?;
         let cur = dirblock.get_item(0)?;
 
         let cur_split = match cache.get_item(&cur)? {
@@ -653,65 +682,43 @@ fn bisect_dirblock(
     Ok(lo)
 }
 
-// TODO(jelmer): Move this into a more central place?
+/// Lightweight `os.stat_result`-shaped pyclass exposing exactly the
+/// six fields dirstate consumes.
 #[pyclass]
 struct StatResult {
-    metadata: std::fs::Metadata,
+    info: bazaar::dirstate::StatInfo,
 }
 
 #[pymethods]
 impl StatResult {
     #[getter]
-    fn st_size(&self) -> PyResult<u64> {
-        Ok(self.metadata.len())
+    fn st_size(&self) -> u64 {
+        self.info.size
     }
 
     #[getter]
-    fn st_mtime(&self) -> PyResult<u64> {
-        let modified = self
-            .metadata
-            .modified()
-            .map_err(PyErr::new::<pyo3::exceptions::PyOSError, _>)?;
-        let since_epoch = modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-        Ok(since_epoch.as_secs())
+    fn st_mtime(&self) -> i64 {
+        self.info.mtime
     }
 
     #[getter]
-    fn st_ctime(&self) -> PyResult<u64> {
-        let created = self
-            .metadata
-            .created()
-            .map_err(PyErr::new::<pyo3::exceptions::PyOSError, _>)?;
-        let since_epoch = created
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-        Ok(since_epoch.as_secs())
+    fn st_ctime(&self) -> i64 {
+        self.info.ctime
     }
 
-    #[cfg(unix)]
     #[getter]
-    fn st_mode(&self) -> PyResult<u32> {
-        Ok(self.metadata.permissions().mode())
+    fn st_mode(&self) -> u32 {
+        self.info.mode
     }
 
-    #[cfg(not(unix))]
     #[getter]
-    fn st_mode(&self) -> PyResult<u32> {
-        Ok(0)
+    fn st_dev(&self) -> u64 {
+        self.info.dev
     }
 
-    #[cfg(unix)]
     #[getter]
-    fn st_dev(&self) -> PyResult<u64> {
-        Ok(self.metadata.dev())
-    }
-
-    #[cfg(unix)]
-    #[getter]
-    fn st_ino(&self) -> PyResult<u64> {
-        Ok(self.metadata.ino())
+    fn st_ino(&self) -> u64 {
+        self.info.ino
     }
 }
 
@@ -737,8 +744,8 @@ impl SHA1Provider {
         path: &Bound<PyAny>,
     ) -> PyResult<(Py<PyAny>, Bound<'a, PyBytes>)> {
         let path = extract_path(path)?;
-        let (md, sha1) = self.provider.stat_and_sha1(&path)?;
-        let pmd = StatResult { metadata: md };
+        let (info, sha1) = self.provider.stat_and_sha1(&path)?;
+        let pmd = StatResult { info };
         Ok((
             pmd.into_pyobject(py)?.unbind().into(),
             PyBytes::new(py, sha1.as_bytes()),
@@ -751,6 +758,106 @@ fn DefaultSHA1Provider() -> PyResult<SHA1Provider> {
     Ok(SHA1Provider {
         provider: Box::new(bazaar::dirstate::DefaultSHA1Provider::new()),
     })
+}
+
+/// Adapter that lets a Python `SHA1Provider`-shaped object (anything
+/// with a `sha1(abspath)` method returning bytes) be plugged into the
+/// pure-Rust `DirState`. The provider is held as a `Py<PyAny>` so we
+/// can call back into Python; the GIL is acquired on each call.
+struct PyCallbackSha1Provider {
+    obj: Py<PyAny>,
+}
+
+impl bazaar::dirstate::SHA1Provider for PyCallbackSha1Provider {
+    fn sha1(&self, path: &std::path::Path) -> std::io::Result<String> {
+        Python::attach(|py| {
+            let path_obj = path_to_py(py, path)
+                .map_err(|e| std::io::Error::other(format!("path_to_py: {}", e)))?;
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("sha1", (path_obj,))
+                .map_err(|e| std::io::Error::other(format!("sha1 callback: {}", e)))?;
+            let bytes: &[u8] = result
+                .extract()
+                .map_err(|e| std::io::Error::other(format!("sha1 result: {}", e)))?;
+            std::str::from_utf8(bytes)
+                .map(|s| s.to_string())
+                .map_err(|e| std::io::Error::other(format!("sha1 utf8: {}", e)))
+        })
+    }
+
+    fn stat_and_sha1(
+        &self,
+        path: &std::path::Path,
+    ) -> std::io::Result<(bazaar::dirstate::StatInfo, String)> {
+        Python::attach(|py| {
+            let path_obj = path_to_py(py, path)
+                .map_err(|e| std::io::Error::other(format!("path_to_py: {}", e)))?;
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("stat_and_sha1", (path_obj,))
+                .map_err(|e| std::io::Error::other(format!("stat_and_sha1 callback: {}", e)))?;
+            let (stat_obj, sha_obj): (Bound<'_, PyAny>, Bound<'_, PyAny>) = result
+                .extract()
+                .map_err(|e| std::io::Error::other(format!("stat_and_sha1 result: {}", e)))?;
+            let info = stat_result_to_info(&stat_obj)
+                .map_err(|e| std::io::Error::other(format!("stat_and_sha1 stat_result: {}", e)))?;
+            let sha_bytes: &[u8] = sha_obj
+                .extract()
+                .map_err(|e| std::io::Error::other(format!("stat_and_sha1 sha bytes: {}", e)))?;
+            let sha = std::str::from_utf8(sha_bytes)
+                .map_err(|e| std::io::Error::other(format!("stat_and_sha1 sha utf8: {}", e)))?
+                .to_string();
+            Ok((info, sha))
+        })
+    }
+}
+
+/// Read the `st_*` attributes off a Python `os.stat_result`-shaped
+/// object and pack them into a [`StatInfo`].  Used by callback
+/// adapters that bridge Python `SHA1Provider`s into the Rust trait.
+fn stat_result_to_info(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::dirstate::StatInfo> {
+    Ok(bazaar::dirstate::StatInfo {
+        mode: obj.getattr("st_mode")?.extract()?,
+        size: obj.getattr("st_size")?.extract()?,
+        mtime: obj.getattr("st_mtime")?.extract::<f64>()? as i64,
+        ctime: obj.getattr("st_ctime")?.extract::<f64>()? as i64,
+        dev: obj.getattr("st_dev")?.extract()?,
+        ino: obj.getattr("st_ino")?.extract()?,
+    })
+}
+
+/// Build the `Box<dyn SHA1Provider>` to hand to `DirState::new`.
+/// Recognises the pyo3 `SHA1Provider` pyclass (uses its inner Rust
+/// provider directly) and otherwise wraps the Python object in
+/// `PyCallbackSha1Provider`.
+fn sha1_provider_from_py(
+    py: Python<'_>,
+    obj: &Bound<PyAny>,
+) -> Box<dyn bazaar::dirstate::SHA1Provider + Send + Sync> {
+    let _ = py;
+    Box::new(PyCallbackSha1Provider {
+        obj: obj.clone().unbind(),
+    })
+}
+
+/// Convert a `&Path` to a Python object suitable for passing to
+/// `SHA1Provider.sha1`. On Unix, hand back raw bytes so non-utf8
+/// paths survive; on other platforms fall back to the path string.
+fn path_to_py<'py>(py: Python<'py>, path: &Path) -> PyResult<Bound<'py, PyAny>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        Ok(PyBytes::new(py, bytes).into_any())
+    }
+    #[cfg(not(unix))]
+    {
+        let s = path.to_string_lossy();
+        Ok(PyString::new(py, &s).into_any())
+    }
 }
 
 /// Python constants that [`DirStateRs`] uses in its scalar-state
@@ -993,10 +1100,23 @@ fn dirstate_change_to_pytuple<'py>(
             },
         ],
     )?;
+    // Python expects file_id=None for unversioned entries.  The Rust
+    // DirstateChange currently stores file_id as Vec<u8>, with an
+    // empty vec sentinel meaning "unversioned"; surface that as None
+    // here so the resulting InventoryTreeChange compares equal to
+    // what InterInventoryTree.iter_changes produces.
+    let file_id_obj = if change.file_id.is_empty()
+        && !change.old_versioned
+        && !change.new_versioned
+    {
+        py.None()
+    } else {
+        PyBytes::new(py, &change.file_id).into_any().unbind()
+    };
     PyTuple::new(
         py,
         [
-            PyBytes::new(py, &change.file_id).into_any().unbind(),
+            file_id_obj,
             path_tuple.into_any().unbind(),
             pyo3::types::PyBool::new(py, change.content_change)
                 .to_owned()
@@ -1095,6 +1215,7 @@ impl PyDirState {
         fdatasync = false,
     ))]
     fn new(
+        py: Python<'_>,
         path: &Bound<PyAny>,
         sha1_provider: Option<&Bound<PyAny>>,
         worth_saving_limit: i64,
@@ -1102,17 +1223,11 @@ impl PyDirState {
         fdatasync: bool,
     ) -> PyResult<Self> {
         let path = extract_path(path)?;
-        // Commit 1 only supports the default sha1 provider. Custom
-        // providers — whether the pyo3 SHA1Provider wrapper or an
-        // arbitrary Python callable — need a dedicated adapter, which
-        // is a follow-up commit.
-        if sha1_provider.is_some() {
-            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "custom sha1_provider is not yet wired through DirStateRs",
-            ));
-        }
         let provider: Box<dyn bazaar::dirstate::SHA1Provider + Send + Sync> =
-            Box::new(bazaar::dirstate::DefaultSHA1Provider::new());
+            match sha1_provider {
+                Some(obj) => sha1_provider_from_py(py, obj),
+                None => Box::new(bazaar::dirstate::DefaultSHA1Provider::new()),
+            };
         Ok(Self {
             inner: bazaar::dirstate::DirState::new(
                 path,
@@ -1125,26 +1240,17 @@ impl PyDirState {
     }
 
     /// On-disk filename the dirstate points at. Read-only; matches
-    /// Python's `DirState._filename` attribute.
+    /// Python's `DirState._filename` attribute, which is the ``str``
+    /// path returned by ``Transport.local_abspath`` (always str, on
+    /// every platform).
     #[getter]
-    fn filename<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        // Python stores `_filename` as bytes on POSIX and as str on
-        // Windows; we always return bytes for now, matching the
-        // POSIX-only branch that dirstate tests exercise.
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            Ok(PyBytes::new(py, self.inner.filename.as_os_str().as_bytes()))
-        }
-        #[cfg(not(unix))]
-        {
-            let s = self
-                .inner
-                .filename
-                .to_str()
-                .ok_or_else(|| PyTypeError::new_err("dirstate filename is not valid utf-8"))?;
-            Ok(PyBytes::new(py, s.as_bytes()))
-        }
+    fn filename<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyString>> {
+        let s = self
+            .inner
+            .filename
+            .to_str()
+            .ok_or_else(|| PyTypeError::new_err("dirstate filename is not valid utf-8"))?;
+        Ok(pyo3::types::PyString::new(py, s))
     }
 
     /// Header state flag matching Python's `_header_state` attribute.
@@ -1205,6 +1311,12 @@ impl PyDirState {
     #[setter]
     fn set_cutoff_time(&mut self, value: Option<i64>) {
         self.inner.cutoff_time = value;
+    }
+
+    /// Compute, cache, and return the SHA cutoff time (`now - 3`).
+    /// Mirrors Python's `DirState._sha_cutoff_time`.
+    fn compute_sha_cutoff_time(&mut self) -> i64 {
+        self.inner.compute_sha_cutoff_time()
     }
 
     /// Declared entry count from the header. Matches Python's
@@ -1421,7 +1533,15 @@ impl PyDirState {
                 st_dev,
                 st_ino,
             )
-            .map_err(|e| pyo3::exceptions::PyKeyError::new_err(format!("observed_sha1: {}", e)))?;
+            .map_err(|e| match e {
+                bazaar::dirstate::UpdateEntryError::EntryNotFound => {
+                    pyo3::exceptions::PyKeyError::new_err("observed_sha1: entry not found")
+                }
+                bazaar::dirstate::UpdateEntryError::Io(io) => {
+                    pyo3::exceptions::PyOSError::new_err(io.to_string())
+                }
+                other => pyo3::exceptions::PyRuntimeError::new_err(other.to_string()),
+            })?;
         match updated {
             None => Ok(None),
             Some(td) => Ok(Some(PyTuple::new(
@@ -1458,11 +1578,7 @@ impl PyDirState {
             basename: key.get_item(1)?.extract()?,
             file_id: key.get_item(2)?.extract()?,
         };
-        let abspath_bytes: Vec<u8> = if let Ok(b) = abspath.extract::<Vec<u8>>() {
-            b
-        } else {
-            abspath.extract::<String>()?.into_bytes()
-        };
+        let abspath_bytes: Vec<u8> = abspath.extract()?;
         // Unpack stat_value into a StatInfo — Python already did the
         // lstat, no need to double-stat.
         let stat = bazaar::dirstate::StatInfo {
@@ -1555,14 +1671,7 @@ impl PyDirState {
         for t in trees_any.try_iter()? {
             let tt = t?.cast_into::<PyTuple>()?;
             let mk_bytes: Vec<u8> = tt.get_item(0)?.extract()?;
-            let minikind =
-                bazaar::dirstate::Kind::from_minikind(mk_bytes.first().copied().unwrap_or(0))
-                    .map_err(|b| {
-                        pyo3::exceptions::PyValueError::new_err(format!(
-                            "invalid minikind byte {:?}",
-                            b
-                        ))
-                    })?;
+            let minikind = decode_minikind(&mk_bytes)?;
             entry_trees.push(bazaar::dirstate::TreeData {
                 minikind,
                 fingerprint: tt.get_item(1)?.extract()?,
@@ -1586,14 +1695,7 @@ impl PyDirState {
                     Some(kind_obj.extract::<osutils::Kind>()?)
                 };
                 let stat_obj = pt.get_item(3)?;
-                let abspath: Vec<u8> = {
-                    let a = pt.get_item(4)?;
-                    if let Ok(b) = a.extract::<Vec<u8>>() {
-                        b
-                    } else {
-                        a.extract::<String>()?.into_bytes()
-                    }
-                };
+                let abspath: Vec<u8> = pt.get_item(4)?.extract()?;
                 let stat = bazaar::dirstate::StatInfo {
                     mode: stat_obj.getattr("st_mode")?.extract()?,
                     size: stat_obj.getattr("st_size")?.extract()?,
@@ -1645,6 +1747,7 @@ impl PyDirState {
             bazaar::dirstate::LockState::Read,
         );
 
+        let dirstate_path = self.inner.filename.to_string_lossy().into_owned();
         let (change, changed) = self
             .inner
             .process_entry(
@@ -1656,13 +1759,10 @@ impl PyDirState {
             )
             .map_err(|e| match e {
                 bazaar::dirstate::ProcessEntryError::DirstateCorrupt(msg) => {
-                    // `bzrformats.dirstate` re-exports its own
-                    // DirstateCorrupt subclass; breezy tests catch
-                    // that specific class, not the generic one in
-                    // bzrformats.errors.
-                    let ds_mod = py.import("bzrformats.dirstate").unwrap();
-                    let cls = ds_mod.getattr("DirstateCorrupt").unwrap();
-                    PyErr::from_value(cls.call1(("<unknown>", msg)).unwrap())
+                    DirstateCorrupt::new_err((dirstate_path, msg))
+                }
+                bazaar::dirstate::ProcessEntryError::BadFileKind { path, mode } => {
+                    bad_file_kind_error(py, &path, mode)
                 }
                 bazaar::dirstate::ProcessEntryError::Internal(msg) => {
                     pyo3::exceptions::PyAssertionError::new_err(msg)
@@ -1689,8 +1789,14 @@ impl PyDirState {
     /// pointer immediately after the fifth newline — the position
     /// where the first dirblock record begins.  The caller must hold
     /// a read or write lock and must have positioned the file at the
-    /// start of the header.
-    fn read_header_from_file(&mut self, state_file: &Bound<PyAny>) -> PyResult<()> {
+    /// start of the header.  `state` is forwarded into the
+    /// `DirstateCorrupt(state, msg)` exception so callers can inspect
+    /// which dirstate failed to parse.
+    fn read_header_from_file(
+        &mut self,
+        state: &Bound<PyAny>,
+        state_file: &Bound<PyAny>,
+    ) -> PyResult<()> {
         let mut data: Vec<u8> = Vec::new();
         for _ in 0..5 {
             let line = state_file.call_method0("readline")?;
@@ -1699,7 +1805,7 @@ impl PyDirState {
         }
         self.inner
             .read_header(&data)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
+            .map_err(|e| DirstateCorrupt::new_err((state.clone().unbind(), e.to_string())))
     }
 
     /// Bisect for rows at the given paths. Mirrors Python's
@@ -1711,6 +1817,7 @@ impl PyDirState {
     fn bisect<'py>(
         &self,
         py: Python<'py>,
+        state: &Bound<PyAny>,
         state_file: &Bound<PyAny>,
         file_size: u64,
         paths: &Bound<PyAny>,
@@ -1720,7 +1827,7 @@ impl PyDirState {
         let found = self
             .inner
             .bisect(rust_paths, file_size, read_range)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("bisect failed: {}", e)))?;
+            .map_err(|e| bisect_err_to_py(state, e))?;
         bisect_result_to_pydict(py, &found)
     }
 
@@ -1729,6 +1836,7 @@ impl PyDirState {
     fn bisect_dirblocks<'py>(
         &self,
         py: Python<'py>,
+        state: &Bound<PyAny>,
         state_file: &Bound<PyAny>,
         file_size: u64,
         dir_list: &Bound<PyAny>,
@@ -1738,9 +1846,7 @@ impl PyDirState {
         let found = self
             .inner
             .bisect_dirblocks(rust_dirs, file_size, read_range)
-            .map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!("bisect_dirblocks failed: {}", e))
-            })?;
+            .map_err(|e| bisect_err_to_py(state, e))?;
         bisect_result_to_pydict(py, &found)
     }
 
@@ -1751,6 +1857,7 @@ impl PyDirState {
     fn bisect_recursive<'py>(
         &self,
         py: Python<'py>,
+        state: &Bound<PyAny>,
         state_file: &Bound<PyAny>,
         file_size: u64,
         paths: &Bound<PyAny>,
@@ -1760,9 +1867,7 @@ impl PyDirState {
         let found = self
             .inner
             .bisect_recursive(rust_paths, file_size, read_range)
-            .map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!("bisect_recursive failed: {}", e))
-            })?;
+            .map_err(|e| bisect_err_to_py(state, e))?;
         let out = PyDict::new(py);
         for ((dn, bn, fid), trees) in &found {
             let key = PyTuple::new(
@@ -2336,7 +2441,7 @@ impl PyDirState {
         file_id: &[u8],
         kind: osutils::Kind,
         stat: Option<&Bound<PyAny>>,
-        fingerprint: &[u8],
+        fingerprint: Option<&[u8]>,
     ) -> PyResult<()> {
         let stat_info: Option<bazaar::dirstate::StatInfo> = match stat {
             None => None,
@@ -2352,7 +2457,7 @@ impl PyDirState {
         };
         match self
             .inner
-            .add_path(path, file_id, kind, stat_info, fingerprint)
+            .add_path(path, file_id, kind, stat_info, fingerprint.unwrap_or(b""))
         {
             Ok(()) => Ok(()),
             Err(e) => Err(add_error_to_py(py, e)),
@@ -2777,6 +2882,20 @@ impl PyDirState {
         Ok(out)
     }
 
+    /// Materialise every entry across every dirblock as a list of
+    /// `((dirname, basename, file_id), [tree_tuple, ...])` tuples in
+    /// dirblock order.  Mirrors Python's `_iter_entries`, but does the
+    /// marshalling once instead of once per dirblock access — call
+    /// once and iterate the returned list, do not re-call inside a
+    /// loop.
+    fn entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        for entry in self.inner.iter_entries() {
+            out.append(entry_to_py_tuple(py, entry)?)?;
+        }
+        Ok(out)
+    }
+
     /// Build a lazy `IterChanges` iterator.  Wraps the pure-crate
     /// `IterChangesIter` state machine; call repeatedly via
     /// `__next__` to drain one `DirstateInventoryChange`-shaped tuple
@@ -2804,11 +2923,7 @@ impl PyDirState {
     ) -> PyResult<IterChanges> {
         let search: std::collections::HashSet<Vec<u8>> = collect_bytes_set(search_specific_files)?;
         let partial = !(search.len() == 1 && search.contains(&Vec::<u8>::new()));
-        let root_abspath_bytes: Vec<u8> = if let Ok(b) = root_abspath.extract::<Vec<u8>>() {
-            b
-        } else {
-            root_abspath.extract::<String>()?.into_bytes()
-        };
+        let root_abspath_bytes: Vec<u8> = root_abspath.extract()?;
         let pstate = bazaar::dirstate::ProcessEntryState {
             source_index,
             target_index,
@@ -3004,11 +3119,13 @@ impl IterChanges {
             ref mut pstate,
             ..
         } = *slf;
-        let result = {
+        let (result, dirstate_path) = {
             let mut state_ref = dirstate.borrow_mut(py);
-            state_ref
+            let path = state_ref.inner.filename.to_string_lossy().into_owned();
+            let r = state_ref
                 .inner
-                .iter_changes_next(iter_state, pstate, &transport)
+                .iter_changes_next(iter_state, pstate, &transport);
+            (r, path)
         };
         match result {
             Ok(Some(change)) => {
@@ -3019,9 +3136,10 @@ impl IterChanges {
             }
             Ok(None) => Ok(None),
             Err(bazaar::dirstate::ProcessEntryError::DirstateCorrupt(msg)) => {
-                let ds_mod = py.import("bzrformats.dirstate")?;
-                let cls = ds_mod.getattr("DirstateCorrupt")?;
-                Err(PyErr::from_value(cls.call1(("<unknown>", msg))?))
+                Err(DirstateCorrupt::new_err((dirstate_path, msg)))
+            }
+            Err(bazaar::dirstate::ProcessEntryError::BadFileKind { path, mode }) => {
+                Err(bad_file_kind_error(py, &path, mode))
             }
             Err(bazaar::dirstate::ProcessEntryError::Internal(msg)) => {
                 Err(pyo3::exceptions::PyAssertionError::new_err(msg))
@@ -3210,7 +3328,7 @@ pub fn _dirstate_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(inv_entry_to_details))?;
     m.add_wrapped(wrap_pyfunction!(get_output_lines))?;
 
-    // Register dirstate helper functions (_read_dirblocks, update_entry, ProcessEntryC)
+    // Register dirstate helper functions (_read_dirblocks, entry_to_line).
     crate::dirstate_helpers::register(&m)?;
 
     Ok(m)

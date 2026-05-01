@@ -77,12 +77,12 @@ fn hexlify_sha1(bin: &[u8; 20]) -> [u8; 40] {
 /// Convert a key tuple of the form (b'sha1:xxxx...',) to 20-byte binary sha1.
 /// Returns None if the key is not a valid sha1 key.
 fn key_to_sha1(key: &Bound<PyAny>) -> Option<[u8; 20]> {
-    let tuple: &Bound<PyTuple> = key.downcast().ok()?;
+    let tuple: &Bound<PyTuple> = key.cast().ok()?;
     if tuple.len() != 1 {
         return None;
     }
     let item = tuple.get_item(0).ok()?;
-    let bytes_obj: &Bound<PyBytes> = item.downcast().ok()?;
+    let bytes_obj: &Bound<PyBytes> = item.cast().ok()?;
     let data = bytes_obj.as_bytes();
     if data.len() != 45 || !data.starts_with(b"sha1:") {
         return None;
@@ -610,7 +610,7 @@ fn _parse_into_chk(
         ));
     }
     let bytes_obj: &Bound<PyBytes> = data
-        .downcast()
+        .cast()
         .map_err(|_| PyTypeError::new_err("We only support parsing byte strings."))?;
     GCCHKSHA1LeafNode::new(bytes_obj)
 }
@@ -646,7 +646,7 @@ fn _flatten_node<'py>(
     // Build string_key from node[1] (key tuple joined by \0)
     let key_tuple = node.get_item(1)?;
     let key_tuple: &Bound<PyTuple> = key_tuple
-        .downcast()
+        .cast()
         .map_err(|_| PyTypeError::new_err("Expected a tuple for key"))?;
     let mut string_key_bytes: Vec<u8> = Vec::new();
     for i in 0..key_tuple.len() {
@@ -655,14 +655,14 @@ fn _flatten_node<'py>(
         }
         let item = key_tuple.get_item(i)?;
         let b: &Bound<PyBytes> = item
-            .downcast()
+            .cast()
             .map_err(|_| PyTypeError::new_err("Expected bytes for key part"))?;
         string_key_bytes.extend_from_slice(b.as_bytes());
     }
 
     // Get value from node[2]
     let val_obj = node.get_item(2)?;
-    let val_bytes: &Bound<PyBytes> = val_obj.downcast().map_err(|_| {
+    let val_bytes: &Bound<PyBytes> = val_obj.cast().map_err(|_| {
         PyTypeError::new_err(format!(
             "Expected bytes for value not: {:?}",
             val_obj.get_type()
@@ -686,7 +686,7 @@ fn _flatten_node<'py>(
                 if ref_idx > 0 {
                     refs_bytes.push(b'\r');
                 }
-                let reference: &Bound<'py, PyTuple> = reference_obj.downcast().map_err(|_| {
+                let reference: &Bound<'py, PyTuple> = reference_obj.cast().map_err(|_| {
                     PyTypeError::new_err(format!(
                         "We expect references to be tuples not: {:?}",
                         reference_obj.get_type()
@@ -697,7 +697,7 @@ fn _flatten_node<'py>(
                         refs_bytes.push(0);
                     }
                     let ref_bit = reference.get_item(k)?;
-                    let ref_bit_bytes: &Bound<'py, PyBytes> = ref_bit.downcast().map_err(|_| {
+                    let ref_bit_bytes: &Bound<'py, PyBytes> = ref_bit.cast().map_err(|_| {
                         PyTypeError::new_err(format!(
                             "We expect reference bits to be bytes not: {:?}",
                             ref_bit.get_type()
@@ -743,7 +743,7 @@ fn _py_unhexlify<'py>(
     as_hex: &Bound<PyAny>,
 ) -> PyResult<Option<Bound<'py, PyBytes>>> {
     let bytes_obj: &Bound<PyBytes> = as_hex
-        .downcast()
+        .cast()
         .map_err(|_| PyValueError::new_err("not a 40-byte hex digest"))?;
     let data = bytes_obj.as_bytes();
     if data.len() != 40 {
