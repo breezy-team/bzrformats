@@ -61,6 +61,9 @@ pub enum IndexError {
     /// A node line referenced a byte offset that couldn't be parsed as an
     /// integer.
     BadReferenceOffset(Vec<u8>),
+    /// Catch-all for runtime errors — bad input keys, IO failures from a
+    /// transport, missing trailers, etc.
+    Other(String),
 }
 
 impl std::fmt::Display for IndexError {
@@ -80,6 +83,7 @@ impl std::fmt::Display for IndexError {
             IndexError::BadReferenceOffset(s) => {
                 write!(f, "bad reference offset: {:?}", s)
             }
+            IndexError::Other(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -380,6 +384,313 @@ pub fn serialize_graph_index(
         }
     }
     Ok(out)
+}
+
+/// Minimal byte-store interface a [`GraphIndex`] needs to read its backing
+/// file. The full-load path uses only [`IndexTransport::get_bytes`]; the
+/// bisection path (not yet ported) will additionally use a `readv`-style
+/// method.
+///
+/// Mirrors the slice of `bzrformats.transport.Transport` that
+/// `GraphIndex` actually calls. Kept narrow on purpose so test fixtures
+/// and pyo3 adapters don't have to implement methods the index logic
+/// will never invoke.
+pub trait IndexTransport {
+    /// Read the full contents of `path` and return them as a byte vector.
+    fn get_bytes(&self, path: &str) -> Result<Vec<u8>, IndexError>;
+
+    /// Resolve `path` relative to the transport root. Used only for
+    /// diagnostic messages — implementations may simply return `path`.
+    fn abspath(&self, path: &str) -> String {
+        path.to_string()
+    }
+}
+
+/// Errors specific to `GraphIndex` operations beyond
+/// signature/format issues already covered by [`IndexError`]. These are
+/// folded into [`IndexError`] via the `Other` variant if needed.
+impl IndexError {
+    fn missing_trailer() -> Self {
+        IndexError::Other("BadIndexData: missing trailer".to_string())
+    }
+}
+
+/// One reference list (a list of keys), resolved from byte offsets.
+pub type RefList = Vec<IndexKey>;
+
+/// All reference lists for a single node, in declared order.
+pub type RefLists = Vec<RefList>;
+
+/// A `(value, reference lists)` pair stored against each present key.
+pub type NodeBody = (Vec<u8>, RefLists);
+
+/// One emitted entry: `(key, value, reference lists)`.
+pub type IndexEntry = (IndexKey, Vec<u8>, RefLists);
+
+/// A prefix tuple for [`GraphIndex::iter_entries_prefix`]. `None` slots
+/// match any key element at that position.
+pub type KeyPrefix = Vec<Option<Vec<u8>>>;
+
+/// A read-only graph index opened on a [`IndexTransport`]-backed file.
+///
+/// This is the full-load implementation: the first method that needs
+/// data calls [`GraphIndex::buffer_all`], which reads the entire file
+/// into memory and resolves every node's reference offsets to keys. The
+/// bisection-driven partial-read path stays in Python for now.
+pub struct GraphIndex<T: IndexTransport> {
+    transport: T,
+    name: String,
+    base_offset: u64,
+    /// Parsed node table — `key -> (value, resolved reference lists)`.
+    /// `None` until [`GraphIndex::buffer_all`] has been called.
+    nodes: Option<HashMap<IndexKey, NodeBody>>,
+    /// Header metadata. `None` until the file has been read at least
+    /// once.
+    header: Option<IndexHeader>,
+}
+
+impl<T: IndexTransport> GraphIndex<T> {
+    /// Open an index on `transport` at `name`. Pass `base_offset` if the
+    /// index lives at a non-zero offset within the underlying file (the
+    /// pack-file case).
+    pub fn new(transport: T, name: impl Into<String>, base_offset: u64) -> Self {
+        Self {
+            transport,
+            name: name.into(),
+            base_offset,
+            nodes: None,
+            header: None,
+        }
+    }
+
+    /// Read the entire backing file, parse it, and resolve every
+    /// reference offset to its key. Idempotent — subsequent calls are
+    /// cheap no-ops.
+    pub fn buffer_all(&mut self) -> Result<(), IndexError> {
+        if self.nodes.is_some() {
+            return Ok(());
+        }
+        let raw = self.transport.get_bytes(&self.name)?;
+        let data = if self.base_offset == 0 {
+            raw
+        } else {
+            raw[self.base_offset as usize..].to_vec()
+        };
+        let header = parse_header(&data)?;
+        let body = &data[header.header_end..];
+        // Mirrors Python: split on b"\n", drop the trailing empty
+        // segment that follows the final newline. parse_lines counts
+        // trailer (empty) lines and we require exactly one.
+        let mut segments: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
+        segments.pop();
+        let parsed = parse_lines(&segments, header.header_end as u64, header.key_length)?;
+        if parsed.trailers != 1 {
+            return Err(IndexError::missing_trailer());
+        }
+        // Build a fast offset->key map for resolving ref offsets to keys.
+        let mut offset_to_key: HashMap<u64, IndexKey> = HashMap::new();
+        for (offset, raw_node) in &parsed.keys_by_offset {
+            offset_to_key.insert(*offset, raw_node.key.clone());
+        }
+        let mut nodes: HashMap<IndexKey, (Vec<u8>, Vec<Vec<IndexKey>>)> = HashMap::new();
+        let node_ref_lists = header.node_ref_lists;
+        for (offset, raw_node) in parsed.keys_by_offset.into_iter() {
+            let _ = offset;
+            if raw_node.absent {
+                continue;
+            }
+            // parse_lines always emits at least one (possibly empty)
+            // reference list, even when the index header says 0 — the
+            // tab-split sees `[""]`. Truncate to the declared count.
+            let resolved = if node_ref_lists == 0 {
+                Vec::new()
+            } else {
+                let mut out: Vec<Vec<IndexKey>> = Vec::with_capacity(node_ref_lists);
+                for ref_list in &raw_node.ref_offsets {
+                    let mut list: Vec<IndexKey> = Vec::with_capacity(ref_list.len());
+                    for off in ref_list {
+                        let k = offset_to_key.get(off).ok_or_else(|| {
+                            IndexError::Other(format!("unresolved reference offset {}", off))
+                        })?;
+                        list.push(k.clone());
+                    }
+                    out.push(list);
+                }
+                out
+            };
+            nodes.insert(raw_node.key, (raw_node.value, resolved));
+        }
+        self.nodes = Some(nodes);
+        self.header = Some(header);
+        Ok(())
+    }
+
+    /// Number of keys in the index. Triggers a full load on first call.
+    pub fn key_count(&mut self) -> Result<usize, IndexError> {
+        if let Some(h) = &self.header {
+            return Ok(h.key_count);
+        }
+        self.buffer_all()?;
+        Ok(self
+            .header
+            .as_ref()
+            .expect("header set by buffer_all")
+            .key_count)
+    }
+
+    /// Number of parallel reference lists each present node carries.
+    /// Triggers a full load on first call.
+    pub fn node_ref_lists(&mut self) -> Result<usize, IndexError> {
+        if let Some(h) = &self.header {
+            return Ok(h.node_ref_lists);
+        }
+        self.buffer_all()?;
+        Ok(self
+            .header
+            .as_ref()
+            .expect("header set by buffer_all")
+            .node_ref_lists)
+    }
+
+    /// Number of bytestrings in each key tuple. Triggers a full load on
+    /// first call.
+    pub fn key_length(&mut self) -> Result<usize, IndexError> {
+        if let Some(h) = &self.header {
+            return Ok(h.key_length);
+        }
+        self.buffer_all()?;
+        Ok(self
+            .header
+            .as_ref()
+            .expect("header set by buffer_all")
+            .key_length)
+    }
+
+    /// Iterate over every present entry as `(key, value, resolved
+    /// reference lists)`. Order is unspecified — the Python equivalent
+    /// is also unordered (HashMap iteration).
+    pub fn iter_all_entries(
+        &mut self,
+    ) -> Result<Vec<IndexEntry>, IndexError> {
+        self.buffer_all()?;
+        let nodes = self.nodes.as_ref().expect("buffer_all populated nodes");
+        Ok(nodes
+            .iter()
+            .map(|(k, (v, r))| (k.clone(), v.clone(), r.clone()))
+            .collect())
+    }
+
+    /// Iterate over only the entries whose key is in `keys`. Missing
+    /// keys are silently skipped, matching Python.
+    pub fn iter_entries(
+        &mut self,
+        keys: &[IndexKey],
+    ) -> Result<Vec<IndexEntry>, IndexError> {
+        self.buffer_all()?;
+        let nodes = self.nodes.as_ref().expect("buffer_all populated nodes");
+        let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<&IndexKey> = std::collections::HashSet::new();
+        for k in keys {
+            if !seen.insert(k) {
+                continue;
+            }
+            if let Some((v, r)) = nodes.get(k) {
+                out.push((k.clone(), v.clone(), r.clone()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Iterate over entries matching one of the given key prefixes. A
+    /// prefix is a tuple the same length as a key with trailing
+    /// elements set to `None`. The first element must not be `None`.
+    pub fn iter_entries_prefix(
+        &mut self,
+        prefixes: &[KeyPrefix],
+    ) -> Result<Vec<IndexEntry>, IndexError> {
+        self.buffer_all()?;
+        let key_length = self.header.as_ref().expect("header").key_length;
+        for p in prefixes {
+            if p.len() != key_length {
+                return Err(IndexError::Other(format!(
+                    "BadIndexKey: prefix length {} != key length {}",
+                    p.len(),
+                    key_length
+                )));
+            }
+            if !matches!(p.first(), Some(Some(_))) {
+                return Err(IndexError::Other(
+                    "BadIndexKey: first prefix element may not be None".to_string(),
+                ));
+            }
+        }
+        let nodes = self.nodes.as_ref().expect("buffer_all populated nodes");
+        // Fast path for length-1 keys: a prefix with no None elements is
+        // just an exact lookup.
+        if key_length == 1 {
+            return self.iter_entries(
+                &prefixes
+                    .iter()
+                    .map(|p| {
+                        p.iter()
+                            .map(|e| e.clone().expect("validated above"))
+                            .collect::<IndexKey>()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let mut out = Vec::new();
+        let mut emitted: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        for prefix in prefixes {
+            for (k, (v, r)) in nodes.iter() {
+                if k.len() != key_length {
+                    continue;
+                }
+                let matches = prefix.iter().zip(k.iter()).all(|(p_elem, k_elem)| match p_elem {
+                    Some(p) => p == k_elem,
+                    None => true,
+                });
+                if matches && emitted.insert(k.clone()) {
+                    out.push((k.clone(), v.clone(), r.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reference keys not present in the index, drawn from
+    /// reference list `ref_list_num`. Triggers a full load.
+    pub fn external_references(
+        &mut self,
+        ref_list_num: usize,
+    ) -> Result<std::collections::HashSet<IndexKey>, IndexError> {
+        self.buffer_all()?;
+        let header = self.header.as_ref().expect("header");
+        if ref_list_num + 1 > header.node_ref_lists {
+            return Err(IndexError::Other(format!(
+                "No ref list {}, index has {} ref lists",
+                ref_list_num, header.node_ref_lists
+            )));
+        }
+        let nodes = self.nodes.as_ref().expect("nodes");
+        let mut refs = std::collections::HashSet::new();
+        for (_k, (_v, ref_lists)) in nodes.iter() {
+            let list = &ref_lists[ref_list_num];
+            for r in list {
+                if !nodes.contains_key(r) {
+                    refs.insert(r.clone());
+                }
+            }
+        }
+        Ok(refs)
+    }
+
+    /// Validate the index — currently this just walks every entry,
+    /// matching Python's `iter_all_entries`-based check.
+    pub fn validate(&mut self) -> Result<(), IndexError> {
+        self.buffer_all()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -859,5 +1170,270 @@ mod tests {
         assert!(body.starts_with(b"a\x00\x00\x001"));
         assert!(body.windows(5).any(|w| w == b"b\x00\x00\x002"));
         assert!(body.windows(5).any(|w| w == b"c\x00\x00\x003"));
+    }
+
+    struct MemTransport {
+        files: std::collections::HashMap<String, Vec<u8>>,
+    }
+
+    impl MemTransport {
+        fn new() -> Self {
+            Self {
+                files: std::collections::HashMap::new(),
+            }
+        }
+
+        fn put(&mut self, path: &str, bytes: Vec<u8>) {
+            self.files.insert(path.to_string(), bytes);
+        }
+    }
+
+    impl IndexTransport for MemTransport {
+        fn get_bytes(&self, path: &str) -> Result<Vec<u8>, IndexError> {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| IndexError::Other(format!("NoSuchFile: {}", path)))
+        }
+    }
+
+    fn build_index(nodes: &[IndexNode], reference_lists: usize, key_elements: usize) -> Vec<u8> {
+        serialize_graph_index(nodes, reference_lists, key_elements).unwrap()
+    }
+
+    #[test]
+    fn graph_index_buffer_all_no_refs() {
+        let bytes = build_index(
+            &[
+                node(&[b"a"], false, vec![], b"v1"),
+                node(&[b"b"], false, vec![], b"v2"),
+            ],
+            0,
+            1,
+        );
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        assert_eq!(idx.key_count().unwrap(), 2);
+        assert_eq!(idx.node_ref_lists().unwrap(), 0);
+        let mut entries = idx.iter_all_entries().unwrap();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            entries,
+            vec![
+                (key(&[b"a"]), b"v1".to_vec(), vec![]),
+                (key(&[b"b"]), b"v2".to_vec(), vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_index_resolves_references() {
+        let bytes = build_index(
+            &[
+                node(&[b"a"], false, vec![vec![]], b"v1"),
+                node(&[b"b"], false, vec![vec![key(&[b"a"])]], b"v2"),
+            ],
+            1,
+            1,
+        );
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        let mut entries = idx.iter_all_entries().unwrap();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            entries,
+            vec![
+                (key(&[b"a"]), b"v1".to_vec(), vec![vec![]]),
+                (key(&[b"b"]), b"v2".to_vec(), vec![vec![key(&[b"a"])]],),
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_index_iter_entries_filters_to_requested_keys() {
+        let bytes = build_index(
+            &[
+                node(&[b"a"], false, vec![], b"v1"),
+                node(&[b"b"], false, vec![], b"v2"),
+                node(&[b"c"], false, vec![], b"v3"),
+            ],
+            0,
+            1,
+        );
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        let mut entries = idx
+            .iter_entries(&[key(&[b"a"]), key(&[b"missing"]), key(&[b"c"])])
+            .unwrap();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            entries,
+            vec![
+                (key(&[b"a"]), b"v1".to_vec(), vec![]),
+                (key(&[b"c"]), b"v3".to_vec(), vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_index_iter_entries_dedupes_repeated_keys() {
+        let bytes = build_index(&[node(&[b"a"], false, vec![], b"v1")], 0, 1);
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        let entries = idx.iter_entries(&[key(&[b"a"]), key(&[b"a"])]).unwrap();
+        assert_eq!(entries, vec![(key(&[b"a"]), b"v1".to_vec(), vec![])]);
+    }
+
+    #[test]
+    fn graph_index_external_references() {
+        // `a` references `missing` (which is recorded as absent) — that
+        // counts as external. `b` references `a` — that's internal.
+        let bytes = build_index(
+            &[
+                node(&[b"a"], false, vec![vec![key(&[b"missing"])]], b"v1"),
+                node(&[b"missing"], true, vec![], b""),
+                node(&[b"b"], false, vec![vec![key(&[b"a"])]], b"v2"),
+            ],
+            1,
+            1,
+        );
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        let externals = idx.external_references(0).unwrap();
+        let expected: std::collections::HashSet<IndexKey> =
+            vec![key(&[b"missing"])].into_iter().collect();
+        assert_eq!(externals, expected);
+    }
+
+    #[test]
+    fn graph_index_external_references_rejects_invalid_ref_list() {
+        let bytes = build_index(&[node(&[b"a"], false, vec![], b"v1")], 0, 1);
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        let err = idx.external_references(0).unwrap_err();
+        assert_eq!(
+            err,
+            IndexError::Other("No ref list 0, index has 0 ref lists".to_string())
+        );
+    }
+
+    #[test]
+    fn graph_index_iter_entries_prefix_one_element() {
+        let bytes = build_index(
+            &[
+                node(&[b"a"], false, vec![], b"v1"),
+                node(&[b"b"], false, vec![], b"v2"),
+            ],
+            0,
+            1,
+        );
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        // Length-1 prefix is just an exact lookup.
+        let entries = idx
+            .iter_entries_prefix(&[vec![Some(b"a".to_vec())]])
+            .unwrap();
+        assert_eq!(entries, vec![(key(&[b"a"]), b"v1".to_vec(), vec![])]);
+    }
+
+    #[test]
+    fn graph_index_iter_entries_prefix_multi_element() {
+        let bytes = build_index(
+            &[
+                node(&[b"foo", b"bar"], false, vec![], b"v1"),
+                node(&[b"foo", b"baz"], false, vec![], b"v2"),
+                node(&[b"qux", b"bar"], false, vec![], b"v3"),
+            ],
+            0,
+            2,
+        );
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        // `(foo, None)` should match both foo entries.
+        let mut entries = idx
+            .iter_entries_prefix(&[vec![Some(b"foo".to_vec()), None]])
+            .unwrap();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            entries,
+            vec![
+                (key(&[b"foo", b"bar"]), b"v1".to_vec(), vec![]),
+                (key(&[b"foo", b"baz"]), b"v2".to_vec(), vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_index_iter_entries_prefix_rejects_none_first_element() {
+        let bytes = build_index(&[node(&[b"a"], false, vec![], b"v1")], 0, 1);
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        let err = idx.iter_entries_prefix(&[vec![None]]).unwrap_err();
+        assert_eq!(
+            err,
+            IndexError::Other("BadIndexKey: first prefix element may not be None".to_string())
+        );
+    }
+
+    #[test]
+    fn graph_index_validate_ok_for_well_formed_index() {
+        let bytes = build_index(&[node(&[b"a"], false, vec![], b"v")], 0, 1);
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        idx.validate().unwrap();
+    }
+
+    #[test]
+    fn graph_index_buffer_all_idempotent() {
+        let bytes = build_index(&[node(&[b"a"], false, vec![], b"v")], 0, 1);
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        idx.buffer_all().unwrap();
+        idx.buffer_all().unwrap();
+        assert_eq!(idx.key_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn graph_index_missing_trailer_is_error() {
+        // Build a header but truncate the trailing newline so the
+        // empty-trailer count comes out wrong.
+        let mut bytes = build_index(&[node(&[b"a"], false, vec![], b"v")], 0, 1);
+        // The serializer ends the file with `\n\n`. Drop the final \n
+        // so `parse_lines` sees zero trailers.
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        bytes.pop();
+        let mut t = MemTransport::new();
+        t.put("idx", bytes);
+        let mut idx = GraphIndex::new(t, "idx", 0);
+        let err = idx.buffer_all().unwrap_err();
+        assert_eq!(
+            err,
+            IndexError::Other("BadIndexData: missing trailer".to_string())
+        );
+    }
+
+    #[test]
+    fn graph_index_respects_base_offset() {
+        let inner = build_index(&[node(&[b"a"], false, vec![], b"v")], 0, 1);
+        let mut wrapped = b"junk-before-header".to_vec();
+        let prefix_len = wrapped.len() as u64;
+        wrapped.extend_from_slice(&inner);
+        let mut t = MemTransport::new();
+        t.put("idx", wrapped);
+        let mut idx = GraphIndex::new(t, "idx", prefix_len);
+        assert_eq!(idx.key_count().unwrap(), 1);
+        let entries = idx.iter_all_entries().unwrap();
+        assert_eq!(entries, vec![(key(&[b"a"]), b"v".to_vec(), vec![])]);
     }
 }
