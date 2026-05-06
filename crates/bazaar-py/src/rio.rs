@@ -352,12 +352,57 @@ fn rio_iter<'a>(
     PyIterator::from_object(&ret)
 }
 
+#[pyfunction]
+#[pyo3(signature = (stanza, max_width = 72))]
+fn to_patch_lines<'a>(
+    py: Python<'a>,
+    stanza: &Stanza,
+    max_width: usize,
+) -> PyResult<Bound<'a, PyList>> {
+    let lines = bazaar::rio::to_patch_lines(&stanza.stanza, max_width).map_err(|e| match e {
+        bazaar::rio::Error::Other(msg) => PyErr::new::<PyValueError, _>(msg),
+        bazaar::rio::Error::Io(e) => PyErr::new::<PyIOError, _>(e.to_string()),
+        _ => PyErr::new::<PyValueError, _>("Error generating patch lines".to_string()),
+    })?;
+    let ret = PyList::empty(py);
+    for line in lines {
+        ret.append(PyBytes::new(py, &line))?;
+    }
+    Ok(ret)
+}
+
+#[pyfunction]
+fn read_patch_stanza(line_iter: &Bound<PyAny>) -> PyResult<Option<Stanza>> {
+    let py_iter = line_iter.try_iter()?;
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    for item in py_iter {
+        let item = item?;
+        lines.push(item.extract::<Vec<u8>>()?);
+    }
+    let stanza = bazaar::rio::read_patch_stanza(lines).map_err(|e| match e {
+        bazaar::rio::Error::Io(e) => PyErr::new::<PyIOError, _>(e.to_string()),
+        bazaar::rio::Error::InvalidTag(t) => {
+            PyErr::new::<PyValueError, _>(format!("invalid tag: {}", t))
+        }
+        bazaar::rio::Error::ContinuationLineWithoutTag => {
+            PyErr::new::<PyValueError, _>("continuation line without tag".to_string())
+        }
+        bazaar::rio::Error::TagValueSeparatorNotFound(_) => {
+            PyErr::new::<PyValueError, _>("tag/value separator not found".to_string())
+        }
+        bazaar::rio::Error::Other(msg) => PyErr::new::<PyValueError, _>(msg),
+    })?;
+    Ok(stanza.map(|stanza| Stanza { stanza }))
+}
+
 pub(crate) fn rio(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(valid_tag))?;
     m.add_wrapped(wrap_pyfunction!(read_stanza))?;
     m.add_wrapped(wrap_pyfunction!(read_stanza_file))?;
     m.add_wrapped(wrap_pyfunction!(read_stanzas))?;
     m.add_wrapped(wrap_pyfunction!(rio_iter))?;
+    m.add_wrapped(wrap_pyfunction!(to_patch_lines))?;
+    m.add_wrapped(wrap_pyfunction!(read_patch_stanza))?;
 
     m.add_class::<Stanza>()?;
     m.add_class::<RioReader>()?;

@@ -354,6 +354,196 @@ pub fn rio_iter(
     lines.into_iter()
 }
 
+/// Convert a stanza into RIO-Patch format lines.
+///
+/// RIO-Patch is a RIO variant designed to be e-mailed as part of a patch.
+/// It resists common forms of damage such as newline conversion or the
+/// removal of trailing whitespace, yet is also reasonably easy to read.
+pub fn to_patch_lines(stanza: &Stanza, max_width: usize) -> Result<Vec<Vec<u8>>, Error> {
+    if max_width <= 6 {
+        return Err(Error::Other(format!("max_width too small: {}", max_width)));
+    }
+    let max_rio_width = max_width - 4;
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    for pline in stanza.to_lines() {
+        let pbytes = pline.into_bytes();
+        // Equivalent of pline.split(b"\n")[:-1]: split on \n and drop the
+        // trailing empty segment that follows the final newline. If pbytes
+        // does not end with \n we still drop the last segment, matching
+        // Python's behaviour.
+        let mut segments: Vec<&[u8]> = pbytes.split(|&b| b == b'\n').collect();
+        segments.pop();
+        for segment in segments {
+            // Escape backslashes.
+            let mut line: Vec<u8> = Vec::with_capacity(segment.len());
+            for &b in segment {
+                if b == b'\\' {
+                    line.extend_from_slice(b"\\\\");
+                } else {
+                    line.push(b);
+                }
+            }
+            while !line.is_empty() {
+                let split_at = std::cmp::min(max_rio_width, line.len());
+                let mut partline = line[..split_at].to_vec();
+                let mut rest = line[split_at..].to_vec();
+                // The Python implementation has `if len(line) > 0 and
+                // line[:1] != [b" "]` which is always true (comparing bytes
+                // to a list never matches), so the break-search runs
+                // whenever there is a remainder.
+                if !rest.is_empty() {
+                    let start = partline.len().saturating_sub(20);
+                    let mut break_index: i64 = -1;
+                    if let Some(pos) = partline[start..].iter().rposition(|&b| b == b' ') {
+                        break_index = (start + pos) as i64;
+                    }
+                    if break_index < 3 {
+                        if let Some(pos) = partline[start..].iter().rposition(|&b| b == b'-') {
+                            break_index = (start + pos) as i64 + 1;
+                        }
+                    }
+                    if break_index < 3 {
+                        if let Some(pos) = partline[start..].iter().rposition(|&b| b == b'/') {
+                            break_index = (start + pos) as i64;
+                        }
+                    }
+                    if break_index >= 3 {
+                        let bi = break_index as usize;
+                        let mut new_rest = partline[bi..].to_vec();
+                        new_rest.extend_from_slice(&rest);
+                        rest = new_rest;
+                        partline.truncate(bi);
+                    }
+                }
+                if !rest.is_empty() {
+                    // Indent continuation lines by two spaces.
+                    let mut indented = b"  ".to_vec();
+                    indented.append(&mut rest);
+                    rest = indented;
+                }
+                // Escape carriage returns.
+                let mut escaped: Vec<u8> = Vec::with_capacity(partline.len());
+                for &b in &partline {
+                    if b == b'\r' {
+                        escaped.extend_from_slice(b"\\r");
+                    } else {
+                        escaped.push(b);
+                    }
+                }
+                partline = escaped;
+                let mut blank_line = false;
+                if !rest.is_empty() {
+                    partline.push(b'\\');
+                } else if partline.last() == Some(&b' ') {
+                    partline.push(b'\\');
+                    blank_line = true;
+                }
+                let mut out = b"# ".to_vec();
+                out.append(&mut partline);
+                out.push(b'\n');
+                lines.push(out);
+                if blank_line {
+                    lines.push(b"#   \n".to_vec());
+                }
+                line = rest;
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// Decode the RIO-Patch line wrapping into raw RIO lines suitable for
+/// `read_stanza`.
+fn patch_stanza_iter<I>(line_iter: I) -> Result<Vec<Vec<u8>>, Error>
+where
+    I: IntoIterator<Item = Vec<u8>>,
+{
+    let mut out = Vec::new();
+    let mut last_line: Option<Vec<u8>> = None;
+    let mut first_chunk = true;
+    for line in line_iter {
+        let mut line: Vec<u8> = if line.starts_with(b"# ") {
+            line[2..].to_vec()
+        } else if line.starts_with(b"#") {
+            line[1..].to_vec()
+        } else {
+            return Err(Error::Other(format!("bad line {:?}", line)));
+        };
+        if !first_chunk && line.len() > 2 {
+            line = line[2..].to_vec();
+        }
+        // Strip carriage returns.
+        line.retain(|&b| b != b'\r');
+        // Apply the backslash decoding: \\ -> \, \r -> \r, \\n -> "" (line continuation).
+        let decoded = decode_patch_escapes(&line);
+        let combined = match last_line.take() {
+            None => decoded,
+            Some(mut prev) => {
+                prev.extend_from_slice(&decoded);
+                prev
+            }
+        };
+        if combined.last() == Some(&b'\n') {
+            out.push(combined);
+            last_line = None;
+            first_chunk = true;
+        } else {
+            last_line = Some(combined);
+            first_chunk = false;
+        }
+    }
+    if let Some(rem) = last_line {
+        out.push(rem);
+    }
+    Ok(out)
+}
+
+fn decode_patch_escapes(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'\\' && i + 1 < input.len() {
+            match input[i + 1] {
+                b'\\' => {
+                    out.push(b'\\');
+                    i += 2;
+                }
+                b'r' => {
+                    out.push(b'\r');
+                    i += 2;
+                }
+                b'\n' => {
+                    // Soft-wrap continuation: drop both bytes.
+                    i += 2;
+                }
+                other => {
+                    // Unknown escape: leave the backslash and consume the
+                    // following character verbatim, mirroring Python's
+                    // KeyError-on-mapget behaviour would actually raise; but
+                    // since the encoder only produces the three escapes
+                    // above, in practice this branch is unreachable.
+                    out.push(b'\\');
+                    out.push(other);
+                    i += 2;
+                }
+            }
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Convert an iterable of RIO-Patch lines into a Stanza.
+pub fn read_patch_stanza<I>(line_iter: I) -> Result<Option<Stanza>, Error>
+where
+    I: IntoIterator<Item = Vec<u8>>,
+{
+    let lines = patch_stanza_iter(line_iter)?;
+    read_stanza(lines.into_iter().map(Ok))
+}
+
 #[cfg(test)]
 mod tests {
     use super::valid_tag;
@@ -729,5 +919,182 @@ field-with-newlines: foo
             ),
         ]);
         assert_eq!(s, expected);
+    }
+
+    use super::{read_patch_stanza, to_patch_lines};
+
+    fn mail_munge(lines: &[Vec<u8>], dos_nl: bool) -> Vec<Vec<u8>> {
+        lines
+            .iter()
+            .map(|line| {
+                let mut out = Vec::with_capacity(line.len());
+                let mut buf: Vec<u8> = Vec::new();
+                for &b in line {
+                    if b == b'\n' {
+                        while buf.last() == Some(&b' ') {
+                            buf.pop();
+                        }
+                        out.append(&mut buf);
+                        if dos_nl && out.last() != Some(&b'\r') {
+                            out.push(b'\r');
+                        }
+                        out.push(b'\n');
+                    } else {
+                        buf.push(b);
+                    }
+                }
+                out.append(&mut buf);
+                out
+            })
+            .collect()
+    }
+
+    fn b(s: &[u8]) -> Vec<u8> {
+        s.to_vec()
+    }
+
+    #[test]
+    fn test_to_patch_lines_basic_max_72() {
+        let mut s = Stanza::new();
+        s.add(
+            "data".to_string(),
+            StanzaValue::String("#\n\r\\r ".to_string()),
+        )
+        .unwrap();
+        s.add("space".to_string(), StanzaValue::String(" ".repeat(255)))
+            .unwrap();
+        s.add("hash".to_string(), StanzaValue::String("#".repeat(255)))
+            .unwrap();
+        let lines = to_patch_lines(&s, 72).unwrap();
+        let expected: Vec<Vec<u8>> = vec![
+            b(b"# data: #\n"),
+            b(b"# \t\\r\\\\r \\\n"),
+            b(b"#   \n"),
+            b(b"# space:                                                             \\\n"),
+            b(b"#                                                                    \\\n"),
+            b(b"#                                                                    \\\n"),
+            b(b"#                                                                    \\\n"),
+            b(b"#   \n"),
+            b(b"# hash: ##############################################################\\\n"),
+            b(b"#   ##################################################################\\\n"),
+            b(b"#   ##################################################################\\\n"),
+            b(b"#   #############################################################\n"),
+        ];
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn test_to_patch_lines_roundtrip_through_mail_munge() {
+        let mut s = Stanza::new();
+        s.add(
+            "data".to_string(),
+            StanzaValue::String("#\n\r\\r ".to_string()),
+        )
+        .unwrap();
+        s.add("space".to_string(), StanzaValue::String(" ".repeat(255)))
+            .unwrap();
+        s.add("hash".to_string(), StanzaValue::String("#".repeat(255)))
+            .unwrap();
+        let lines = to_patch_lines(&s, 72).unwrap();
+
+        let munged_no_dos = mail_munge(&lines, false);
+        let parsed = read_patch_stanza(munged_no_dos).unwrap().unwrap();
+        assert_eq!(
+            parsed.get("data"),
+            Some(&StanzaValue::String("#\n\r\\r ".to_string()))
+        );
+        assert_eq!(
+            parsed.get("space"),
+            Some(&StanzaValue::String(" ".repeat(255)))
+        );
+        assert_eq!(
+            parsed.get("hash"),
+            Some(&StanzaValue::String("#".repeat(255)))
+        );
+
+        let munged_dos = mail_munge(&lines, true);
+        let parsed = read_patch_stanza(munged_dos).unwrap().unwrap();
+        assert_eq!(
+            parsed.get("data"),
+            Some(&StanzaValue::String("#\n\r\\r ".to_string()))
+        );
+        assert_eq!(
+            parsed.get("space"),
+            Some(&StanzaValue::String(" ".repeat(255)))
+        );
+        assert_eq!(
+            parsed.get("hash"),
+            Some(&StanzaValue::String("#".repeat(255)))
+        );
+    }
+
+    #[test]
+    fn test_to_patch_lines_too_small_width() {
+        let mut s = Stanza::new();
+        s.add("foo".to_string(), StanzaValue::String("bar".to_string()))
+            .unwrap();
+        assert!(to_patch_lines(&s, 6).is_err());
+        assert!(to_patch_lines(&s, 7).is_ok());
+    }
+
+    #[test]
+    fn test_to_patch_lines_break_on_space() {
+        let mut s = Stanza::new();
+        s.add(
+            "breaktest".to_string(),
+            StanzaValue::String("linebreak -/".repeat(30)),
+        )
+        .unwrap();
+        let lines = to_patch_lines(&s, 71).unwrap();
+        let expected: Vec<Vec<u8>> = vec![
+            b(b"# breaktest: linebreak -/linebreak -/linebreak -/linebreak\\\n"),
+            b(b"#    -/linebreak -/linebreak -/linebreak -/linebreak -/linebreak\\\n"),
+            b(b"#    -/linebreak -/linebreak -/linebreak -/linebreak -/linebreak\\\n"),
+            b(b"#    -/linebreak -/linebreak -/linebreak -/linebreak -/linebreak\\\n"),
+            b(b"#    -/linebreak -/linebreak -/linebreak -/linebreak -/linebreak\\\n"),
+            b(b"#    -/linebreak -/linebreak -/linebreak -/linebreak -/linebreak\\\n"),
+            b(b"#    -/linebreak -/\n"),
+        ];
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn test_to_patch_lines_break_on_dash() {
+        let mut s = Stanza::new();
+        s.add(
+            "breaktest".to_string(),
+            StanzaValue::String("linebreak-/".repeat(30)),
+        )
+        .unwrap();
+        let lines = to_patch_lines(&s, 70).unwrap();
+        let expected: Vec<Vec<u8>> = vec![
+            b(b"# breaktest: linebreak-/linebreak-/linebreak-/linebreak-/linebreak-\\\n"),
+            b(b"#   /linebreak-/linebreak-/linebreak-/linebreak-/linebreak-\\\n"),
+            b(b"#   /linebreak-/linebreak-/linebreak-/linebreak-/linebreak-\\\n"),
+            b(b"#   /linebreak-/linebreak-/linebreak-/linebreak-/linebreak-\\\n"),
+            b(b"#   /linebreak-/linebreak-/linebreak-/linebreak-/linebreak-\\\n"),
+            b(b"#   /linebreak-/linebreak-/linebreak-/linebreak-/linebreak-/\n"),
+        ];
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn test_to_patch_lines_break_on_slash() {
+        let mut s = Stanza::new();
+        s.add(
+            "breaktest".to_string(),
+            StanzaValue::String("linebreak/".repeat(30)),
+        )
+        .unwrap();
+        let lines = to_patch_lines(&s, 70).unwrap();
+        let expected: Vec<Vec<u8>> = vec![
+            b(b"# breaktest: linebreak/linebreak/linebreak/linebreak/linebreak\\\n"),
+            b(b"#   /linebreak/linebreak/linebreak/linebreak/linebreak/linebreak\\\n"),
+            b(b"#   /linebreak/linebreak/linebreak/linebreak/linebreak/linebreak\\\n"),
+            b(b"#   /linebreak/linebreak/linebreak/linebreak/linebreak/linebreak\\\n"),
+            b(b"#   /linebreak/linebreak/linebreak/linebreak/linebreak/linebreak\\\n"),
+            b(b"#   /linebreak/\n"),
+        ];
+        assert_eq!(lines, expected);
     }
 }
