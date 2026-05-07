@@ -1,8 +1,8 @@
 use bazaar::index::{
-    parse_header, parse_lines, serialize_graph_index, IndexError, IndexHeader, IndexKey, IndexNode,
-    ParsedLines, RawNode,
+    parse_header, parse_lines, serialize_graph_index, GraphIndex as RsGraphIndex, IndexEntry,
+    IndexError, IndexHeader, IndexKey, IndexNode, IndexTransport, KeyPrefix, ParsedLines, RawNode,
 };
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::import_exception;
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBytes, PyDict, PyList, PyTuple};
@@ -235,10 +235,274 @@ type ParseLinesResult<'py> = (
     Bound<'py, PyDict>,
 );
 
+/// Adapter that lets a Python `Transport` object stand in for a Rust
+/// [`IndexTransport`]. Calls `transport.get_bytes(name)` on the wrapped
+/// object — the index never needs anything else from the Python
+/// transport for the full-load path.
+struct PyIndexTransport {
+    obj: Py<PyAny>,
+}
+
+impl IndexTransport for PyIndexTransport {
+    fn get_bytes(&self, path: &str) -> Result<Vec<u8>, IndexError> {
+        Python::attach(|py| {
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("get_bytes", (path,))
+                .map_err(|e| IndexError::Other(e.to_string()))?;
+            let bytes = result
+                .cast_into::<PyBytes>()
+                .map_err(|_| IndexError::Other("get_bytes did not return bytes".to_string()))?;
+            Ok(bytes.as_bytes().to_vec())
+        })
+    }
+
+    fn abspath(&self, path: &str) -> String {
+        Python::attach(|py| {
+            self.obj
+                .bind(py)
+                .call_method1("abspath", (path,))
+                .ok()
+                .and_then(|r| r.extract::<String>().ok())
+                .unwrap_or_else(|| path.to_string())
+        })
+    }
+}
+
+/// A pyo3-exposed graph-index reader backed by the pure-Rust
+/// [`bazaar::index::GraphIndex`].
+///
+/// The Python wrapper around it should pass any `Transport`-shaped
+/// object that implements `get_bytes` (the standard
+/// `bzrformats.transport.Transport` does). Bisection-based partial
+/// reads remain in Python; this binding is for callers that want the
+/// full-load path.
+#[pyclass(name = "GraphIndex")]
+struct PyGraphIndex {
+    inner: std::sync::Mutex<RsGraphIndex<PyIndexTransport>>,
+}
+
+fn extract_prefix(obj: &Bound<PyAny>) -> PyResult<KeyPrefix> {
+    let mut out = Vec::new();
+    for item in obj.try_iter()? {
+        let elem = item?;
+        if elem.is_none() {
+            out.push(None);
+        } else {
+            let b = elem
+                .cast_into::<PyBytes>()
+                .map_err(|_| PyTypeError::new_err("prefix element must be bytes or None"))?;
+            out.push(Some(b.as_bytes().to_vec()));
+        }
+    }
+    Ok(out)
+}
+
+#[pymethods]
+impl PyGraphIndex {
+    #[new]
+    #[pyo3(signature = (transport, name, _size = None, _unlimited_cache = false, offset = 0))]
+    fn new(
+        transport: Py<PyAny>,
+        name: String,
+        _size: Option<u64>,
+        _unlimited_cache: bool,
+        offset: u64,
+    ) -> PyResult<Self> {
+        let t = PyIndexTransport { obj: transport };
+        Ok(Self {
+            inner: std::sync::Mutex::new(RsGraphIndex::new(t, name, offset)),
+        })
+    }
+
+    fn key_count(&self) -> PyResult<usize> {
+        self.inner
+            .lock()
+            .unwrap()
+            .key_count()
+            .map_err(index_err_to_py)
+    }
+
+    #[getter]
+    fn node_ref_lists(&self) -> PyResult<usize> {
+        self.inner
+            .lock()
+            .unwrap()
+            .node_ref_lists()
+            .map_err(index_err_to_py)
+    }
+
+    #[getter]
+    fn _key_length(&self) -> PyResult<usize> {
+        self.inner
+            .lock()
+            .unwrap()
+            .key_length()
+            .map_err(index_err_to_py)
+    }
+
+    fn validate(&self) -> PyResult<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .validate()
+            .map_err(index_err_to_py)
+    }
+
+    fn _buffer_all(&self) -> PyResult<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .buffer_all()
+            .map_err(index_err_to_py)
+    }
+
+    /// Yield `(self, key, value)` or `(self, key, value, refs)` tuples
+    /// matching the Python `GraphIndex.iter_all_entries` shape.
+    fn iter_all_entries<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let (entries, node_ref_lists) = {
+            let r = slf.borrow();
+            let mut g = r.inner.lock().unwrap();
+            let entries = g.iter_all_entries().map_err(index_err_to_py)?;
+            let nrl = g.node_ref_lists().map_err(index_err_to_py)?;
+            (entries, nrl)
+        };
+        emit_entries(py, &slf, &entries, node_ref_lists)
+    }
+
+    /// Same as `iter_all_entries` but restricted to `keys`.
+    fn iter_entries<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let mut requested: Vec<IndexKey> = Vec::new();
+        for key_obj in keys.try_iter()? {
+            requested.push(extract_key(&key_obj?)?);
+        }
+        if requested.is_empty() {
+            return Ok(PyList::empty(py));
+        }
+        let (entries, node_ref_lists) = {
+            let r = slf.borrow();
+            let mut g = r.inner.lock().unwrap();
+            let entries = g.iter_entries(&requested).map_err(index_err_to_py)?;
+            let nrl = g.node_ref_lists().map_err(index_err_to_py)?;
+            (entries, nrl)
+        };
+        emit_entries(py, &slf, &entries, node_ref_lists)
+    }
+
+    /// Same shape as `iter_entries`, but matches by prefix.
+    fn iter_entries_prefix<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let mut prefixes: Vec<KeyPrefix> = Vec::new();
+        for prefix_obj in keys.try_iter()? {
+            prefixes.push(extract_prefix(&prefix_obj?)?);
+        }
+        if prefixes.is_empty() {
+            return Ok(PyList::empty(py));
+        }
+        let (entries, node_ref_lists) = {
+            let r = slf.borrow();
+            let mut g = r.inner.lock().unwrap();
+            let entries = g.iter_entries_prefix(&prefixes).map_err(|e| match e {
+                IndexError::Other(msg) if msg.starts_with("BadIndexKey") => {
+                    PyValueError::new_err(msg)
+                }
+                other => index_err_to_py(other),
+            })?;
+            let nrl = g.node_ref_lists().map_err(index_err_to_py)?;
+            (entries, nrl)
+        };
+        emit_entries(py, &slf, &entries, node_ref_lists)
+    }
+
+    /// Set of keys referenced by `ref_list_num` that aren't present in
+    /// the index.
+    fn external_references<'py>(
+        &self,
+        py: Python<'py>,
+        ref_list_num: usize,
+    ) -> PyResult<Bound<'py, pyo3::types::PySet>> {
+        let refs = self
+            .inner
+            .lock()
+            .unwrap()
+            .external_references(ref_list_num)
+            .map_err(|e| match e {
+                IndexError::Other(msg) if msg.starts_with("No ref list") => {
+                    PyValueError::new_err(msg)
+                }
+                other => index_err_to_py(other),
+            })?;
+        let set = pyo3::types::PySet::empty(py)?;
+        for r in refs {
+            set.add(key_to_py(py, &r)?)?;
+        }
+        Ok(set)
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        Ok("GraphIndex(<rust>)".to_string())
+    }
+}
+
+/// Build the per-entry tuple matching Python's `iter_all_entries`
+/// shape: `(self, key, value)` for zero-ref-list indexes, or
+/// `(self, key, value, refs)` otherwise.
+fn emit_entries<'py>(
+    py: Python<'py>,
+    slf: &Bound<'py, PyGraphIndex>,
+    entries: &[IndexEntry],
+    node_ref_lists: usize,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    let self_any: Bound<PyAny> = slf.clone().into_any();
+    for (key, value, refs) in entries {
+        let key_t = key_to_py(py, key)?;
+        let value_b = PyBytes::new(py, value);
+        if node_ref_lists == 0 {
+            out.append(PyTuple::new(
+                py,
+                [self_any.clone(), key_t.into_any(), value_b.into_any()],
+            )?)?;
+        } else {
+            let mut ref_tuples: Vec<Bound<PyTuple>> = Vec::with_capacity(refs.len());
+            for inner in refs {
+                let key_tuples: Vec<Bound<PyTuple>> = inner
+                    .iter()
+                    .map(|k| key_to_py(py, k))
+                    .collect::<PyResult<_>>()?;
+                ref_tuples.push(PyTuple::new(py, key_tuples)?);
+            }
+            let refs_tuple = PyTuple::new(py, ref_tuples)?;
+            out.append(PyTuple::new(
+                py,
+                [
+                    self_any.clone(),
+                    key_t.into_any(),
+                    value_b.into_any(),
+                    refs_tuple.into_any(),
+                ],
+            )?)?;
+        }
+    }
+    Ok(out)
+}
+
 pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "index")?;
     m.add_function(wrap_pyfunction!(py_serialize_graph_index, &m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_header, &m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_lines, &m)?)?;
+    m.add_class::<PyGraphIndex>()?;
     Ok(m)
 }
