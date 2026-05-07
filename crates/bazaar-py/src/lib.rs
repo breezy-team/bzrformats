@@ -526,6 +526,11 @@ impl InventorySerializer {
         PyBytes::new(py, self.0.format_num())
     }
 
+    #[getter]
+    fn support_altered_by_hack(&self) -> bool {
+        self.0.support_altered_by_hack()
+    }
+
     #[pyo3(signature = (inv, f, working = false))]
     fn write_inventory<'py>(
         &self,
@@ -534,14 +539,9 @@ impl InventorySerializer {
         f: Py<PyAny>,
         working: bool,
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
-        if working {
-            return Err(PyRuntimeError::new_err(
-                "working=True is not supported by Rust XML inventory serializer",
-            ));
-        }
         let lines = self
             .0
-            .write_inventory_to_lines(&inv.0)
+            .write_inventory_to_lines(&inv.0, working)
             .map_err(inventory_serializer_err_to_py_err)?;
         if !f.is_none(py) {
             for line in &lines {
@@ -558,7 +558,7 @@ impl InventorySerializer {
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         let lines = self
             .0
-            .write_inventory_to_lines(&inv.0)
+            .write_inventory_to_lines(&inv.0, false)
             .map_err(inventory_serializer_err_to_py_err)?;
         Ok(lines.into_iter().map(|l| PyBytes::new(py, &l)).collect())
     }
@@ -578,7 +578,7 @@ impl InventorySerializer {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let buf = self
             .0
-            .write_inventory_to_string(&inv.0)
+            .write_inventory_to_string(&inv.0, false)
             .map_err(inventory_serializer_err_to_py_err)?;
         Ok(PyBytes::new(py, &buf))
     }
@@ -612,6 +612,63 @@ impl InventorySerializer {
             .detach(|| self.0.read_inventory(&mut file, revision_id))
             .map_err(inventory_serializer_err_to_py_err)?;
         Ok(inventory::Inventory(inv))
+    }
+
+    fn _find_text_key_references<'py>(
+        &self,
+        py: Python<'py>,
+        line_iterator: Py<PyAny>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let iter = line_iterator.bind(py).try_iter()?;
+        let mut owned: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for item in iter {
+            let item = item?;
+            let tuple = item.downcast::<pyo3::types::PyTuple>().map_err(|_| {
+                PyTypeError::new_err("line_iterator must yield (line, line_key) tuples")
+            })?;
+            if tuple.len() != 2 {
+                return Err(PyTypeError::new_err(
+                    "line_iterator must yield 2-tuples of (line, line_key)",
+                ));
+            }
+            let line: Vec<u8> = tuple.get_item(0)?.extract()?;
+            // Mirror upstream Python's `revision_id == line_key[-1]`: when
+            // line_key is a versionedfile key tuple like (revision_id,) we
+            // take the last element. Some callers (knitpack_repo's
+            // find_text_keys_from_content) pass bare bytes as line_key, in
+            // which case Python's `line_key[-1]` yields an int that never
+            // compares equal to the unescaped revision id — so the matching
+            // step always fails. We replicate that by passing an empty
+            // sentinel that won't match any real revision id.
+            let line_key = tuple.get_item(1)?;
+            let revid: Vec<u8> = if let Ok(key_tuple) =
+                line_key.downcast::<pyo3::types::PyTuple>()
+            {
+                if key_tuple.is_empty() {
+                    return Err(PyTypeError::new_err("line_key tuple must be non-empty"));
+                }
+                key_tuple.get_item(key_tuple.len() - 1)?.extract()?
+            } else {
+                Vec::new()
+            };
+            owned.push((line, revid));
+        }
+        let result = py
+            .detach(|| {
+                bazaar::xml_serializer::find_text_key_references(
+                    owned.iter().map(|(l, k)| (l.as_slice(), k.as_slice())),
+                )
+            })
+            .map_err(inventory_serializer_err_to_py_err)?;
+        let dict = pyo3::types::PyDict::new(py);
+        for ((file_id, revision_id), present) in result {
+            let key = pyo3::types::PyTuple::new(
+                py,
+                [PyBytes::new(py, &file_id), PyBytes::new(py, &revision_id)],
+            )?;
+            dict.set_item(key, present)?;
+        }
+        Ok(dict)
     }
 }
 

@@ -920,7 +920,15 @@ impl InventorySerializer for XMLInventorySerializer5 {
         b"5"
     }
 
-    fn write_inventory_to_lines(&self, inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error> {
+    fn support_altered_by_hack(&self) -> bool {
+        true
+    }
+
+    fn write_inventory_to_lines(
+        &self,
+        inv: &MutableInventory,
+        working: bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
         let mut out = Vec::new();
         append_v5_root(&mut out, inv)?;
         // For v5 the comparison root_id is always TREE_ROOT, even if the
@@ -931,7 +939,7 @@ impl InventorySerializer for XMLInventorySerializer5 {
             &mut out,
             Some(ROOT_ID_BYTES),
             SUPPORTED_KINDS_BASE,
-            false,
+            working,
         )?;
         Ok(split_lines_keepends(&out))
     }
@@ -955,10 +963,18 @@ impl InventorySerializer for XMLInventorySerializer6 {
         b"6"
     }
 
-    fn write_inventory_to_lines(&self, inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error> {
+    fn support_altered_by_hack(&self) -> bool {
+        true
+    }
+
+    fn write_inventory_to_lines(
+        &self,
+        inv: &MutableInventory,
+        working: bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
         let mut out = Vec::new();
         append_v8_root(&mut out, b"6", inv)?;
-        serialize_inventory_flat(inv, &mut out, None, SUPPORTED_KINDS_BASE, false)?;
+        serialize_inventory_flat(inv, &mut out, None, SUPPORTED_KINDS_BASE, working)?;
         Ok(split_lines_keepends(&out))
     }
 
@@ -981,10 +997,18 @@ impl InventorySerializer for XMLInventorySerializer7 {
         b"7"
     }
 
-    fn write_inventory_to_lines(&self, inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error> {
+    fn support_altered_by_hack(&self) -> bool {
+        true
+    }
+
+    fn write_inventory_to_lines(
+        &self,
+        inv: &MutableInventory,
+        working: bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
         let mut out = Vec::new();
         append_v8_root(&mut out, b"7", inv)?;
-        serialize_inventory_flat(inv, &mut out, None, SUPPORTED_KINDS_WITH_TREE_REF, false)?;
+        serialize_inventory_flat(inv, &mut out, None, SUPPORTED_KINDS_WITH_TREE_REF, working)?;
         Ok(split_lines_keepends(&out))
     }
 
@@ -1007,10 +1031,18 @@ impl InventorySerializer for XMLInventorySerializer8 {
         b"8"
     }
 
-    fn write_inventory_to_lines(&self, inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error> {
+    fn support_altered_by_hack(&self) -> bool {
+        true
+    }
+
+    fn write_inventory_to_lines(
+        &self,
+        inv: &MutableInventory,
+        working: bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
         let mut out = Vec::new();
         append_v8_root(&mut out, b"8", inv)?;
-        serialize_inventory_flat(inv, &mut out, None, SUPPORTED_KINDS_BASE, false)?;
+        serialize_inventory_flat(inv, &mut out, None, SUPPORTED_KINDS_BASE, working)?;
         Ok(split_lines_keepends(&out))
     }
 
@@ -1202,7 +1234,11 @@ impl InventorySerializer for XMLInventorySerializer4 {
         b"4"
     }
 
-    fn write_inventory_to_lines(&self, _inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error> {
+    fn write_inventory_to_lines(
+        &self,
+        _inv: &MutableInventory,
+        _working: bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
         // v4 serialisation is no longer supported, only deserialisation.
         Err(Error::EncodeError(
             "v4 inventory serialisation is not supported".to_string(),
@@ -1440,7 +1476,7 @@ mod tests {
             .read_inventory_from_lines(&[COMMITTED_INV_V5], None)
             .unwrap();
         assert_eq!(inv.len(), 4);
-        let bytes = s.write_inventory_to_string(&inv).unwrap();
+        let bytes = s.write_inventory_to_string(&inv, false).unwrap();
         assert_eq!(bytes, EXPECTED_INV_V5);
         let inv2 = s.read_inventory_from_lines(&[&bytes], None).unwrap();
         assert_eq!(inv, inv2);
@@ -1482,10 +1518,54 @@ mod tests {
             Some("a".to_string()),
         ))
         .unwrap();
-        let out = s.write_inventory_to_string(&inv).unwrap();
+        let out = s.write_inventory_to_string(&inv, false).unwrap();
         assert_eq!(out, EXPECTED_INV_V8);
         let inv2 = s.read_inventory_from_lines(&[&out], None).unwrap();
         assert_eq!(inv, inv2);
+    }
+
+    #[test]
+    fn inventory_v8_working_skips_history_data() {
+        let s = XMLInventorySerializer8;
+        let mut inv = MutableInventory::new();
+        inv.revision_id = Some(RevisionId::from(b"rev_outer".as_slice()));
+        inv.add(Entry::root(
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+        ))
+        .unwrap();
+        inv.add(Entry::directory(
+            FileId::from(b"dir-id".as_slice()),
+            "dir".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+        ))
+        .unwrap();
+        inv.add(Entry::file(
+            FileId::from(b"file-id".as_slice()),
+            "file".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+            Some(b"A".to_vec()),
+            Some(1),
+            Some(true),
+            None,
+        ))
+        .unwrap();
+        inv.add(Entry::link(
+            FileId::from(b"link-id".as_slice()),
+            "link".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+            Some("a".to_string()),
+        ))
+        .unwrap();
+        let out = s.write_inventory_to_string(&inv, true).unwrap();
+        // The root <directory> still carries `revision`, matching upstream
+        // _append_inventory_root which is unaffected by `working`. Other
+        // entries omit revision/text_sha1/text_size/symlink_target.
+        let expected: &[u8] = b"<inventory format=\"8\" revision_id=\"rev_outer\">\n<directory file_id=\"tree-root-321\" name=\"\" revision=\"rev_outer\" />\n<directory file_id=\"dir-id\" name=\"dir\" parent_id=\"tree-root-321\" />\n<file executable=\"yes\" file_id=\"file-id\" name=\"file\" parent_id=\"tree-root-321\" />\n<symlink file_id=\"link-id\" name=\"link\" parent_id=\"tree-root-321\" />\n</inventory>\n";
+        assert_eq!(out, expected);
     }
 
     #[test]
