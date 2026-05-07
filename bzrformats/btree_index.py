@@ -74,9 +74,7 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
 
     def __new__(cls, reference_lists=0, key_elements=1, spill_at=100000):
         """Construct via the pyo3 base class with only its known args."""
-        return _mod_index.GraphIndexBuilder.__new__(
-            cls, reference_lists, key_elements
-        )
+        return _mod_index.GraphIndexBuilder.__new__(cls, reference_lists, key_elements)
 
     def __init__(self, reference_lists=0, key_elements=1, spill_at=100000):
         """See GraphIndexBuilder.__init__.
@@ -389,7 +387,8 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
 
     def _find_ancestors(self, keys, ref_list_num, parent_map, missing_keys):
         """One step of the ancestry walk; populates parent_map and
-        missing_keys, returns parents not already in parent_map."""
+        missing_keys, returns parents not already in parent_map.
+        """
         found = set()
         new_search = set()
         for _, key, _value, refs in self.iter_entries(keys):
@@ -1196,9 +1195,7 @@ class BTreeGraphIndex:
             for _1, key, value in self.iter_all_entries():
                 nodes[key] = value
         mode = "reader-refs" if self.node_ref_lists else "reader-norefs"
-        for entry in _index_rs.iter_entries_prefix(
-            nodes, keys, self._key_length, mode
-        ):
+        for entry in _index_rs.iter_entries_prefix(nodes, keys, self._key_length, mode):
             yield (self, *entry)
 
     def key_count(self):
