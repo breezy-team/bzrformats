@@ -245,20 +245,18 @@ class GraphIndexBuilder:
         :param value: The value to associate with the key. It may be any
             bytes as long as it does not contain \0 or \n.
         """
-        (node_refs, absent_references) = self._check_key_ref_value(
-            key, references, value
+        _index_rs.add_node_to_builder(
+            self,
+            key,
+            value,
+            references,
+            self._nodes,
+            self._absent_keys,
+            self.reference_lists,
+            self._key_length,
         )
-        if key in self._nodes and self._nodes[key][0] != b"a":
-            raise BadIndexDuplicateKey(key, self)
-        for reference in absent_references:
-            # There may be duplicates, but I don't think it is worth worrying
-            # about
-            self._nodes[reference] = (b"a", (), b"")
-        self._absent_keys.update(absent_references)
-        self._absent_keys.discard(key)
-        self._nodes[key] = (b"", node_refs, value)
         if self._nodes_by_key is not None and self._key_length > 1:
-            self._update_nodes_by_key(key, value, node_refs)
+            self._update_nodes_by_key(key, value, self._nodes[key][1])
 
     def clear_cache(self):
         """See GraphIndex.clear_cache().

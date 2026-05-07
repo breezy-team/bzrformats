@@ -13,6 +13,7 @@ import_exception!(bzrformats.index, BadIndexOptions);
 import_exception!(bzrformats.index, BadIndexData);
 import_exception!(bzrformats.index, BadIndexKey);
 import_exception!(bzrformats.index, BadIndexValue);
+import_exception!(bzrformats.index, BadIndexDuplicateKey);
 import_exception!(bzrformats.errors, BzrFormatsError);
 
 fn index_err_to_py(err: IndexError) -> PyErr {
@@ -1516,6 +1517,77 @@ fn py_external_references_from_reader_nodes<'py>(
     Ok(out)
 }
 
+/// Insert a node into a `GraphIndexBuilder`-shaped state. Folds the
+/// per-node check_key_ref_value + duplicate check + dict updates from
+/// `add_node` into a single Rust call.
+///
+/// `nodes` is the builder's `_nodes` dict (mutated in place).
+/// `absent_keys` is the `_absent_keys` set (mutated in place).
+/// `builder` is the Python builder instance, only used so that
+/// `BadIndexDuplicateKey(key, builder)` carries the right context.
+#[pyfunction]
+#[pyo3(name = "add_node_to_builder")]
+fn py_add_node_to_builder<'py>(
+    py: Python<'py>,
+    builder: Bound<'py, PyAny>,
+    key: Bound<'py, PyAny>,
+    value: Bound<'py, PyBytes>,
+    references: Bound<'py, PyAny>,
+    nodes: Bound<'py, PyDict>,
+    absent_keys: Bound<'py, pyo3::types::PySet>,
+    reference_lists_count: usize,
+    key_length: usize,
+) -> PyResult<()> {
+    let (node_refs, absent_references) = py_check_key_ref_value(
+        py,
+        key.clone(),
+        references,
+        value.clone(),
+        nodes.clone(),
+        reference_lists_count,
+        key_length,
+    )?;
+    if let Some(existing) = nodes.get_item(key.clone())? {
+        let existing_tuple = existing
+            .cast_into::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("nodes value must be a tuple"))?;
+        let absent_marker = existing_tuple
+            .get_item(0)?
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyTypeError::new_err("absent marker must be bytes"))?;
+        if absent_marker.as_bytes() != b"a" {
+            return Err(BadIndexDuplicateKey::new_err((
+                key.unbind(),
+                builder.unbind(),
+            )));
+        }
+    }
+    let empty_tuple = PyTuple::empty(py);
+    let absent_value = PyTuple::new(
+        py,
+        [
+            PyBytes::new(py, b"a").into_any(),
+            empty_tuple.clone().into_any(),
+            PyBytes::new(py, b"").into_any(),
+        ],
+    )?;
+    for ref_obj in absent_references.iter() {
+        nodes.set_item(ref_obj.clone(), absent_value.clone())?;
+        absent_keys.add(ref_obj)?;
+    }
+    absent_keys.discard(key.clone())?;
+    let present_value = PyTuple::new(
+        py,
+        [
+            PyBytes::new(py, b"").into_any(),
+            node_refs.into_any(),
+            value.into_any(),
+        ],
+    )?;
+    nodes.set_item(key, present_value)?;
+    Ok(())
+}
+
 /// Validate `key`, `references`, and `value` for a builder
 /// `add_node` call. Returns `(node_refs_tuple, absent_references_list)`
 /// where `node_refs_tuple` is a tuple of tuples of tuples (each inner
@@ -1618,6 +1690,7 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(py_check_key, &m)?)?;
     m.add_function(wrap_pyfunction!(py_check_value, &m)?)?;
     m.add_function(wrap_pyfunction!(py_check_key_ref_value, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_add_node_to_builder, &m)?)?;
     m.add_function(wrap_pyfunction!(
         py_external_references_from_reader_nodes,
         &m
