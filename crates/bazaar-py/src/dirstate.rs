@@ -1105,9 +1105,7 @@ fn dirstate_change_to_pytuple<'py>(
     // empty vec sentinel meaning "unversioned"; surface that as None
     // here so the resulting InventoryTreeChange compares equal to
     // what InterInventoryTree.iter_changes produces.
-    let file_id_obj = if change.file_id.is_empty()
-        && !change.old_versioned
-        && !change.new_versioned
+    let file_id_obj = if change.file_id.is_empty() && !change.old_versioned && !change.new_versioned
     {
         py.None()
     } else {
@@ -1223,11 +1221,10 @@ impl PyDirState {
         fdatasync: bool,
     ) -> PyResult<Self> {
         let path = extract_path(path)?;
-        let provider: Box<dyn bazaar::dirstate::SHA1Provider + Send + Sync> =
-            match sha1_provider {
-                Some(obj) => sha1_provider_from_py(py, obj),
-                None => Box::new(bazaar::dirstate::DefaultSHA1Provider::new()),
-            };
+        let provider: Box<dyn bazaar::dirstate::SHA1Provider + Send + Sync> = match sha1_provider {
+            Some(obj) => sha1_provider_from_py(py, obj),
+            None => Box::new(bazaar::dirstate::DefaultSHA1Provider::new()),
+        };
         Ok(Self {
             inner: bazaar::dirstate::DirState::new(
                 path,

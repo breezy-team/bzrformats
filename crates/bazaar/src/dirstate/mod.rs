@@ -248,6 +248,9 @@ fn gather_result_for_consistency(pstate: &mut ProcessEntryState, change: &Dirsta
 mod transport;
 pub use transport::{DirEntryInfo, StatInfo, Transport, TransportError};
 
+mod file_transport;
+pub use file_transport::FileTransport;
+
 mod walker;
 pub use walker::{WalkDirsUtf8, WalkedDir};
 
@@ -1574,8 +1577,7 @@ impl DirState {
             if let (true, Some(pi)) = (advance_path, current_path_info.as_ref()) {
                 if !path_handled {
                     if pstate.want_unversioned {
-                        let new_executable =
-                            pi.stat.is_file() && (pi.stat.mode & 0o100) != 0;
+                        let new_executable = pi.stat.is_file() && (pi.stat.mode & 0o100) != 0;
                         let path = if walker_rel.is_empty() {
                             pi.basename.clone()
                         } else {
