@@ -20,14 +20,17 @@ v4 is a deprecated format: only deserialization is supported.
 """
 
 from . import revision as _mod_revision
-from ._bzr_rs import _revision_serializer_v4_rs
-from ._bzr_rs import inventory_serializer_v4  # noqa: F401
+from ._bzr_rs import (
+    _revision_serializer_v4_rs,
+    inventory_serializer_v4,  # noqa: F401
+)
 
 
 class Revision(_mod_revision.Revision):
     """Revision class with additional v4-specific attributes."""
 
     def __new__(cls, *args, **kwargs):
+        """Create a Revision instance, extracting v4-specific attributes from kwargs."""
         inventory_id = kwargs.pop("inventory_id", None)
         parent_sha1s = kwargs.pop("parent_sha1s", None)
         self = _mod_revision.Revision.__new__(cls, *args, **kwargs)

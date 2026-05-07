@@ -17,7 +17,7 @@
 from io import BytesIO
 
 import bzrformats.xml5
-import bzrformats.xml_serializer  # noqa: F401
+import bzrformats.xml_serializer
 from bzrformats import inventory, serializer, xml6, xml7, xml8
 from bzrformats.inventory import Inventory
 
