@@ -1,6 +1,7 @@
 use bazaar::index::{
-    parse_header, parse_lines, serialize_graph_index, GraphIndex as RsGraphIndex, IndexEntry,
-    IndexError, IndexHeader, IndexKey, IndexNode, IndexTransport, KeyPrefix, ParsedLines, RawNode,
+    parse_full, parse_header, parse_lines, serialize_graph_index, GraphIndex as RsGraphIndex,
+    IndexEntry, IndexError, IndexHeader, IndexKey, IndexNode, IndexTransport, KeyPrefix,
+    ParsedLines, RawNode,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::import_exception;
@@ -10,14 +11,15 @@ use pyo3::types::{PyAnyMethods, PyBytes, PyDict, PyList, PyTuple};
 import_exception!(bzrformats.index, BadIndexFormatSignature);
 import_exception!(bzrformats.index, BadIndexOptions);
 import_exception!(bzrformats.index, BadIndexData);
-import_exception!(bzrformats.errors, BzrError);
+import_exception!(bzrformats.errors, BzrFormatsError);
 
 fn index_err_to_py(err: IndexError) -> PyErr {
     match err {
         IndexError::BadSignature => BadIndexFormatSignature::new_err(("", "GraphIndex")),
         IndexError::BadOptions => BadIndexOptions::new_err(("",)),
         IndexError::BadLineData => BadIndexData::new_err(("",)),
-        other => BzrError::new_err(other.to_string()),
+        IndexError::Other(msg) if msg.starts_with("BadIndexData") => BadIndexData::new_err((msg,)),
+        other => BzrFormatsError::new_err(other.to_string()),
     }
 }
 
@@ -498,11 +500,55 @@ fn emit_entries<'py>(
     Ok(out)
 }
 
+/// Parse a full index file given its raw bytes (with any base-offset
+/// already trimmed off by the caller). Returns
+/// `(node_ref_lists, key_length, key_count, nodes_dict)` where
+/// `nodes_dict` is keyed by the node's tuple-of-bytes key.
+///
+/// For 0-ref-list indexes the dict values are `value_bytes`; otherwise
+/// they are `(value_bytes, refs_tuple)` matching the layout
+/// `GraphIndex._buffer_all` produces.
+#[pyfunction]
+#[pyo3(name = "parse_full")]
+fn py_parse_full<'py>(
+    py: Python<'py>,
+    data: &[u8],
+) -> PyResult<(usize, usize, usize, Bound<'py, PyDict>)> {
+    let (header, nodes) = parse_full(data).map_err(index_err_to_py)?;
+    let nodes_dict = PyDict::new(py);
+    for (key, (value, refs)) in &nodes {
+        let key_t = key_to_py(py, key)?;
+        let value_b = PyBytes::new(py, value);
+        if header.node_ref_lists == 0 {
+            nodes_dict.set_item(key_t, value_b)?;
+        } else {
+            let mut ref_tuples: Vec<Bound<PyTuple>> = Vec::with_capacity(refs.len());
+            for inner in refs {
+                let key_tuples: Vec<Bound<PyTuple>> = inner
+                    .iter()
+                    .map(|k| key_to_py(py, k))
+                    .collect::<PyResult<_>>()?;
+                ref_tuples.push(PyTuple::new(py, key_tuples)?);
+            }
+            let refs_tuple = PyTuple::new(py, ref_tuples)?;
+            let value_tuple = PyTuple::new(py, [value_b.into_any(), refs_tuple.into_any()])?;
+            nodes_dict.set_item(key_t, value_tuple)?;
+        }
+    }
+    Ok((
+        header.node_ref_lists,
+        header.key_length,
+        header.key_count,
+        nodes_dict,
+    ))
+}
+
 pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "index")?;
     m.add_function(wrap_pyfunction!(py_serialize_graph_index, &m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_header, &m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_lines, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_parse_full, &m)?)?;
     m.add_class::<PyGraphIndex>()?;
     Ok(m)
 }

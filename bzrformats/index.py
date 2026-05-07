@@ -432,39 +432,29 @@ class GraphIndex:
             return
         logger.debug("Reading entire index %s", self._transport.abspath(self._name))
         if stream is None:
-            stream = self._transport.get(self._name)
-            if self._base_offset != 0 or not hasattr(stream, "readline"):
-                # This is wasteful, but it is better than dealing with
-                # adjusting all the offsets, etc.
-                stream = BytesIO(stream.read()[self._base_offset :])
+            data = self._transport.get_bytes(self._name)
+            if self._base_offset != 0:
+                data = data[self._base_offset :]
+        else:
+            try:
+                data = stream.read()
+            finally:
+                stream.close()
         try:
-            self._read_prefix(stream)
-            self._expected_elements = 3 + self._key_length
-            # raw data keyed by offset
-            self._keys_by_offset = {}
-            # ready-to-return key:value or key:value, node_ref_lists
-            self._nodes = {}
-            self._nodes_by_key = None
-            trailers = 0
-            pos = stream.tell()
-            lines = stream.read().split(b"\n")
-        finally:
-            stream.close()
-        del lines[-1]
-        _, _, _, trailers = self._parse_lines(lines, pos)
-        for key, absent, references, value in self._keys_by_offset.values():
-            if absent:
-                continue
-            # resolve references:
-            if self.node_ref_lists:
-                node_value = (value, self._resolve_references(references))
-            else:
-                node_value = value
-            self._nodes[key] = node_value
-        # cache the keys for quick set intersections
-        if trailers != 1:
-            # there must be one line - the empty trailer line.
-            raise BadIndexData(self)
+            node_ref_lists, key_length, key_count, nodes = _index_rs.parse_full(data)
+        except BadIndexFormatSignature:
+            raise BadIndexFormatSignature(self._name, GraphIndex) from None
+        except BadIndexOptions:
+            raise BadIndexOptions(self) from None
+        except BadIndexData:
+            raise BadIndexData(self) from None
+        self.node_ref_lists = node_ref_lists
+        self._key_length = key_length
+        self._key_count = key_count
+        self._expected_elements = 3 + key_length
+        self._keys_by_offset = {}
+        self._nodes = nodes
+        self._nodes_by_key = None
 
     def clear_cache(self):
         """Clear out any cached/memoized values.

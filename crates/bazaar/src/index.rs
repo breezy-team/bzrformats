@@ -431,6 +431,58 @@ pub type IndexEntry = (IndexKey, Vec<u8>, RefLists);
 /// match any key element at that position.
 pub type KeyPrefix = Vec<Option<Vec<u8>>>;
 
+/// Parse a complete graph-index file (header + body) and resolve every
+/// reference offset to its key. Returns the header metadata along with
+/// the `key -> (value, reference lists)` map for present nodes only.
+///
+/// `data` must be the body of the file with any base-offset already
+/// trimmed off; the caller owns transport reads and offset adjustment.
+pub fn parse_full(data: &[u8]) -> Result<(IndexHeader, HashMap<IndexKey, NodeBody>), IndexError> {
+    let header = parse_header(data)?;
+    let body = &data[header.header_end..];
+    // Mirrors Python: split on b"\n", drop the trailing empty
+    // segment that follows the final newline. parse_lines counts
+    // trailer (empty) lines and we require exactly one.
+    let mut segments: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
+    segments.pop();
+    let parsed = parse_lines(&segments, header.header_end as u64, header.key_length)?;
+    if parsed.trailers != 1 {
+        return Err(IndexError::missing_trailer());
+    }
+    let mut offset_to_key: HashMap<u64, IndexKey> = HashMap::new();
+    for (offset, raw_node) in &parsed.keys_by_offset {
+        offset_to_key.insert(*offset, raw_node.key.clone());
+    }
+    let mut nodes: HashMap<IndexKey, NodeBody> = HashMap::new();
+    let node_ref_lists = header.node_ref_lists;
+    for (_, raw_node) in parsed.keys_by_offset.into_iter() {
+        if raw_node.absent {
+            continue;
+        }
+        // parse_lines always emits at least one (possibly empty)
+        // reference list, even when the index header says 0 — the
+        // tab-split sees `[""]`. Truncate to the declared count.
+        let resolved = if node_ref_lists == 0 {
+            Vec::new()
+        } else {
+            let mut out: Vec<Vec<IndexKey>> = Vec::with_capacity(node_ref_lists);
+            for ref_list in &raw_node.ref_offsets {
+                let mut list: Vec<IndexKey> = Vec::with_capacity(ref_list.len());
+                for off in ref_list {
+                    let k = offset_to_key.get(off).ok_or_else(|| {
+                        IndexError::Other(format!("unresolved reference offset {}", off))
+                    })?;
+                    list.push(k.clone());
+                }
+                out.push(list);
+            }
+            out
+        };
+        nodes.insert(raw_node.key, (raw_node.value, resolved));
+    }
+    Ok((header, nodes))
+}
+
 /// A read-only graph index opened on a [`IndexTransport`]-backed file.
 ///
 /// This is the full-load implementation: the first method that needs
@@ -476,50 +528,7 @@ impl<T: IndexTransport> GraphIndex<T> {
         } else {
             raw[self.base_offset as usize..].to_vec()
         };
-        let header = parse_header(&data)?;
-        let body = &data[header.header_end..];
-        // Mirrors Python: split on b"\n", drop the trailing empty
-        // segment that follows the final newline. parse_lines counts
-        // trailer (empty) lines and we require exactly one.
-        let mut segments: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
-        segments.pop();
-        let parsed = parse_lines(&segments, header.header_end as u64, header.key_length)?;
-        if parsed.trailers != 1 {
-            return Err(IndexError::missing_trailer());
-        }
-        // Build a fast offset->key map for resolving ref offsets to keys.
-        let mut offset_to_key: HashMap<u64, IndexKey> = HashMap::new();
-        for (offset, raw_node) in &parsed.keys_by_offset {
-            offset_to_key.insert(*offset, raw_node.key.clone());
-        }
-        let mut nodes: HashMap<IndexKey, (Vec<u8>, Vec<Vec<IndexKey>>)> = HashMap::new();
-        let node_ref_lists = header.node_ref_lists;
-        for (offset, raw_node) in parsed.keys_by_offset.into_iter() {
-            let _ = offset;
-            if raw_node.absent {
-                continue;
-            }
-            // parse_lines always emits at least one (possibly empty)
-            // reference list, even when the index header says 0 — the
-            // tab-split sees `[""]`. Truncate to the declared count.
-            let resolved = if node_ref_lists == 0 {
-                Vec::new()
-            } else {
-                let mut out: Vec<Vec<IndexKey>> = Vec::with_capacity(node_ref_lists);
-                for ref_list in &raw_node.ref_offsets {
-                    let mut list: Vec<IndexKey> = Vec::with_capacity(ref_list.len());
-                    for off in ref_list {
-                        let k = offset_to_key.get(off).ok_or_else(|| {
-                            IndexError::Other(format!("unresolved reference offset {}", off))
-                        })?;
-                        list.push(k.clone());
-                    }
-                    out.push(list);
-                }
-                out
-            };
-            nodes.insert(raw_node.key, (raw_node.value, resolved));
-        }
+        let (header, nodes) = parse_full(&data)?;
         self.nodes = Some(nodes);
         self.header = Some(header);
         Ok(())
@@ -569,9 +578,7 @@ impl<T: IndexTransport> GraphIndex<T> {
     /// Iterate over every present entry as `(key, value, resolved
     /// reference lists)`. Order is unspecified — the Python equivalent
     /// is also unordered (HashMap iteration).
-    pub fn iter_all_entries(
-        &mut self,
-    ) -> Result<Vec<IndexEntry>, IndexError> {
+    pub fn iter_all_entries(&mut self) -> Result<Vec<IndexEntry>, IndexError> {
         self.buffer_all()?;
         let nodes = self.nodes.as_ref().expect("buffer_all populated nodes");
         Ok(nodes
@@ -582,10 +589,7 @@ impl<T: IndexTransport> GraphIndex<T> {
 
     /// Iterate over only the entries whose key is in `keys`. Missing
     /// keys are silently skipped, matching Python.
-    pub fn iter_entries(
-        &mut self,
-        keys: &[IndexKey],
-    ) -> Result<Vec<IndexEntry>, IndexError> {
+    pub fn iter_entries(&mut self, keys: &[IndexKey]) -> Result<Vec<IndexEntry>, IndexError> {
         self.buffer_all()?;
         let nodes = self.nodes.as_ref().expect("buffer_all populated nodes");
         let mut out = Vec::new();
@@ -646,10 +650,13 @@ impl<T: IndexTransport> GraphIndex<T> {
                 if k.len() != key_length {
                     continue;
                 }
-                let matches = prefix.iter().zip(k.iter()).all(|(p_elem, k_elem)| match p_elem {
-                    Some(p) => p == k_elem,
-                    None => true,
-                });
+                let matches = prefix
+                    .iter()
+                    .zip(k.iter())
+                    .all(|(p_elem, k_elem)| match p_elem {
+                        Some(p) => p == k_elem,
+                        None => true,
+                    });
                 if matches && emitted.insert(k.clone()) {
                     out.push((k.clone(), v.clone(), r.clone()));
                 }
