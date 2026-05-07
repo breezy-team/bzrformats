@@ -1757,6 +1757,44 @@ fn py_iter_builder_nodes_for_keys<'py>(
     Ok(out)
 }
 
+/// Insert a node into a `BTreeBuilder`-shaped `_nodes` dict
+/// (`{key: (refs, value)}`). Performs the per-add validation +
+/// duplicate-key check + dict insertion in a single Rust call.
+///
+/// Raises `BadIndexDuplicateKey(key, builder)` if `key` is already
+/// present.
+#[pyfunction]
+#[pyo3(name = "add_node_to_btree_builder")]
+fn py_add_node_to_btree_builder<'py>(
+    py: Python<'py>,
+    builder: Bound<'py, PyAny>,
+    key: Bound<'py, PyAny>,
+    value: Bound<'py, PyBytes>,
+    references: Bound<'py, PyAny>,
+    nodes: Bound<'py, PyDict>,
+    reference_lists_count: usize,
+    key_length: usize,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let (node_refs, _absent) = py_check_key_ref_value(
+        py,
+        key.clone(),
+        references,
+        value.clone(),
+        nodes.clone(),
+        reference_lists_count,
+        key_length,
+    )?;
+    if nodes.contains(key.clone())? {
+        return Err(BadIndexDuplicateKey::new_err((
+            key.unbind(),
+            builder.unbind(),
+        )));
+    }
+    let pair = PyTuple::new(py, [node_refs.clone().into_any(), value.into_any()])?;
+    nodes.set_item(key, pair)?;
+    Ok(node_refs)
+}
+
 /// Insert a node into a `GraphIndexBuilder`-shaped state. Folds the
 /// per-node check_key_ref_value + duplicate check + dict updates from
 /// `add_node` into a single Rust call.
@@ -1931,6 +1969,7 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(py_check_value, &m)?)?;
     m.add_function(wrap_pyfunction!(py_check_key_ref_value, &m)?)?;
     m.add_function(wrap_pyfunction!(py_add_node_to_builder, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_add_node_to_btree_builder, &m)?)?;
     m.add_function(wrap_pyfunction!(py_iter_builder_nodes, &m)?)?;
     m.add_function(wrap_pyfunction!(py_iter_builder_nodes_for_keys, &m)?)?;
     m.add_function(wrap_pyfunction!(py_strip_prefix_entries, &m)?)?;

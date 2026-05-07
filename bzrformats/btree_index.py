@@ -105,11 +105,15 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
         """
         # Ensure that 'key' is a tuple.
         key = tuple(key)
-        # we don't care about absent_references
-        node_refs, _ = self._check_key_ref_value(key, references, value)
-        if key in self._nodes:
-            raise _mod_index.BadIndexDuplicateKey(key, self)
-        self._nodes[key] = (node_refs, value)
+        node_refs = _index_rs.add_node_to_btree_builder(
+            self,
+            key,
+            value,
+            references,
+            self._nodes,
+            self.reference_lists,
+            self._key_length,
+        )
         if self._nodes_by_key is not None and self._key_length > 1:
             self._update_nodes_by_key(key, value, node_refs)
         if len(self._nodes) < self._spill_at:
