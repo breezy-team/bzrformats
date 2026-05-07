@@ -1341,3 +1341,9 @@ from ._bzr_rs import btree_serializer as _btree_serializer
 from ._bzr_rs import index as _index_rs
 
 _gcchk_factory = _btree_serializer._parse_into_chk  # type: ignore
+
+# Pure-Rust BTreeGraphIndex implementation, available for callers that want
+# the lower-overhead path. Reads through any object that implements the
+# transport read API (`get_bytes`, `readv`, `recommended_page_size`,
+# `abspath`).
+RustBTreeGraphIndex = _btree_index_rs.BTreeGraphIndex
