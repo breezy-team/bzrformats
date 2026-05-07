@@ -17,6 +17,19 @@ import_exception!(bzrformats.index, BadIndexKey);
 import_exception!(bzrformats.index, BadIndexValue);
 import_exception!(bzrformats.index, BadIndexDuplicateKey);
 import_exception!(bzrformats.errors, BzrFormatsError);
+import_exception!(bzrformats.transport, NoSuchFile);
+mod dromedary_errors {
+    use pyo3::import_exception;
+    import_exception!(dromedary.errors, NoSuchFile);
+}
+
+/// Whether `err` represents a "no such file" condition raised by any
+/// of the transport backends bzrformats sees in practice. Each library
+/// has its own NoSuchFile class with no shared base, so we have to
+/// check each explicitly.
+fn is_no_such_file(py: Python<'_>, err: &PyErr) -> bool {
+    err.is_instance_of::<NoSuchFile>(py) || err.is_instance_of::<dromedary_errors::NoSuchFile>(py)
+}
 
 fn index_err_to_py(err: IndexError) -> PyErr {
     match err {
@@ -588,6 +601,13 @@ fn entries_to_pylist<'py>(
 #[pyclass(name = "GraphIndexBuilder", subclass)]
 struct PyGraphIndexBuilder {
     inner: std::sync::Mutex<RsGraphIndexBuilder>,
+    // Python-exposed attribute slots. The pure-Python class allowed
+    // assigning arbitrary objects to these names (e.g. test fixtures
+    // that store sentinels). Mirror that by holding the last-assigned
+    // Python value alongside the Rust state, falling back to the Rust
+    // bool until something is assigned.
+    optimize_for_size_py: std::sync::Mutex<Option<Py<PyAny>>>,
+    combine_backing_indices_py: std::sync::Mutex<Option<Py<PyAny>>>,
 }
 
 #[pymethods]
@@ -597,6 +617,8 @@ impl PyGraphIndexBuilder {
     fn new(reference_lists: usize, key_elements: usize) -> Self {
         Self {
             inner: std::sync::Mutex::new(RsGraphIndexBuilder::new(reference_lists, key_elements)),
+            optimize_for_size_py: std::sync::Mutex::new(None),
+            combine_backing_indices_py: std::sync::Mutex::new(None),
         }
     }
 
@@ -611,13 +633,37 @@ impl PyGraphIndexBuilder {
     }
 
     #[getter]
-    fn _optimize_for_size(&self) -> bool {
-        self.inner.lock().unwrap().optimize_for_size()
+    fn _optimize_for_size<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(v) = self.optimize_for_size_py.lock().unwrap().as_ref() {
+            return Ok(v.bind(py).clone());
+        }
+        let b = self.inner.lock().unwrap().optimize_for_size();
+        Ok(b.into_pyobject(py)?.to_owned().into_any())
+    }
+
+    #[setter]
+    fn set__optimize_for_size(&self, value: Bound<'_, PyAny>) {
+        if let Ok(b) = value.extract::<bool>() {
+            self.inner.lock().unwrap().set_optimize(Some(b), None);
+        }
+        *self.optimize_for_size_py.lock().unwrap() = Some(value.unbind());
     }
 
     #[getter]
-    fn _combine_backing_indices(&self) -> bool {
-        self.inner.lock().unwrap().combine_backing_indices()
+    fn _combine_backing_indices<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(v) = self.combine_backing_indices_py.lock().unwrap().as_ref() {
+            return Ok(v.bind(py).clone());
+        }
+        let b = self.inner.lock().unwrap().combine_backing_indices();
+        Ok(b.into_pyobject(py)?.to_owned().into_any())
+    }
+
+    #[setter]
+    fn set__combine_backing_indices(&self, value: Bound<'_, PyAny>) {
+        if let Ok(b) = value.extract::<bool>() {
+            self.inner.lock().unwrap().set_optimize(None, Some(b));
+        }
+        *self.combine_backing_indices_py.lock().unwrap() = Some(value.unbind());
     }
 
     /// Add a node with `key`, `value`, and optional references.
@@ -671,6 +717,14 @@ impl PyGraphIndexBuilder {
             .lock()
             .unwrap()
             .set_optimize(for_size, combine_backing_indices);
+        // Only the explicitly-passed flag is touched; any sentinel
+        // value previously assigned to the *other* attribute survives.
+        if for_size.is_some() {
+            *self.optimize_for_size_py.lock().unwrap() = None;
+        }
+        if combine_backing_indices.is_some() {
+            *self.combine_backing_indices_py.lock().unwrap() = None;
+        }
         Ok(())
     }
 
@@ -715,9 +769,16 @@ impl PyGraphIndexBuilder {
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyList>> {
+        // Mirror the lenience of the historical Python implementation:
+        // if a caller hands us something that doesn't shape like a key
+        // (e.g. flat bytes instead of a tuple of bytes), skip it rather
+        // than raising — those values can never be present in the
+        // tuple-keyed index, so the result for them is "no match".
         let mut requested: Vec<IndexKey> = Vec::new();
         for k in keys.try_iter()? {
-            requested.push(extract_key(&k?)?);
+            if let Ok(key) = extract_key(&k?) {
+                requested.push(key);
+            }
         }
         let (entries, has_refs) = {
             let r = slf.borrow();
@@ -856,6 +917,8 @@ impl PyInMemoryGraphIndex {
                     reference_lists,
                     key_elements,
                 )),
+                optimize_for_size_py: std::sync::Mutex::new(None),
+                combine_backing_indices_py: std::sync::Mutex::new(None),
             },
         )
     }
@@ -1153,13 +1216,13 @@ impl PyCombinedGraphIndex {
     }
 
     #[getter]
-    fn _sibling_indices<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
+    fn _sibling_indices<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PySet>> {
         let guard = self.sibling_indices.lock().unwrap();
-        let list = PyList::empty(py);
+        let set = pyo3::types::PySet::empty(py)?;
         for idx in guard.iter() {
-            list.append(idx.bind(py)).expect("PyList append");
+            set.add(idx.bind(py))?;
         }
-        list
+        Ok(set)
     }
 
     #[getter]
@@ -1255,7 +1318,6 @@ impl PyCombinedGraphIndex {
     }
 
     fn key_count(&self, py: Python<'_>) -> PyResult<usize> {
-        let no_such_file = py.import("bzrformats.transport")?.getattr("NoSuchFile")?;
         loop {
             let snapshot: Vec<Py<PyAny>> = {
                 let list = self.indices_list.bind(py);
@@ -1267,7 +1329,7 @@ impl PyCombinedGraphIndex {
                 match idx.bind(py).call_method0("key_count") {
                     Ok(v) => total += v.extract::<usize>()?,
                     Err(e) => {
-                        if e.is_instance(py, &no_such_file) {
+                        if is_no_such_file(py, &e) {
                             hit_no_such_file = Some(e);
                             break;
                         }
@@ -1290,7 +1352,6 @@ impl PyCombinedGraphIndex {
         slf: Bound<'py, Self>,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let no_such_file = py.import("bzrformats.transport")?.getattr("NoSuchFile")?;
         let r = slf.borrow();
         let out = PyList::empty(py);
         let seen = pyo3::types::PySet::empty(py)?;
@@ -1304,7 +1365,7 @@ impl PyCombinedGraphIndex {
                 let entries = match idx.bind(py).call_method0("iter_all_entries") {
                     Ok(v) => v,
                     Err(e) => {
-                        if e.is_instance(py, &no_such_file) {
+                        if is_no_such_file(py, &e) {
                             err = Some(e);
                             break 'outer;
                         }
@@ -1314,7 +1375,7 @@ impl PyCombinedGraphIndex {
                 let iter = match entries.try_iter() {
                     Ok(it) => it,
                     Err(e) => {
-                        if e.is_instance(py, &no_such_file) {
+                        if is_no_such_file(py, &e) {
                             err = Some(e);
                             break 'outer;
                         }
@@ -1325,7 +1386,7 @@ impl PyCombinedGraphIndex {
                     let entry = match entry_res {
                         Ok(e) => e,
                         Err(e) => {
-                            if e.is_instance(py, &no_such_file) {
+                            if is_no_such_file(py, &e) {
                                 err = Some(e);
                                 break 'outer;
                             }
@@ -1355,7 +1416,6 @@ impl PyCombinedGraphIndex {
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let no_such_file = py.import("bzrformats.transport")?.getattr("NoSuchFile")?;
         let working_keys = pyo3::types::PySet::empty(py)?;
         for k in keys.try_iter()? {
             working_keys.add(k?)?;
@@ -1379,7 +1439,7 @@ impl PyCombinedGraphIndex {
                 {
                     Ok(v) => v,
                     Err(e) => {
-                        if e.is_instance(py, &no_such_file) {
+                        if is_no_such_file(py, &e) {
                             err = Some(e);
                             break 'outer;
                         }
@@ -1389,7 +1449,7 @@ impl PyCombinedGraphIndex {
                 let iter = match entries.try_iter() {
                     Ok(it) => it,
                     Err(e) => {
-                        if e.is_instance(py, &no_such_file) {
+                        if is_no_such_file(py, &e) {
                             err = Some(e);
                             break 'outer;
                         }
@@ -1401,7 +1461,7 @@ impl PyCombinedGraphIndex {
                     let entry = match entry_res {
                         Ok(e) => e,
                         Err(e) => {
-                            if e.is_instance(py, &no_such_file) {
+                            if is_no_such_file(py, &e) {
                                 err = Some(e);
                                 break 'outer;
                             }
@@ -1436,7 +1496,6 @@ impl PyCombinedGraphIndex {
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let no_such_file = py.import("bzrformats.transport")?.getattr("NoSuchFile")?;
         let key_set = pyo3::types::PySet::empty(py)?;
         for k in keys.try_iter()? {
             key_set.add(k?)?;
@@ -1461,7 +1520,7 @@ impl PyCombinedGraphIndex {
                 {
                     Ok(v) => v,
                     Err(e) => {
-                        if e.is_instance(py, &no_such_file) {
+                        if is_no_such_file(py, &e) {
                             err = Some(e);
                             break 'outer;
                         }
@@ -1471,7 +1530,7 @@ impl PyCombinedGraphIndex {
                 let iter = match entries.try_iter() {
                     Ok(it) => it,
                     Err(e) => {
-                        if e.is_instance(py, &no_such_file) {
+                        if is_no_such_file(py, &e) {
                             err = Some(e);
                             break 'outer;
                         }
@@ -1483,7 +1542,7 @@ impl PyCombinedGraphIndex {
                     let entry = match entry_res {
                         Ok(e) => e,
                         Err(e) => {
-                            if e.is_instance(py, &no_such_file) {
+                            if is_no_such_file(py, &e) {
                                 err = Some(e);
                                 break 'outer;
                             }
@@ -1517,7 +1576,6 @@ impl PyCombinedGraphIndex {
     }
 
     fn validate(&self, py: Python<'_>) -> PyResult<()> {
-        let no_such_file = py.import("bzrformats.transport")?.getattr("NoSuchFile")?;
         loop {
             let snapshot: Vec<Py<PyAny>> = {
                 let list = self.indices_list.bind(py);
@@ -1526,7 +1584,7 @@ impl PyCombinedGraphIndex {
             let mut err: Option<PyErr> = None;
             for idx in &snapshot {
                 if let Err(e) = idx.bind(py).call_method0("validate") {
-                    if e.is_instance(py, &no_such_file) {
+                    if is_no_such_file(py, &e) {
                         err = Some(e);
                         break;
                     }
