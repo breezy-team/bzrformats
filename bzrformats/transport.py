@@ -33,14 +33,25 @@ class NoSuchFile(PathError):
     _fmt = "No such file: %(path)r%(extra)s"
 
 
-# Tuple for catching NoSuchFile from both bzrformats and breezy transports.
-# Use this in except clauses when the transport may be either implementation.
+# Tuple for catching NoSuchFile from any transport backend that callers may
+# encounter (bzrformats, dromedary, breezy). Use this in except clauses when
+# the transport could be any of them — the underlying classes are distinct
+# hierarchies.
+_no_such_file_classes = [NoSuchFile]
+try:
+    from dromedary.errors import NoSuchFile as _DromedaryNoSuchFile
+
+    _no_such_file_classes.append(_DromedaryNoSuchFile)
+except ImportError:
+    pass
 try:
     from breezy.transport import NoSuchFile as _BreezyNoSuchFile
 
-    TransportNoSuchFile = (NoSuchFile, _BreezyNoSuchFile)
+    _no_such_file_classes.append(_BreezyNoSuchFile)
 except ImportError:
-    TransportNoSuchFile = NoSuchFile
+    pass
+
+TransportNoSuchFile = tuple(_no_such_file_classes)
 
 
 class FileExists(PathError):
