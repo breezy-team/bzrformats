@@ -1685,6 +1685,44 @@ fn py_strip_prefix_entries<'py>(
     Ok(out)
 }
 
+/// Sort and emit a `BTreeBuilder`-shaped `_nodes` dict
+/// (`{key: (refs, value)}`). Returns a list of `(key, value)` or
+/// `(key, value, refs)` tuples sorted by key — the caller prepends
+/// `self`.
+#[pyfunction]
+#[pyo3(name = "iter_btree_builder_nodes_sorted")]
+fn py_iter_btree_builder_nodes_sorted<'py>(
+    py: Python<'py>,
+    nodes: Bound<'py, PyDict>,
+    has_refs: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut sortable: Vec<(IndexKey, Bound<'py, PyAny>, Bound<'py, PyAny>)> =
+        Vec::with_capacity(nodes.len());
+    for (key_obj, value_obj) in nodes.iter() {
+        let key_tuple = key_obj
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("key must be a tuple"))?;
+        let key_rs = extract_key(key_tuple.as_any())?;
+        let value_tuple = value_obj
+            .cast_into::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("btree node must be a 2-tuple"))?;
+        let refs_obj = value_tuple.get_item(0)?;
+        let value_b = value_tuple.get_item(1)?;
+        sortable.push((key_rs, refs_obj, value_b));
+    }
+    sortable.sort_by(|a, b| a.0.cmp(&b.0));
+    let out = PyList::empty(py);
+    for (key_rs, refs_obj, value_b) in sortable {
+        let key_t = key_to_py(py, &key_rs)?;
+        if has_refs {
+            out.append(PyTuple::new(py, [key_t.into_any(), value_b, refs_obj])?)?;
+        } else {
+            out.append(PyTuple::new(py, [key_t.into_any(), value_b])?)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Iterate all present entries in a `GraphIndexBuilder`-shaped
 /// `_nodes` dict (`{key: (absent, refs, value)}`). Skips absent
 /// entries. Returns a list of `(key, value)` or `(key, value, refs)`
@@ -1971,6 +2009,7 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(py_add_node_to_builder, &m)?)?;
     m.add_function(wrap_pyfunction!(py_add_node_to_btree_builder, &m)?)?;
     m.add_function(wrap_pyfunction!(py_iter_builder_nodes, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_iter_btree_builder_nodes_sorted, &m)?)?;
     m.add_function(wrap_pyfunction!(py_iter_builder_nodes_for_keys, &m)?)?;
     m.add_function(wrap_pyfunction!(py_strip_prefix_entries, &m)?)?;
     m.add_function(wrap_pyfunction!(py_prepend_prefix_nodes, &m)?)?;

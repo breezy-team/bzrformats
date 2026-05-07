@@ -188,15 +188,10 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
 
     def _iter_mem_nodes(self):
         """Iterate over the nodes held in memory."""
-        nodes = self._nodes
-        if self.reference_lists:
-            for key in sorted(nodes):
-                references, value = nodes[key]
-                yield self, key, value, references
-        else:
-            for key in sorted(nodes):
-                references, value = nodes[key]
-                yield self, key, value
+        for entry in _index_rs.iter_btree_builder_nodes_sorted(
+            self._nodes, bool(self.reference_lists)
+        ):
+            yield (self, *entry)
 
     def _iter_smallest(self, iterators_to_combine):
         if len(iterators_to_combine) == 1:
