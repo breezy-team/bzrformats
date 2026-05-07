@@ -421,6 +421,15 @@ pub trait IndexTransport {
         path.to_string()
     }
 
+    /// How big a request the transport would prefer per round trip, in
+    /// bytes. Mirrors `bzrformats.transport.Transport.recommended_page_size`.
+    /// The B+Tree reader rounds this up to whole pages when deciding how
+    /// much prefetching to do. The default (64 KiB) matches the
+    /// in-process / memory transport's default.
+    fn recommended_page_size(&self) -> u64 {
+        64 * 1024
+    }
+
     /// Vectored read. Each `(offset, length)` request returns one
     /// `(actual_offset, data)` pair, possibly out of order or with
     /// expanded coverage if the transport upcasts the request.
