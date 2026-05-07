@@ -454,6 +454,12 @@ pub fn to_patch_lines(stanza: &Stanza, max_width: usize) -> Result<Vec<Vec<u8>>,
 
 /// Decode the RIO-Patch line wrapping into raw RIO lines suitable for
 /// `read_stanza`.
+///
+/// Stops at the first stanza terminator (a line whose decoded payload is
+/// just a newline), leaving any following lines on the iterator for the
+/// caller — the merge-directive format embeds a patch/bundle body after
+/// the header stanza and would otherwise trip over the non-`#`-prefixed
+/// lines.
 fn patch_stanza_iter<I>(line_iter: I) -> Result<Vec<Vec<u8>>, Error>
 where
     I: IntoIterator<Item = Vec<u8>>,
@@ -484,9 +490,13 @@ where
             }
         };
         if combined.last() == Some(&b'\n') {
+            let is_terminator = first_chunk && combined == b"\n";
             out.push(combined);
             last_line = None;
             first_chunk = true;
+            if is_terminator {
+                break;
+            }
         } else {
             last_line = Some(combined);
             first_chunk = false;
