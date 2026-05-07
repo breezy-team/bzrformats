@@ -828,6 +828,68 @@ fn py_iter_entries_prefix<'py>(
     Ok(out)
 }
 
+/// External references for a `GraphIndexBuilder`-shaped `_nodes` dict.
+///
+/// Returns the set of keys referenced from the second reference list
+/// of any present node that aren't themselves present (or are absent)
+/// in the index. Mirrors `GraphIndexBuilder._external_references`.
+///
+/// `nodes` is `{key: (absent_marker_bytes, refs_tuple, value_bytes)}`.
+/// `reference_lists` is the configured number of parallel reference
+/// lists; the function returns an empty set unless this is `>= 2`.
+#[pyfunction]
+#[pyo3(name = "external_references_from_builder_nodes")]
+fn py_external_references_from_builder_nodes<'py>(
+    py: Python<'py>,
+    nodes: Bound<'py, PyDict>,
+    reference_lists: usize,
+) -> PyResult<Bound<'py, pyo3::types::PySet>> {
+    let out = pyo3::types::PySet::empty(py)?;
+    if reference_lists < 2 {
+        return Ok(out);
+    }
+    let mut present: std::collections::HashSet<Vec<Vec<u8>>> = std::collections::HashSet::new();
+    let mut refs: Vec<Bound<'py, PyAny>> = Vec::new();
+    for (key_obj, value_obj) in nodes.iter() {
+        let value_tuple = value_obj
+            .cast_into::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("builder node must be a 3-tuple"))?;
+        let absent_obj = value_tuple.get_item(0)?;
+        let absent_bytes = absent_obj
+            .cast::<PyBytes>()
+            .map_err(|_| PyTypeError::new_err("absent marker must be bytes"))?;
+        if absent_bytes.as_bytes() == b"a" {
+            continue;
+        }
+        let key_tuple = key_obj
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("key must be a tuple"))?;
+        let key_rs = extract_key(key_tuple.as_any())?;
+        present.insert(key_rs);
+        let refs_tuple_obj = value_tuple.get_item(1)?;
+        let refs_tuple = refs_tuple_obj
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("refs must be a tuple"))?;
+        if refs_tuple.len() < 2 {
+            continue;
+        }
+        let second_refs_obj = refs_tuple.get_item(1)?;
+        for ref_obj in second_refs_obj.try_iter()? {
+            refs.push(ref_obj?);
+        }
+    }
+    for ref_obj in refs {
+        let ref_tuple = ref_obj
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("ref must be a tuple"))?;
+        let ref_rs = extract_key(ref_tuple.as_any())?;
+        if !present.contains(&ref_rs) {
+            out.add(ref_tuple)?;
+        }
+    }
+    Ok(out)
+}
+
 pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "index")?;
     m.add_function(wrap_pyfunction!(py_serialize_graph_index, &m)?)?;
@@ -835,6 +897,10 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(py_parse_lines, &m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_full, &m)?)?;
     m.add_function(wrap_pyfunction!(py_iter_entries_prefix, &m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_external_references_from_builder_nodes,
+        &m
+    )?)?;
     m.add_class::<PyGraphIndex>()?;
     m.add_class::<PyParsedRangeMap>()?;
     Ok(m)
