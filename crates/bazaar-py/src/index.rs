@@ -11,6 +11,7 @@ use pyo3::types::{PyAnyMethods, PyBytes, PyDict, PyList, PyTuple};
 import_exception!(bzrformats.index, BadIndexFormatSignature);
 import_exception!(bzrformats.index, BadIndexOptions);
 import_exception!(bzrformats.index, BadIndexData);
+import_exception!(bzrformats.index, BadIndexKey);
 import_exception!(bzrformats.errors, BzrFormatsError);
 
 fn index_err_to_py(err: IndexError) -> PyErr {
@@ -543,12 +544,176 @@ fn py_parse_full<'py>(
     ))
 }
 
+/// Linear-scan prefix lookup over a `_nodes`-shaped dict. Each prefix
+/// is a tuple the same length as a key with `None` permitted in any
+/// position except the first.
+///
+/// `mode` selects the dict-value shape:
+///  - `"reader-norefs"`: values are `bytes`; entries are `(key, value)`.
+///  - `"reader-refs"`:   values are `(bytes, refs)`; entries are
+///    `(key, value, refs)`.
+///  - `"builder-norefs"`: values are `(absent, refs, value)`; entries are
+///    `(key, value)`. Absent nodes are skipped.
+///  - `"builder-refs"`:   values are `(absent, refs, value)`; entries are
+///    `(key, value, refs)`. Absent nodes are skipped.
+///  - `"btree-builder-norefs"`: values are `(refs, value)`; entries are
+///    `(key, value)`.
+///  - `"btree-builder-refs"`:   values are `(refs, value)`; entries are
+///    `(key, value, refs)`.
+///
+/// Returns a list of result tuples; the caller prepends `self`.
+#[pyfunction]
+#[pyo3(name = "iter_entries_prefix")]
+fn py_iter_entries_prefix<'py>(
+    py: Python<'py>,
+    nodes: Bound<'py, PyDict>,
+    prefixes: Bound<'py, PyAny>,
+    key_length: usize,
+    mode: &str,
+) -> PyResult<Bound<'py, PyList>> {
+    enum NodeShape {
+        ReaderNoRefs,
+        ReaderRefs,
+        BuilderNoRefs,
+        BuilderRefs,
+        BTreeBuilderNoRefs,
+        BTreeBuilderRefs,
+    }
+    let shape = match mode {
+        "reader-norefs" => NodeShape::ReaderNoRefs,
+        "reader-refs" => NodeShape::ReaderRefs,
+        "builder-norefs" => NodeShape::BuilderNoRefs,
+        "builder-refs" => NodeShape::BuilderRefs,
+        "btree-builder-norefs" => NodeShape::BTreeBuilderNoRefs,
+        "btree-builder-refs" => NodeShape::BTreeBuilderRefs,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown iter_entries_prefix mode: {other}"
+            )))
+        }
+    };
+    let mut parsed: Vec<(Bound<'py, PyTuple>, KeyPrefix)> = Vec::new();
+    let mut seen_prefixes: std::collections::HashSet<Vec<Option<Vec<u8>>>> =
+        std::collections::HashSet::new();
+    for prefix_obj in prefixes.try_iter()? {
+        let prefix_obj = prefix_obj?;
+        let prefix_tuple = prefix_obj
+            .cast::<PyTuple>()
+            .map_err(|_| BadIndexKey::new_err((prefix_obj.clone().unbind(),)))?
+            .clone();
+        let prefix = extract_prefix(prefix_tuple.as_any())
+            .map_err(|_| BadIndexKey::new_err((prefix_tuple.clone().unbind(),)))?;
+        if prefix.len() != key_length || prefix.first().is_none_or(|e| e.is_none()) {
+            return Err(BadIndexKey::new_err((prefix_tuple.unbind(),)));
+        }
+        if seen_prefixes.insert(prefix.clone()) {
+            parsed.push((prefix_tuple, prefix));
+        }
+    }
+
+    let out = PyList::empty(py);
+    if parsed.is_empty() {
+        return Ok(out);
+    }
+
+    let mut emitted: std::collections::HashSet<Vec<Vec<u8>>> = std::collections::HashSet::new();
+    for (key_obj, value_obj) in nodes.iter() {
+        let key_tuple = match key_obj.cast::<PyTuple>() {
+            Ok(t) => t.clone(),
+            Err(_) => continue,
+        };
+        let key_rs = match extract_key(key_tuple.as_any()) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        if key_rs.len() != key_length {
+            continue;
+        }
+        let any_match = parsed.iter().any(|(_, prefix)| {
+            prefix
+                .iter()
+                .zip(key_rs.iter())
+                .all(|(p_elem, k_elem)| match p_elem {
+                    Some(p) => p == k_elem,
+                    None => true,
+                })
+        });
+        if !any_match {
+            continue;
+        }
+        if !emitted.insert(key_rs) {
+            continue;
+        }
+        match shape {
+            NodeShape::ReaderNoRefs => {
+                out.append(PyTuple::new(py, [key_tuple.into_any(), value_obj])?)?;
+            }
+            NodeShape::ReaderRefs => {
+                let value_tuple = value_obj
+                    .cast_into::<PyTuple>()
+                    .map_err(|_| PyTypeError::new_err("node value must be a 2-tuple"))?;
+                let value_b = value_tuple.get_item(0)?;
+                let refs_t = value_tuple.get_item(1)?;
+                out.append(PyTuple::new(
+                    py,
+                    [key_tuple.into_any(), value_b.into_any(), refs_t.into_any()],
+                )?)?;
+            }
+            NodeShape::BuilderNoRefs | NodeShape::BuilderRefs => {
+                let value_tuple = value_obj
+                    .cast_into::<PyTuple>()
+                    .map_err(|_| PyTypeError::new_err("builder node must be a 3-tuple"))?;
+                let absent_obj = value_tuple.get_item(0)?;
+                let absent_bytes = absent_obj
+                    .cast::<PyBytes>()
+                    .map_err(|_| PyTypeError::new_err("absent marker must be bytes"))?;
+                if absent_bytes.as_bytes() == b"a" {
+                    continue;
+                }
+                let refs_t = value_tuple.get_item(1)?;
+                let value_b = value_tuple.get_item(2)?;
+                if matches!(shape, NodeShape::BuilderRefs) {
+                    out.append(PyTuple::new(
+                        py,
+                        [key_tuple.into_any(), value_b.into_any(), refs_t.into_any()],
+                    )?)?;
+                } else {
+                    out.append(PyTuple::new(
+                        py,
+                        [key_tuple.into_any(), value_b.into_any()],
+                    )?)?;
+                }
+            }
+            NodeShape::BTreeBuilderNoRefs | NodeShape::BTreeBuilderRefs => {
+                let value_tuple = value_obj
+                    .cast_into::<PyTuple>()
+                    .map_err(|_| PyTypeError::new_err("btree builder node must be a 2-tuple"))?;
+                let refs_t = value_tuple.get_item(0)?;
+                let value_b = value_tuple.get_item(1)?;
+                if matches!(shape, NodeShape::BTreeBuilderRefs) {
+                    out.append(PyTuple::new(
+                        py,
+                        [key_tuple.into_any(), value_b.into_any(), refs_t.into_any()],
+                    )?)?;
+                } else {
+                    out.append(PyTuple::new(
+                        py,
+                        [key_tuple.into_any(), value_b.into_any()],
+                    )?)?;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "index")?;
     m.add_function(wrap_pyfunction!(py_serialize_graph_index, &m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_header, &m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_lines, &m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_full, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_iter_entries_prefix, &m)?)?;
     m.add_class::<PyGraphIndex>()?;
     Ok(m)
 }

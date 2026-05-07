@@ -386,7 +386,6 @@ class GraphIndex:
         self._parsed_key_map = []
         self._key_count = None
         self._keys_by_offset = None
-        self._nodes_by_key = None
         self._size = size
         # The number of bytes we've read so far in trying to process this file
         self._bytes_read = 0
@@ -454,7 +453,6 @@ class GraphIndex:
         self._expected_elements = 3 + key_length
         self._keys_by_offset = {}
         self._nodes = nodes
-        self._nodes_by_key = None
 
     def clear_cache(self):
         """Clear out any cached/memoized values.
@@ -478,24 +476,6 @@ class GraphIndex:
             ref_list = ref_lists[ref_list_num]
             refs.update([ref for ref in ref_list if ref not in nodes])
         return refs
-
-    def _get_nodes_by_key(self):
-        if self._nodes_by_key is None:
-            nodes_by_key = {}
-            if self.node_ref_lists:
-                for key, (value, references) in self._nodes.items():
-                    key_dict = nodes_by_key
-                    for subkey in key[:-1]:
-                        key_dict = key_dict.setdefault(subkey, {})
-                    key_dict[key[-1]] = key, value, references
-            else:
-                for key, value in self._nodes.items():
-                    key_dict = nodes_by_key
-                    for subkey in key[:-1]:
-                        key_dict = key_dict.setdefault(subkey, {})
-                    key_dict[key[-1]] = key, value
-            self._nodes_by_key = nodes_by_key
-        return self._nodes_by_key
 
     def iter_all_entries(self):
         """Iterate over all keys within the index.
@@ -678,23 +658,16 @@ class GraphIndex:
             will be returned, and every match that is in the index will be
             returned.
         """
-        keys = set(keys)
+        keys = list(keys)
         if not keys:
             return
-        # load data - also finds key lengths
         if self._nodes is None:
             self._buffer_all()
-        if self._key_length == 1:
-            for key in keys:
-                _sanity_check_key(self, key)
-                if self.node_ref_lists:
-                    value, node_refs = self._nodes[key]
-                    yield self, key, value, node_refs
-                else:
-                    yield self, key, self._nodes[key]
-            return
-        nodes_by_key = self._get_nodes_by_key()
-        yield from _iter_entries_prefix(self, nodes_by_key, keys)
+        mode = "reader-refs" if self.node_ref_lists else "reader-norefs"
+        for entry in _index_rs.iter_entries_prefix(
+            self._nodes, keys, self._key_length, mode
+        ):
+            yield (self, *entry)
 
     def _find_ancestors(self, keys, ref_list_num, parent_map, missing_keys):
         """See BTreeIndex._find_ancestors."""
@@ -1584,22 +1557,14 @@ class InMemoryGraphIndex(GraphIndexBuilder):
             will be returned, and every match that is in the index will be
             returned.
         """
-        keys = set(keys)
+        keys = list(keys)
         if not keys:
             return
-        if self._key_length == 1:
-            for key in keys:
-                _sanity_check_key(self, key)
-                node = self._nodes[key]
-                if node[0]:
-                    continue
-                if self.reference_lists:
-                    yield self, key, node[2], node[1]
-                else:
-                    yield self, key, node[2]
-            return
-        nodes_by_key = self._get_nodes_by_key()
-        yield from _iter_entries_prefix(self, nodes_by_key, keys)
+        mode = "builder-refs" if self.reference_lists else "builder-norefs"
+        for entry in _index_rs.iter_entries_prefix(
+            self._nodes, keys, self._key_length, mode
+        ):
+            yield (self, *entry)
 
     def key_count(self):
         """Return an estimate of the number of keys in this index.
@@ -1757,44 +1722,3 @@ class GraphIndexPrefixAdapter:
         self.adapted.validate()
 
 
-def _sanity_check_key(index_or_builder, key):
-    """Raise BadIndexKey if key cannot be used for prefix matching."""
-    if key[0] is None:
-        raise BadIndexKey(key)
-    if len(key) != index_or_builder._key_length:
-        raise BadIndexKey(key)
-
-
-def _iter_entries_prefix(index_or_builder, nodes_by_key, keys):
-    """Helper for implementing prefix matching iterators."""
-    for key in keys:
-        _sanity_check_key(index_or_builder, key)
-        # find what it refers to:
-        key_dict = nodes_by_key
-        elements = list(key)
-        # find the subdict whose contents should be returned.
-        try:
-            while len(elements) and elements[0] is not None:
-                key_dict = key_dict[elements[0]]
-                elements.pop(0)
-        except KeyError:
-            # a non-existant lookup.
-            continue
-        if len(elements):
-            dicts = [key_dict]
-            while dicts:
-                values_view = dicts.pop().values()
-                # can't be empty or would not exist
-                value = next(iter(values_view))
-                if isinstance(value, dict):
-                    # still descending, push values
-                    dicts.extend(values_view)
-                else:
-                    # at leaf tuples, yield values
-                    for value in values_view:
-                        # each value is the key:value:node refs tuple
-                        # ready to yield.
-                        yield (index_or_builder,) + value
-        else:
-            # the last thing looked up was a terminal element
-            yield (index_or_builder,) + key_dict

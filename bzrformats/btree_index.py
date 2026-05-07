@@ -344,7 +344,7 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
             will be returned, and every match that is in the index will be
             returned.
         """
-        keys = set(keys)
+        keys = list(keys)
         if not keys:
             return
         for backing in self._backing_indices:
@@ -352,20 +352,11 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
                 continue
             for node in backing.iter_entries_prefix(keys):
                 yield (self,) + node[1:]
-        if self._key_length == 1:
-            for key in keys:
-                _mod_index._sanity_check_key(self, key)
-                try:
-                    node = self._nodes[key]
-                except KeyError:
-                    continue
-                if self.reference_lists:
-                    yield self, key, node[1], node[0]
-                else:
-                    yield self, key, node[1]
-            return
-        nodes_by_key = self._get_nodes_by_key()
-        yield from _mod_index._iter_entries_prefix(self, nodes_by_key, keys)
+        mode = "btree-builder-refs" if self.reference_lists else "btree-builder-norefs"
+        for entry in _index_rs.iter_entries_prefix(
+            self._nodes, keys, self._key_length, mode
+        ):
+            yield (self, *entry)
 
     def _get_nodes_by_key(self):
         if self._nodes_by_key is None:
@@ -1173,46 +1164,16 @@ class BTreeGraphIndex:
         # current breezy) just suck the entire index and iterate in memory.
         nodes = {}
         if self.node_ref_lists:
-            if self._key_length == 1:
-                for _1, key, value, refs in self.iter_all_entries():
-                    nodes[key] = value, refs
-            else:
-                nodes_by_key = {}
-                for _1, key, value, refs in self.iter_all_entries():
-                    key_value = key, value, refs
-                    # For a key of (foo, bar, baz) create
-                    # _nodes_by_key[foo][bar][baz] = key_value
-                    key_dict = nodes_by_key
-                    for subkey in key[:-1]:
-                        key_dict = key_dict.setdefault(subkey, {})
-                    key_dict[key[-1]] = key_value
+            for _1, key, value, refs in self.iter_all_entries():
+                nodes[key] = value, refs
         else:
-            if self._key_length == 1:
-                for _1, key, value in self.iter_all_entries():
-                    nodes[key] = value
-            else:
-                nodes_by_key = {}
-                for _1, key, value in self.iter_all_entries():
-                    key_value = key, value
-                    # For a key of (foo, bar, baz) create
-                    # _nodes_by_key[foo][bar][baz] = key_value
-                    key_dict = nodes_by_key
-                    for subkey in key[:-1]:
-                        key_dict = key_dict.setdefault(subkey, {})
-                    key_dict[key[-1]] = key_value
-        if self._key_length == 1:
-            for key in keys:
-                _mod_index._sanity_check_key(self, key)
-                try:
-                    if self.node_ref_lists:
-                        value, node_refs = nodes[key]
-                        yield self, key, value, node_refs
-                    else:
-                        yield self, key, nodes[key]
-                except KeyError:
-                    pass
-            return
-        yield from _mod_index._iter_entries_prefix(self, nodes_by_key, keys)
+            for _1, key, value in self.iter_all_entries():
+                nodes[key] = value
+        mode = "reader-refs" if self.node_ref_lists else "reader-norefs"
+        for entry in _index_rs.iter_entries_prefix(
+            nodes, keys, self._key_length, mode
+        ):
+            yield (self, *entry)
 
     def key_count(self):
         """Return an estimate of the number of keys in this index.
@@ -1354,5 +1315,6 @@ _gcchk_factory = _LeafNode
 
 from ._bzr_rs import btree_index as _btree_index_rs
 from ._bzr_rs import btree_serializer as _btree_serializer
+from ._bzr_rs import index as _index_rs
 
 _gcchk_factory = _btree_serializer._parse_into_chk  # type: ignore
