@@ -1,7 +1,7 @@
 use bazaar::index::{
     parse_full, parse_header, parse_lines, serialize_graph_index, GraphIndex as RsGraphIndex,
     IndexEntry, IndexError, IndexHeader, IndexKey, IndexNode, IndexTransport, KeyPrefix,
-    ParsedLines, RawNode,
+    ParsedLines, ParsedRangeMap as RsParsedRangeMap, RawNode,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::import_exception;
@@ -300,6 +300,127 @@ fn extract_prefix(obj: &Bound<PyAny>) -> PyResult<KeyPrefix> {
         }
     }
     Ok(out)
+}
+
+/// Tracks which byte spans of a graph-index file have already been
+/// parsed by the bisection path, along with the corresponding key
+/// ranges. Replaces the parallel `_parsed_byte_map` /
+/// `_parsed_key_map` lists in the Python `GraphIndex`.
+#[pyclass(name = "ParsedRangeMap")]
+struct PyParsedRangeMap {
+    inner: std::sync::Mutex<RsParsedRangeMap>,
+}
+
+fn key_or_none_from_py(obj: &Bound<PyAny>) -> PyResult<Option<IndexKey>> {
+    if obj.is_none() {
+        return Ok(None);
+    }
+    let key = extract_key(obj)?;
+    Ok(Some(key))
+}
+
+fn key_or_none_to_py<'py>(py: Python<'py>, k: &Option<IndexKey>) -> PyResult<Bound<'py, PyAny>> {
+    match k {
+        Some(key) => Ok(key_to_py(py, key)?.into_any()),
+        None => Ok(py.None().into_bound(py)),
+    }
+}
+
+#[pymethods]
+impl PyParsedRangeMap {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(RsParsedRangeMap::new()),
+        }
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    fn byte_range<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, PyTuple>> {
+        let m = self.inner.lock().unwrap();
+        let (start, end) = m
+            .byte_range(index)
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err(index))?;
+        PyTuple::new(
+            py,
+            [
+                start.into_pyobject(py)?.into_any(),
+                end.into_pyobject(py)?.into_any(),
+            ],
+        )
+    }
+
+    fn key_range<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, PyTuple>> {
+        let m = self.inner.lock().unwrap();
+        let (start, end) = m
+            .key_range(index)
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err(index))?;
+        let start_py = key_or_none_to_py(py, &start)?;
+        let end_py = key_or_none_to_py(py, &end)?;
+        PyTuple::new(py, [start_py, end_py])
+    }
+
+    fn byte_index(&self, offset: u64) -> isize {
+        self.inner.lock().unwrap().byte_index(offset)
+    }
+
+    fn key_index(&self, key: Bound<'_, PyAny>) -> PyResult<isize> {
+        // The Python caller passes a key tuple — never None — but be
+        // defensive for the empty-tuple sentinel that means "before any
+        // real key".
+        let probe = key_or_none_from_py(&key)?;
+        Ok(self.inner.lock().unwrap().key_index(&probe))
+    }
+
+    fn is_parsed(&self, offset: u64) -> bool {
+        self.inner.lock().unwrap().is_parsed(offset)
+    }
+
+    fn mark_parsed<'py>(
+        &self,
+        start: u64,
+        start_key: Bound<'py, PyAny>,
+        end: u64,
+        end_key: Bound<'py, PyAny>,
+    ) -> PyResult<()> {
+        let sk = key_or_none_from_py(&start_key)?;
+        let ek = key_or_none_from_py(&end_key)?;
+        self.inner.lock().unwrap().mark_parsed(start, sk, end, ek);
+        Ok(())
+    }
+
+    /// Materialise the byte-range list as `[(start, end), ...]`.
+    fn byte_ranges<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let m = self.inner.lock().unwrap();
+        let out = PyList::empty(py);
+        for i in 0..m.len() {
+            let (s, e) = m.byte_range(i).expect("in range");
+            out.append(PyTuple::new(
+                py,
+                [
+                    s.into_pyobject(py)?.into_any(),
+                    e.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+        }
+        Ok(out)
+    }
+
+    /// Materialise the key-range list as `[(start_key, end_key), ...]`.
+    fn key_ranges<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let m = self.inner.lock().unwrap();
+        let out = PyList::empty(py);
+        for i in 0..m.len() {
+            let (s, e) = m.key_range(i).expect("in range");
+            let sp = key_or_none_to_py(py, &s)?;
+            let ep = key_or_none_to_py(py, &e)?;
+            out.append(PyTuple::new(py, [sp, ep])?)?;
+        }
+        Ok(out)
+    }
 }
 
 #[pymethods]
@@ -715,5 +836,6 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(py_parse_full, &m)?)?;
     m.add_function(wrap_pyfunction!(py_iter_entries_prefix, &m)?)?;
     m.add_class::<PyGraphIndex>()?;
+    m.add_class::<PyParsedRangeMap>()?;
     Ok(m)
 }

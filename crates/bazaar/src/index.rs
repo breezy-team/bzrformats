@@ -431,6 +431,112 @@ pub type IndexEntry = (IndexKey, Vec<u8>, RefLists);
 /// match any key element at that position.
 pub type KeyPrefix = Vec<Option<Vec<u8>>>;
 
+/// Bookkeeping for the byte-range and key-range subsets of a
+/// graph-index file that the bisection path has already parsed. The
+/// ranges in each map are sorted, non-overlapping, and parallel: index
+/// `i` in `byte_map` corresponds to index `i` in `key_map`.
+///
+/// `None` keys at either end represent "no key before this region",
+/// matching the empty-tuple sentinel the Python code uses when the
+/// region only contains the file header and not yet any node lines.
+#[derive(Debug, Default, Clone)]
+pub struct ParsedRangeMap {
+    byte_map: Vec<(u64, u64)>,
+    key_map: Vec<(Option<IndexKey>, Option<IndexKey>)>,
+}
+
+impl ParsedRangeMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.byte_map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.byte_map.is_empty()
+    }
+
+    pub fn byte_range(&self, index: usize) -> Option<(u64, u64)> {
+        self.byte_map.get(index).copied()
+    }
+
+    pub fn key_range(&self, index: usize) -> Option<(Option<IndexKey>, Option<IndexKey>)> {
+        self.key_map.get(index).cloned()
+    }
+
+    /// Largest index `i` such that `byte_map[i].0 <= offset`. Returns
+    /// `-1` when no such index exists (empty map or offset before every
+    /// region's start).
+    pub fn byte_index(&self, offset: u64) -> isize {
+        self.byte_map
+            .iter()
+            .rposition(|r| r.0 <= offset)
+            .map(|i| i as isize)
+            .unwrap_or(-1)
+    }
+
+    /// Largest index `i` such that `key_map[i].0 <= key`. Returns `-1`
+    /// when no such index exists.
+    pub fn key_index(&self, key: &Option<IndexKey>) -> isize {
+        self.key_map
+            .iter()
+            .rposition(|r| r.0 <= *key)
+            .map(|i| i as isize)
+            .unwrap_or(-1)
+    }
+
+    /// `true` when `offset` falls inside one of the parsed regions.
+    pub fn is_parsed(&self, offset: u64) -> bool {
+        let index = self.byte_index(offset);
+        if index < 0 {
+            return false;
+        }
+        let (start, end) = self.byte_map[index as usize];
+        offset >= start && offset < end
+    }
+
+    /// Mark `[start, end)` as parsed, keyed by `[start_key, end_key]`.
+    /// Adjacent ranges are merged.
+    pub fn mark_parsed(
+        &mut self,
+        start: u64,
+        start_key: Option<IndexKey>,
+        end: u64,
+        end_key: Option<IndexKey>,
+    ) {
+        let index = self.byte_index(start);
+        let new_value = (start, end);
+        let new_key = (start_key, end_key);
+        if index < 0 {
+            self.byte_map.insert(0, new_value);
+            self.key_map.insert(0, new_key);
+            return;
+        }
+        let index = index as usize;
+        let next = index + 1;
+        if next < self.byte_map.len()
+            && self.byte_map[index].1 == start
+            && self.byte_map[next].0 == end
+        {
+            self.byte_map[index] = (self.byte_map[index].0, self.byte_map[next].1);
+            self.key_map[index] = (self.key_map[index].0.clone(), self.key_map[next].1.clone());
+            self.byte_map.remove(next);
+            self.key_map.remove(next);
+        } else if self.byte_map[index].1 == start {
+            self.byte_map[index] = (self.byte_map[index].0, end);
+            self.key_map[index] = (self.key_map[index].0.clone(), new_key.1);
+        } else if next < self.byte_map.len() && self.byte_map[next].0 == end {
+            self.byte_map[next] = (start, self.byte_map[next].1);
+            self.key_map[next] = (new_key.0, self.key_map[next].1.clone());
+        } else {
+            self.byte_map.insert(next, new_value);
+            self.key_map.insert(next, new_key);
+        }
+    }
+}
+
 /// Parse a complete graph-index file (header + body) and resolve every
 /// reference offset to its key. Returns the header metadata along with
 /// the `key -> (value, reference lists)` map for present nodes only.
@@ -1442,5 +1548,108 @@ mod tests {
         assert_eq!(idx.key_count().unwrap(), 1);
         let entries = idx.iter_all_entries().unwrap();
         assert_eq!(entries, vec![(key(&[b"a"]), b"v".to_vec(), vec![])]);
+    }
+
+    #[test]
+    fn parsed_range_map_starts_empty() {
+        let m = ParsedRangeMap::new();
+        assert!(m.is_empty());
+        assert_eq!(m.len(), 0);
+        assert_eq!(m.byte_index(0), -1);
+        assert_eq!(m.key_index(&None), -1);
+        assert!(!m.is_parsed(0));
+    }
+
+    #[test]
+    fn parsed_range_map_first_insert() {
+        let mut m = ParsedRangeMap::new();
+        m.mark_parsed(0, None, 100, Some(key(&[b"k"])));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.byte_range(0), Some((0, 100)));
+        assert_eq!(m.key_range(0), Some((None, Some(key(&[b"k"])))));
+    }
+
+    #[test]
+    fn parsed_range_map_byte_index_matches_python_doctest() {
+        // Python doctest: regions 0..10, 11..12 → byte_index(0)=0,
+        // byte_index(10)=0, byte_index(11)=1, byte_index(12)=1.
+        let mut m = ParsedRangeMap::new();
+        m.mark_parsed(0, Some(key(&[b"a"])), 10, Some(key(&[b"b"])));
+        m.mark_parsed(11, Some(key(&[b"c"])), 12, Some(key(&[b"d"])));
+        assert_eq!(m.byte_index(0), 0);
+        assert_eq!(m.byte_index(10), 0);
+        assert_eq!(m.byte_index(11), 1);
+        assert_eq!(m.byte_index(12), 1);
+    }
+
+    #[test]
+    fn parsed_range_map_extend_lower_region() {
+        let mut m = ParsedRangeMap::new();
+        m.mark_parsed(0, None, 50, Some(key(&[b"k1"])));
+        m.mark_parsed(50, Some(key(&[b"k1"])), 100, Some(key(&[b"k2"])));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.byte_range(0), Some((0, 100)));
+        assert_eq!(m.key_range(0), Some((None, Some(key(&[b"k2"])))));
+    }
+
+    #[test]
+    fn parsed_range_map_extend_higher_region() {
+        // Header seeds (0, 30) as the first region; a later parse for
+        // (60, 100) creates a second region. Then a parse for (30, 60)
+        // exactly fills the gap, extending the higher region's start
+        // backwards rather than the lower region's end forwards.
+        let mut m = ParsedRangeMap::new();
+        m.mark_parsed(0, None, 30, None);
+        m.mark_parsed(60, Some(key(&[b"k2"])), 100, Some(key(&[b"k3"])));
+        // mark_parsed at (30, 60) abuts the next region exactly,
+        // extending its start backward.
+        m.mark_parsed(30, Some(key(&[b"k1"])), 60, Some(key(&[b"k2"])));
+        // Adjacency on both ends merges into a single span.
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.byte_range(0), Some((0, 100)));
+    }
+
+    #[test]
+    fn parsed_range_map_combine_two_regions() {
+        let mut m = ParsedRangeMap::new();
+        m.mark_parsed(0, None, 50, Some(key(&[b"k1"])));
+        m.mark_parsed(60, Some(key(&[b"k2"])), 100, Some(key(&[b"k3"])));
+        assert_eq!(m.len(), 2);
+        m.mark_parsed(50, Some(key(&[b"k1"])), 60, Some(key(&[b"k2"])));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.byte_range(0), Some((0, 100)));
+    }
+
+    #[test]
+    fn parsed_range_map_disjoint_new_region() {
+        let mut m = ParsedRangeMap::new();
+        m.mark_parsed(0, None, 50, Some(key(&[b"k1"])));
+        m.mark_parsed(200, Some(key(&[b"k5"])), 300, Some(key(&[b"k6"])));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.byte_range(0), Some((0, 50)));
+        assert_eq!(m.byte_range(1), Some((200, 300)));
+    }
+
+    #[test]
+    fn parsed_range_map_is_parsed_inside_only() {
+        let mut m = ParsedRangeMap::new();
+        m.mark_parsed(10, Some(key(&[b"a"])), 20, Some(key(&[b"b"])));
+        assert!(!m.is_parsed(9));
+        assert!(m.is_parsed(10));
+        assert!(m.is_parsed(15));
+        assert!(!m.is_parsed(20));
+        assert!(!m.is_parsed(100));
+    }
+
+    #[test]
+    fn parsed_range_map_key_index() {
+        // Disjoint byte ranges so the two key ranges remain distinct.
+        let mut m = ParsedRangeMap::new();
+        m.mark_parsed(0, None, 50, Some(key(&[b"a"])));
+        m.mark_parsed(60, Some(key(&[b"b"])), 100, Some(key(&[b"c"])));
+        assert_eq!(m.key_index(&None), 0);
+        assert_eq!(m.key_index(&Some(key(&[b"a"]))), 0);
+        assert_eq!(m.key_index(&Some(key(&[b"b"]))), 1);
+        assert_eq!(m.key_index(&Some(key(&[b"e"]))), 1);
     }
 }

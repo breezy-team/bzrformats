@@ -600,8 +600,8 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
     def test_open_sets_parsed_map_empty(self):
         """Test open sets parsed map empty."""
         index = self.make_index()
-        self.assertEqual([], index._parsed_byte_map)
-        self.assertEqual([], index._parsed_key_map)
+        self.assertEqual([], index._range_map.byte_ranges())
+        self.assertEqual([], index._range_map.key_ranges())
 
     def test_key_count_buffers(self):
         """Test key count buffers."""
@@ -641,7 +641,7 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
         self.assertEqual([((index._size // 2, (b"missing",)), False)], result)
         # And this should have caused the file to be fully buffered
         self.assertIsNot(None, index._nodes)
-        self.assertEqual([], index._parsed_byte_map)
+        self.assertEqual([], index._range_map.byte_ranges())
 
     def test_first_lookup_key_via_location(self):
         """Test first lookup key via location."""
@@ -673,10 +673,10 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
         self.assertIs(None, index._nodes)
         # And the regions of the file that have been parsed should be in the
         # parsed_byte_map and the parsed_key_map
-        self.assertEqual([(0, 4008), (5046, 8996)], index._parsed_byte_map)
+        self.assertEqual([(0, 4008), (5046, 8996)], index._range_map.byte_ranges())
         self.assertEqual(
             [((), self.make_key(26)), (self.make_key(31), self.make_key(48))],
-            index._parsed_key_map,
+            index._range_map.key_ranges(),
         )
 
     def test_parsing_non_adjacent_data_trims(self):
@@ -689,10 +689,10 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
         self.assertEqual([((index._size // 2, (b"40",)), False)], result)
         # and we should have a parse map that includes the header and the
         # region that was parsed after trimming.
-        self.assertEqual([(0, 4008), (5046, 8996)], index._parsed_byte_map)
+        self.assertEqual([(0, 4008), (5046, 8996)], index._range_map.byte_ranges())
         self.assertEqual(
             [((), self.make_key(26)), (self.make_key(31), self.make_key(48))],
-            index._parsed_key_map,
+            index._range_map.key_ranges(),
         )
 
     def test_parsing_data_handles_parsed_contained_regions(self):
@@ -714,10 +714,10 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
         result = index._lookup_keys_via_location([(index._size // 2, (b"40",))])
         # and we should have a parse map that includes the header and the
         # region that was parsed after trimming.
-        self.assertEqual([(0, 4045), (11759, 15707)], index._parsed_byte_map)
+        self.assertEqual([(0, 4045), (11759, 15707)], index._range_map.byte_ranges())
         self.assertEqual(
             [((), self.make_key(116)), (self.make_key(35), self.make_key(51))],
-            index._parsed_key_map,
+            index._range_map.key_ranges(),
         )
         # now ask for two keys, right before and after the parsed region
         result = index._lookup_keys_via_location(
@@ -736,7 +736,7 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
             ],
             result,
         )
-        self.assertEqual([(0, 4045), (9889, 17993)], index._parsed_byte_map)
+        self.assertEqual([(0, 4045), (9889, 17993)], index._range_map.byte_ranges())
 
     def test_lookup_missing_key_answers_without_io_when_map_permits(self):
         """Test lookup missing key answers without io when map permits."""
@@ -746,10 +746,10 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
         # lookup the keys in the middle of the file
         result = index._lookup_keys_via_location([(index._size // 2, (b"40",))])
         # check the parse map, this determines the test validity
-        self.assertEqual([(0, 4008), (5046, 8996)], index._parsed_byte_map)
+        self.assertEqual([(0, 4008), (5046, 8996)], index._range_map.byte_ranges())
         self.assertEqual(
             [((), self.make_key(26)), (self.make_key(31), self.make_key(48))],
-            index._parsed_key_map,
+            index._range_map.key_ranges(),
         )
         # reset the transport log
         del index._transport._activity[:]
@@ -769,10 +769,10 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
         # lookup the keys in the middle of the file
         result = index._lookup_keys_via_location([(index._size // 2, (b"40",))])
         # check the parse map, this determines the test validity
-        self.assertEqual([(0, 4008), (5046, 8996)], index._parsed_byte_map)
+        self.assertEqual([(0, 4008), (5046, 8996)], index._range_map.byte_ranges())
         self.assertEqual(
             [((), self.make_key(26)), (self.make_key(31), self.make_key(48))],
-            index._parsed_key_map,
+            index._range_map.key_ranges(),
         )
         # reset the transport log
         del index._transport._activity[:]
@@ -802,10 +802,10 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
         # unparsed region before the middle.
         result = index._lookup_keys_via_location([(index._size // 2, (b"30",))])
         # check the parse map, this determines the test validity
-        self.assertEqual([(0, 4008), (5046, 8996)], index._parsed_byte_map)
+        self.assertEqual([(0, 4008), (5046, 8996)], index._range_map.byte_ranges())
         self.assertEqual(
             [((), self.make_key(26)), (self.make_key(31), self.make_key(48))],
-            index._parsed_key_map,
+            index._range_map.key_ranges(),
         )
         self.assertEqual([((index._size // 2, (b"30",)), -1)], result)
 
@@ -818,10 +818,10 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
         # unparsed region after the middle.
         result = index._lookup_keys_via_location([(index._size // 2, (b"50",))])
         # check the parse map, this determines the test validity
-        self.assertEqual([(0, 4008), (5046, 8996)], index._parsed_byte_map)
+        self.assertEqual([(0, 4008), (5046, 8996)], index._range_map.byte_ranges())
         self.assertEqual(
             [((), self.make_key(26)), (self.make_key(31), self.make_key(48))],
-            index._parsed_key_map,
+            index._range_map.key_ranges(),
         )
         self.assertEqual([((index._size // 2, (b"50",)), +1)], result)
 
@@ -846,10 +846,10 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
         result = index._lookup_keys_via_location([(index_center, (b"40",))])
         # check the parse map - only the start and middle should have been
         # parsed.
-        self.assertEqual([(0, 4027), (10198, 14028)], index._parsed_byte_map)
+        self.assertEqual([(0, 4027), (10198, 14028)], index._range_map.byte_ranges())
         self.assertEqual(
             [((), self.make_key(17)), (self.make_key(44), self.make_key(5))],
-            index._parsed_key_map,
+            index._range_map.key_ranges(),
         )
         # and check the transport activity likewise.
         self.assertEqual(
@@ -899,10 +899,10 @@ class TestGraphIndex(TestCaseWithMemoryTransport):
         result = index._lookup_keys_via_location([(index_center, (b"40",))])
         # check the parse map - only the start and middle should have been
         # parsed.
-        self.assertEqual([(0, 3890), (6444, 10274)], index._parsed_byte_map)
+        self.assertEqual([(0, 3890), (6444, 10274)], index._range_map.byte_ranges())
         self.assertEqual(
             [((), self.make_key(25)), (self.make_key(37), self.make_key(52))],
-            index._parsed_key_map,
+            index._range_map.key_ranges(),
         )
         # and check the transport activity likewise.
         self.assertEqual(
