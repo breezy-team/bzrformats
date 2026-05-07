@@ -24,17 +24,23 @@ from ..errors import LockContention
 from . import TestCase
 
 
+def _read_count(path):
+    return lock._snapshot_state()["read_locks"].get(path, 0)
+
+
+def _write_held(path):
+    return path in lock._snapshot_state()["write_locks"]
+
+
 class TestLockBookkeeping(TestCase):
-    """Tests for ``_read_locks``/``_write_locks`` bookkeeping invariants."""
+    """Tests for the in-process bookkeeping invariants."""
 
     def setUp(self):
         super().setUp()
         # Reset module-global tallies between tests so failures don't
         # poison their neighbours.
-        lock._read_locks.clear()
-        lock._write_locks.clear()
-        self.addCleanup(lock._read_locks.clear)
-        self.addCleanup(lock._write_locks.clear)
+        lock._reset_state()
+        self.addCleanup(lock._reset_state)
         fd, self.path = tempfile.mkstemp()
         os.close(fd)
         self.addCleanup(self._safe_unlink, self.path)
@@ -48,19 +54,19 @@ class TestLockBookkeeping(TestCase):
     def test_two_read_locks_share(self):
         a = lock.ReadLock(self.path)
         b = lock.ReadLock(self.path)
-        self.assertEqual(2, lock._read_locks[self.path])
+        self.assertEqual(2, _read_count(self.path))
         a.unlock()
-        self.assertEqual(1, lock._read_locks[self.path])
+        self.assertEqual(1, _read_count(self.path))
         b.unlock()
-        self.assertNotIn(self.path, lock._read_locks)
+        self.assertEqual(0, _read_count(self.path))
 
     def test_write_blocks_when_reader_open(self):
         rl = lock.ReadLock(self.path)
         try:
             self.assertRaises(LockContention, lock.WriteLock, self.path)
             # Bookkeeping must be unchanged after the failed acquire.
-            self.assertEqual(1, lock._read_locks[self.path])
-            self.assertNotIn(self.path, lock._write_locks)
+            self.assertEqual(1, _read_count(self.path))
+            self.assertFalse(_write_held(self.path))
         finally:
             rl.unlock()
 
@@ -69,14 +75,14 @@ class TestLockBookkeeping(TestCase):
         try:
             rl = lock.ReadLock(self.path)
             try:
-                self.assertEqual(1, lock._read_locks[self.path])
-                self.assertIn(self.path, lock._write_locks)
+                self.assertEqual(1, _read_count(self.path))
+                self.assertTrue(_write_held(self.path))
             finally:
                 rl.unlock()
-            self.assertNotIn(self.path, lock._read_locks)
+            self.assertEqual(0, _read_count(self.path))
         finally:
             wl.unlock()
-        self.assertNotIn(self.path, lock._write_locks)
+        self.assertFalse(_write_held(self.path))
 
     def test_temporary_write_lock_with_other_reader(self):
         a = lock.ReadLock(self.path)
@@ -86,7 +92,7 @@ class TestLockBookkeeping(TestCase):
             self.assertFalse(ok)
             self.assertIs(a, ret)
             # We still hold both read locks.
-            self.assertEqual(2, lock._read_locks[self.path])
+            self.assertEqual(2, _read_count(self.path))
         finally:
             b.unlock()
             a.unlock()
@@ -96,14 +102,14 @@ class TestLockBookkeeping(TestCase):
         ok, wl = a.temporary_write_lock()
         try:
             self.assertTrue(ok)
-            self.assertNotIn(self.path, lock._read_locks)
-            self.assertIn(self.path, lock._write_locks)
+            self.assertEqual(0, _read_count(self.path))
+            self.assertTrue(_write_held(self.path))
         finally:
             # On the failure path temporary_write_lock returns (False, self)
             # so wl == a; either way we unlock through `wl`.
             wl.unlock()
-        self.assertNotIn(self.path, lock._write_locks)
-        self.assertNotIn(self.path, lock._read_locks)
+        self.assertFalse(_write_held(self.path))
+        self.assertEqual(0, _read_count(self.path))
 
     def test_write_lock_failure_does_not_leak(self):
         # Trigger a contention failure by holding a reader, then verify
@@ -111,26 +117,25 @@ class TestLockBookkeeping(TestCase):
         rl = lock.ReadLock(self.path)
         try:
             self.assertRaises(LockContention, lock.WriteLock, self.path)
-            self.assertEqual({self.path: 1}, dict(lock._read_locks))
-            self.assertEqual(set(), lock._write_locks)
+            self.assertEqual(1, _read_count(self.path))
+            self.assertFalse(_write_held(self.path))
         finally:
             rl.unlock()
 
     def test_read_lock_failure_does_not_leak(self):
         # Open the file unwritable so fcntl can still grab a shared lock —
         # we instead exercise the open-failure path by pointing at a
-        # non-existent file.  The constructor must not leave a stale entry
-        # in _read_locks.
+        # non-existent file.  The constructor must not leave a stale entry.
         bogus = self.path + ".does-not-exist"
         self.assertRaises(FileNotFoundError, lock.ReadLock, bogus)
-        self.assertNotIn(bogus, lock._read_locks)
+        self.assertEqual(0, _read_count(bogus))
 
     def test_restore_read_lock_keeps_tallies_consistent(self):
         wl = lock.WriteLock(self.path)
         rl = wl.restore_read_lock()
         try:
-            self.assertNotIn(self.path, lock._write_locks)
-            self.assertEqual(1, lock._read_locks[self.path])
+            self.assertFalse(_write_held(self.path))
+            self.assertEqual(1, _read_count(self.path))
         finally:
             rl.unlock()
-        self.assertNotIn(self.path, lock._read_locks)
+        self.assertEqual(0, _read_count(self.path))
