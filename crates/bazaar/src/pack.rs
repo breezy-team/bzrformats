@@ -1,9 +1,9 @@
 //! Bazaar container format 1 serialization.
 //!
-//! Port of the pure-logic core of `bzrformats/pack.py`. This module covers
-//! name validation, header/record construction, and (in a follow-up) the
-//! push parser. I/O-oriented wrappers (`ContainerWriter`, `ContainerReader`,
-//! transport plumbing) stay in Python.
+//! Port of the pure-logic core of `bzrformats/pack.py`, plus stream-oriented
+//! reader/writer types. Transport plumbing (`ReadVFile`,
+//! `make_readv_reader`) stays in Python — that's a thin adapter over the
+//! transport layer.
 
 /// Magic bytes written at the start of a format-1 container (without the
 /// trailing newline).
@@ -268,6 +268,346 @@ impl ContainerPushParser {
             State::ExpectingNothing => {}
         }
         Ok(())
+    }
+}
+
+/// `_check_name_encoding` from pack.py: rejects names that aren't valid UTF-8.
+pub fn check_name_encoding(name: &[u8]) -> Result<(), PackError> {
+    std::str::from_utf8(name)
+        .map(|_| ())
+        .map_err(|e| PackError::InvalidRecord(e.to_string()))
+}
+
+/// Errors that can happen while reading a container stream.
+#[derive(Debug)]
+pub enum ReadError {
+    Pack(PackError),
+    Io(std::io::Error),
+    /// Stream ended before the container was complete.
+    UnexpectedEof,
+    /// Trailing bytes after the End marker.
+    ExcessData(Vec<u8>),
+    /// `validate` saw the same name tuple twice.
+    DuplicateName(Vec<Vec<u8>>),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::Pack(e) => write!(f, "{}", e),
+            ReadError::Io(e) => write!(f, "{}", e),
+            ReadError::UnexpectedEof => write!(f, "unexpected end of container stream"),
+            ReadError::ExcessData(d) => {
+                write!(f, "container has data after end marker: {:?}", d)
+            }
+            ReadError::DuplicateName(n) => {
+                write!(
+                    f,
+                    "container has multiple records with the same name: {:?}",
+                    n
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+impl From<PackError> for ReadError {
+    fn from(e: PackError) -> Self {
+        ReadError::Pack(e)
+    }
+}
+
+impl From<std::io::Error> for ReadError {
+    fn from(e: std::io::Error) -> Self {
+        ReadError::Io(e)
+    }
+}
+
+/// Default coalescing threshold: when a record body is below this size,
+/// merge the header and body into a single `write` call to cut IO.
+pub const DEFAULT_JOIN_WRITES_THRESHOLD: usize = 100_000;
+
+/// Stateful container-format-1 writer. Wraps any [`std::io::Write`] and
+/// tracks the byte offset so callers can build a (offset, length) memo for
+/// random-access reads.
+pub struct ContainerWriter<W: std::io::Write> {
+    out: W,
+    /// Records below this byte length merge their header and body into one
+    /// write; larger records issue separate writes per chunk.
+    pub join_writes_threshold: usize,
+    /// Bytes written so far, including the header line.
+    pub current_offset: u64,
+    /// Number of bytes records added (excludes begin/end framing).
+    pub records_written: u64,
+}
+
+impl<W: std::io::Write> ContainerWriter<W> {
+    pub fn new(out: W) -> Self {
+        Self {
+            out,
+            join_writes_threshold: DEFAULT_JOIN_WRITES_THRESHOLD,
+            current_offset: 0,
+            records_written: 0,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.out.write_all(bytes)?;
+        self.current_offset += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Write the format header line.
+    pub fn begin(&mut self) -> std::io::Result<()> {
+        self.write(&begin())
+    }
+
+    /// Write the End marker.
+    pub fn end(&mut self) -> std::io::Result<()> {
+        self.write(end())
+    }
+
+    /// Append a Bytes record. Returns `(offset, length)` of the record
+    /// within the container.
+    pub fn add_bytes_record(
+        &mut self,
+        chunks: &[&[u8]],
+        length: usize,
+        names: &[Vec<Vec<u8>>],
+    ) -> Result<(u64, u64), ReadError> {
+        let start = self.current_offset;
+        let header = bytes_header(length, names)?;
+        if length < self.join_writes_threshold {
+            // Merge header + body into a single write.
+            let mut buf = Vec::with_capacity(header.len() + length);
+            buf.extend_from_slice(&header);
+            for chunk in chunks {
+                buf.extend_from_slice(chunk);
+            }
+            self.write(&buf)?;
+        } else {
+            self.write(&header)?;
+            for chunk in chunks {
+                self.write(chunk)?;
+            }
+        }
+        self.records_written += 1;
+        Ok((start, self.current_offset - start))
+    }
+
+    /// Consume the writer and yield the underlying writer back.
+    pub fn into_inner(self) -> W {
+        self.out
+    }
+}
+
+/// Read one `\n`-terminated line from `reader`. Returns the bytes without
+/// the trailing newline. `Err(UnexpectedEof)` if the stream ends without a
+/// newline. Distinguishes a clean EOF (no bytes consumed) by returning
+/// `Ok(None)`.
+fn read_line<R: std::io::BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, ReadError> {
+    let mut buf = Vec::new();
+    let n = reader.read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() != Some(&b'\n') {
+        return Err(ReadError::UnexpectedEof);
+    }
+    buf.pop();
+    Ok(Some(buf))
+}
+
+/// Read exactly one byte. Returns `Ok(None)` at clean EOF.
+fn read_byte<R: std::io::Read>(reader: &mut R) -> Result<Option<u8>, ReadError> {
+    let mut buf = [0u8; 1];
+    let n = reader.read(&mut buf)?;
+    if n == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(buf[0]))
+    }
+}
+
+/// Stream-based reader for a Bytes record. Decodes the prelude (length +
+/// names) on construction; the body is then read incrementally via
+/// [`read_content`](Self::read_content).
+pub struct BytesRecordReader<'a, R: std::io::BufRead> {
+    source: &'a mut R,
+    names: Vec<Vec<Vec<u8>>>,
+    remaining: usize,
+}
+
+impl<'a, R: std::io::BufRead> BytesRecordReader<'a, R> {
+    /// Parse the prelude of a Bytes record from `source`.
+    pub fn read_prelude(source: &'a mut R) -> Result<Self, ReadError> {
+        // Length line.
+        let line = read_line(source)?.ok_or(ReadError::UnexpectedEof)?;
+        let s = std::str::from_utf8(&line)
+            .map_err(|_| PackError::InvalidRecord(format!("{:?} is not a valid length.", line)))?;
+        let length: usize = s
+            .parse()
+            .map_err(|_| PackError::InvalidRecord(format!("{:?} is not a valid length.", line)))?;
+
+        // Name lines, terminated by a blank line.
+        let mut names = Vec::new();
+        loop {
+            let name_line = read_line(source)?.ok_or(ReadError::UnexpectedEof)?;
+            if name_line.is_empty() {
+                break;
+            }
+            let parts: Vec<Vec<u8>> = name_line.split(|&b| b == 0).map(|p| p.to_vec()).collect();
+            for part in &parts {
+                check_name(part)?;
+            }
+            names.push(parts);
+        }
+
+        Ok(Self {
+            source,
+            names,
+            remaining: length,
+        })
+    }
+
+    pub fn names(&self) -> &[Vec<Vec<u8>>] {
+        &self.names
+    }
+
+    /// Bytes left to read in the body.
+    pub fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    /// Read up to `max` bytes of body (or all remaining body if `None`).
+    pub fn read_content(&mut self, max: Option<usize>) -> Result<Vec<u8>, ReadError> {
+        let want = match max {
+            Some(n) => n.min(self.remaining),
+            None => self.remaining,
+        };
+        let mut buf = vec![0u8; want];
+        self.source.read_exact(&mut buf).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                ReadError::UnexpectedEof
+            } else {
+                ReadError::Io(e)
+            }
+        })?;
+        self.remaining -= want;
+        Ok(buf)
+    }
+
+    /// Drain the rest of the body (e.g. for `validate`).
+    pub fn drain(&mut self) -> Result<(), ReadError> {
+        let _ = self.read_content(None)?;
+        Ok(())
+    }
+
+    /// Validate a record: re-checks names are valid UTF-8, then drains.
+    pub fn validate(&mut self) -> Result<(), ReadError> {
+        for name_tuple in &self.names {
+            for name in name_tuple {
+                check_name_encoding(name)?;
+            }
+        }
+        self.drain()
+    }
+}
+
+/// One entry from [`ContainerReader::iter_records`]: either a Bytes record
+/// being delivered, or end-of-container.
+pub enum RecordKind<'a, R: std::io::BufRead> {
+    Bytes(BytesRecordReader<'a, R>),
+    End,
+}
+
+/// Stream-based container reader. Reads the format header, then records.
+pub struct ContainerReader<R: std::io::BufRead> {
+    source: R,
+    format_read: bool,
+}
+
+impl<R: std::io::BufRead> ContainerReader<R> {
+    pub fn new(source: R) -> Self {
+        Self {
+            source,
+            format_read: false,
+        }
+    }
+
+    /// Validate and consume the format header line.
+    pub fn read_format(&mut self) -> Result<(), ReadError> {
+        let line = read_line(&mut self.source)?.ok_or(ReadError::UnexpectedEof)?;
+        if line != FORMAT_ONE {
+            return Err(PackError::UnknownContainerFormat(line).into());
+        }
+        self.format_read = true;
+        Ok(())
+    }
+
+    /// Read the next record (or end marker) from the stream. After
+    /// `RecordKind::End` is returned, callers should stop iterating.
+    /// `RecordKind::Bytes` borrows the reader exclusively until it is
+    /// dropped — Rust's borrow checker enforces the "don't use the record
+    /// after advancing the iterator" rule that the Python doc warns about.
+    pub fn next_record(&mut self) -> Result<RecordKind<'_, R>, ReadError> {
+        if !self.format_read {
+            self.read_format()?;
+        }
+        match read_byte(&mut self.source)? {
+            None => Err(ReadError::UnexpectedEof),
+            Some(b'B') => {
+                let r = BytesRecordReader::read_prelude(&mut self.source)?;
+                Ok(RecordKind::Bytes(r))
+            }
+            Some(b'E') => Ok(RecordKind::End),
+            Some(other) => Err(PackError::UnknownRecordType(other).into()),
+        }
+    }
+
+    /// Validate the entire container: every name must decode as UTF-8, all
+    /// name tuples must be unique, and there must be no trailing data.
+    pub fn validate(&mut self) -> Result<(), ReadError> {
+        let mut seen: std::collections::HashSet<Vec<Vec<u8>>> = std::collections::HashSet::new();
+        loop {
+            match self.next_record()? {
+                RecordKind::End => break,
+                RecordKind::Bytes(mut r) => {
+                    for name_tuple in r.names() {
+                        for name in name_tuple {
+                            check_name_encoding(name)?;
+                        }
+                        if !seen.insert(name_tuple.clone()) {
+                            return Err(ReadError::DuplicateName(name_tuple.clone()));
+                        }
+                    }
+                    r.drain()?;
+                }
+            }
+        }
+        let mut tail = [0u8; 1];
+        match self.source.read(&mut tail)? {
+            0 => Ok(()),
+            _ => Err(ReadError::ExcessData(tail.to_vec())),
+        }
+    }
+
+    /// Read every record into memory. Convenience for callers that want
+    /// the contents up front.
+    pub fn read_all(&mut self) -> Result<Vec<Record>, ReadError> {
+        let mut out = Vec::new();
+        loop {
+            match self.next_record()? {
+                RecordKind::End => return Ok(out),
+                RecordKind::Bytes(mut r) => {
+                    let names = r.names().to_vec();
+                    let body = r.read_content(None)?;
+                    out.push((names, body));
+                }
+            }
+        }
     }
 }
 
@@ -571,5 +911,169 @@ mod tests {
         p.accept_bytes(&data[..header_len + 10]).unwrap();
         // Still needs body.len() - 10 more bytes, which is bigger than 16K.
         assert!(p.read_size_hint() >= body.len() - 10);
+    }
+
+    #[test]
+    fn check_name_encoding_accepts_ascii_and_utf8() {
+        assert!(check_name_encoding(b"abc").is_ok());
+        assert!(check_name_encoding("\u{e9}clair".as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn check_name_encoding_rejects_invalid_utf8() {
+        assert!(check_name_encoding(b"\xcc").is_err());
+    }
+
+    #[test]
+    fn writer_emits_format_header_on_begin() {
+        let mut buf = Vec::new();
+        let mut w = ContainerWriter::new(&mut buf);
+        w.begin().unwrap();
+        assert_eq!(buf, b"Bazaar pack format 1 (introduced in 0.18)\n");
+    }
+
+    #[test]
+    fn writer_records_offsets_and_increments_count() {
+        let mut buf = Vec::new();
+        let mut w = ContainerWriter::new(&mut buf);
+        w.begin().unwrap();
+        let memo = w
+            .add_bytes_record(&[b"abc"], 3, &[name(&[b"name1"])])
+            .unwrap();
+        // Header line is 42 bytes including newline; record body starts there.
+        assert_eq!(memo, (42, 13));
+        assert_eq!(w.records_written, 1);
+        // Second record's offset starts where the first ended.
+        let memo2 = w.add_bytes_record(&[b"abc"], 3, &[]).unwrap();
+        assert_eq!(memo2.0, 42 + 13);
+    }
+
+    #[test]
+    fn writer_split_writes_when_above_threshold() {
+        // Record larger than the threshold writes header+chunks separately.
+        struct Chunked(Vec<Vec<u8>>);
+        impl std::io::Write for Chunked {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.push(b.to_vec());
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Chunked(Vec::new());
+        {
+            let mut w = ContainerWriter::new(&mut sink);
+            w.join_writes_threshold = 2;
+            w.begin().unwrap();
+            w.add_bytes_record(&[b"abcabc"], 6, &[name(&[b"name1"])])
+                .unwrap();
+        }
+        // Three writes: format header, record header, record body.
+        assert_eq!(sink.0.len(), 3);
+        assert_eq!(sink.0[0], b"Bazaar pack format 1 (introduced in 0.18)\n");
+        assert_eq!(sink.0[1], b"B6\nname1\n\n");
+        assert_eq!(sink.0[2], b"abcabc");
+    }
+
+    #[test]
+    fn writer_rejects_invalid_name() {
+        let mut buf = Vec::new();
+        let mut w = ContainerWriter::new(&mut buf);
+        w.begin().unwrap();
+        let err = w
+            .add_bytes_record(&[b"abc"], 3, &[name(&[b"bad name"])])
+            .unwrap_err();
+        match err {
+            ReadError::Pack(PackError::InvalidName(_)) => {}
+            other => panic!("expected InvalidName, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reader_empty_container_validates() {
+        let data = make_container(&[]);
+        let mut r = ContainerReader::new(std::io::Cursor::new(data));
+        r.validate().unwrap();
+    }
+
+    #[test]
+    fn reader_single_record_round_trips() {
+        let data = make_container(&[(&[&[b"name"]], b"body")]);
+        let mut r = ContainerReader::new(std::io::Cursor::new(data));
+        let records = r.read_all().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, vec![vec![b"name".to_vec()]]);
+        assert_eq!(records[0].1, b"body");
+    }
+
+    #[test]
+    fn reader_validate_rejects_duplicate_names() {
+        let data = make_container(&[(&[&[b"n"]], b""), (&[&[b"n"]], b"")]);
+        let mut r = ContainerReader::new(std::io::Cursor::new(data));
+        match r.validate() {
+            Err(ReadError::DuplicateName(_)) => {}
+            other => panic!("expected DuplicateName, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reader_validate_rejects_excess_data() {
+        let mut data = make_container(&[]);
+        data.extend_from_slice(b"crud");
+        let mut r = ContainerReader::new(std::io::Cursor::new(data));
+        match r.validate() {
+            Err(ReadError::ExcessData(_)) => {}
+            other => panic!("expected ExcessData, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reader_validate_rejects_bad_format() {
+        let mut r = ContainerReader::new(std::io::Cursor::new(b"unknown format\n".to_vec()));
+        match r.validate() {
+            Err(ReadError::Pack(PackError::UnknownContainerFormat(_))) => {}
+            other => panic!("expected UnknownContainerFormat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reader_validate_rejects_undecodable_name() {
+        let data = b"Bazaar pack format 1 (introduced in 0.18)\nB0\n\xcc\n\nE".to_vec();
+        let mut r = ContainerReader::new(std::io::Cursor::new(data));
+        match r.validate() {
+            Err(ReadError::Pack(PackError::InvalidRecord(_))) => {}
+            other => panic!("expected InvalidRecord, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bytes_record_reader_max_length() {
+        let mut data: &[u8] = b"6\n\nabcdef";
+        let mut r = BytesRecordReader::read_prelude(&mut data).unwrap();
+        assert_eq!(r.read_content(Some(3)).unwrap(), b"abc");
+        assert_eq!(r.read_content(Some(3)).unwrap(), b"def");
+        // Past the end: no more bytes.
+        assert_eq!(r.read_content(Some(99)).unwrap(), b"");
+    }
+
+    #[test]
+    fn bytes_record_reader_invalid_length_errors() {
+        let mut data: &[u8] = b"not a number\n";
+        match BytesRecordReader::read_prelude(&mut data) {
+            Err(ReadError::Pack(PackError::InvalidRecord(_))) => {}
+            Err(other) => panic!("expected InvalidRecord, got {:?}", other),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn bytes_record_reader_eof_during_name() {
+        let mut data: &[u8] = b"123\nname";
+        match BytesRecordReader::read_prelude(&mut data) {
+            Err(ReadError::UnexpectedEof) => {}
+            Err(other) => panic!("expected UnexpectedEof, got {:?}", other),
+            Ok(_) => panic!("expected error"),
+        }
     }
 }
