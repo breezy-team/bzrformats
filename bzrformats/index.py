@@ -727,14 +727,10 @@ class InMemoryGraphIndex(GraphIndexBuilder):
             efficient order for the index (in this case dictionary hash order).
         """
         evil_logger.debug("iter_all_entries scales with size of history.")
-        if self.reference_lists:
-            for key, (absent, references, value) in self._nodes.items():
-                if not absent:
-                    yield self, key, value, references
-        else:
-            for key, (absent, _references, value) in self._nodes.items():
-                if not absent:
-                    yield self, key, value
+        for entry in _index_rs.iter_builder_nodes(
+            self._nodes, bool(self.reference_lists)
+        ):
+            yield (self, *entry)
 
     def iter_entries(self, keys):
         """Iterate over keys within the index.
@@ -744,20 +740,10 @@ class InMemoryGraphIndex(GraphIndexBuilder):
             defined order for the result iteration - it will be in the most
             efficient order for the index (keys iteration order in this case).
         """
-        # Note: See BTreeBuilder.iter_entries for an explanation of why we
-        #       aren't using set().intersection() here
-        nodes = self._nodes
-        keys = [key for key in keys if key in nodes]
-        if self.reference_lists:
-            for key in keys:
-                node = nodes[key]
-                if not node[0]:
-                    yield self, key, node[2], node[1]
-        else:
-            for key in keys:
-                node = nodes[key]
-                if not node[0]:
-                    yield self, key, node[2]
+        for entry in _index_rs.iter_builder_nodes_for_keys(
+            self._nodes, keys, bool(self.reference_lists)
+        ):
+            yield (self, *entry)
 
     def iter_entries_prefix(self, keys):
         """Iterate over keys within the index using prefix matching.

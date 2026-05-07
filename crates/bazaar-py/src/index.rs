@@ -1517,6 +1517,78 @@ fn py_external_references_from_reader_nodes<'py>(
     Ok(out)
 }
 
+/// Iterate all present entries in a `GraphIndexBuilder`-shaped
+/// `_nodes` dict (`{key: (absent, refs, value)}`). Skips absent
+/// entries. Returns a list of `(key, value)` or `(key, value, refs)`
+/// tuples; the caller prepends `self`.
+#[pyfunction]
+#[pyo3(name = "iter_builder_nodes")]
+fn py_iter_builder_nodes<'py>(
+    py: Python<'py>,
+    nodes: Bound<'py, PyDict>,
+    has_refs: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for (key_obj, value_obj) in nodes.iter() {
+        let value_tuple = value_obj
+            .cast_into::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("builder node must be a 3-tuple"))?;
+        let absent_bytes = value_tuple
+            .get_item(0)?
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyTypeError::new_err("absent marker must be bytes"))?;
+        if absent_bytes.as_bytes() == b"a" {
+            continue;
+        }
+        let refs_obj = value_tuple.get_item(1)?;
+        let value_b = value_tuple.get_item(2)?;
+        if has_refs {
+            out.append(PyTuple::new(py, [key_obj.clone(), value_b, refs_obj])?)?;
+        } else {
+            out.append(PyTuple::new(py, [key_obj.clone(), value_b])?)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Iterate present entries in a builder-shaped `_nodes` dict that
+/// match one of the requested `keys`. Same return shape as
+/// `iter_builder_nodes`.
+#[pyfunction]
+#[pyo3(name = "iter_builder_nodes_for_keys")]
+fn py_iter_builder_nodes_for_keys<'py>(
+    py: Python<'py>,
+    nodes: Bound<'py, PyDict>,
+    keys: Bound<'py, PyAny>,
+    has_refs: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for key_obj in keys.try_iter()? {
+        let key_obj = key_obj?;
+        let Some(value_obj) = nodes.get_item(key_obj.clone())? else {
+            continue;
+        };
+        let value_tuple = value_obj
+            .cast_into::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("builder node must be a 3-tuple"))?;
+        let absent_bytes = value_tuple
+            .get_item(0)?
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyTypeError::new_err("absent marker must be bytes"))?;
+        if absent_bytes.as_bytes() == b"a" {
+            continue;
+        }
+        let refs_obj = value_tuple.get_item(1)?;
+        let value_b = value_tuple.get_item(2)?;
+        if has_refs {
+            out.append(PyTuple::new(py, [key_obj, value_b, refs_obj])?)?;
+        } else {
+            out.append(PyTuple::new(py, [key_obj, value_b])?)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Insert a node into a `GraphIndexBuilder`-shaped state. Folds the
 /// per-node check_key_ref_value + duplicate check + dict updates from
 /// `add_node` into a single Rust call.
@@ -1691,6 +1763,8 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(py_check_value, &m)?)?;
     m.add_function(wrap_pyfunction!(py_check_key_ref_value, &m)?)?;
     m.add_function(wrap_pyfunction!(py_add_node_to_builder, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_iter_builder_nodes, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_iter_builder_nodes_for_keys, &m)?)?;
     m.add_function(wrap_pyfunction!(
         py_external_references_from_reader_nodes,
         &m
