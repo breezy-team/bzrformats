@@ -814,24 +814,7 @@ class GraphIndexPrefixAdapter:
 
         :param nodes: An iterable of (key, node_refs, value) entries to add.
         """
-        # save nodes in case its an iterator
-        nodes = tuple(nodes)
-        translated_nodes = []
-        try:
-            # Add prefix_key to each reference node_refs is a tuple of tuples,
-            # so split it apart, and add prefix_key to the internal reference
-            for key, value, node_refs in nodes:
-                adjusted_references = tuple(
-                    tuple(self.prefix + ref_node for ref_node in ref_list)
-                    for ref_list in node_refs
-                )
-                translated_nodes.append((self.prefix + key, value, adjusted_references))
-        except ValueError:
-            # XXX: TODO add an explicit interface for getting the reference list
-            # status, to handle this bit of user-friendliness in the API more
-            # explicitly.
-            for key, value in nodes:
-                translated_nodes.append((self.prefix + key, value))
+        translated_nodes = _index_rs.prepend_prefix_nodes(nodes, self.prefix)
         self.add_nodes_callback(translated_nodes)
 
     def add_node(self, key, value, references=()):

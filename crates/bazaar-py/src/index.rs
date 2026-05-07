@@ -1517,6 +1517,78 @@ fn py_external_references_from_reader_nodes<'py>(
     Ok(out)
 }
 
+/// Prepend `prefix` to each node's key (and to every reference key
+/// when the node carries refs). Mirrors the inner loop of
+/// `GraphIndexPrefixAdapter.add_nodes`. Returns the translated list
+/// in the same shape as the input — `(key, value)` or
+/// `(key, value, refs)`.
+#[pyfunction]
+#[pyo3(name = "prepend_prefix_nodes")]
+fn py_prepend_prefix_nodes<'py>(
+    py: Python<'py>,
+    nodes: Bound<'py, PyAny>,
+    prefix: Bound<'py, PyTuple>,
+) -> PyResult<Bound<'py, PyList>> {
+    let prefix_parts: Vec<Bound<'py, PyAny>> = (0..prefix.len())
+        .map(|i| prefix.get_item(i))
+        .collect::<PyResult<_>>()?;
+    let out = PyList::empty(py);
+    for node_obj in nodes.try_iter()? {
+        let node = node_obj?;
+        let node_tuple = node
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("node must be a tuple"))?
+            .clone();
+        if node_tuple.len() != 2 && node_tuple.len() != 3 {
+            return Err(PyValueError::new_err("node must be a 2- or 3-tuple"));
+        }
+        let key = node_tuple
+            .get_item(0)?
+            .cast_into::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("node key must be a tuple"))?;
+        let value = node_tuple.get_item(1)?;
+        let mut new_key_parts = prefix_parts.clone();
+        for i in 0..key.len() {
+            new_key_parts.push(key.get_item(i)?);
+        }
+        let new_key = PyTuple::new(py, new_key_parts)?;
+        if node_tuple.len() == 3 {
+            let refs_tuple = node_tuple
+                .get_item(2)?
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("refs must be a tuple"))?;
+            let mut new_lists: Vec<Bound<'py, PyTuple>> = Vec::with_capacity(refs_tuple.len());
+            for list_idx in 0..refs_tuple.len() {
+                let ref_list = refs_tuple
+                    .get_item(list_idx)?
+                    .cast_into::<PyTuple>()
+                    .map_err(|_| PyTypeError::new_err("ref list must be a tuple"))?;
+                let mut new_refs: Vec<Bound<'py, PyTuple>> = Vec::with_capacity(ref_list.len());
+                for ref_idx in 0..ref_list.len() {
+                    let ref_key = ref_list
+                        .get_item(ref_idx)?
+                        .cast_into::<PyTuple>()
+                        .map_err(|_| PyTypeError::new_err("ref key must be a tuple"))?;
+                    let mut new_ref_parts = prefix_parts.clone();
+                    for i in 0..ref_key.len() {
+                        new_ref_parts.push(ref_key.get_item(i)?);
+                    }
+                    new_refs.push(PyTuple::new(py, new_ref_parts)?);
+                }
+                new_lists.push(PyTuple::new(py, new_refs)?);
+            }
+            let new_refs_tuple = PyTuple::new(py, new_lists)?;
+            out.append(PyTuple::new(
+                py,
+                [new_key.into_any(), value, new_refs_tuple.into_any()],
+            )?)?;
+        } else {
+            out.append(PyTuple::new(py, [new_key.into_any(), value])?)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Strip a fixed key prefix from each node yielded by `nodes_iter`,
 /// validating that every key (and every reference key) starts with
 /// `prefix`. Yielded tuples preserve `node[0]` (the inner index),
@@ -1862,6 +1934,7 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(py_iter_builder_nodes, &m)?)?;
     m.add_function(wrap_pyfunction!(py_iter_builder_nodes_for_keys, &m)?)?;
     m.add_function(wrap_pyfunction!(py_strip_prefix_entries, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_prepend_prefix_nodes, &m)?)?;
     m.add_function(wrap_pyfunction!(
         py_external_references_from_reader_nodes,
         &m
