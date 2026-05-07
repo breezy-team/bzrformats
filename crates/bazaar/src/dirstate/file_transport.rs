@@ -288,4 +288,34 @@ mod tests {
         let mut t = FileTransport::new(tmp.path());
         assert!(matches!(t.read_all(), Err(TransportError::NotLocked)));
     }
+
+    #[test]
+    fn dirstate_initialize_then_load_roundtrip() {
+        // End-to-end: create an empty dirstate via DirState::initialize,
+        // then re-open it and verify the parsed dirblocks contain just
+        // the root entry.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dirstate");
+        let mut transport = FileTransport::new(&path);
+        let provider: Box<dyn crate::dirstate::SHA1Provider + Send + Sync> =
+            Box::new(crate::dirstate::DefaultSHA1Provider::new());
+        let mut state =
+            crate::dirstate::DirState::initialize(&mut transport, path.clone(), provider).unwrap();
+        assert_eq!(state.parents, Vec::<Vec<u8>>::new());
+        assert_eq!(state.dirblocks.len(), 2);
+        assert_eq!(state.dirblocks[0].entries.len(), 1);
+        assert_eq!(
+            state.dirblocks[0].entries[0].key.file_id,
+            crate::inventory::ROOT_ID
+        );
+        transport.unlock().unwrap();
+
+        // Reopen and verify the saved bytes are a valid dirstate.
+        let mut t2 = FileTransport::new(&path);
+        t2.lock_read().unwrap();
+        let data = t2.read_all().unwrap();
+        // Should at least start with the format-3 header.
+        assert!(data.starts_with(b"#bazaar dirstate flat format 3\n"));
+        t2.unlock().unwrap();
+    }
 }

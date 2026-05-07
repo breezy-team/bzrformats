@@ -27,7 +27,10 @@ mod kind;
 pub use kind::{Kind, OptionKindExt};
 
 mod entry;
-pub use entry::{Dirblock, Entry, EntryKey, LockState, MemoryState, TreeData, YesNo};
+pub use entry::{
+    null_parent_details, Dirblock, Entry, EntryKey, LockState, MemoryState, TreeData, YesNo,
+    NULLSTAT,
+};
 
 mod id_index;
 pub use id_index::{inv_entry_to_details, IdIndex};
@@ -37,16 +40,6 @@ use iter_changes::IterPhase;
 pub use iter_changes::{
     DirstateChange, IterChangesIter, ProcessEntryError, ProcessEntryState, ProcessPathInfo,
 };
-
-fn null_parent_details() -> TreeData {
-    TreeData {
-        minikind: Kind::Absent,
-        fingerprint: Vec::new(),
-        size: 0,
-        executable: false,
-        packed_stat: Vec::new(),
-    }
-}
 
 fn join_path(dirname: &[u8], basename: &[u8]) -> Vec<u8> {
     if dirname.is_empty() {
@@ -357,6 +350,99 @@ impl DirState {
             id_index: None,
             packed_stat_index: None,
         }
+    }
+
+    /// Build the empty dirblock layout that `initialize` and
+    /// `set_state_from_scratch` start from: a single root entry under
+    /// the empty dirname, plus a sibling block ready to receive
+    /// children.
+    pub fn empty_tree_dirblocks() -> Vec<Dirblock> {
+        vec![
+            Dirblock {
+                dirname: Vec::new(),
+                entries: vec![Entry {
+                    key: EntryKey {
+                        dirname: Vec::new(),
+                        basename: Vec::new(),
+                        file_id: crate::inventory::ROOT_ID.to_vec(),
+                    },
+                    trees: vec![TreeData {
+                        minikind: Kind::Directory,
+                        fingerprint: Vec::new(),
+                        size: 0,
+                        executable: false,
+                        packed_stat: NULLSTAT.to_vec(),
+                    }],
+                }],
+            },
+            Dirblock {
+                dirname: Vec::new(),
+                entries: Vec::new(),
+            },
+        ]
+    }
+
+    /// Mirror Python's `DirState.initialize`: open `transport`,
+    /// acquire a write lock, populate an empty dirstate (one root
+    /// node with `ROOT_ID`, no parents), serialise it, and return the
+    /// state plus the still-locked transport. The caller is
+    /// responsible for unlocking when done.
+    pub fn initialize<T: Transport + ?Sized>(
+        transport: &mut T,
+        path: PathBuf,
+        sha1_provider: Box<dyn SHA1Provider + Send + Sync>,
+    ) -> Result<DirState, TransportError> {
+        let mut state = DirState::new(path, sha1_provider, 0, true, false);
+        transport.lock_write()?;
+        state.lock_state = Some(LockState::Write);
+        state.set_data(Vec::new(), DirState::empty_tree_dirblocks());
+        state.save_to(transport)?;
+        Ok(state)
+    }
+
+    /// Mirror Python's `DirState.on_file`: build a `DirState` whose
+    /// metadata fields match the configured worth-saving / fdatasync /
+    /// use-filesystem-for-exec flags. Does not touch disk; the caller
+    /// must subsequently lock and read via a `Transport`.
+    pub fn on_file(
+        path: PathBuf,
+        sha1_provider: Box<dyn SHA1Provider + Send + Sync>,
+        worth_saving_limit: i64,
+        use_filesystem_for_exec: bool,
+        fdatasync: bool,
+    ) -> DirState {
+        DirState::new(
+            path,
+            sha1_provider,
+            worth_saving_limit,
+            use_filesystem_for_exec,
+            fdatasync,
+        )
+    }
+
+    /// Mirror Python's `DirState.set_state_from_scratch`: reset to an
+    /// empty tree, then layer the given inventory and parent trees on
+    /// top.
+    ///
+    /// Returns either of the underlying errors as `Other(String)` to
+    /// keep the signature simple — callers that need to discriminate
+    /// can call `set_state_from_inventory` and `set_parent_trees`
+    /// directly.
+    pub fn set_state_from_scratch(
+        &mut self,
+        inventory: Vec<(Vec<u8>, Vec<u8>, Kind, Vec<u8>, bool)>,
+        parent_trees: Vec<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>, TreeData)>)>,
+        parent_ghosts: Vec<Vec<u8>>,
+    ) -> Result<(), TransportError> {
+        self.set_data(Vec::new(), DirState::empty_tree_dirblocks());
+        self.set_state_from_inventory(inventory)
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        let parent_ids: Vec<Vec<u8>> = parent_trees.iter().map(|(id, _)| id.clone()).collect();
+        let parent_rows: Vec<Vec<(Vec<u8>, Vec<u8>, TreeData)>> =
+            parent_trees.into_iter().map(|(_, rows)| rows).collect();
+        self.set_parent_trees(parent_ids, parent_ghosts, parent_rows)
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        Ok(())
     }
 
     /// Yield a reference to every entry across every dirblock, in
