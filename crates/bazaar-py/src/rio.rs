@@ -373,13 +373,29 @@ fn to_patch_lines<'a>(
 
 #[pyfunction]
 fn read_patch_stanza(line_iter: &Bound<PyAny>) -> PyResult<Option<Stanza>> {
+    // Pull lines on demand: the merge-directive format embeds a patch
+    // body after the stanza terminator, so we must leave any unread
+    // lines on the Python iterator for the caller.
     let py_iter = line_iter.try_iter()?;
-    let mut lines: Vec<Vec<u8>> = Vec::new();
-    for item in py_iter {
-        let item = item?;
-        lines.push(item.extract::<Vec<u8>>()?);
+    let mut py_iter = py_iter;
+    let mut header_lines: Vec<Vec<u8>> = Vec::new();
+    let mut header_complete = false;
+    for item in py_iter.by_ref() {
+        let bytes = item?.extract::<Vec<u8>>()?;
+        // The terminator is a `# \n` (or `#\n`) line — ``patch_stanza_iter``
+        // strips the `#` prefix and stops once the decoded payload is just
+        // ``\n``.
+        let is_terminator = bytes == b"# \n" || bytes == b"#\n";
+        header_lines.push(bytes);
+        if is_terminator {
+            header_complete = true;
+            break;
+        }
     }
-    let stanza = bazaar::rio::read_patch_stanza(lines).map_err(|e| match e {
+    // ``patch_stanza_iter`` is forgiving when the header isn't terminated;
+    // preserve that behaviour for callers that pass a header-only iterator.
+    let _ = header_complete;
+    let stanza = bazaar::rio::read_patch_stanza(header_lines).map_err(|e| match e {
         bazaar::rio::Error::Io(e) => PyErr::new::<PyIOError, _>(e.to_string()),
         bazaar::rio::Error::InvalidTag(t) => {
             PyErr::new::<PyValueError, _>(format!("invalid tag: {}", t))
