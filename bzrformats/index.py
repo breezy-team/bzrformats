@@ -849,25 +849,7 @@ class GraphIndexPrefixAdapter:
 
     def _strip_prefix(self, an_iter):
         """Strip prefix data from nodes and return it."""
-        for node in an_iter:
-            # cross checks
-            if node[1][: self.prefix_len] != self.prefix:
-                raise BadIndexData(self)
-            for ref_list in node[3]:
-                for ref_node in ref_list:
-                    if ref_node[: self.prefix_len] != self.prefix:
-                        raise BadIndexData(self)
-            yield (
-                node[0],
-                node[1][self.prefix_len :],
-                node[2],
-                (
-                    tuple(
-                        tuple(ref_node[self.prefix_len :] for ref_node in ref_list)
-                        for ref_list in node[3]
-                    )
-                ),
-            )
+        yield from _index_rs.strip_prefix_entries(an_iter, self.prefix, self)
 
     def iter_all_entries(self):
         """Iterate over all keys within the index.

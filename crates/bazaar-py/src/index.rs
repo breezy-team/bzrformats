@@ -1517,6 +1517,102 @@ fn py_external_references_from_reader_nodes<'py>(
     Ok(out)
 }
 
+/// Strip a fixed key prefix from each node yielded by `nodes_iter`,
+/// validating that every key (and every reference key) starts with
+/// `prefix`. Yielded tuples preserve `node[0]` (the inner index),
+/// strip the prefix from `node[1]` and from each ref-key, and pass
+/// `node[2]` through unchanged. Raises `BadIndexData(adapter)` on
+/// mismatch.
+#[pyfunction]
+#[pyo3(name = "strip_prefix_entries")]
+fn py_strip_prefix_entries<'py>(
+    py: Python<'py>,
+    nodes_iter: Bound<'py, PyAny>,
+    prefix: Bound<'py, PyTuple>,
+    adapter: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let prefix_len = prefix.len();
+    let prefix_parts: Vec<Bound<'py, PyAny>> = (0..prefix_len)
+        .map(|i| prefix.get_item(i))
+        .collect::<PyResult<_>>()?;
+    let out = PyList::empty(py);
+    for node_obj in nodes_iter.try_iter()? {
+        let node = node_obj?;
+        let node_tuple = node
+            .cast::<PyTuple>()
+            .map_err(|_| BadIndexData::new_err((adapter.clone().unbind(),)))?
+            .clone();
+        let inner_index = node_tuple.get_item(0)?;
+        let key = node_tuple
+            .get_item(1)?
+            .cast_into::<PyTuple>()
+            .map_err(|_| BadIndexData::new_err((adapter.clone().unbind(),)))?;
+        if key.len() < prefix_len {
+            return Err(BadIndexData::new_err((adapter.clone().unbind(),)));
+        }
+        for (i, p) in prefix_parts.iter().enumerate() {
+            let key_part = key.get_item(i)?;
+            if !key_part.eq(p)? {
+                return Err(BadIndexData::new_err((adapter.clone().unbind(),)));
+            }
+        }
+        let stripped_key_parts: Vec<Bound<'py, PyAny>> = (prefix_len..key.len())
+            .map(|i| key.get_item(i))
+            .collect::<PyResult<_>>()?;
+        let stripped_key = PyTuple::new(py, stripped_key_parts)?;
+        let value = node_tuple.get_item(2)?;
+        let stripped_refs = if node_tuple.len() >= 4 {
+            let refs_tuple = node_tuple
+                .get_item(3)?
+                .cast_into::<PyTuple>()
+                .map_err(|_| BadIndexData::new_err((adapter.clone().unbind(),)))?;
+            let mut new_lists: Vec<Bound<'py, PyTuple>> = Vec::with_capacity(refs_tuple.len());
+            for ref_list_idx in 0..refs_tuple.len() {
+                let ref_list = refs_tuple
+                    .get_item(ref_list_idx)?
+                    .cast_into::<PyTuple>()
+                    .map_err(|_| BadIndexData::new_err((adapter.clone().unbind(),)))?;
+                let mut new_refs: Vec<Bound<'py, PyTuple>> = Vec::with_capacity(ref_list.len());
+                for ref_idx in 0..ref_list.len() {
+                    let ref_key = ref_list
+                        .get_item(ref_idx)?
+                        .cast_into::<PyTuple>()
+                        .map_err(|_| BadIndexData::new_err((adapter.clone().unbind(),)))?;
+                    if ref_key.len() < prefix_len {
+                        return Err(BadIndexData::new_err((adapter.clone().unbind(),)));
+                    }
+                    for (i, p) in prefix_parts.iter().enumerate() {
+                        let part = ref_key.get_item(i)?;
+                        if !part.eq(p)? {
+                            return Err(BadIndexData::new_err((adapter.clone().unbind(),)));
+                        }
+                    }
+                    let stripped_ref_parts: Vec<Bound<'py, PyAny>> = (prefix_len..ref_key.len())
+                        .map(|i| ref_key.get_item(i))
+                        .collect::<PyResult<_>>()?;
+                    new_refs.push(PyTuple::new(py, stripped_ref_parts)?);
+                }
+                new_lists.push(PyTuple::new(py, new_refs)?);
+            }
+            Some(PyTuple::new(py, new_lists)?)
+        } else {
+            None
+        };
+        if let Some(refs) = stripped_refs {
+            out.append(PyTuple::new(
+                py,
+                [inner_index, stripped_key.into_any(), value, refs.into_any()],
+            )?)?;
+        } else {
+            out.append(PyTuple::new(
+                py,
+                [inner_index, stripped_key.into_any(), value],
+            )?)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Iterate all present entries in a `GraphIndexBuilder`-shaped
 /// `_nodes` dict (`{key: (absent, refs, value)}`). Skips absent
 /// entries. Returns a list of `(key, value)` or `(key, value, refs)`
@@ -1765,6 +1861,7 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(py_add_node_to_builder, &m)?)?;
     m.add_function(wrap_pyfunction!(py_iter_builder_nodes, &m)?)?;
     m.add_function(wrap_pyfunction!(py_iter_builder_nodes_for_keys, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_strip_prefix_entries, &m)?)?;
     m.add_function(wrap_pyfunction!(
         py_external_references_from_reader_nodes,
         &m
