@@ -404,6 +404,37 @@ pub trait IndexTransport {
     fn abspath(&self, path: &str) -> String {
         path.to_string()
     }
+
+    /// Vectored read. Each `(offset, length)` request returns one
+    /// `(actual_offset, data)` pair, possibly out of order or with
+    /// expanded coverage if the transport upcasts the request.
+    /// `adjust_for_latency` corresponds to the bzrformats Transport
+    /// flag of the same name; `upper_limit` bounds any expansion the
+    /// transport performs.
+    ///
+    /// The default implementation falls back to `get_bytes` plus
+    /// per-range slicing — adequate for in-memory test transports.
+    fn readv(
+        &self,
+        path: &str,
+        ranges: &[(u64, u64)],
+        _adjust_for_latency: bool,
+        _upper_limit: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>, IndexError> {
+        let data = self.get_bytes(path)?;
+        let mut out = Vec::with_capacity(ranges.len());
+        for &(offset, length) in ranges {
+            let end = (offset + length) as usize;
+            if end > data.len() {
+                return Err(IndexError::Other(format!(
+                    "readv past end of {} at offset {}+{}",
+                    path, offset, length
+                )));
+            }
+            out.push((offset, data[offset as usize..end].to_vec()));
+        }
+        Ok(out)
+    }
 }
 
 /// Errors specific to `GraphIndex` operations beyond
@@ -614,36 +645,150 @@ pub fn parse_full(data: &[u8]) -> Result<(IndexHeader, HashMap<IndexKey, NodeBod
     Ok((header, nodes))
 }
 
+/// A node parsed during the bisection path but whose references are
+/// stored as raw byte offsets, not yet resolved to keys.
+pub type BisectNodeBody = (Vec<u8>, Vec<Vec<u64>>);
+
 /// A read-only graph index opened on a [`IndexTransport`]-backed file.
 ///
-/// This is the full-load implementation: the first method that needs
-/// data calls [`GraphIndex::buffer_all`], which reads the entire file
-/// into memory and resolves every node's reference offsets to keys. The
-/// bisection-driven partial-read path stays in Python for now.
+/// Two paths share this struct: the full-load fallback implemented in
+/// [`GraphIndex::buffer_all`] (reads + parses the entire file in one
+/// shot) and the bisection-driven partial-read flow. The latter keeps
+/// the file's size, the parsed-region map, and the half-resolved
+/// `bisect_nodes` table around so successive lookups can satisfy
+/// themselves from cached parts of the file.
 pub struct GraphIndex<T: IndexTransport> {
     transport: T,
     name: String,
     base_offset: u64,
+    /// Total size of the backing file, in bytes. `None` disables the
+    /// bisection path (every read goes through `buffer_all`).
+    size: Option<u64>,
     /// Parsed node table — `key -> (value, resolved reference lists)`.
     /// `None` until [`GraphIndex::buffer_all`] has been called.
     nodes: Option<HashMap<IndexKey, NodeBody>>,
     /// Header metadata. `None` until the file has been read at least
     /// once.
     header: Option<IndexHeader>,
+    /// Nodes parsed during the bisection path. Reference lists are
+    /// stored as byte offsets — call [`GraphIndex::resolve_references`]
+    /// to substitute actual keys.
+    bisect_nodes: Option<HashMap<IndexKey, BisectNodeBody>>,
+    /// Raw nodes keyed by their byte offset in the file. Used to
+    /// resolve reference offsets to keys during bisection.
+    keys_by_offset: HashMap<u64, RawNode>,
+    /// Tracks which byte (and key) ranges have already been parsed.
+    range_map: ParsedRangeMap,
+    /// Total bytes read from the transport so far. Used by the
+    /// 50%-read heuristic that promotes a bisection lookup to a full
+    /// `buffer_all`.
+    bytes_read: u64,
 }
 
 impl<T: IndexTransport> GraphIndex<T> {
     /// Open an index on `transport` at `name`. Pass `base_offset` if the
     /// index lives at a non-zero offset within the underlying file (the
-    /// pack-file case).
+    /// pack-file case). `size` enables bisection-driven partial reads
+    /// when known.
     pub fn new(transport: T, name: impl Into<String>, base_offset: u64) -> Self {
+        Self::with_size(transport, name, base_offset, None)
+    }
+
+    /// Open an index whose backing file size is known. With a size,
+    /// `iter_entries` for small key sets uses bisection rather than
+    /// reading the whole file.
+    pub fn with_size(
+        transport: T,
+        name: impl Into<String>,
+        base_offset: u64,
+        size: Option<u64>,
+    ) -> Self {
         Self {
             transport,
             name: name.into(),
             base_offset,
+            size,
             nodes: None,
             header: None,
+            bisect_nodes: None,
+            keys_by_offset: HashMap::new(),
+            range_map: ParsedRangeMap::new(),
+            bytes_read: 0,
         }
+    }
+
+    /// File size, if known.
+    pub fn size(&self) -> Option<u64> {
+        self.size
+    }
+
+    /// Total bytes read from the transport so far.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// `true` once `buffer_all` has populated the in-memory node table.
+    pub fn is_buffered_already(&self) -> bool {
+        self.nodes.is_some()
+    }
+
+    /// Read-only view of the parsed header, if any.
+    pub fn header(&self) -> Option<&IndexHeader> {
+        self.header.as_ref()
+    }
+
+    /// Iterator over post-`buffer_all` nodes. Returns an empty iterator
+    /// if `buffer_all` hasn't run yet.
+    pub fn nodes_iter(&self) -> impl Iterator<Item = (&IndexKey, &NodeBody)> {
+        self.nodes.iter().flat_map(|m| m.iter())
+    }
+
+    /// Read enough of the file to populate the header (and the bisect
+    /// state). If the bytes-read crosses 50% of the file size this
+    /// promotes to a full buffer. No-op if the header is already
+    /// known.
+    pub fn ensure_header_parsed(&mut self) -> Result<(), IndexError> {
+        if self.header.is_some() {
+            return Ok(());
+        }
+        self.read_and_parse(vec![(0, 200)])?;
+        Ok(())
+    }
+
+    /// Public entry point for tests that want to drive the bisection
+    /// `read_and_parse` flow directly with a list of `(offset, length)`
+    /// readv ranges.
+    pub fn read_and_parse_for_test(
+        &mut self,
+        readv_ranges: Vec<(u64, u64)>,
+    ) -> Result<(), IndexError> {
+        self.read_and_parse(readv_ranges)
+    }
+
+    /// Cached key count. Reads only what's already known — does **not**
+    /// trigger any I/O. Returns `0` when the header hasn't been parsed
+    /// yet (matching `key_count is None` in Python).
+    pub fn key_count_or_zero(&self) -> usize {
+        self.header.as_ref().map(|h| h.key_count).unwrap_or(0)
+    }
+
+    /// Read-only view of the parsed-range map. Tests and the pyo3
+    /// adapter consult this to verify which byte spans the bisection
+    /// path has covered.
+    pub fn range_map(&self) -> &ParsedRangeMap {
+        &self.range_map
+    }
+
+    /// Read-only view of the bisect-mode node cache. `None` until the
+    /// header has been parsed via the bisection path.
+    pub fn bisect_nodes(&self) -> Option<&HashMap<IndexKey, BisectNodeBody>> {
+        self.bisect_nodes.as_ref()
+    }
+
+    /// Read-only view of the `offset -> RawNode` map populated by the
+    /// bisection path.
+    pub fn keys_by_offset(&self) -> &HashMap<u64, RawNode> {
+        &self.keys_by_offset
     }
 
     /// Read the entire backing file, parse it, and resolve every
@@ -665,45 +810,50 @@ impl<T: IndexTransport> GraphIndex<T> {
         Ok(())
     }
 
-    /// Number of keys in the index. Triggers a full load on first call.
+    /// Number of keys in the index. With a known size, this reads only
+    /// the header. Without a size, falls back to a full load.
     pub fn key_count(&mut self) -> Result<usize, IndexError> {
         if let Some(h) = &self.header {
             return Ok(h.key_count);
         }
-        self.buffer_all()?;
+        if self.size.is_some() {
+            self.ensure_header_parsed()?;
+        } else {
+            self.buffer_all()?;
+        }
         Ok(self
             .header
             .as_ref()
-            .expect("header set by buffer_all")
+            .expect("header set by ensure_header_parsed/buffer_all")
             .key_count)
     }
 
     /// Number of parallel reference lists each present node carries.
-    /// Triggers a full load on first call.
+    /// With a known size, reads only the header. Otherwise full load.
     pub fn node_ref_lists(&mut self) -> Result<usize, IndexError> {
         if let Some(h) = &self.header {
             return Ok(h.node_ref_lists);
         }
-        self.buffer_all()?;
-        Ok(self
-            .header
-            .as_ref()
-            .expect("header set by buffer_all")
-            .node_ref_lists)
+        if self.size.is_some() {
+            self.ensure_header_parsed()?;
+        } else {
+            self.buffer_all()?;
+        }
+        Ok(self.header.as_ref().expect("header set").node_ref_lists)
     }
 
-    /// Number of bytestrings in each key tuple. Triggers a full load on
-    /// first call.
+    /// Number of bytestrings in each key tuple. With a known size,
+    /// reads only the header. Otherwise full load.
     pub fn key_length(&mut self) -> Result<usize, IndexError> {
         if let Some(h) = &self.header {
             return Ok(h.key_length);
         }
-        self.buffer_all()?;
-        Ok(self
-            .header
-            .as_ref()
-            .expect("header set by buffer_all")
-            .key_length)
+        if self.size.is_some() {
+            self.ensure_header_parsed()?;
+        } else {
+            self.buffer_all()?;
+        }
+        Ok(self.header.as_ref().expect("header set").key_length)
     }
 
     /// Iterate over every present entry as `(key, value, resolved
@@ -829,6 +979,479 @@ impl<T: IndexTransport> GraphIndex<T> {
         self.buffer_all()?;
         Ok(())
     }
+
+    /// Resolve a list of reference-offset lists against the
+    /// `keys_by_offset` map, returning concrete key tuples in the same
+    /// order. Mirrors the Python `_resolve_references` helper used
+    /// during the bisection path.
+    pub fn resolve_references(
+        &self,
+        references: &[Vec<u64>],
+    ) -> Result<Vec<Vec<IndexKey>>, IndexError> {
+        let mut out = Vec::with_capacity(references.len());
+        for ref_list in references {
+            let mut resolved = Vec::with_capacity(ref_list.len());
+            for off in ref_list {
+                let raw = self.keys_by_offset.get(off).ok_or_else(|| {
+                    IndexError::Other(format!("unresolved reference offset {}", off))
+                })?;
+                resolved.push(raw.key.clone());
+            }
+            out.push(resolved);
+        }
+        Ok(out)
+    }
+
+    /// Parse a header from a freshly-read prefix of the file, populating
+    /// the `header`, `range_map`, `keys_by_offset`, and `bisect_nodes`
+    /// fields. Returns the offset and remaining body slice for the
+    /// caller to feed into [`GraphIndex::parse_region`].
+    fn parse_header_from_bytes<'a>(
+        &mut self,
+        bytes: &'a [u8],
+    ) -> Result<(u64, &'a [u8]), IndexError> {
+        let header = parse_header(bytes)?;
+        self.range_map.mark_parsed(
+            0,
+            Some(Vec::new()),
+            header.header_end as u64,
+            Some(Vec::new()),
+        );
+        let header_end = header.header_end as u64;
+        self.header = Some(header);
+        self.bisect_nodes = Some(HashMap::new());
+        Ok((header_end, &bytes[header_end as usize..]))
+    }
+
+    /// Parse one segment of `data` starting at `offset` into the
+    /// bisect-state. Returns `(high_parsed_byte, last_segment)`. The
+    /// segment-trimming logic mirrors the Python `_parse_segment`.
+    fn parse_segment(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        end: u64,
+        index: isize,
+    ) -> Result<(u64, bool), IndexError> {
+        let lower_end = self
+            .range_map
+            .byte_range(index as usize)
+            .ok_or_else(|| IndexError::Other("parse_segment: index out of range".into()))?
+            .1;
+
+        let mut trim_start: Option<u64>;
+        let start_adjacent;
+        if offset < lower_end {
+            trim_start = Some(lower_end - offset);
+            start_adjacent = true;
+        } else if offset == lower_end {
+            trim_start = None;
+            start_adjacent = true;
+        } else {
+            trim_start = None;
+            start_adjacent = false;
+        }
+
+        let size = self.size.unwrap_or(0);
+        let mut trim_end: Option<u64>;
+        let end_adjacent;
+        let last_segment;
+        if Some(end) == self.size {
+            trim_end = None;
+            end_adjacent = true;
+            last_segment = true;
+        } else if (index as usize) + 1 == self.range_map.len() {
+            trim_end = None;
+            end_adjacent = false;
+            last_segment = true;
+        } else {
+            let (higher_start, higher_end) = self
+                .range_map
+                .byte_range((index as usize) + 1)
+                .expect("higher region present");
+            if end == higher_start {
+                trim_end = None;
+                end_adjacent = true;
+                last_segment = true;
+            } else if end > higher_start {
+                trim_end = Some(higher_start - offset);
+                end_adjacent = true;
+                last_segment = end < higher_end;
+            } else {
+                trim_end = None;
+                end_adjacent = false;
+                last_segment = true;
+            }
+        }
+        let _ = size;
+
+        if !start_adjacent {
+            let start_idx = trim_start.map(|s| s as usize).unwrap_or(0);
+            let pos = data[start_idx..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .ok_or_else(|| IndexError::Other("no \\n was present".into()))?;
+            trim_start = Some((start_idx + pos + 1) as u64);
+        }
+        if !end_adjacent {
+            let end_idx = trim_end.map(|e| e as usize).unwrap_or(data.len());
+            let pos = data[..end_idx]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .ok_or_else(|| IndexError::Other("no \\n was present".into()))?;
+            trim_end = Some((pos + 1) as u64);
+        }
+
+        let ts = trim_start.map(|t| t as usize).unwrap_or(0);
+        let te = trim_end.map(|t| t as usize).unwrap_or(data.len());
+        let trimmed = &data[ts..te];
+        if trimmed.is_empty() {
+            return Err(IndexError::Other(format!(
+                "read unneeded data [{}:{}] from [{}:{}]",
+                ts,
+                te,
+                offset,
+                offset + data.len() as u64
+            )));
+        }
+        let parse_offset = if ts != 0 { offset + ts as u64 } else { offset };
+
+        // splitlines mangles \r — use literal \n.
+        let mut segments: Vec<&[u8]> = trimmed.split(|&b| b == b'\n').collect();
+        segments.pop();
+        let key_length = self.header.as_ref().expect("header parsed").key_length;
+        let parsed = parse_lines(&segments, parse_offset, key_length)?;
+        let bisect_nodes = self
+            .bisect_nodes
+            .as_mut()
+            .expect("bisect_nodes initialised by parse_header_from_bytes");
+        for (key, value, ref_offsets) in parsed.nodes {
+            bisect_nodes.insert(key, (value, ref_offsets));
+        }
+        for (off, raw) in &parsed.keys_by_offset {
+            self.keys_by_offset.insert(*off, raw.clone());
+        }
+        self.range_map.mark_parsed(
+            parse_offset,
+            parsed.first_key,
+            parse_offset + trimmed.len() as u64,
+            parsed.last_key,
+        );
+        Ok((parse_offset + trimmed.len() as u64, last_segment))
+    }
+
+    /// Parse `data` starting at `offset` into the bisect-state, calling
+    /// [`GraphIndex::parse_segment`] in a loop until the region is
+    /// fully covered.
+    fn parse_region(&mut self, offset: u64, data: &[u8]) -> Result<(), IndexError> {
+        let end = offset + data.len() as u64;
+        let mut high_parsed = offset;
+        loop {
+            let index = self.range_map.byte_index(high_parsed);
+            let cur_end = self
+                .range_map
+                .byte_range(index as usize)
+                .map(|r| r.1)
+                .unwrap_or(0);
+            if end < cur_end {
+                return Ok(());
+            }
+            let (next_high, last_segment) = self.parse_segment(offset, data, end, index)?;
+            high_parsed = next_high;
+            if last_segment {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Service a vectored read for the bisection path. If the read
+    /// returns the whole file, promote it to `buffer_all`. Otherwise
+    /// each chunk feeds into [`GraphIndex::parse_region`].
+    fn read_and_parse(&mut self, mut readv_ranges: Vec<(u64, u64)>) -> Result<(), IndexError> {
+        if readv_ranges.is_empty() {
+            return Ok(());
+        }
+        let size = self
+            .size
+            .ok_or_else(|| IndexError::Other("read_and_parse called without a size".into()))?;
+        if self.nodes.is_none() && self.bytes_read * 2 >= size {
+            self.buffer_all()?;
+            return Ok(());
+        }
+        if self.base_offset != 0 {
+            for r in &mut readv_ranges {
+                r.0 += self.base_offset;
+            }
+        }
+        let upper = size + self.base_offset;
+        let readv_data = self
+            .transport
+            .readv(&self.name, &readv_ranges, true, upper)?;
+        for (raw_offset, raw_data) in readv_data {
+            // Translate transport-absolute offset to index-local. If the
+            // chunk starts before our base_offset (the transport
+            // expanded the range), trim the prefix off rather than
+            // serving spurious bytes to parse_header.
+            let signed_offset = raw_offset as i64 - self.base_offset as i64;
+            let (mut offset, mut data) = if signed_offset < 0 {
+                let drop = (-signed_offset) as usize;
+                if drop >= raw_data.len() {
+                    self.bytes_read += raw_data.len() as u64;
+                    continue;
+                }
+                (0u64, raw_data[drop..].to_vec())
+            } else {
+                (signed_offset as u64, raw_data)
+            };
+            self.bytes_read += data.len() as u64;
+            if data.len() as u64 == size && offset == 0 {
+                self.buffer_all_from_bytes(data)?;
+                return Ok(());
+            }
+            if self.bisect_nodes.is_none() {
+                if offset != 0 {
+                    return Err(IndexError::Other(
+                        "header chunk did not start at offset 0".into(),
+                    ));
+                }
+                let (header_end, body) = self.parse_header_from_bytes(&data)?;
+                let body_vec = body.to_vec();
+                offset = header_end;
+                data = body_vec;
+            }
+            self.parse_region(offset, &data)?;
+        }
+        Ok(())
+    }
+
+    /// Variant of `buffer_all` that consumes a pre-fetched byte buffer.
+    /// `data` is the index region only (the caller has already trimmed
+    /// any base-offset prefix).
+    fn buffer_all_from_bytes(&mut self, data: Vec<u8>) -> Result<(), IndexError> {
+        if self.nodes.is_some() {
+            return Ok(());
+        }
+        let (header, nodes) = parse_full(&data)?;
+        self.nodes = Some(nodes);
+        self.header = Some(header);
+        Ok(())
+    }
+
+    /// Bisection result for a single `(location, key)` probe.
+    pub fn lookup_keys_via_location(
+        &mut self,
+        location_keys: &[(u64, IndexKey)],
+    ) -> Result<Vec<((u64, IndexKey), LookupResult)>, IndexError> {
+        let size = self
+            .size
+            .ok_or_else(|| IndexError::Other("lookup_keys_via_location requires a size".into()))?;
+
+        let mut readv_ranges: Vec<(u64, u64)> = Vec::new();
+        for (location, key) in location_keys {
+            if let Some(bn) = &self.bisect_nodes {
+                if bn.contains_key(key) {
+                    continue;
+                }
+            }
+            // Check the parsed key range first.
+            let key_idx = self.range_map.key_index(&Some(key.clone()));
+            if !self.range_map.is_empty() && key_idx >= 0 {
+                let (key_start, key_end) = self
+                    .range_map
+                    .key_range(key_idx as usize)
+                    .expect("idx in range");
+                let (_, byte_end) = self
+                    .range_map
+                    .byte_range(key_idx as usize)
+                    .expect("idx in range");
+                if key_start.as_ref().map(|k| k <= key).unwrap_or(true)
+                    && (key_end.as_ref().map(|k| k >= key).unwrap_or(false) || byte_end == size)
+                {
+                    continue;
+                }
+            }
+            let byte_idx = self.range_map.byte_index(*location);
+            if !self.range_map.is_empty() && byte_idx >= 0 {
+                let (byte_start, byte_end) = self
+                    .range_map
+                    .byte_range(byte_idx as usize)
+                    .expect("idx in range");
+                if byte_start <= *location && byte_end > *location {
+                    continue;
+                }
+            }
+            let mut length = 800u64;
+            if location + length > size {
+                length = size - location;
+            }
+            if length > 0 {
+                readv_ranges.push((*location, length));
+            }
+        }
+        if self.bisect_nodes.is_none() {
+            readv_ranges.push((0, 200));
+        }
+        self.read_and_parse(readv_ranges)?;
+
+        let mut result: Vec<((u64, IndexKey), LookupResult)> = Vec::new();
+        if let Some(nodes) = &self.nodes {
+            // read_and_parse promoted to buffer_all.
+            for (location, key) in location_keys {
+                if !nodes.contains_key(key) {
+                    result.push(((*location, key.clone()), LookupResult::Missing));
+                } else {
+                    let (value, refs) = nodes.get(key).unwrap();
+                    result.push((
+                        (*location, key.clone()),
+                        LookupResult::Found {
+                            value: value.clone(),
+                            refs: refs.clone(),
+                        },
+                    ));
+                }
+            }
+            return Ok(result);
+        }
+
+        let mut pending_references: Vec<(u64, IndexKey)> = Vec::new();
+        let mut pending_locations: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
+        let bisect_nodes_view = self
+            .bisect_nodes
+            .as_ref()
+            .expect("bisect_nodes initialised");
+        let header_ref_lists = self.header.as_ref().expect("header").node_ref_lists;
+        for (location, key) in location_keys {
+            if bisect_nodes_view.contains_key(key) {
+                let (value, refs) = bisect_nodes_view.get(key).unwrap();
+                if header_ref_lists > 0 {
+                    let mut wanted: Vec<u64> = Vec::new();
+                    for ref_list in refs {
+                        for r in ref_list {
+                            if !self.keys_by_offset.contains_key(r) {
+                                wanted.push(*r);
+                            }
+                        }
+                    }
+                    if !wanted.is_empty() {
+                        pending_locations.extend(wanted);
+                        pending_references.push((*location, key.clone()));
+                        continue;
+                    }
+                    let resolved = self.resolve_references(refs)?;
+                    result.push((
+                        (*location, key.clone()),
+                        LookupResult::Found {
+                            value: value.clone(),
+                            refs: resolved,
+                        },
+                    ));
+                } else {
+                    result.push((
+                        (*location, key.clone()),
+                        LookupResult::Found {
+                            value: value.clone(),
+                            refs: Vec::new(),
+                        },
+                    ));
+                }
+                continue;
+            }
+            let key_idx = self.range_map.key_index(&Some(key.clone()));
+            if key_idx >= 0 {
+                let (key_start, key_end) = self
+                    .range_map
+                    .key_range(key_idx as usize)
+                    .expect("idx in range");
+                let (_, byte_end) = self
+                    .range_map
+                    .byte_range(key_idx as usize)
+                    .expect("idx in range");
+                if key_start.as_ref().map(|k| k <= key).unwrap_or(true)
+                    && (key_end.as_ref().map(|k| k >= key).unwrap_or(false) || byte_end == size)
+                {
+                    result.push(((*location, key.clone()), LookupResult::Missing));
+                    continue;
+                }
+            }
+            let byte_idx = self.range_map.byte_index(*location);
+            let (probed_key_start, _) = self
+                .range_map
+                .key_range(byte_idx.max(0) as usize)
+                .unwrap_or((None, None));
+            let direction = if probed_key_start.as_ref().map(|k| key < k).unwrap_or(false) {
+                LookupResult::Direction(-1)
+            } else {
+                LookupResult::Direction(1)
+            };
+            result.push(((*location, key.clone()), direction));
+        }
+
+        // Resolve pending references with another readv pass.
+        let mut more_ranges: Vec<(u64, u64)> = Vec::new();
+        for location in &pending_locations {
+            let mut length = 800u64;
+            if location + length > size {
+                length = size - location;
+            }
+            if length > 0 {
+                more_ranges.push((*location, length));
+            }
+        }
+        self.read_and_parse(more_ranges)?;
+
+        if let Some(nodes) = &self.nodes {
+            for (location, key) in pending_references {
+                let (value, refs) = nodes.get(&key).expect("nodes contains pending key");
+                result.push((
+                    (location, key.clone()),
+                    LookupResult::Found {
+                        value: value.clone(),
+                        refs: refs.clone(),
+                    },
+                ));
+            }
+            return Ok(result);
+        }
+        // Re-borrow bisect_nodes since read_and_parse may have mutated it.
+        let bisect_nodes_view = self
+            .bisect_nodes
+            .as_ref()
+            .expect("bisect_nodes initialised");
+        let pending_clone: Vec<(u64, IndexKey)> = pending_references.clone();
+        for (location, key) in pending_clone {
+            let (value, refs) = bisect_nodes_view
+                .get(&key)
+                .expect("bisect_nodes contains pending key");
+            let value = value.clone();
+            let refs = refs.clone();
+            let resolved = self.resolve_references(&refs)?;
+            result.push((
+                (location, key),
+                LookupResult::Found {
+                    value,
+                    refs: resolved,
+                },
+            ));
+        }
+        Ok(result)
+    }
+}
+
+/// Outcome of a single `(location, key)` probe in
+/// [`GraphIndex::lookup_keys_via_location`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupResult {
+    /// Key is present; `refs` is fully key-resolved.
+    Found {
+        value: Vec<u8>,
+        refs: Vec<Vec<IndexKey>>,
+    },
+    /// Key is absent in this index.
+    Missing,
+    /// Key is in an unparsed region above (`+1`) or below (`-1`) the
+    /// probed location.
+    Direction(i32),
 }
 
 #[cfg(test)]

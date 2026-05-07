@@ -240,11 +240,41 @@ type ParseLinesResult<'py> = (
 );
 
 /// Adapter that lets a Python `Transport` object stand in for a Rust
-/// [`IndexTransport`]. Calls `transport.get_bytes(name)` on the wrapped
-/// object — the index never needs anything else from the Python
-/// transport for the full-load path.
+/// [`IndexTransport`]. Holds an unbound `Py<PyAny>` and re-attaches to a
+/// `Python<'_>` for each call.
 struct PyIndexTransport {
     obj: Py<PyAny>,
+}
+
+impl Clone for PyIndexTransport {
+    fn clone(&self) -> Self {
+        Python::attach(|py| Self {
+            obj: self.obj.clone_ref(py),
+        })
+    }
+}
+
+thread_local! {
+    /// The most recent Python exception raised by a `PyIndexTransport`
+    /// call; the pyo3 method dispatcher consults this so the original
+    /// exception class (e.g. `TransportNoSuchFile`) is preserved
+    /// across the Rust boundary.
+    static PENDING_PY_ERR: std::cell::RefCell<Option<PyErr>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+fn stash_py_err(err: PyErr) -> IndexError {
+    let msg = err.to_string();
+    PENDING_PY_ERR.with(|c| *c.borrow_mut() = Some(err));
+    IndexError::Other(format!("__pyerr__: {msg}"))
+}
+
+fn reraise_pending_pyerr_or(err: IndexError) -> PyErr {
+    if let Some(stashed) = PENDING_PY_ERR.with(|c| c.borrow_mut().take()) {
+        return stashed;
+    }
+    index_err_to_py(err)
 }
 
 impl IndexTransport for PyIndexTransport {
@@ -254,7 +284,7 @@ impl IndexTransport for PyIndexTransport {
                 .obj
                 .bind(py)
                 .call_method1("get_bytes", (path,))
-                .map_err(|e| IndexError::Other(e.to_string()))?;
+                .map_err(stash_py_err)?;
             let bytes = result
                 .cast_into::<PyBytes>()
                 .map_err(|_| IndexError::Other("get_bytes did not return bytes".to_string()))?;
@@ -272,19 +302,74 @@ impl IndexTransport for PyIndexTransport {
                 .unwrap_or_else(|| path.to_string())
         })
     }
+
+    fn readv(
+        &self,
+        path: &str,
+        ranges: &[(u64, u64)],
+        adjust_for_latency: bool,
+        upper_limit: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>, IndexError> {
+        Python::attach(|py| -> Result<_, IndexError> {
+            let py_ranges: Vec<Bound<'_, PyTuple>> = ranges
+                .iter()
+                .map(|(o, l)| PyTuple::new(py, [*o, *l]))
+                .collect::<PyResult<_>>()
+                .map_err(|e| IndexError::Other(e.to_string()))?;
+            let py_list = pyo3::types::PyList::new(py, py_ranges)
+                .map_err(|e| IndexError::Other(e.to_string()))?;
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs
+                .set_item("adjust_for_latency", adjust_for_latency)
+                .map_err(|e| IndexError::Other(e.to_string()))?;
+            kwargs
+                .set_item("upper_limit", upper_limit)
+                .map_err(|e| IndexError::Other(e.to_string()))?;
+            let iter = self
+                .obj
+                .bind(py)
+                .call_method("readv", (path, py_list), Some(&kwargs))
+                .map_err(stash_py_err)?;
+            let mut out = Vec::with_capacity(ranges.len());
+            for item in iter.try_iter().map_err(stash_py_err)? {
+                let item = item.map_err(stash_py_err)?;
+                let tup = item
+                    .cast_into::<PyTuple>()
+                    .map_err(|_| IndexError::Other("readv yielded non-tuple item".to_string()))?;
+                let offset_obj = tup.get_item(0).map_err(stash_py_err)?;
+                let offset: u64 = offset_obj.extract().map_err(stash_py_err)?;
+                let bytes = tup
+                    .get_item(1)
+                    .map_err(stash_py_err)?
+                    .cast_into::<PyBytes>()
+                    .map_err(|_| {
+                        IndexError::Other("readv yielded non-bytes payload".to_string())
+                    })?;
+                out.push((offset, bytes.as_bytes().to_vec()));
+            }
+            Ok(out)
+        })
+    }
 }
 
-/// A pyo3-exposed graph-index reader backed by the pure-Rust
-/// [`bazaar::index::GraphIndex`].
-///
-/// The Python wrapper around it should pass any `Transport`-shaped
-/// object that implements `get_bytes` (the standard
-/// `bzrformats.transport.Transport` does). Bisection-based partial
-/// reads remain in Python; this binding is for callers that want the
-/// full-load path.
-#[pyclass(name = "GraphIndex")]
+/// pyo3-exposed graph-index reader. Owns both the Rust-side
+/// [`bazaar::index::GraphIndex`] state and the original Python
+/// transport reference — the latter is exposed as `_transport` so that
+/// Python tests, hashing, and equality keep working.
+#[pyclass(name = "GraphIndex", subclass)]
 struct PyGraphIndex {
+    /// Rust-side index state. Wrapped in a `Mutex` because pyo3 method
+    /// calls take `&self`.
     inner: std::sync::Mutex<RsGraphIndex<PyIndexTransport>>,
+    /// The Python transport object passed to `__init__`. Tests and
+    /// `__hash__` consult it directly.
+    transport_py: Py<PyAny>,
+    /// Filename within the transport.
+    name: String,
+    /// Backing-file size. `None` disables bisection.
+    size: Option<u64>,
+    /// Base offset into the backing file (used by pack-files).
+    base_offset: u64,
 }
 
 fn extract_prefix(obj: &Bound<PyAny>) -> PyResult<KeyPrefix> {
@@ -427,18 +512,51 @@ impl PyParsedRangeMap {
 #[pymethods]
 impl PyGraphIndex {
     #[new]
-    #[pyo3(signature = (transport, name, _size = None, _unlimited_cache = false, offset = 0))]
+    #[pyo3(signature = (transport, name, size = None, unlimited_cache = false, offset = 0))]
     fn new(
+        py: Python<'_>,
         transport: Py<PyAny>,
         name: String,
-        _size: Option<u64>,
-        _unlimited_cache: bool,
+        size: Option<u64>,
+        unlimited_cache: bool,
         offset: u64,
     ) -> PyResult<Self> {
-        let t = PyIndexTransport { obj: transport };
+        let _ = unlimited_cache;
+        let t = PyIndexTransport {
+            obj: transport.clone_ref(py),
+        };
         Ok(Self {
-            inner: std::sync::Mutex::new(RsGraphIndex::new(t, name, offset)),
+            inner: std::sync::Mutex::new(RsGraphIndex::with_size(t, name.clone(), offset, size)),
+            transport_py: transport,
+            name,
+            size,
+            base_offset: offset,
         })
+    }
+
+    #[getter]
+    fn _transport<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
+        self.transport_py.bind(py).clone()
+    }
+
+    #[getter]
+    fn _name(&self) -> &str {
+        &self.name
+    }
+
+    #[getter]
+    fn _size(&self) -> Option<u64> {
+        self.size
+    }
+
+    #[getter]
+    fn _base_offset(&self) -> u64 {
+        self.base_offset
+    }
+
+    #[getter]
+    fn _bytes_read(&self) -> u64 {
+        self.inner.lock().unwrap().bytes_read()
     }
 
     fn key_count(&self) -> PyResult<usize> {
@@ -446,7 +564,7 @@ impl PyGraphIndex {
             .lock()
             .unwrap()
             .key_count()
-            .map_err(index_err_to_py)
+            .map_err(reraise_pending_pyerr_or)
     }
 
     #[getter]
@@ -455,7 +573,7 @@ impl PyGraphIndex {
             .lock()
             .unwrap()
             .node_ref_lists()
-            .map_err(index_err_to_py)
+            .map_err(reraise_pending_pyerr_or)
     }
 
     #[getter]
@@ -464,7 +582,7 @@ impl PyGraphIndex {
             .lock()
             .unwrap()
             .key_length()
-            .map_err(index_err_to_py)
+            .map_err(reraise_pending_pyerr_or)
     }
 
     fn validate(&self) -> PyResult<()> {
@@ -472,7 +590,7 @@ impl PyGraphIndex {
             .lock()
             .unwrap()
             .validate()
-            .map_err(index_err_to_py)
+            .map_err(reraise_pending_pyerr_or)
     }
 
     fn _buffer_all(&self) -> PyResult<()> {
@@ -480,7 +598,7 @@ impl PyGraphIndex {
             .lock()
             .unwrap()
             .buffer_all()
-            .map_err(index_err_to_py)
+            .map_err(reraise_pending_pyerr_or)
     }
 
     /// Yield `(self, key, value)` or `(self, key, value, refs)` tuples
@@ -492,62 +610,159 @@ impl PyGraphIndex {
         let (entries, node_ref_lists) = {
             let r = slf.borrow();
             let mut g = r.inner.lock().unwrap();
-            let entries = g.iter_all_entries().map_err(index_err_to_py)?;
-            let nrl = g.node_ref_lists().map_err(index_err_to_py)?;
+            let entries = g.iter_all_entries().map_err(reraise_pending_pyerr_or)?;
+            let nrl = g.node_ref_lists().map_err(reraise_pending_pyerr_or)?;
             (entries, nrl)
         };
         emit_entries(py, &slf, &entries, node_ref_lists)
     }
 
-    /// Same as `iter_all_entries` but restricted to `keys`.
+    /// Same as `iter_all_entries` but restricted to `keys`. When the
+    /// index size is known and the key set is small relative to the
+    /// total key count, this dispatches through bisection. Otherwise it
+    /// promotes to `buffer_all`.
     fn iter_entries<'py>(
         slf: Bound<'py, Self>,
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyList>> {
+        // Materialise the input keys but defer bytes-extraction until
+        // after we've decided whether to buffer the whole file. The
+        // Python contract is: file-not-found errors should surface
+        // before key-type errors.
+        let key_objs: Vec<Bound<'py, PyAny>> = keys.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+        if key_objs.is_empty() {
+            return Ok(PyList::empty(py));
+        }
+        // Decide whether to buffer the whole file or use bisection.
+        let need_buffer_all = {
+            let r = slf.borrow();
+            let mut g = r.inner.lock().unwrap();
+            match g.size() {
+                None => true,
+                Some(_) => {
+                    if g.is_buffered_already() {
+                        true
+                    } else {
+                        // Read just the header so we know the key count.
+                        if g.key_count_or_zero() == 0 {
+                            g.ensure_header_parsed().map_err(reraise_pending_pyerr_or)?;
+                        }
+                        // After buffer_all may have been triggered by the
+                        // 50%-bytes heuristic.
+                        if g.is_buffered_already() {
+                            true
+                        } else {
+                            key_objs.len() * 20 > g.key_count_or_zero()
+                        }
+                    }
+                }
+            }
+        };
+        // I/O succeeded; now extract keys. Non-bytes elements are
+        // silently dropped — they cannot match any actual key in the
+        // index, which matches the duck-typed lookup the Python
+        // version did via plain dict containment.
         let mut requested: Vec<IndexKey> = Vec::new();
-        for key_obj in keys.try_iter()? {
-            requested.push(extract_key(&key_obj?)?);
+        let mut seen: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        for key_obj in &key_objs {
+            let Ok(k) = extract_key(key_obj) else {
+                continue;
+            };
+            if seen.insert(k.clone()) {
+                requested.push(k);
+            }
         }
         if requested.is_empty() {
             return Ok(PyList::empty(py));
         }
-        let (entries, node_ref_lists) = {
-            let r = slf.borrow();
-            let mut g = r.inner.lock().unwrap();
-            let entries = g.iter_entries(&requested).map_err(index_err_to_py)?;
-            let nrl = g.node_ref_lists().map_err(index_err_to_py)?;
-            (entries, nrl)
-        };
-        emit_entries(py, &slf, &entries, node_ref_lists)
+        if need_buffer_all {
+            let (entries, node_ref_lists) = {
+                let r = slf.borrow();
+                let mut g = r.inner.lock().unwrap();
+                let entries = g
+                    .iter_entries(&requested)
+                    .map_err(reraise_pending_pyerr_or)?;
+                let nrl = g.node_ref_lists().map_err(reraise_pending_pyerr_or)?;
+                (entries, nrl)
+            };
+            return emit_entries(py, &slf, &entries, node_ref_lists);
+        }
+        // Bisection path: use bisect_multi via Python.
+        let bisect_multi = py.import("bzrformats.bisect_multi")?;
+        let bisect_fn = bisect_multi.getattr("bisect_multi_bytes")?;
+        let probe = slf.getattr("_lookup_keys_via_location")?;
+        let size_obj = slf.borrow().size.unwrap_or(0).into_pyobject(py)?;
+        let keys_set = pyo3::types::PySet::new(
+            py,
+            requested
+                .iter()
+                .map(|k| key_to_py(py, k))
+                .collect::<PyResult<Vec<_>>>()?,
+        )?;
+        let bisect_result = bisect_fn.call1((probe, size_obj, keys_set))?;
+        let out = PyList::empty(py);
+        for item in bisect_result.try_iter()? {
+            let item = item?;
+            let tup = item
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("bisect_multi yielded non-tuple item"))?;
+            let inner_result = tup.get_item(1)?;
+            if inner_result.is_truthy()? {
+                out.append(inner_result)?;
+            }
+        }
+        Ok(out)
     }
 
-    /// Same shape as `iter_entries`, but matches by prefix.
+    /// Same shape as `iter_entries`, but matches by prefix. Always
+    /// triggers a full load (`buffer_all`); the pure-Rust prefix
+    /// matcher only operates on the post-`buffer_all` node table.
     fn iter_entries_prefix<'py>(
         slf: Bound<'py, Self>,
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let mut prefixes: Vec<KeyPrefix> = Vec::new();
-        for prefix_obj in keys.try_iter()? {
-            prefixes.push(extract_prefix(&prefix_obj?)?);
+        // Materialise the keys list once; we may iterate twice.
+        let keys_list = pyo3::types::PyList::empty(py);
+        for k in keys.try_iter()? {
+            keys_list.append(k?)?;
         }
-        if prefixes.is_empty() {
+        if keys_list.is_empty() {
             return Ok(PyList::empty(py));
         }
-        let (entries, node_ref_lists) = {
+        let (key_length, has_refs) = {
             let r = slf.borrow();
             let mut g = r.inner.lock().unwrap();
-            let entries = g.iter_entries_prefix(&prefixes).map_err(|e| match e {
-                IndexError::Other(msg) if msg.starts_with("BadIndexKey") => {
-                    PyValueError::new_err(msg)
-                }
-                other => index_err_to_py(other),
-            })?;
-            let nrl = g.node_ref_lists().map_err(index_err_to_py)?;
-            (entries, nrl)
+            g.buffer_all().map_err(reraise_pending_pyerr_or)?;
+            let kl = g.key_length().map_err(reraise_pending_pyerr_or)?;
+            let nrl = g.node_ref_lists().map_err(reraise_pending_pyerr_or)?;
+            (kl, nrl > 0)
         };
-        emit_entries(py, &slf, &entries, node_ref_lists)
+        let nodes_dict = slf.getattr("_nodes")?;
+        let nodes = nodes_dict
+            .cast_into::<pyo3::types::PyDict>()
+            .map_err(|_| PyTypeError::new_err("_nodes is not a dict"))?;
+        let mode = if has_refs {
+            "reader-refs"
+        } else {
+            "reader-norefs"
+        };
+        let entries = py_iter_entries_prefix(py, nodes, keys_list.into_any(), key_length, mode)?;
+        // Prepend (self,) to each entry tuple.
+        let out = PyList::empty(py);
+        let self_any: Bound<PyAny> = slf.clone().into_any();
+        for entry in entries.iter() {
+            let tup = entry
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("entry must be a tuple"))?;
+            let mut items: Vec<Bound<PyAny>> = vec![self_any.clone()];
+            for it in tup.iter() {
+                items.push(it.into_any());
+            }
+            out.append(PyTuple::new(py, items)?)?;
+        }
+        Ok(out)
     }
 
     /// Set of keys referenced by `ref_list_num` that aren't present in
@@ -566,7 +781,7 @@ impl PyGraphIndex {
                 IndexError::Other(msg) if msg.starts_with("No ref list") => {
                     PyValueError::new_err(msg)
                 }
-                other => index_err_to_py(other),
+                other => reraise_pending_pyerr_or(other),
             })?;
         let set = pyo3::types::PySet::empty(py)?;
         for r in refs {
@@ -575,8 +790,328 @@ impl PyGraphIndex {
         Ok(set)
     }
 
-    fn __repr__(&self) -> PyResult<String> {
-        Ok("GraphIndex(<rust>)".to_string())
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let abspath: String = self
+            .transport_py
+            .bind(py)
+            .call_method1("abspath", (self.name.as_str(),))
+            .ok()
+            .and_then(|r| r.extract().ok())
+            .unwrap_or_else(|| self.name.clone());
+        Ok(format!("GraphIndex({:?})", abspath))
+    }
+
+    fn __richcmp__(
+        &self,
+        py: Python<'_>,
+        other: Bound<'_, PyAny>,
+        op: pyo3::pyclass::CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        if let Ok(rhs) = other.cast::<PyGraphIndex>() {
+            let rhs_ref = rhs.borrow();
+            let lhs_t = self.transport_py.bind(py);
+            let rhs_t = rhs_ref.transport_py.bind(py);
+            let transports_equal = lhs_t.eq(rhs_t).unwrap_or(false);
+            let equal = transports_equal && self.name == rhs_ref.name && self.size == rhs_ref.size;
+            return match op {
+                pyo3::pyclass::CompareOp::Eq => {
+                    Ok(equal.into_pyobject(py)?.to_owned().into_any().unbind())
+                }
+                pyo3::pyclass::CompareOp::Ne => {
+                    Ok((!equal).into_pyobject(py)?.to_owned().into_any().unbind())
+                }
+                pyo3::pyclass::CompareOp::Lt => {
+                    let lh = self.__hash__(py)?;
+                    let rh = rhs_ref.__hash__(py)?;
+                    Ok((lh < rh).into_pyobject(py)?.to_owned().into_any().unbind())
+                }
+                _ => Ok(py.NotImplemented()),
+            };
+        }
+        match op {
+            pyo3::pyclass::CompareOp::Eq => {
+                Ok(false.into_pyobject(py)?.to_owned().into_any().unbind())
+            }
+            pyo3::pyclass::CompareOp::Ne => {
+                Ok(true.into_pyobject(py)?.to_owned().into_any().unbind())
+            }
+            pyo3::pyclass::CompareOp::Lt => Err(PyTypeError::new_err(other.unbind())),
+            _ => Ok(py.NotImplemented()),
+        }
+    }
+
+    fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
+        // Mirrors Python: hash((type(self), self._transport, self._name, self._size))
+        let class_obj = py.get_type::<PyGraphIndex>();
+        let tup = PyTuple::new(
+            py,
+            [
+                class_obj.into_any(),
+                self.transport_py.bind(py).clone(),
+                pyo3::types::PyString::new(py, &self.name).into_any(),
+                match self.size {
+                    Some(s) => s.into_pyobject(py)?.into_any(),
+                    None => py.None().into_bound(py),
+                },
+            ],
+        )?;
+        tup.hash()
+    }
+
+    /// Materialised dict of post-`buffer_all` nodes, or `None` if
+    /// `buffer_all` hasn't run yet. Mirrors the Python `_nodes`
+    /// attribute. Tests inspect this to confirm caching behaviour.
+    #[getter]
+    fn _nodes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let g = self.inner.lock().unwrap();
+        if !g.is_buffered_already() {
+            return Ok(py.None().into_bound(py));
+        }
+        let node_ref_lists = g.key_count_or_zero(); // unused; just to silence
+        let _ = node_ref_lists;
+        let nrl = g.header().map(|h| h.node_ref_lists).unwrap_or(0);
+        let dict = pyo3::types::PyDict::new(py);
+        for (key, (value, refs)) in g.nodes_iter() {
+            let key_t = key_to_py(py, key)?;
+            let value_b = PyBytes::new(py, value);
+            if nrl == 0 {
+                dict.set_item(key_t, value_b)?;
+            } else {
+                let mut ref_tuples: Vec<Bound<PyTuple>> = Vec::with_capacity(refs.len());
+                for inner in refs {
+                    let key_tuples: Vec<Bound<PyTuple>> = inner
+                        .iter()
+                        .map(|k| key_to_py(py, k))
+                        .collect::<PyResult<_>>()?;
+                    ref_tuples.push(PyTuple::new(py, key_tuples)?);
+                }
+                let refs_tuple = PyTuple::new(py, ref_tuples)?;
+                let pair = PyTuple::new(py, [value_b.into_any(), refs_tuple.into_any()])?;
+                dict.set_item(key_t, pair)?;
+            }
+        }
+        Ok(dict.into_any())
+    }
+
+    /// Materialise the bisect-state node table. Tests inspect this to
+    /// verify which keys the bisection path has already cached.
+    #[getter]
+    fn _bisect_nodes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let g = self.inner.lock().unwrap();
+        match g.bisect_nodes() {
+            None => Ok(py.None().into_bound(py)),
+            Some(map) => {
+                let dict = pyo3::types::PyDict::new(py);
+                for (k, (value, refs)) in map.iter() {
+                    let key_t = key_to_py(py, k)?;
+                    let value_b = PyBytes::new(py, value);
+                    if refs.is_empty() {
+                        dict.set_item(key_t, value_b)?;
+                    } else {
+                        let mut ref_tuples: Vec<Bound<PyTuple>> = Vec::with_capacity(refs.len());
+                        for inner in refs {
+                            let items: Vec<Bound<PyAny>> = inner
+                                .iter()
+                                .map(|o| -> PyResult<Bound<PyAny>> {
+                                    Ok(o.into_pyobject(py)?.into_any())
+                                })
+                                .collect::<PyResult<_>>()?;
+                            ref_tuples.push(PyTuple::new(py, items)?);
+                        }
+                        let refs_tuple = PyTuple::new(py, ref_tuples)?;
+                        let pair = PyTuple::new(py, [value_b.into_any(), refs_tuple.into_any()])?;
+                        dict.set_item(key_t, pair)?;
+                    }
+                }
+                Ok(dict.into_any())
+            }
+        }
+    }
+
+    #[getter]
+    fn _keys_by_offset<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let g = self.inner.lock().unwrap();
+        let dict = pyo3::types::PyDict::new(py);
+        for (offset, raw) in g.keys_by_offset().iter() {
+            dict.set_item(*offset, raw_node_to_py(py, raw)?)?;
+        }
+        Ok(dict)
+    }
+
+    /// Read-only view of the parsed-range map. Returns a fresh
+    /// `ParsedRangeMap` snapshot; mutations on the returned object do
+    /// not affect the index.
+    #[getter]
+    fn _range_map(&self) -> PyParsedRangeMap {
+        let g = self.inner.lock().unwrap();
+        PyParsedRangeMap {
+            inner: std::sync::Mutex::new(g.range_map().clone()),
+        }
+    }
+
+    /// `_find_ancestors` from the Python class. Walks
+    /// `iter_entries(keys)`, populating `parent_map` and adding any
+    /// missing keys to `missing_keys`. Returns the set of newly-seen
+    /// parent keys not yet in `parent_map`.
+    fn _find_ancestors<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+        ref_list_num: usize,
+        parent_map: Bound<'py, pyo3::types::PyDict>,
+        missing_keys: Bound<'py, pyo3::types::PySet>,
+    ) -> PyResult<Bound<'py, pyo3::types::PySet>> {
+        let key_list = pyo3::types::PyList::empty(py);
+        for k in keys.try_iter()? {
+            key_list.append(k?)?;
+        }
+        let entries = slf.call_method1("iter_entries", (key_list.clone(),))?;
+        let found = pyo3::types::PySet::empty(py)?;
+        let new_search = pyo3::types::PySet::empty(py)?;
+        for entry_obj in entries.try_iter()? {
+            let entry = entry_obj?;
+            let entry_t = entry
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("entry must be a tuple"))?;
+            let key = entry_t.get_item(1)?;
+            let refs = entry_t.get_item(3)?;
+            let parent_keys = refs.get_item(ref_list_num)?;
+            found.add(key.clone())?;
+            parent_map.set_item(key, parent_keys.clone())?;
+            for p in parent_keys.try_iter()? {
+                new_search.add(p?)?;
+            }
+        }
+        // Find missing keys: original_keys - found.
+        for k in key_list.iter() {
+            if !found.contains(k.clone())? {
+                missing_keys.add(k)?;
+            }
+        }
+        // Return new_search - parent_map keys.
+        let result = pyo3::types::PySet::empty(py)?;
+        for k in new_search.iter() {
+            if !parent_map.contains(k.clone())? {
+                result.add(k)?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn clear_cache(&self) {}
+
+    /// Service a vectored read against the bisection state. Tests
+    /// call this directly to exercise the parsed-region bookkeeping;
+    /// mirrors the Python `_read_and_parse`.
+    fn _read_and_parse(&self, readv_ranges: Bound<'_, PyAny>) -> PyResult<()> {
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for item in readv_ranges.try_iter()? {
+            let item = item?;
+            let tup = item
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("readv_ranges items must be tuples"))?;
+            let start: u64 = tup.get_item(0)?.extract()?;
+            let length: u64 = tup.get_item(1)?.extract()?;
+            ranges.push((start, length));
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .read_and_parse_for_test(ranges)
+            .map_err(reraise_pending_pyerr_or)
+    }
+
+    /// Bisection probe used by `bisect_multi.bisect_multi_bytes`.
+    /// `location_keys` is a list of `(byte_offset, key_tuple)` pairs;
+    /// returns a list of `(input_pair, result)` matching the Python
+    /// `_lookup_keys_via_location` contract (result is `False` for
+    /// missing, `-1`/`+1` for direction, or
+    /// `(self, key, value[, refs])` for found).
+    fn _lookup_keys_via_location<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        location_keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let mut requested: Vec<(u64, IndexKey)> = Vec::new();
+        for item_obj in location_keys.try_iter()? {
+            let item = item_obj?;
+            let tup = item
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("location_keys items must be tuples"))?;
+            let location: u64 = tup.get_item(0)?.extract()?;
+            let key = extract_key(&tup.get_item(1)?)?;
+            requested.push((location, key));
+        }
+        let results = {
+            let r = slf.borrow();
+            let mut g = r.inner.lock().unwrap();
+            g.lookup_keys_via_location(&requested)
+                .map_err(|e| match e {
+                    IndexError::Other(msg) => BzrFormatsError::new_err(msg),
+                    other => reraise_pending_pyerr_or(other),
+                })?
+        };
+        let node_ref_lists = {
+            let r = slf.borrow();
+            let mut g = r.inner.lock().unwrap();
+            g.node_ref_lists().map_err(reraise_pending_pyerr_or)?
+        };
+        let out = PyList::empty(py);
+        let self_any: Bound<PyAny> = slf.clone().into_any();
+        for ((location, key), res) in results {
+            let key_t = key_to_py(py, &key)?;
+            let in_pair = PyTuple::new(
+                py,
+                [
+                    location.into_pyobject(py)?.into_any(),
+                    key_t.clone().into_any(),
+                ],
+            )?;
+            let result_obj: Bound<'py, PyAny> = match res {
+                bazaar::index::LookupResult::Missing => {
+                    false.into_pyobject(py)?.to_owned().into_any()
+                }
+                bazaar::index::LookupResult::Direction(d) => {
+                    (d as i32).into_pyobject(py)?.into_any().into_any()
+                }
+                bazaar::index::LookupResult::Found { value, refs } => {
+                    let value_b = PyBytes::new(py, &value);
+                    if node_ref_lists == 0 {
+                        PyTuple::new(
+                            py,
+                            [
+                                self_any.clone(),
+                                key_t.clone().into_any(),
+                                value_b.into_any(),
+                            ],
+                        )?
+                        .into_any()
+                    } else {
+                        let mut ref_tuples: Vec<Bound<PyTuple>> = Vec::with_capacity(refs.len());
+                        for inner in &refs {
+                            let key_tuples: Vec<Bound<PyTuple>> = inner
+                                .iter()
+                                .map(|k| key_to_py(py, k))
+                                .collect::<PyResult<_>>()?;
+                            ref_tuples.push(PyTuple::new(py, key_tuples)?);
+                        }
+                        let refs_tuple = PyTuple::new(py, ref_tuples)?;
+                        PyTuple::new(
+                            py,
+                            [
+                                self_any.clone(),
+                                key_t.clone().into_any(),
+                                value_b.into_any(),
+                                refs_tuple.into_any(),
+                            ],
+                        )?
+                        .into_any()
+                    }
+                }
+            };
+            out.append(PyTuple::new(py, [in_pair.into_any(), result_obj])?)?;
+        }
+        Ok(out)
     }
 }
 
@@ -637,7 +1172,7 @@ fn py_parse_full<'py>(
     py: Python<'py>,
     data: &[u8],
 ) -> PyResult<(usize, usize, usize, Bound<'py, PyDict>)> {
-    let (header, nodes) = parse_full(data).map_err(index_err_to_py)?;
+    let (header, nodes) = parse_full(data).map_err(reraise_pending_pyerr_or)?;
     let nodes_dict = PyDict::new(py);
     for (key, (value, refs)) in &nodes {
         let key_t = key_to_py(py, key)?;
