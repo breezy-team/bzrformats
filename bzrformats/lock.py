@@ -30,4 +30,10 @@ from ._bzr_rs.lock import (
     _snapshot_state,
 )
 
-__all__ = ["LogicalLockResult", "ReadLock", "WriteLock"]
+__all__ = [
+    "LogicalLockResult",
+    "ReadLock",
+    "WriteLock",
+    "_reset_state",
+    "_snapshot_state",
+]
