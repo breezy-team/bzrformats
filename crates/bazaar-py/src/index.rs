@@ -891,6 +891,58 @@ fn py_external_references_from_builder_nodes<'py>(
     Ok(out)
 }
 
+/// External references from a `GraphIndex._nodes` dict at a specific
+/// reference-list index. Returns the set of keys reachable through
+/// `ref_list_num` that aren't themselves present in the index.
+///
+/// `nodes` is `{key: (bytes, refs_tuple)}`. Raises `ValueError` if
+/// `ref_list_num` is out of range for `node_ref_lists`.
+#[pyfunction]
+#[pyo3(name = "external_references_from_reader_nodes")]
+fn py_external_references_from_reader_nodes<'py>(
+    py: Python<'py>,
+    nodes: Bound<'py, PyDict>,
+    ref_list_num: usize,
+    node_ref_lists: usize,
+) -> PyResult<Bound<'py, pyo3::types::PySet>> {
+    if ref_list_num + 1 > node_ref_lists {
+        return Err(PyValueError::new_err(format!(
+            "No ref list {}, index has {} ref lists",
+            ref_list_num, node_ref_lists
+        )));
+    }
+    let out = pyo3::types::PySet::empty(py)?;
+    let mut present: std::collections::HashSet<Vec<Vec<u8>>> = std::collections::HashSet::new();
+    let mut candidate_refs: Vec<Bound<'py, PyAny>> = Vec::new();
+    for (key_obj, value_obj) in nodes.iter() {
+        let key_tuple = key_obj
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("key must be a tuple"))?;
+        present.insert(extract_key(key_tuple.as_any())?);
+        let value_tuple = value_obj
+            .cast_into::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("node value must be a 2-tuple"))?;
+        let refs_obj = value_tuple.get_item(1)?;
+        let refs_tuple = refs_obj
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("refs must be a tuple"))?;
+        let ref_list_obj = refs_tuple.get_item(ref_list_num)?;
+        for r in ref_list_obj.try_iter()? {
+            candidate_refs.push(r?);
+        }
+    }
+    for ref_obj in candidate_refs {
+        let ref_tuple = ref_obj
+            .cast::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("ref must be a tuple"))?;
+        let ref_rs = extract_key(ref_tuple.as_any())?;
+        if !present.contains(&ref_rs) {
+            out.add(ref_tuple)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Validate that `key` conforms to the `GraphIndexBuilder` key
 /// interface: a tuple of `key_length` non-empty `bytes` elements with
 /// no whitespace or null characters anywhere. Raises `BadIndexKey` on
@@ -942,6 +994,10 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     )?)?;
     m.add_function(wrap_pyfunction!(py_check_key, &m)?)?;
     m.add_function(wrap_pyfunction!(py_check_value, &m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_external_references_from_reader_nodes,
+        &m
+    )?)?;
     m.add_class::<PyGraphIndex>()?;
     m.add_class::<PyParsedRangeMap>()?;
     Ok(m)

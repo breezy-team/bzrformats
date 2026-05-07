@@ -437,17 +437,9 @@ class GraphIndex:
     def external_references(self, ref_list_num):
         """Return references that are not present in this index."""
         self._buffer_all()
-        if ref_list_num + 1 > self.node_ref_lists:
-            raise ValueError(
-                "No ref list %d, index has %d ref lists"
-                % (ref_list_num, self.node_ref_lists)
-            )
-        refs = set()
-        nodes = self._nodes
-        for _key, (_value, ref_lists) in nodes.items():
-            ref_list = ref_lists[ref_list_num]
-            refs.update([ref for ref in ref_list if ref not in nodes])
-        return refs
+        return _index_rs.external_references_from_reader_nodes(
+            self._nodes, ref_list_num, self.node_ref_lists
+        )
 
     def iter_all_entries(self):
         """Iterate over all keys within the index.
