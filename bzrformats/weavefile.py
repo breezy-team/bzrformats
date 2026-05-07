@@ -34,8 +34,6 @@ processing instructions.  Lines of text are prefixed by '.' if the
 line contains a newline, or ',' if not.
 """
 
-from ._bzr_rs import weave as _weave_rs
-
 FORMAT_1 = b"# bzr weave file v5\n"
 
 
@@ -49,9 +47,6 @@ def write_weave(weave, f, format=None):
 
     Raises:
         ValueError: If an unknown format is specified.
-
-    Returns:
-        The result of write_weave_v5 (None).
     """
     if format is None or format == 1:
         return write_weave_v5(weave, f)
@@ -61,11 +56,7 @@ def write_weave(weave, f, format=None):
 
 def write_weave_v5(weave, f):
     """Write weave to file f."""
-    f.write(
-        _weave_rs.write_weave_v5(
-            weave._parents, weave._sha1s, weave._names, weave._weave
-        )
-    )
+    f.write(weave._to_v5_bytes())
 
 
 def read_weave(f):
@@ -94,10 +85,5 @@ def _read_weave_v5(f, w):
         data = f.read()
     finally:
         f.close()
-    parents, sha1s, names, weave = _weave_rs.read_weave_v5(data)
-    w._parents = parents
-    w._sha1s = sha1s
-    w._names = names
-    w._weave = weave
-    w._name_map = {name: i for i, name in enumerate(names)}
+    w._load_from_v5_bytes(data)
     return w
