@@ -949,6 +949,44 @@ impl PyGraphIndex {
         }
     }
 
+    /// Backward-compatible view of the parsed byte spans as
+    /// `[(start, end), ...]`. Mirrors the pre-Rust-port attribute that
+    /// older callers and tests still read.
+    #[getter]
+    fn _parsed_byte_map<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let g = self.inner.lock().unwrap();
+        let m = g.range_map();
+        let out = PyList::empty(py);
+        for i in 0..m.len() {
+            let (s, e) = m.byte_range(i).expect("in range");
+            out.append(PyTuple::new(
+                py,
+                [
+                    s.into_pyobject(py)?.into_any(),
+                    e.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+        }
+        Ok(out)
+    }
+
+    /// Backward-compatible view of the parsed key spans as
+    /// `[(start_key, end_key), ...]`. Mirrors the pre-Rust-port
+    /// attribute that older callers and tests still read.
+    #[getter]
+    fn _parsed_key_map<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let g = self.inner.lock().unwrap();
+        let m = g.range_map();
+        let out = PyList::empty(py);
+        for i in 0..m.len() {
+            let (s, e) = m.key_range(i).expect("in range");
+            let sp = key_or_none_to_py(py, &s)?;
+            let ep = key_or_none_to_py(py, &e)?;
+            out.append(PyTuple::new(py, [sp, ep])?)?;
+        }
+        Ok(out)
+    }
+
     /// `_find_ancestors` from the Python class. Walks
     /// `iter_entries(keys)`, populating `parent_map` and adding any
     /// missing keys to `missing_keys`. Returns the set of newly-seen
@@ -1478,6 +1516,56 @@ fn py_external_references_from_reader_nodes<'py>(
     Ok(out)
 }
 
+/// Validate `key`, `references`, and `value` for a builder
+/// `add_node` call. Returns `(node_refs_tuple, absent_references_list)`
+/// where `node_refs_tuple` is a tuple of tuples of tuples (each inner
+/// tuple is a key) and `absent_references_list` is a list of keys that
+/// aren't already present in `nodes`.
+///
+/// Raises `BadIndexKey` for bad keys, `BadIndexValue` for bad values
+/// or wrong reference list count.
+#[pyfunction]
+#[pyo3(name = "check_key_ref_value")]
+fn py_check_key_ref_value<'py>(
+    py: Python<'py>,
+    key: Bound<'py, PyAny>,
+    references: Bound<'py, PyAny>,
+    value: Bound<'py, PyBytes>,
+    nodes: Bound<'py, PyDict>,
+    reference_lists_count: usize,
+    key_length: usize,
+) -> PyResult<(Bound<'py, PyTuple>, Bound<'py, PyList>)> {
+    py_check_key(key.clone(), key_length)?;
+    py_check_value(value.clone())?;
+    let ref_lists: Vec<Bound<'py, PyAny>> = references.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+    if ref_lists.len() != reference_lists_count {
+        return Err(BadIndexValue::new_err((references.unbind(),)));
+    }
+    let absent_list = PyList::empty(py);
+    let mut node_ref_tuples: Vec<Bound<'py, PyTuple>> = Vec::with_capacity(ref_lists.len());
+    for ref_list_obj in ref_lists {
+        let mut tupled_refs: Vec<Bound<'py, PyTuple>> = Vec::new();
+        for ref_obj in ref_list_obj.try_iter()? {
+            let ref_obj = ref_obj?;
+            let ref_tuple = if let Ok(t) = ref_obj.cast::<PyTuple>() {
+                t.clone()
+            } else {
+                let parts: Vec<Bound<'py, PyAny>> =
+                    ref_obj.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+                PyTuple::new(py, parts)?
+            };
+            if !nodes.contains(ref_tuple.clone())? {
+                py_check_key(ref_tuple.clone().into_any(), key_length)?;
+                absent_list.append(ref_tuple.clone())?;
+            }
+            tupled_refs.push(ref_tuple);
+        }
+        node_ref_tuples.push(PyTuple::new(py, tupled_refs)?);
+    }
+    let result_tuple = PyTuple::new(py, node_ref_tuples)?;
+    Ok((result_tuple, absent_list))
+}
+
 /// Validate that `key` conforms to the `GraphIndexBuilder` key
 /// interface: a tuple of `key_length` non-empty `bytes` elements with
 /// no whitespace or null characters anywhere. Raises `BadIndexKey` on
@@ -1529,6 +1617,7 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     )?)?;
     m.add_function(wrap_pyfunction!(py_check_key, &m)?)?;
     m.add_function(wrap_pyfunction!(py_check_value, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_check_key_ref_value, &m)?)?;
     m.add_function(wrap_pyfunction!(
         py_external_references_from_reader_nodes,
         &m

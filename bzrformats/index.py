@@ -225,22 +225,14 @@ class GraphIndexBuilder:
               This may contain duplicates if the same key is referenced in
               multiple lists.
         """
-        self._check_key(key)
-        _index_rs.check_value(value)
-        if len(references) != self.reference_lists:
-            raise BadIndexValue(references)
-        node_refs = []
-        absent_references = []
-        for reference_list in references:
-            for reference in reference_list:
-                # If reference *is* in self._nodes, then we know it has already
-                # been checked.
-                if reference not in self._nodes:
-                    self._check_key(reference)
-                    absent_references.append(reference)
-            reference_list = tuple([tuple(ref) for ref in reference_list])
-            node_refs.append(reference_list)
-        return tuple(node_refs), absent_references
+        return _index_rs.check_key_ref_value(
+            key,
+            references,
+            value,
+            self._nodes,
+            self.reference_lists,
+            self._key_length,
+        )
 
     def add_node(self, key, value, references=()):
         r"""Add a node to the index.
