@@ -61,6 +61,16 @@ pub enum IndexError {
     /// A node line referenced a byte offset that couldn't be parsed as an
     /// integer.
     BadReferenceOffset(Vec<u8>),
+    /// A key tuple was rejected (wrong length, empty element, or contained
+    /// disallowed bytes).
+    BadKey(IndexKey),
+    /// A value was rejected (wrong reference list count, or disallowed
+    /// bytes in payload).
+    BadValue(String),
+    /// `add_node` was called for a key already present (and not absent).
+    DuplicateKey(IndexKey),
+    /// Format-1 data parsing error (e.g. `_strip_prefix` mismatch).
+    BadIndexData,
     /// Catch-all for runtime errors — bad input keys, IO failures from a
     /// transport, missing trailers, etc.
     Other(String),
@@ -83,6 +93,12 @@ impl std::fmt::Display for IndexError {
             IndexError::BadReferenceOffset(s) => {
                 write!(f, "bad reference offset: {:?}", s)
             }
+            IndexError::BadKey(k) => write!(f, "bad index key: {:?}", k),
+            IndexError::BadValue(msg) => write!(f, "bad index value: {}", msg),
+            IndexError::DuplicateKey(k) => {
+                write!(f, "duplicate index key: {:?}", k)
+            }
+            IndexError::BadIndexData => write!(f, "bad index data"),
             IndexError::Other(msg) => write!(f, "{}", msg),
         }
     }
@@ -1454,6 +1470,905 @@ pub enum LookupResult {
     Direction(i32),
 }
 
+/// One node held by [`GraphIndexBuilder`]. `absent` mirrors the
+/// `b""` (present) vs `b"a"` (absent) marker stored in the Python
+/// builder's three-tuple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuilderNode {
+    pub absent: bool,
+    pub references: Vec<Vec<IndexKey>>,
+    pub value: Vec<u8>,
+}
+
+/// In-memory builder for a graph-index file. Mirrors the Python
+/// `GraphIndexBuilder`/`InMemoryGraphIndex`.
+///
+/// Use [`GraphIndexBuilder::add_node`] to insert nodes, then
+/// [`GraphIndexBuilder::finish`] to serialise to the format-1 byte
+/// stream the on-disk reader consumes.
+#[derive(Debug, Clone)]
+pub struct GraphIndexBuilder {
+    reference_lists: usize,
+    key_length: usize,
+    nodes: HashMap<IndexKey, BuilderNode>,
+    absent_keys: std::collections::HashSet<IndexKey>,
+    optimize_for_size: bool,
+    combine_backing_indices: bool,
+}
+
+impl GraphIndexBuilder {
+    /// Create a new builder. `reference_lists` is the number of
+    /// parallel reference lists per node (0, 1, or 2 in practice);
+    /// `key_elements` is the tuple length every key must have.
+    pub fn new(reference_lists: usize, key_elements: usize) -> Self {
+        Self {
+            reference_lists,
+            key_length: key_elements,
+            nodes: HashMap::new(),
+            absent_keys: std::collections::HashSet::new(),
+            optimize_for_size: false,
+            combine_backing_indices: true,
+        }
+    }
+
+    pub fn reference_lists(&self) -> usize {
+        self.reference_lists
+    }
+
+    pub fn key_length(&self) -> usize {
+        self.key_length
+    }
+
+    pub fn optimize_for_size(&self) -> bool {
+        self.optimize_for_size
+    }
+
+    pub fn combine_backing_indices(&self) -> bool {
+        self.combine_backing_indices
+    }
+
+    /// Mirrors `GraphIndexBuilder.set_optimize`. Either flag may be
+    /// `None` to leave the current setting alone.
+    pub fn set_optimize(&mut self, for_size: Option<bool>, combine_backing_indices: Option<bool>) {
+        if let Some(v) = for_size {
+            self.optimize_for_size = v;
+        }
+        if let Some(v) = combine_backing_indices {
+            self.combine_backing_indices = v;
+        }
+    }
+
+    /// Read-only view of the node table.
+    pub fn nodes(&self) -> &HashMap<IndexKey, BuilderNode> {
+        &self.nodes
+    }
+
+    /// `true` once `key` is in the table and not flagged absent.
+    pub fn contains_present(&self, key: &IndexKey) -> bool {
+        self.nodes.get(key).map(|n| !n.absent).unwrap_or(false)
+    }
+
+    /// Validate `key` against this builder's key length and the
+    /// disallowed-bytes rules.
+    pub fn check_key(&self, key: &IndexKey) -> Result<(), IndexError> {
+        if !key_is_valid(key, self.key_length) {
+            return Err(IndexError::BadKey(key.clone()));
+        }
+        Ok(())
+    }
+
+    /// Return `(node_refs, absent_references)` for a candidate
+    /// `add_node` call. Mirrors `_check_key_ref_value`.
+    pub fn check_key_ref_value(
+        &self,
+        key: &IndexKey,
+        references: &[Vec<IndexKey>],
+        value: &[u8],
+    ) -> Result<(Vec<Vec<IndexKey>>, Vec<IndexKey>), IndexError> {
+        self.check_key(key)?;
+        if !value_is_valid(value) {
+            return Err(IndexError::BadValue(format!(
+                "value {:?} contains \\n or \\0",
+                value
+            )));
+        }
+        if references.len() != self.reference_lists {
+            return Err(IndexError::BadValue(format!(
+                "expected {} reference lists, got {}",
+                self.reference_lists,
+                references.len()
+            )));
+        }
+        let mut absent = Vec::new();
+        let mut node_refs = Vec::with_capacity(references.len());
+        for ref_list in references {
+            let mut tupled: Vec<IndexKey> = Vec::with_capacity(ref_list.len());
+            for r in ref_list {
+                if !self.nodes.contains_key(r) {
+                    self.check_key(r)?;
+                    absent.push(r.clone());
+                }
+                tupled.push(r.clone());
+            }
+            node_refs.push(tupled);
+        }
+        Ok((node_refs, absent))
+    }
+
+    /// Insert a node. Returns [`IndexError::DuplicateKey`] if `key` is
+    /// already present (and not flagged absent).
+    pub fn add_node(
+        &mut self,
+        key: IndexKey,
+        value: Vec<u8>,
+        references: Vec<Vec<IndexKey>>,
+    ) -> Result<(), IndexError> {
+        let (node_refs, absent_refs) = self.check_key_ref_value(&key, &references, &value)?;
+        if let Some(existing) = self.nodes.get(&key) {
+            if !existing.absent {
+                return Err(IndexError::DuplicateKey(key));
+            }
+        }
+        for r in &absent_refs {
+            self.nodes.entry(r.clone()).or_insert_with(|| BuilderNode {
+                absent: true,
+                references: Vec::new(),
+                value: Vec::new(),
+            });
+            self.absent_keys.insert(r.clone());
+        }
+        self.absent_keys.remove(&key);
+        self.nodes.insert(
+            key,
+            BuilderNode {
+                absent: false,
+                references: node_refs,
+                value,
+            },
+        );
+        Ok(())
+    }
+
+    /// Number of present (non-absent) keys.
+    pub fn key_count(&self) -> usize {
+        self.nodes.len() - self.absent_keys.len()
+    }
+
+    /// Iterate every present entry as `(key, value, refs)`. Order is
+    /// unspecified.
+    pub fn iter_all_entries(
+        &self,
+    ) -> impl Iterator<Item = (IndexKey, Vec<u8>, Vec<Vec<IndexKey>>)> + '_ {
+        self.nodes.iter().filter_map(|(k, n)| {
+            if n.absent {
+                None
+            } else {
+                Some((k.clone(), n.value.clone(), n.references.clone()))
+            }
+        })
+    }
+
+    /// Iterate present entries whose key is in `keys`.
+    pub fn iter_entries<'a, I>(
+        &'a self,
+        keys: I,
+    ) -> impl Iterator<Item = (IndexKey, Vec<u8>, Vec<Vec<IndexKey>>)> + 'a
+    where
+        I: IntoIterator<Item = IndexKey> + 'a,
+    {
+        keys.into_iter().filter_map(move |k| {
+            let n = self.nodes.get(&k)?;
+            if n.absent {
+                None
+            } else {
+                Some((k, n.value.clone(), n.references.clone()))
+            }
+        })
+    }
+
+    /// Iterate present entries whose key matches one of `prefixes`.
+    /// Each prefix is a [`KeyPrefix`] — same length as a key with
+    /// trailing slots set to `None`. The first slot must not be `None`.
+    pub fn iter_entries_prefix(
+        &self,
+        prefixes: &[KeyPrefix],
+    ) -> Result<Vec<IndexEntry>, IndexError> {
+        for p in prefixes {
+            if p.len() != self.key_length {
+                return Err(IndexError::BadKey(
+                    p.iter().map(|e| e.clone().unwrap_or_default()).collect(),
+                ));
+            }
+            if matches!(p.first(), Some(None)) {
+                return Err(IndexError::BadKey(Vec::new()));
+            }
+        }
+        let mut out = Vec::new();
+        let mut emitted: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        for prefix in prefixes {
+            for (k, n) in self.nodes.iter() {
+                if n.absent {
+                    continue;
+                }
+                if k.len() != self.key_length {
+                    continue;
+                }
+                let matches = prefix
+                    .iter()
+                    .zip(k.iter())
+                    .all(|(p_elem, k_elem)| match p_elem {
+                        Some(p) => p == k_elem,
+                        None => true,
+                    });
+                if matches && emitted.insert(k.clone()) {
+                    out.push((k.clone(), n.value.clone(), n.references.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reference keys not present in this builder, drawn from the
+    /// second reference list. Mirrors `_external_references`.
+    pub fn external_references(&self) -> std::collections::HashSet<IndexKey> {
+        let mut refs = std::collections::HashSet::new();
+        if self.reference_lists < 2 {
+            return refs;
+        }
+        let mut keys: std::collections::HashSet<&IndexKey> = std::collections::HashSet::new();
+        for (k, n) in &self.nodes {
+            if n.absent {
+                continue;
+            }
+            keys.insert(k);
+            if let Some(list) = n.references.get(1) {
+                for r in list {
+                    refs.insert(r.clone());
+                }
+            }
+        }
+        refs.retain(|r| !keys.contains(r));
+        refs
+    }
+
+    /// Serialise to the format-1 byte stream.
+    pub fn finish(&self) -> Result<Vec<u8>, IndexError> {
+        let mut nodes: Vec<IndexNode> = Vec::with_capacity(self.nodes.len());
+        for (key, node) in &self.nodes {
+            nodes.push(IndexNode {
+                key: key.clone(),
+                absent: node.absent,
+                references: node.references.clone(),
+                value: node.value.clone(),
+            });
+        }
+        serialize_graph_index(&nodes, self.reference_lists, self.key_length)
+    }
+
+    /// Compute ancestry by walking iter_entries and following the
+    /// reference list at `ref_list_num`. Mirrors
+    /// `GraphIndexBuilder.find_ancestry`.
+    pub fn find_ancestry(
+        &self,
+        keys: &[IndexKey],
+        ref_list_num: usize,
+    ) -> Result<
+        (
+            HashMap<IndexKey, Vec<IndexKey>>,
+            std::collections::HashSet<IndexKey>,
+        ),
+        IndexError,
+    > {
+        let mut pending: std::collections::HashSet<IndexKey> = keys.iter().cloned().collect();
+        let mut parent_map: HashMap<IndexKey, Vec<IndexKey>> = HashMap::new();
+        let mut missing: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        while !pending.is_empty() {
+            let mut next_pending: std::collections::HashSet<IndexKey> =
+                std::collections::HashSet::new();
+            let snapshot: Vec<IndexKey> = pending.iter().cloned().collect();
+            for (k, _v, refs) in self.iter_entries(snapshot) {
+                let parent_keys = refs.get(ref_list_num).cloned().unwrap_or_default();
+                for p in &parent_keys {
+                    if !parent_map.contains_key(p) {
+                        next_pending.insert(p.clone());
+                    }
+                }
+                parent_map.insert(k, parent_keys);
+            }
+            for k in pending.iter() {
+                if !parent_map.contains_key(k) {
+                    missing.insert(k.clone());
+                }
+            }
+            pending = next_pending;
+        }
+        Ok((parent_map, missing))
+    }
+}
+
+/// Validate-and-add interface that all index implementations support.
+/// Pure-Rust consumers can use this for index abstraction; the pyo3
+/// layer hides this behind duck-typed Python objects.
+pub trait IndexLike {
+    /// Number of present keys in the index.
+    fn key_count(&self) -> Result<usize, IndexError>;
+
+    /// Number of parallel reference lists per node.
+    fn node_ref_lists(&self) -> Result<usize, IndexError>;
+
+    /// Iterate every present entry.
+    fn iter_all(&self) -> Result<Vec<IndexEntry>, IndexError>;
+
+    /// Iterate present entries restricted to `keys`.
+    fn iter(&self, keys: &[IndexKey]) -> Result<Vec<IndexEntry>, IndexError>;
+
+    /// Iterate present entries whose keys match one of `prefixes`.
+    fn iter_prefix(&self, prefixes: &[KeyPrefix]) -> Result<Vec<IndexEntry>, IndexError>;
+
+    /// Set of reference keys at `ref_list_num` not present in the
+    /// index.
+    fn external_refs(
+        &self,
+        ref_list_num: usize,
+    ) -> Result<std::collections::HashSet<IndexKey>, IndexError>;
+
+    /// Best-effort validation walk.
+    fn validate(&self) -> Result<(), IndexError> {
+        let _ = self.iter_all()?;
+        Ok(())
+    }
+
+    /// Optional cache-clear hook. Default no-op.
+    fn clear_cache(&self) {}
+
+    /// One step of the ancestry walk used by
+    /// [`CombinedGraphIndex::find_ancestry`]. Looks up each `key` in the
+    /// index, populating `parent_map[key] = parent_keys` for each
+    /// found entry and adding the unfound keys to `missing_keys`.
+    /// Returns the parent keys that aren't already in `parent_map`,
+    /// ready to feed into the next iteration.
+    fn find_ancestors(
+        &self,
+        search_keys: &[IndexKey],
+        ref_list_num: usize,
+        parent_map: &mut HashMap<IndexKey, Vec<IndexKey>>,
+        missing_keys: &mut std::collections::HashSet<IndexKey>,
+    ) -> Result<std::collections::HashSet<IndexKey>, IndexError> {
+        let entries = self.iter(search_keys)?;
+        let mut found: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        let mut new_search: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        for (key, _value, refs) in entries {
+            let parents: Vec<IndexKey> = refs.get(ref_list_num).cloned().unwrap_or_default();
+            for p in &parents {
+                if !parent_map.contains_key(p) {
+                    new_search.insert(p.clone());
+                }
+            }
+            found.insert(key.clone());
+            parent_map.insert(key, parents);
+        }
+        for k in search_keys {
+            if !found.contains(k) {
+                missing_keys.insert(k.clone());
+            }
+        }
+        // Drop keys we already have parents for.
+        new_search.retain(|k| !parent_map.contains_key(k));
+        Ok(new_search)
+    }
+}
+
+impl IndexLike for GraphIndexBuilder {
+    fn key_count(&self) -> Result<usize, IndexError> {
+        Ok(self.key_count())
+    }
+
+    fn node_ref_lists(&self) -> Result<usize, IndexError> {
+        Ok(self.reference_lists)
+    }
+
+    fn iter_all(&self) -> Result<Vec<IndexEntry>, IndexError> {
+        Ok(self.iter_all_entries().collect())
+    }
+
+    fn iter(&self, keys: &[IndexKey]) -> Result<Vec<IndexEntry>, IndexError> {
+        Ok(self.iter_entries(keys.iter().cloned()).collect())
+    }
+
+    fn iter_prefix(&self, prefixes: &[KeyPrefix]) -> Result<Vec<IndexEntry>, IndexError> {
+        self.iter_entries_prefix(prefixes)
+    }
+
+    fn external_refs(
+        &self,
+        ref_list_num: usize,
+    ) -> Result<std::collections::HashSet<IndexKey>, IndexError> {
+        if ref_list_num + 1 > self.reference_lists {
+            return Err(IndexError::Other(format!(
+                "No ref list {}, index has {} ref lists",
+                ref_list_num, self.reference_lists
+            )));
+        }
+        if ref_list_num != 1 {
+            // The Python `_external_references` is hard-coded to use
+            // ref list 1; for other lists we have no implementation.
+            return Ok(std::collections::HashSet::new());
+        }
+        Ok(self.external_references())
+    }
+}
+
+impl<T: IndexTransport> IndexLike for std::sync::Mutex<GraphIndex<T>> {
+    fn key_count(&self) -> Result<usize, IndexError> {
+        self.lock().unwrap().key_count()
+    }
+
+    fn node_ref_lists(&self) -> Result<usize, IndexError> {
+        self.lock().unwrap().node_ref_lists()
+    }
+
+    fn iter_all(&self) -> Result<Vec<IndexEntry>, IndexError> {
+        self.lock().unwrap().iter_all_entries()
+    }
+
+    fn iter(&self, keys: &[IndexKey]) -> Result<Vec<IndexEntry>, IndexError> {
+        self.lock().unwrap().iter_entries(keys)
+    }
+
+    fn iter_prefix(&self, prefixes: &[KeyPrefix]) -> Result<Vec<IndexEntry>, IndexError> {
+        self.lock().unwrap().iter_entries_prefix(prefixes)
+    }
+
+    fn external_refs(
+        &self,
+        ref_list_num: usize,
+    ) -> Result<std::collections::HashSet<IndexKey>, IndexError> {
+        self.lock().unwrap().external_references(ref_list_num)
+    }
+
+    fn validate(&self) -> Result<(), IndexError> {
+        self.lock().unwrap().validate()
+    }
+}
+
+/// A combined view over multiple [`IndexLike`] backends. Mirrors
+/// the Python `CombinedGraphIndex`.
+pub struct CombinedGraphIndex {
+    indices: Vec<Box<dyn IndexLike + Send + Sync>>,
+}
+
+impl CombinedGraphIndex {
+    pub fn new() -> Self {
+        Self {
+            indices: Vec::new(),
+        }
+    }
+
+    pub fn from_indices(indices: Vec<Box<dyn IndexLike + Send + Sync>>) -> Self {
+        Self { indices }
+    }
+
+    pub fn push(&mut self, index: Box<dyn IndexLike + Send + Sync>) {
+        self.indices.push(index);
+    }
+
+    pub fn insert(&mut self, pos: usize, index: Box<dyn IndexLike + Send + Sync>) {
+        self.indices.insert(pos, index);
+    }
+
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    /// Read-only access to the wrapped indices.
+    pub fn indices(&self) -> &[Box<dyn IndexLike + Send + Sync>] {
+        &self.indices
+    }
+
+    /// Move the indices at `hits` (positional) to the front of the
+    /// list, preserving relative order. Mirrors
+    /// `CombinedGraphIndex._move_to_front_by_index`.
+    pub fn move_to_front(&mut self, hits: &[usize]) {
+        if hits.is_empty() {
+            return;
+        }
+        let mut hit_set: std::collections::HashSet<usize> = hits.iter().copied().collect();
+        let mut new_order: Vec<Box<dyn IndexLike + Send + Sync>> =
+            Vec::with_capacity(self.indices.len());
+        // Preserve the order specified by `hits`.
+        for &h in hits {
+            if h < self.indices.len() {
+                hit_set.remove(&h);
+            }
+        }
+        // Move hits to the front in the requested order.
+        let mut taken: HashMap<usize, Box<dyn IndexLike + Send + Sync>> = HashMap::new();
+        for (i, idx) in std::mem::take(&mut self.indices).into_iter().enumerate() {
+            taken.insert(i, idx);
+        }
+        for &h in hits {
+            if let Some(idx) = taken.remove(&h) {
+                new_order.push(idx);
+            }
+        }
+        // Then keep the rest in original order.
+        let mut leftover: Vec<(usize, Box<dyn IndexLike + Send + Sync>)> =
+            taken.into_iter().collect();
+        leftover.sort_by_key(|(i, _)| *i);
+        for (_, idx) in leftover {
+            new_order.push(idx);
+        }
+        self.indices = new_order;
+    }
+}
+
+impl Default for CombinedGraphIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CombinedGraphIndex {
+    /// Like [`Self::iter`] but also returns the (positional) indices
+    /// that contributed at least one entry — the caller can pass this
+    /// to [`Self::move_to_front`] to reorder for locality.
+    pub fn iter_entries_with_hits(
+        &mut self,
+        keys: &[IndexKey],
+    ) -> Result<(Vec<IndexEntry>, Vec<usize>), IndexError> {
+        let mut remaining: std::collections::HashSet<IndexKey> = keys.iter().cloned().collect();
+        let mut out = Vec::new();
+        let mut hits: Vec<usize> = Vec::new();
+        for (i, idx) in self.indices.iter().enumerate() {
+            if remaining.is_empty() {
+                break;
+            }
+            let snapshot: Vec<IndexKey> = remaining.iter().cloned().collect();
+            let entries = idx.iter(&snapshot)?;
+            let mut hit = false;
+            for entry in entries {
+                if remaining.remove(&entry.0) {
+                    out.push(entry);
+                    hit = true;
+                }
+            }
+            if hit {
+                hits.push(i);
+            }
+        }
+        Ok((out, hits))
+    }
+
+    /// Like [`Self::iter_prefix`] but also reports which positional
+    /// indices contributed.
+    pub fn iter_entries_prefix_with_hits(
+        &mut self,
+        prefixes: &[KeyPrefix],
+    ) -> Result<(Vec<IndexEntry>, Vec<usize>), IndexError> {
+        let mut seen: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let mut hits: Vec<usize> = Vec::new();
+        for (i, idx) in self.indices.iter().enumerate() {
+            let entries = idx.iter_prefix(prefixes)?;
+            let mut hit = false;
+            for entry in entries {
+                if seen.insert(entry.0.clone()) {
+                    out.push(entry);
+                    hit = true;
+                }
+            }
+            if hit {
+                hits.push(i);
+            }
+        }
+        Ok((out, hits))
+    }
+
+    /// Find the complete ancestry for `keys`. Returns `(parent_map,
+    /// missing_keys)`. Mirrors `CombinedGraphIndex.find_ancestry`.
+    pub fn find_ancestry(
+        &self,
+        keys: &[IndexKey],
+        ref_list_num: usize,
+    ) -> Result<
+        (
+            HashMap<IndexKey, Vec<IndexKey>>,
+            std::collections::HashSet<IndexKey>,
+        ),
+        IndexError,
+    > {
+        let mut parent_map: HashMap<IndexKey, Vec<IndexKey>> = HashMap::new();
+        let mut missing_keys: std::collections::HashSet<IndexKey> =
+            std::collections::HashSet::new();
+        let mut keys_to_lookup: std::collections::HashSet<IndexKey> =
+            keys.iter().cloned().collect();
+        while !keys_to_lookup.is_empty() {
+            let mut all_index_missing: Option<std::collections::HashSet<IndexKey>> = None;
+            // The next index searches for what the previous one failed
+            // to find — so reduce keys_to_lookup at each step.
+            let mut current = keys_to_lookup.clone();
+            for idx in &self.indices {
+                let mut index_missing: std::collections::HashSet<IndexKey> =
+                    std::collections::HashSet::new();
+                let snapshot: Vec<IndexKey> = current.iter().cloned().collect();
+                let mut search_keys = snapshot;
+                while !search_keys.is_empty() {
+                    let new_search = idx.find_ancestors(
+                        &search_keys,
+                        ref_list_num,
+                        &mut parent_map,
+                        &mut index_missing,
+                    )?;
+                    search_keys = new_search.into_iter().collect();
+                }
+                match all_index_missing.as_mut() {
+                    None => {
+                        all_index_missing = Some(index_missing.clone());
+                    }
+                    Some(prev) => {
+                        prev.retain(|k| index_missing.contains(k));
+                    }
+                }
+                current = index_missing;
+                if current.is_empty() {
+                    break;
+                }
+            }
+            match all_index_missing {
+                None => {
+                    // No indices: everything we asked for is missing.
+                    missing_keys.extend(current);
+                    break;
+                }
+                Some(s) => {
+                    missing_keys.extend(s.iter().cloned());
+                    keys_to_lookup = current.difference(&s).cloned().collect();
+                }
+            }
+        }
+        Ok((parent_map, missing_keys))
+    }
+
+    /// Get the parent map for the given keys, mirroring
+    /// `CombinedGraphIndex.get_parent_map`. `null_revision` is the
+    /// project's `NULL_REVISION` constant — passed in so the pure
+    /// crate stays unaware of revision-specific semantics.
+    pub fn get_parent_map(
+        &self,
+        keys: &[IndexKey],
+        null_revision: &IndexKey,
+    ) -> Result<HashMap<IndexKey, Vec<IndexKey>>, IndexError> {
+        let mut search_keys: Vec<IndexKey> = keys.to_vec();
+        let mut found_parents: HashMap<IndexKey, Vec<IndexKey>> = HashMap::new();
+        if let Some(pos) = search_keys.iter().position(|k| k == null_revision) {
+            search_keys.remove(pos);
+            found_parents.insert(null_revision.clone(), Vec::new());
+        }
+        for (key, _value, refs) in self.iter(&search_keys)? {
+            let parents = refs.first().cloned().unwrap_or_default();
+            if parents.is_empty() {
+                found_parents.insert(key, vec![null_revision.clone()]);
+            } else {
+                found_parents.insert(key, parents);
+            }
+        }
+        Ok(found_parents)
+    }
+}
+
+impl IndexLike for CombinedGraphIndex {
+    fn key_count(&self) -> Result<usize, IndexError> {
+        let mut total = 0;
+        for idx in &self.indices {
+            total += idx.key_count()?;
+        }
+        Ok(total)
+    }
+
+    fn node_ref_lists(&self) -> Result<usize, IndexError> {
+        // Combined inherits the first index's setting.
+        if let Some(first) = self.indices.first() {
+            first.node_ref_lists()
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn iter_all(&self) -> Result<Vec<IndexEntry>, IndexError> {
+        let mut seen: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for idx in &self.indices {
+            for entry in idx.iter_all()? {
+                if seen.insert(entry.0.clone()) {
+                    out.push(entry);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn iter(&self, keys: &[IndexKey]) -> Result<Vec<IndexEntry>, IndexError> {
+        let mut remaining: std::collections::HashSet<IndexKey> = keys.iter().cloned().collect();
+        let mut out = Vec::new();
+        for idx in &self.indices {
+            if remaining.is_empty() {
+                break;
+            }
+            let snapshot: Vec<IndexKey> = remaining.iter().cloned().collect();
+            for entry in idx.iter(&snapshot)? {
+                if remaining.remove(&entry.0) {
+                    out.push(entry);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn iter_prefix(&self, prefixes: &[KeyPrefix]) -> Result<Vec<IndexEntry>, IndexError> {
+        let mut seen: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for idx in &self.indices {
+            for entry in idx.iter_prefix(prefixes)? {
+                if seen.insert(entry.0.clone()) {
+                    out.push(entry);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn external_refs(
+        &self,
+        ref_list_num: usize,
+    ) -> Result<std::collections::HashSet<IndexKey>, IndexError> {
+        let mut refs = std::collections::HashSet::new();
+        for idx in &self.indices {
+            refs.extend(idx.external_refs(ref_list_num)?);
+        }
+        Ok(refs)
+    }
+
+    fn validate(&self) -> Result<(), IndexError> {
+        for idx in &self.indices {
+            idx.validate()?;
+        }
+        Ok(())
+    }
+
+    fn clear_cache(&self) {
+        for idx in &self.indices {
+            idx.clear_cache();
+        }
+    }
+}
+
+/// An adapter that prefixes/un-prefixes every key passed through to a
+/// wrapped index. Mirrors `GraphIndexPrefixAdapter`.
+pub struct GraphIndexPrefixAdapter<I: IndexLike> {
+    inner: I,
+    prefix: IndexKey,
+    /// `prefix.len()` cached.
+    prefix_len: usize,
+    /// `prefix + (None,) * missing_key_length` — used for prefix
+    /// queries against the inner index.
+    prefix_query: KeyPrefix,
+}
+
+impl<I: IndexLike> GraphIndexPrefixAdapter<I> {
+    pub fn new(inner: I, prefix: IndexKey, missing_key_length: usize) -> Self {
+        let prefix_len = prefix.len();
+        let mut prefix_query: KeyPrefix = prefix.iter().cloned().map(Some).collect();
+        for _ in 0..missing_key_length {
+            prefix_query.push(None);
+        }
+        Self {
+            inner,
+            prefix,
+            prefix_len,
+            prefix_query,
+        }
+    }
+
+    fn extend_key(&self, key: &IndexKey) -> IndexKey {
+        let mut full = self.prefix.clone();
+        full.extend(key.iter().cloned());
+        full
+    }
+
+    fn strip_entry(&self, entry: IndexEntry) -> Result<IndexEntry, IndexError> {
+        let (key, value, refs) = entry;
+        if key.len() < self.prefix_len {
+            return Err(IndexError::BadIndexData);
+        }
+        for (a, b) in self.prefix.iter().zip(key.iter()) {
+            if a != b {
+                return Err(IndexError::BadIndexData);
+            }
+        }
+        let stripped_key: IndexKey = key[self.prefix_len..].to_vec();
+        let mut stripped_refs: Vec<Vec<IndexKey>> = Vec::with_capacity(refs.len());
+        for ref_list in refs {
+            let mut new_list: Vec<IndexKey> = Vec::with_capacity(ref_list.len());
+            for ref_key in ref_list {
+                if ref_key.len() < self.prefix_len {
+                    return Err(IndexError::BadIndexData);
+                }
+                for (a, b) in self.prefix.iter().zip(ref_key.iter()) {
+                    if a != b {
+                        return Err(IndexError::BadIndexData);
+                    }
+                }
+                new_list.push(ref_key[self.prefix_len..].to_vec());
+            }
+            stripped_refs.push(new_list);
+        }
+        Ok((stripped_key, value, stripped_refs))
+    }
+}
+
+impl<I: IndexLike> IndexLike for GraphIndexPrefixAdapter<I> {
+    fn key_count(&self) -> Result<usize, IndexError> {
+        Ok(self.iter_all()?.len())
+    }
+
+    fn node_ref_lists(&self) -> Result<usize, IndexError> {
+        self.inner.node_ref_lists()
+    }
+
+    fn iter_all(&self) -> Result<Vec<IndexEntry>, IndexError> {
+        let inner_entries = self.inner.iter_prefix(&[self.prefix_query.clone()])?;
+        let mut out = Vec::with_capacity(inner_entries.len());
+        for e in inner_entries {
+            out.push(self.strip_entry(e)?);
+        }
+        Ok(out)
+    }
+
+    fn iter(&self, keys: &[IndexKey]) -> Result<Vec<IndexEntry>, IndexError> {
+        let extended: Vec<IndexKey> = keys.iter().map(|k| self.extend_key(k)).collect();
+        let inner_entries = self.inner.iter(&extended)?;
+        let mut out = Vec::with_capacity(inner_entries.len());
+        for e in inner_entries {
+            out.push(self.strip_entry(e)?);
+        }
+        Ok(out)
+    }
+
+    fn iter_prefix(&self, prefixes: &[KeyPrefix]) -> Result<Vec<IndexEntry>, IndexError> {
+        let extended: Vec<KeyPrefix> = prefixes
+            .iter()
+            .map(|p| {
+                let mut full: KeyPrefix = self.prefix.iter().cloned().map(Some).collect();
+                full.extend(p.iter().cloned());
+                full
+            })
+            .collect();
+        let inner_entries = self.inner.iter_prefix(&extended)?;
+        let mut out = Vec::with_capacity(inner_entries.len());
+        for e in inner_entries {
+            out.push(self.strip_entry(e)?);
+        }
+        Ok(out)
+    }
+
+    fn external_refs(
+        &self,
+        _ref_list_num: usize,
+    ) -> Result<std::collections::HashSet<IndexKey>, IndexError> {
+        // Prefix adapter inherits the inner index's external refs but
+        // they would need stripping; not exercised by tests.
+        Ok(std::collections::HashSet::new())
+    }
+
+    fn validate(&self) -> Result<(), IndexError> {
+        self.inner.validate()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2239,6 +3154,98 @@ mod tests {
     fn value_is_valid_rejects_newline_or_null() {
         assert!(!value_is_valid(b"has\nnewline"));
         assert!(!value_is_valid(b"has\0null"));
+    }
+
+    #[test]
+    fn builder_add_node_and_finish_roundtrip() {
+        let mut b = GraphIndexBuilder::new(0, 1);
+        b.add_node(key(&[b"a"]), b"v1".to_vec(), vec![]).unwrap();
+        b.add_node(key(&[b"b"]), b"v2".to_vec(), vec![]).unwrap();
+        assert_eq!(b.key_count(), 2);
+        let bytes = b.finish().unwrap();
+        let (header, parsed) = parse_full(&bytes).unwrap();
+        assert_eq!(header.key_count, 2);
+        assert_eq!(parsed.get(&key(&[b"a"])), Some(&(b"v1".to_vec(), vec![])));
+    }
+
+    #[test]
+    fn builder_rejects_duplicate_key() {
+        let mut b = GraphIndexBuilder::new(0, 1);
+        b.add_node(key(&[b"a"]), b"v1".to_vec(), vec![]).unwrap();
+        let err = b
+            .add_node(key(&[b"a"]), b"v2".to_vec(), vec![])
+            .unwrap_err();
+        assert!(matches!(err, IndexError::DuplicateKey(_)));
+    }
+
+    #[test]
+    fn builder_rejects_bad_key() {
+        let mut b = GraphIndexBuilder::new(0, 1);
+        let err = b
+            .add_node(key(&[b"with space"]), b"v".to_vec(), vec![])
+            .unwrap_err();
+        assert!(matches!(err, IndexError::BadKey(_)));
+    }
+
+    #[test]
+    fn builder_records_absent_references() {
+        let mut b = GraphIndexBuilder::new(1, 1);
+        b.add_node(key(&[b"a"]), b"v".to_vec(), vec![vec![key(&[b"missing"])]])
+            .unwrap();
+        assert_eq!(b.key_count(), 1);
+        // The absent reference is in the table but flagged absent.
+        assert!(b.nodes().contains_key(&key(&[b"missing"])));
+        assert!(b.nodes().get(&key(&[b"missing"])).unwrap().absent);
+    }
+
+    #[test]
+    fn builder_external_references_returns_unresolved_second_refs() {
+        let mut b = GraphIndexBuilder::new(2, 1);
+        b.add_node(
+            key(&[b"a"]),
+            b"v".to_vec(),
+            vec![vec![], vec![key(&[b"parent1"]), key(&[b"a"])]],
+        )
+        .unwrap();
+        let refs = b.external_references();
+        assert!(refs.contains(&key(&[b"parent1"])));
+        // `a` itself is present (just added).
+        assert!(!refs.contains(&key(&[b"a"])));
+    }
+
+    #[test]
+    fn combined_iter_dedups_keys() {
+        let mut b1 = GraphIndexBuilder::new(0, 1);
+        b1.add_node(key(&[b"a"]), b"v-from-1".to_vec(), vec![])
+            .unwrap();
+        let mut b2 = GraphIndexBuilder::new(0, 1);
+        b2.add_node(key(&[b"a"]), b"v-from-2".to_vec(), vec![])
+            .unwrap();
+        b2.add_node(key(&[b"b"]), b"vb".to_vec(), vec![]).unwrap();
+        let combined = CombinedGraphIndex::from_indices(vec![Box::new(b1), Box::new(b2)]);
+        let mut all = combined.iter_all().unwrap();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(all.len(), 2);
+        // First index wins for duplicates.
+        assert_eq!(all[0].1, b"v-from-1".to_vec());
+    }
+
+    #[test]
+    fn prefix_adapter_strips_keys_and_refs() {
+        let mut b = GraphIndexBuilder::new(1, 2);
+        b.add_node(
+            key(&[b"prefix", b"k1"]),
+            b"v1".to_vec(),
+            vec![vec![key(&[b"prefix", b"k2"])]],
+        )
+        .unwrap();
+        b.add_node(key(&[b"prefix", b"k2"]), b"v2".to_vec(), vec![vec![]])
+            .unwrap();
+        let adapter = GraphIndexPrefixAdapter::new(b, key(&[b"prefix"]), 1);
+        let mut entries = adapter.iter_all().unwrap();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(entries[0].0, key(&[b"k1"]));
+        assert_eq!(entries[0].2, vec![vec![key(&[b"k2"])]]);
     }
 
     #[test]

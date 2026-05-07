@@ -1,7 +1,9 @@
 use bazaar::index::{
     key_is_valid, parse_full, parse_header, parse_lines, serialize_graph_index, value_is_valid,
-    GraphIndex as RsGraphIndex, IndexEntry, IndexError, IndexHeader, IndexKey, IndexNode,
-    IndexTransport, KeyPrefix, ParsedLines, ParsedRangeMap as RsParsedRangeMap, RawNode,
+    BuilderNode, CombinedGraphIndex as RsCombinedGraphIndex, GraphIndex as RsGraphIndex,
+    GraphIndexBuilder as RsGraphIndexBuilder, GraphIndexPrefixAdapter as RsGraphIndexPrefixAdapter,
+    IndexEntry, IndexError, IndexHeader, IndexKey, IndexLike, IndexNode, IndexTransport, KeyPrefix,
+    ParsedLines, ParsedRangeMap as RsParsedRangeMap, RawNode,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::import_exception;
@@ -21,7 +23,21 @@ fn index_err_to_py(err: IndexError) -> PyErr {
         IndexError::BadSignature => BadIndexFormatSignature::new_err(("", "GraphIndex")),
         IndexError::BadOptions => BadIndexOptions::new_err(("",)),
         IndexError::BadLineData => BadIndexData::new_err(("",)),
+        IndexError::BadIndexData => BadIndexData::new_err(("",)),
         IndexError::Other(msg) if msg.starts_with("BadIndexData") => BadIndexData::new_err((msg,)),
+        IndexError::BadKey(k) => Python::attach(|py| {
+            let py_key = key_to_py(py, &k)
+                .map(|t| t.unbind().into_any())
+                .unwrap_or_else(|_| py.None());
+            BadIndexKey::new_err((py_key,))
+        }),
+        IndexError::BadValue(msg) => BadIndexValue::new_err((msg,)),
+        IndexError::DuplicateKey(k) => Python::attach(|py| {
+            let py_key = key_to_py(py, &k)
+                .map(|t| t.unbind().into_any())
+                .unwrap_or_else(|_| py.None());
+            BadIndexDuplicateKey::new_err((py_key, py.None()))
+        }),
         other => BzrFormatsError::new_err(other.to_string()),
     }
 }
@@ -510,6 +526,1428 @@ impl PyParsedRangeMap {
     }
 }
 
+/// Helper: extract a `Vec<Vec<IndexKey>>` from a Python iterable of
+/// iterables of key tuples.
+fn extract_references(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<IndexKey>>> {
+    let mut out = Vec::new();
+    for ref_list_obj in obj.try_iter()? {
+        let ref_list_obj = ref_list_obj?;
+        let mut list = Vec::new();
+        for ref_obj in ref_list_obj.try_iter()? {
+            list.push(extract_key(&ref_obj?)?);
+        }
+        out.push(list);
+    }
+    Ok(out)
+}
+
+/// Helper: turn a list of `IndexEntry` into a Python list of tuples
+/// `(self, key, value[, refs])`.
+fn entries_to_pylist<'py>(
+    py: Python<'py>,
+    self_obj: Bound<'py, PyAny>,
+    entries: &[IndexEntry],
+    has_refs: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for (key, value, refs) in entries {
+        let key_t = key_to_py(py, key)?;
+        let value_b = PyBytes::new(py, value);
+        if has_refs {
+            let mut ref_tuples: Vec<Bound<PyTuple>> = Vec::with_capacity(refs.len());
+            for inner in refs {
+                let key_tuples: Vec<Bound<PyTuple>> = inner
+                    .iter()
+                    .map(|k| key_to_py(py, k))
+                    .collect::<PyResult<_>>()?;
+                ref_tuples.push(PyTuple::new(py, key_tuples)?);
+            }
+            let refs_tuple = PyTuple::new(py, ref_tuples)?;
+            out.append(PyTuple::new(
+                py,
+                [
+                    self_obj.clone(),
+                    key_t.into_any(),
+                    value_b.into_any(),
+                    refs_tuple.into_any(),
+                ],
+            )?)?;
+        } else {
+            out.append(PyTuple::new(
+                py,
+                [self_obj.clone(), key_t.into_any(), value_b.into_any()],
+            )?)?;
+        }
+    }
+    Ok(out)
+}
+
+/// pyo3-exposed builder. Owns a Rust `GraphIndexBuilder`; subclassable
+/// so Python subclasses (BTreeBuilder, InMemoryGraphIndex) can extend
+/// it.
+#[pyclass(name = "GraphIndexBuilder", subclass)]
+struct PyGraphIndexBuilder {
+    inner: std::sync::Mutex<RsGraphIndexBuilder>,
+}
+
+#[pymethods]
+impl PyGraphIndexBuilder {
+    #[new]
+    #[pyo3(signature = (reference_lists = 0, key_elements = 1))]
+    fn new(reference_lists: usize, key_elements: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(RsGraphIndexBuilder::new(reference_lists, key_elements)),
+        }
+    }
+
+    #[getter]
+    fn reference_lists(&self) -> usize {
+        self.inner.lock().unwrap().reference_lists()
+    }
+
+    #[getter]
+    fn _key_length(&self) -> usize {
+        self.inner.lock().unwrap().key_length()
+    }
+
+    #[getter]
+    fn _optimize_for_size(&self) -> bool {
+        self.inner.lock().unwrap().optimize_for_size()
+    }
+
+    #[getter]
+    fn _combine_backing_indices(&self) -> bool {
+        self.inner.lock().unwrap().combine_backing_indices()
+    }
+
+    /// Add a node with `key`, `value`, and optional references.
+    #[pyo3(signature = (key, value, references = None))]
+    fn add_node(
+        &self,
+        key: Bound<'_, PyAny>,
+        value: Bound<'_, PyBytes>,
+        references: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let key_tuple = key
+            .cast::<PyTuple>()
+            .map_err(|_| BadIndexKey::new_err((key.clone().unbind(),)))?;
+        let key_rs = extract_key(key_tuple.as_any())
+            .map_err(|_| BadIndexKey::new_err((key_tuple.clone().unbind(),)))?;
+        let refs_rs = match references {
+            Some(r) => extract_references(&r)
+                .map_err(|_| BadIndexKey::new_err((key_tuple.clone().unbind(),)))?,
+            None => Vec::new(),
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .add_node(key_rs, value.as_bytes().to_vec(), refs_rs)
+            .map_err(index_err_to_py)
+    }
+
+    fn clear_cache(&self) {}
+
+    /// Serialise the index. Returns a `BytesIO` containing the bytes
+    /// (matching the Python original).
+    fn finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let bytes = self
+            .inner
+            .lock()
+            .unwrap()
+            .finish()
+            .map_err(index_err_to_py)?;
+        let io = py.import("io")?;
+        let bytes_io = io.getattr("BytesIO")?;
+        bytes_io.call1((PyBytes::new(py, &bytes),))
+    }
+
+    #[pyo3(signature = (for_size = None, combine_backing_indices = None))]
+    fn set_optimize(
+        &self,
+        for_size: Option<bool>,
+        combine_backing_indices: Option<bool>,
+    ) -> PyResult<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_optimize(for_size, combine_backing_indices);
+        Ok(())
+    }
+
+    fn _external_references<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PySet>> {
+        let refs = self.inner.lock().unwrap().external_references();
+        let set = pyo3::types::PySet::empty(py)?;
+        for r in refs {
+            set.add(key_to_py(py, &r)?)?;
+        }
+        Ok(set)
+    }
+
+    fn key_count(&self) -> usize {
+        self.inner.lock().unwrap().key_count()
+    }
+
+    fn validate(&self) -> PyResult<()> {
+        self.inner.lock().unwrap();
+        Ok(())
+    }
+
+    fn iter_all_entries<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let (entries, has_refs) = {
+            let r = slf.borrow();
+            let g = r.inner.lock().unwrap();
+            (
+                g.iter_all_entries().collect::<Vec<_>>(),
+                g.reference_lists() > 0,
+            )
+        };
+        entries_to_pylist(py, slf.into_any(), &entries, has_refs)
+    }
+
+    fn iter_entries<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let mut requested: Vec<IndexKey> = Vec::new();
+        for k in keys.try_iter()? {
+            requested.push(extract_key(&k?)?);
+        }
+        let (entries, has_refs) = {
+            let r = slf.borrow();
+            let g = r.inner.lock().unwrap();
+            (
+                g.iter_entries(requested).collect::<Vec<_>>(),
+                g.reference_lists() > 0,
+            )
+        };
+        entries_to_pylist(py, slf.into_any(), &entries, has_refs)
+    }
+
+    fn iter_entries_prefix<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let mut prefixes: Vec<KeyPrefix> = Vec::new();
+        for k in keys.try_iter()? {
+            prefixes.push(extract_prefix(&k?)?);
+        }
+        if prefixes.is_empty() {
+            return Ok(PyList::empty(py));
+        }
+        let (entries, has_refs) = {
+            let r = slf.borrow();
+            let g = r.inner.lock().unwrap();
+            let entries = g.iter_entries_prefix(&prefixes).map_err(|e| match e {
+                IndexError::BadKey(k) => Python::attach(|py| {
+                    let py_key = key_to_py(py, &k)
+                        .map(|t| t.unbind().into_any())
+                        .unwrap_or_else(|_| py.None());
+                    BadIndexKey::new_err((py_key,))
+                }),
+                other => index_err_to_py(other),
+            })?;
+            (entries, g.reference_lists() > 0)
+        };
+        entries_to_pylist(py, slf.into_any(), &entries, has_refs)
+    }
+
+    fn find_ancestry<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+        ref_list_num: usize,
+    ) -> PyResult<(Bound<'py, PyDict>, Bound<'py, pyo3::types::PySet>)> {
+        let mut keys_rs: Vec<IndexKey> = Vec::new();
+        for k in keys.try_iter()? {
+            keys_rs.push(extract_key(&k?)?);
+        }
+        let (parent_map, missing) = self
+            .inner
+            .lock()
+            .unwrap()
+            .find_ancestry(&keys_rs, ref_list_num)
+            .map_err(index_err_to_py)?;
+        let pm = PyDict::new(py);
+        for (k, parents) in &parent_map {
+            let key_t = key_to_py(py, k)?;
+            let parent_tuples: Vec<Bound<PyTuple>> = parents
+                .iter()
+                .map(|p| key_to_py(py, p))
+                .collect::<PyResult<_>>()?;
+            pm.set_item(key_t, PyTuple::new(py, parent_tuples)?)?;
+        }
+        let mset = pyo3::types::PySet::empty(py)?;
+        for k in &missing {
+            mset.add(key_to_py(py, k)?)?;
+        }
+        Ok((pm, mset))
+    }
+
+    /// Single-step of the ancestry walk used by
+    /// `CombinedGraphIndex.find_ancestry`. Each call processes
+    /// `search_keys`, populating `parent_map` with `key -> parent_keys`
+    /// for found entries and adding the unfound keys to
+    /// `index_missing_keys`. Returns the parent keys not already in
+    /// `parent_map`, ready for the next iteration.
+    fn _find_ancestors<'py>(
+        &self,
+        py: Python<'py>,
+        search_keys: Bound<'py, PyAny>,
+        ref_list_num: usize,
+        parent_map: Bound<'py, PyDict>,
+        index_missing_keys: Bound<'py, pyo3::types::PySet>,
+    ) -> PyResult<Bound<'py, pyo3::types::PySet>> {
+        let mut keys_rs: Vec<IndexKey> = Vec::new();
+        for k in search_keys.try_iter()? {
+            keys_rs.push(extract_key(&k?)?);
+        }
+        let mut parent_map_rs: std::collections::HashMap<IndexKey, Vec<IndexKey>> =
+            std::collections::HashMap::new();
+        let mut missing_rs: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        let new_search = self
+            .inner
+            .lock()
+            .unwrap()
+            .find_ancestors(&keys_rs, ref_list_num, &mut parent_map_rs, &mut missing_rs)
+            .map_err(index_err_to_py)?;
+        // Merge into Python parent_map.
+        for (k, parents) in &parent_map_rs {
+            let key_t = key_to_py(py, k)?;
+            let parent_tuples: Vec<Bound<PyTuple>> = parents
+                .iter()
+                .map(|p| key_to_py(py, p))
+                .collect::<PyResult<_>>()?;
+            parent_map.set_item(key_t, PyTuple::new(py, parent_tuples)?)?;
+        }
+        for k in &missing_rs {
+            index_missing_keys.add(key_to_py(py, k)?)?;
+        }
+        let out = pyo3::types::PySet::empty(py)?;
+        for k in &new_search {
+            out.add(key_to_py(py, k)?)?;
+        }
+        Ok(out)
+    }
+}
+
+/// pyo3-exposed in-memory index. Subclasses `GraphIndexBuilder` with
+/// `add_nodes`, `__lt__`, and an alternative `validate` (which is a
+/// no-op for in-memory data).
+#[pyclass(name = "InMemoryGraphIndex", extends = PyGraphIndexBuilder, subclass)]
+struct PyInMemoryGraphIndex;
+
+#[pymethods]
+impl PyInMemoryGraphIndex {
+    #[new]
+    #[pyo3(signature = (reference_lists = 0, key_elements = 1))]
+    fn new(reference_lists: usize, key_elements: usize) -> (Self, PyGraphIndexBuilder) {
+        (
+            PyInMemoryGraphIndex,
+            PyGraphIndexBuilder {
+                inner: std::sync::Mutex::new(RsGraphIndexBuilder::new(
+                    reference_lists,
+                    key_elements,
+                )),
+            },
+        )
+    }
+
+    /// `add_nodes` accepts an iterable of either 2- or 3-tuples
+    /// matching the `iter_all_entries` shape.
+    fn add_nodes(slf: Bound<'_, Self>, nodes: Bound<'_, PyAny>) -> PyResult<()> {
+        let parent = slf.into_super();
+        let has_refs = parent.borrow().inner.lock().unwrap().reference_lists() > 0;
+        for node in nodes.try_iter()? {
+            let node = node?;
+            let tup = node
+                .cast::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("node must be a tuple"))?;
+            if has_refs {
+                if tup.len() != 3 {
+                    return Err(PyTypeError::new_err(
+                        "node must be a 3-tuple when reference_lists > 0",
+                    ));
+                }
+                let key = tup.get_item(0)?;
+                let value = tup.get_item(1)?;
+                let refs = tup.get_item(2)?;
+                let value_b = value
+                    .cast_into::<PyBytes>()
+                    .map_err(|_| PyTypeError::new_err("value must be bytes"))?;
+                parent.borrow().add_node(key, value_b, Some(refs))?;
+            } else {
+                if tup.len() != 2 {
+                    return Err(PyTypeError::new_err(
+                        "node must be a 2-tuple when reference_lists == 0",
+                    ));
+                }
+                let key = tup.get_item(0)?;
+                let value = tup.get_item(1)?;
+                let value_b = value
+                    .cast_into::<PyBytes>()
+                    .map_err(|_| PyTypeError::new_err("value must be bytes"))?;
+                parent.borrow().add_node(key, value_b, None)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Adapts a Python index object (anything with the public
+/// `key_count`/`iter_*`/etc. methods) to the pure-Rust [`IndexLike`]
+/// trait, by calling Python methods and marshalling results.
+struct PyIndexAdapter {
+    obj: Py<PyAny>,
+}
+
+impl PyIndexAdapter {
+    fn new(obj: Py<PyAny>) -> Self {
+        Self { obj }
+    }
+}
+
+fn extract_entry(item: Bound<'_, PyAny>) -> Result<IndexEntry, IndexError> {
+    let tup = item
+        .cast_into::<PyTuple>()
+        .map_err(|_| IndexError::Other("entry must be a tuple".to_string()))?;
+    let key_obj = tup
+        .get_item(1)
+        .map_err(|e| IndexError::Other(e.to_string()))?;
+    let key_tuple = key_obj
+        .cast_into::<PyTuple>()
+        .map_err(|_| IndexError::Other("entry key must be a tuple".to_string()))?;
+    let key = extract_key(key_tuple.as_any()).map_err(|e| IndexError::Other(e.to_string()))?;
+    let value_obj = tup
+        .get_item(2)
+        .map_err(|e| IndexError::Other(e.to_string()))?;
+    let value = value_obj
+        .cast_into::<PyBytes>()
+        .map_err(|_| IndexError::Other("entry value must be bytes".to_string()))?
+        .as_bytes()
+        .to_vec();
+    let refs: Vec<Vec<IndexKey>> = if tup.len() >= 4 {
+        let refs_obj = tup
+            .get_item(3)
+            .map_err(|e| IndexError::Other(e.to_string()))?;
+        let mut out = Vec::new();
+        for ref_list_obj in refs_obj
+            .try_iter()
+            .map_err(|e| IndexError::Other(e.to_string()))?
+        {
+            let ref_list_obj = ref_list_obj.map_err(|e| IndexError::Other(e.to_string()))?;
+            let mut list = Vec::new();
+            for ref_obj in ref_list_obj
+                .try_iter()
+                .map_err(|e| IndexError::Other(e.to_string()))?
+            {
+                let ref_obj = ref_obj.map_err(|e| IndexError::Other(e.to_string()))?;
+                let ref_tuple = ref_obj
+                    .cast_into::<PyTuple>()
+                    .map_err(|_| IndexError::Other("ref must be a tuple".to_string()))?;
+                list.push(
+                    extract_key(ref_tuple.as_any())
+                        .map_err(|e| IndexError::Other(e.to_string()))?,
+                );
+            }
+            out.push(list);
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    Ok((key, value, refs))
+}
+
+impl IndexLike for PyIndexAdapter {
+    fn key_count(&self) -> Result<usize, IndexError> {
+        Python::attach(|py| {
+            let result = self
+                .obj
+                .bind(py)
+                .call_method0("key_count")
+                .map_err(stash_py_err)?;
+            result
+                .extract::<usize>()
+                .map_err(|e| IndexError::Other(e.to_string()))
+        })
+    }
+
+    fn node_ref_lists(&self) -> Result<usize, IndexError> {
+        Python::attach(|py| {
+            let result = self
+                .obj
+                .bind(py)
+                .getattr("node_ref_lists")
+                .map_err(stash_py_err)?;
+            result
+                .extract::<usize>()
+                .map_err(|e| IndexError::Other(e.to_string()))
+        })
+    }
+
+    fn iter_all(&self) -> Result<Vec<IndexEntry>, IndexError> {
+        Python::attach(|py| {
+            let result = self
+                .obj
+                .bind(py)
+                .call_method0("iter_all_entries")
+                .map_err(stash_py_err)?;
+            let mut out = Vec::new();
+            for item in result.try_iter().map_err(stash_py_err)? {
+                out.push(extract_entry(item.map_err(stash_py_err)?)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn iter(&self, keys: &[IndexKey]) -> Result<Vec<IndexEntry>, IndexError> {
+        Python::attach(|py| {
+            let py_keys = PyList::empty(py);
+            for k in keys {
+                py_keys
+                    .append(key_to_py(py, k).map_err(stash_py_err)?)
+                    .map_err(stash_py_err)?;
+            }
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("iter_entries", (py_keys,))
+                .map_err(stash_py_err)?;
+            let mut out = Vec::new();
+            for item in result.try_iter().map_err(stash_py_err)? {
+                out.push(extract_entry(item.map_err(stash_py_err)?)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn iter_prefix(&self, prefixes: &[KeyPrefix]) -> Result<Vec<IndexEntry>, IndexError> {
+        Python::attach(|py| {
+            let py_prefixes = PyList::empty(py);
+            for p in prefixes {
+                let parts: Vec<Bound<PyAny>> = p
+                    .iter()
+                    .map(|e| match e {
+                        Some(b) => PyBytes::new(py, b).into_any(),
+                        None => py.None().into_bound(py),
+                    })
+                    .collect();
+                py_prefixes
+                    .append(PyTuple::new(py, parts).map_err(stash_py_err)?)
+                    .map_err(stash_py_err)?;
+            }
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("iter_entries_prefix", (py_prefixes,))
+                .map_err(stash_py_err)?;
+            let mut out = Vec::new();
+            for item in result.try_iter().map_err(stash_py_err)? {
+                out.push(extract_entry(item.map_err(stash_py_err)?)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn external_refs(
+        &self,
+        ref_list_num: usize,
+    ) -> Result<std::collections::HashSet<IndexKey>, IndexError> {
+        Python::attach(|py| {
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("external_references", (ref_list_num,))
+                .map_err(stash_py_err)?;
+            let mut out = std::collections::HashSet::new();
+            for item in result.try_iter().map_err(stash_py_err)? {
+                let item = item.map_err(stash_py_err)?;
+                let key_tuple = item
+                    .cast_into::<PyTuple>()
+                    .map_err(|_| IndexError::Other("external ref must be a tuple".to_string()))?;
+                out.insert(
+                    extract_key(key_tuple.as_any())
+                        .map_err(|e| IndexError::Other(e.to_string()))?,
+                );
+            }
+            Ok(out)
+        })
+    }
+
+    fn validate(&self) -> Result<(), IndexError> {
+        Python::attach(|py| {
+            self.obj
+                .bind(py)
+                .call_method0("validate")
+                .map_err(stash_py_err)?;
+            Ok(())
+        })
+    }
+
+    fn clear_cache(&self) {
+        Python::attach(|py| {
+            let _ = self.obj.bind(py).call_method0("clear_cache");
+        });
+    }
+}
+
+/// pyo3-exposed combined index.
+///
+/// `_indices` is a real Python list so reload callbacks can do
+/// `idx._indices[:] = new_indices` in place. The orchestration
+/// (cross-index dedup, hit tracking, NoSuchFile reload) lives here
+/// so that the source-index reference in each yielded entry is
+/// preserved verbatim — pure-Rust consumers wanting equivalent
+/// orchestration over `Box<dyn IndexLike>` go through
+/// [`bazaar::index::CombinedGraphIndex`].
+#[pyclass(name = "CombinedGraphIndex", subclass)]
+struct PyCombinedGraphIndex {
+    indices_list: Py<PyList>,
+    index_names_list: Py<PyList>,
+    sibling_indices: std::sync::Mutex<Vec<Py<PyAny>>>,
+    reload_func: std::sync::Mutex<Option<Py<PyAny>>>,
+}
+
+#[pymethods]
+impl PyCombinedGraphIndex {
+    #[new]
+    #[pyo3(signature = (indices, reload_func = None))]
+    fn new(
+        py: Python<'_>,
+        indices: Bound<'_, PyAny>,
+        reload_func: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let indices_list = PyList::empty(py);
+        for idx in indices.try_iter()? {
+            indices_list.append(idx?)?;
+        }
+        let len = indices_list.len();
+        let names = PyList::empty(py);
+        for _ in 0..len {
+            names.append(py.None())?;
+        }
+        Ok(Self {
+            indices_list: indices_list.unbind(),
+            index_names_list: names.unbind(),
+            sibling_indices: std::sync::Mutex::new(Vec::new()),
+            reload_func: std::sync::Mutex::new(reload_func),
+        })
+    }
+
+    #[getter]
+    fn _indices<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
+        self.indices_list.bind(py).clone()
+    }
+
+    #[getter]
+    fn _index_names<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
+        self.index_names_list.bind(py).clone()
+    }
+
+    #[getter]
+    fn _sibling_indices<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
+        let guard = self.sibling_indices.lock().unwrap();
+        let list = PyList::empty(py);
+        for idx in guard.iter() {
+            list.append(idx.bind(py)).expect("PyList append");
+        }
+        list
+    }
+
+    #[getter]
+    fn _reload_func<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        let guard = self.reload_func.lock().unwrap();
+        match guard.as_ref() {
+            Some(f) => f.clone_ref(py),
+            None => py.None(),
+        }
+    }
+
+    #[setter]
+    fn set__reload_func(&self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        let mut guard = self.reload_func.lock().unwrap();
+        if value.is_none() {
+            *guard = None;
+        } else {
+            *guard = Some(value.unbind());
+        }
+        Ok(())
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let list = self.indices_list.bind(py);
+        let parts: Vec<String> = list
+            .iter()
+            .map(|i| {
+                i.repr()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| "<index>".to_string())
+            })
+            .collect();
+        Ok(format!("CombinedGraphIndex({})", parts.join(", ")))
+    }
+
+    fn clear_cache(&self, py: Python<'_>) -> PyResult<()> {
+        let list = self.indices_list.bind(py);
+        for idx in list.iter() {
+            idx.call_method0("clear_cache")?;
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (pos, index, name = None))]
+    fn insert_index(
+        &self,
+        py: Python<'_>,
+        pos: isize,
+        index: Py<PyAny>,
+        name: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let list = self.indices_list.bind(py);
+        let names = self.index_names_list.bind(py);
+        list.call_method1("insert", (pos, index))?;
+        let name_obj: Bound<'_, PyAny> = match name {
+            Some(n) => n.into_bound(py),
+            None => py.None().into_bound(py),
+        };
+        names.call_method1("insert", (pos, name_obj))?;
+        Ok(())
+    }
+
+    fn set_sibling_indices(&self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        let mut new_siblings: Vec<Py<PyAny>> = Vec::new();
+        for idx in value.try_iter()? {
+            new_siblings.push(idx?.unbind());
+        }
+        let mut guard = self.sibling_indices.lock().unwrap();
+        *guard = new_siblings;
+        Ok(())
+    }
+
+    /// Reorder this combined index by promoting indices whose name is
+    /// in `hit_names` to the front. Used by sibling propagation.
+    fn _move_to_front_by_name(&self, py: Python<'_>, hit_names: Bound<'_, PyAny>) -> PyResult<()> {
+        let names = self.index_names_list.bind(py);
+        let list = self.indices_list.bind(py);
+        // Build the hit_indices list by scanning current names.
+        let mut hits: Vec<Py<PyAny>> = Vec::new();
+        let hit_set = pyo3::types::PySet::empty(py)?;
+        for n in hit_names.try_iter()? {
+            hit_set.add(n?)?;
+        }
+        let len = names.len();
+        for i in 0..len {
+            let name = names.get_item(i)?;
+            if hit_set.contains(name)? {
+                hits.push(list.get_item(i)?.unbind());
+            }
+        }
+        let _ = self.move_to_front_by_index(py, &hits)?;
+        Ok(())
+    }
+
+    fn key_count(&self, py: Python<'_>) -> PyResult<usize> {
+        let no_such_file = py.import("bzrformats.transport")?.getattr("NoSuchFile")?;
+        loop {
+            let snapshot: Vec<Py<PyAny>> = {
+                let list = self.indices_list.bind(py);
+                list.iter().map(|i| i.unbind()).collect()
+            };
+            let mut total = 0usize;
+            let mut hit_no_such_file: Option<PyErr> = None;
+            for idx in &snapshot {
+                match idx.bind(py).call_method0("key_count") {
+                    Ok(v) => total += v.extract::<usize>()?,
+                    Err(e) => {
+                        if e.is_instance(py, &no_such_file) {
+                            hit_no_such_file = Some(e);
+                            break;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            match hit_no_such_file {
+                None => return Ok(total),
+                Some(e) => {
+                    if !self.try_reload(py)? {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn iter_all_entries<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let no_such_file = py.import("bzrformats.transport")?.getattr("NoSuchFile")?;
+        let r = slf.borrow();
+        let out = PyList::empty(py);
+        let seen = pyo3::types::PySet::empty(py)?;
+        loop {
+            let snapshot: Vec<Py<PyAny>> = {
+                let list = r.indices_list.bind(py);
+                list.iter().map(|i| i.unbind()).collect()
+            };
+            let mut err: Option<PyErr> = None;
+            'outer: for idx in &snapshot {
+                let entries = match idx.bind(py).call_method0("iter_all_entries") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if e.is_instance(py, &no_such_file) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                let iter = match entries.try_iter() {
+                    Ok(it) => it,
+                    Err(e) => {
+                        if e.is_instance(py, &no_such_file) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                for entry_res in iter {
+                    let entry = match entry_res {
+                        Ok(e) => e,
+                        Err(e) => {
+                            if e.is_instance(py, &no_such_file) {
+                                err = Some(e);
+                                break 'outer;
+                            }
+                            return Err(e);
+                        }
+                    };
+                    let key = entry.get_item(1)?;
+                    if !seen.contains(key.clone())? {
+                        seen.add(key)?;
+                        out.append(entry)?;
+                    }
+                }
+            }
+            match err {
+                None => return Ok(out),
+                Some(e) => {
+                    if !r.try_reload(py)? {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn iter_entries<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let no_such_file = py.import("bzrformats.transport")?.getattr("NoSuchFile")?;
+        let working_keys = pyo3::types::PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            working_keys.add(k?)?;
+        }
+        let r = slf.borrow();
+        let out = PyList::empty(py);
+        let mut hit_indices: Vec<Py<PyAny>> = Vec::new();
+        loop {
+            let snapshot: Vec<Py<PyAny>> = {
+                let list = r.indices_list.bind(py);
+                list.iter().map(|i| i.unbind()).collect()
+            };
+            let mut err: Option<PyErr> = None;
+            'outer: for idx in &snapshot {
+                if working_keys.is_empty() {
+                    break;
+                }
+                let entries = match idx
+                    .bind(py)
+                    .call_method1("iter_entries", (working_keys.clone(),))
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if e.is_instance(py, &no_such_file) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                let iter = match entries.try_iter() {
+                    Ok(it) => it,
+                    Err(e) => {
+                        if e.is_instance(py, &no_such_file) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                let mut index_hit = false;
+                for entry_res in iter {
+                    let entry = match entry_res {
+                        Ok(e) => e,
+                        Err(e) => {
+                            if e.is_instance(py, &no_such_file) {
+                                err = Some(e);
+                                break 'outer;
+                            }
+                            return Err(e);
+                        }
+                    };
+                    let key = entry.get_item(1)?;
+                    working_keys.discard(key)?;
+                    out.append(entry)?;
+                    index_hit = true;
+                }
+                if index_hit {
+                    hit_indices.push(idx.clone_ref(py));
+                }
+            }
+            match err {
+                None => {
+                    r.move_to_front(py, &hit_indices)?;
+                    return Ok(out);
+                }
+                Some(e) => {
+                    if !r.try_reload(py)? {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn iter_entries_prefix<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let no_such_file = py.import("bzrformats.transport")?.getattr("NoSuchFile")?;
+        let key_set = pyo3::types::PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            key_set.add(k?)?;
+        }
+        if key_set.is_empty() {
+            return Ok(PyList::empty(py));
+        }
+        let r = slf.borrow();
+        let out = PyList::empty(py);
+        let seen = pyo3::types::PySet::empty(py)?;
+        let mut hit_indices: Vec<Py<PyAny>> = Vec::new();
+        loop {
+            let snapshot: Vec<Py<PyAny>> = {
+                let list = r.indices_list.bind(py);
+                list.iter().map(|i| i.unbind()).collect()
+            };
+            let mut err: Option<PyErr> = None;
+            'outer: for idx in &snapshot {
+                let entries = match idx
+                    .bind(py)
+                    .call_method1("iter_entries_prefix", (key_set.clone(),))
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if e.is_instance(py, &no_such_file) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                let iter = match entries.try_iter() {
+                    Ok(it) => it,
+                    Err(e) => {
+                        if e.is_instance(py, &no_such_file) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                let mut index_hit = false;
+                for entry_res in iter {
+                    let entry = match entry_res {
+                        Ok(e) => e,
+                        Err(e) => {
+                            if e.is_instance(py, &no_such_file) {
+                                err = Some(e);
+                                break 'outer;
+                            }
+                            return Err(e);
+                        }
+                    };
+                    let key = entry.get_item(1)?;
+                    if seen.contains(key.clone())? {
+                        continue;
+                    }
+                    seen.add(key)?;
+                    out.append(entry)?;
+                    index_hit = true;
+                }
+                if index_hit {
+                    hit_indices.push(idx.clone_ref(py));
+                }
+            }
+            match err {
+                None => {
+                    r.move_to_front(py, &hit_indices)?;
+                    return Ok(out);
+                }
+                Some(e) => {
+                    if !r.try_reload(py)? {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate(&self, py: Python<'_>) -> PyResult<()> {
+        let no_such_file = py.import("bzrformats.transport")?.getattr("NoSuchFile")?;
+        loop {
+            let snapshot: Vec<Py<PyAny>> = {
+                let list = self.indices_list.bind(py);
+                list.iter().map(|i| i.unbind()).collect()
+            };
+            let mut err: Option<PyErr> = None;
+            for idx in &snapshot {
+                if let Err(e) = idx.bind(py).call_method0("validate") {
+                    if e.is_instance(py, &no_such_file) {
+                        err = Some(e);
+                        break;
+                    }
+                    return Err(e);
+                }
+            }
+            match err {
+                None => return Ok(()),
+                Some(e) => {
+                    if !self.try_reload(py)? {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn find_ancestry<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+        ref_list_num: usize,
+    ) -> PyResult<(Bound<'py, PyDict>, Bound<'py, pyo3::types::PySet>)> {
+        let parent_map = PyDict::new(py);
+        let missing = pyo3::types::PySet::empty(py)?;
+        let mut keys_to_lookup: Bound<'py, pyo3::types::PySet> = pyo3::types::PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            keys_to_lookup.add(k?)?;
+        }
+        loop {
+            if keys_to_lookup.is_empty() {
+                break;
+            }
+            let snapshot: Vec<Py<PyAny>> = {
+                let list = self.indices_list.bind(py);
+                list.iter().map(|i| i.unbind()).collect()
+            };
+            let mut all_index_missing: Option<Bound<'py, pyo3::types::PySet>> = None;
+            let mut current = keys_to_lookup
+                .call_method0("copy")?
+                .cast_into::<pyo3::types::PySet>()
+                .map_err(|_| PyTypeError::new_err("set.copy() returned non-set"))?;
+            for idx in &snapshot {
+                let index_missing = pyo3::types::PySet::empty(py)?;
+                let mut search_keys = current
+                    .call_method0("copy")?
+                    .cast_into::<pyo3::types::PySet>()
+                    .map_err(|_| PyTypeError::new_err("set.copy() returned non-set"))?;
+                while !search_keys.is_empty() {
+                    search_keys = idx
+                        .bind(py)
+                        .call_method1(
+                            "_find_ancestors",
+                            (
+                                search_keys,
+                                ref_list_num,
+                                parent_map.clone(),
+                                index_missing.clone(),
+                            ),
+                        )?
+                        .cast_into::<pyo3::types::PySet>()
+                        .map_err(|_| PyTypeError::new_err("_find_ancestors must return a set"))?;
+                }
+                match all_index_missing.as_ref() {
+                    None => {
+                        all_index_missing = Some(
+                            index_missing
+                                .call_method0("copy")?
+                                .cast_into::<pyo3::types::PySet>()
+                                .map_err(|_| PyTypeError::new_err("set.copy() returned non-set"))?,
+                        );
+                    }
+                    Some(prev) => {
+                        all_index_missing = Some(
+                            prev.call_method1("intersection", (index_missing.clone(),))?
+                                .cast_into::<pyo3::types::PySet>()
+                                .map_err(|_| PyTypeError::new_err("intersection"))?,
+                        );
+                    }
+                }
+                current = index_missing;
+                if current.is_empty() {
+                    break;
+                }
+            }
+            match all_index_missing {
+                None => {
+                    for k in current.iter() {
+                        missing.add(k)?;
+                    }
+                    break;
+                }
+                Some(s) => {
+                    for k in s.iter() {
+                        missing.add(k)?;
+                    }
+                    keys_to_lookup = current
+                        .call_method1("difference", (s,))?
+                        .cast_into::<pyo3::types::PySet>()
+                        .map_err(|_| PyTypeError::new_err("difference"))?;
+                }
+            }
+        }
+        Ok((parent_map, missing))
+    }
+
+    fn get_parent_map<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let revision = py.import("bzrformats.revision")?;
+        let null_revision = revision.getattr("NULL_REVISION")?;
+        let search_keys = pyo3::types::PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            search_keys.add(k?)?;
+        }
+        let found_parents = PyDict::new(py);
+        if search_keys.contains(null_revision.clone())? {
+            search_keys.discard(null_revision.clone())?;
+            found_parents.set_item(null_revision.clone(), PyList::empty(py))?;
+        }
+        let entries = Self::iter_entries(slf, py, search_keys.into_any())?;
+        for entry in entries.iter() {
+            let key = entry.get_item(1)?;
+            let refs = entry.get_item(3)?;
+            let parents = refs.get_item(0)?;
+            let parents_tuple = parents
+                .clone()
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("parents must be a tuple"))?;
+            if parents_tuple.is_empty() {
+                let nr_tuple = PyTuple::new(py, [null_revision.clone()])?;
+                found_parents.set_item(key, nr_tuple)?;
+            } else {
+                found_parents.set_item(key, parents)?;
+            }
+        }
+        Ok(found_parents)
+    }
+
+    fn __contains__(slf: Bound<'_, Self>, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<bool> {
+        let key_list = PyList::new(py, [key.clone()])?;
+        let pm = Self::get_parent_map(slf, py, key_list.into_any())?;
+        pm.contains(key)
+    }
+}
+
+impl PyCombinedGraphIndex {
+    fn try_reload(&self, py: Python<'_>) -> PyResult<bool> {
+        let func_clone = {
+            let guard = self.reload_func.lock().unwrap();
+            guard.as_ref().map(|f| f.clone_ref(py))
+        };
+        let func = match func_clone {
+            None => return Ok(false),
+            Some(f) => f,
+        };
+        let result = func.bind(py).call0()?;
+        result.is_truthy()
+    }
+
+    fn move_to_front(&self, py: Python<'_>, hits: &[Py<PyAny>]) -> PyResult<()> {
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let list = self.indices_list.bind(py);
+        // Already at front in the same order?
+        if hits.len() <= list.len() {
+            let mut all_match = true;
+            for (i, h) in hits.iter().enumerate() {
+                let cur = list.get_item(i)?;
+                if !h.bind(py).is(&cur) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if all_match {
+                return Ok(());
+            }
+        }
+        let hit_names = self.move_to_front_by_index(py, hits)?;
+        // Propagate to siblings.
+        let siblings: Vec<Py<PyAny>> = {
+            let guard = self.sibling_indices.lock().unwrap();
+            guard.iter().map(|s| s.clone_ref(py)).collect()
+        };
+        for sibling in &siblings {
+            sibling
+                .bind(py)
+                .call_method1("_move_to_front_by_name", (hit_names.clone(),))?;
+        }
+        Ok(())
+    }
+
+    fn move_to_front_by_index<'py>(
+        &self,
+        py: Python<'py>,
+        hits: &[Py<PyAny>],
+    ) -> PyResult<Bound<'py, PyList>> {
+        let list = self.indices_list.bind(py);
+        let names = self.index_names_list.bind(py);
+        let len = list.len();
+        let mut hit_positions: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut new_indices: Vec<Bound<'_, PyAny>> = Vec::with_capacity(len);
+        let mut new_names: Vec<Bound<'_, PyAny>> = Vec::with_capacity(len);
+        let hit_names = PyList::empty(py);
+        for h in hits {
+            for i in 0..len {
+                let item = list.get_item(i)?;
+                if h.bind(py).is(&item) {
+                    new_indices.push(item);
+                    let name = names.get_item(i)?;
+                    hit_names.append(name.clone())?;
+                    new_names.push(name);
+                    hit_positions.insert(i);
+                    break;
+                }
+            }
+        }
+        for i in 0..len {
+            if !hit_positions.contains(&i) {
+                new_indices.push(list.get_item(i)?);
+                new_names.push(names.get_item(i)?);
+            }
+        }
+        list.del_slice(0, len)?;
+        for v in new_indices {
+            list.append(v)?;
+        }
+        names.del_slice(0, len)?;
+        for v in new_names {
+            names.append(v)?;
+        }
+        Ok(hit_names)
+    }
+}
+
+/// pyo3-exposed prefix adapter. Wraps any `iter_*`-supporting Python
+/// index object and prepends/strips a fixed prefix on every call.
+#[pyclass(name = "GraphIndexPrefixAdapter", subclass)]
+struct PyGraphIndexPrefixAdapter {
+    adapted: Py<PyAny>,
+    prefix: Py<PyTuple>,
+    prefix_len: usize,
+    /// `prefix + (None,) * missing_key_length`.
+    prefix_query: Py<PyTuple>,
+    add_nodes_callback: std::sync::Mutex<Option<Py<PyAny>>>,
+}
+
+#[pymethods]
+impl PyGraphIndexPrefixAdapter {
+    #[new]
+    #[pyo3(signature = (adapted, prefix, missing_key_length, add_nodes_callback = None))]
+    fn new<'py>(
+        py: Python<'py>,
+        adapted: Py<PyAny>,
+        prefix: Bound<'py, PyTuple>,
+        missing_key_length: usize,
+        add_nodes_callback: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let prefix_len = prefix.len();
+        let mut query_parts: Vec<Bound<'py, PyAny>> =
+            Vec::with_capacity(prefix_len + missing_key_length);
+        for i in 0..prefix_len {
+            query_parts.push(prefix.get_item(i)?);
+        }
+        for _ in 0..missing_key_length {
+            query_parts.push(py.None().into_bound(py));
+        }
+        let prefix_query = PyTuple::new(py, query_parts)?;
+        Ok(Self {
+            adapted,
+            prefix: prefix.unbind(),
+            prefix_len,
+            prefix_query: prefix_query.unbind(),
+            add_nodes_callback: std::sync::Mutex::new(add_nodes_callback),
+        })
+    }
+
+    #[getter]
+    fn adapted<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
+        self.adapted.bind(py).clone()
+    }
+
+    #[getter]
+    fn prefix<'py>(&self, py: Python<'py>) -> Bound<'py, PyTuple> {
+        self.prefix.bind(py).clone()
+    }
+
+    #[getter]
+    fn prefix_len(&self) -> usize {
+        self.prefix_len
+    }
+
+    #[getter]
+    fn prefix_key<'py>(&self, py: Python<'py>) -> Bound<'py, PyTuple> {
+        self.prefix_query.bind(py).clone()
+    }
+
+    #[getter]
+    fn add_nodes_callback<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        let guard = self.add_nodes_callback.lock().unwrap();
+        match guard.as_ref() {
+            Some(f) => f.clone_ref(py),
+            None => py.None(),
+        }
+    }
+
+    fn add_nodes(&self, py: Python<'_>, nodes: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let translated = py_prepend_prefix_nodes(py, nodes, self.prefix.bind(py).clone())?;
+        let cb_clone = {
+            let guard = self.add_nodes_callback.lock().unwrap();
+            guard.as_ref().map(|f| f.clone_ref(py))
+        };
+        let cb = cb_clone.ok_or_else(|| {
+            PyTypeError::new_err("GraphIndexPrefixAdapter has no add_nodes_callback")
+        })?;
+        Ok(cb.bind(py).call1((translated,))?.unbind())
+    }
+
+    #[pyo3(signature = (key, value, references = None))]
+    fn add_node(
+        slf: Bound<'_, Self>,
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        value: Bound<'_, PyAny>,
+        references: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let single = match references {
+            Some(r) => PyTuple::new(py, [key, value, r])?,
+            None => PyTuple::new(py, [key, value])?,
+        };
+        let nodes = PyTuple::new(py, [single])?;
+        slf.borrow().add_nodes(py, nodes.into_any())?;
+        Ok(())
+    }
+
+    fn iter_all_entries<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let inner = slf.borrow();
+        let prefix_query = inner.prefix_query.bind(py).clone();
+        let entries = inner
+            .adapted
+            .bind(py)
+            .call_method1("iter_entries_prefix", (PyList::new(py, [prefix_query])?,))?;
+        py_strip_prefix_entries(py, entries, inner.prefix.bind(py).clone(), slf.into_any())
+    }
+
+    fn iter_entries<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let inner = slf.borrow();
+        let prefix = inner.prefix.bind(py).clone();
+        let extended = PyList::empty(py);
+        for k in keys.try_iter()? {
+            let key_t = k?
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("key must be a tuple"))?;
+            let mut parts: Vec<Bound<PyAny>> = Vec::with_capacity(prefix.len() + key_t.len());
+            for i in 0..prefix.len() {
+                parts.push(prefix.get_item(i)?);
+            }
+            for i in 0..key_t.len() {
+                parts.push(key_t.get_item(i)?);
+            }
+            extended.append(PyTuple::new(py, parts)?)?;
+        }
+        let entries = inner
+            .adapted
+            .bind(py)
+            .call_method1("iter_entries", (extended,))?;
+        py_strip_prefix_entries(py, entries, prefix, slf.into_any())
+    }
+
+    fn iter_entries_prefix<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let inner = slf.borrow();
+        let prefix = inner.prefix.bind(py).clone();
+        let extended = PyList::empty(py);
+        for k in keys.try_iter()? {
+            let key_t = k?
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("key must be a tuple"))?;
+            let mut parts: Vec<Bound<PyAny>> = Vec::with_capacity(prefix.len() + key_t.len());
+            for i in 0..prefix.len() {
+                parts.push(prefix.get_item(i)?);
+            }
+            for i in 0..key_t.len() {
+                parts.push(key_t.get_item(i)?);
+            }
+            extended.append(PyTuple::new(py, parts)?)?;
+        }
+        let entries = inner
+            .adapted
+            .bind(py)
+            .call_method1("iter_entries_prefix", (extended,))?;
+        py_strip_prefix_entries(py, entries, prefix, slf.into_any())
+    }
+
+    fn key_count(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<usize> {
+        let entries = Self::iter_all_entries(slf, py)?;
+        Ok(entries.len())
+    }
+
+    fn validate(&self, py: Python<'_>) -> PyResult<()> {
+        self.adapted.bind(py).call_method0("validate")?;
+        Ok(())
+    }
+}
+
+/// Build the per-entry tuple matching Python's `iter_all_entries`
+/// shape — kept here for the GraphIndex iter_* methods that already
+/// exist below.
 #[pymethods]
 impl PyGraphIndex {
     #[new]
@@ -2056,5 +3494,9 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     )?)?;
     m.add_class::<PyGraphIndex>()?;
     m.add_class::<PyParsedRangeMap>()?;
+    m.add_class::<PyGraphIndexBuilder>()?;
+    m.add_class::<PyInMemoryGraphIndex>()?;
+    m.add_class::<PyCombinedGraphIndex>()?;
+    m.add_class::<PyGraphIndexPrefixAdapter>()?;
     Ok(m)
 }

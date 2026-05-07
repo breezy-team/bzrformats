@@ -2158,7 +2158,7 @@ class TestInMemoryGraphIndex(TestCaseWithMemoryTransport):
     def test_iter_missing_entry_empty(self):
         """Test iter missing entry empty."""
         index = self.make_index()
-        self.assertEqual([], list(index.iter_entries([b"a"])))
+        self.assertEqual([], list(index.iter_entries([(b"a",)])))
 
     def test_key_count_empty(self):
         """Test key count empty."""

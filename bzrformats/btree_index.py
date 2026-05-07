@@ -72,22 +72,24 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
     VALUE          := no-newline-no-null-bytes
     """
 
+    def __new__(cls, reference_lists=0, key_elements=1, spill_at=100000):
+        """Construct via the pyo3 base class with only its known args."""
+        return _mod_index.GraphIndexBuilder.__new__(
+            cls, reference_lists, key_elements
+        )
+
     def __init__(self, reference_lists=0, key_elements=1, spill_at=100000):
         """See GraphIndexBuilder.__init__.
 
         :param spill_at: Optional parameter controlling the maximum number
             of nodes that BTreeBuilder will hold in memory.
         """
-        _mod_index.GraphIndexBuilder.__init__(
-            self, reference_lists=reference_lists, key_elements=key_elements
-        )
         self._spill_at = spill_at
         self._backing_indices = []
         # A map of {key: (node_refs, value)}
         self._nodes = {}
         # Indicate it hasn't been built yet
         self._nodes_by_key = None
-        self._optimize_for_size = False
 
     def add_node(self, key, value, references=()):
         r"""Add a node to the index.
@@ -359,6 +361,46 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
                     key_dict[key[-1]] = key, value
             self._nodes_by_key = nodes_by_key
         return self._nodes_by_key
+
+    def _update_nodes_by_key(self, key, value, node_refs):
+        """Update the lazy nodes_by_key trie with one new key."""
+        if self._nodes_by_key is None:
+            return
+        key_value = (key, value, node_refs) if self.reference_lists else (key, value)
+        key_dict = self._nodes_by_key
+        for subkey in key[:-1]:
+            key_dict = key_dict.setdefault(subkey, {})
+        key_dict[key[-1]] = key_value
+
+    def find_ancestry(self, keys, ref_list_num):
+        """Walk iter_entries to find the ancestry for `keys`."""
+        pending = set(keys)
+        parent_map = {}
+        missing_keys = set()
+        while pending:
+            next_pending = set()
+            for _, key, _value, ref_lists in self.iter_entries(pending):
+                parent_keys = ref_lists[ref_list_num]
+                parent_map[key] = parent_keys
+                next_pending.update(p for p in parent_keys if p not in parent_map)
+                missing_keys.update(pending.difference(parent_map))
+            pending = next_pending
+        return parent_map, missing_keys
+
+    def _find_ancestors(self, keys, ref_list_num, parent_map, missing_keys):
+        """One step of the ancestry walk; populates parent_map and
+        missing_keys, returns parents not already in parent_map."""
+        found = set()
+        new_search = set()
+        for _, key, _value, refs in self.iter_entries(keys):
+            parent_keys = refs[ref_list_num]
+            parent_map[key] = parent_keys
+            for p in parent_keys:
+                if p not in parent_map:
+                    new_search.add(p)
+            found.add(key)
+        missing_keys.update(set(keys) - found)
+        return new_search
 
     def key_count(self):
         """Return an estimate of the number of keys in this index.
