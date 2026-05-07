@@ -17,6 +17,7 @@
 from io import BytesIO
 
 import bzrformats.xml5
+import bzrformats.xml_serializer
 from bzrformats import inventory, serializer, xml6, xml7, xml8
 from bzrformats.inventory import Inventory
 
@@ -521,12 +522,15 @@ class TestSerializer(TestCase):
 
     def test_serialization_error(self):
         s_v5 = bzrformats.xml5.inventory_serializer_v5
-        e = self.assertRaises(
+        # The Rust XML parser's error wording differs from the previous
+        # ElementTree implementation, so just verify the right exception
+        # class is raised (matching the contract documented in the
+        # InventorySerializer base class).
+        self.assertRaises(
             serializer.UnexpectedInventoryFormat,
             s_v5.read_inventory_from_lines,
             [b"<Notquitexml"],
         )
-        self.assertEqual(str(e), "unclosed token: line 1, column 0")
 
 
 class TestEncodeAndEscape(TestCase):

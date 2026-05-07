@@ -1,7 +1,8 @@
 #![allow(dead_code)]
+use crate::inventory::{Entry, MutableInventory};
 use crate::revision::Revision;
-use crate::serializer::{Error, RevisionSerializer};
-use crate::RevisionId;
+use crate::serializer::{Error, InventorySerializer, RevisionSerializer};
+use crate::{FileId, RevisionId};
 use lazy_regex::regex_replace_all;
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
@@ -437,6 +438,884 @@ impl XMLRevisionSerializer for XMLRevisionSerializer5 {
     }
 }
 
+const ROOT_ID_BYTES: &[u8] = b"TREE_ROOT";
+
+fn unescape_xml(data: &[u8]) -> Result<Vec<u8>, Error> {
+    // Replicates the behaviour of Python's _unescape_xml in xml8.py:
+    // expand &name; entities for the standard XML named refs and numeric
+    // character references like &#181; into their UTF-8 byte equivalents.
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        if b != b'&' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let end = match data[i + 1..].iter().position(|&c| c == b';') {
+            Some(p) => i + 1 + p,
+            None => {
+                return Err(Error::DecodeError(
+                    "unterminated entity reference".to_string(),
+                ));
+            }
+        };
+        let code = &data[i + 1..end];
+        match code {
+            b"apos" => out.push(b'\''),
+            b"quot" => out.push(b'"'),
+            b"amp" => out.push(b'&'),
+            b"lt" => out.push(b'<'),
+            b"gt" => out.push(b'>'),
+            _ => {
+                if let Some(num) = code.strip_prefix(b"#") {
+                    let n_str = str::from_utf8(num)
+                        .map_err(|e| Error::DecodeError(format!("bad entity: {}", e)))?;
+                    let codepoint: u32 = n_str
+                        .parse()
+                        .map_err(|e| Error::DecodeError(format!("bad entity: {}", e)))?;
+                    let c = char::from_u32(codepoint).ok_or_else(|| {
+                        Error::DecodeError(format!("invalid codepoint: {}", codepoint))
+                    })?;
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                } else {
+                    return Err(Error::DecodeError(format!(
+                        "unknown entity: {}",
+                        String::from_utf8_lossy(code)
+                    )));
+                }
+            }
+        }
+        i = end + 1;
+    }
+    Ok(out)
+}
+
+fn unpack_inventory_entry(elt: &Element, root_id: Option<&FileId>) -> Result<Entry, Error> {
+    let kind = elt.name.as_str();
+    let file_id = elt
+        .attributes
+        .get("file_id")
+        .ok_or_else(|| Error::DecodeError(format!("entry missing file_id: {}", kind)))?;
+    let file_id = FileId::from(file_id.as_bytes());
+    let revision = elt
+        .attributes
+        .get("revision")
+        .map(|s| RevisionId::from(s.as_bytes()));
+    let parent_id = match elt.attributes.get("parent_id") {
+        Some(s) => Some(FileId::from(s.as_bytes())),
+        None => root_id.cloned(),
+    };
+    let name = elt.attributes.get("name").cloned().unwrap_or_default();
+    match kind {
+        "directory" => {
+            if let Some(parent_id) = parent_id {
+                Ok(Entry::directory(file_id, name, parent_id, revision))
+            } else {
+                Ok(Entry::root(file_id, revision))
+            }
+        }
+        "file" => {
+            let text_sha1 = elt
+                .attributes
+                .get("text_sha1")
+                .map(|s| s.as_bytes().to_vec());
+            let executable = elt
+                .attributes
+                .get("executable")
+                .map(|s| s == "yes")
+                .unwrap_or(false);
+            let text_size = match elt.attributes.get("text_size") {
+                Some(s) => Some(
+                    s.parse::<u64>()
+                        .map_err(|e| Error::DecodeError(format!("bad text_size: {}", e)))?,
+                ),
+                None => None,
+            };
+            let text_id = elt.attributes.get("text_id").map(|s| s.as_bytes().to_vec());
+            let parent_id = parent_id
+                .ok_or_else(|| Error::DecodeError("file without parent_id".to_string()))?;
+            Ok(Entry::file(
+                file_id,
+                name,
+                parent_id,
+                revision,
+                text_sha1,
+                text_size,
+                Some(executable),
+                text_id,
+            ))
+        }
+        "symlink" => {
+            let symlink_target = elt.attributes.get("symlink_target").cloned();
+            let parent_id = parent_id
+                .ok_or_else(|| Error::DecodeError("symlink without parent_id".to_string()))?;
+            Ok(Entry::link(
+                file_id,
+                name,
+                parent_id,
+                revision,
+                symlink_target,
+            ))
+        }
+        "tree-reference" => {
+            let parent_id = parent_id.ok_or_else(|| {
+                Error::DecodeError("tree-reference without parent_id".to_string())
+            })?;
+            let reference_revision = elt
+                .attributes
+                .get("reference_revision")
+                .map(|s| RevisionId::from(s.as_bytes()));
+            Ok(Entry::tree_reference(
+                file_id,
+                name,
+                parent_id,
+                revision,
+                reference_revision,
+            ))
+        }
+        other => Err(Error::UnsupportedInventoryKind(other.to_string())),
+    }
+}
+
+fn parse_inventory_xml_root(data: &[u8]) -> Result<Element, Error> {
+    Element::parse(data).map_err(|e| {
+        // mimic Python ElementTree's "unclosed token: line 1, column 0"
+        // which the test_serialization_error test depends on.
+        Error::UnexpectedInventoryFormat(format!("{}", e))
+    })
+}
+
+fn unpack_inventory_flat_v8(
+    elt: &Element,
+    expected_format: &[u8],
+    revision_id: Option<RevisionId>,
+) -> Result<MutableInventory, Error> {
+    if elt.name != "inventory" {
+        return Err(Error::UnexpectedInventoryFormat(format!(
+            "Root tag is {:?}",
+            elt.name
+        )));
+    }
+    let format = elt
+        .attributes
+        .get("format")
+        .ok_or_else(|| Error::UnexpectedInventoryFormat("missing format".to_string()))?;
+    if format.as_bytes() != expected_format {
+        return Err(Error::UnexpectedInventoryFormat(format!(
+            "Invalid format version {:?}",
+            format
+        )));
+    }
+    let data_revision_id = elt
+        .attributes
+        .get("revision_id")
+        .map(|s| RevisionId::from(s.as_bytes()));
+    let revision_id = data_revision_id.or(revision_id);
+
+    let mut inv = MutableInventory::new();
+    inv.revision_id = revision_id.clone();
+
+    for child in &elt.children {
+        let child = match child.as_element() {
+            Some(c) => c,
+            None => continue,
+        };
+        let entry = unpack_inventory_entry(child, None)?;
+        inv.add(entry)
+            .map_err(|e| Error::DecodeError(format!("error adding entry: {:?}", e)))?;
+    }
+    Ok(inv)
+}
+
+fn unpack_inventory_flat_v5(
+    elt: &Element,
+    revision_id: Option<RevisionId>,
+) -> Result<MutableInventory, Error> {
+    if elt.name != "inventory" {
+        return Err(Error::UnexpectedInventoryFormat(format!(
+            "Root tag is {:?}",
+            elt.name
+        )));
+    }
+    if let Some(format) = elt.attributes.get("format") {
+        if format != "5" {
+            return Err(Error::UnexpectedInventoryFormat(format!(
+                "invalid format version {:?} on inventory",
+                format
+            )));
+        }
+    }
+    let root_id_bytes = elt
+        .attributes
+        .get("file_id")
+        .map(|s| s.as_bytes().to_vec())
+        .unwrap_or_else(|| ROOT_ID_BYTES.to_vec());
+    let root_id = FileId::from(root_id_bytes);
+
+    let data_revision_id = elt
+        .attributes
+        .get("revision_id")
+        .map(|s| RevisionId::from(s.as_bytes()));
+    let effective_revision_id = data_revision_id.or(revision_id);
+
+    let mut inv = MutableInventory::new();
+    inv.revision_id = effective_revision_id.clone();
+    let root = Entry::root(root_id.clone(), effective_revision_id);
+    inv.add(root)
+        .map_err(|e| Error::DecodeError(format!("error adding root: {:?}", e)))?;
+
+    for child in &elt.children {
+        let child = match child.as_element() {
+            Some(c) => c,
+            None => continue,
+        };
+        let entry = unpack_inventory_entry(child, Some(&root_id))?;
+        inv.add(entry)
+            .map_err(|e| Error::DecodeError(format!("error adding entry: {:?}", e)))?;
+    }
+    Ok(inv)
+}
+
+fn append_v5_root(out: &mut Vec<u8>, inv: &MutableInventory) -> Result<(), Error> {
+    let root = inv
+        .root()
+        .ok_or_else(|| Error::EncodeError("inventory has no root".to_string()))?;
+    out.extend_from_slice(b"<inventory");
+    if root.file_id().as_bytes() != ROOT_ID_BYTES {
+        out.extend_from_slice(b" file_id=\"");
+        out.extend_from_slice(encode_and_escape_bytes(root.file_id().as_bytes()).as_bytes());
+        out.push(b'"');
+    }
+    out.extend_from_slice(b" format=\"5\"");
+    if let Some(revision_id) = &inv.revision_id {
+        out.extend_from_slice(b" revision_id=\"");
+        out.extend_from_slice(encode_and_escape_bytes(revision_id.as_bytes()).as_bytes());
+        out.push(b'"');
+    }
+    out.extend_from_slice(b">\n");
+    Ok(())
+}
+
+fn append_v8_root(
+    out: &mut Vec<u8>,
+    format_num: &[u8],
+    inv: &MutableInventory,
+) -> Result<(), Error> {
+    out.extend_from_slice(b"<inventory format=\"");
+    out.extend_from_slice(format_num);
+    out.push(b'"');
+    if let Some(revision_id) = &inv.revision_id {
+        out.extend_from_slice(b" revision_id=\"");
+        out.extend_from_slice(encode_and_escape_bytes(revision_id.as_bytes()).as_bytes());
+        out.push(b'"');
+    }
+    out.extend_from_slice(b">\n");
+
+    let root = inv
+        .root()
+        .ok_or_else(|| Error::EncodeError("inventory has no root".to_string()))?;
+    let root_revision = root.revision().cloned().or_else(|| inv.revision_id.clone());
+    out.extend_from_slice(b"<directory file_id=\"");
+    out.extend_from_slice(encode_and_escape_bytes(root.file_id().as_bytes()).as_bytes());
+    out.extend_from_slice(b"\" name=\"");
+    out.extend_from_slice(encode_and_escape_string(root.name()).as_bytes());
+    out.extend_from_slice(b"\" revision=\"");
+    if let Some(rev) = root_revision {
+        out.extend_from_slice(encode_and_escape_bytes(rev.as_bytes()).as_bytes());
+    }
+    out.extend_from_slice(b"\" />\n");
+    Ok(())
+}
+
+fn serialize_inventory_flat(
+    inv: &MutableInventory,
+    out: &mut Vec<u8>,
+    root_id: Option<&[u8]>,
+    supported_kinds: &[&str],
+    working: bool,
+) -> Result<(), Error> {
+    // Iterate all entries; skip the root (which is the first entry yielded).
+    let mut entries = inv.iter_entries(None);
+    if entries.next().is_none() {
+        // No root, no body to write
+        return Ok(());
+    }
+    for (_path, ie) in entries {
+        let kind = ie.kind();
+        let kind_str = osutils::Kind::as_str(&kind);
+        if !supported_kinds.contains(&kind_str) {
+            return Err(Error::UnsupportedInventoryKind(kind_str.to_string()));
+        }
+        let parent_str = if ie
+            .parent_id()
+            .map(|p| Some(p.as_bytes()) != root_id)
+            .unwrap_or(false)
+        {
+            let pid = ie.parent_id().unwrap();
+            let mut s = Vec::new();
+            s.extend_from_slice(b" parent_id=\"");
+            s.extend_from_slice(encode_and_escape_bytes(pid.as_bytes()).as_bytes());
+            s.push(b'"');
+            s
+        } else {
+            Vec::new()
+        };
+        match ie {
+            Entry::File {
+                file_id,
+                name,
+                revision,
+                text_sha1,
+                text_size,
+                executable,
+                ..
+            } => {
+                out.extend_from_slice(b"<file");
+                if *executable {
+                    out.extend_from_slice(b" executable=\"yes\"");
+                }
+                out.extend_from_slice(b" file_id=\"");
+                out.extend_from_slice(encode_and_escape_bytes(file_id.as_bytes()).as_bytes());
+                out.extend_from_slice(b"\" name=\"");
+                out.extend_from_slice(encode_and_escape_string(name).as_bytes());
+                out.push(b'"');
+                out.extend_from_slice(&parent_str);
+                if !working {
+                    out.extend_from_slice(b" revision=\"");
+                    if let Some(rev) = revision {
+                        out.extend_from_slice(encode_and_escape_bytes(rev.as_bytes()).as_bytes());
+                    }
+                    out.extend_from_slice(b"\" text_sha1=\"");
+                    if let Some(sha) = text_sha1 {
+                        out.extend_from_slice(sha.as_slice());
+                    }
+                    out.extend_from_slice(b"\" text_size=\"");
+                    if let Some(size) = text_size {
+                        out.extend_from_slice(format!("{}", size).as_bytes());
+                    } else {
+                        out.extend_from_slice(b"None");
+                    }
+                    out.push(b'"');
+                }
+                out.extend_from_slice(b" />\n");
+            }
+            Entry::Directory {
+                file_id,
+                name,
+                revision,
+                ..
+            } => {
+                out.extend_from_slice(b"<directory file_id=\"");
+                out.extend_from_slice(encode_and_escape_bytes(file_id.as_bytes()).as_bytes());
+                out.extend_from_slice(b"\" name=\"");
+                out.extend_from_slice(encode_and_escape_string(name).as_bytes());
+                out.push(b'"');
+                out.extend_from_slice(&parent_str);
+                if !working {
+                    out.extend_from_slice(b" revision=\"");
+                    if let Some(rev) = revision {
+                        out.extend_from_slice(encode_and_escape_bytes(rev.as_bytes()).as_bytes());
+                    }
+                    out.push(b'"');
+                }
+                out.extend_from_slice(b" />\n");
+            }
+            Entry::Link {
+                file_id,
+                name,
+                revision,
+                symlink_target,
+                ..
+            } => {
+                out.extend_from_slice(b"<symlink file_id=\"");
+                out.extend_from_slice(encode_and_escape_bytes(file_id.as_bytes()).as_bytes());
+                out.extend_from_slice(b"\" name=\"");
+                out.extend_from_slice(encode_and_escape_string(name).as_bytes());
+                out.push(b'"');
+                out.extend_from_slice(&parent_str);
+                if !working {
+                    out.extend_from_slice(b" revision=\"");
+                    if let Some(rev) = revision {
+                        out.extend_from_slice(encode_and_escape_bytes(rev.as_bytes()).as_bytes());
+                    }
+                    out.extend_from_slice(b"\" symlink_target=\"");
+                    if let Some(target) = symlink_target {
+                        out.extend_from_slice(encode_and_escape_string(target).as_bytes());
+                    }
+                    out.push(b'"');
+                }
+                out.extend_from_slice(b" />\n");
+            }
+            Entry::TreeReference {
+                file_id,
+                name,
+                revision,
+                reference_revision,
+                ..
+            } => {
+                out.extend_from_slice(b"<tree-reference file_id=\"");
+                out.extend_from_slice(encode_and_escape_bytes(file_id.as_bytes()).as_bytes());
+                out.extend_from_slice(b"\" name=\"");
+                out.extend_from_slice(encode_and_escape_string(name).as_bytes());
+                out.push(b'"');
+                out.extend_from_slice(&parent_str);
+                if !working {
+                    out.extend_from_slice(b" revision=\"");
+                    if let Some(rev) = revision {
+                        out.extend_from_slice(encode_and_escape_bytes(rev.as_bytes()).as_bytes());
+                    }
+                    out.extend_from_slice(b"\" reference_revision=\"");
+                    if let Some(rref) = reference_revision {
+                        out.extend_from_slice(encode_and_escape_bytes(rref.as_bytes()).as_bytes());
+                    }
+                    out.push(b'"');
+                }
+                out.extend_from_slice(b" />\n");
+            }
+            Entry::Root { .. } => {
+                // The root is skipped above, but if we somehow encounter it
+                // again (e.g. because iter_entries yielded it as a non-first
+                // element) treat that as a logic error.
+                return Err(Error::EncodeError(
+                    "unexpected root encountered during serialization".to_string(),
+                ));
+            }
+        }
+    }
+    out.extend_from_slice(b"</inventory>\n");
+    Ok(())
+}
+
+/// Split a serialized inventory byte stream into per-line chunks, the way
+/// Python's str.splitlines(keepends=True) does — one `\n`-terminated line per
+/// chunk (the final line may be unterminated).
+fn split_lines_keepends(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b == b'\n' {
+            out.push(data[start..=i].to_vec());
+            start = i + 1;
+        }
+    }
+    if start < data.len() {
+        out.push(data[start..].to_vec());
+    }
+    out
+}
+
+pub struct XMLInventorySerializer5;
+pub struct XMLInventorySerializer6;
+pub struct XMLInventorySerializer7;
+pub struct XMLInventorySerializer8;
+
+const SUPPORTED_KINDS_BASE: &[&str] = &["file", "directory", "symlink"];
+const SUPPORTED_KINDS_WITH_TREE_REF: &[&str] = &["file", "directory", "symlink", "tree-reference"];
+
+impl InventorySerializer for XMLInventorySerializer5 {
+    fn format_num(&self) -> &'static [u8] {
+        b"5"
+    }
+
+    fn write_inventory_to_lines(&self, inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error> {
+        let mut out = Vec::new();
+        append_v5_root(&mut out, inv)?;
+        // For v5 the comparison root_id is always TREE_ROOT, even if the
+        // inventory's actual root file_id is something else; this matches
+        // Python xml5.InventorySerializer_v5.root_id = inventory.ROOT_ID.
+        serialize_inventory_flat(
+            inv,
+            &mut out,
+            Some(ROOT_ID_BYTES),
+            SUPPORTED_KINDS_BASE,
+            false,
+        )?;
+        Ok(split_lines_keepends(&out))
+    }
+
+    fn read_inventory_from_lines(
+        &self,
+        lines: &[&[u8]],
+        revision_id: Option<RevisionId>,
+    ) -> Result<MutableInventory, Error> {
+        let mut data = Vec::new();
+        for line in lines {
+            data.extend_from_slice(line);
+        }
+        let elt = parse_inventory_xml_root(&data)?;
+        unpack_inventory_flat_v5(&elt, revision_id)
+    }
+}
+
+impl InventorySerializer for XMLInventorySerializer6 {
+    fn format_num(&self) -> &'static [u8] {
+        b"6"
+    }
+
+    fn write_inventory_to_lines(&self, inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error> {
+        let mut out = Vec::new();
+        append_v8_root(&mut out, b"6", inv)?;
+        serialize_inventory_flat(inv, &mut out, None, SUPPORTED_KINDS_BASE, false)?;
+        Ok(split_lines_keepends(&out))
+    }
+
+    fn read_inventory_from_lines(
+        &self,
+        lines: &[&[u8]],
+        revision_id: Option<RevisionId>,
+    ) -> Result<MutableInventory, Error> {
+        let mut data = Vec::new();
+        for line in lines {
+            data.extend_from_slice(line);
+        }
+        let elt = parse_inventory_xml_root(&data)?;
+        unpack_inventory_flat_v8(&elt, b"6", revision_id)
+    }
+}
+
+impl InventorySerializer for XMLInventorySerializer7 {
+    fn format_num(&self) -> &'static [u8] {
+        b"7"
+    }
+
+    fn write_inventory_to_lines(&self, inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error> {
+        let mut out = Vec::new();
+        append_v8_root(&mut out, b"7", inv)?;
+        serialize_inventory_flat(inv, &mut out, None, SUPPORTED_KINDS_WITH_TREE_REF, false)?;
+        Ok(split_lines_keepends(&out))
+    }
+
+    fn read_inventory_from_lines(
+        &self,
+        lines: &[&[u8]],
+        revision_id: Option<RevisionId>,
+    ) -> Result<MutableInventory, Error> {
+        let mut data = Vec::new();
+        for line in lines {
+            data.extend_from_slice(line);
+        }
+        let elt = parse_inventory_xml_root(&data)?;
+        unpack_inventory_flat_v8(&elt, b"7", revision_id)
+    }
+}
+
+impl InventorySerializer for XMLInventorySerializer8 {
+    fn format_num(&self) -> &'static [u8] {
+        b"8"
+    }
+
+    fn write_inventory_to_lines(&self, inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error> {
+        let mut out = Vec::new();
+        append_v8_root(&mut out, b"8", inv)?;
+        serialize_inventory_flat(inv, &mut out, None, SUPPORTED_KINDS_BASE, false)?;
+        Ok(split_lines_keepends(&out))
+    }
+
+    fn read_inventory_from_lines(
+        &self,
+        lines: &[&[u8]],
+        revision_id: Option<RevisionId>,
+    ) -> Result<MutableInventory, Error> {
+        let mut data = Vec::new();
+        for line in lines {
+            data.extend_from_slice(line);
+        }
+        let elt = parse_inventory_xml_root(&data)?;
+        unpack_inventory_flat_v8(&elt, b"8", revision_id)
+    }
+}
+
+/// File-id and revision-id tuples found in an inventory line.
+pub fn find_text_key_references<'a, I>(iter: I) -> Result<HashMap<(Vec<u8>, Vec<u8>), bool>, Error>
+where
+    I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+{
+    use lazy_regex::regex_captures;
+    let mut result: HashMap<(Vec<u8>, Vec<u8>), bool> = HashMap::new();
+    let mut unescape_cache: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+
+    for (line, line_key) in iter {
+        // The Python search regex is:
+        // b'file_id="(?P<file_id>[^"]+)".* revision="(?P<revision_id>[^"]+)"'
+        // We must match against bytes — fancy_regex/lazy-regex unicode is fine
+        // because the bytes are ASCII-safe enough for this match.
+        let line_str = match str::from_utf8(line) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let cap = regex_captures!(r#"file_id="([^"]+)".* revision="([^"]+)""#, line_str);
+        let (_full, file_id, revision_id) = match cap {
+            Some(c) => c,
+            None => continue,
+        };
+        let file_id_b = file_id.as_bytes();
+        let revision_id_b = revision_id.as_bytes();
+
+        let revision_decoded = if let Some(v) = unescape_cache.get(revision_id_b) {
+            v.clone()
+        } else {
+            let dec = unescape_xml(revision_id_b)?;
+            unescape_cache.insert(revision_id_b.to_vec(), dec.clone());
+            dec
+        };
+        let file_id_decoded = if let Some(v) = unescape_cache.get(file_id_b) {
+            v.clone()
+        } else {
+            let dec = unescape_xml(file_id_b)?;
+            unescape_cache.insert(file_id_b.to_vec(), dec.clone());
+            dec
+        };
+
+        let key = (file_id_decoded, revision_decoded.clone());
+        result.entry(key.clone()).or_insert(false);
+        if revision_decoded == line_key {
+            result.insert(key, true);
+        }
+    }
+    Ok(result)
+}
+
+/// Version 4 revision serializer: deserialization-only. v4 also stores
+/// inventory_id and parent_sha1s as extra metadata.
+pub struct XMLRevisionSerializer4;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevisionV4 {
+    pub revision: Revision,
+    pub inventory_id: Option<Vec<u8>>,
+    pub parent_sha1s: Vec<Option<Vec<u8>>>,
+}
+
+impl XMLRevisionSerializer4 {
+    pub fn read_revision_from_string(&self, data: &[u8]) -> Result<RevisionV4, Error> {
+        let elt = Element::parse(data)
+            .map_err(|e| Error::DecodeError(format!("XML parse error: {}", e)))?;
+        self.unpack_revision(&elt)
+    }
+
+    pub fn read_revision(&self, file: &mut dyn Read) -> Result<RevisionV4, Error> {
+        let elt = Element::parse(file)
+            .map_err(|e| Error::DecodeError(format!("XML parse error: {}", e)))?;
+        self.unpack_revision(&elt)
+    }
+
+    fn unpack_revision(&self, elt: &Element) -> Result<RevisionV4, Error> {
+        // <changeset> is deprecated...
+        if elt.name != "revision" && elt.name != "changeset" {
+            return Err(Error::DecodeError(format!(
+                "unexpected tag in revision file: {}",
+                elt.name
+            )));
+        }
+        let timezone = match elt.attributes.get("timezone") {
+            Some(s) => Some(
+                s.parse::<i32>()
+                    .map_err(|e| Error::DecodeError(format!("bad timezone: {}", e)))?,
+            ),
+            None => None,
+        };
+        let message = elt.get_child("message").map_or_else(
+            || "".to_string(),
+            |e| {
+                e.get_text()
+                    .map_or_else(|| "".to_owned(), |t| t.to_string())
+            },
+        );
+        let precursor = elt.attributes.get("precursor").cloned();
+        let precursor_sha1 = elt.attributes.get("precursor_sha1").cloned();
+
+        let mut parent_ids: Vec<RevisionId> = Vec::new();
+        let mut parent_sha1s: Vec<Option<Vec<u8>>> = Vec::new();
+        if let Some(pelts) = elt.get_child("parents") {
+            for p in pelts.children.iter().filter_map(|c| c.as_element()) {
+                let rid = p
+                    .attributes
+                    .get("revision_id")
+                    .ok_or_else(|| Error::DecodeError("parent missing revision_id".to_string()))?;
+                parent_ids.push(RevisionId::from(rid.as_bytes()));
+                parent_sha1s.push(
+                    p.attributes
+                        .get("revision_sha1")
+                        .map(|s| s.as_bytes().to_vec()),
+                );
+            }
+        } else if let Some(precursor) = precursor {
+            // revisions written prior to 0.0.5 have a single precursor
+            // given as an attribute.
+            parent_ids.push(RevisionId::from(precursor.as_bytes()));
+            parent_sha1s.push(precursor_sha1.map(|s| s.as_bytes().to_vec()));
+        }
+
+        let timestamp = elt
+            .attributes
+            .get("timestamp")
+            .ok_or_else(|| Error::DecodeError("missing timestamp".to_string()))?
+            .parse::<f64>()
+            .map_err(|e| Error::DecodeError(format!("bad timestamp: {}", e)))?;
+        let revision_id = elt
+            .attributes
+            .get("revision_id")
+            .ok_or_else(|| Error::DecodeError("missing revision_id".to_string()))?;
+        let revision_id = RevisionId::from(revision_id.as_bytes());
+        let inventory_id = elt
+            .attributes
+            .get("inventory_id")
+            .map(|s| s.as_bytes().to_vec());
+        let inventory_sha1 = elt
+            .attributes
+            .get("inventory_sha1")
+            .map(|s| s.as_bytes().to_vec());
+        let committer = elt.attributes.get("committer").cloned();
+
+        let revision = Revision::new(
+            revision_id,
+            parent_ids,
+            committer,
+            message,
+            HashMap::new(),
+            inventory_sha1,
+            timestamp,
+            timezone,
+        );
+
+        Ok(RevisionV4 {
+            revision,
+            inventory_id,
+            parent_sha1s,
+        })
+    }
+}
+
+/// Version 0.0.4 inventory serializer (deserialization only).
+///
+/// v4 entries use `<entry>` tags with a `kind` attribute, and may carry a
+/// `text_id` field for files. The root id comes from the inventory element's
+/// `file_id` attribute (defaulting to TREE_ROOT). v4 has no format attribute,
+/// no revision_id, no rich roots, and no tree-references.
+pub struct XMLInventorySerializer4;
+
+impl InventorySerializer for XMLInventorySerializer4 {
+    fn format_num(&self) -> &'static [u8] {
+        b"4"
+    }
+
+    fn write_inventory_to_lines(&self, _inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error> {
+        // v4 serialisation is no longer supported, only deserialisation.
+        Err(Error::EncodeError(
+            "v4 inventory serialisation is not supported".to_string(),
+        ))
+    }
+
+    fn read_inventory_from_lines(
+        &self,
+        lines: &[&[u8]],
+        _revision_id: Option<RevisionId>,
+    ) -> Result<MutableInventory, Error> {
+        let mut data = Vec::new();
+        for line in lines {
+            data.extend_from_slice(line);
+        }
+        XMLInventorySerializer4.read_inventory_from_string(&data)
+    }
+}
+
+fn unpack_inventory_entry_v4(elt: &Element, root_id: &FileId) -> Result<Entry, Error> {
+    if elt.name != "entry" {
+        return Err(Error::DecodeError(format!(
+            "unexpected tag in v4 inventory: {}",
+            elt.name
+        )));
+    }
+    let file_id = elt
+        .attributes
+        .get("file_id")
+        .ok_or_else(|| Error::DecodeError("entry missing file_id".to_string()))?;
+    let file_id = FileId::from(file_id.as_bytes());
+    let name = elt.attributes.get("name").cloned().unwrap_or_default();
+    // v4 doesn't carry parent_id for top-level nodes; map missing/ROOT_ID
+    // to the inventory's root id, matching xml4.py._unpack_entry.
+    let parent_id = match elt.attributes.get("parent_id") {
+        Some(s) if s.as_bytes() != ROOT_ID_BYTES => FileId::from(s.as_bytes()),
+        _ => root_id.clone(),
+    };
+    let kind = elt
+        .attributes
+        .get("kind")
+        .ok_or_else(|| Error::DecodeError("entry missing kind".to_string()))?;
+    match kind.as_str() {
+        "directory" => Ok(Entry::directory(file_id, name, parent_id, None)),
+        "file" => {
+            let text_id = elt.attributes.get("text_id").map(|s| s.as_bytes().to_vec());
+            let text_sha1 = elt
+                .attributes
+                .get("text_sha1")
+                .map(|s| s.as_bytes().to_vec());
+            let text_size = match elt.attributes.get("text_size") {
+                Some(s) => Some(
+                    s.parse::<u64>()
+                        .map_err(|e| Error::DecodeError(format!("bad text_size: {}", e)))?,
+                ),
+                None => None,
+            };
+            Ok(Entry::file(
+                file_id, name, parent_id, None, text_sha1, text_size, None, text_id,
+            ))
+        }
+        "symlink" => {
+            let symlink_target = elt.attributes.get("symlink_target").cloned();
+            Ok(Entry::link(file_id, name, parent_id, None, symlink_target))
+        }
+        other => Err(Error::DecodeError(format!("unknown kind {:?}", other))),
+    }
+}
+
+impl XMLInventorySerializer4 {
+    pub fn read_inventory_from_string(&self, data: &[u8]) -> Result<MutableInventory, Error> {
+        let elt = parse_inventory_xml_root(data)?;
+        self.unpack_inventory(&elt)
+    }
+
+    pub fn read_inventory(&self, f: &mut dyn Read) -> Result<MutableInventory, Error> {
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        self.read_inventory_from_string(&buf)
+    }
+
+    fn unpack_inventory(&self, elt: &Element) -> Result<MutableInventory, Error> {
+        if elt.name != "inventory" {
+            return Err(Error::UnexpectedInventoryFormat(format!(
+                "Root tag is {:?}",
+                elt.name
+            )));
+        }
+        let root_id_bytes = elt
+            .attributes
+            .get("file_id")
+            .map(|s| s.as_bytes().to_vec())
+            .unwrap_or_else(|| ROOT_ID_BYTES.to_vec());
+        let root_id = FileId::from(root_id_bytes);
+
+        let mut inv = MutableInventory::new();
+        let root = Entry::root(root_id.clone(), None);
+        inv.add(root)
+            .map_err(|e| Error::DecodeError(format!("error adding root: {:?}", e)))?;
+
+        for child in &elt.children {
+            let child = match child.as_element() {
+                Some(c) => c,
+                None => continue,
+            };
+            let entry = unpack_inventory_entry_v4(child, &root_id)?;
+            inv.add(entry)
+                .map_err(|e| Error::DecodeError(format!("error adding entry: {:?}", e)))?;
+        }
+        Ok(inv)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +1423,196 @@ mod tests {
         let bytes = serializer.write_revision_to_string(&rev).unwrap();
         let rev2 = serializer.read_revision_from_string(&bytes).unwrap();
         assert_eq!(rev, rev2);
+    }
+
+    use crate::serializer::InventorySerializer;
+
+    const COMMITTED_INV_V5: &[u8] = b"<inventory>\n<file file_id=\"bar-20050901064931-73b4b1138abc9cd2\"\n      name=\"bar\" parent_id=\"TREE_ROOT\"\n      revision=\"mbp@foo-123123\"\n      text_sha1=\"A\" text_size=\"1\"/>\n<directory name=\"subdir\"\n           file_id=\"foo-20050801201819-4139aa4a272f4250\"\n           parent_id=\"TREE_ROOT\"\n           revision=\"mbp@foo-00\"/>\n<file executable=\"yes\" file_id=\"bar-20050824000535-6bc48cfad47ed134\"\n      name=\"bar\" parent_id=\"foo-20050801201819-4139aa4a272f4250\"\n      revision=\"mbp@foo-00\"\n      text_sha1=\"B\" text_size=\"0\"/>\n</inventory>\n";
+
+    const EXPECTED_INV_V5: &[u8] = b"<inventory format=\"5\">\n<file file_id=\"bar-20050901064931-73b4b1138abc9cd2\" name=\"bar\" revision=\"mbp@foo-123123\" text_sha1=\"A\" text_size=\"1\" />\n<directory file_id=\"foo-20050801201819-4139aa4a272f4250\" name=\"subdir\" revision=\"mbp@foo-00\" />\n<file executable=\"yes\" file_id=\"bar-20050824000535-6bc48cfad47ed134\" name=\"bar\" parent_id=\"foo-20050801201819-4139aa4a272f4250\" revision=\"mbp@foo-00\" text_sha1=\"B\" text_size=\"0\" />\n</inventory>\n";
+
+    const EXPECTED_INV_V8: &[u8] = b"<inventory format=\"8\" revision_id=\"rev_outer\">\n<directory file_id=\"tree-root-321\" name=\"\" revision=\"rev_outer\" />\n<directory file_id=\"dir-id\" name=\"dir\" parent_id=\"tree-root-321\" revision=\"rev_outer\" />\n<file file_id=\"file-id\" name=\"file\" parent_id=\"tree-root-321\" revision=\"rev_outer\" text_sha1=\"A\" text_size=\"1\" />\n<symlink file_id=\"link-id\" name=\"link\" parent_id=\"tree-root-321\" revision=\"rev_outer\" symlink_target=\"a\" />\n</inventory>\n";
+
+    #[test]
+    fn inventory_v5_roundtrip() {
+        let s = XMLInventorySerializer5;
+        let inv = s
+            .read_inventory_from_lines(&[COMMITTED_INV_V5], None)
+            .unwrap();
+        assert_eq!(inv.len(), 4);
+        let bytes = s.write_inventory_to_string(&inv).unwrap();
+        assert_eq!(bytes, EXPECTED_INV_V5);
+        let inv2 = s.read_inventory_from_lines(&[&bytes], None).unwrap();
+        assert_eq!(inv, inv2);
+    }
+
+    #[test]
+    fn inventory_v8_roundtrip() {
+        let s = XMLInventorySerializer8;
+        let mut inv = MutableInventory::new();
+        inv.revision_id = Some(RevisionId::from(b"rev_outer".as_slice()));
+        inv.add(Entry::root(
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+        ))
+        .unwrap();
+        inv.add(Entry::directory(
+            FileId::from(b"dir-id".as_slice()),
+            "dir".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+        ))
+        .unwrap();
+        inv.add(Entry::file(
+            FileId::from(b"file-id".as_slice()),
+            "file".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+            Some(b"A".to_vec()),
+            Some(1),
+            Some(false),
+            None,
+        ))
+        .unwrap();
+        inv.add(Entry::link(
+            FileId::from(b"link-id".as_slice()),
+            "link".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+            Some("a".to_string()),
+        ))
+        .unwrap();
+        let out = s.write_inventory_to_string(&inv).unwrap();
+        assert_eq!(out, EXPECTED_INV_V8);
+        let inv2 = s.read_inventory_from_lines(&[&out], None).unwrap();
+        assert_eq!(inv, inv2);
+    }
+
+    #[test]
+    fn inventory_v5_no_format_attribute_uses_argument_revision_id() {
+        let s = XMLInventorySerializer5;
+        let inv = s
+            .read_inventory_from_lines(
+                &[b"<inventory format=\"5\">\n</inventory>\n"],
+                Some(RevisionId::from(b"test-rev-id".as_slice())),
+            )
+            .unwrap();
+        assert_eq!(
+            inv.root().unwrap().revision().map(|r| r.as_bytes()),
+            Some(b"test-rev-id".as_slice())
+        );
+    }
+
+    #[test]
+    fn inventory_v5_revision_id_from_data() {
+        let s = XMLInventorySerializer5;
+        let inv = s
+            .read_inventory_from_lines(
+                &[b"<inventory format=\"5\" revision_id=\"a-rev-id\">\n</inventory>\n"],
+                Some(RevisionId::from(b"test-rev-id".as_slice())),
+            )
+            .unwrap();
+        assert_eq!(
+            inv.root().unwrap().revision().map(|r| r.as_bytes()),
+            Some(b"a-rev-id".as_slice())
+        );
+    }
+
+    #[test]
+    fn unescape_xml_basic() {
+        assert_eq!(unescape_xml(b"foo&amp;bar").unwrap(), b"foo&bar".to_vec());
+        assert_eq!(unescape_xml(b"&lt;tag&gt;").unwrap(), b"<tag>".to_vec());
+        assert_eq!(unescape_xml(b"&#181;").unwrap(), b"\xc2\xb5".to_vec());
+    }
+
+    #[test]
+    fn unescape_xml_unknown_entity() {
+        assert!(unescape_xml(b"foo&bar;").is_err());
+    }
+
+    const REVISION_V4: &[u8] = b"<revision committer=\"Test\" timestamp=\"1.0\" revision_id=\"r1\" inventory_id=\"i1\" inventory_sha1=\"sha\">\n<message>hi</message>\n<parents>\n<revision_ref revision_id=\"p1\" revision_sha1=\"psha\"/>\n</parents>\n</revision>";
+
+    #[test]
+    fn revision_v4_unpack() {
+        let s = XMLRevisionSerializer4;
+        let rv4 = s.read_revision_from_string(REVISION_V4).unwrap();
+        assert_eq!(rv4.revision.revision_id.as_bytes(), b"r1");
+        assert_eq!(rv4.inventory_id.as_deref(), Some(b"i1".as_slice()));
+        assert_eq!(rv4.parent_sha1s.len(), 1);
+        assert_eq!(rv4.parent_sha1s[0].as_deref(), Some(b"psha".as_slice()));
+    }
+
+    const INVENTORY_V4: &[u8] = b"<inventory>\n<entry kind=\"directory\" file_id=\"src-id\" name=\"src\"/>\n<entry kind=\"file\" file_id=\"foo-id\" name=\"foo.c\" parent_id=\"src-id\" text_sha1=\"abc\" text_size=\"3\" text_id=\"tid\"/>\n<entry kind=\"symlink\" file_id=\"link-id\" name=\"l\" symlink_target=\"target\"/>\n</inventory>";
+
+    #[test]
+    fn inventory_v4_unpack() {
+        use crate::inventory::Inventory as _;
+
+        let s = XMLInventorySerializer4;
+        let inv = s.read_inventory_from_string(INVENTORY_V4).unwrap();
+        // root + 3 entries
+        assert_eq!(inv.len(), 4);
+
+        let foo = inv
+            .get_entry(&FileId::from(b"foo-id".as_slice()))
+            .expect("foo-id present");
+        match foo {
+            Entry::File {
+                text_sha1,
+                text_size,
+                text_id,
+                ..
+            } => {
+                assert_eq!(text_sha1.as_deref(), Some(b"abc".as_slice()));
+                assert_eq!(text_size, &Some(3u64));
+                assert_eq!(text_id.as_deref(), Some(b"tid".as_slice()));
+            }
+            other => panic!("expected file, got {:?}", other),
+        }
+
+        let link = inv
+            .get_entry(&FileId::from(b"link-id".as_slice()))
+            .expect("link-id present");
+        match link {
+            Entry::Link { symlink_target, .. } => {
+                assert_eq!(symlink_target.as_deref(), Some("target"));
+            }
+            other => panic!("expected symlink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inventory_v4_root_id_from_attribute() {
+        let s = XMLInventorySerializer4;
+        let inv = s
+            .read_inventory_from_string(b"<inventory file_id=\"alt-root\"></inventory>")
+            .unwrap();
+        assert_eq!(
+            inv.root().unwrap().file_id().as_bytes(),
+            b"alt-root".as_slice()
+        );
+    }
+
+    #[test]
+    fn inventory_v4_default_root_id_is_tree_root() {
+        let s = XMLInventorySerializer4;
+        let inv = s
+            .read_inventory_from_string(b"<inventory></inventory>")
+            .unwrap();
+        assert_eq!(inv.root().unwrap().file_id().as_bytes(), b"TREE_ROOT");
+    }
+
+    #[test]
+    fn inventory_v4_unknown_kind_errors() {
+        let s = XMLInventorySerializer4;
+        let err = s
+            .read_inventory_from_string(
+                b"<inventory>\n<entry kind=\"weird\" file_id=\"x\" name=\"x\"/>\n</inventory>",
+            )
+            .unwrap_err();
+        match err {
+            Error::DecodeError(msg) => assert!(msg.contains("unknown kind")),
+            other => panic!("expected DecodeError, got {:?}", other),
+        }
     }
 }

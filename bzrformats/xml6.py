@@ -16,18 +16,4 @@
 
 """XML serialization format version 6 for inventories with rich roots."""
 
-from . import xml8
-
-
-class InventorySerializer_v6(xml8.InventorySerializer_v8):
-    """This serialiser supports rich roots.
-
-    While its inventory format number is 6, its revision format is 5.
-    Its inventory_sha1 may be inaccurate-- the inventory may have been
-    converted from format 5 or 7 without updating the sha1.
-    """
-
-    format_num = b"6"
-
-
-inventory_serializer_v6 = InventorySerializer_v6()
+from ._bzr_rs import inventory_serializer_v6  # noqa: F401

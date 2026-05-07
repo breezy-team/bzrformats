@@ -358,6 +358,78 @@ impl XMLRevisionSerializer8 {
     }
 }
 
+/// v4 revision serializer (deserialization-only). Unlike v5/v8 it
+/// also recovers `inventory_id` and `parent_sha1s` metadata, so it
+/// doesn't fit the `RevisionSerializer` trait shape — it's exposed
+/// directly with its own read methods that return a tuple.
+#[pyclass]
+struct XMLRevisionSerializer4;
+
+#[pymethods]
+impl XMLRevisionSerializer4 {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    #[getter]
+    fn format_name(&self) -> &'static str {
+        "4"
+    }
+
+    #[getter]
+    fn squashes_xml_invalid_characters(&self) -> bool {
+        true
+    }
+
+    fn read_revision_from_string<'py>(
+        &self,
+        py: Python<'py>,
+        text: &[u8],
+    ) -> PyResult<(
+        Revision,
+        Option<Bound<'py, PyBytes>>,
+        Vec<Option<Bound<'py, PyBytes>>>,
+    )> {
+        let rv4 = py
+            .detach(|| {
+                bazaar::xml_serializer::XMLRevisionSerializer4.read_revision_from_string(text)
+            })
+            .map_err(serializer_err_to_py_err)?;
+        Ok((
+            Revision(rv4.revision),
+            rv4.inventory_id.map(|v| PyBytes::new(py, &v)),
+            rv4.parent_sha1s
+                .into_iter()
+                .map(|s| s.map(|v| PyBytes::new(py, &v)))
+                .collect(),
+        ))
+    }
+
+    fn read_revision<'py>(
+        &self,
+        py: Python<'py>,
+        file: Py<PyAny>,
+    ) -> PyResult<(
+        Revision,
+        Option<Bound<'py, PyBytes>>,
+        Vec<Option<Bound<'py, PyBytes>>>,
+    )> {
+        let mut file = PyBinaryFile::from(file);
+        let rv4 = py
+            .detach(|| bazaar::xml_serializer::XMLRevisionSerializer4.read_revision(&mut file))
+            .map_err(serializer_err_to_py_err)?;
+        Ok((
+            Revision(rv4.revision),
+            rv4.inventory_id.map(|v| PyBytes::new(py, &v)),
+            rv4.parent_sha1s
+                .into_iter()
+                .map(|s| s.map(|v| PyBytes::new(py, &v)))
+                .collect(),
+        ))
+    }
+}
+
 #[pyclass(subclass,extends=RevisionSerializer)]
 struct XMLRevisionSerializer5;
 
@@ -432,6 +504,187 @@ impl RevisionSerializer {
     }
 }
 
+import_exception!(bzrformats.serializer, UnexpectedInventoryFormat);
+import_exception!(bzrformats.serializer, UnsupportedInventoryKind);
+
+fn inventory_serializer_err_to_py_err(e: bazaar::serializer::Error) -> PyErr {
+    use bazaar::serializer::Error;
+    match e {
+        Error::UnexpectedInventoryFormat(msg) => UnexpectedInventoryFormat::new_err(msg),
+        Error::UnsupportedInventoryKind(kind) => UnsupportedInventoryKind::new_err((kind,)),
+        other => PyRuntimeError::new_err(format!("serializer error: {:?}", other)),
+    }
+}
+
+#[pyclass(subclass)]
+struct InventorySerializer(Box<dyn bazaar::serializer::InventorySerializer>);
+
+#[pymethods]
+impl InventorySerializer {
+    #[getter]
+    fn format_num<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, self.0.format_num())
+    }
+
+    #[pyo3(signature = (inv, f, working = false))]
+    fn write_inventory<'py>(
+        &self,
+        py: Python<'py>,
+        inv: &inventory::Inventory,
+        f: Py<PyAny>,
+        working: bool,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        if working {
+            return Err(PyRuntimeError::new_err(
+                "working=True is not supported by Rust XML inventory serializer",
+            ));
+        }
+        let lines = self
+            .0
+            .write_inventory_to_lines(&inv.0)
+            .map_err(inventory_serializer_err_to_py_err)?;
+        if !f.is_none(py) {
+            for line in &lines {
+                f.call_method1(py, "write", (PyBytes::new(py, line),))?;
+            }
+        }
+        Ok(lines.into_iter().map(|l| PyBytes::new(py, &l)).collect())
+    }
+
+    fn write_inventory_to_lines<'py>(
+        &self,
+        py: Python<'py>,
+        inv: &inventory::Inventory,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let lines = self
+            .0
+            .write_inventory_to_lines(&inv.0)
+            .map_err(inventory_serializer_err_to_py_err)?;
+        Ok(lines.into_iter().map(|l| PyBytes::new(py, &l)).collect())
+    }
+
+    fn write_inventory_to_chunks<'py>(
+        &self,
+        py: Python<'py>,
+        inv: &inventory::Inventory,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        self.write_inventory_to_lines(py, inv)
+    }
+
+    fn write_inventory_to_string<'py>(
+        &self,
+        py: Python<'py>,
+        inv: &inventory::Inventory,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let buf = self
+            .0
+            .write_inventory_to_string(&inv.0)
+            .map_err(inventory_serializer_err_to_py_err)?;
+        Ok(PyBytes::new(py, &buf))
+    }
+
+    #[pyo3(signature = (lines, revision_id = None, entry_cache = None, return_from_cache = false))]
+    fn read_inventory_from_lines(
+        &self,
+        py: Python,
+        lines: Vec<Vec<u8>>,
+        revision_id: Option<RevisionId>,
+        entry_cache: Option<Py<PyAny>>,
+        return_from_cache: bool,
+    ) -> PyResult<inventory::Inventory> {
+        let _ = (entry_cache, return_from_cache);
+        let line_refs: Vec<&[u8]> = lines.iter().map(|v| v.as_slice()).collect();
+        let inv = py
+            .detach(|| self.0.read_inventory_from_lines(&line_refs, revision_id))
+            .map_err(inventory_serializer_err_to_py_err)?;
+        Ok(inventory::Inventory(inv))
+    }
+
+    #[pyo3(signature = (f, revision_id = None))]
+    fn read_inventory(
+        &self,
+        py: Python,
+        f: Py<PyAny>,
+        revision_id: Option<RevisionId>,
+    ) -> PyResult<inventory::Inventory> {
+        let mut file = PyBinaryFile::from(f);
+        let inv = py
+            .detach(|| self.0.read_inventory(&mut file, revision_id))
+            .map_err(inventory_serializer_err_to_py_err)?;
+        Ok(inventory::Inventory(inv))
+    }
+}
+
+#[pyclass(subclass, extends = InventorySerializer)]
+struct XMLInventorySerializer4;
+
+#[pymethods]
+impl XMLInventorySerializer4 {
+    #[new]
+    fn new() -> (Self, InventorySerializer) {
+        (
+            Self,
+            InventorySerializer(Box::new(bazaar::xml_serializer::XMLInventorySerializer4)),
+        )
+    }
+}
+
+#[pyclass(subclass, extends = InventorySerializer)]
+struct XMLInventorySerializer5;
+
+#[pymethods]
+impl XMLInventorySerializer5 {
+    #[new]
+    fn new() -> (Self, InventorySerializer) {
+        (
+            Self,
+            InventorySerializer(Box::new(bazaar::xml_serializer::XMLInventorySerializer5)),
+        )
+    }
+}
+
+#[pyclass(subclass, extends = InventorySerializer)]
+struct XMLInventorySerializer6;
+
+#[pymethods]
+impl XMLInventorySerializer6 {
+    #[new]
+    fn new() -> (Self, InventorySerializer) {
+        (
+            Self,
+            InventorySerializer(Box::new(bazaar::xml_serializer::XMLInventorySerializer6)),
+        )
+    }
+}
+
+#[pyclass(subclass, extends = InventorySerializer)]
+struct XMLInventorySerializer7;
+
+#[pymethods]
+impl XMLInventorySerializer7 {
+    #[new]
+    fn new() -> (Self, InventorySerializer) {
+        (
+            Self,
+            InventorySerializer(Box::new(bazaar::xml_serializer::XMLInventorySerializer7)),
+        )
+    }
+}
+
+#[pyclass(subclass, extends = InventorySerializer)]
+struct XMLInventorySerializer8;
+
+#[pymethods]
+impl XMLInventorySerializer8 {
+    #[new]
+    fn new() -> (Self, InventorySerializer) {
+        (
+            Self,
+            InventorySerializer(Box::new(bazaar::xml_serializer::XMLInventorySerializer8)),
+        )
+    }
+}
+
 #[pyfunction(name = "is_null")]
 fn is_null_revision(revision_id: RevisionId) -> bool {
     revision_id.is_null()
@@ -503,8 +756,15 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_submodule(&inventorym)?;
     m.add_class::<RevisionSerializer>()?;
     m.add_class::<BEncodeRevisionSerializerv1>()?;
+    m.add_class::<XMLRevisionSerializer4>()?;
     m.add_class::<XMLRevisionSerializer5>()?;
     m.add_class::<XMLRevisionSerializer8>()?;
+    m.add_class::<InventorySerializer>()?;
+    m.add_class::<XMLInventorySerializer4>()?;
+    m.add_class::<XMLInventorySerializer5>()?;
+    m.add_class::<XMLInventorySerializer6>()?;
+    m.add_class::<XMLInventorySerializer7>()?;
+    m.add_class::<XMLInventorySerializer8>()?;
     m.add(
         "revision_bencode_serializer",
         m.getattr("BEncodeRevisionSerializerv1")?.call0()?,
@@ -516,6 +776,30 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add(
         "revision_serializer_v5",
         m.getattr("XMLRevisionSerializer5")?.call0()?,
+    )?;
+    m.add(
+        "_revision_serializer_v4_rs",
+        m.getattr("XMLRevisionSerializer4")?.call0()?,
+    )?;
+    m.add(
+        "inventory_serializer_v4",
+        m.getattr("XMLInventorySerializer4")?.call0()?,
+    )?;
+    m.add(
+        "inventory_serializer_v5",
+        m.getattr("XMLInventorySerializer5")?.call0()?,
+    )?;
+    m.add(
+        "inventory_serializer_v6",
+        m.getattr("XMLInventorySerializer6")?.call0()?,
+    )?;
+    m.add(
+        "inventory_serializer_v7",
+        m.getattr("XMLInventorySerializer7")?.call0()?,
+    )?;
+    m.add(
+        "inventory_serializer_v8",
+        m.getattr("XMLInventorySerializer8")?.call0()?,
     )?;
     m.add("CURRENT_REVISION", bazaar::CURRENT_REVISION)?;
     m.add("NULL_REVISION", bazaar::NULL_REVISION)?;

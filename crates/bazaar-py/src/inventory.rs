@@ -1030,7 +1030,7 @@ fn inventory_err_to_py_err(e: Error, py: Python) -> PyErr {
 }
 
 #[pyclass]
-struct Inventory(bazaar::inventory::MutableInventory);
+pub(crate) struct Inventory(pub(crate) bazaar::inventory::MutableInventory);
 
 #[pymethods]
 impl Inventory {

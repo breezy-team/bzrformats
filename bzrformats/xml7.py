@@ -16,16 +16,4 @@
 
 """XML serialization format version 7 with tree reference support."""
 
-from . import xml6
-
-
-class InventorySerializer_v7(xml6.InventorySerializer_v6):
-    """A Serializer that supports tree references."""
-
-    # this format is used by BzrBranch6
-
-    supported_kinds = {"file", "directory", "symlink", "tree-reference"}
-    format_num = b"7"
-
-
-inventory_serializer_v7 = InventorySerializer_v7()
+from ._bzr_rs import inventory_serializer_v7  # noqa: F401
