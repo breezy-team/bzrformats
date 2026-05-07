@@ -504,14 +504,13 @@ class TestBTreeBuilder(BTreeTestCase):
         self.assertFalse(builder._optimize_for_size)
         # test that we can set combine_backing_indices without effecting
         # _optimize_for_size
-        obj = object()
-        builder._optimize_for_size = obj
+        builder.set_optimize(for_size=True)
         builder.set_optimize(combine_backing_indices=False)
         self.assertFalse(builder._combine_backing_indices)
-        self.assertIs(obj, builder._optimize_for_size)
+        self.assertTrue(builder._optimize_for_size)
         builder.set_optimize(combine_backing_indices=True)
         self.assertTrue(builder._combine_backing_indices)
-        self.assertIs(obj, builder._optimize_for_size)
+        self.assertTrue(builder._optimize_for_size)
 
     def test_spill_index_stress_2_2(self):
         # test that references and longer keys don't confuse things.

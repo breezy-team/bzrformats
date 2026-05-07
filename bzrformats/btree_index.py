@@ -72,22 +72,22 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
     VALUE          := no-newline-no-null-bytes
     """
 
+    def __new__(cls, reference_lists=0, key_elements=1, spill_at=100000):
+        """Construct via the pyo3 base class with only its known args."""
+        return _mod_index.GraphIndexBuilder.__new__(cls, reference_lists, key_elements)
+
     def __init__(self, reference_lists=0, key_elements=1, spill_at=100000):
         """See GraphIndexBuilder.__init__.
 
         :param spill_at: Optional parameter controlling the maximum number
             of nodes that BTreeBuilder will hold in memory.
         """
-        _mod_index.GraphIndexBuilder.__init__(
-            self, reference_lists=reference_lists, key_elements=key_elements
-        )
         self._spill_at = spill_at
         self._backing_indices = []
         # A map of {key: (node_refs, value)}
         self._nodes = {}
         # Indicate it hasn't been built yet
         self._nodes_by_key = None
-        self._optimize_for_size = False
 
     def add_node(self, key, value, references=()):
         r"""Add a node to the index.
@@ -105,11 +105,15 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
         """
         # Ensure that 'key' is a tuple.
         key = tuple(key)
-        # we don't care about absent_references
-        node_refs, _ = self._check_key_ref_value(key, references, value)
-        if key in self._nodes:
-            raise _mod_index.BadIndexDuplicateKey(key, self)
-        self._nodes[key] = (node_refs, value)
+        node_refs = _index_rs.add_node_to_btree_builder(
+            self,
+            key,
+            value,
+            references,
+            self._nodes,
+            self.reference_lists,
+            self._key_length,
+        )
         if self._nodes_by_key is not None and self._key_length > 1:
             self._update_nodes_by_key(key, value, node_refs)
         if len(self._nodes) < self._spill_at:
@@ -184,15 +188,10 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
 
     def _iter_mem_nodes(self):
         """Iterate over the nodes held in memory."""
-        nodes = self._nodes
-        if self.reference_lists:
-            for key in sorted(nodes):
-                references, value = nodes[key]
-                yield self, key, value, references
-        else:
-            for key in sorted(nodes):
-                references, value = nodes[key]
-                yield self, key, value
+        for entry in _index_rs.iter_btree_builder_nodes_sorted(
+            self._nodes, bool(self.reference_lists)
+        ):
+            yield (self, *entry)
 
     def _iter_smallest(self, iterators_to_combine):
         if len(iterators_to_combine) == 1:
@@ -295,28 +294,13 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
             efficient order for the index (keys iteration order in this case).
         """
         keys = set(keys)
-        # Note: We don't use keys.intersection() here. If you read the C api,
-        #       set.intersection(other) special cases when other is a set and
-        #       will iterate the smaller of the two and lookup in the other.
-        #       It does *not* do this for any other type (even dict, unlike
-        #       some other set functions.) Since we expect keys is generally <<
-        #       self._nodes, it is faster to iterate over it in a list
-        #       comprehension
-        nodes = self._nodes
-        local_keys = [key for key in keys if key in nodes]
-        if self.reference_lists:
-            for key in local_keys:
-                node = nodes[key]
-                yield self, key, node[1], node[0]
-        else:
-            for key in local_keys:
-                node = nodes[key]
-                yield self, key, node[1]
-        # Find things that are in backing indices that have not been handled
-        # yet.
+        entries, local_keys = _index_rs.iter_btree_builder_nodes_for_keys(
+            self._nodes, keys, bool(self.reference_lists)
+        )
+        for entry in entries:
+            yield (self, *entry)
         if not self._backing_indices:
-            return  # We won't find anything there either
-        # Remove all of the keys that we found locally
+            return
         keys.difference_update(local_keys)
         for backing in self._backing_indices:
             if backing is None:
@@ -344,7 +328,7 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
             will be returned, and every match that is in the index will be
             returned.
         """
-        keys = set(keys)
+        keys = list(keys)
         if not keys:
             return
         for backing in self._backing_indices:
@@ -352,20 +336,11 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
                 continue
             for node in backing.iter_entries_prefix(keys):
                 yield (self,) + node[1:]
-        if self._key_length == 1:
-            for key in keys:
-                _mod_index._sanity_check_key(self, key)
-                try:
-                    node = self._nodes[key]
-                except KeyError:
-                    continue
-                if self.reference_lists:
-                    yield self, key, node[1], node[0]
-                else:
-                    yield self, key, node[1]
-            return
-        nodes_by_key = self._get_nodes_by_key()
-        yield from _mod_index._iter_entries_prefix(self, nodes_by_key, keys)
+        mode = "btree-builder-refs" if self.reference_lists else "btree-builder-norefs"
+        for entry in _index_rs.iter_entries_prefix(
+            self._nodes, keys, self._key_length, mode
+        ):
+            yield (self, *entry)
 
     def _get_nodes_by_key(self):
         if self._nodes_by_key is None:
@@ -384,6 +359,47 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
                     key_dict[key[-1]] = key, value
             self._nodes_by_key = nodes_by_key
         return self._nodes_by_key
+
+    def _update_nodes_by_key(self, key, value, node_refs):
+        """Update the lazy nodes_by_key trie with one new key."""
+        if self._nodes_by_key is None:
+            return
+        key_value = (key, value, node_refs) if self.reference_lists else (key, value)
+        key_dict = self._nodes_by_key
+        for subkey in key[:-1]:
+            key_dict = key_dict.setdefault(subkey, {})
+        key_dict[key[-1]] = key_value
+
+    def find_ancestry(self, keys, ref_list_num):
+        """Walk iter_entries to find the ancestry for `keys`."""
+        pending = set(keys)
+        parent_map = {}
+        missing_keys = set()
+        while pending:
+            next_pending = set()
+            for _, key, _value, ref_lists in self.iter_entries(pending):
+                parent_keys = ref_lists[ref_list_num]
+                parent_map[key] = parent_keys
+                next_pending.update(p for p in parent_keys if p not in parent_map)
+                missing_keys.update(pending.difference(parent_map))
+            pending = next_pending
+        return parent_map, missing_keys
+
+    def _find_ancestors(self, keys, ref_list_num, parent_map, missing_keys):
+        """One step of the ancestry walk; populates parent_map and
+        missing_keys, returns parents not already in parent_map.
+        """
+        found = set()
+        new_search = set()
+        for _, key, _value, refs in self.iter_entries(keys):
+            parent_keys = refs[ref_list_num]
+            parent_map[key] = parent_keys
+            for p in parent_keys:
+                if p not in parent_map:
+                    new_search.add(p)
+            found.add(key)
+        missing_keys.update(set(keys) - found)
+        return new_search
 
     def key_count(self):
         """Return an estimate of the number of keys in this index.
@@ -1173,46 +1189,14 @@ class BTreeGraphIndex:
         # current breezy) just suck the entire index and iterate in memory.
         nodes = {}
         if self.node_ref_lists:
-            if self._key_length == 1:
-                for _1, key, value, refs in self.iter_all_entries():
-                    nodes[key] = value, refs
-            else:
-                nodes_by_key = {}
-                for _1, key, value, refs in self.iter_all_entries():
-                    key_value = key, value, refs
-                    # For a key of (foo, bar, baz) create
-                    # _nodes_by_key[foo][bar][baz] = key_value
-                    key_dict = nodes_by_key
-                    for subkey in key[:-1]:
-                        key_dict = key_dict.setdefault(subkey, {})
-                    key_dict[key[-1]] = key_value
+            for _1, key, value, refs in self.iter_all_entries():
+                nodes[key] = value, refs
         else:
-            if self._key_length == 1:
-                for _1, key, value in self.iter_all_entries():
-                    nodes[key] = value
-            else:
-                nodes_by_key = {}
-                for _1, key, value in self.iter_all_entries():
-                    key_value = key, value
-                    # For a key of (foo, bar, baz) create
-                    # _nodes_by_key[foo][bar][baz] = key_value
-                    key_dict = nodes_by_key
-                    for subkey in key[:-1]:
-                        key_dict = key_dict.setdefault(subkey, {})
-                    key_dict[key[-1]] = key_value
-        if self._key_length == 1:
-            for key in keys:
-                _mod_index._sanity_check_key(self, key)
-                try:
-                    if self.node_ref_lists:
-                        value, node_refs = nodes[key]
-                        yield self, key, value, node_refs
-                    else:
-                        yield self, key, nodes[key]
-                except KeyError:
-                    pass
-            return
-        yield from _mod_index._iter_entries_prefix(self, nodes_by_key, keys)
+            for _1, key, value in self.iter_all_entries():
+                nodes[key] = value
+        mode = "reader-refs" if self.node_ref_lists else "reader-norefs"
+        for entry in _index_rs.iter_entries_prefix(nodes, keys, self._key_length, mode):
+            yield (self, *entry)
 
     def key_count(self):
         """Return an estimate of the number of keys in this index.
@@ -1354,5 +1338,6 @@ _gcchk_factory = _LeafNode
 
 from ._bzr_rs import btree_index as _btree_index_rs
 from ._bzr_rs import btree_serializer as _btree_serializer
+from ._bzr_rs import index as _index_rs
 
 _gcchk_factory = _btree_serializer._parse_into_chk  # type: ignore
