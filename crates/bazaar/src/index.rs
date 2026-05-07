@@ -431,6 +431,31 @@ pub type IndexEntry = (IndexKey, Vec<u8>, RefLists);
 /// match any key element at that position.
 pub type KeyPrefix = Vec<Option<Vec<u8>>>;
 
+/// `true` when `b` is one of the bytes a key element must not contain:
+/// tab, LF, VT, FF, CR, NUL, or space.
+#[inline]
+fn is_key_disallowed(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0 | b' ')
+}
+
+/// `true` when every element of `key` is non-empty and free of the
+/// whitespace + null bytes the format reserves as field/record
+/// separators. Matches the `_check_key` validation in the Python
+/// `GraphIndexBuilder`.
+pub fn key_is_valid(key: &[Vec<u8>], key_length: usize) -> bool {
+    if key.len() != key_length {
+        return false;
+    }
+    key.iter()
+        .all(|element| !element.is_empty() && !element.iter().any(|&b| is_key_disallowed(b)))
+}
+
+/// `true` when `value` may legally appear as a node payload — neither
+/// `\n` nor `\0` bytes anywhere in the slice.
+pub fn value_is_valid(value: &[u8]) -> bool {
+    !value.iter().any(|&b| b == b'\n' || b == 0)
+}
+
 /// Bookkeeping for the byte-range and key-range subsets of a
 /// graph-index file that the bisection path has already parsed. The
 /// ranges in each map are sorted, non-overlapping, and parallel: index
@@ -1548,6 +1573,49 @@ mod tests {
         assert_eq!(idx.key_count().unwrap(), 1);
         let entries = idx.iter_all_entries().unwrap();
         assert_eq!(entries, vec![(key(&[b"a"]), b"v".to_vec(), vec![])]);
+    }
+
+    #[test]
+    fn key_is_valid_accepts_clean_bytes() {
+        assert!(key_is_valid(&[b"foo".to_vec()], 1));
+        assert!(key_is_valid(&[b"foo".to_vec(), b"bar".to_vec()], 2));
+    }
+
+    #[test]
+    fn key_is_valid_rejects_wrong_length() {
+        assert!(!key_is_valid(&[b"foo".to_vec()], 2));
+        assert!(!key_is_valid(&[b"a".to_vec(), b"b".to_vec()], 1));
+    }
+
+    #[test]
+    fn key_is_valid_rejects_empty_element() {
+        assert!(!key_is_valid(&[b"".to_vec()], 1));
+        assert!(!key_is_valid(&[b"a".to_vec(), b"".to_vec()], 2));
+    }
+
+    #[test]
+    fn key_is_valid_rejects_separator_bytes() {
+        for &bad in [b'\t', b'\n', 0x0b, 0x0c, b'\r', 0, b' '].iter() {
+            let elem = vec![b'a', bad];
+            assert!(
+                !key_is_valid(&[elem.clone()], 1),
+                "byte 0x{:02x} should disqualify",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn value_is_valid_accepts_arbitrary_bytes() {
+        assert!(value_is_valid(b"any value"));
+        assert!(value_is_valid(b""));
+        assert!(value_is_valid(b"with\ttab and CR\r is fine"));
+    }
+
+    #[test]
+    fn value_is_valid_rejects_newline_or_null() {
+        assert!(!value_is_valid(b"has\nnewline"));
+        assert!(!value_is_valid(b"has\0null"));
     }
 
     #[test]

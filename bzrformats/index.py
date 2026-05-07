@@ -25,7 +25,6 @@ __all__ = [
 ]
 
 import logging
-import re
 from io import BytesIO
 
 from . import revision as _mod_revision
@@ -93,8 +92,6 @@ class BadIndexValue(BzrFormatsError):
         self.value = value
 
 
-_whitespace_re = re.compile(b"[\t\n\x0b\x0c\r\x00 ]")
-_newline_null_re = re.compile(b"[\n\0]")
 
 
 def _has_key_from_parent_map(self, key):
@@ -148,17 +145,7 @@ class GraphIndexBuilder:
 
     def _check_key(self, key):
         """Raise BadIndexKey if key is not a valid key for this index."""
-        if type(key) not in (tuple,):
-            raise BadIndexKey(key)
-        if self._key_length != len(key):
-            raise BadIndexKey(key)
-        for element in key:
-            if (
-                not element
-                or not isinstance(element, bytes)
-                or _whitespace_re.search(element) is not None
-            ):
-                raise BadIndexKey(key)
+        _index_rs.check_key(key, self._key_length)
 
     def _external_references(self):
         """Return references that are not present in this index."""
@@ -230,8 +217,7 @@ class GraphIndexBuilder:
               multiple lists.
         """
         self._check_key(key)
-        if _newline_null_re.search(value) is not None:
-            raise BadIndexValue(value)
+        _index_rs.check_value(value)
         if len(references) != self.reference_lists:
             raise BadIndexValue(references)
         node_refs = []

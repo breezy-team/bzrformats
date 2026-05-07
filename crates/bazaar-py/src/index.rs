@@ -1,7 +1,7 @@
 use bazaar::index::{
-    parse_full, parse_header, parse_lines, serialize_graph_index, GraphIndex as RsGraphIndex,
-    IndexEntry, IndexError, IndexHeader, IndexKey, IndexNode, IndexTransport, KeyPrefix,
-    ParsedLines, ParsedRangeMap as RsParsedRangeMap, RawNode,
+    key_is_valid, parse_full, parse_header, parse_lines, serialize_graph_index, value_is_valid,
+    GraphIndex as RsGraphIndex, IndexEntry, IndexError, IndexHeader, IndexKey, IndexNode,
+    IndexTransport, KeyPrefix, ParsedLines, ParsedRangeMap as RsParsedRangeMap, RawNode,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::import_exception;
@@ -12,6 +12,7 @@ import_exception!(bzrformats.index, BadIndexFormatSignature);
 import_exception!(bzrformats.index, BadIndexOptions);
 import_exception!(bzrformats.index, BadIndexData);
 import_exception!(bzrformats.index, BadIndexKey);
+import_exception!(bzrformats.index, BadIndexValue);
 import_exception!(bzrformats.errors, BzrFormatsError);
 
 fn index_err_to_py(err: IndexError) -> PyErr {
@@ -890,6 +891,44 @@ fn py_external_references_from_builder_nodes<'py>(
     Ok(out)
 }
 
+/// Validate that `key` conforms to the `GraphIndexBuilder` key
+/// interface: a tuple of `key_length` non-empty `bytes` elements with
+/// no whitespace or null characters anywhere. Raises `BadIndexKey` on
+/// failure.
+#[pyfunction]
+#[pyo3(name = "check_key")]
+fn py_check_key(key: Bound<'_, PyAny>, key_length: usize) -> PyResult<()> {
+    let key_tuple = key
+        .cast::<PyTuple>()
+        .map_err(|_| BadIndexKey::new_err((key.clone().unbind(),)))?
+        .clone();
+    if key_tuple.len() != key_length {
+        return Err(BadIndexKey::new_err((key_tuple.unbind(),)));
+    }
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key_length);
+    for item in key_tuple.iter() {
+        let b = item
+            .cast_into::<PyBytes>()
+            .map_err(|_| BadIndexKey::new_err((key_tuple.clone().unbind(),)))?;
+        parts.push(b.as_bytes().to_vec());
+    }
+    if !key_is_valid(&parts, key_length) {
+        return Err(BadIndexKey::new_err((key_tuple.unbind(),)));
+    }
+    Ok(())
+}
+
+/// Validate that `value` may legally appear as a node payload: no `\n`
+/// or `\0` bytes. Raises `BadIndexValue` on failure.
+#[pyfunction]
+#[pyo3(name = "check_value")]
+fn py_check_value(value: Bound<'_, PyBytes>) -> PyResult<()> {
+    if !value_is_valid(value.as_bytes()) {
+        return Err(BadIndexValue::new_err((value.unbind(),)));
+    }
+    Ok(())
+}
+
 pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "index")?;
     m.add_function(wrap_pyfunction!(py_serialize_graph_index, &m)?)?;
@@ -901,6 +940,8 @@ pub fn _index_rs(py: Python) -> PyResult<Bound<PyModule>> {
         py_external_references_from_builder_nodes,
         &m
     )?)?;
+    m.add_function(wrap_pyfunction!(py_check_key, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_check_value, &m)?)?;
     m.add_class::<PyGraphIndex>()?;
     m.add_class::<PyParsedRangeMap>()?;
     Ok(m)
