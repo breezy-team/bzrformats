@@ -551,10 +551,8 @@ impl<T: IndexTransport> BTreeGraphIndex<T> {
     /// Number of keys in the index. May trigger a transport read to
     /// load the header on first call.
     pub fn key_count(&mut self) -> Result<usize, IndexError> {
-        if self.key_count.is_none() {
-            self.get_root_node()?;
-        }
-        Ok(self.key_count.expect("populated by get_root_node"))
+        self.ensure_root_loaded()?;
+        Ok(self.key_count.expect("populated by ensure_root_loaded"))
     }
 
     /// Read every leaf node in order and yield `(key, value, refs)`.
@@ -711,16 +709,14 @@ impl<T: IndexTransport> BTreeGraphIndex<T> {
     }
 
     fn key_length_unwrap(&mut self) -> Result<usize, IndexError> {
-        if self.key_length.is_none() {
-            self.get_root_node()?;
-        }
+        self.ensure_root_loaded()?;
         self.key_length
             .ok_or_else(|| IndexError::Other("header not parsed".to_string()))
     }
 
     /// Validate that every node in the index can be read and parsed.
     pub fn validate(&mut self) -> Result<(), IndexError> {
-        self.get_root_node()?;
+        self.ensure_root_loaded()?;
         let row_lengths = self.row_lengths.as_ref().expect("populated").clone();
         let row_offsets = self.row_offsets.as_ref().expect("populated").clone();
         let start_node = if row_lengths.len() > 1 {
@@ -744,7 +740,7 @@ impl<T: IndexTransport> BTreeGraphIndex<T> {
         &mut self,
         ref_list_num: usize,
     ) -> Result<HashSet<LeafKey>, IndexError> {
-        self.get_root_node()?;
+        self.ensure_root_loaded()?;
         let nrl = self
             .node_ref_lists
             .ok_or_else(|| IndexError::Other("header not parsed".to_string()))?;
@@ -858,11 +854,15 @@ impl<T: IndexTransport> BTreeGraphIndex<T> {
 
     // ---------------- internal helpers ----------------
 
-    fn get_root_node(&mut self) -> Result<&NodeKind, IndexError> {
-        if self.root_node.is_none() {
-            self.get_internal_nodes(&[0])?;
+    /// Read enough of the index to populate the header (and the root node
+    /// when one exists). Empty indices have no root page; in that case
+    /// the header is parsed and `root_node` stays `None`.
+    fn ensure_root_loaded(&mut self) -> Result<(), IndexError> {
+        if self.root_node.is_some() || self.key_count.is_some() {
+            return Ok(());
         }
-        Ok(self.root_node.as_ref().expect("root populated"))
+        self.get_internal_nodes(&[0])?;
+        Ok(())
     }
 
     fn compute_total_pages_in_index(&self) -> Result<u64, IndexError> {
@@ -1556,6 +1556,159 @@ mod tests {
         assert_eq!(result[2], (2, vec![vec![b"e".to_vec()]]));
     }
 
+    // ---- Ports of TestMultiBisectRight from
+    // bzrformats/tests/test_btree_index.py. The Python tests use bare
+    // strings; we wrap them as one-segment LeafKeys for parity.
+
+    fn k(s: &str) -> LeafKey {
+        vec![s.as_bytes().to_vec()]
+    }
+
+    fn ks(slice: &[&str]) -> Vec<LeafKey> {
+        slice.iter().map(|s| k(s)).collect()
+    }
+
+    fn assert_multi_bisect_right(expected: &[(usize, &[&str])], search: &[&str], fixed: &[&str]) {
+        let got = multi_bisect_right(&ks(search), &ks(fixed));
+        let want: Vec<(usize, Vec<LeafKey>)> = expected
+            .iter()
+            .map(|(pos, keys)| (*pos, ks(keys)))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn multi_bisect_right_after() {
+        assert_multi_bisect_right(&[(1, &["b"])], &["b"], &["a"]);
+        assert_multi_bisect_right(&[(3, &["e", "f", "g"])], &["e", "f", "g"], &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn multi_bisect_right_before() {
+        assert_multi_bisect_right(&[(0, &["a"])], &["a"], &["b"]);
+        assert_multi_bisect_right(
+            &[(0, &["a", "b", "c", "d"])],
+            &["a", "b", "c", "d"],
+            &["e", "f", "g"],
+        );
+    }
+
+    #[test]
+    fn multi_bisect_right_exact() {
+        assert_multi_bisect_right(&[(1, &["a"])], &["a"], &["a"]);
+        assert_multi_bisect_right(&[(1, &["a"]), (2, &["b"])], &["a", "b"], &["a", "b"]);
+        assert_multi_bisect_right(&[(1, &["a"]), (3, &["c"])], &["a", "c"], &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn multi_bisect_right_inbetween() {
+        assert_multi_bisect_right(&[(1, &["b"])], &["b"], &["a", "c"]);
+        assert_multi_bisect_right(
+            &[(1, &["b", "c", "d"]), (2, &["f", "g"])],
+            &["b", "c", "d", "f", "g"],
+            &["a", "e", "h"],
+        );
+    }
+
+    #[test]
+    fn multi_bisect_right_mixed() {
+        assert_multi_bisect_right(
+            &[(0, &["a", "b"]), (2, &["d", "e"]), (4, &["g", "h"])],
+            &["a", "b", "d", "e", "g", "h"],
+            &["c", "d", "f", "g"],
+        );
+    }
+
+    // ---- Ports of TestBTreeNodes (LeafNode_1_0, LeafNode_2_2,
+    // InternalNode_1) from bzrformats/tests/test_btree_index.py.
+
+    #[test]
+    fn leaf_node_1_0_canned_bytes() {
+        let body: &[u8] = b"type=leaf\n\
+            0000000000000000000000000000000000000000\x00\x00value:0\n\
+            1111111111111111111111111111111111111111\x00\x00value:1\n\
+            2222222222222222222222222222222222222222\x00\x00value:2\n\
+            3333333333333333333333333333333333333333\x00\x00value:3\n\
+            4444444444444444444444444444444444444444\x00\x00value:4\n";
+        let node = LeafNode::parse(body, 1, 0).unwrap();
+        assert_eq!(node.len(), 5);
+        for i in 0..5 {
+            let key = vec![format!("{}", i).repeat(40).into_bytes()];
+            let (value, refs) = node.get(&key).expect("key present");
+            assert_eq!(value, &format!("value:{}", i).into_bytes());
+            assert!(refs.is_empty());
+        }
+    }
+
+    #[test]
+    fn leaf_node_2_2_canned_bytes_with_refs() {
+        let body: &[u8] = b"type=leaf\n\
+            00\x0000\x00\t00\x00ref00\x00value:0\n\
+            00\x0011\x0000\x00ref00\t00\x00ref00\r01\x00ref01\x00value:1\n\
+            11\x0033\x0011\x00ref22\t11\x00ref22\r11\x00ref22\x00value:3\n\
+            11\x0044\x00\t11\x00ref00\x00value:4\n";
+        let node = LeafNode::parse(body, 2, 2).unwrap();
+        assert_eq!(node.len(), 4);
+
+        // (00, 00) -> value:0, refs=([], [(00, ref00)])
+        let k = vec![b"00".to_vec(), b"00".to_vec()];
+        let (v, refs) = node.get(&k).unwrap();
+        assert_eq!(v, b"value:0");
+        assert_eq!(refs.len(), 2);
+        assert!(refs[0].is_empty());
+        assert_eq!(refs[1], vec![vec![b"00".to_vec(), b"ref00".to_vec()]]);
+
+        // (00, 11) -> value:1, refs=([(00, ref00)], [(00, ref00), (01, ref01)])
+        let k = vec![b"00".to_vec(), b"11".to_vec()];
+        let (v, refs) = node.get(&k).unwrap();
+        assert_eq!(v, b"value:1");
+        assert_eq!(refs[0], vec![vec![b"00".to_vec(), b"ref00".to_vec()]]);
+        assert_eq!(
+            refs[1],
+            vec![
+                vec![b"00".to_vec(), b"ref00".to_vec()],
+                vec![b"01".to_vec(), b"ref01".to_vec()],
+            ]
+        );
+
+        // (11, 33) -> value:3, refs=([(11, ref22)], [(11, ref22), (11, ref22)])
+        let k = vec![b"11".to_vec(), b"33".to_vec()];
+        let (v, refs) = node.get(&k).unwrap();
+        assert_eq!(v, b"value:3");
+        assert_eq!(refs[0], vec![vec![b"11".to_vec(), b"ref22".to_vec()]]);
+        assert_eq!(
+            refs[1],
+            vec![
+                vec![b"11".to_vec(), b"ref22".to_vec()],
+                vec![b"11".to_vec(), b"ref22".to_vec()],
+            ]
+        );
+
+        // (11, 44) -> value:4, refs=([], [(11, ref00)])
+        let k = vec![b"11".to_vec(), b"44".to_vec()];
+        let (v, refs) = node.get(&k).unwrap();
+        assert_eq!(v, b"value:4");
+        assert!(refs[0].is_empty());
+        assert_eq!(refs[1], vec![vec![b"11".to_vec(), b"ref00".to_vec()]]);
+    }
+
+    #[test]
+    fn internal_node_1_canned_bytes() {
+        let body: &[u8] = b"type=internal\n\
+            offset=1\n\
+            0000000000000000000000000000000000000000\n\
+            1111111111111111111111111111111111111111\n\
+            2222222222222222222222222222222222222222\n\
+            3333333333333333333333333333333333333333\n\
+            4444444444444444444444444444444444444444\n";
+        let node = parse_internal_node(body).unwrap();
+        assert_eq!(node.offset, 1);
+        let expected: Vec<LeafKey> = (0..5)
+            .map(|i| vec![format!("{}", i).repeat(40).into_bytes()])
+            .collect();
+        assert_eq!(node.keys, expected);
+    }
+
     use crate::index::IndexTransport;
 
     /// Tiny in-memory IndexTransport used for end-to-end tests.
@@ -1760,5 +1913,706 @@ mod tests {
         assert_eq!(parent_map[&vec![b"a".to_vec()]], vec![vec![b"b".to_vec()]]);
         assert_eq!(parent_map[&vec![b"b".to_vec()]], vec![vec![b"c".to_vec()]]);
         assert!(parent_map[&vec![b"c".to_vec()]].is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Ports of TestBTreeIndex behavioural tests from
+    // bzrformats/tests/test_btree_index.py.
+    //
+    // The Python suite uses a `make_nodes(count, key_elements, ref_lists)`
+    // helper to generate canonical fixture nodes; we mirror its shape so
+    // the tests stay easy to compare.
+    // ---------------------------------------------------------------
+
+    fn make_nodes(
+        count: usize,
+        key_elements: usize,
+        reference_lists: usize,
+    ) -> Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> {
+        fn pos_to_key(pos: usize, lead: &[u8]) -> Vec<u8> {
+            let s = format!("{}", pos);
+            let mut out: Vec<u8> = lead.to_vec();
+            for _ in 0..40 {
+                out.extend_from_slice(s.as_bytes());
+            }
+            out
+        }
+        let mut keys: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> = Vec::new();
+        for prefix_pos in 0..key_elements {
+            let prefix: Vec<Vec<u8>> = if key_elements > 1 {
+                vec![pos_to_key(prefix_pos, b"")]
+            } else {
+                Vec::new()
+            };
+            for pos in 0..count {
+                let mut key = prefix.clone();
+                key.push(pos_to_key(pos, b""));
+                let value = format!("value:{}", pos).into_bytes();
+                let refs: Vec<Vec<LeafKey>> = if reference_lists > 0 {
+                    let mut out = Vec::new();
+                    for list_pos in 0..reference_lists {
+                        let mut list: Vec<LeafKey> = Vec::new();
+                        let limit = list_pos + pos % 2;
+                        for ref_pos in 0..limit {
+                            let mut ref_key = prefix.clone();
+                            if pos % 2 == 1 {
+                                ref_key.push(pos_to_key(pos - 1, b"ref"));
+                            } else {
+                                ref_key.push(pos_to_key(ref_pos, b"ref"));
+                            }
+                            list.push(ref_key);
+                        }
+                        out.push(list);
+                    }
+                    out
+                } else {
+                    Vec::new()
+                };
+                keys.push((key, value, refs));
+            }
+        }
+        keys
+    }
+
+    fn open_index(
+        nodes: &[(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)],
+        ref_lists: usize,
+        key_elements: usize,
+    ) -> BTreeGraphIndex<MemTransport> {
+        let data = build_index(nodes, ref_lists, key_elements);
+        let size = data.len() as u64;
+        BTreeGraphIndex::new(MemTransport::new("idx", data), "idx", Some(size), 0)
+    }
+
+    #[test]
+    fn empty_key_count() {
+        let mut idx = open_index(&[], 0, 1);
+        assert_eq!(idx.key_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn empty_key_count_no_size() {
+        // Mirror of test_empty_key_count_no_size — opening with size=None
+        // should still parse the header and report 0 keys.
+        let data = build_index(&[], 0, 1);
+        let transport = MemTransport::new("idx", data);
+        let mut idx = BTreeGraphIndex::new(transport, "idx", None, 0);
+        assert_eq!(idx.key_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn non_empty_key_count_2_2() {
+        // 35 keys × 2 prefix-elements × 1 = 70 entries.
+        let nodes = make_nodes(35, 2, 2);
+        let mut idx = open_index(&nodes, 2, 2);
+        assert_eq!(idx.key_count().unwrap(), 70);
+    }
+
+    #[test]
+    fn key_count_2_levels_2_2() {
+        // 160 nodes is enough to force a multi-level tree.
+        let nodes = make_nodes(160, 2, 2);
+        let mut idx = open_index(&nodes, 2, 2);
+        assert_eq!(idx.key_count().unwrap(), 320);
+    }
+
+    #[test]
+    fn validate_one_page() {
+        let nodes = make_nodes(45, 2, 2);
+        let mut idx = open_index(&nodes, 2, 2);
+        idx.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_two_pages() {
+        let nodes = make_nodes(80, 2, 2);
+        let mut idx = open_index(&nodes, 2, 2);
+        idx.validate().unwrap();
+    }
+
+    #[test]
+    fn iter_all_only_root_no_size() {
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> =
+            vec![(vec![b"key".to_vec()], b"value".to_vec(), Vec::new())];
+        let data = build_index(&nodes, 0, 1);
+        let mut idx = BTreeGraphIndex::new(MemTransport::new("idx", data), "idx", None, 0);
+        let entries = idx.iter_all_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, vec![b"key".to_vec()]);
+        assert_eq!(entries[0].1, b"value");
+    }
+
+    #[test]
+    fn iter_all_entries_round_trips_full_set() {
+        // Smaller than the Python 20k-node test (which exists to exercise
+        // the multi-page linear scan path) but still triggers a 2-row
+        // tree, validating the same orchestration.
+        let nodes = make_nodes(160, 2, 2);
+        let mut idx = open_index(&nodes, 2, 2);
+        let mut got = idx.iter_all_entries().unwrap();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected = nodes.clone();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got.len(), expected.len());
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert_eq!(g.0, e.0);
+            assert_eq!(g.1, e.1);
+            assert_eq!(g.2, e.2);
+        }
+    }
+
+    #[test]
+    fn iter_entries_references_2_refs_resolved() {
+        // The Python test points iter_entries at one key from a multi-page
+        // index and expects to see exactly that key with its references.
+        let nodes = make_nodes(160, 2, 2);
+        let mut idx = open_index(&nodes, 2, 2);
+        let target = nodes[30].clone();
+        let got = idx.iter_entries(&[target.0.clone()]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, target.0);
+        assert_eq!(got[0].1, target.1);
+        assert_eq!(got[0].2, target.2);
+    }
+
+    #[test]
+    fn iter_entries_prefix_1_key_element_no_refs() {
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> = vec![
+            (vec![b"name".to_vec()], b"data".to_vec(), Vec::new()),
+            (vec![b"ref".to_vec()], b"refdata".to_vec(), Vec::new()),
+        ];
+        let mut idx = open_index(&nodes, 0, 1);
+        let mut got = idx
+            .iter_entries_prefix(&[vec![Some(b"name".to_vec())], vec![Some(b"ref".to_vec())]])
+            .unwrap();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, vec![b"name".to_vec()]);
+        assert_eq!(got[1].0, vec![b"ref".to_vec()]);
+    }
+
+    #[test]
+    fn iter_entries_prefix_2_key_element_no_refs() {
+        // Mirror of test_iter_key_prefix_2_key_element_no_refs.
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> = vec![
+            (
+                vec![b"name".to_vec(), b"fin1".to_vec()],
+                b"data".to_vec(),
+                Vec::new(),
+            ),
+            (
+                vec![b"name".to_vec(), b"fin2".to_vec()],
+                b"beta".to_vec(),
+                Vec::new(),
+            ),
+            (
+                vec![b"ref".to_vec(), b"erence".to_vec()],
+                b"refdata".to_vec(),
+                Vec::new(),
+            ),
+        ];
+        let mut idx = open_index(&nodes, 0, 2);
+        // Exact prefixes pick out the matching entries.
+        let mut got = idx
+            .iter_entries_prefix(&[
+                vec![Some(b"name".to_vec()), Some(b"fin1".to_vec())],
+                vec![Some(b"ref".to_vec()), Some(b"erence".to_vec())],
+            ])
+            .unwrap();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, vec![b"name".to_vec(), b"fin1".to_vec()]);
+        assert_eq!(got[1].0, vec![b"ref".to_vec(), b"erence".to_vec()]);
+        // None in the second slot matches both name/* entries.
+        let mut got = idx
+            .iter_entries_prefix(&[vec![Some(b"name".to_vec()), None]])
+            .unwrap();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, vec![b"name".to_vec(), b"fin1".to_vec()]);
+        assert_eq!(got[1].0, vec![b"name".to_vec(), b"fin2".to_vec()]);
+    }
+
+    #[test]
+    fn iter_entries_prefix_wrong_length_errors() {
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> = vec![];
+        let mut idx = open_index(&nodes, 0, 1);
+        // Single-element index, prefix of length 2 — error.
+        assert!(idx
+            .iter_entries_prefix(&[vec![Some(b"foo".to_vec()), None]])
+            .is_err());
+    }
+
+    #[test]
+    fn iter_entries_prefix_first_none_errors() {
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> = vec![];
+        let mut idx = open_index(&nodes, 0, 1);
+        // First slot may not be None.
+        assert!(idx.iter_entries_prefix(&[vec![None]]).is_err());
+    }
+
+    #[test]
+    fn external_references_no_refs_errors() {
+        // ref_lists=0 → asking for ref_list_num=0 should fail.
+        let mut idx = open_index(&[], 0, 1);
+        assert!(idx.external_references(0).is_err());
+    }
+
+    #[test]
+    fn external_references_no_results() {
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> =
+            vec![(vec![b"key".to_vec()], b"value".to_vec(), vec![Vec::new()])];
+        let mut idx = open_index(&nodes, 1, 1);
+        assert!(idx.external_references(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn external_references_missing_ref() {
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> = vec![(
+            vec![b"key".to_vec()],
+            b"value".to_vec(),
+            vec![vec![vec![b"missing".to_vec()]]],
+        )];
+        let mut idx = open_index(&nodes, 1, 1);
+        let refs = idx.external_references(0).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert!(refs.contains(&vec![b"missing".to_vec()]));
+    }
+
+    #[test]
+    fn external_references_multiple_ref_lists() {
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> = vec![(
+            vec![b"key".to_vec()],
+            b"value".to_vec(),
+            vec![Vec::new(), vec![vec![b"missing".to_vec()]]],
+        )];
+        let mut idx = open_index(&nodes, 2, 1);
+        assert!(idx.external_references(0).unwrap().is_empty());
+        let refs = idx.external_references(1).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert!(refs.contains(&vec![b"missing".to_vec()]));
+    }
+
+    #[test]
+    fn external_references_two_records() {
+        // key-1 references key-2; key-2 is in the index, so no externals.
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> = vec![
+            (
+                vec![b"key-1".to_vec()],
+                b"value".to_vec(),
+                vec![vec![vec![b"key-2".to_vec()]]],
+            ),
+            (vec![b"key-2".to_vec()], b"value".to_vec(), vec![Vec::new()]),
+        ];
+        let mut idx = open_index(&nodes, 1, 1);
+        assert!(idx.external_references(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn find_ancestors_one_page() {
+        let key1 = vec![b"key-1".to_vec()];
+        let key2 = vec![b"key-2".to_vec()];
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> = vec![
+            (key1.clone(), b"value".to_vec(), vec![vec![key2.clone()]]),
+            (key2.clone(), b"value".to_vec(), vec![Vec::new()]),
+        ];
+        let mut idx = open_index(&nodes, 1, 1);
+        let mut parent_map: std::collections::HashMap<LeafKey, LeafRefList> =
+            std::collections::HashMap::new();
+        let mut missing: HashSet<LeafKey> = HashSet::new();
+        let search = idx
+            .find_ancestors(&[key1.clone()], 0, &mut parent_map, &mut missing)
+            .unwrap();
+        assert!(missing.is_empty());
+        assert!(search.is_empty());
+        assert_eq!(parent_map.len(), 2);
+        assert_eq!(parent_map[&key1], vec![key2.clone()]);
+        assert!(parent_map[&key2].is_empty());
+    }
+
+    #[test]
+    fn find_ancestors_one_page_w_missing() {
+        let key1 = vec![b"key-1".to_vec()];
+        let key2 = vec![b"key-2".to_vec()];
+        let key3 = vec![b"key-3".to_vec()];
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> = vec![
+            (key1.clone(), b"value".to_vec(), vec![vec![key2.clone()]]),
+            (key2.clone(), b"value".to_vec(), vec![Vec::new()]),
+        ];
+        let mut idx = open_index(&nodes, 1, 1);
+        let mut parent_map: std::collections::HashMap<LeafKey, LeafRefList> =
+            std::collections::HashMap::new();
+        let mut missing: HashSet<LeafKey> = HashSet::new();
+        let search = idx
+            .find_ancestors(
+                &[key2.clone(), key3.clone()],
+                0,
+                &mut parent_map,
+                &mut missing,
+            )
+            .unwrap();
+        assert_eq!(parent_map.len(), 1);
+        assert!(parent_map[&key2].is_empty());
+        // key3 isn't on the page we visited and doesn't fall in the
+        // [min,max] of any covered leaf, so it's known missing.
+        assert_eq!(missing.len(), 1);
+        assert!(missing.contains(&key3));
+        assert!(search.is_empty());
+    }
+
+    #[test]
+    fn find_ancestors_dont_search_known() {
+        let key1 = vec![b"key-1".to_vec()];
+        let key2 = vec![b"key-2".to_vec()];
+        let key3 = vec![b"key-3".to_vec()];
+        let nodes: Vec<(LeafKey, Vec<u8>, Vec<Vec<LeafKey>>)> = vec![
+            (key1.clone(), b"value".to_vec(), vec![vec![key2.clone()]]),
+            (key2.clone(), b"value".to_vec(), vec![vec![key3.clone()]]),
+            (key3.clone(), b"value".to_vec(), vec![Vec::new()]),
+        ];
+        let mut idx = open_index(&nodes, 1, 1);
+        // We already know key2's parents, so the walker should not
+        // re-visit key3.
+        let mut parent_map: std::collections::HashMap<LeafKey, LeafRefList> =
+            std::collections::HashMap::new();
+        parent_map.insert(key2.clone(), vec![key3.clone()]);
+        let mut missing: HashSet<LeafKey> = HashSet::new();
+        let search = idx
+            .find_ancestors(&[key1.clone()], 0, &mut parent_map, &mut missing)
+            .unwrap();
+        assert!(missing.is_empty());
+        assert!(search.is_empty());
+        assert_eq!(parent_map.len(), 2);
+        assert_eq!(parent_map[&key1], vec![key2.clone()]);
+        assert_eq!(parent_map[&key2], vec![key3.clone()]);
+    }
+
+    // ---------------------------------------------------------------
+    // Ports of TestExpandOffsets / TestMultiBisectRight-adjacent tests.
+    //
+    // The Python TestExpandOffsets fixture builds a `BTreeGraphIndex`
+    // and pokes private attributes (`_size`, `_recommended_pages`,
+    // `_row_lengths`, `_get_offsets_to_cached_pages`) to drive the
+    // expand_offsets logic without ever reading from disk. We mirror
+    // that by exposing a `#[cfg(test)]` helper that lets a unit test
+    // synthesise the same state.
+    //
+    // The cached-pages set is supplied on each `expand_offsets` call
+    // (the Python suite monkeypatches `_get_offsets_to_cached_pages`,
+    // so for parity here we just take it as a parameter).
+    // ---------------------------------------------------------------
+
+    impl<T: IndexTransport> BTreeGraphIndex<T> {
+        /// Test-only: construct an index with synthetic header state and
+        /// no transport reads needed. Mirrors the Python
+        /// `TestExpandOffsets.prepare_index` helper.
+        #[cfg(test)]
+        pub(super) fn for_expand_test(
+            transport: T,
+            size: Option<u64>,
+            recommended_pages: usize,
+            row_lengths: Vec<usize>,
+            key_count: usize,
+            with_root: bool,
+        ) -> Self {
+            let mut idx = Self::new(transport, "test-index", size, 0);
+            idx.recommended_pages = recommended_pages;
+            idx.node_ref_lists = Some(0);
+            idx.key_length = Some(1);
+            idx.key_count = Some(key_count);
+            idx.row_offsets = Some(compute_row_offsets(&row_lengths));
+            idx.row_lengths = Some(row_lengths);
+            if with_root {
+                // Synthesise a minimal internal-node root so
+                // expand_offsets's "first read" branch isn't taken.
+                idx.root_node = Some(NodeKind::Internal(InternalNode {
+                    offset: 0,
+                    keys: Vec::new(),
+                }));
+            }
+            idx
+        }
+
+        /// Test-only: drive `expand_offsets` with an explicit cached set.
+        /// The production path consults `get_offsets_to_cached_pages`,
+        /// which inspects the LRUs; for unit tests we want full control
+        /// over what's "cached".
+        #[cfg(test)]
+        pub(super) fn expand_offsets_with_cached(
+            &self,
+            offsets: &[usize],
+            cached: &HashSet<usize>,
+        ) -> Result<Vec<usize>, IndexError> {
+            // Reimplement the public expand_offsets logic but take the
+            // cached set from the caller.
+            if offsets.len() >= self.recommended_pages {
+                return Ok(offsets.to_vec());
+            }
+            if self.size.is_none() {
+                return Ok(offsets.to_vec());
+            }
+            let total_pages = self.compute_total_pages_in_index()? as usize;
+            if total_pages.saturating_sub(cached.len()) <= self.recommended_pages {
+                let mut expanded: Vec<usize> =
+                    (0..total_pages).filter(|p| !cached.contains(p)).collect();
+                expanded.sort();
+                return Ok(expanded);
+            }
+            if self.root_node.is_none() {
+                return Ok(offsets.to_vec());
+            }
+            let row_lengths = self.row_lengths.as_ref().expect("populated");
+            let tree_depth = row_lengths.len();
+            if cached.len() < tree_depth && offsets.len() == 1 {
+                return Ok(offsets.to_vec());
+            }
+            let row_offsets = self.row_offsets.as_ref().expect("populated");
+            let mut final_offsets =
+                self.expand_to_neighbors(offsets, cached, total_pages, row_offsets);
+            final_offsets.sort();
+            Ok(final_offsets)
+        }
+    }
+
+    /// Stand-in transport that errors on any transport call — the
+    /// `TestExpandOffsets` cases never actually read from disk.
+    struct UnusedTransport;
+    impl IndexTransport for UnusedTransport {
+        fn get_bytes(&self, _path: &str) -> Result<Vec<u8>, IndexError> {
+            Err(IndexError::Other(
+                "UnusedTransport: no bytes to read".to_string(),
+            ))
+        }
+        fn recommended_page_size(&self) -> u64 {
+            // The make_index() helper uses MemoryTransport which has a
+            // 4096-byte recommendation; mirror that here.
+            4096
+        }
+    }
+
+    fn make_synth_index(
+        size: Option<u64>,
+        recommended_pages: usize,
+        row_lengths: Vec<usize>,
+        key_count: usize,
+        with_root: bool,
+    ) -> BTreeGraphIndex<UnusedTransport> {
+        BTreeGraphIndex::for_expand_test(
+            UnusedTransport,
+            size,
+            recommended_pages,
+            row_lengths,
+            key_count,
+            with_root,
+        )
+    }
+
+    fn cached(set: &[usize]) -> HashSet<usize> {
+        set.iter().copied().collect()
+    }
+
+    fn make_100_node_index() -> BTreeGraphIndex<UnusedTransport> {
+        // 100 pages (1 root + 99 leaves), with a "we already read pages 0
+        // and 50" cached set provided per call.
+        make_synth_index(Some(4096 * 100), 6, vec![1, 99], 1000, true)
+    }
+
+    fn make_1000_node_index() -> BTreeGraphIndex<UnusedTransport> {
+        make_synth_index(Some(4096 * 1000), 6, vec![1, 9, 990], 90000, true)
+    }
+
+    fn assert_expand(
+        expected: &[usize],
+        idx: &BTreeGraphIndex<UnusedTransport>,
+        offsets: &[usize],
+        cached_set: &[usize],
+    ) {
+        let got = idx
+            .expand_offsets_with_cached(offsets, &cached(cached_set))
+            .expect("expand");
+        assert_eq!(got, expected, "expanding {:?}", offsets);
+    }
+
+    #[test]
+    fn default_recommended_pages() {
+        // Local transport recommends 4096 bytes / 4096 PAGE_SIZE = 1 page.
+        let idx = BTreeGraphIndex::new(UnusedTransport, "test", None, 0);
+        assert_eq!(idx.recommended_pages, 1);
+    }
+
+    #[test]
+    fn compute_total_pages_in_index_no_header() {
+        // With no header parsed yet, the count is round_up(size / PAGE_SIZE).
+        for (size, expected) in [
+            (1024u64, 1u64),
+            (4095, 1),
+            (4096, 1),
+            (4097, 2),
+            (8192, 2),
+            (4096 * 75 + 10, 76),
+        ] {
+            let idx = BTreeGraphIndex::new(UnusedTransport, "test", Some(size), 0);
+            assert_eq!(idx.compute_total_pages_in_index().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn find_layer_first_and_end_three_layers() {
+        // Three rows: row 0 has 1 page, row 1 has 9 pages, row 2 has 990.
+        // row_offsets = [0, 1, 10, 1000].
+        let idx = make_1000_node_index();
+        let row_offsets = idx.row_offsets.as_ref().unwrap();
+        assert_eq!(find_layer_first_and_end(row_offsets, 0), (0, 1));
+        assert_eq!(find_layer_first_and_end(row_offsets, 1), (1, 10));
+        assert_eq!(find_layer_first_and_end(row_offsets, 9), (1, 10));
+        assert_eq!(find_layer_first_and_end(row_offsets, 10), (10, 1000));
+        assert_eq!(find_layer_first_and_end(row_offsets, 99), (10, 1000));
+        assert_eq!(find_layer_first_and_end(row_offsets, 999), (10, 1000));
+    }
+
+    #[test]
+    fn expand_unknown_size() {
+        // No size: never expand.
+        let idx = make_synth_index(None, 10, vec![1], 0, false);
+        assert_expand(&[0], &idx, &[0], &[]);
+        assert_expand(&[1, 4, 9], &idx, &[1, 4, 9], &[]);
+    }
+
+    #[test]
+    fn expand_more_than_recommended() {
+        // Already requesting >= recommended pages: don't expand further.
+        let idx = make_synth_index(Some(4096 * 100), 2, vec![1, 99], 1000, true);
+        assert_expand(&[1, 10], &idx, &[1, 10], &[]);
+        assert_expand(&[1, 10, 20], &idx, &[1, 10, 20], &[]);
+    }
+
+    #[test]
+    fn expand_read_all_from_root() {
+        // recommended=20 covers all 10 pages, so request [0] expands to 0..10.
+        let idx = make_synth_index(Some(4096 * 10), 20, vec![1, 9], 1000, false);
+        assert_expand(&(0..10).collect::<Vec<_>>(), &idx, &[0], &[]);
+    }
+
+    #[test]
+    fn expand_read_all_when_cached() {
+        // Already cached pages [0, 1, 2, 5, 6]; uncached count is 5,
+        // recommended=5 so we can read everything that's left.
+        let idx = make_synth_index(Some(4096 * 10), 5, vec![1, 9], 1000, true);
+        let cset: &[usize] = &[0, 1, 2, 5, 6];
+        assert_expand(&[3, 4, 7, 8, 9], &idx, &[3], cset);
+        assert_expand(&[3, 4, 7, 8, 9], &idx, &[8], cset);
+        assert_expand(&[3, 4, 7, 8, 9], &idx, &[9], cset);
+    }
+
+    #[test]
+    fn expand_no_root_node() {
+        // First read with no root yet: don't expand.
+        let idx = make_synth_index(Some(4096 * 10), 5, vec![1, 9], 1000, false);
+        assert_expand(&[0], &idx, &[0], &[]);
+    }
+
+    #[test]
+    fn expand_include_neighbors() {
+        let idx = make_100_node_index();
+        let cset: &[usize] = &[0, 50];
+        assert_expand(&[9, 10, 11, 12, 13, 14, 15], &idx, &[12], cset);
+        assert_expand(&[88, 89, 90, 91, 92, 93, 94], &idx, &[91], cset);
+        // Hitting the layer's edge: we keep going in the other direction.
+        assert_expand(&[1, 2, 3, 4, 5, 6], &idx, &[2], cset);
+        assert_expand(&[94, 95, 96, 97, 98, 99], &idx, &[98], cset);
+        // Multiple offsets expand around each.
+        assert_expand(&[1, 2, 3, 80, 81, 82], &idx, &[2, 81], cset);
+        assert_expand(&[1, 2, 3, 9, 10, 11, 80, 81, 82], &idx, &[2, 10, 81], cset);
+    }
+
+    #[test]
+    fn expand_stop_at_cached() {
+        let idx = make_100_node_index();
+        let cset: &[usize] = &[0, 10, 19];
+        assert_expand(&[11, 12, 13, 14, 15, 16], &idx, &[11], cset);
+        assert_expand(&[11, 12, 13, 14, 15, 16], &idx, &[12], cset);
+        assert_expand(&[12, 13, 14, 15, 16, 17, 18], &idx, &[15], cset);
+        assert_expand(&[13, 14, 15, 16, 17, 18], &idx, &[16], cset);
+        assert_expand(&[13, 14, 15, 16, 17, 18], &idx, &[17], cset);
+        assert_expand(&[13, 14, 15, 16, 17, 18], &idx, &[18], cset);
+    }
+
+    #[test]
+    fn expand_cannot_fully_expand() {
+        // Bound by cached neighbours on both sides — we don't loop forever.
+        let idx = make_100_node_index();
+        let cset: &[usize] = &[0, 10, 12];
+        assert_expand(&[11], &idx, &[11], cset);
+    }
+
+    #[test]
+    fn expand_overlap() {
+        let idx = make_100_node_index();
+        let cset: &[usize] = &[0, 50];
+        assert_expand(&[10, 11, 12, 13, 14, 15], &idx, &[12, 13], cset);
+        assert_expand(&[10, 11, 12, 13, 14, 15], &idx, &[11, 14], cset);
+    }
+
+    #[test]
+    fn expand_stay_within_layer() {
+        // A 3-layer tree: expansion should not bleed into the next layer.
+        let idx = make_1000_node_index();
+        let cset: &[usize] = &[0, 5, 500];
+        assert_expand(&[1, 2, 3, 4], &idx, &[2], cset);
+        assert_expand(&[6, 7, 8, 9], &idx, &[6], cset);
+        assert_expand(&[6, 7, 8, 9], &idx, &[9], cset);
+        assert_expand(&[10, 11, 12, 13, 14, 15], &idx, &[10], cset);
+        assert_expand(&[10, 11, 12, 13, 14, 15, 16], &idx, &[13], cset);
+
+        // A different cached set blocks expansion within row 1.
+        let cset2: &[usize] = &[0, 4, 12];
+        assert_expand(&[5, 6, 7, 8, 9], &idx, &[7], cset2);
+        assert_expand(&[10, 11], &idx, &[11], cset2);
+    }
+
+    #[test]
+    fn expand_small_requests_unexpanded() {
+        // Single-page requests in a deep tree don't expand on the first
+        // pass (we haven't read enough yet to justify it).
+        let idx = make_100_node_index();
+        let cset: &[usize] = &[0];
+        assert_expand(&[1], &idx, &[1], cset);
+        assert_expand(&[50], &idx, &[50], cset);
+        // But once we ask for >1 offset, we expand around each.
+        assert_expand(&[49, 50, 51, 59, 60, 61], &idx, &[50, 60], cset);
+
+        let idx = make_1000_node_index();
+        let cset: &[usize] = &[0];
+        assert_expand(&[1], &idx, &[1], cset);
+        let cset: &[usize] = &[0, 1];
+        assert_expand(&[100], &idx, &[100], cset);
+        let cset: &[usize] = &[0, 1, 100];
+        assert_expand(&[2, 3, 4, 5, 6, 7], &idx, &[2], cset);
+        assert_expand(&[2, 3, 4, 5, 6, 7], &idx, &[4], cset);
+        let cset: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7, 100];
+        assert_expand(&[102, 103, 104, 105, 106, 107, 108], &idx, &[105], cset);
+    }
+
+    #[test]
+    fn find_ancestors_empty_index() {
+        let mut idx = open_index(&[], 1, 1);
+        let mut parent_map: std::collections::HashMap<LeafKey, LeafRefList> =
+            std::collections::HashMap::new();
+        let mut missing: HashSet<LeafKey> = HashSet::new();
+        let one = vec![b"one".to_vec()];
+        let two = vec![b"two".to_vec()];
+        let search = idx
+            .find_ancestors(
+                &[one.clone(), two.clone()],
+                0,
+                &mut parent_map,
+                &mut missing,
+            )
+            .unwrap();
+        assert!(search.is_empty());
+        assert!(parent_map.is_empty());
+        assert_eq!(missing.len(), 2);
+        assert!(missing.contains(&one));
+        assert!(missing.contains(&two));
     }
 }
