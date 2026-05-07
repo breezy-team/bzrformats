@@ -27,6 +27,23 @@ pub enum MemoryState {
     InMemoryHashModified,
 }
 
+/// Sentinel `packed_stat` value used when no real stat is cached for
+/// an entry — 32 ASCII `x` characters, distinct from any base64
+/// encoding of an actual stat tuple.
+pub const NULLSTAT: &[u8] = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+/// `(minikind, fingerprint, size, executable, packed_stat)` tuple
+/// reserved for absent parent slots in the dirblock format.
+pub fn null_parent_details() -> TreeData {
+    TreeData {
+        minikind: Kind::Absent,
+        fingerprint: Vec::new(),
+        size: 0,
+        executable: false,
+        packed_stat: Vec::new(),
+    }
+}
+
 /// Per-tree record attached to an entry: `(minikind, fingerprint, size, executable, packed_stat)`.
 ///
 /// Mirrors the 5-tuple stored at `entry[1][tree_index]` in the Python

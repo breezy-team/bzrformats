@@ -22,6 +22,7 @@ pub mod inventory;
 pub mod inventory_delta;
 pub mod key_mapper;
 pub mod knit;
+pub mod lock;
 pub mod multiparent;
 pub mod pack;
 pub mod repository;
