@@ -294,28 +294,13 @@ class BTreeBuilder(_mod_index.GraphIndexBuilder):
             efficient order for the index (keys iteration order in this case).
         """
         keys = set(keys)
-        # Note: We don't use keys.intersection() here. If you read the C api,
-        #       set.intersection(other) special cases when other is a set and
-        #       will iterate the smaller of the two and lookup in the other.
-        #       It does *not* do this for any other type (even dict, unlike
-        #       some other set functions.) Since we expect keys is generally <<
-        #       self._nodes, it is faster to iterate over it in a list
-        #       comprehension
-        nodes = self._nodes
-        local_keys = [key for key in keys if key in nodes]
-        if self.reference_lists:
-            for key in local_keys:
-                node = nodes[key]
-                yield self, key, node[1], node[0]
-        else:
-            for key in local_keys:
-                node = nodes[key]
-                yield self, key, node[1]
-        # Find things that are in backing indices that have not been handled
-        # yet.
+        entries, local_keys = _index_rs.iter_btree_builder_nodes_for_keys(
+            self._nodes, keys, bool(self.reference_lists)
+        )
+        for entry in entries:
+            yield (self, *entry)
         if not self._backing_indices:
-            return  # We won't find anything there either
-        # Remove all of the keys that we found locally
+            return
         keys.difference_update(local_keys)
         for backing in self._backing_indices:
             if backing is None:
