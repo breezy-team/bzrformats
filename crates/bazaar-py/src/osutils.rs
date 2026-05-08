@@ -91,12 +91,11 @@ fn normalizes_filenames() -> bool {
 }
 
 #[pyfunction]
-fn supports_symlinks(path: PathBuf) -> Option<bool> {
+pub fn supports_symlinks(path: PathBuf) -> Option<bool> {
     bazaar::osutils::mounts::supports_symlinks(path)
 }
 
-#[pymodule]
-fn _osutils_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
+pub fn _osutils_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(split_lines, m)?)?;
     m.add_function(wrap_pyfunction!(rand_chars, m)?)?;
     m.add_function(wrap_pyfunction!(is_inside, m)?)?;

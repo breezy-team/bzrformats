@@ -11,3 +11,4 @@ bazaar = { path = "../bazaar", features=["pyo3"] }
 pyo3 = { workspace = true, features = ["extension-module", "chrono"]}
 pyo3-filelike = { workspace = true }
 chrono = { workspace = true }
+walkdir = "2"

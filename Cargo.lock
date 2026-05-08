@@ -96,6 +96,7 @@ dependencies = [
  "chrono",
  "pyo3",
  "pyo3-filelike",
+ "walkdir",
 ]
 
 [[package]]
@@ -149,15 +150,6 @@ name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
-
-[[package]]
-name = "bzrformats-osutils"
-version = "0.1.0"
-dependencies = [
- "bazaar",
- "pyo3",
- "walkdir",
-]
 
 [[package]]
 name = "cc"
