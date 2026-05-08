@@ -18,7 +18,7 @@ pub struct ProcessPathInfo {
     pub abspath: Vec<u8>,
     /// Filesystem kind, or `None` when the path is missing or is of
     /// a kind dirstate doesn't track (block / char / socket / fifo).
-    pub kind: Option<osutils::Kind>,
+    pub kind: Option<crate::osutils::Kind>,
     /// Stat info for the path.
     pub stat: StatInfo,
 }
@@ -90,8 +90,8 @@ pub struct DirstateChange {
     pub target_parent_id: Option<Vec<u8>>,
     pub old_basename: Option<Vec<u8>>,
     pub new_basename: Option<Vec<u8>>,
-    pub source_kind: Option<osutils::Kind>,
-    pub target_kind: Option<osutils::Kind>,
+    pub source_kind: Option<crate::osutils::Kind>,
+    pub target_kind: Option<crate::osutils::Kind>,
     pub source_exec: Option<bool>,
     pub target_exec: Option<bool>,
 }

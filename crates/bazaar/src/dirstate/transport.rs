@@ -48,7 +48,7 @@ pub struct DirEntryInfo {
     pub basename: Vec<u8>,
     /// Filesystem kind, or `None` for kinds dirstate doesn't track
     /// (block / char / socket / fifo).
-    pub kind: Option<osutils::Kind>,
+    pub kind: Option<crate::osutils::Kind>,
     /// Stat info from `lstat` on the child.
     pub stat: StatInfo,
     /// Absolute path of the child on disk (utf8 bytes).

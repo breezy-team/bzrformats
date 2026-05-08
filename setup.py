@@ -117,9 +117,6 @@ rust_extensions = [
     RustExtension(
         "bzrformats._bzr_rs", "crates/bazaar-py/Cargo.toml", binding=Binding.PyO3
     ),
-    RustExtension(
-        "bzrformats._osutils_rs", "crates/osutils-py/Cargo.toml", binding=Binding.PyO3
-    ),
 ]
 entry_points = {}
 

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 pub fn validate_properties(properties: &HashMap<String, Vec<u8>>) -> bool {
     for (key, _value) in properties.iter() {
-        if osutils::contains_whitespace(key.as_str()) {
+        if crate::osutils::contains_whitespace(key.as_str()) {
             return false;
         }
     }

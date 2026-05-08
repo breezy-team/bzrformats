@@ -22,6 +22,7 @@ mod inventory;
 mod knit;
 mod lock;
 mod multiparent;
+mod osutils;
 mod pack;
 mod smart;
 mod textmerge;
@@ -927,6 +928,10 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let tuned_gzipm = tuned_gzip::_tuned_gzip_rs(py)?;
     m.add_submodule(&tuned_gzipm)?;
 
+    let osutilsm = PyModule::new(py, "osutils")?;
+    osutils::_osutils_rs(py, &osutilsm)?;
+    m.add_submodule(&osutilsm)?;
+
     let chunk_writerm = chunk_writer::_chunk_writer_rs(py)?;
     m.add_submodule(&chunk_writerm)?;
 
@@ -963,6 +968,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.bisect_multi", module_name), &bisect_multim)?;
     modules.set_item(format!("{}.chunk_writer", module_name), &chunk_writerm)?;
     modules.set_item(format!("{}.tuned_gzip", module_name), &tuned_gzipm)?;
+    modules.set_item(format!("{}.osutils", module_name), &osutilsm)?;
     modules.set_item(format!("{}.chunk_writer", module_name), &chunk_writerm)?;
     modules.set_item(format!("{}.bisect_multi", module_name), &bisect_multim)?;
 

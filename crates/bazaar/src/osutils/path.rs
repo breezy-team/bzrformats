@@ -14,6 +14,15 @@ pub fn is_inside_any(dir_list: &[&Path], fname: &Path) -> bool {
     false
 }
 
+pub fn is_inside_or_parent_of_any(dir_list: &[&Path], fname: &Path) -> bool {
+    for dirname in dir_list {
+        if is_inside(dirname, fname) || is_inside(fname, dirname) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn parent_directories(path: &Path) -> impl Iterator<Item = &Path> {
     let mut path = path;
     std::iter::from_fn(move || {

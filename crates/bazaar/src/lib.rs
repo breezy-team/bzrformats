@@ -24,6 +24,7 @@ pub mod key_mapper;
 pub mod knit;
 pub mod lock;
 pub mod multiparent;
+pub mod osutils;
 pub mod pack;
 pub mod repository;
 pub mod revision;

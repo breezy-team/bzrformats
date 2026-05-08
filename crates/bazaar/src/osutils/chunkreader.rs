@@ -64,7 +64,7 @@ fn test_chunks_reader_vec() {
 
 #[test]
 fn test_chunks_reader_slice() {
-    let chunks = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+    let chunks: Vec<&[u8]> = vec![&[1, 2, 3], &[4, 5, 6], &[7, 8, 9]];
     let mut reader = ChunksReader::new(Box::new(chunks.into_iter()));
 
     let mut buf = [0; 4];

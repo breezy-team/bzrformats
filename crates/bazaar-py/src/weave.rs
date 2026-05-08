@@ -583,6 +583,20 @@ impl PyWeave {
         }
         Ok(outer)
     }
+    #[setter]
+    fn set__parents<'py>(&mut self, py: Python<'py>, new_parents: Bound<'py, PyAny>) -> PyResult<()> {
+        let mut outer = Vec::new();
+        for ps in new_parents.try_iter()? {
+            let mut inner = Vec::new();
+            for p in ps?.try_iter()? {
+                inner.push(p?.extract::<usize>()?);
+            }
+            outer.push(inner);
+        }
+        self.inner.parents = outer;
+        Ok(())
+    }
+
 
     /// Snapshot of the per-version sha1 list.
     #[getter]
@@ -593,6 +607,18 @@ impl PyWeave {
         }
         Ok(out)
     }
+    #[setter]
+    fn set__names<'py>(&mut self, py: Python<'py>, new_names: Bound<'py, PyAny>) -> PyResult<()> {
+        let mut names = Vec::new();
+        for n in new_names.try_iter()? {
+            let b = n?.cast_into::<PyBytes>()
+                .map_err(|_| PyTypeError::new_err("_names must be bytes"))?;
+            names.push(b.as_bytes().to_vec());
+        }
+        self.inner.names = names;
+        Ok(())
+    }
+
 
     /// Snapshot of the per-version name list.
     #[getter]

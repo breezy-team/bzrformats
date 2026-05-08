@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 #[pyfunction]
 fn split_lines<'a>(py: Python<'a>, text: &'a [u8]) -> PyResult<Bound<'a, PyList>> {
     let ret = PyList::empty(py);
-    for line in osutils::split_lines(text) {
+    for line in bazaar::osutils::split_lines(text) {
         let line_bytes = PyBytes::new(py, &line);
         ret.append(line_bytes)?;
     }
@@ -14,27 +14,27 @@ fn split_lines<'a>(py: Python<'a>, text: &'a [u8]) -> PyResult<Bound<'a, PyList>
 
 #[pyfunction]
 fn rand_chars(num: usize) -> PyResult<String> {
-    Ok(osutils::rand_chars(num))
+    Ok(bazaar::osutils::rand_chars(num))
 }
 
 #[pyfunction]
 fn is_inside(dir: &str, fname: &str) -> PyResult<bool> {
     let dir_path = Path::new(dir);
     let fname_path = Path::new(fname);
-    Ok(osutils::path::is_inside(dir_path, fname_path))
+    Ok(bazaar::osutils::path::is_inside(dir_path, fname_path))
 }
 
 #[pyfunction]
 fn is_inside_any(dir_list: Vec<String>, fname: &str) -> PyResult<bool> {
     let dir_paths: Vec<&Path> = dir_list.iter().map(|d| Path::new(d.as_str())).collect();
     let fname_path = Path::new(fname);
-    Ok(osutils::path::is_inside_any(&dir_paths, fname_path))
+    Ok(bazaar::osutils::path::is_inside_any(&dir_paths, fname_path))
 }
 
 #[pyfunction]
 fn parent_directories(path: &str) -> PyResult<Vec<String>> {
     let path_obj = Path::new(path);
-    let parents: Vec<String> = osutils::path::parent_directories(path_obj)
+    let parents: Vec<String> = bazaar::osutils::path::parent_directories(path_obj)
         .map(|p| p.to_string_lossy().to_string())
         .collect();
     Ok(parents)
@@ -87,16 +87,15 @@ fn walkdirs_utf8(top: &str) -> PyResult<Vec<(String, Vec<(String, String, u64, S
 
 #[pyfunction]
 fn normalizes_filenames() -> bool {
-    osutils::path::normalizes_filenames()
+    bazaar::osutils::path::normalizes_filenames()
 }
 
 #[pyfunction]
-fn supports_symlinks(path: PathBuf) -> Option<bool> {
-    osutils::mounts::supports_symlinks(path)
+pub fn supports_symlinks(path: PathBuf) -> Option<bool> {
+    bazaar::osutils::mounts::supports_symlinks(path)
 }
 
-#[pymodule]
-fn _osutils_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
+pub fn _osutils_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(split_lines, m)?)?;
     m.add_function(wrap_pyfunction!(rand_chars, m)?)?;
     m.add_function(wrap_pyfunction!(is_inside, m)?)?;

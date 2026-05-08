@@ -6,7 +6,7 @@
 //! default one just hashes the raw file contents.
 
 use super::transport::StatInfo;
-use osutils::sha::{sha_file, sha_file_by_name};
+use crate::osutils::sha::{sha_file, sha_file_by_name};
 use std::fs::File;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;

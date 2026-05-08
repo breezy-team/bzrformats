@@ -1,6 +1,6 @@
 use lazy_regex::regex;
 use lazy_static::lazy_static;
-use osutils::rand_chars;
+use crate::osutils::rand_chars;
 use regex::bytes::Regex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,7 +21,7 @@ fn gen_file_id_suffix() -> String {
     let random_chars = rand_chars(16);
     format!(
         "-{}-{}-",
-        osutils::time::compact_date(current_time),
+        crate::osutils::time::compact_date(current_time),
         random_chars
     )
 }
@@ -110,7 +110,7 @@ fn get_identifier(s: &str) -> Vec<u8> {
 pub fn gen_revision_id(username: &str, timestamp: Option<u64>) -> Vec<u8> {
     let user_or_email = get_identifier(username);
     // This gives 36^16 ~= 2^82.7 ~= 83 bits of entropy
-    let unique_chunk = osutils::rand_chars(16).as_bytes().to_vec();
+    let unique_chunk = crate::osutils::rand_chars(16).as_bytes().to_vec();
     let timestamp = timestamp.unwrap_or_else(|| {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -119,7 +119,7 @@ pub fn gen_revision_id(username: &str, timestamp: Option<u64>) -> Vec<u8> {
     });
     [
         user_or_email,
-        osutils::time::compact_date(timestamp).as_bytes().to_vec(),
+        crate::osutils::time::compact_date(timestamp).as_bytes().to_vec(),
         unique_chunk,
     ]
     .join(&b'-')

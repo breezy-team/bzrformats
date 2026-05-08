@@ -1,5 +1,5 @@
-use crate::chunks_to_lines;
-use crate::path::{accessible_normalized_filename, inaccessible_normalized_filename};
+use super::chunks_to_lines;
+use super::path::{accessible_normalized_filename, inaccessible_normalized_filename};
 use std::path::{Path, PathBuf};
 
 fn assert_chunks_to_lines(input: Vec<&str>, expected: Vec<&str>) {
@@ -25,7 +25,7 @@ fn test_chunks_to_lines() {
 #[test]
 fn test_is_inside() {
     fn is_inside(path: &str, dir: &str) -> bool {
-        crate::path::is_inside(Path::new(path), Path::new(dir))
+        super::path::is_inside(Path::new(path), Path::new(dir))
     }
     assert!(is_inside("a", "a"));
     assert!(!is_inside("a", "b"));
@@ -43,7 +43,7 @@ fn test_is_inside() {
 fn test_is_inside_any() {
     fn is_inside_any(path: &str, dirs: &[&str]) -> bool {
         let dirs = dirs.iter().map(Path::new).collect::<Vec<&Path>>();
-        crate::path::is_inside_any(dirs.as_slice(), Path::new(path))
+        super::path::is_inside_any(dirs.as_slice(), Path::new(path))
     }
     assert!(is_inside_any("a", &["a"]));
     assert!(!is_inside_any("a", &["b"]));
@@ -64,7 +64,7 @@ fn test_is_inside_any() {
 fn test_is_inside_or_parent_of_any() {
     fn is_inside_or_parent_of_any(path: &str, dirs: &[&str]) -> bool {
         let dirs = dirs.iter().map(Path::new).collect::<Vec<&Path>>();
-        crate::path::is_inside_or_parent_of_any(dirs.as_slice(), Path::new(path))
+        super::path::is_inside_or_parent_of_any(dirs.as_slice(), Path::new(path))
     }
     assert!(is_inside_or_parent_of_any("a", &["a"]));
     assert!(!is_inside_or_parent_of_any("a", &["b"]));

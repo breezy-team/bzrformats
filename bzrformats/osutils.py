@@ -260,14 +260,14 @@ def file_iterator(file_obj, chunk_size=65536):
 
 def normalizes_filenames():
     """Check if the filesystem normalizes filenames (e.g. Mac OS X)."""
-    from . import _osutils_rs
+    from ._bzr_rs import osutils as _osutils_rs
 
     return _osutils_rs.normalizes_filenames()
 
 
 def rand_chars(length):
     """Generate a string of random characters."""
-    from . import _osutils_rs
+    from ._bzr_rs import osutils as _osutils_rs
 
     return _osutils_rs.rand_chars(length)
 
@@ -456,7 +456,7 @@ def parent_directories(filename):
     :param filename: Path (bytes or str)
     :return: List of parent directory paths
     """
-    from . import _osutils_rs
+    from ._bzr_rs import osutils as _osutils_rs
 
     if isinstance(filename, bytes):
         filename = filename.decode("utf-8")
@@ -472,7 +472,7 @@ def split_lines(text):
     Returns:
         List of byte strings, each ending with \\n where appropriate
     """
-    from . import _osutils_rs
+    from ._bzr_rs import osutils as _osutils_rs
 
     return _osutils_rs.split_lines(text)
 

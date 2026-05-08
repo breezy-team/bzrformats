@@ -134,7 +134,7 @@ pub trait GroupCompressor {
             ));
         }
         // we assume someone knew what they were doing when they passed it in
-        let sha = expected_sha.unwrap_or_else(|| osutils::sha::sha_chunks(chunks));
+        let sha = expected_sha.unwrap_or_else(|| crate::osutils::sha::sha_chunks(chunks));
         if let Some(nostore_sha) = nostore_sha {
             if sha == nostore_sha {
                 return Err(Error::ExistingContent(key.clone()));
@@ -231,7 +231,7 @@ impl GroupCompressor for TraditionalGroupCompressor {
         soft: Option<bool>,
     ) -> Result<(usize, usize, RecordKind), Error> {
         let new_lines =
-            osutils::chunks_to_lines(chunks.iter().map(|x| Ok::<_, std::io::Error>(*x)))
+            crate::osutils::chunks_to_lines(chunks.iter().map(|x| Ok::<_, std::io::Error>(*x)))
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
         let (mut out_lines, mut index_lines) =
@@ -328,7 +328,7 @@ impl TraditionalGroupCompressor {
                 vec![apply_delta(source.as_slice(), data.as_slice())?]
             }
         };
-        let data_sha1 = osutils::sha::sha_chunks(data.as_slice());
+        let data_sha1 = crate::osutils::sha::sha_chunks(data.as_slice());
         Ok((data, data_sha1))
     }
 }
@@ -420,7 +420,7 @@ impl RabinGroupCompressor {
             }
             other => return Err(ExtractError::UnknownKind(other)),
         };
-        let data_sha1 = osutils::sha::sha_chunks(&data);
+        let data_sha1 = crate::osutils::sha::sha_chunks(&data);
         Ok((data, data_sha1))
     }
 
@@ -636,7 +636,7 @@ mod tests {
     fn rabin_compressor_nostore_sha_match_raises_existing_content() {
         let mut gc = RabinGroupCompressor::new(None);
         let text = b"some content that we want to deduplicate\n";
-        let actual_sha = osutils::sha::sha_chunks(&[text.as_slice()]);
+        let actual_sha = crate::osutils::sha::sha_chunks(&[text.as_slice()]);
         let err = gc
             .compress(
                 &key(&[b"label"]),
@@ -682,7 +682,7 @@ mod tests {
         let (sha, _, _, _) = gc
             .compress(&key, &[text.as_slice()], text.len(), None, None, None)
             .unwrap();
-        let expected_sha = osutils::sha::sha_chunks(&[text.as_slice()]);
+        let expected_sha = crate::osutils::sha::sha_chunks(&[text.as_slice()]);
         assert_eq!(sha, expected_sha);
 
         // The recorded label_deltas key is the prefix plus "sha1:..." segment.
@@ -902,7 +902,7 @@ mod tests {
     fn traditional_compressor_nostore_sha_match_raises_existing_content() {
         let mut gc = TraditionalGroupCompressor::new();
         let text = b"some line-delta content\n";
-        let actual_sha = osutils::sha::sha_chunks(&[text.as_slice()]);
+        let actual_sha = crate::osutils::sha::sha_chunks(&[text.as_slice()]);
         let err = gc
             .compress(
                 &key(&[b"label"]),
@@ -925,7 +925,7 @@ mod tests {
         let (sha, _, _, _) = gc
             .compress(&key, &[text.as_slice()], text.len(), None, None, None)
             .unwrap();
-        let expected_sha = osutils::sha::sha_chunks(&[text.as_slice()]);
+        let expected_sha = crate::osutils::sha::sha_chunks(&[text.as_slice()]);
         assert_eq!(sha, expected_sha);
         let stored_key = vec![
             b"prefix".to_vec(),

@@ -122,8 +122,8 @@ pub fn read_item<R: Read>(r: &mut R) -> Result<GroupCompressItem, Error> {
 /// enum (rather than `Box<dyn Read>`) keeps the owning struct `Send + Sync`
 /// so it can live inside a pyo3 `#[pyclass]` without the `unsendable` marker.
 enum Decompressor {
-    Lzma(xz2::read::XzDecoder<osutils::chunkreader::ChunksReader<Vec<u8>>>),
-    Zlib(flate2::read::ZlibDecoder<osutils::chunkreader::ChunksReader<Vec<u8>>>),
+    Lzma(xz2::read::XzDecoder<crate::osutils::chunkreader::ChunksReader<Vec<u8>>>),
+    Zlib(flate2::read::ZlibDecoder<crate::osutils::chunkreader::ChunksReader<Vec<u8>>>),
 }
 
 impl std::io::Read for Decompressor {
@@ -274,7 +274,7 @@ impl GroupCompressBlock {
             if self.z_content_length == Some(0) {
                 self.content = Some(b"".to_vec());
             } else {
-                let c = osutils::chunkreader::ChunksReader::new(Box::new(
+                let c = crate::osutils::chunkreader::ChunksReader::new(Box::new(
                     self.z_content_chunks.clone().unwrap().into_iter(),
                 ));
                 self.z_content_decompressor = Some(match self.compressor.unwrap() {

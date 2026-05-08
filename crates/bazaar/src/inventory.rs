@@ -1,6 +1,6 @@
 use crate::inventory_delta::{InventoryDelta, InventoryDeltaEntry, InventoryDeltaInconsistency};
 use crate::{FileId, RevisionId};
-use osutils::Kind;
+use crate::osutils::Kind;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -747,7 +747,7 @@ impl MutableInventory {
         &self,
         relpath: &str,
     ) -> Option<(&Entry, Vec<String>, Vec<String>)> {
-        let names = osutils::path::splitpath(relpath).unwrap();
+        let names = crate::osutils::path::splitpath(relpath).unwrap();
         self.get_entry_by_path_segments_partial(&names)
     }
 
@@ -783,7 +783,7 @@ impl MutableInventory {
     }
 
     pub fn get_entry_by_path(&self, relpath: &str) -> Option<&Entry> {
-        self.get_entry_by_path_segments(osutils::path::splitpath(relpath).unwrap().as_slice())
+        self.get_entry_by_path_segments(crate::osutils::path::splitpath(relpath).unwrap().as_slice())
     }
 
     pub fn get_entry_by_path_segments(&self, names: &[&str]) -> Option<&Entry> {
@@ -1222,7 +1222,7 @@ impl MutableInventory {
         symlink_target: Option<String>,
         reference_revision: Option<RevisionId>,
     ) -> Result<FileId, Error> {
-        let parts = osutils::path::splitpath(relpath).unwrap();
+        let parts = crate::osutils::path::splitpath(relpath).unwrap();
 
         if parts.is_empty() {
             self.clear();
@@ -1446,7 +1446,7 @@ impl Eq for MutableInventory {}
 
 // Normalize name
 pub fn ensure_normalized_name(name: &std::path::Path) -> Result<std::path::PathBuf, Error> {
-    let (norm_name, can_access) = osutils::path::normalized_filename(name).ok_or_else(|| {
+    let (norm_name, can_access) = crate::osutils::path::normalized_filename(name).ok_or_else(|| {
         Error::InvalidNormalization(name.to_path_buf(), "name is not normalized".to_string())
     })?;
 

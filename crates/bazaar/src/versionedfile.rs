@@ -509,7 +509,7 @@ pub trait ContentFactory {
         Self: Sized,
     {
         Box::new(
-            osutils::chunks_to_lines(self.into_chunks().map(Ok::<_, std::io::Error>))
+            crate::osutils::chunks_to_lines(self.into_chunks().map(Ok::<_, std::io::Error>))
                 .map(|v| v.unwrap().into_owned()),
         )
     }
@@ -568,7 +568,7 @@ impl ContentFactory for FulltextContentFactory {
         'a: 'b,
     {
         Box::new(
-            osutils::chunks_to_lines(std::iter::once(Ok::<_, std::io::Error>(&self.fulltext)))
+            crate::osutils::chunks_to_lines(std::iter::once(Ok::<_, std::io::Error>(&self.fulltext)))
                 .map(|v| v.unwrap()),
         )
     }
@@ -679,7 +679,7 @@ impl ContentFactory for ChunkedContentFactory {
         'a: 'b,
     {
         Box::new(
-            osutils::chunks_to_lines(self.chunks.iter().map(Ok::<_, std::io::Error>))
+            crate::osutils::chunks_to_lines(self.chunks.iter().map(Ok::<_, std::io::Error>))
                 .map(|l| l.unwrap()),
         )
     }

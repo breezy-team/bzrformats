@@ -87,27 +87,27 @@ impl Kind {
         matches!(self, Kind::Absent | Kind::Relocated)
     }
 
-    /// Convert to the 4-variant [`osutils::Kind`]; returns `None`
+    /// Convert to the 4-variant [`crate::osutils::Kind`]; returns `None`
     /// for ``Absent`` / ``Relocated`` (which have no filesystem
     /// counterpart).
-    pub fn to_osutils_kind(self) -> Option<osutils::Kind> {
+    pub fn to_osutils_kind(self) -> Option<crate::osutils::Kind> {
         match self {
-            Kind::File => Some(osutils::Kind::File),
-            Kind::Directory => Some(osutils::Kind::Directory),
-            Kind::Symlink => Some(osutils::Kind::Symlink),
-            Kind::TreeReference => Some(osutils::Kind::TreeReference),
+            Kind::File => Some(crate::osutils::Kind::File),
+            Kind::Directory => Some(crate::osutils::Kind::Directory),
+            Kind::Symlink => Some(crate::osutils::Kind::Symlink),
+            Kind::TreeReference => Some(crate::osutils::Kind::TreeReference),
             Kind::Absent | Kind::Relocated => None,
         }
     }
 }
 
-impl From<osutils::Kind> for Kind {
-    fn from(k: osutils::Kind) -> Self {
+impl From<crate::osutils::Kind> for Kind {
+    fn from(k: crate::osutils::Kind) -> Self {
         match k {
-            osutils::Kind::File => Kind::File,
-            osutils::Kind::Directory => Kind::Directory,
-            osutils::Kind::Symlink => Kind::Symlink,
-            osutils::Kind::TreeReference => Kind::TreeReference,
+            crate::osutils::Kind::File => Kind::File,
+            crate::osutils::Kind::Directory => Kind::Directory,
+            crate::osutils::Kind::Symlink => Kind::Symlink,
+            crate::osutils::Kind::TreeReference => Kind::TreeReference,
         }
     }
 }

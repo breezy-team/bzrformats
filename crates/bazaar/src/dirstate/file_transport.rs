@@ -224,13 +224,13 @@ fn stat_info_from_metadata(m: &std::fs::Metadata) -> Result<StatInfo, TransportE
     }
 }
 
-fn osutils_kind_from_stat(stat: &StatInfo) -> Option<osutils::Kind> {
+fn osutils_kind_from_stat(stat: &StatInfo) -> Option<crate::osutils::Kind> {
     if stat.is_file() {
-        Some(osutils::Kind::File)
+        Some(crate::osutils::Kind::File)
     } else if stat.is_dir() {
-        Some(osutils::Kind::Directory)
+        Some(crate::osutils::Kind::Directory)
     } else if stat.is_symlink() {
-        Some(osutils::Kind::Symlink)
+        Some(crate::osutils::Kind::Symlink)
     } else {
         None
     }

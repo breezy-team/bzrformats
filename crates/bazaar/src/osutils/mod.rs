@@ -286,3 +286,6 @@ pub mod mounts;
 pub mod path;
 pub mod sha;
 pub mod time;
+
+#[cfg(test)]
+mod tests;

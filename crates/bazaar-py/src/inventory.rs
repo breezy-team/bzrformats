@@ -4,7 +4,7 @@ use bazaar::inventory_delta::{
     InventoryDeltaSerializeError,
 };
 use bazaar::{FileId, RevisionId};
-use osutils::Kind;
+use bazaar::osutils::Kind;
 use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::{
     PyIndexError, PyKeyError, PyNotImplementedError, PyTypeError, PyValueError,
@@ -1075,7 +1075,7 @@ impl Inventory {
         &mut self,
         py: Python<'py>,
         relpath: &str,
-        kind: osutils::Kind,
+        kind: bazaar::osutils::Kind,
         file_id: Option<FileId>,
         revision: Option<RevisionId>,
         text_sha1: Option<Vec<u8>>,

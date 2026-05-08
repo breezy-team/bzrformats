@@ -73,13 +73,15 @@ dependencies = [
  "log",
  "lru",
  "maplit",
+ "memchr",
  "nix",
- "osutils",
  "patiencediff",
  "pyo3",
+ "rand",
  "regex",
  "sha1",
  "tempfile",
+ "unicode-normalization",
  "vcs-graph",
  "winapi",
  "xmltree",
@@ -92,9 +94,9 @@ version = "3.4.2"
 dependencies = [
  "bazaar",
  "chrono",
- "osutils",
  "pyo3",
  "pyo3-filelike",
+ "walkdir",
 ]
 
 [[package]]
@@ -150,15 +152,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
-name = "bzrformats-osutils"
-version = "0.1.0"
-dependencies = [
- "osutils",
- "pyo3",
- "walkdir",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -187,9 +180,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -576,21 +567,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "osutils"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "lazy_static",
- "log",
- "memchr",
- "pyo3",
- "rand",
- "sha1",
- "unicode-normalization",
- "winapi",
-]
 
 [[package]]
 name = "patiencediff"
