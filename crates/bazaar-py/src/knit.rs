@@ -110,9 +110,10 @@ fn process_one_record<'py>(
 
 /// Load the knit index file into memory.
 ///
-/// This is the Rust equivalent of _load_data_c from the Cython extension.
+/// Successor to the Cython `_load_data_c`; the `_c` suffix is dropped
+/// because the Rust extension is no longer C-shaped.
 #[pyfunction]
-pub fn _load_data_c(py: Python, kndx: &Bound<PyAny>, fp: &Bound<PyAny>) -> PyResult<()> {
+pub fn _load_data(py: Python, kndx: &Bound<PyAny>, fp: &Bound<PyAny>) -> PyResult<()> {
     let cache = kndx.getattr("_cache")?;
     let cache = cache.cast_into::<PyDict>()?;
     let history = kndx.getattr("_history")?;
@@ -1586,7 +1587,7 @@ fn dictionary_compress_rs<'py>(
 
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
-    m.add_function(wrap_pyfunction!(_load_data_c, &m)?)?;
+    m.add_function(wrap_pyfunction!(_load_data, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_fulltext_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_line_delta_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(lower_fulltext_rs, &m)?)?;
