@@ -19,10 +19,20 @@
 //! call [`ReadLock::unlock`]/[`WriteLock::unlock`] to release earlier
 //! and observe any error.
 
+#[cfg(unix)]
 use nix::libc;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use winapi::um::fileapi::{LockFileEx, UnlockFileEx};
+#[cfg(windows)]
+use winapi::um::minwinbase::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OVERLAPPED};
+#[cfg(windows)]
+use winapi::um::winnt::HANDLE;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -147,6 +157,7 @@ enum FcntlOp {
 /// `fcntl(F_SETLK, struct flock)` so we get the same per-process
 /// semantics as Python's `fcntl.lockf`. Maps `EWOULDBLOCK`/`EAGAIN`
 /// to `LockError::Contention`.
+#[cfg(unix)]
 fn fcntl_lockf(file: &File, op: FcntlOp, path: &Path) -> Result<(), LockError> {
     use nix::errno::Errno;
     let mut fl: libc::flock = unsafe { std::mem::zeroed() };
@@ -169,6 +180,38 @@ fn fcntl_lockf(file: &File, op: FcntlOp, path: &Path) -> Result<(), LockError> {
     Err(LockError::Io(std::io::Error::from_raw_os_error(
         errno as i32,
     )))
+}
+
+/// Apply the requested lock operation to `file` on Windows.
+#[cfg(windows)]
+fn fcntl_lockf(file: &File, op: FcntlOp, path: &Path) -> Result<(), LockError> {
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let res = match op {
+        FcntlOp::LockShared => unsafe {
+            LockFileEx(handle, LOCKFILE_FAIL_IMMEDIATELY, 0, !0, !0, &mut overlapped)
+        },
+        FcntlOp::LockExclusive => unsafe {
+            LockFileEx(
+                handle,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                !0,
+                !0,
+                &mut overlapped,
+            )
+        },
+        FcntlOp::Unlock => unsafe { UnlockFileEx(handle, 0, !0, !0, &mut overlapped) },
+    };
+    if res != 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(33) {
+        // ERROR_LOCK_VIOLATION
+        return Err(LockError::Contention(path.to_path_buf()));
+    }
+    Err(LockError::Io(err))
 }
 
 /// OS-level shared (read) lock on a file. The file is accessible
