@@ -37,9 +37,6 @@ pub mod versionedfile;
 pub mod weave;
 pub mod xml_serializer;
 
-#[cfg(feature = "pyo3")]
-pub mod pyversionedfile;
-
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileId(Vec<u8>);
 
