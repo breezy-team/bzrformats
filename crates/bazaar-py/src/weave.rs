@@ -1,6 +1,7 @@
 use bazaar::weave::{
-    extract, inclusions, read_weave_v5, reweave, walk_internal, write_weave_v5, ExtractLine,
-    Instruction, PlanMergeState, WalkLine, WeaveEntry, WeaveError, WeaveFile, WeaveFileError,
+    extract, inclusions, order_record_stream, read_weave_v5, reweave, walk_internal,
+    write_weave_v5, ExtractLine, Instruction, PlanMergeState, WalkLine, WeaveEntry, WeaveError,
+    WeaveFile, WeaveFileError,
 };
 use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
@@ -15,6 +16,7 @@ import_exception!(bzrformats.weave, WeaveTextDiffers);
 import_exception!(bzrformats.errors, RevisionAlreadyPresent);
 import_exception!(bzrformats.errors, RevisionNotPresent);
 import_exception!(bzrformats.versionedfile, ExistingContent);
+import_exception!(bzrformats.versionedfile, UnavailableRepresentation);
 
 fn py_weave_to_rust(weave: &Bound<PyList>) -> PyResult<Vec<WeaveEntry>> {
     let mut out = Vec::with_capacity(weave.len());
@@ -1139,7 +1141,7 @@ impl PyWeave {
         random_id: bool,
         check_content: bool,
     ) -> PyResult<(Bound<'py, PyBytes>, usize, usize)> {
-        let _ = (parent_texts, left_matching_blocks, random_id, check_content);
+        let _ = (parent_texts, left_matching_blocks, random_id);
         let parent_names: Vec<Vec<u8>> = parents
             .try_iter()?
             .map(|p| -> PyResult<Vec<u8>> {
@@ -1150,6 +1152,11 @@ impl PyWeave {
                 Ok(b.as_bytes().to_vec())
             })
             .collect::<PyResult<_>>()?;
+        // Bytes-only check is unconditional (we have to be able to copy
+        // the lines somewhere); the inline-newline check honours
+        // `check_content` because callers sometimes opt out for
+        // performance on already-validated input. Mirrors the Python
+        // `VersionedFile._check_lines_*` flow.
         let lines_rust: Vec<Vec<u8>> = lines
             .try_iter()?
             .map(|l| -> PyResult<Vec<u8>> {
@@ -1158,7 +1165,7 @@ impl PyWeave {
                     .cast_into::<PyBytes>()
                     .map_err(|_| PyTypeError::new_err("lines"))?;
                 let bytes = b.as_bytes();
-                if bytes.len() > 1 && bytes[..bytes.len() - 1].contains(&b'\n') {
+                if check_content && bytes.len() > 1 && bytes[..bytes.len() - 1].contains(&b'\n') {
                     return Err(PyValueError::new_err("lines contain newlines"));
                 }
                 Ok(bytes.to_vec())
@@ -1263,6 +1270,246 @@ impl PyWeave {
         self.inner.sha1s[version] = sha.to_vec();
         Ok(())
     }
+
+    /// Yield content factories for `version_keys` in the requested order.
+    /// Mirrors `Weave.get_record_stream` from bzrformats/weave.py:
+    ///
+    /// * each input is a 1-element tuple key `(name,)`
+    /// * `ordering` is one of `"unordered"`, `"topological"`,
+    ///   `"groupcompress"`
+    /// * `include_delta_closure` is accepted for interface parity but
+    ///   ignored; this storage doesn't carry deltas
+    ///
+    /// Versions known to this weave are returned as
+    /// [`WeaveContentFactory`]; missing versions are returned as
+    /// `bzrformats._bzr_rs.versionedfile.AbsentContentFactory` so the
+    /// caller can short-circuit to its absent path.
+    #[pyo3(signature = (version_keys, ordering, include_delta_closure))]
+    fn get_record_stream<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        version_keys: Bound<'py, PyAny>,
+        ordering: &str,
+        include_delta_closure: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let _ = include_delta_closure;
+
+        // `version_keys` is an iterable of 1-element tuples — extract the
+        // last segment of each (matching the Python `version[-1]` idiom).
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        for item in version_keys.try_iter()? {
+            let tup = item?;
+            // Accept either a tuple-of-bytes or a bare bytes object;
+            // the Python code did `version[-1]` which works for both.
+            if let Ok(b) = tup.extract::<&[u8]>() {
+                names.push(b.to_vec());
+                continue;
+            }
+            let last = tup.get_item(tup.len()? - 1)?;
+            let bytes = last
+                .cast_into::<PyBytes>()
+                .map_err(|_| PyTypeError::new_err("version key tail must be bytes"))?;
+            names.push(bytes.as_bytes().to_vec());
+        }
+
+        // Reorder names per `ordering`. Unknown names land at the end,
+        // matching the `set(versions).difference(set(parents))` fallback
+        // in the Python implementation.
+        let weave_ref = slf.borrow(py);
+        let ordered_names = order_record_stream(&weave_ref.inner, &names, ordering).ok_or_else(
+            || PyValueError::new_err(format!("unknown ordering {:?}", ordering)),
+        )?;
+        drop(weave_ref);
+
+        // Build the result list: one factory per name.
+        let absent_cls = py
+            .import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("AbsentContentFactory")?;
+
+        let out = PyList::empty(py);
+        for name in ordered_names {
+            let weave_ref = slf.borrow(py);
+            if let Some(idx) = weave_ref.inner.lookup(&name) {
+                // Snapshot sha1 + parent names while we hold the borrow,
+                // then drop it before constructing the pyclass.
+                let sha1 = weave_ref.inner.sha1s[idx].clone();
+                let parents: Vec<Vec<u8>> = weave_ref.inner.parents[idx]
+                    .iter()
+                    .map(|&p| weave_ref.inner.names[p].clone())
+                    .collect();
+                drop(weave_ref);
+                let factory = WeaveContentFactory {
+                    weave: slf.clone_ref(py),
+                    name,
+                    sha1,
+                    parents,
+                };
+                out.append(Py::new(py, factory)?)?;
+            } else {
+                drop(weave_ref);
+                let key = PyTuple::new(py, [PyBytes::new(py, &name)])?;
+                let absent = absent_cls.call1((key,))?;
+                out.append(absent)?;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Streaming content factory wrapping a single version of a [`PyWeave`].
+///
+/// The Python `Weave.get_record_stream` previously yielded an
+/// `WeaveContentFactory` defined in `bzrformats/weave.py` that called
+/// back into the weave for every byte access. This Rust port is
+/// behaviour-equivalent but holds a `Py<PyWeave>` directly so reads go
+/// straight into the Rust core without bouncing through Python.
+#[pyclass(name = "WeaveContentFactory", module = "bzrformats._bzr_rs.weave")]
+pub struct WeaveContentFactory {
+    weave: Py<PyWeave>,
+    /// Version name (the `key[-1]`).
+    name: Vec<u8>,
+    /// Stored sha1 hex digest.
+    sha1: Vec<u8>,
+    /// Parent version names (snapshotted at construction).
+    parents: Vec<Vec<u8>>,
+}
+
+#[pymethods]
+impl WeaveContentFactory {
+    #[new]
+    fn new(py: Python<'_>, weave: Py<PyWeave>, name: Vec<u8>) -> PyResult<Self> {
+        let weave_ref = weave.borrow(py);
+        let idx = weave_ref.inner.lookup(&name).ok_or_else(|| {
+            RevisionNotPresent::new_err((PyBytes::new(py, &name).unbind(), py.None()))
+        })?;
+        let sha1 = weave_ref.inner.sha1s[idx].clone();
+        let parents: Vec<Vec<u8>> = weave_ref.inner.parents[idx]
+            .iter()
+            .map(|&p| weave_ref.inner.names[p].clone())
+            .collect();
+        drop(weave_ref);
+        Ok(Self {
+            weave,
+            name,
+            sha1,
+            parents,
+        })
+    }
+
+    #[getter]
+    fn sha1<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.sha1)
+    }
+
+    /// Size of the fulltext. The original Python class didn't populate
+    /// this, returning None; mirror that. Not consulted by callers we
+    /// know about, but kept for parity.
+    #[getter]
+    fn size(&self, py: Python<'_>) -> Py<PyAny> {
+        py.None()
+    }
+
+    #[getter]
+    fn key<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, [PyBytes::new(py, &self.name)])
+    }
+
+    #[getter]
+    fn parents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let items: Vec<Bound<PyTuple>> = self
+            .parents
+            .iter()
+            .map(|p| PyTuple::new(py, [PyBytes::new(py, p)]))
+            .collect::<PyResult<_>>()?;
+        PyTuple::new(py, items)
+    }
+
+    #[getter]
+    fn storage_kind(&self) -> &'static str {
+        "fulltext"
+    }
+
+    /// Return the content in the requested encoding. Mirrors
+    /// `WeaveContentFactory.get_bytes_as`.
+    fn get_bytes_as<'py>(
+        &self,
+        py: Python<'py>,
+        storage_kind: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match storage_kind {
+            "fulltext" => {
+                // Concatenate the lines into a single bytes blob.
+                let weave_ref = self.weave.borrow(py);
+                let idx = weave_ref.inner.lookup(&self.name).ok_or_else(|| {
+                    RevisionNotPresent::new_err((
+                        PyBytes::new(py, &self.name).unbind(),
+                        py.None(),
+                    ))
+                })?;
+                let lines = weave_ref
+                    .inner
+                    .get_lines(idx)
+                    .map_err(|e| weave_op_err_to_py(py, e))?;
+                let mut buf: Vec<u8> = Vec::new();
+                for line in &lines {
+                    buf.extend_from_slice(line);
+                }
+                Ok(PyBytes::new(py, &buf).into_any())
+            }
+            "chunked" | "lines" => self
+                .get_lines_as_pylist(py)
+                .map(|l| l.into_any()),
+            other => {
+                let key = PyTuple::new(py, [PyBytes::new(py, &self.name)])?.unbind();
+                Err(UnavailableRepresentation::new_err((
+                    key,
+                    other.to_string(),
+                    "fulltext",
+                )))
+            }
+        }
+    }
+
+    /// Iterate the content lines. Mirrors
+    /// `WeaveContentFactory.iter_bytes_as`.
+    fn iter_bytes_as<'py>(
+        &self,
+        py: Python<'py>,
+        storage_kind: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match storage_kind {
+            "chunked" | "lines" => {
+                // Return an iterator over the lines list. Python's
+                // `iter(list)` is fine and matches the original behavior.
+                let lines = self.get_lines_as_pylist(py)?;
+                Ok(lines.call_method0("__iter__")?)
+            }
+            other => {
+                let key = PyTuple::new(py, [PyBytes::new(py, &self.name)])?.unbind();
+                Err(UnavailableRepresentation::new_err((
+                    key,
+                    other.to_string(),
+                    "fulltext",
+                )))
+            }
+        }
+    }
+}
+
+impl WeaveContentFactory {
+    /// Shared helper for the `chunked`/`lines` paths.
+    fn get_lines_as_pylist<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let weave_ref = self.weave.borrow(py);
+        let idx = weave_ref.inner.lookup(&self.name).ok_or_else(|| {
+            RevisionNotPresent::new_err((PyBytes::new(py, &self.name).unbind(), py.None()))
+        })?;
+        let lines = weave_ref
+            .inner
+            .get_lines(idx)
+            .map_err(|e| weave_op_err_to_py(py, e))?;
+        let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
+        PyList::new(py, items)
+    }
 }
 
 pub fn _weave_rs(py: Python) -> PyResult<Bound<PyModule>> {
@@ -1274,5 +1521,6 @@ pub fn _weave_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(py_write_weave_v5, &m)?)?;
     m.add_function(wrap_pyfunction!(py_weave_add, &m)?)?;
     m.add_class::<PyWeave>()?;
+    m.add_class::<WeaveContentFactory>()?;
     Ok(m)
 }

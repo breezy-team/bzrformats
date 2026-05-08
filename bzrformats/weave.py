@@ -35,12 +35,8 @@ from .errors import (
 )
 from .transport import TransportNoSuchFile
 from .versionedfile import (
-    AbsentContentFactory,
-    ContentFactory,
-    UnavailableRepresentation,
     VersionedFile,
     adapter_registry,
-    sort_groupcompress,
 )
 from .weavefile import _read_weave_v5, write_weave_v5
 
@@ -114,31 +110,9 @@ class WeaveTextDiffers(WeaveError):
         self.weave_b = weave_b
 
 
-class WeaveContentFactory(ContentFactory):
-    """Content factory for streaming from weaves."""
-
-    def __init__(self, version, weave):
-        ContentFactory.__init__(self)
-        self.sha1 = weave.get_sha1s([version])[version]
-        self.key = (version,)
-        parents = weave.get_parent_map([version])[version]
-        self.parents = tuple((parent,) for parent in parents)
-        self.storage_kind = "fulltext"
-        self._weave = weave
-
-    def get_bytes_as(self, storage_kind):
-        if storage_kind == "fulltext":
-            return self._weave.get_text(self.key[-1])
-        elif storage_kind in ("chunked", "lines"):
-            return self._weave.get_lines(self.key[-1])
-        else:
-            raise UnavailableRepresentation(self.key, storage_kind, "fulltext")
-
-    def iter_bytes_as(self, storage_kind):
-        if storage_kind in ("chunked", "lines"):
-            return iter(self._weave.get_lines(self.key[-1]))
-        else:
-            raise UnavailableRepresentation(self.key, storage_kind, "fulltext")
+# Re-export the Rust-backed WeaveContentFactory so callers that previously
+# imported it from this module keep working.
+WeaveContentFactory = _weave_rs.WeaveContentFactory
 
 
 class Weave(_weave_rs.Weave, VersionedFile):
@@ -205,11 +179,13 @@ class Weave(_weave_rs.Weave, VersionedFile):
         random_id=False,
         check_content=True,
     ):
-        """Add a single text on top of the versioned file. See VersionedFile.add_lines."""
+        """Add a single text on top of the versioned file. See VersionedFile.add_lines.
+
+        Line validation (`_check_lines_not_unicode` + `_check_lines_are_lines`)
+        is delegated to the Rust `_add_lines`, which honours the
+        ``check_content`` flag.
+        """
         self._check_write_ok()
-        if check_content:
-            self._check_lines_not_unicode(lines)
-            self._check_lines_are_lines(lines)
         return self._add_lines(
             version_id,
             list(parents),
@@ -221,26 +197,9 @@ class Weave(_weave_rs.Weave, VersionedFile):
             check_content,
         )
 
-    def get_record_stream(self, versions, ordering, include_delta_closure):
-        """See VersionedFile.get_record_stream."""
-        import vcsgraph.tsort as tsort
-
-        versions = [version[-1] for version in versions]
-        if ordering == "topological":
-            parents = self.get_parent_map(versions)
-            new_versions = tsort.topo_sort(parents)
-            new_versions.extend(set(versions).difference(set(parents)))
-            versions = new_versions
-        elif ordering == "groupcompress":
-            parents = self.get_parent_map(versions)
-            new_versions = sort_groupcompress(parents)
-            new_versions.extend(set(versions).difference(set(parents)))
-            versions = new_versions
-        for version in versions:
-            if version in self:
-                yield WeaveContentFactory(version, self)
-            else:
-                yield AbsentContentFactory((version,))
+    # `get_record_stream` is provided by the Rust `_weave_rs.Weave` base.
+    # It returns a list (vs. the previous Python generator); callers
+    # treat the result as iterable, which still works.
 
     def insert_record_stream(self, stream):
         """See VersionedFile.insert_record_stream."""

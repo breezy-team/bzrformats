@@ -668,6 +668,79 @@ impl PlanMergeState {
     }
 }
 
+/// Apply one of the documented orderings to a list of version names
+/// against `wf`'s parent table, returning the same names re-ordered.
+/// Unknown names are appended at the end in their original order, to
+/// match `Weave.get_record_stream`'s
+/// `set(versions).difference(set(parents))` fallback.
+///
+/// `ordering` is one of:
+///
+/// * `"unordered"` — input order, unchanged
+/// * `"topological"` — parents before their children
+/// * `"groupcompress"` — reverse-topological, grouped by key prefix
+///
+/// Returns `None` if `ordering` isn't recognised.
+pub fn order_record_stream(
+    wf: &WeaveFile,
+    names: &[Vec<u8>],
+    ordering: &str,
+) -> Option<Vec<Vec<u8>>> {
+    use vcs_graph::tsort::TopoSorter;
+
+    let mut known = Vec::new();
+    let mut unknown = Vec::new();
+    for name in names {
+        if wf.lookup(name).is_some() {
+            known.push(name.clone());
+        } else {
+            unknown.push(name.clone());
+        }
+    }
+
+    match ordering {
+        "unordered" => Some(names.to_vec()),
+        "topological" => {
+            let pairs: Vec<(Vec<u8>, Vec<Vec<u8>>)> = known
+                .iter()
+                .map(|name| {
+                    let idx = wf.lookup(name).expect("known by construction");
+                    let parents = wf.parents[idx]
+                        .iter()
+                        .map(|&p| wf.names[p].clone())
+                        .collect();
+                    (name.clone(), parents)
+                })
+                .collect();
+            let mut sorter = TopoSorter::new(pairs.into_iter());
+            let mut sorted = sorter.sorted().expect("acyclic by invariant");
+            sorted.extend(unknown);
+            Some(sorted)
+        }
+        "groupcompress" => {
+            let parent_map: Vec<(Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>)> = known
+                .iter()
+                .map(|name| {
+                    let idx = wf.lookup(name).expect("known by construction");
+                    let key = vec![name.clone()];
+                    let parents: Vec<Vec<Vec<u8>>> = wf.parents[idx]
+                        .iter()
+                        .map(|&p| vec![wf.names[p].clone()])
+                        .collect();
+                    (key, parents)
+                })
+                .collect();
+            let mut out: Vec<Vec<u8>> = crate::groupcompress::sort::sort_gc_optimal(parent_map)
+                .into_iter()
+                .map(|key| key.into_iter().next().expect("single-segment key"))
+                .collect();
+            out.extend(unknown);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// Combine two weaves into a single weave that contains every version
 /// from both inputs, with parent sets that are the union of the parent
 /// sets in `wa` and `wb`. Mirrors `bzrformats.weave._reweave`.
@@ -2221,6 +2294,58 @@ mod tests {
         assert_eq!(result.get_lines(i).unwrap(), ls(&[b"a\n", b"alpha\n"]));
         let j = result.lookup(b"b-only").unwrap();
         assert_eq!(result.get_lines(j).unwrap(), ls(&[b"a\n", b"beta\n"]));
+    }
+
+    /// `order_record_stream` topological: parents come before children;
+    /// unknown names land at the end in input order.
+    #[test]
+    fn order_record_stream_topological() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"a"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wf.add(Some(b"b"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
+            .unwrap();
+        wf.add(Some(b"c"), &ls(&[b"a\n", b"b\n", b"c\n"]), &[1], None, None)
+            .unwrap();
+        // Input order is leaf-first, plus an unknown.
+        let names: Vec<Vec<u8>> = vec![
+            b"c".to_vec(),
+            b"a".to_vec(),
+            b"missing".to_vec(),
+            b"b".to_vec(),
+        ];
+        let got = order_record_stream(&wf, &names, "topological").unwrap();
+        // Topological subset is [a, b, c] (parents before children);
+        // unknowns appended preserving order.
+        assert_eq!(
+            got,
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"missing".to_vec(),
+            ]
+        );
+    }
+
+    /// `order_record_stream` unordered preserves input order verbatim.
+    #[test]
+    fn order_record_stream_unordered() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"a"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wf.add(Some(b"b"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
+            .unwrap();
+        let names: Vec<Vec<u8>> = vec![b"b".to_vec(), b"a".to_vec()];
+        assert_eq!(
+            order_record_stream(&wf, &names, "unordered").unwrap(),
+            vec![b"b".to_vec(), b"a".to_vec()]
+        );
+    }
+
+    /// `order_record_stream` rejects unknown ordering names.
+    #[test]
+    fn order_record_stream_rejects_unknown_ordering() {
+        let wf = WeaveFile::default();
+        assert!(order_record_stream(&wf, &[], "bogus").is_none());
     }
 
     /// `reweave` errors out if the two inputs disagree on the text of a
