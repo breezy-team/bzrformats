@@ -81,6 +81,7 @@ dependencies = [
  "sha1",
  "tempfile",
  "vcs-graph",
+ "winapi",
  "xmltree",
  "xz2",
 ]

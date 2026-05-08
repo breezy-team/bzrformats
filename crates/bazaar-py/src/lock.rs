@@ -64,9 +64,22 @@ struct PyReadLock {
 
 impl PyReadLock {
     fn build_file_obj(py: Python<'_>, lock: &RsReadLock) -> PyResult<Py<PyAny>> {
-        use std::os::fd::AsRawFd;
         let file = lock.file().ok_or_else(|| LockNotHeld::new_err(()))?;
-        let fd = file.as_raw_fd();
+        #[cfg(unix)]
+        let fd = {
+            use std::os::fd::AsRawFd;
+            file.as_raw_fd().into_pyobject(py)?.into_any()
+        };
+        #[cfg(windows)]
+        let fd = {
+            use std::os::windows::io::AsRawHandle;
+            let handle = file.as_raw_handle();
+            let msvcrt = py.import("msvcrt")?;
+            let os = py.import("os")?;
+            let flags = os.getattr("O_RDONLY")?;
+            msvcrt.call_method1("open_osfhandle", (handle as usize, flags))?
+        };
+
         // Wrap the underlying fd in a Python file object that does not
         // own (close) it on `__del__` — closeFd=False — because the
         // Rust ReadLock owns the std::fs::File and will close it on
@@ -204,9 +217,22 @@ struct PyWriteLock {
 
 impl PyWriteLock {
     fn build_file_obj(py: Python<'_>, lock: &RsWriteLock) -> PyResult<Py<PyAny>> {
-        use std::os::fd::AsRawFd;
         let file = lock.file().ok_or_else(|| LockNotHeld::new_err(()))?;
-        let fd = file.as_raw_fd();
+        #[cfg(unix)]
+        let fd = {
+            use std::os::fd::AsRawFd;
+            file.as_raw_fd().into_pyobject(py)?.into_any()
+        };
+        #[cfg(windows)]
+        let fd = {
+            use std::os::windows::io::AsRawHandle;
+            let handle = file.as_raw_handle();
+            let msvcrt = py.import("msvcrt")?;
+            let os = py.import("os")?;
+            let flags = os.getattr("O_RDWR")?;
+            msvcrt.call_method1("open_osfhandle", (handle as usize, flags))?
+        };
+
         let fdopen = py.import("os")?.getattr("fdopen")?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("closefd", false)?;

@@ -128,6 +128,7 @@ pub fn link_or_copy<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dest: Q) -> std::io:
 #[cfg(any(target_os = "windows"))]
 pub fn link_or_copy<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dest: Q) -> std::io::Result<()> {
     std::fs::copy(src.as_ref(), dest.as_ref())?;
+    Ok(())
 }
 
 pub fn copy_tree<P: AsRef<Path>, Q: AsRef<Path>>(from_path: P, to_path: Q) -> std::io::Result<()> {
@@ -168,6 +169,7 @@ pub fn copy_tree<P: AsRef<Path>, Q: AsRef<Path>>(from_path: P, to_path: Q) -> st
     Ok(())
 }
 
+#[cfg(unix)]
 const FORMATS: [(SFlag, &str); 7] = [
     (SFlag::S_IFDIR, "directory"),
     (SFlag::S_IFCHR, "chardev"),
@@ -178,6 +180,7 @@ const FORMATS: [(SFlag, &str); 7] = [
     (SFlag::S_IFSOCK, "socket"),
 ];
 
+#[cfg(unix)]
 pub fn kind_from_mode(mode: SFlag) -> &'static str {
     for (format_mode, format_kind) in FORMATS.iter() {
         if mode.bitand(SFlag::S_IFMT) == *format_mode {

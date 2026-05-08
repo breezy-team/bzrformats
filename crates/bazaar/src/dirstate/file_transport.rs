@@ -15,7 +15,6 @@ use super::transport::{DirEntryInfo, StatInfo, Transport, TransportError};
 use super::LockState;
 use crate::lock::{LockError, ReadLock, WriteLock};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 
 enum LockHandle {
@@ -134,13 +133,7 @@ impl Transport for FileTransport {
 
     fn fdatasync(&mut self) -> Result<(), TransportError> {
         let file = self.current_file()?;
-        // Borrow the fd and call fdatasync via nix.
-        // SAFETY: file is owned by self for the duration of this call.
-        let fd = unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) };
-        nix::unistd::fdatasync(fd).map_err(|e| TransportError::Io {
-            kind: std::io::ErrorKind::Other,
-            message: e.to_string(),
-        })?;
+        file.sync_data().map_err(TransportError::from)?;
         Ok(())
     }
 

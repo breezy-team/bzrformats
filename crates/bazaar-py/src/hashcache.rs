@@ -1,6 +1,7 @@
 use bazaar::filters::ContentFilter;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+#[cfg(unix)]
 use std::fs::Permissions;
 use std::io::Error;
 #[cfg(unix)]

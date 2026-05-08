@@ -736,7 +736,11 @@ impl PyGraphIndexBuilder {
     }
 
     fn validate(&self) -> PyResult<()> {
-        let _guard = self.inner.lock().unwrap();
+        self.inner
+            .lock()
+            .unwrap()
+            .validate()
+            .map_err(index_err_to_py)?;
         Ok(())
     }
 

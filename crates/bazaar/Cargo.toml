@@ -37,6 +37,9 @@ adler = "1.0.2"
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs"] }
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["fileapi", "minwindef", "winnt", "errhandlingapi", "minwinbase"] }
+
 [features]
 default = ["pyo3"]
 pyo3 = ["dep:pyo3"]
