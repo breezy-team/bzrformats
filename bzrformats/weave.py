@@ -47,6 +47,10 @@ class WeaveError(BzrFormatsError):
     _fmt = "Error in processing weave: %(msg)s"
 
     def __init__(self, msg=None):
+        """Initialize the error.
+
+        :param msg: Error message.
+        """
         super().__init__()
         self.msg = msg
 
@@ -57,6 +61,11 @@ class WeaveRevisionAlreadyPresent(WeaveError):
     _fmt = "Revision {%(revision_id)s} already present in %(weave)s"
 
     def __init__(self, revision_id, weave):
+        """Initialize the error.
+
+        :param revision_id: The revision that is already present.
+        :param weave: The weave it is present in.
+        """
         super().__init__()
         self.revision_id = revision_id
         self.weave = weave
@@ -68,6 +77,11 @@ class WeaveRevisionNotPresent(WeaveError):
     _fmt = "Revision {%(revision_id)s} not present in %(weave)s"
 
     def __init__(self, revision_id, weave):
+        """Initialize the error.
+
+        :param revision_id: The revision that is missing.
+        :param weave: The weave it is missing from.
+        """
         super().__init__()
         self.revision_id = revision_id
         self.weave = weave
@@ -79,6 +93,10 @@ class WeaveFormatError(WeaveError):
     _fmt = "Weave invariant violated: %(what)s"
 
     def __init__(self, what):
+        """Initialize the error.
+
+        :param what: Description of the violation.
+        """
         super().__init__()
         self.what = what
 
@@ -104,6 +122,12 @@ class WeaveTextDiffers(WeaveError):
     )
 
     def __init__(self, revision_id, weave_a, weave_b):
+        """Initialize the error.
+
+        :param revision_id: The revision that differs.
+        :param weave_a: The first weave.
+        :param weave_b: The second weave.
+        """
         super().__init__()
         self.revision_id = revision_id
         self.weave_a = weave_a
@@ -129,6 +153,7 @@ class Weave(_weave_rs.Weave, VersionedFile):
     """
 
     def __new__(cls, *args, **kwargs):
+        """Create a new Weave instance."""
         # The Rust pyclass __new__ accepts (weave_name, access_mode,
         # get_scope, allow_reserved). Subclasses (WeaveFile) take a
         # different positional/kwargs shape, so we can't just forward
@@ -153,6 +178,14 @@ class Weave(_weave_rs.Weave, VersionedFile):
         get_scope=None,
         allow_reserved=False,
     ):
+        """Initialize the Weave instance.
+
+        :param weave_name: Name of the weave.
+        :param access_mode: Access mode.
+        :param matcher: Matcher to use.
+        :param get_scope: Scope to use.
+        :param allow_reserved: Whether to allow reserved names.
+        """
         # The Rust core ignores ``matcher``; the diff matcher used by
         # ``_add`` is hard-coded to ``patiencediff::SequenceMatcher`` in
         # Rust. ``matcher`` is accepted for API compatibility.
