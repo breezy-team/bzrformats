@@ -1109,8 +1109,10 @@ def cleanup_pack_knit(versioned_files):
     Args:
         versioned_files: The KnitVersionedFiles instance to clean up.
     """
-    versioned_files.stream.close()
+    # writer.end() writes the trailing record marker through the same
+    # stream, so it has to run before stream.close() releases the fd.
     versioned_files.writer.end()
+    versioned_files.stream.close()
 
 
 def _get_total_build_size(self, keys, positions):

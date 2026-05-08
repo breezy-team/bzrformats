@@ -163,7 +163,7 @@ fn fcntl_lockf(file: &File, op: FcntlOp, path: &Path) -> Result<(), LockError> {
         return Ok(());
     }
     let errno = Errno::last();
-    if matches!(errno, Errno::EWOULDBLOCK | Errno::EAGAIN | Errno::EACCES) {
+    if matches!(errno, Errno::EWOULDBLOCK | Errno::EACCES) {
         return Err(LockError::Contention(path.to_path_buf()));
     }
     Err(LockError::Io(std::io::Error::from_raw_os_error(

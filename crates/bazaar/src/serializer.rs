@@ -38,17 +38,42 @@ pub trait RevisionSerializer: Send + Sync {
 pub trait InventorySerializer: Send + Sync {
     fn format_num(&self) -> &'static [u8];
 
+    /// Whether this serializer supports the "altered-by" hack — extracting
+    /// per-text revision references by regex-scanning inventory lines
+    /// without parsing the full XML. True for the flat XML formats
+    /// (v5/v6/v7/v8); false for v4 and CHK serializers.
+    fn support_altered_by_hack(&self) -> bool {
+        false
+    }
+
     /// Serialize the inventory to a vector of byte chunks (one per line).
-    fn write_inventory_to_lines(&self, inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error>;
+    ///
+    /// If `working` is true, history data (text_sha1, text_size,
+    /// reference_revision, symlink_target, revision) is omitted. This is used
+    /// by working-tree inventory serialization where that data is not yet
+    /// stable.
+    fn write_inventory_to_lines(
+        &self,
+        inv: &MutableInventory,
+        working: bool,
+    ) -> Result<Vec<Vec<u8>>, Error>;
 
     /// Serialize the inventory to a vector of byte chunks (alias for lines).
-    fn write_inventory_to_chunks(&self, inv: &MutableInventory) -> Result<Vec<Vec<u8>>, Error> {
-        self.write_inventory_to_lines(inv)
+    fn write_inventory_to_chunks(
+        &self,
+        inv: &MutableInventory,
+        working: bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        self.write_inventory_to_lines(inv, working)
     }
 
     /// Serialize the inventory to a single byte string.
-    fn write_inventory_to_string(&self, inv: &MutableInventory) -> Result<Vec<u8>, Error> {
-        let lines = self.write_inventory_to_lines(inv)?;
+    fn write_inventory_to_string(
+        &self,
+        inv: &MutableInventory,
+        working: bool,
+    ) -> Result<Vec<u8>, Error> {
+        let lines = self.write_inventory_to_lines(inv, working)?;
         let mut out = Vec::new();
         for line in lines {
             out.extend_from_slice(&line);
@@ -61,8 +86,9 @@ pub trait InventorySerializer: Send + Sync {
         &self,
         inv: &MutableInventory,
         f: &mut dyn std::io::Write,
+        working: bool,
     ) -> Result<Vec<Vec<u8>>, Error> {
-        let lines = self.write_inventory_to_lines(inv)?;
+        let lines = self.write_inventory_to_lines(inv, working)?;
         for line in &lines {
             f.write_all(line)?;
         }
