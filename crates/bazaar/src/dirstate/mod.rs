@@ -185,17 +185,17 @@ fn compute_path_info(
         Err(_) => return Ok(None),
     };
     let mut kind = if stat.is_file() {
-        Some(osutils::Kind::File)
+        Some(crate::osutils::Kind::File)
     } else if stat.is_dir() {
-        Some(osutils::Kind::Directory)
+        Some(crate::osutils::Kind::Directory)
     } else if stat.is_symlink() {
-        Some(osutils::Kind::Symlink)
+        Some(crate::osutils::Kind::Symlink)
     } else {
         None
     };
     // The tree root itself is never a tree-reference (mirrors Python's
     // `_directory_may_be_tree_reference`: `return relpath and ...`).
-    if kind == Some(osutils::Kind::Directory)
+    if kind == Some(crate::osutils::Kind::Directory)
         && pstate.supports_tree_reference
         && !path_utf8.is_empty()
     {
@@ -207,7 +207,7 @@ fn compute_path_info(
             ))
         })?;
         if is_ref {
-            kind = Some(osutils::Kind::TreeReference);
+            kind = Some(crate::osutils::Kind::TreeReference);
         }
     }
     Ok(Some(ProcessPathInfo {
@@ -923,7 +923,7 @@ impl DirState {
                     mode: info.stat.mode,
                 })?;
                 match target_kind {
-                    osutils::Kind::Directory => {
+                    crate::osutils::Kind::Directory => {
                         if path.is_none() {
                             let p = join_path(&old_dirname, &old_basename);
                             path = Some(p.clone());
@@ -936,11 +936,11 @@ impl DirState {
                         }
                         (
                             source_minikind != Kind::Directory,
-                            Some(osutils::Kind::Directory),
+                            Some(crate::osutils::Kind::Directory),
                             false,
                         )
                     }
-                    osutils::Kind::File => {
+                    crate::osutils::Kind::File => {
                         let cc = if source_minikind != Kind::File {
                             true
                         } else {
@@ -970,20 +970,20 @@ impl DirState {
                         } else {
                             target_details.executable
                         };
-                        (cc, Some(osutils::Kind::File), te)
+                        (cc, Some(crate::osutils::Kind::File), te)
                     }
-                    osutils::Kind::Symlink => {
+                    crate::osutils::Kind::Symlink => {
                         let cc = if source_minikind != Kind::Symlink {
                             true
                         } else {
                             link_or_sha1.as_deref()
                                 != Some(source_details_mut.fingerprint.as_slice())
                         };
-                        (cc, Some(osutils::Kind::Symlink), false)
+                        (cc, Some(crate::osutils::Kind::Symlink), false)
                     }
-                    osutils::Kind::TreeReference => (
+                    crate::osutils::Kind::TreeReference => (
                         source_minikind != Kind::TreeReference,
-                        Some(osutils::Kind::TreeReference),
+                        Some(crate::osutils::Kind::TreeReference),
                         false,
                     ),
                 }
@@ -1241,16 +1241,16 @@ impl DirState {
                         None => None,
                         Some(stat) => {
                             let mut kind = if stat.is_file() {
-                                Some(osutils::Kind::File)
+                                Some(crate::osutils::Kind::File)
                             } else if stat.is_dir() {
-                                Some(osutils::Kind::Directory)
+                                Some(crate::osutils::Kind::Directory)
                             } else if stat.is_symlink() {
-                                Some(osutils::Kind::Symlink)
+                                Some(crate::osutils::Kind::Symlink)
                             } else {
                                 None
                             };
                             // The tree root itself is never a tree-reference.
-                            if kind == Some(osutils::Kind::Directory)
+                            if kind == Some(crate::osutils::Kind::Directory)
                                 && pstate.supports_tree_reference
                                 && !current_root.is_empty()
                             {
@@ -1264,7 +1264,7 @@ impl DirState {
                                         ))
                                     })?;
                                 if is_ref {
-                                    kind = Some(osutils::Kind::TreeReference);
+                                    kind = Some(crate::osutils::Kind::TreeReference);
                                 }
                             }
                             Some(ProcessPathInfo {
@@ -1346,7 +1346,7 @@ impl DirState {
                     // ``b/c`` were both removed) needs them reported.
                     let walk_disk = root_path_info
                         .as_ref()
-                        .map(|p| p.kind == Some(osutils::Kind::Directory))
+                        .map(|p| p.kind == Some(crate::osutils::Kind::Directory))
                         .unwrap_or(false);
                     let initial_key = EntryKey {
                         dirname: current_root.clone(),
@@ -1431,11 +1431,11 @@ impl DirState {
                     }
                     if supports_ref {
                         for e in entries.iter_mut() {
-                            if e.kind != Some(osutils::Kind::Directory) {
+                            if e.kind != Some(crate::osutils::Kind::Directory) {
                                 continue;
                             }
                             match transport.is_tree_reference_dir(&e.abspath) {
-                                Ok(true) => e.kind = Some(osutils::Kind::TreeReference),
+                                Ok(true) => e.kind = Some(crate::osutils::Kind::TreeReference),
                                 Ok(false) => {}
                                 Err(err) => {
                                     if tref_err.is_none() {
@@ -1689,7 +1689,7 @@ impl DirState {
                             target_exec: Some(new_executable),
                         });
                     }
-                    if pi.kind == Some(osutils::Kind::Directory) {
+                    if pi.kind == Some(crate::osutils::Kind::Directory) {
                         let child_rel = if walker_rel.is_empty() {
                             pi.basename.clone()
                         } else {
@@ -1703,7 +1703,7 @@ impl DirState {
                         }
                     }
                 }
-                if pi.kind == Some(osutils::Kind::TreeReference) {
+                if pi.kind == Some(crate::osutils::Kind::TreeReference) {
                     let child_rel = if walker_rel.is_empty() {
                         pi.basename.clone()
                     } else {
@@ -1817,8 +1817,8 @@ impl DirState {
             if changed == Some(true) {
                 if let Some(ref c) = change {
                     gather_result_for_consistency(pstate, c);
-                    if c.source_kind == Some(osutils::Kind::Directory)
-                        && c.target_kind != Some(osutils::Kind::Directory)
+                    if c.source_kind == Some(crate::osutils::Kind::Directory)
+                        && c.target_kind != Some(crate::osutils::Kind::Directory)
                     {
                         let entry_path = match pstate.source_index {
                             Some(si)
@@ -3608,7 +3608,7 @@ impl DirState {
         &mut self,
         path: &str,
         file_id: &[u8],
-        kind: osutils::Kind,
+        kind: crate::osutils::Kind,
         stat: Option<StatInfo>,
         fingerprint: &[u8],
     ) -> Result<(), AddError> {
@@ -3623,7 +3623,7 @@ impl DirState {
         // is a hard error on Linux; on macOS the filesystem is the one
         // doing the normalisation so the result is always accessible.
         let basename_norm =
-            match osutils::path::normalized_filename(std::path::Path::new(basename_s)) {
+            match crate::osutils::path::normalized_filename(std::path::Path::new(basename_s)) {
                 Some((norm, accessible)) => {
                     if norm.as_os_str() != std::ffi::OsStr::new(basename_s) && !accessible {
                         return Err(AddError::InvalidNormalization {
@@ -3690,7 +3690,7 @@ impl DirState {
     /// for supplying the packed_stat bytes (use `pack_stat` on the
     /// `os.lstat` result, or `None` to substitute `NULLSTAT`).
     ///
-    /// `kind` is the filesystem kind; ``osutils::Kind`` already
+    /// `kind` is the filesystem kind; ``crate::osutils::Kind`` already
     /// constrains it to the four valid variants.
     ///
     /// The method performs the same duplicate-id detection Python does:
@@ -3713,7 +3713,7 @@ impl DirState {
         dirname: &[u8],
         basename: &[u8],
         file_id: &[u8],
-        kind: osutils::Kind,
+        kind: crate::osutils::Kind,
         size: u64,
         packed_stat: &[u8],
         fingerprint: &[u8],
@@ -3864,21 +3864,21 @@ impl DirState {
         // the caller passes a value.
         let minikind: Kind = kind.into();
         let tree0 = match kind {
-            osutils::Kind::Directory => TreeData {
+            crate::osutils::Kind::Directory => TreeData {
                 minikind,
                 fingerprint: Vec::new(),
                 size: 0,
                 executable: false,
                 packed_stat: packed_stat.to_vec(),
             },
-            osutils::Kind::TreeReference => TreeData {
+            crate::osutils::Kind::TreeReference => TreeData {
                 minikind,
                 fingerprint: fingerprint.to_vec(),
                 size: 0,
                 executable: false,
                 packed_stat: packed_stat.to_vec(),
             },
-            osutils::Kind::File | osutils::Kind::Symlink => TreeData {
+            crate::osutils::Kind::File | crate::osutils::Kind::Symlink => TreeData {
                 minikind,
                 fingerprint: fingerprint.to_vec(),
                 size,
@@ -3955,7 +3955,7 @@ impl DirState {
             existing.trees[0] = trees.into_iter().next().unwrap();
         }
 
-        if kind == osutils::Kind::Directory {
+        if kind == crate::osutils::Kind::Directory {
             // Python: _ensure_block(block_index, entry_index, utf8path).
             // We need to pass coordinates of the entry we just inserted
             // / overwrote. Re-find it since insertion may have shifted.

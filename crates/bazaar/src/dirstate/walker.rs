@@ -96,7 +96,7 @@ impl WalkDirsUtf8 {
         // the first-named child first.
         self.pending_subdirs = entries
             .iter()
-            .filter(|e| e.kind == Some(osutils::Kind::Directory))
+            .filter(|e| e.kind == Some(crate::osutils::Kind::Directory))
             .map(|e| {
                 let mut child_relpath = relpath.clone();
                 if !child_relpath.is_empty() {

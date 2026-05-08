@@ -384,11 +384,11 @@ pub fn make_delta<'a>(
 ) -> impl Iterator<Item = Cow<'a, [u8]>> {
     // TODO(perf): Use Cow<[u8]> for the source lines
     let line_locations = LinesDeltaIndex::new(
-        osutils::split_lines(source_bytes)
+        crate::osutils::split_lines(source_bytes)
             .map(|x| x.into_owned())
             .collect::<Vec<_>>(),
     );
-    let lines = osutils::split_lines(target_bytes).collect::<Vec<_>>();
+    let lines = crate::osutils::split_lines(target_bytes).collect::<Vec<_>>();
     line_locations
         .make_delta(lines.as_slice(), target_bytes.len(), None)
         .0
@@ -400,11 +400,11 @@ mod tests {
     use super::*;
 
     fn lines_of(s: &'static [u8]) -> Vec<Vec<u8>> {
-        osutils::split_lines(s).map(|c| c.into_owned()).collect()
+        crate::osutils::split_lines(s).map(|c| c.into_owned()).collect()
     }
 
     fn cow_lines(s: &'static [u8]) -> Vec<Cow<'static, [u8]>> {
-        osutils::split_lines(s).collect()
+        crate::osutils::split_lines(s).collect()
     }
 
     #[test]

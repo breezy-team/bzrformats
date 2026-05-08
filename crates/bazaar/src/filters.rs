@@ -1,4 +1,4 @@
-use osutils::sha::sha_chunks;
+use crate::osutils::sha::sha_chunks;
 use std::fs::File;
 use std::io::Error;
 use std::io::Read;

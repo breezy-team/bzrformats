@@ -745,7 +745,7 @@ fn serialize_inventory_flat(
     }
     for (_path, ie) in entries {
         let kind = ie.kind();
-        let kind_str = osutils::Kind::as_str(&kind);
+        let kind_str = crate::osutils::Kind::as_str(&kind);
         if !supported_kinds.contains(&kind_str) {
             return Err(Error::UnsupportedInventoryKind(kind_str.to_string()));
         }

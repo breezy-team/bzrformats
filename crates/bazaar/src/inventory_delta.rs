@@ -231,7 +231,7 @@ pub fn serialize_inventory_delta(
         .iter()
         .map(|entry| {
             if let Some(entry) = entry.new_entry.as_ref() {
-                if !tree_references && entry.kind() == osutils::Kind::TreeReference {
+                if !tree_references && entry.kind() == crate::osutils::Kind::TreeReference {
                     return Err(InventoryDeltaSerializeError::UnsupportedKind(
                         "tree-reference".to_string(),
                     ));
@@ -606,7 +606,7 @@ pub fn parse_inventory_delta(
         )?;
         if !allow_tree_references
             && item.new_entry.is_some()
-            && item.new_entry.as_ref().unwrap().kind() == osutils::Kind::TreeReference
+            && item.new_entry.as_ref().unwrap().kind() == crate::osutils::Kind::TreeReference
         {
             return Err(InventoryDeltaParseError::Incompatible(
                 "Tree reference not allowed".to_string(),

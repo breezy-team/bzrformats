@@ -363,11 +363,11 @@ fn decode_minikind(bytes: &[u8]) -> PyResult<bazaar::dirstate::Kind> {
 /// socket / fifo kinds are reported as `None` (the walker ignores
 /// those rows).  Never returns `TreeReference` — that distinction
 /// comes from `is_tree_reference_dir`, not the stat mode.
-fn kind_from_mode(mode: u32) -> Option<osutils::Kind> {
+fn kind_from_mode(mode: u32) -> Option<bazaar::osutils::Kind> {
     match mode & 0o170000 {
-        0o100000 => Some(osutils::Kind::File),
-        0o040000 => Some(osutils::Kind::Directory),
-        0o120000 => Some(osutils::Kind::Symlink),
+        0o100000 => Some(bazaar::osutils::Kind::File),
+        0o040000 => Some(bazaar::osutils::Kind::Directory),
+        0o120000 => Some(bazaar::osutils::Kind::Symlink),
         _ => None,
     }
 }
@@ -1687,10 +1687,10 @@ impl PyDirState {
             } else {
                 let pt = pi.cast::<PyTuple>()?;
                 let kind_obj = pt.get_item(2)?;
-                let kind: Option<osutils::Kind> = if kind_obj.is_none() {
+                let kind: Option<bazaar::osutils::Kind> = if kind_obj.is_none() {
                     None
                 } else {
-                    Some(kind_obj.extract::<osutils::Kind>()?)
+                    Some(kind_obj.extract::<bazaar::osutils::Kind>()?)
                 };
                 let stat_obj = pt.get_item(3)?;
                 let abspath: Vec<u8> = pt.get_item(4)?.extract()?;
@@ -2402,7 +2402,7 @@ impl PyDirState {
         dirname: &[u8],
         basename: &[u8],
         file_id: &[u8],
-        kind: osutils::Kind,
+        kind: bazaar::osutils::Kind,
         size: u64,
         packed_stat: &[u8],
         fingerprint: Option<&[u8]>,
@@ -2437,7 +2437,7 @@ impl PyDirState {
         py: Python<'_>,
         path: &str,
         file_id: &[u8],
-        kind: osutils::Kind,
+        kind: bazaar::osutils::Kind,
         stat: Option<&Bound<PyAny>>,
         fingerprint: Option<&[u8]>,
     ) -> PyResult<()> {

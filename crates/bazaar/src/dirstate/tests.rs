@@ -2087,7 +2087,7 @@ fn add_inserts_new_file_at_root() {
             b"",
             b"a",
             b"fid-a",
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             7,
             &stat,
             b"sha1",
@@ -2113,7 +2113,7 @@ fn add_directory_creates_child_block() {
             b"",
             b"sub",
             b"fid-sub",
-            osutils::Kind::Directory,
+            crate::osutils::Kind::Directory,
             0,
             &stat,
             b"",
@@ -2138,7 +2138,7 @@ fn add_duplicate_file_id_errors() {
             b"",
             b"a",
             b"fid-a",
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             1,
             &stat,
             b"",
@@ -2150,7 +2150,7 @@ fn add_duplicate_file_id_errors() {
             b"",
             b"b",
             b"fid-a",
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             1,
             &stat,
             b"",
@@ -2169,7 +2169,7 @@ fn add_second_path_same_basename_errors() {
             b"",
             b"a",
             b"fid-a",
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             1,
             &stat,
             b"",
@@ -2181,7 +2181,7 @@ fn add_second_path_same_basename_errors() {
             b"",
             b"a",
             b"fid-other",
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             1,
             &stat,
             b"",
@@ -2202,7 +2202,7 @@ fn add_parent_missing_errors_not_versioned() {
             b"missing",
             b"child",
             b"fid-c",
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             0,
             &stat,
             b"",
@@ -2250,7 +2250,7 @@ fn set_state_from_inventory_rename_same_id_bug_395556() {
     let mut state = add_fixture();
     let stat = b"x".repeat(32);
     state
-        .add(b"b", b"", b"b", b"b-id", osutils::Kind::File, 0, &stat, b"")
+        .add(b"b", b"", b"b", b"b-id", crate::osutils::Kind::File, 0, &stat, b"")
         .expect("add");
 
     let inv_after_rename: Vec<(Vec<u8>, Vec<u8>, Kind, Vec<u8>, bool)> = vec![
@@ -2525,7 +2525,7 @@ fn update_entry_refreshes_sha_after_content_change() {
             b"",
             b"a-file",
             b"file-id",
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             0,
             &stat,
             b"",
@@ -2616,7 +2616,7 @@ fn bisect_roundtrips_via_get_lines() {
             b"",
             b"alpha",
             b"a-id",
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             11,
             &stat,
             b"sha-a",
@@ -2628,7 +2628,7 @@ fn bisect_roundtrips_via_get_lines() {
             b"",
             b"bravo",
             b"b-id",
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             22,
             &stat,
             b"sha-b",
@@ -2685,7 +2685,7 @@ fn set_parent_trees_simple_case() {
             b"",
             b"a-file",
             b"file-id",
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             0,
             &stat,
             b"",
@@ -2745,7 +2745,7 @@ fn set_parent_trees_ghost_parent_has_no_entries() {
     let mut state = add_fixture();
     let stat = b"x".repeat(32);
     state
-        .add(b"x", b"", b"x", b"x-id", osutils::Kind::File, 0, &stat, b"")
+        .add(b"x", b"", b"x", b"x-id", crate::osutils::Kind::File, 0, &stat, b"")
         .expect("add");
 
     state
@@ -2779,7 +2779,7 @@ fn set_parent_trees_cross_path_relocation() {
             b"",
             b"new-path",
             b"fid",
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             0,
             &stat,
             b"",
@@ -4775,11 +4775,11 @@ impl Transport for MemoryTransport {
                 continue;
             }
             let kind = if info.is_dir() {
-                Some(osutils::Kind::Directory)
+                Some(crate::osutils::Kind::Directory)
             } else if info.is_file() {
-                Some(osutils::Kind::File)
+                Some(crate::osutils::Kind::File)
             } else if info.is_symlink() {
-                Some(osutils::Kind::Symlink)
+                Some(crate::osutils::Kind::Symlink)
             } else {
                 None
             };
@@ -5606,18 +5606,18 @@ fn kind_is_absent_or_relocated_only_those_two() {
 
 #[test]
 fn kind_to_osutils_kind_maps_real_kinds() {
-    assert_eq!(Kind::File.to_osutils_kind(), Some(osutils::Kind::File));
+    assert_eq!(Kind::File.to_osutils_kind(), Some(crate::osutils::Kind::File));
     assert_eq!(
         Kind::Directory.to_osutils_kind(),
-        Some(osutils::Kind::Directory)
+        Some(crate::osutils::Kind::Directory)
     );
     assert_eq!(
         Kind::Symlink.to_osutils_kind(),
-        Some(osutils::Kind::Symlink)
+        Some(crate::osutils::Kind::Symlink)
     );
     assert_eq!(
         Kind::TreeReference.to_osutils_kind(),
-        Some(osutils::Kind::TreeReference)
+        Some(crate::osutils::Kind::TreeReference)
     );
     assert_eq!(Kind::Absent.to_osutils_kind(), None);
     assert_eq!(Kind::Relocated.to_osutils_kind(), None);
@@ -5625,11 +5625,11 @@ fn kind_to_osutils_kind_maps_real_kinds() {
 
 #[test]
 fn kind_from_osutils_kind_maps_all_four() {
-    assert_eq!(Kind::from(osutils::Kind::File), Kind::File);
-    assert_eq!(Kind::from(osutils::Kind::Directory), Kind::Directory);
-    assert_eq!(Kind::from(osutils::Kind::Symlink), Kind::Symlink);
+    assert_eq!(Kind::from(crate::osutils::Kind::File), Kind::File);
+    assert_eq!(Kind::from(crate::osutils::Kind::Directory), Kind::Directory);
+    assert_eq!(Kind::from(crate::osutils::Kind::Symlink), Kind::Symlink);
     assert_eq!(
-        Kind::from(osutils::Kind::TreeReference),
+        Kind::from(crate::osutils::Kind::TreeReference),
         Kind::TreeReference
     );
 }
@@ -5741,7 +5741,7 @@ fn versioned_file_row(
             b"",
             basename,
             file_id,
-            osutils::Kind::File,
+            crate::osutils::Kind::File,
             on_disk_stat.size,
             &packed_stat,
             fingerprint,
@@ -6295,7 +6295,7 @@ fn bootstrap_new_parent_slot_appends_one_absent_tree_per_row() {
 fn add_path_inserts_entry_using_path_string() {
     let mut state = add_fixture();
     state
-        .add_path("a", b"fid-a", osutils::Kind::File, None, b"")
+        .add_path("a", b"fid-a", crate::osutils::Kind::File, None, b"")
         .expect("add_path");
     let row = state
         .get_entry_by_path(0, b"a")
@@ -6308,7 +6308,7 @@ fn add_path_inserts_entry_using_path_string() {
 fn add_path_rejects_dot_basename() {
     let mut state = add_fixture();
     let err = state
-        .add_path(".", b"fid", osutils::Kind::File, None, b"")
+        .add_path(".", b"fid", crate::osutils::Kind::File, None, b"")
         .unwrap_err();
     assert!(
         matches!(err, AddError::InvalidEntryName { .. }),
@@ -6321,7 +6321,7 @@ fn add_path_rejects_dot_basename() {
 fn add_path_rejects_dotdot_basename() {
     let mut state = add_fixture();
     let err = state
-        .add_path("sub/..", b"fid", osutils::Kind::File, None, b"")
+        .add_path("sub/..", b"fid", crate::osutils::Kind::File, None, b"")
         .unwrap_err();
     assert!(
         matches!(err, AddError::InvalidEntryName { .. }),
@@ -6334,7 +6334,7 @@ fn add_path_rejects_dotdot_basename() {
 fn apply_removals_makes_entry_absent() {
     let mut state = add_fixture();
     state
-        .add_path("a", b"fid-a", osutils::Kind::File, None, b"")
+        .add_path("a", b"fid-a", crate::osutils::Kind::File, None, b"")
         .expect("add_path");
     state
         .apply_removals(&[(b"fid-a".to_vec(), b"a".to_vec())])
@@ -6352,7 +6352,7 @@ fn apply_removals_makes_entry_absent() {
 fn apply_removals_with_wrong_file_id_returns_invalid() {
     let mut state = add_fixture();
     state
-        .add_path("a", b"fid-a", osutils::Kind::File, None, b"")
+        .add_path("a", b"fid-a", crate::osutils::Kind::File, None, b"")
         .expect("add_path");
     let err = state
         .apply_removals(&[(b"wrong-id".to_vec(), b"a".to_vec())])

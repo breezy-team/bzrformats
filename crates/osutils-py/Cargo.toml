@@ -9,5 +9,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module"] }
-osutils = { path = "../osutils-rs" }
+bazaar = { path = "../bazaar" }
 walkdir = "2"
