@@ -860,16 +860,26 @@ pub trait VersionedFiles<CF: ContentFactory, I> {
     ) -> Box<dyn Iterator<Item = CF>>;
 }
 
-pub fn record_to_fulltext_bytes<R: ContentFactory, W: std::io::Write>(
-    record: R,
+/// Encode a record's metadata + fulltext into the `fulltext\n<len><meta><body>`
+/// network framing. Mirrors `bzrformats.versionedfile.record_to_fulltext_bytes`.
+///
+/// The arguments are the data the framing actually needs: the record's
+/// key, optional parents (None means "no graph info"), and fulltext
+/// bytes. Callers in pyo3-land extract these from the Python record
+/// with `?` so any AttributeError or extraction failure surfaces as a
+/// real Python exception.
+pub fn write_fulltext_record<W: std::io::Write>(
+    key: &Key,
+    parents: Option<&[Key]>,
+    fulltext: &[u8],
     w: &mut W,
 ) -> std::io::Result<()> {
     let mut record_meta = bendy::encoding::Encoder::new();
 
     record_meta
         .emit_list(|e| {
-            e.emit(record.key())?;
-            if let Some(parents) = record.parents() {
+            e.emit(key)?;
+            if let Some(parents) = parents {
                 e.emit_list(|e| {
                     for parent in parents {
                         e.emit(parent)?;
@@ -888,9 +898,22 @@ pub fn record_to_fulltext_bytes<R: ContentFactory, W: std::io::Write>(
     w.write_all(b"fulltext\n")?;
     w.write_all(&length_prefix(&record_meta))?;
     w.write_all(&record_meta)?;
-    w.write_all(&record.into_fulltext())?;
+    w.write_all(fulltext)?;
 
     Ok(())
+}
+
+/// Convenience wrapper that pulls all the framing inputs out of a
+/// `ContentFactory`. Used by Rust-only callers; pyo3 wrappers should
+/// call [`write_fulltext_record`] directly to keep error propagation
+/// fallible.
+pub fn record_to_fulltext_bytes<R: ContentFactory, W: std::io::Write>(
+    record: R,
+    w: &mut W,
+) -> std::io::Result<()> {
+    let key = record.key();
+    let parents = record.parents();
+    write_fulltext_record(&key, parents.as_deref(), &record.into_fulltext(), w)
 }
 
 fn length_prefix(data: &[u8]) -> Vec<u8> {

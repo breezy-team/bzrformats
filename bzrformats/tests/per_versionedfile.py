@@ -863,18 +863,20 @@ class TestWeave(TestCaseWithMemoryTransport, VersionedFileTestMixIn):
         )
         w.check()
 
-        # Corrupted
-        w._weave[4] = b"There\n"
+        # Corrupted: rewrite literal entry index 4 (the `b"there\n"`
+        # line) via the test-only Rust mutator since `_weave` is now a
+        # snapshot and assignment to it goes nowhere.
+        w._test_corrupt_line(4, b"There\n")
         return w
 
     def get_file_corrupted_checksum(self):
         w = self.get_file_corrupted_text()
         # Corrected
-        w._weave[4] = b"there\n"
+        w._test_corrupt_line(4, b"there\n")
         self.assertEqual(b"hello\nthere\n", w.get_text(b"v2"))
 
         # Invalid checksum, first digit changed
-        w._sha1s[1] = b"f0f265c6e75f1c8f9ab76dcf85528352c5f215ef"
+        w._test_corrupt_sha1(1, b"f0f265c6e75f1c8f9ab76dcf85528352c5f215ef")
         return w
 
     def reopen_file(self, name="foo", create=False):

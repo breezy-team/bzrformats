@@ -3785,4 +3785,4 @@ class _KnitAnnotator(VersionedFileAnnotator):
 
 
 from ._bzr_rs import knit as _knit_rs
-from ._bzr_rs.knit import _load_data_c as _load_data
+from ._bzr_rs.knit import _load_data

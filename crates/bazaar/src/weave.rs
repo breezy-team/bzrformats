@@ -233,9 +233,15 @@ impl WeaveFile {
                 for line in lines {
                     self.weave.push(WeaveEntry::Line(line.clone()));
                 }
+                // InsertClose carries no meaningful version — the
+                // bracket pairs by stack order, not by index. The on-disk
+                // format reflects this (`}\n` with no version), and the
+                // reader normalises to 0 here. Keep them aligned so a
+                // round-trip via `write_weave_v5`/`read_weave_v5` is a
+                // structural identity.
                 self.weave.push(WeaveEntry::Control {
                     op: Instruction::InsertClose,
-                    version: new_version,
+                    version: 0,
                 });
             }
             return Ok(new_version);
@@ -324,7 +330,7 @@ impl WeaveFile {
                 }
                 splice.push(WeaveEntry::Control {
                     op: Instruction::InsertClose,
-                    version: new_version,
+                    version: 0,
                 });
                 let added = splice.len();
                 let tail = self.weave.split_off(i);
@@ -353,6 +359,447 @@ impl WeaveFile {
         }
         Ok(idx)
     }
+
+    /// Add a single text addressed by parent *names* rather than indices.
+    /// Mirrors the high-level `Weave.add_lines` entry point: looks up each
+    /// parent name, errors with `RevisionNotPresentByName` if any parent is
+    /// unknown, and otherwise delegates to [`WeaveFile::add`].
+    pub fn add_lines(
+        &mut self,
+        version_id: &[u8],
+        parent_names: &[&[u8]],
+        lines: &[Vec<u8>],
+        sha1: Option<Vec<u8>>,
+        nostore_sha: Option<&[u8]>,
+    ) -> Result<usize, WeaveError> {
+        let mut parent_idxs = Vec::with_capacity(parent_names.len());
+        for name in parent_names {
+            parent_idxs.push(
+                self.lookup(name)
+                    .ok_or_else(|| WeaveError::RevisionNotPresentByName(name.to_vec()))?,
+            );
+        }
+        self.add(Some(version_id), lines, &parent_idxs, sha1, nostore_sha)
+    }
+
+    /// Yield every line that is inserted by, or present in, the given set of
+    /// versions. Lines are returned with a trailing newline appended if they
+    /// don't already have one. Mirrors `Weave.iter_lines_added_or_present_in_versions`.
+    ///
+    /// `version_names` is interpreted as a set; `None` means "all versions".
+    /// Each yielded entry is `(line_with_eol, inserted_version_name)`.
+    pub fn iter_lines_added_or_present_in_versions<'a, I>(
+        &self,
+        version_names: Option<I>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WeaveError>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        // Build the set of insert-version *indices* we care about.
+        let included: std::collections::HashSet<usize> = match version_names {
+            None => (0..self.parents.len()).collect(),
+            Some(iter) => {
+                let mut s = std::collections::HashSet::new();
+                for name in iter {
+                    if let Some(idx) = self.lookup(name) {
+                        s.insert(idx);
+                    }
+                    // Unknown names are silently dropped, matching the Python
+                    // contract (the set is filtered against actually-walked
+                    // insert versions).
+                }
+                s
+            }
+        };
+
+        let walked = walk_internal(&self.weave)?;
+        let mut out = Vec::new();
+        for w in walked {
+            if !included.contains(&w.insert) {
+                continue;
+            }
+            let mut line = w.text.to_vec();
+            if !line.ends_with(b"\n") {
+                line.push(b'\n');
+            }
+            out.push((line, self.names[w.insert].clone()));
+        }
+        Ok(out)
+    }
+
+    /// Three-way merge plan between `ver_a` and `ver_b`. Each yielded
+    /// entry is one of: `killed-base`, `killed-both`, `killed-a`,
+    /// `killed-b`, `unchanged`, `new-a`, `new-b`, `ghost-a`, `ghost-b`,
+    /// `irrelevant`. Mirrors `Weave.plan_merge`.
+    pub fn plan_merge(
+        &self,
+        ver_a: &[u8],
+        ver_b: &[u8],
+    ) -> Result<Vec<(PlanMergeState, Vec<u8>)>, WeaveError> {
+        let idx_a = self
+            .lookup(ver_a)
+            .ok_or_else(|| WeaveError::RevisionNotPresentByName(ver_a.to_vec()))?;
+        let idx_b = self
+            .lookup(ver_b)
+            .ok_or_else(|| WeaveError::RevisionNotPresentByName(ver_b.to_vec()))?;
+
+        let inc_a = inclusions(&self.parents, &[idx_a]);
+        let inc_b = inclusions(&self.parents, &[idx_b]);
+        let inc_c: std::collections::HashSet<usize> = inc_a.intersection(&inc_b).copied().collect();
+
+        let walked = walk_internal(&self.weave)?;
+        let mut out = Vec::new();
+        for w in walked {
+            let deletes_hit_c = w.deletes.iter().any(|d| inc_c.contains(d));
+            let state = if deletes_hit_c {
+                PlanMergeState::KilledBase
+            } else if inc_c.contains(&w.insert) {
+                let killed_a = w.deletes.iter().any(|d| inc_a.contains(d));
+                let killed_b = w.deletes.iter().any(|d| inc_b.contains(d));
+                match (killed_a, killed_b) {
+                    (true, true) => PlanMergeState::KilledBoth,
+                    (true, false) => PlanMergeState::KilledA,
+                    (false, true) => PlanMergeState::KilledB,
+                    (false, false) => PlanMergeState::Unchanged,
+                }
+            } else if inc_a.contains(&w.insert) {
+                if w.deletes.iter().any(|d| inc_a.contains(d)) {
+                    PlanMergeState::GhostA
+                } else {
+                    PlanMergeState::NewA
+                }
+            } else if inc_b.contains(&w.insert) {
+                if w.deletes.iter().any(|d| inc_b.contains(d)) {
+                    PlanMergeState::GhostB
+                } else {
+                    PlanMergeState::NewB
+                }
+            } else {
+                PlanMergeState::Irrelevant
+            };
+            out.push((state, w.text.to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Internal consistency check. Verifies parent indices are acyclic
+    /// (each parent strictly less than its child), recomputes ancestry
+    /// from scratch and compares to `get_ancestry`, then walks the weave
+    /// accumulating per-version sha1s and compares to the stored sha1s.
+    /// Mirrors `Weave.check`.
+    pub fn check(&self) -> Result<(), WeaveError> {
+        use sha1::{Digest, Sha1};
+
+        let nv = self.num_versions();
+        for v in 0..nv {
+            if let Some(&max) = self.parents[v].iter().max() {
+                if max >= v {
+                    return Err(WeaveError::Acyclic { version: v, max });
+                }
+            }
+        }
+
+        // Per-version inclusion sets (by name) built incrementally.
+        let mut inclusions_by_name: std::collections::HashMap<Vec<u8>, std::collections::HashSet<Vec<u8>>> =
+            std::collections::HashMap::with_capacity(nv);
+        let mut hashers: std::collections::HashMap<Vec<u8>, Sha1> =
+            std::collections::HashMap::with_capacity(nv);
+        for v in 0..nv {
+            let name = &self.names[v];
+            let mut new_inc: std::collections::HashSet<Vec<u8>> =
+                std::collections::HashSet::new();
+            new_inc.insert(name.clone());
+            for &p in &self.parents[v] {
+                let parent_name = &self.names[p];
+                if let Some(parent_inc) = inclusions_by_name.get(parent_name) {
+                    new_inc.extend(parent_inc.iter().cloned());
+                }
+            }
+            // Cross-check against get_ancestry, which derives the same set
+            // through the inclusions() helper. If they disagree, the
+            // parent table is inconsistent in some way we missed.
+            let computed = self
+                .get_ancestry(std::iter::once(name.as_slice()))?
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            if computed != new_inc {
+                return Err(WeaveError::AncestryMismatch(name.clone()));
+            }
+            inclusions_by_name.insert(name.clone(), new_inc);
+            hashers.insert(name.clone(), Sha1::new());
+        }
+
+        for w in walk_internal(&self.weave)? {
+            let insert_name = &self.names[w.insert];
+            let delete_names: Vec<&[u8]> = w
+                .deletes
+                .iter()
+                .map(|&d| self.names[d].as_slice())
+                .collect();
+            for v in 0..nv {
+                let name = &self.names[v];
+                let inc = &inclusions_by_name[name];
+                if !inc.contains(insert_name) {
+                    continue;
+                }
+                if delete_names.iter().any(|d| inc.contains(*d)) {
+                    continue;
+                }
+                hashers.get_mut(name).expect("seeded above").update(w.text);
+            }
+        }
+
+        for v in 0..nv {
+            let name = &self.names[v];
+            let digest = hashers.remove(name).expect("seeded above").finalize();
+            let mut hex = vec![0u8; digest.len() * 2];
+            for (i, byte) in digest.iter().enumerate() {
+                let high = byte >> 4;
+                let low = byte & 0x0f;
+                hex[i * 2] = if high < 10 {
+                    b'0' + high
+                } else {
+                    b'a' + high - 10
+                };
+                hex[i * 2 + 1] = if low < 10 {
+                    b'0' + low
+                } else {
+                    b'a' + low - 10
+                };
+            }
+            if hex != self.sha1s[v] {
+                return Err(WeaveError::InvalidChecksum {
+                    version: v,
+                    expected: self.sha1s[v].clone(),
+                    measured: hex,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Translate parent indices in `other` to parent indices in `self`,
+    /// looking up by version name. Errors if any of the parents are
+    /// missing from `self`. Mirrors `Weave._imported_parents`.
+    pub fn imported_parents(&self, other: &WeaveFile, other_idx: usize) -> Result<Vec<usize>, WeaveError> {
+        let mut new_parents = Vec::with_capacity(other.parents[other_idx].len());
+        for &parent_idx in &other.parents[other_idx] {
+            let parent_name = &other.names[parent_idx];
+            let mapped = self
+                .lookup(parent_name)
+                .ok_or_else(|| WeaveError::MissingParent {
+                    parent: parent_name.clone(),
+                    child: other.names[other_idx].clone(),
+                })?;
+            new_parents.push(mapped);
+        }
+        Ok(new_parents)
+    }
+
+    /// Cross-check that a version `name` shared between `self` and `other`
+    /// has matching sha1s and compatible (subset-wise) parent sets.
+    /// Returns `Ok(true)` if the version exists in `self` and is
+    /// consistent, `Ok(false)` if not present in `self`, or
+    /// `Err(TextDiffers | ParentMismatch)` on inconsistency. Mirrors
+    /// `Weave._check_version_consistent`.
+    pub fn check_version_consistent(
+        &self,
+        other: &WeaveFile,
+        other_idx: usize,
+        name: &[u8],
+    ) -> Result<bool, WeaveError> {
+        let this_idx = match self.lookup(name) {
+            None => return Ok(false),
+            Some(i) => i,
+        };
+        if self.sha1s[this_idx] != other.sha1s[other_idx] {
+            return Err(WeaveError::TextDiffers(name.to_vec()));
+        }
+        let self_parents: std::collections::HashSet<Vec<u8>> = self.parents[this_idx]
+            .iter()
+            .map(|&p| self.names[p].clone())
+            .collect();
+        let other_parents: std::collections::HashSet<Vec<u8>> = other.parents[other_idx]
+            .iter()
+            .map(|&p| other.names[p].clone())
+            .collect();
+        if !other_parents.is_subset(&self_parents) {
+            return Err(WeaveError::ParentMismatch {
+                version: name.to_vec(),
+                a: self_parents.into_iter().collect(),
+                b: other_parents.into_iter().collect(),
+            });
+        }
+        Ok(true)
+    }
+}
+
+/// One state in a [`WeaveFile::plan_merge`] result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanMergeState {
+    KilledBase,
+    KilledBoth,
+    KilledA,
+    KilledB,
+    Unchanged,
+    NewA,
+    NewB,
+    GhostA,
+    GhostB,
+    Irrelevant,
+}
+
+impl PlanMergeState {
+    /// String tag matching the Python `Weave.plan_merge` yields
+    /// (e.g. `b"killed-a"`).
+    pub fn tag(self) -> &'static [u8] {
+        match self {
+            PlanMergeState::KilledBase => b"killed-base",
+            PlanMergeState::KilledBoth => b"killed-both",
+            PlanMergeState::KilledA => b"killed-a",
+            PlanMergeState::KilledB => b"killed-b",
+            PlanMergeState::Unchanged => b"unchanged",
+            PlanMergeState::NewA => b"new-a",
+            PlanMergeState::NewB => b"new-b",
+            PlanMergeState::GhostA => b"ghost-a",
+            PlanMergeState::GhostB => b"ghost-b",
+            PlanMergeState::Irrelevant => b"irrelevant",
+        }
+    }
+}
+
+/// Apply one of the documented orderings to a list of version names
+/// against `wf`'s parent table, returning the same names re-ordered.
+/// Unknown names are appended at the end in their original order, to
+/// match `Weave.get_record_stream`'s
+/// `set(versions).difference(set(parents))` fallback.
+///
+/// `ordering` is one of:
+///
+/// * `"unordered"` — input order, unchanged
+/// * `"topological"` — parents before their children
+/// * `"groupcompress"` — reverse-topological, grouped by key prefix
+///
+/// Returns `None` if `ordering` isn't recognised.
+pub fn order_record_stream(
+    wf: &WeaveFile,
+    names: &[Vec<u8>],
+    ordering: &str,
+) -> Option<Vec<Vec<u8>>> {
+    use vcs_graph::tsort::TopoSorter;
+
+    let mut known = Vec::new();
+    let mut unknown = Vec::new();
+    for name in names {
+        if wf.lookup(name).is_some() {
+            known.push(name.clone());
+        } else {
+            unknown.push(name.clone());
+        }
+    }
+
+    match ordering {
+        "unordered" => Some(names.to_vec()),
+        "topological" => {
+            let pairs: Vec<(Vec<u8>, Vec<Vec<u8>>)> = known
+                .iter()
+                .map(|name| {
+                    let idx = wf.lookup(name).expect("known by construction");
+                    let parents = wf.parents[idx]
+                        .iter()
+                        .map(|&p| wf.names[p].clone())
+                        .collect();
+                    (name.clone(), parents)
+                })
+                .collect();
+            let mut sorter = TopoSorter::new(pairs.into_iter());
+            let mut sorted = sorter.sorted().expect("acyclic by invariant");
+            sorted.extend(unknown);
+            Some(sorted)
+        }
+        "groupcompress" => {
+            let parent_map: Vec<(Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>)> = known
+                .iter()
+                .map(|name| {
+                    let idx = wf.lookup(name).expect("known by construction");
+                    let key = vec![name.clone()];
+                    let parents: Vec<Vec<Vec<u8>>> = wf.parents[idx]
+                        .iter()
+                        .map(|&p| vec![wf.names[p].clone()])
+                        .collect();
+                    (key, parents)
+                })
+                .collect();
+            let mut out: Vec<Vec<u8>> = crate::groupcompress::sort::sort_gc_optimal(parent_map)
+                .into_iter()
+                .map(|key| key.into_iter().next().expect("single-segment key"))
+                .collect();
+            out.extend(unknown);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Combine two weaves into a single weave that contains every version
+/// from both inputs, with parent sets that are the union of the parent
+/// sets in `wa` and `wb`. Mirrors `bzrformats.weave._reweave`.
+///
+/// Errors out with `WeaveError::TextDiffers` if any shared version has
+/// different content in the two inputs.
+pub fn reweave(wa: &WeaveFile, wb: &WeaveFile) -> Result<WeaveFile, WeaveError> {
+    use vcs_graph::tsort::TopoSorter;
+
+    // Build combined parent graph: name -> set(parent_names).
+    // Iteration order matches the Python implementation: wa first then wb,
+    // and within each weave the existing version order.
+    let mut combined: std::collections::BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> =
+        std::collections::BTreeMap::new();
+    for w in [wa, wb] {
+        for (idx, name) in w.names.iter().enumerate() {
+            let entry = combined.entry(name.clone()).or_default();
+            for &p in &w.parents[idx] {
+                entry.insert(w.names[p].clone());
+            }
+        }
+    }
+
+    // Topo-sort by parent graph.
+    let pairs: Vec<(Vec<u8>, Vec<Vec<u8>>)> = combined
+        .iter()
+        .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+        .collect();
+    let mut sorter = TopoSorter::new(pairs.into_iter());
+    let order = sorter
+        .sorted()
+        .map_err(|_| WeaveError::ReweaveCycle)?;
+
+    let mut wr = WeaveFile::default();
+    for name in order {
+        let lines = if let Some(idx_a) = wa.lookup(&name) {
+            let lines_a = wa.get_lines(idx_a)?;
+            if let Some(idx_b) = wb.lookup(&name) {
+                let lines_b = wb.get_lines(idx_b)?;
+                if lines_a != lines_b {
+                    return Err(WeaveError::TextDiffers(name.clone()));
+                }
+            }
+            lines_a
+        } else {
+            // Must be in wb (sorter only emitted versions from `combined`).
+            let idx_b = wb.lookup(&name).expect("name from combined map");
+            wb.get_lines(idx_b)?
+        };
+        let parent_names: Vec<Vec<u8>> = combined
+            .get(&name)
+            .expect("name from combined map")
+            .iter()
+            .cloned()
+            .collect();
+        let parent_refs: Vec<&[u8]> = parent_names.iter().map(|p| p.as_slice()).collect();
+        wr.add_lines(&name, &parent_refs, &lines, None, None)?;
+    }
+    Ok(wr)
 }
 
 /// Errors from reading a v5 weave file.
@@ -428,6 +875,24 @@ pub enum WeaveError {
         expected: Vec<u8>,
         measured: Vec<u8>,
     },
+    /// `check` found a parent index that wasn't strictly less than its child.
+    Acyclic { version: usize, max: usize },
+    /// `check` found ancestry computed by walking the parent table did not
+    /// match `get_ancestry`'s output for the same version.
+    AncestryMismatch(Vec<u8>),
+    /// `imported_parents` couldn't find a needed parent in `self`.
+    MissingParent { parent: Vec<u8>, child: Vec<u8> },
+    /// Two weaves disagree on a version's text content.
+    TextDiffers(Vec<u8>),
+    /// Two weaves disagree on a version's parents (and `other` isn't a
+    /// subset of `self`).
+    ParentMismatch {
+        version: Vec<u8>,
+        a: Vec<Vec<u8>>,
+        b: Vec<Vec<u8>>,
+    },
+    /// `reweave` saw a cycle in the combined parent graph.
+    ReweaveCycle,
 }
 
 impl std::fmt::Display for WeaveError {
@@ -462,6 +927,28 @@ impl std::fmt::Display for WeaveError {
                 "invalid checksum for version {}: expected {:?}, measured {:?}",
                 version, expected, measured
             ),
+            WeaveError::Acyclic { version, max } => write!(
+                f,
+                "invalid included version {} for index {}",
+                max, version
+            ),
+            WeaveError::AncestryMismatch(name) => {
+                write!(f, "ancestry mismatch for version {:?}", name)
+            }
+            WeaveError::MissingParent { parent, child } => write!(
+                f,
+                "missing parent {{{:?}}} of {{{:?}}}",
+                parent, child
+            ),
+            WeaveError::TextDiffers(name) => {
+                write!(f, "weaves differ on text content for version {:?}", name)
+            }
+            WeaveError::ParentMismatch { version, a, b } => write!(
+                f,
+                "inconsistent parents for version {{{:?}}}: {:?} vs {:?}",
+                version, a, b
+            ),
+            WeaveError::ReweaveCycle => write!(f, "cycle in combined parent graph during reweave"),
         }
     }
 }
@@ -1554,5 +2041,522 @@ mod tests {
             n.extend_from_slice(&sha);
             n
         });
+    }
+
+    /// `add_lines` resolves parent names via `lookup` and surfaces
+    /// `RevisionNotPresentByName` for missing parents — matching what the
+    /// Python `Weave.add_lines` -> `_add` flow does for invalid parent
+    /// names (test_weave.InvalidAdd).
+    #[test]
+    fn add_lines_by_name_unknown_parent_errors() {
+        let mut wf = WeaveFile::default();
+        let lines = ls(&[b"x\n"]);
+        let parents: &[&[u8]] = &[b"69"];
+        let err = wf.add_lines(b"text0", parents, &lines, None, None).unwrap_err();
+        assert_eq!(err, WeaveError::RevisionNotPresentByName(b"69".to_vec()));
+    }
+
+    /// `add_lines` happy path: resolves parent name to its index and
+    /// records the new version on top of the existing weave.
+    #[test]
+    fn add_lines_by_name_resolves_parent() {
+        let mut wf = WeaveFile::default();
+        wf.add_lines(b"v0", &[], &ls(&[b"a\n"]), None, None).unwrap();
+        let p: &[&[u8]] = &[b"v0"];
+        let idx = wf
+            .add_lines(b"v1", p, &ls(&[b"a\n", b"b\n"]), None, None)
+            .unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(wf.get_lines(1).unwrap(), ls(&[b"a\n", b"b\n"]));
+    }
+
+    /// Lines with no trailing newline get one appended on iteration.
+    /// Mirrors the trailing-`\n` handling in
+    /// `Weave.iter_lines_added_or_present_in_versions`.
+    #[test]
+    fn iter_lines_appends_missing_newline() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"v0"), &[b"no-eol".to_vec()], &[], None, None)
+            .unwrap();
+        let names: Vec<&[u8]> = vec![b"v0"];
+        let got = wf
+            .iter_lines_added_or_present_in_versions(Some(names))
+            .unwrap();
+        assert_eq!(got, vec![(b"no-eol\n".to_vec(), b"v0".to_vec())]);
+    }
+
+    /// Filtering by a subset of versions only yields lines inserted by
+    /// those versions.
+    #[test]
+    fn iter_lines_filters_by_version() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"v0"), &ls(&[b"a\n", b"b\n"]), &[], None, None)
+            .unwrap();
+        wf.add(Some(b"v1"), &ls(&[b"a\n", b"b\n", b"c\n"]), &[0], None, None)
+            .unwrap();
+        let names: Vec<&[u8]> = vec![b"v1"];
+        let got = wf
+            .iter_lines_added_or_present_in_versions(Some(names))
+            .unwrap();
+        assert_eq!(got, vec![(b"c\n".to_vec(), b"v1".to_vec())]);
+    }
+
+    /// `None` for `version_names` means "all versions".
+    #[test]
+    fn iter_lines_all_versions() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wf.add(Some(b"v1"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
+            .unwrap();
+        let got = wf
+            .iter_lines_added_or_present_in_versions::<std::iter::Empty<&[u8]>>(None)
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (b"a\n".to_vec(), b"v0".to_vec()),
+                (b"b\n".to_vec(), b"v1".to_vec()),
+            ]
+        );
+    }
+
+    /// `plan_merge` between two siblings of the same base reports
+    /// each new line as `new-a` or `new-b`.
+    #[test]
+    fn plan_merge_disjoint_additions() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"base"), &ls(&[b"shared\n"]), &[], None, None)
+            .unwrap();
+        wf.add(
+            Some(b"a"),
+            &ls(&[b"shared\n", b"from-a\n"]),
+            &[0],
+            None,
+            None,
+        )
+        .unwrap();
+        wf.add(
+            Some(b"b"),
+            &ls(&[b"shared\n", b"from-b\n"]),
+            &[0],
+            None,
+            None,
+        )
+        .unwrap();
+        let plan = wf.plan_merge(b"a", b"b").unwrap();
+        let by_state: Vec<(&'static [u8], &[u8])> =
+            plan.iter().map(|(s, l)| (s.tag(), l.as_slice())).collect();
+        assert!(by_state.contains(&(b"unchanged", b"shared\n".as_slice())));
+        assert!(by_state.contains(&(b"new-a", b"from-a\n".as_slice())));
+        assert!(by_state.contains(&(b"new-b", b"from-b\n".as_slice())));
+    }
+
+    /// `plan_merge` reports a base-killed line when both branches have
+    /// dropped the same content.
+    #[test]
+    fn plan_merge_killed_both() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"base"), &ls(&[b"keep\n", b"drop\n"]), &[], None, None)
+            .unwrap();
+        wf.add(Some(b"a"), &ls(&[b"keep\n"]), &[0], None, None).unwrap();
+        wf.add(Some(b"b"), &ls(&[b"keep\n"]), &[0], None, None).unwrap();
+        let plan = wf.plan_merge(b"a", b"b").unwrap();
+        let drops: Vec<&'static [u8]> = plan
+            .iter()
+            .filter(|(_, l)| l == b"drop\n")
+            .map(|(s, _)| s.tag())
+            .collect();
+        // The dropped line is reported once with state killed-both.
+        assert_eq!(drops, vec![b"killed-both"]);
+    }
+
+    /// `check` accepts a freshly-built weave that round-trips correctly.
+    #[test]
+    fn check_passes_on_clean_weave() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wf.add(Some(b"v1"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
+            .unwrap();
+        wf.check().unwrap();
+    }
+
+    /// `check` rejects a weave whose stored sha1 doesn't match the text
+    /// it would actually produce. Mirrors `JoinWeavesTests.test_written_detection`.
+    #[test]
+    fn check_rejects_corrupt_sha1() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        // Tamper with the stored sha1 for v0.
+        wf.sha1s[0] = b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_vec();
+        let err = wf.check().unwrap_err();
+        assert!(matches!(err, WeaveError::InvalidChecksum { version: 0, .. }));
+    }
+
+    /// `check` rejects a parents table where any parent index isn't strictly
+    /// less than its child.
+    #[test]
+    fn check_rejects_acyclic_violation() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wf.add(Some(b"v1"), &ls(&[b"a\n"]), &[0], None, None).unwrap();
+        // Now manually introduce an invalid self-parent.
+        wf.parents[1] = vec![1];
+        let err = wf.check().unwrap_err();
+        assert_eq!(
+            err,
+            WeaveError::Acyclic {
+                version: 1,
+                max: 1
+            }
+        );
+    }
+
+    /// `imported_parents` maps `other`'s parent indices to `self`'s, by
+    /// version name.
+    #[test]
+    fn imported_parents_translates_indices() {
+        let mut wa = WeaveFile::default();
+        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wa.add(Some(b"v1"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
+            .unwrap();
+        let mut wb = WeaveFile::default();
+        // Different ordering in wb.
+        wb.add(Some(b"v1"), &ls(&[b"x\n"]), &[], None, None).unwrap();
+        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+
+        // wa.imported_parents(wb, 0) — wb[0]'s parents in wb are [], so
+        // the result is also empty.
+        let got = wa.imported_parents(&wb, 0).unwrap();
+        assert!(got.is_empty());
+    }
+
+    /// `imported_parents` errors if a parent in `other` is missing from `self`.
+    #[test]
+    fn imported_parents_missing_parent_errors() {
+        let mut wa = WeaveFile::default();
+        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+
+        let mut wb = WeaveFile::default();
+        wb.add(Some(b"orphan"), &ls(&[b"x\n"]), &[], None, None).unwrap();
+        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[0], None, None).unwrap();
+        // wb's v0 has parent "orphan" which doesn't exist in wa.
+        let err = wa.imported_parents(&wb, 1).unwrap_err();
+        assert!(matches!(err, WeaveError::MissingParent { .. }));
+    }
+
+    /// `check_version_consistent` returns Ok(false) for versions absent
+    /// from `self`, Ok(true) when names match and parents are subset-OK,
+    /// and errors when sha1s differ.
+    #[test]
+    fn check_version_consistent_states() {
+        let mut wa = WeaveFile::default();
+        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        let mut wb = WeaveFile::default();
+        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wb.add(Some(b"v1"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
+            .unwrap();
+
+        // wb has v1 that wa doesn't — wa.check_version_consistent(wb, 1, "v1") -> Ok(false).
+        assert_eq!(wa.check_version_consistent(&wb, 1, b"v1").unwrap(), false);
+
+        // Both have v0 with identical content — Ok(true).
+        assert_eq!(wa.check_version_consistent(&wb, 0, b"v0").unwrap(), true);
+
+        // Tamper with wb's v0 sha to force a TextDiffers.
+        wb.sha1s[0] = b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_vec();
+        let err = wa.check_version_consistent(&wb, 0, b"v0").unwrap_err();
+        assert_eq!(err, WeaveError::TextDiffers(b"v0".to_vec()));
+    }
+
+    /// `reweave` of two weaves sharing a common base produces a weave
+    /// that contains every version from both inputs.
+    #[test]
+    fn reweave_merges_disjoint_branches() {
+        let mut wa = WeaveFile::default();
+        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wa.add(Some(b"a-only"), &ls(&[b"a\n", b"alpha\n"]), &[0], None, None)
+            .unwrap();
+
+        let mut wb = WeaveFile::default();
+        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wb.add(Some(b"b-only"), &ls(&[b"a\n", b"beta\n"]), &[0], None, None)
+            .unwrap();
+
+        let result = reweave(&wa, &wb).unwrap();
+        let mut names = result.versions();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![b"a-only".to_vec(), b"b-only".to_vec(), b"v0".to_vec()]
+        );
+        // Round-trip text from both branches.
+        let i = result.lookup(b"a-only").unwrap();
+        assert_eq!(result.get_lines(i).unwrap(), ls(&[b"a\n", b"alpha\n"]));
+        let j = result.lookup(b"b-only").unwrap();
+        assert_eq!(result.get_lines(j).unwrap(), ls(&[b"a\n", b"beta\n"]));
+    }
+
+    /// `order_record_stream` topological: parents come before children;
+    /// unknown names land at the end in input order.
+    #[test]
+    fn order_record_stream_topological() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"a"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wf.add(Some(b"b"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
+            .unwrap();
+        wf.add(Some(b"c"), &ls(&[b"a\n", b"b\n", b"c\n"]), &[1], None, None)
+            .unwrap();
+        // Input order is leaf-first, plus an unknown.
+        let names: Vec<Vec<u8>> = vec![
+            b"c".to_vec(),
+            b"a".to_vec(),
+            b"missing".to_vec(),
+            b"b".to_vec(),
+        ];
+        let got = order_record_stream(&wf, &names, "topological").unwrap();
+        // Topological subset is [a, b, c] (parents before children);
+        // unknowns appended preserving order.
+        assert_eq!(
+            got,
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"missing".to_vec(),
+            ]
+        );
+    }
+
+    /// `order_record_stream` unordered preserves input order verbatim.
+    #[test]
+    fn order_record_stream_unordered() {
+        let mut wf = WeaveFile::default();
+        wf.add(Some(b"a"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wf.add(Some(b"b"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
+            .unwrap();
+        let names: Vec<Vec<u8>> = vec![b"b".to_vec(), b"a".to_vec()];
+        assert_eq!(
+            order_record_stream(&wf, &names, "unordered").unwrap(),
+            vec![b"b".to_vec(), b"a".to_vec()]
+        );
+    }
+
+    /// `order_record_stream` rejects unknown ordering names.
+    #[test]
+    fn order_record_stream_rejects_unknown_ordering() {
+        let wf = WeaveFile::default();
+        assert!(order_record_stream(&wf, &[], "bogus").is_none());
+    }
+
+    /// `reweave` errors out if the two inputs disagree on the text of a
+    /// shared version. Mirrors the Python `WeaveTextDiffers` raise.
+    #[test]
+    fn reweave_text_diffs_error() {
+        let mut wa = WeaveFile::default();
+        wa.add(Some(b"v0"), &ls(&[b"hello\n"]), &[], None, None)
+            .unwrap();
+        let mut wb = WeaveFile::default();
+        wb.add(Some(b"v0"), &ls(&[b"goodbye\n"]), &[], None, None)
+            .unwrap();
+        let err = reweave(&wa, &wb).unwrap_err();
+        assert_eq!(err, WeaveError::TextDiffers(b"v0".to_vec()));
+    }
+
+    // ----------------------------------------------------------------
+    // Tests below were ported from `bzrformats/tests/test_weave.py` —
+    // they assemble `WeaveFile` literals directly to verify reading
+    // behavior on shapes that aren't reachable through the normal
+    // `add`/`add_lines` flow. The Python originals poked at private
+    // attributes (`_weave`, `_parents`, `_sha1s`); they live here now
+    // because the pyclass exposes those fields read-only.
+    // ----------------------------------------------------------------
+
+    /// Round-trip equality regression: a weave built with `add` and the
+    /// same weave parsed from its v5 serialization must compare equal.
+    /// Mirrors what the `Weave` Python `__eq__` is supposed to do.
+    #[test]
+    fn round_trip_equality() {
+        let mut w1 = WeaveFile::default();
+        w1.add(Some(b"text0"), &[b"header".to_vec()], &[], None, None).unwrap();
+        w1.add(
+            Some(b"text1"),
+            &[b"header".to_vec(), b"".to_vec(), b"line from 1".to_vec()],
+            &[0],
+            None,
+            None,
+        )
+        .unwrap();
+        let bytes = write_weave_v5(&w1);
+        let w2 = read_weave_v5(&bytes).unwrap();
+        assert_eq!(w1.parents, w2.parents);
+        assert_eq!(w1.sha1s, w2.sha1s);
+        assert_eq!(w1.names, w2.names);
+        assert_eq!(w1.weave, w2.weave);
+        assert_eq!(w1, w2);
+    }
+
+    /// Mirrors `test_weave.CannedDelete`: a weave with a delete bracket
+    /// produces the deleted line for v0 and skips it for v1.
+    #[test]
+    fn canned_delete_round_trip() {
+        let lines_v0 = ls(&[b"first line", b"line to be deleted", b"last line"]);
+        let lines_v1 = ls(&[b"first line", b"last line"]);
+        let weave_body = vec![
+            ctl(Instruction::InsertOpen, 0),
+            line(b"first line"),
+            ctl(Instruction::DeleteOpen, 1),
+            line(b"line to be deleted"),
+            ctl(Instruction::DeleteClose, 1),
+            line(b"last line"),
+            ctl(Instruction::InsertClose, 0),
+        ];
+        let wf = WeaveFile {
+            parents: vec![vec![], vec![0]],
+            sha1s: vec![sha_strings(&lines_v0), sha_strings(&lines_v1)],
+            names: vec![b"v0".to_vec(), b"v1".to_vec()],
+            weave: weave_body,
+        };
+        assert_eq!(wf.get_lines(0).unwrap(), lines_v0);
+        assert_eq!(wf.get_lines(1).unwrap(), lines_v1);
+    }
+
+    /// Mirrors `test_weave.CannedReplacement`: deletion plus a
+    /// fresh insertion under the same version replaces the line.
+    #[test]
+    fn canned_replacement_round_trip() {
+        let lines_v0 = ls(&[b"first line", b"line to be deleted", b"last line"]);
+        let lines_v1 = ls(&[b"first line", b"replacement line", b"last line"]);
+        let weave_body = vec![
+            ctl(Instruction::InsertOpen, 0),
+            line(b"first line"),
+            ctl(Instruction::DeleteOpen, 1),
+            line(b"line to be deleted"),
+            ctl(Instruction::DeleteClose, 1),
+            ctl(Instruction::InsertOpen, 1),
+            line(b"replacement line"),
+            ctl(Instruction::InsertClose, 1),
+            line(b"last line"),
+            ctl(Instruction::InsertClose, 0),
+        ];
+        let wf = WeaveFile {
+            parents: vec![vec![], vec![0]],
+            sha1s: vec![sha_strings(&lines_v0), sha_strings(&lines_v1)],
+            names: vec![b"v0".to_vec(), b"v1".to_vec()],
+            weave: weave_body,
+        };
+        assert_eq!(wf.get_lines(0).unwrap(), lines_v0);
+        assert_eq!(wf.get_lines(1).unwrap(), lines_v1);
+    }
+
+    /// Mirrors `test_weave.InsertNested`: insertions can nest and each
+    /// version's reconstructed text only includes the blocks whose
+    /// open-instruction is in its ancestry.
+    #[test]
+    fn insert_nested_round_trip() {
+        let v0 = ls(&[b"foo {", b"}"]);
+        let v1 = ls(&[b"foo {", b"  added in version 1", b"  also from v1", b"}"]);
+        let v2 = ls(&[b"foo {", b"  added in v2", b"}"]);
+        let v3 = ls(&[
+            b"foo {",
+            b"  added in version 1",
+            b"  added in v2",
+            b"  also from v1",
+            b"}",
+        ]);
+        let weave_body = vec![
+            ctl(Instruction::InsertOpen, 0),
+            line(b"foo {"),
+            ctl(Instruction::InsertOpen, 1),
+            line(b"  added in version 1"),
+            ctl(Instruction::InsertOpen, 2),
+            line(b"  added in v2"),
+            ctl(Instruction::InsertClose, 2),
+            line(b"  also from v1"),
+            ctl(Instruction::InsertClose, 1),
+            line(b"}"),
+            ctl(Instruction::InsertClose, 0),
+        ];
+        let wf = WeaveFile {
+            parents: vec![vec![], vec![0], vec![0], vec![0, 1, 2]],
+            sha1s: vec![
+                sha_strings(&v0),
+                sha_strings(&v1),
+                sha_strings(&v2),
+                sha_strings(&v3),
+            ],
+            names: vec![
+                b"v0".to_vec(),
+                b"v1".to_vec(),
+                b"v2".to_vec(),
+                b"v3".to_vec(),
+            ],
+            weave: weave_body,
+        };
+        assert_eq!(wf.get_lines(0).unwrap(), v0);
+        assert_eq!(wf.get_lines(1).unwrap(), v1);
+        assert_eq!(wf.get_lines(2).unwrap(), v2);
+        assert_eq!(wf.get_lines(3).unwrap(), v3);
+    }
+
+    /// Mirrors `test_weave.IncludeVersions`: a v1 insertion outside the
+    /// v0 insertion still attaches to the right version when extracted.
+    #[test]
+    fn include_versions_round_trip() {
+        let v0 = ls(&[b"first line"]);
+        let v01 = ls(&[b"first line", b"second line"]);
+        let weave_body = vec![
+            ctl(Instruction::InsertOpen, 0),
+            line(b"first line"),
+            ctl(Instruction::InsertClose, 0),
+            ctl(Instruction::InsertOpen, 1),
+            line(b"second line"),
+            ctl(Instruction::InsertClose, 1),
+        ];
+        let wf = WeaveFile {
+            parents: vec![vec![], vec![0]],
+            sha1s: vec![sha_strings(&v0), sha_strings(&v01)],
+            names: vec![b"v0".to_vec(), b"v1".to_vec()],
+            weave: weave_body,
+        };
+        assert_eq!(wf.get_lines(0).unwrap(), v0);
+        assert_eq!(wf.get_lines(1).unwrap(), v01);
+    }
+
+    /// Mirrors `test_weave.DivergedIncludes`: two siblings of the same
+    /// base each get their own additional line when extracted, and
+    /// `get_ancestry` reports the right ancestor name set.
+    #[test]
+    fn diverged_includes_round_trip() {
+        let v0 = ls(&[b"first line"]);
+        let v01 = ls(&[b"first line", b"second line"]);
+        let v02 = ls(&[b"first line", b"alternative second line"]);
+        let weave_body = vec![
+            ctl(Instruction::InsertOpen, 0),
+            line(b"first line"),
+            ctl(Instruction::InsertClose, 0),
+            ctl(Instruction::InsertOpen, 1),
+            line(b"second line"),
+            ctl(Instruction::InsertClose, 1),
+            ctl(Instruction::InsertOpen, 2),
+            line(b"alternative second line"),
+            ctl(Instruction::InsertClose, 2),
+        ];
+        let wf = WeaveFile {
+            parents: vec![vec![], vec![0], vec![0]],
+            sha1s: vec![
+                sha_strings(&v0),
+                sha_strings(&v01),
+                sha_strings(&v02),
+            ],
+            names: vec![b"0".to_vec(), b"1".to_vec(), b"2".to_vec()],
+            weave: weave_body,
+        };
+        assert_eq!(wf.get_lines(0).unwrap(), v0);
+        assert_eq!(wf.get_lines(1).unwrap(), v01);
+        assert_eq!(wf.get_lines(2).unwrap(), v02);
+        let ancestry: Vec<&[u8]> = vec![b"2"];
+        let mut got = wf.get_ancestry(ancestry).unwrap();
+        got.sort();
+        assert_eq!(got, vec![b"0".to_vec(), b"2".to_vec()]);
     }
 }

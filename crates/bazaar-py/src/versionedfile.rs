@@ -141,14 +141,31 @@ impl ChunkedContentFactory {
 }
 
 #[pyfunction]
-pub fn record_to_fulltext_bytes(py: Python, record: Py<PyAny>) -> PyResult<Py<PyAny>> {
-    let record = record.extract::<bazaar::pyversionedfile::PyContentFactory>(py)?;
+pub fn record_to_fulltext_bytes<'py>(
+    py: Python<'py>,
+    record: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    // Pull every framing input out of the Python record with `?` so
+    // attribute or extraction failures surface as proper Python errors.
+    // Python's record contract:
+    //   record.key                         -> tuple of bytes
+    //   record.parents                     -> None, or sequence of tuples
+    //   record.get_bytes_as("fulltext")    -> bytes
+    let key: Key = record.getattr("key")?.extract()?;
+    let parents_obj = record.getattr("parents")?;
+    let parents: Option<Vec<Key>> = if parents_obj.is_none() {
+        None
+    } else {
+        Some(parents_obj.extract()?)
+    };
+    let fulltext: Vec<u8> = record
+        .call_method1("get_bytes_as", ("fulltext",))?
+        .extract()?;
 
-    let mut s = Vec::new();
-
-    bazaar::versionedfile::record_to_fulltext_bytes(record, &mut s)?;
-
-    Ok(PyBytes::new(py, &s).into())
+    let _ = py;
+    let mut buf = Vec::new();
+    bazaar::versionedfile::write_fulltext_record(&key, parents.as_deref(), &fulltext, &mut buf)?;
+    Ok(PyBytes::new(record.py(), &buf))
 }
 
 #[pyclass(extends=AbstractContentFactory)]
