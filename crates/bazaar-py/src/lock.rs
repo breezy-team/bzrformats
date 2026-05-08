@@ -40,6 +40,7 @@ fn extract_path(obj: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
         }
         #[cfg(not(unix))]
         {
+            use pyo3::exceptions::PyValueError;
             return String::from_utf8(b)
                 .map(PathBuf::from)
                 .map_err(|e| PyValueError::new_err(e.to_string()));
