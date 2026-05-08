@@ -6,7 +6,7 @@ use bazaar::lock::{
     self as rs_lock, LockError, ReadLock as RsReadLock, TemporaryWriteLockResult,
     WriteLock as RsWriteLock,
 };
-use pyo3::exceptions::{PyOSError, PyValueError};
+use pyo3::exceptions::PyOSError;
 use pyo3::import_exception;
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyDict, PyTuple};

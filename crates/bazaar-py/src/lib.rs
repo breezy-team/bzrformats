@@ -624,7 +624,7 @@ impl InventorySerializer {
         let mut owned: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for item in iter {
             let item = item?;
-            let tuple = item.downcast::<pyo3::types::PyTuple>().map_err(|_| {
+            let tuple = item.cast::<pyo3::types::PyTuple>().map_err(|_| {
                 PyTypeError::new_err("line_iterator must yield (line, line_key) tuples")
             })?;
             if tuple.len() != 2 {
@@ -643,7 +643,7 @@ impl InventorySerializer {
             // sentinel that won't match any real revision id.
             let line_key = tuple.get_item(1)?;
             let revid: Vec<u8> = if let Ok(key_tuple) =
-                line_key.downcast::<pyo3::types::PyTuple>()
+                line_key.cast::<pyo3::types::PyTuple>()
             {
                 if key_tuple.is_empty() {
                     return Err(PyTypeError::new_err("line_key tuple must be non-empty"));

@@ -308,8 +308,8 @@ impl BTreeGraphIndex {
         self.inner.lock().unwrap().size()
     }
 
-    #[setter]
-    fn set__size(&self, value: Option<u64>) {
+    #[setter(_size)]
+    fn set_size(&self, value: Option<u64>) {
         // Tests use `index._size = None` to throw away the size info and
         // force a full read.
         let mut guard = self.inner.lock().unwrap();
