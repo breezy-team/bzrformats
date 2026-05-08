@@ -1126,13 +1126,14 @@ impl PyWeave {
     }
 
     /// Mirrors `Weave._add_lines` — add a single text given parent *names*.
-    /// Returns `(sha1_bytes, total_size, idx)`.
+    /// Returns `(sha1_bytes, total_size, idx)`. `version_id` may be None;
+    /// the Rust core then auto-allocates `b"sha1:" + sha1` as the name.
     #[pyo3(signature = (version_id, parents, lines, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
     #[allow(clippy::too_many_arguments)]
     fn _add_lines<'py>(
         &mut self,
         py: Python<'py>,
-        version_id: &[u8],
+        version_id: Option<&[u8]>,
         parents: Bound<'py, PyAny>,
         lines: Bound<'py, PyAny>,
         parent_texts: Option<Bound<'py, PyAny>>,
@@ -1171,11 +1172,25 @@ impl PyWeave {
                 Ok(bytes.to_vec())
             })
             .collect::<PyResult<_>>()?;
-        let parent_refs: Vec<&[u8]> = parent_names.iter().map(|p| p.as_slice()).collect();
+        // Resolve parent names to indices up front so we can call the
+        // index-taking `add()` path directly. Falling through `add_lines`
+        // would require a bytes name; this _add_lines accepts None so the
+        // SHA-based default naming kicks in.
+        let mut parent_idxs = Vec::with_capacity(parent_names.len());
+        for name in &parent_names {
+            parent_idxs.push(self.inner.lookup(name).ok_or_else(|| {
+                Python::attach(|py| {
+                    RevisionNotPresent::new_err((
+                        PyBytes::new(py, name).unbind(),
+                        weave_name_for_err(py, self.weave_name.as_ref()),
+                    ))
+                })
+            })?);
+        }
         let total: usize = lines_rust.iter().map(|l| l.len()).sum();
         let idx = self
             .inner
-            .add_lines(version_id, &parent_refs, &lines_rust, None, nostore_sha)
+            .add(version_id, &lines_rust, &parent_idxs, None, nostore_sha)
             .map_err(|e| weave_op_err_to_py(py, e))?;
         let sha = bazaar::weave::sha_strings(&lines_rust);
         Ok((PyBytes::new(py, &sha), total, idx))
@@ -1284,6 +1299,9 @@ impl PyWeave {
     /// [`WeaveContentFactory`]; missing versions are returned as
     /// `bzrformats._bzr_rs.versionedfile.AbsentContentFactory` so the
     /// caller can short-circuit to its absent path.
+    ///
+    /// Returns an iterator object so callers can use `next()` directly,
+    /// matching the original Python generator.
     #[pyo3(signature = (version_keys, ordering, include_delta_closure))]
     fn get_record_stream<'py>(
         slf: Py<Self>,
@@ -1291,7 +1309,7 @@ impl PyWeave {
         version_keys: Bound<'py, PyAny>,
         ordering: &str,
         include_delta_closure: bool,
-    ) -> PyResult<Bound<'py, PyList>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let _ = include_delta_closure;
 
         // `version_keys` is an iterable of 1-element tuples — extract the
@@ -1329,21 +1347,11 @@ impl PyWeave {
         let out = PyList::empty(py);
         for name in ordered_names {
             let weave_ref = slf.borrow(py);
-            if let Some(idx) = weave_ref.inner.lookup(&name) {
-                // Snapshot sha1 + parent names while we hold the borrow,
-                // then drop it before constructing the pyclass.
-                let sha1 = weave_ref.inner.sha1s[idx].clone();
-                let parents: Vec<Vec<u8>> = weave_ref.inner.parents[idx]
-                    .iter()
-                    .map(|&p| weave_ref.inner.names[p].clone())
-                    .collect();
+            if weave_ref.inner.lookup(&name).is_some() {
                 drop(weave_ref);
-                let factory = WeaveContentFactory {
-                    weave: slf.clone_ref(py),
-                    name,
-                    sha1,
-                    parents,
-                };
+                // Construct via the public constructor so `key` and
+                // `parents` get the same Py-tuple shape map_key expects.
+                let factory = WeaveContentFactory::new(py, slf.clone_ref(py), name)?;
                 out.append(Py::new(py, factory)?)?;
             } else {
                 drop(weave_ref);
@@ -1352,7 +1360,9 @@ impl PyWeave {
                 out.append(absent)?;
             }
         }
-        Ok(out)
+        // Wrap the eager list in an iterator object so callers can
+        // `next()` it just like the original Python generator.
+        out.call_method0("__iter__")
     }
 }
 
@@ -1363,15 +1373,24 @@ impl PyWeave {
 /// back into the weave for every byte access. This Rust port is
 /// behaviour-equivalent but holds a `Py<PyWeave>` directly so reads go
 /// straight into the Rust core without bouncing through Python.
+///
+/// `key` and `parents` are mutable Python tuples so wrappers can call
+/// `map_key()` to push a partition prefix in place — that's how
+/// `ThunkedVersionedFiles` re-tags records as they flow up.
 #[pyclass(name = "WeaveContentFactory", module = "bzrformats._bzr_rs.weave")]
 pub struct WeaveContentFactory {
     weave: Py<PyWeave>,
-    /// Version name (the `key[-1]`).
+    /// Internal version name. `key[-1]` always equals this; `key`
+    /// itself may grow a prefix via `map_key`.
     name: Vec<u8>,
     /// Stored sha1 hex digest.
     sha1: Vec<u8>,
-    /// Parent version names (snapshotted at construction).
-    parents: Vec<Vec<u8>>,
+    /// Currently-published key. Initialised to `(name,)` and rewritten
+    /// by `map_key`.
+    key: Py<PyTuple>,
+    /// Currently-published parent keys. Initialised to single-element
+    /// tuples per parent name; rewritten by `map_key`.
+    parents: Py<PyTuple>,
 }
 
 #[pymethods]
@@ -1383,15 +1402,22 @@ impl WeaveContentFactory {
             RevisionNotPresent::new_err((PyBytes::new(py, &name).unbind(), py.None()))
         })?;
         let sha1 = weave_ref.inner.sha1s[idx].clone();
-        let parents: Vec<Vec<u8>> = weave_ref.inner.parents[idx]
+        let parent_names: Vec<Vec<u8>> = weave_ref.inner.parents[idx]
             .iter()
             .map(|&p| weave_ref.inner.names[p].clone())
             .collect();
         drop(weave_ref);
+        let key = PyTuple::new(py, [PyBytes::new(py, &name)])?.unbind();
+        let parent_tuples: Vec<Bound<PyTuple>> = parent_names
+            .iter()
+            .map(|p| PyTuple::new(py, [PyBytes::new(py, p)]))
+            .collect::<PyResult<_>>()?;
+        let parents = PyTuple::new(py, parent_tuples)?.unbind();
         Ok(Self {
             weave,
             name,
             sha1,
+            key,
             parents,
         })
     }
@@ -1410,23 +1436,47 @@ impl WeaveContentFactory {
     }
 
     #[getter]
-    fn key<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, [PyBytes::new(py, &self.name)])
+    fn key(&self, py: Python<'_>) -> Py<PyTuple> {
+        self.key.clone_ref(py)
     }
 
     #[getter]
-    fn parents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        let items: Vec<Bound<PyTuple>> = self
-            .parents
-            .iter()
-            .map(|p| PyTuple::new(py, [PyBytes::new(py, p)]))
-            .collect::<PyResult<_>>()?;
-        PyTuple::new(py, items)
+    fn parents(&self, py: Python<'_>) -> Py<PyTuple> {
+        self.parents.clone_ref(py)
     }
 
     #[getter]
     fn storage_kind(&self) -> &'static str {
         "fulltext"
+    }
+
+    /// Apply `cb` to the key and to each parent key in place. Mirrors
+    /// `ContentFactory.map_key`: used by `ThunkedVersionedFiles` to push
+    /// a partition prefix onto the key.
+    fn map_key(slf: Py<Self>, py: Python<'_>, cb: Py<PyAny>) -> PyResult<Py<Self>> {
+        let mut me = slf.borrow_mut(py);
+        let new_key = cb.call1(py, (me.key.bind(py).clone(),))?;
+        let new_key = new_key
+            .bind(py)
+            .clone()
+            .cast_into::<PyTuple>()
+            .map_err(|_| PyTypeError::new_err("map_key callback must return a tuple"))?;
+        me.key = new_key.unbind();
+
+        let parents_bound = me.parents.bind(py).clone();
+        let mut new_parents: Vec<Bound<PyTuple>> = Vec::with_capacity(parents_bound.len());
+        for parent in parents_bound.iter() {
+            let mapped = cb.call1(py, (parent,))?;
+            let mapped = mapped
+                .bind(py)
+                .clone()
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("map_key callback must return a tuple"))?;
+            new_parents.push(mapped);
+        }
+        me.parents = PyTuple::new(py, new_parents)?.unbind();
+        drop(me);
+        Ok(slf)
     }
 
     /// Return the content in the requested encoding. Mirrors
@@ -1459,14 +1509,11 @@ impl WeaveContentFactory {
             "chunked" | "lines" => self
                 .get_lines_as_pylist(py)
                 .map(|l| l.into_any()),
-            other => {
-                let key = PyTuple::new(py, [PyBytes::new(py, &self.name)])?.unbind();
-                Err(UnavailableRepresentation::new_err((
-                    key,
-                    other.to_string(),
-                    "fulltext",
-                )))
-            }
+            other => Err(UnavailableRepresentation::new_err((
+                self.key.clone_ref(py),
+                other.to_string(),
+                "fulltext",
+            ))),
         }
     }
 
@@ -1484,14 +1531,11 @@ impl WeaveContentFactory {
                 let lines = self.get_lines_as_pylist(py)?;
                 Ok(lines.call_method0("__iter__")?)
             }
-            other => {
-                let key = PyTuple::new(py, [PyBytes::new(py, &self.name)])?.unbind();
-                Err(UnavailableRepresentation::new_err((
-                    key,
-                    other.to_string(),
-                    "fulltext",
-                )))
-            }
+            other => Err(UnavailableRepresentation::new_err((
+                self.key.clone_ref(py),
+                other.to_string(),
+                "fulltext",
+            ))),
         }
     }
 }
