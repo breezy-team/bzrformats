@@ -203,6 +203,9 @@ pub enum KnitError {
     BadKnitHeader { path: String },
     /// A `.kndx` record line contained a corrupt field (pos, size, or parent).
     KndxCorrupt { line: Vec<u8>, detail: String },
+    /// A knit index detected an inconsistency (e.g. duplicate with different
+    /// metadata, or a delta record in a non-delta index).
+    Corrupt(String),
 }
 
 impl std::fmt::Display for KnitError {
@@ -260,6 +263,7 @@ impl std::fmt::Display for KnitError {
             KnitError::KndxCorrupt { line, detail } => {
                 write!(f, "kndx corrupt record {:?}: {}", line, detail)
             }
+            KnitError::Corrupt(msg) => write!(f, "knit corrupt: {}", msg),
         }
     }
 }
@@ -1471,6 +1475,57 @@ impl KnitMethod {
             KnitMethod::LineDelta => "line-delta",
         }
     }
+}
+
+/// Encode a single record for insertion into a `_KnitGraphIndex`.
+///
+/// Returns `(value_bytes, node_refs)` ready to pass to `add_callback`.
+///
+/// `node_refs` layout:
+/// - no parents, no deltas: `()`
+/// - parents, no deltas: `(parents,)`
+/// - parents + deltas, fulltext: `(parents, ())`
+/// - parents + deltas, line-delta: `(parents, (compression_parent,))`
+///   where `compression_parent = parents[0]`.
+///
+/// Returns `Err` if `method == LineDelta` but `deltas == false`, or if
+/// `parents` is non-empty but `has_parents == false`.
+pub fn encode_graph_index_record(
+    noeol: bool,
+    pos: u64,
+    size: u64,
+    method: KnitMethod,
+    has_parents: bool,
+    has_deltas: bool,
+    parents: &[KnitKey],
+) -> Result<(Vec<u8>, Vec<Vec<KnitKey>>), KnitError> {
+    if !has_deltas && method == KnitMethod::LineDelta {
+        return Err(KnitError::Corrupt(
+            "attempt to add line-delta in non-delta knit".to_string(),
+        ));
+    }
+    if !has_parents && !parents.is_empty() {
+        return Err(KnitError::Corrupt(
+            "attempt to add node with parents in parentless index".to_string(),
+        ));
+    }
+    let flag = if noeol { b'N' } else { b' ' };
+    let value = format!("{}{} {}", flag as char, pos, size).into_bytes();
+    let node_refs = if has_parents {
+        if has_deltas {
+            if method == KnitMethod::LineDelta {
+                let compression_parent = parents.first().cloned().unwrap_or_default();
+                vec![parents.to_vec(), vec![compression_parent]]
+            } else {
+                vec![parents.to_vec(), vec![]]
+            }
+        } else {
+            vec![parents.to_vec()]
+        }
+    } else {
+        vec![]
+    };
+    Ok((value, node_refs))
 }
 
 /// Parsed contents of a knit graph index `value` field.
