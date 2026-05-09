@@ -667,6 +667,7 @@ from ._bzr_rs.knit import (  # noqa: E402
     KnitPlainFactory,
     PlainKnitContent,
     _KndxIndex,
+    _KnitGraphIndex,
     _KnitKeyAccess,
 )
 
@@ -2254,8 +2255,8 @@ def as_tuples(obj):
     return tuple(result)
 
 
-class _KnitGraphIndex:
-    """A KnitVersionedFiles index layered on GraphIndex."""
+class _KnitGraphIndexPy:
+    """Pure-Python fallback for _KnitGraphIndex (unused; kept for reference)."""
 
     def __init__(
         self,
