@@ -5244,23 +5244,88 @@ impl PyKnitVersionedFiles {
         positions: Bound<'_, PyAny>,
         _min_buffer_size: Option<usize>,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        let kwargs = PyDict::new(py);
-        if let Some(mbs) = _min_buffer_size {
-            kwargs.set_item("_min_buffer_size", mbs)?;
+        const DEFAULT_MIN_BUFFER_SIZE: usize = 5 * 1024 * 1024;
+        let min_buffer_size = _min_buffer_size.unwrap_or(DEFAULT_MIN_BUFFER_SIZE);
+        let positions_dict = positions.cast_into::<PyDict>()?;
+        // Collect all keys and non-local keys as Python lists for later use.
+        let keys_list: Vec<Bound<'_, PyAny>> = keys.try_iter()?.collect::<PyResult<_>>()?;
+        let non_local_list: Vec<Bound<'_, PyAny>> =
+            non_local_keys.try_iter()?.collect::<PyResult<_>>()?;
+        // Split keys by prefix using the Rust helper.
+        let m = py.import("bzrformats._bzr_rs.knit")?;
+        let raw_key_lists = PyList::empty(py);
+        for k in &keys_list {
+            let segs = PyList::empty(py);
+            for seg in k.try_iter()? {
+                segs.append(seg?)?;
+            }
+            raw_key_lists.append(segs)?;
         }
-        py_self
-            .call_method(
-                "_group_keys_for_io",
-                (keys, non_local_keys, positions),
-                Some(&kwargs),
-            )
-            .map(|b| b.unbind())
+        let split_result = m
+            .call_method1("split_keys_by_prefix_rs", (raw_key_lists,))?
+            .cast_into::<PyTuple>()?;
+        let prefix_split_keys = split_result.get_item(0)?.cast_into::<PyDict>()?;
+        let prefix_order_list = split_result.get_item(1)?.cast_into::<pyo3::types::PyList>()?;
+        // Split non-local keys by prefix.
+        let raw_nl_lists = PyList::empty(py);
+        for k in &non_local_list {
+            let segs = PyList::empty(py);
+            for seg in k.try_iter()? {
+                segs.append(seg?)?;
+            }
+            raw_nl_lists.append(segs)?;
+        }
+        let nl_split_result = m
+            .call_method1("split_keys_by_prefix_rs", (raw_nl_lists,))?
+            .cast_into::<PyTuple>()?;
+        let prefix_split_non_local = nl_split_result.get_item(0)?.cast_into::<PyDict>()?;
+        let result = PyList::empty(py);
+        let mut cur_keys = PyList::empty(py);
+        let mut cur_non_local = pyo3::types::PySet::empty(py)?;
+        let mut cur_size: usize = 0;
+        for prefix in prefix_order_list.iter() {
+            let bucket_keys = prefix_split_keys
+                .get_item(&prefix)?
+                .unwrap_or_else(|| PyList::empty(py).into_any());
+            let bucket_nl = prefix_split_non_local
+                .get_item(&prefix)?
+                .unwrap_or_else(|| PyList::empty(py).into_any());
+            let this_size: usize = self
+                .index_obj
+                .bind(py)
+                .call_method1(
+                    "_get_total_build_size",
+                    (bucket_keys.clone(), positions_dict.clone()),
+                )?
+                .extract()?;
+            cur_size += this_size;
+            for k in bucket_keys.try_iter()? {
+                cur_keys.append(k?)?;
+            }
+            for k in bucket_nl.try_iter()? {
+                cur_non_local.add(k?)?;
+            }
+            if cur_size > min_buffer_size {
+                result.append(PyTuple::new(
+                    py,
+                    [cur_keys.as_any(), cur_non_local.as_any()],
+                )?)?;
+                cur_keys = PyList::empty(py);
+                cur_non_local = pyo3::types::PySet::empty(py)?;
+                cur_size = 0;
+            }
+        }
+        if !cur_keys.is_empty() {
+            result.append(PyTuple::new(
+                py,
+                [cur_keys.as_any(), cur_non_local.as_any()],
+            )?)?;
+        }
+        Ok(result.into_any().unbind())
     }
 
-    fn clear_cache(&self, py: Python<'_>) -> PyResult<()> {
-        let py_self = self.to_py_kvf(py)?;
-        py_self.call_method0("clear_cache")?;
+    fn clear_cache(&self, _py: Python<'_>) -> PyResult<()> {
+        // No in-memory cache to clear at this layer.
         Ok(())
     }
 
@@ -5269,9 +5334,40 @@ impl PyKnitVersionedFiles {
         py: Python<'_>,
         keys: Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("get_known_graph_ancestry", (keys,))
+        // Mirrors VersionedFilesWithFallbacks.get_known_graph_ancestry:
+        // call find_ancestry on the local index, then walk fallbacks for any
+        // missing keys, and finally wrap in a KnownGraph.
+        let key_list = PyList::empty(py);
+        for k in keys.try_iter()? {
+            key_list.append(k?)?;
+        }
+        let result_tup = self
+            .index_obj
+            .bind(py)
+            .call_method1("find_ancestry", (key_list,))?
+            .cast_into::<PyTuple>()?;
+        let parent_map = result_tup.get_item(0)?.cast_into::<PyDict>()?;
+        let mut missing_keys = result_tup
+            .get_item(1)?
+            .cast_into::<pyo3::types::PySet>()?;
+        for fallback in &self.immediate_fallback_vfs {
+            if missing_keys.is_empty() {
+                break;
+            }
+            let ftup = fallback
+                .bind(py)
+                .getattr("_index")?
+                .call_method1("find_ancestry", (missing_keys.clone(),))?
+                .cast_into::<PyTuple>()?;
+            let f_parent_map = ftup.get_item(0)?.cast_into::<PyDict>()?;
+            let f_missing = ftup.get_item(1)?.cast_into::<pyo3::types::PySet>()?;
+            for (k, v) in f_parent_map.iter() {
+                parent_map.set_item(k, v)?;
+            }
+            missing_keys = f_missing;
+        }
+        let m = py.import("vcsgraph.known_graph")?;
+        m.call_method1("KnownGraph", (parent_map,))
             .map(|b| b.unbind())
     }
 
