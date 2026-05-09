@@ -4572,20 +4572,66 @@ impl PyKnitVersionedFiles {
         keys: Bound<'_, PyAny>,
         pb: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        // TODO: port iter_lines_added_or_present_in_keys to Rust
-        let py_self = self.to_py_kvf(py)?;
-        let args = (keys,);
-        if let Some(pb) = pb {
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("pb", pb)?;
-            py_self
-                .call_method("iter_lines_added_or_present_in_keys", args, Some(&kwargs))
-                .map(|b| b.unbind())
+        let knit_keys: Vec<KnitKey> = keys
+            .try_iter()?
+            .map(|item| extract_knit_key(&item?).map_err(knit_err_to_py))
+            .collect::<PyResult<_>>()?;
+        let table = Arc::new(Mutex::new(MemoTable::default()));
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table);
+        let pairs = if self.annotated {
+            let kvf = bazaar::knit::KnitVersionedFiles::new(
+                index,
+                access,
+                bazaar::knit::KnitAnnotateFactory,
+                self.max_delta_chain,
+            );
+            kvf.iter_lines_added_or_present_in_keys(&knit_keys)
+                .map_err(knit_err_to_py)?
         } else {
-            py_self
-                .call_method1("iter_lines_added_or_present_in_keys", args)
-                .map(|b| b.unbind())
+            let kvf = bazaar::knit::KnitVersionedFiles::new(
+                index,
+                access,
+                bazaar::knit::KnitPlainFactory,
+                self.max_delta_chain,
+            );
+            kvf.iter_lines_added_or_present_in_keys(&knit_keys)
+                .map_err(knit_err_to_py)?
+        };
+        // Emit local results first.
+        let out = PyList::empty(py);
+        let mut remaining_keys: std::collections::HashSet<KnitKey> =
+            knit_keys.into_iter().collect();
+        for (line, key) in pairs {
+            remaining_keys.remove(&key);
+            let py_key = py_knit_key_to_py(py, &key)?;
+            out.append(PyTuple::new(
+                py,
+                [PyBytes::new(py, &line).into_any(), py_key.into_any()],
+            )?)?;
         }
+        // Consult fallback VFs for any keys that were not found locally.
+        for source in &self.immediate_fallback_vfs {
+            if remaining_keys.is_empty() {
+                break;
+            }
+            let source_keys = PyList::empty(py);
+            for k in &remaining_keys {
+                source_keys.append(py_knit_key_to_py(py, k)?)?;
+            }
+            let fallback_iter = source
+                .bind(py)
+                .call_method1("iter_lines_added_or_present_in_keys", (source_keys,))?;
+            for item in fallback_iter.try_iter()? {
+                let tup = item?.cast_into::<PyTuple>()?;
+                let key = tup.get_item(1)?;
+                let rust_key = extract_knit_key(&key).map_err(knit_err_to_py)?;
+                remaining_keys.remove(&rust_key);
+                out.append(tup)?;
+            }
+        }
+        let _ = pb; // progress bar not needed for eager collection
+        Ok(out.into_any().unbind())
     }
 
     fn make_mpdiffs(&self, py: Python<'_>, keys: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
@@ -4647,11 +4693,33 @@ impl PyKnitVersionedFiles {
         }
     }
 
-    fn _read_records_iter(&self, py: Python<'_>, records: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("_read_records_iter", (records,))
-            .map(|b| b.unbind())
+    fn _read_records_iter_unchecked(
+        &self,
+        py: Python<'_>,
+        records: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        // Fetch raw (gzip-compressed) bytes for each (key, index_memo) pair
+        // in order, without any validation or parsing.
+        let mut keys: Vec<Bound<'_, PyAny>> = Vec::new();
+        let memos_list = PyList::empty(py);
+        for item in records.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            keys.push(tup.get_item(0)?);
+            memos_list.append(tup.get_item(1)?)?;
+        }
+        if keys.is_empty() {
+            return Ok(PyList::empty(py).into_any().unbind());
+        }
+        let raw_iter = self
+            .access_obj
+            .bind(py)
+            .call_method1("get_raw_records", (memos_list,))?;
+        let out = PyList::empty(py);
+        for (key, raw_obj) in keys.iter().zip(raw_iter.try_iter()?) {
+            let raw = raw_obj?;
+            out.append(PyTuple::new(py, [key, &raw])?)?;
+        }
+        Ok(out.into_any().unbind())
     }
 
     fn _read_records_iter_raw(
@@ -4659,21 +4727,105 @@ impl PyKnitVersionedFiles {
         py: Python<'_>,
         records: Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("_read_records_iter_raw", (records,))
-            .map(|b| b.unbind())
+        // Fetch raw bytes and parse each record header to extract the sha1
+        // digest. Yields (key, raw_bytes, digest_bytes).
+        let mut keys: Vec<Bound<'_, PyAny>> = Vec::new();
+        let memos_list = PyList::empty(py);
+        for item in records.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            keys.push(tup.get_item(0)?);
+            memos_list.append(tup.get_item(1)?)?;
+        }
+        if keys.is_empty() {
+            return Ok(PyList::empty(py).into_any().unbind());
+        }
+        let raw_iter = self
+            .access_obj
+            .bind(py)
+            .call_method1("get_raw_records", (memos_list,))?;
+        let out = PyList::empty(py);
+        for (key, raw_obj) in keys.iter().zip(raw_iter.try_iter()?) {
+            let raw_bytes = raw_obj?.cast_into::<PyBytes>()?;
+            let header = bazaar::knit::parse_record_header_only(raw_bytes.as_bytes())
+                .map_err(knit_err_to_py)?;
+            let digest = PyBytes::new(py, &header.digest);
+            out.append(PyTuple::new(
+                py,
+                [key, raw_bytes.as_any(), digest.as_any()],
+            )?)?;
+        }
+        Ok(out.into_any().unbind())
     }
 
-    fn _read_records_iter_unchecked(
-        &self,
-        py: Python<'_>,
-        records: Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("_read_records_iter_unchecked", (records,))
-            .map(|b| b.unbind())
+    fn _read_records_iter(&self, py: Python<'_>, records: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        // Dedup and sort by memo, fetch raw bytes, parse each record fully,
+        // and return (key, content, digest) triples in I/O order.
+        let mut pairs: Vec<(Bound<'_, PyAny>, Bound<'_, PyAny>)> = Vec::new();
+        for item in records.try_iter()? {
+            let tup = item?.cast_into::<PyTuple>()?;
+            pairs.push((tup.get_item(0)?, tup.get_item(1)?));
+        }
+        if pairs.is_empty() {
+            return Ok(PyList::empty(py).into_any().unbind());
+        }
+        // Dedup and sort by the repr of the memo (proxy for file/offset order).
+        let mut seen_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut needed: Vec<(Bound<'_, PyAny>, Bound<'_, PyAny>)> = Vec::new();
+        for (key, memo) in pairs {
+            if seen_ids.insert(memo.as_ptr() as usize) {
+                needed.push((key, memo));
+            }
+        }
+        needed.sort_by(|(_, a), (_, b)| {
+            let ar = a.repr().map(|s| s.to_string()).unwrap_or_default();
+            let br = b.repr().map(|s| s.to_string()).unwrap_or_default();
+            ar.cmp(&br)
+        });
+        let memos_list = PyList::empty(py);
+        for (_, memo) in &needed {
+            memos_list.append(memo)?;
+        }
+        let raw_iter = self
+            .access_obj
+            .bind(py)
+            .call_method1("get_raw_records", (memos_list,))?;
+        let out = PyList::empty(py);
+        for ((key, _), raw_obj) in needed.iter().zip(raw_iter.try_iter()?) {
+            let raw_bytes = raw_obj?.cast_into::<PyBytes>()?;
+            let raw = raw_bytes.as_bytes();
+            // key[-1] is the version_id used to validate the record header.
+            let version_id = key
+                .get_item(-1_isize)?
+                .cast_into::<PyBytes>()
+                .map_err(|_| PyValueError::new_err("key segments must be bytes"))?;
+            let (body_lines, digest) =
+                bazaar::knit::parse_record(version_id.as_bytes(), raw).map_err(knit_err_to_py)?;
+            let refs: Vec<&[u8]> = body_lines.iter().map(|l| l.as_slice()).collect();
+            let content: Bound<'_, PyAny> = if self.annotated {
+                let pairs = pyo3::types::PyList::empty(py);
+                for pair in bazaar::knit::parse_fulltext(&refs).map_err(knit_err_to_py)? {
+                    pairs.append(PyTuple::new(
+                        py,
+                        [PyBytes::new(py, &pair.0), PyBytes::new(py, &pair.1)],
+                    )?)?;
+                }
+                let m = py.import("bzrformats._bzr_rs.knit")?;
+                m.call_method1("AnnotatedKnitContent", (pairs,))?
+            } else {
+                let lines = pyo3::types::PyList::empty(py);
+                for line in &body_lines {
+                    lines.append(PyBytes::new(py, line))?;
+                }
+                let m = py.import("bzrformats._bzr_rs.knit")?;
+                m.call_method1(
+                    "PlainKnitContent",
+                    (lines, PyBytes::new(py, version_id.as_bytes())),
+                )?
+            };
+            let py_digest = PyBytes::new(py, &digest);
+            out.append(PyTuple::new(py, [key, &content, py_digest.as_any()])?)?;
+        }
+        Ok(out.into_any().unbind())
     }
 
     fn _parse_record(
@@ -4682,10 +4834,23 @@ impl PyKnitVersionedFiles {
         version_id: Bound<'_, PyAny>,
         data: Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("_parse_record", (version_id, data))
-            .map(|b| b.unbind())
+        let vid = version_id
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyValueError::new_err("version_id must be bytes"))?;
+        let raw = data
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyValueError::new_err("data must be bytes"))?;
+        let (body, digest) =
+            bazaar::knit::parse_record(vid.as_bytes(), raw.as_bytes()).map_err(knit_err_to_py)?;
+        let list = pyo3::types::PyList::empty(py);
+        for line in &body {
+            list.append(PyBytes::new(py, line))?;
+        }
+        Ok(
+            PyTuple::new(py, [list.as_any(), PyBytes::new(py, &digest).as_any()])?
+                .into_any()
+                .unbind(),
+        )
     }
 
     fn _parse_record_header(
@@ -4694,10 +4859,35 @@ impl PyKnitVersionedFiles {
         key: Bound<'_, PyAny>,
         raw_data: Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("_parse_record_header", (key, raw_data))
-            .map(|b| b.unbind())
+        let raw = raw_data
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyValueError::new_err("raw_data must be bytes"))?;
+        let rec = bazaar::knit::parse_record_header_only(raw.as_bytes()).map_err(|e| {
+            PyValueError::new_err(format!("While reading {{{key}}} got error: {e}"))
+        })?;
+        // Validate version_id matches key[-1].
+        let expected = key
+            .get_item(-1_isize)?
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyValueError::new_err("key segments must be bytes"))?;
+        if rec.version_id != expected.as_bytes() {
+            return Err(PyValueError::new_err(format!(
+                "Mismatched version: expected {:?}, got {:?}",
+                expected.as_bytes(),
+                &rec.version_id,
+            )));
+        }
+        Ok(PyTuple::new(
+            py,
+            [
+                PyBytes::new(py, &rec.method).into_any(),
+                PyBytes::new(py, &rec.version_id).into_any(),
+                PyBytes::new(py, rec.count.to_string().as_bytes()).into_any(),
+                PyBytes::new(py, &rec.digest).into_any(),
+            ],
+        )?
+        .into_any()
+        .unbind())
     }
 
     fn _get_content(
@@ -4776,16 +4966,48 @@ impl PyKnitVersionedFiles {
         lines: Bound<'_, PyAny>,
         dense_lines: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        if let Some(dl) = dense_lines {
-            py_self
-                .call_method1("_record_to_data", (key, digest, lines, dl))
-                .map(|b| b.unbind())
-        } else {
-            py_self
-                .call_method1("_record_to_data", (key, digest, lines))
-                .map(|b| b.unbind())
+        let version_id = key
+            .get_item(-1_isize)?
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyValueError::new_err("key[-1] must be bytes"))?;
+        let digest_bytes = digest
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyValueError::new_err("digest must be bytes"))?;
+        let lines_list: Vec<Bound<'_, PyAny>> = lines.try_iter()?.collect::<PyResult<_>>()?;
+        let line_count = lines_list.len();
+        let payload_src = dense_lines.as_ref().unwrap_or(&lines);
+        let payload: Vec<Vec<u8>> = payload_src
+            .try_iter()?
+            .map(|item| {
+                item?
+                    .cast_into::<PyBytes>()
+                    .map(|b| b.as_bytes().to_vec())
+                    .map_err(|_| PyValueError::new_err("lines must be bytes"))
+            })
+            .collect::<PyResult<_>>()?;
+        let has_trailing_newline = lines_list
+            .last()
+            .and_then(|l| l.cast::<PyBytes>().ok())
+            .map(|b| b.as_bytes().ends_with(b"\n"))
+            .unwrap_or(true);
+        let (size, chunks) = bazaar::knit::record_to_data(
+            version_id.as_bytes(),
+            digest_bytes.as_bytes(),
+            line_count,
+            &payload,
+            has_trailing_newline,
+        )
+        .map_err(knit_err_to_py)?;
+        let chunk_list = PyList::empty(py);
+        for c in &chunks {
+            chunk_list.append(PyBytes::new(py, c))?;
         }
+        Ok(PyTuple::new(
+            py,
+            [size.into_pyobject(py)?.into_any(), chunk_list.into_any()],
+        )?
+        .into_any()
+        .unbind())
     }
 
     #[pyo3(signature = (keys, allow_missing=false))]
@@ -4834,10 +5056,27 @@ impl PyKnitVersionedFiles {
         py: Python<'_>,
         data: Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("_parse_record_unchecked", (data,))
-            .map(|b| b.unbind())
+        let raw = data
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyValueError::new_err("data must be bytes"))?;
+        let (header, body) =
+            bazaar::knit::parse_record_unchecked(raw.as_bytes()).map_err(knit_err_to_py)?;
+        let rec = PyTuple::new(
+            py,
+            [
+                PyBytes::new(py, &header.method).into_any(),
+                PyBytes::new(py, &header.version_id).into_any(),
+                PyBytes::new(py, header.count.to_string().as_bytes()).into_any(),
+                PyBytes::new(py, &header.digest).into_any(),
+            ],
+        )?;
+        let list = pyo3::types::PyList::empty(py);
+        for line in &body {
+            list.append(PyBytes::new(py, line))?;
+        }
+        Ok(PyTuple::new(py, [rec.as_any(), list.as_any()])?
+            .into_any()
+            .unbind())
     }
 
     #[pyo3(signature = (keys, non_local_keys, positions, _min_buffer_size=None))]

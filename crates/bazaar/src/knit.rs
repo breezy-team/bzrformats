@@ -3434,6 +3434,68 @@ where
         }
         Ok(out)
     }
+
+    /// Fetch raw (gzip-compressed) bytes for each `(key, memo)` pair in
+    /// the order given, without any parsing or validation.
+    pub fn read_records_iter_unchecked(
+        &self,
+        records: &[(KnitKey, KnitIndexMemo)],
+    ) -> Result<Vec<(KnitKey, Vec<u8>)>, KnitError> {
+        if records.is_empty() {
+            return Ok(vec![]);
+        }
+        let memos: Vec<KnitIndexMemo> = records.iter().map(|(_, m)| m.clone()).collect();
+        let raw_data = self.access.get_raw_records(&memos)?;
+        Ok(records
+            .iter()
+            .map(|(k, _)| k.clone())
+            .zip(raw_data)
+            .collect())
+    }
+
+    /// Fetch raw bytes for each `(key, memo)` pair and validate each
+    /// record header, returning `(key, raw_bytes, sha1_digest)`.
+    pub fn read_records_iter_raw(
+        &self,
+        records: &[(KnitKey, KnitIndexMemo)],
+    ) -> Result<Vec<(KnitKey, Vec<u8>, Vec<u8>)>, KnitError> {
+        let pairs = self.read_records_iter_unchecked(records)?;
+        let mut out = Vec::with_capacity(pairs.len());
+        for (key, raw) in pairs {
+            let header = parse_record_header_only(&raw)?;
+            out.push((key, raw, header.digest));
+        }
+        Ok(out)
+    }
+
+    /// Yield `(line_bytes, key)` for every line present in any of `keys`.
+    ///
+    /// Reads each record as-stored and reconstructs the content, then
+    /// emits each plain text line paired with its key.  Fallback
+    /// versioned files are not consulted; callers that want fallback
+    /// must iterate them separately.
+    pub fn iter_lines_added_or_present_in_keys(
+        &self,
+        keys: &[KnitKey],
+    ) -> Result<Vec<(Vec<u8>, KnitKey)>, KnitError> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        let build_details = self.index.get_build_details(keys)?;
+        let key_records: Vec<(KnitKey, KnitIndexMemo)> = build_details
+            .iter()
+            .map(|(k, det)| (k.clone(), det.index_memo.clone()))
+            .collect();
+        // read_records_iter fully reconstructs content (applying deltas).
+        let triples = self.read_records_iter(&key_records)?;
+        let mut out = Vec::new();
+        for (key, content, _digest) in triples {
+            for line in content.text() {
+                out.push((line, key.clone()));
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Port of Python's `KnitVersionedFiles._merge_annotations`.
