@@ -199,6 +199,10 @@ pub enum KnitError {
     /// expected value — used by `parse_record` when verifying that a
     /// fetched record really belongs to the requested key.
     UnexpectedVersion { wanted: Vec<u8>, got: Vec<u8> },
+    /// A `.kndx` file did not start with the expected `KNDX_HEADER` bytes.
+    BadKnitHeader { path: String },
+    /// A `.kndx` record line contained a corrupt field (pos, size, or parent).
+    KndxCorrupt { line: Vec<u8>, detail: String },
 }
 
 impl std::fmt::Display for KnitError {
@@ -250,11 +254,36 @@ impl std::fmt::Display for KnitError {
             KnitError::UnexpectedVersion { wanted, got } => {
                 write!(f, "unexpected version, wanted {:?}, got {:?}", wanted, got)
             }
+            KnitError::BadKnitHeader { path } => {
+                write!(f, "knit index file {} does not have a valid header", path)
+            }
+            KnitError::KndxCorrupt { line, detail } => {
+                write!(f, "kndx corrupt record {:?}: {}", line, detail)
+            }
         }
     }
 }
 
 impl std::error::Error for KnitError {}
+
+/// Error returned by [`KndxIndex::load_prefix_typed`]: either a transport
+/// I/O failure or a corrupted kndx header.
+#[derive(Debug)]
+pub enum KndxLoadError {
+    Transport(crate::transport::TransportError),
+    Knit(KnitError),
+}
+
+impl std::fmt::Display for KndxLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KndxLoadError::Transport(e) => e.fmt(f),
+            KndxLoadError::Knit(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for KndxLoadError {}
 
 /// One hunk of an annotated line delta: `(start, end, count, lines)` where
 /// `lines` is a sequence of `(origin, text)` pairs.
@@ -434,10 +463,6 @@ pub fn get_line_delta_blocks(
     out.push((s_pos + (target_len - t_pos), target_len, 0));
     out
 }
-
-// ============================================================
-// In-memory knit content layer
-// ============================================================
 
 /// Trait shared by [`AnnotatedKnitContent`] and [`PlainKnitContent`].
 ///
@@ -741,8 +766,6 @@ impl KnitFactory for KnitPlainFactory {
         parse_line_delta_raw(lines)
     }
 }
-
-// ---- internals ----
 
 enum ParsedLine {
     Annotated(Vec<u8>, Vec<u8>),
@@ -1843,10 +1866,6 @@ pub fn recompress_annotated_to_unannotated_delta(raw_record: &[u8]) -> Result<Ve
     Ok(chunks.into_iter().flatten().collect())
 }
 
-// ============================================================
-// KnitVersionedFiles read pipeline
-// ============================================================
-
 /// A knit key — a tuple of byte segments, identifying one record in
 /// one knit. The last segment is the version_id; the leading segments
 /// (if any) form the file-id prefix used by per-file knits.
@@ -2068,6 +2087,386 @@ where
         out.insert(key.clone(), header.digest);
     }
     Ok(out)
+}
+
+/// Pure-Rust implementation of `_KndxIndex`.
+///
+/// Reads and writes `.kndx` index files through a [`crate::transport::Transport`]
+/// and maps keys to paths using a [`crate::key_mapper::Mapper`].  The
+/// in-memory cache follows the same two-level structure as the Python
+/// original: `cache_dict` (version_id → entry tuple) and `history_vec`
+/// (sequence-number → version_id).
+pub struct KndxIndex<T, M> {
+    transport: T,
+    mapper: M,
+    /// prefix → (cache: HashMap<version_id, CacheEntry>, history: Vec<version_id>)
+    kndx_cache: std::sync::Mutex<std::collections::HashMap<Vec<Vec<u8>>, KndxPrefixCache>>,
+}
+
+/// One per-prefix in-memory cache for a `KndxIndex`.
+#[derive(Default)]
+pub struct KndxPrefixCache {
+    /// version_id → (version_id, options, pos, size, parents, index)
+    pub cache: std::collections::HashMap<Vec<u8>, KndxCacheEntry>,
+    /// sequence-number → version_id (first-occurrence only)
+    pub history: Vec<Vec<u8>>,
+}
+
+/// One row in the per-prefix kndx cache.
+#[derive(Debug, Clone)]
+pub struct KndxCacheEntry {
+    pub version_id: Vec<u8>,
+    pub options: Vec<Vec<u8>>,
+    pub pos: u64,
+    pub size: usize,
+    /// Bare suffixes (last element only, for compatibility with _load_data_c).
+    pub parents: Vec<Vec<u8>>,
+    /// Index into `history` for this version.
+    pub index: usize,
+}
+
+pub const KNDX_HEADER: &[u8] = b"# bzr knit index 8\n";
+
+impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KndxIndex<T, M> {
+    pub fn new(transport: T, mapper: M) -> Self {
+        Self {
+            transport,
+            mapper,
+            kndx_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn prefix_of(key: &KnitKey) -> Vec<Vec<u8>> {
+        key[..key.len().saturating_sub(1)].iter().cloned().collect()
+    }
+
+    pub fn suffix_of(key: &KnitKey) -> Vec<u8> {
+        key.last().cloned().unwrap_or_default()
+    }
+
+    pub fn mapper(&self) -> &M {
+        &self.mapper
+    }
+
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
+
+    pub fn kndx_cache(
+        &self,
+    ) -> &std::sync::Mutex<std::collections::HashMap<Vec<Vec<u8>>, KndxPrefixCache>> {
+        &self.kndx_cache
+    }
+
+    pub fn prefix_path(&self, prefix: &[Vec<u8>]) -> String {
+        let refs: Vec<&[u8]> = prefix.iter().map(|s| s.as_slice()).collect();
+        self.mapper.map(&refs) + ".kndx"
+    }
+
+    /// Load `prefix` into the cache through a shared `&self` reference.
+    ///
+    /// Both transport I/O errors and corrupted kndx headers are collapsed
+    /// into `TransportError::Other`. Callers that need to distinguish
+    /// `BadKnitHeader` should call [`load_prefix_typed`] instead.
+    pub fn load_prefix_shared(
+        &self,
+        prefix: Vec<Vec<u8>>,
+    ) -> Result<(), crate::transport::TransportError> {
+        self.load_prefix_typed(prefix).map_err(|e| match e {
+            KndxLoadError::Transport(te) => te,
+            KndxLoadError::Knit(ke) => crate::transport::TransportError::Other(ke.to_string()),
+        })
+    }
+
+    /// Like [`load_prefix_shared`] but returns a typed [`KndxLoadError`] so
+    /// the caller can distinguish `BadKnitHeader` from transport failures.
+    pub fn load_prefix_typed(&self, prefix: Vec<Vec<u8>>) -> Result<(), KndxLoadError> {
+        if self.kndx_cache.lock().unwrap().contains_key(&prefix) {
+            return Ok(());
+        }
+        let path = self.prefix_path(&prefix);
+        let data = match self.transport.get_bytes(&path) {
+            Ok(d) => d,
+            Err(crate::transport::TransportError::NoSuchFile(_)) => {
+                self.kndx_cache
+                    .lock()
+                    .unwrap()
+                    .insert(prefix, KndxPrefixCache::default());
+                // For ConstantMapper (e.g. revisions.kndx), create an empty
+                // index file so subsequent appends have a base to grow from.
+                if self.mapper.is_constant() {
+                    self.transport
+                        .put_file_non_atomic(&path, KNDX_HEADER, true)
+                        .map_err(KndxLoadError::Transport)?;
+                }
+                return Ok(());
+            }
+            Err(te) => return Err(KndxLoadError::Transport(te)),
+        };
+        let pc = parse_kndx_data(&data).map_err(|e| match e {
+            KnitError::BadKnitHeader { .. } => {
+                KndxLoadError::Knit(KnitError::BadKnitHeader { path: path.clone() })
+            }
+            other => KndxLoadError::Knit(other),
+        })?;
+        self.kndx_cache.lock().unwrap().insert(prefix, pc);
+        Ok(())
+    }
+
+    fn build_details_from_cache(
+        &self,
+        keys: &[KnitKey],
+    ) -> std::collections::HashMap<KnitKey, KnitRecordDetails> {
+        let cache = self.kndx_cache.lock().unwrap();
+        let mut result = std::collections::HashMap::new();
+        for key in keys {
+            let prefix = Self::prefix_of(key);
+            let suffix = Self::suffix_of(key);
+            let Some(pc) = cache.get(&prefix) else {
+                continue;
+            };
+            let Some(entry) = pc.cache.get(&suffix) else {
+                continue;
+            };
+            let (method, noeol) = decode_kndx_options(
+                &entry
+                    .options
+                    .iter()
+                    .map(|o| o.as_slice())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or((KnitMethod::Fulltext, false));
+            let parents: Vec<KnitKey> = entry
+                .parents
+                .iter()
+                .map(|p| {
+                    let mut pk = prefix.clone();
+                    pk.push(p.clone());
+                    pk
+                })
+                .collect();
+            let compression_parent = if method == KnitMethod::LineDelta {
+                parents.first().cloned()
+            } else {
+                None
+            };
+            let knit_path = {
+                let refs: Vec<&[u8]> = prefix.iter().map(|s| s.as_slice()).collect();
+                self.mapper.map(&refs) + ".knit"
+            };
+            result.insert(
+                key.clone(),
+                KnitRecordDetails {
+                    method,
+                    noeol,
+                    index_memo: KnitIndexMemo {
+                        path: knit_path,
+                        offset: entry.pos,
+                        length: entry.size,
+                    },
+                    compression_parent,
+                    parents,
+                },
+            );
+        }
+        result
+    }
+}
+
+/// Parse the binary content of a `.kndx` file into a `KndxPrefixCache`.
+///
+/// The format is one line per entry:
+/// `\nVERSION_ID OPTIONS POS SIZE [PARENT...] :`
+///
+/// Lines not ending in ` :` (partial writes) are silently skipped.
+/// The file must begin with [`KNDX_HEADER`].
+/// Parse a `.kndx` file's bytes into a prefix cache.
+///
+/// Returns `Err(KnitError::BadKnitHeader)` if the file is non-empty but
+/// does not start with `KNDX_HEADER`. Returns `Ok` with an empty cache for
+/// an empty file, and `Ok` with the parsed entries otherwise.
+pub fn parse_kndx_data(data: &[u8]) -> Result<KndxPrefixCache, KnitError> {
+    let mut pc = KndxPrefixCache::default();
+    if data.is_empty() {
+        return Ok(pc);
+    }
+    if !data.starts_with(KNDX_HEADER) {
+        return Err(KnitError::BadKnitHeader {
+            path: "<kndx>".to_string(),
+        });
+    }
+    let rest = &data[KNDX_HEADER.len()..];
+    for line in rest.split(|&b| b == b'\n') {
+        let line = line.strip_prefix(b"\r").unwrap_or(line);
+        let line = if line.first() == Some(&b'\n') {
+            &line[1..]
+        } else {
+            line
+        };
+        // Strip leading \n that separates entries
+        let line = line.strip_prefix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        // Must end with ' :'
+        let Some(line) = line.strip_suffix(b" :") else {
+            continue;
+        };
+        let parts: Vec<&[u8]> = line.splitn(5, |&b| b == b' ').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let version_id = parts[0].to_vec();
+        let options: Vec<Vec<u8>> = parts[1].split(|&b| b == b',').map(|o| o.to_vec()).collect();
+        let pos_str = std::str::from_utf8(parts[2]).map_err(|_| KnitError::KndxCorrupt {
+            line: line.to_vec(),
+            detail: format!("{:?} is not a valid integer", parts[2]),
+        })?;
+        let pos = pos_str.parse::<u64>().map_err(|_| KnitError::KndxCorrupt {
+            line: line.to_vec(),
+            detail: format!("{:?} is not a valid integer", pos_str),
+        })?;
+        let size_str = std::str::from_utf8(parts[3]).map_err(|_| KnitError::KndxCorrupt {
+            line: line.to_vec(),
+            detail: format!("{:?} is not a valid integer", parts[3]),
+        })?;
+        let size = size_str
+            .parse::<usize>()
+            .map_err(|_| KnitError::KndxCorrupt {
+                line: line.to_vec(),
+                detail: format!("{:?} is not a valid integer", size_str),
+            })?;
+        let parents_raw = if parts.len() > 4 {
+            parts[4]
+        } else {
+            b"" as &[u8]
+        };
+        let mut parents: Vec<Vec<u8>> = vec![];
+        for p in parents_raw.split(|&b| b == b' ').filter(|p| !p.is_empty()) {
+            if p.first() == Some(&b'.') {
+                parents.push(p[1..].to_vec());
+            } else {
+                let s = std::str::from_utf8(p).map_err(|_| KnitError::KndxCorrupt {
+                    line: line.to_vec(),
+                    detail: format!("{:?} is not a valid integer", p),
+                })?;
+                let idx: usize = s.parse().map_err(|_| KnitError::KndxCorrupt {
+                    line: line.to_vec(),
+                    detail: format!("{:?} is not a valid integer", s),
+                })?;
+                if idx >= pc.history.len() {
+                    return Err(KnitError::KndxCorrupt {
+                        line: line.to_vec(),
+                        detail: format!(
+                            "Parent index refers to a revision which does not exist yet. {} > {}",
+                            idx,
+                            pc.history.len()
+                        ),
+                    });
+                }
+                parents.push(pc.history[idx].clone());
+            }
+        }
+        let index = if pc.cache.contains_key(&version_id) {
+            pc.cache[&version_id].index
+        } else {
+            let idx = pc.history.len();
+            pc.history.push(version_id.clone());
+            idx
+        };
+        pc.cache.insert(
+            version_id.clone(),
+            KndxCacheEntry {
+                version_id,
+                options,
+                pos,
+                size,
+                parents,
+                index,
+            },
+        );
+    }
+    Ok(pc)
+}
+
+impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitIndex for KndxIndex<T, M> {
+    fn get_build_details(
+        &self,
+        keys: &[KnitKey],
+    ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails>, KnitError> {
+        let prefixes: std::collections::HashSet<Vec<Vec<u8>>> =
+            keys.iter().map(Self::prefix_of).collect();
+        for prefix in prefixes {
+            self.load_prefix_shared(prefix)
+                .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
+        }
+        Ok(self.build_details_from_cache(keys))
+    }
+}
+
+/// Pure-Rust implementation of `_KnitKeyAccess`.
+///
+/// Stores raw knit record bytes in `.knit` files via a
+/// [`crate::transport::Transport`], mapping keys to file paths using a
+/// [`crate::key_mapper::Mapper`].
+pub struct KnitKeyAccess<T, M> {
+    transport: T,
+    mapper: M,
+}
+
+impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitKeyAccess<T, M> {
+    pub fn new(transport: T, mapper: M) -> Self {
+        Self { transport, mapper }
+    }
+
+    pub fn mapper(&self) -> &M {
+        &self.mapper
+    }
+
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    fn key_path(&self, key: &KnitKey) -> String {
+        let prefix = &key[..key.len().saturating_sub(1)];
+        let refs: Vec<&[u8]> = prefix.iter().map(|s| s.as_slice()).collect();
+        self.mapper.map(&refs) + ".knit"
+    }
+
+    /// Write raw record bytes and return the `(key, offset, size)` memo.
+    pub fn add_raw_record(
+        &self,
+        key: KnitKey,
+        raw_data: &[u8],
+    ) -> Result<(KnitKey, u64, usize), crate::transport::TransportError> {
+        let path = self.key_path(&key);
+        let offset = self.transport.append_bytes(&path, raw_data)?;
+        Ok((key, offset, raw_data.len()))
+    }
+}
+
+impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitAccess
+    for KnitKeyAccess<T, M>
+{
+    fn get_raw_record(&self, memo: &KnitIndexMemo) -> Result<Vec<u8>, KnitError> {
+        use crate::transport::ReadRange;
+        let ranges = [ReadRange {
+            offset: memo.offset,
+            length: memo.length,
+        }];
+        self.transport
+            .readv(&memo.path, &ranges)
+            .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))
+            .and_then(|mut v| {
+                v.pop()
+                    .map(|r| r.bytes)
+                    .ok_or_else(|| KnitError::BadIndexValue(b"readv returned no data".to_vec()))
+            })
+    }
 }
 
 #[cfg(test)]
