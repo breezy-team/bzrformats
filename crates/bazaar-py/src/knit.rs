@@ -1046,6 +1046,7 @@ fn knit_method_to_py<'py>(py: Python<'py>, method: bazaar::knit::KnitMethod) -> 
     let s = match method {
         bazaar::knit::KnitMethod::Fulltext => pyo3::intern!(py, "fulltext"),
         bazaar::knit::KnitMethod::LineDelta => pyo3::intern!(py, "line-delta"),
+        bazaar::knit::KnitMethod::NoEol => pyo3::intern!(py, "no-eol"),
     };
     s.clone().into_any()
 }
@@ -1413,9 +1414,11 @@ impl KnitIndexTrait for PyKnitIndex {
                 for (k, v) in dict.iter() {
                     let key = extract_knit_key(&k)?;
                     let mut parents = Vec::new();
-                    for p in v.try_iter().map_err(|e| knit_err_from_py(py, e))? {
-                        let p = p.map_err(|e| knit_err_from_py(py, e))?;
-                        parents.push(extract_knit_key(&p)?);
+                    if !v.is_none() {
+                        for p in v.try_iter().map_err(|e| knit_err_from_py(py, e))? {
+                            let p = p.map_err(|e| knit_err_from_py(py, e))?;
+                            parents.push(extract_knit_key(&p)?);
+                        }
                     }
                     out.insert(key, parents);
                 }
@@ -1583,10 +1586,15 @@ impl KnitIndexTrait for PyKnitIndex {
             };
             for ((key, methods, _memo, parents), py_memo) in records.iter().zip(py_memos) {
                 let py_key = knit_key_to_py(py, key).map_err(|e| knit_err_from_py(py, e))?;
-                // Reconstruct options bytes from methods.
-                let options: Vec<&[u8]> = methods.iter().map(|m| m.as_str().as_bytes()).collect();
-                let options_bytes = options.join(&b","[..]);
-                let py_options = pyo3::types::PyBytes::new(py, &options_bytes);
+                // Build a Python list of bytes from the method list, matching the
+                // format that _KndxIndex.add_records expects: [b"fulltext"] or
+                // [b"line-delta", b"no-eol"].
+                let py_options = pyo3::types::PyList::empty(py);
+                for m in methods {
+                    py_options
+                        .append(pyo3::types::PyBytes::new(py, m.as_str().as_bytes()))
+                        .map_err(|e| knit_err_from_py(py, e))?;
+                }
                 let py_parents = pyo3::types::PyTuple::new(
                     py,
                     parents
@@ -3633,10 +3641,14 @@ impl PyKnitGraphIndex {
             let pos: u64 = memo.get_item(1)?.extract()?;
             let size: u64 = memo.get_item(2)?.extract()?;
             let parents_obj = rec.get_item(3)?;
-            let parents: Vec<KnitKey> = parents_obj
-                .try_iter()?
-                .map(|p| extract_py_knit_key_or_bytes(&p?))
-                .collect::<PyResult<_>>()?;
+            let parents: Vec<KnitKey> = if parents_obj.is_none() {
+                Vec::new()
+            } else {
+                parents_obj
+                    .try_iter()?
+                    .map(|p| extract_py_knit_key_or_bytes(&p?))
+                    .collect::<PyResult<_>>()?
+            };
 
             let (value, node_refs) = bazaar::knit::encode_graph_index_record(
                 noeol,
@@ -3956,7 +3968,6 @@ impl PyKnitKeyAccess {
         py: Python<'py>,
         memos_for_retrieval: Bound<'py, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        use bazaar::knit::{KnitAccess, KnitIndexMemo};
         let list = PyList::empty(py);
         // Group by prefix path for efficient readv batching
         let mut request_lists: Vec<(String, Vec<(u64, usize)>)> = Vec::new();
@@ -4026,6 +4037,29 @@ fn extract_py_knit_key(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::knit::KnitKey
     Ok(key)
 }
 
+/// Like `extract_py_knit_key` but allows the last element to be `None`.
+/// Returns `(key, true)` when the last element was `None` (auto-generate).
+fn extract_py_knit_key_autogen(obj: &Bound<'_, PyAny>) -> PyResult<(bazaar::knit::KnitKey, bool)> {
+    let tup = obj
+        .downcast::<PyTuple>()
+        .map_err(|_| PyValueError::new_err("knit key must be a tuple of bytes"))?;
+    let mut key = Vec::with_capacity(tup.len());
+    let mut autogen = false;
+    let len = tup.len();
+    for (i, item) in tup.iter().enumerate() {
+        if i == len - 1 && item.is_none() {
+            autogen = true;
+            key.push(Vec::new()); // placeholder, filled in after digest
+        } else {
+            let b = item
+                .cast_into::<PyBytes>()
+                .map_err(|_| PyValueError::new_err("knit key elements must be bytes"))?;
+            key.push(b.as_bytes().to_vec());
+        }
+    }
+    Ok((key, autogen))
+}
+
 fn extract_py_knit_keys(obj: &Bound<'_, PyAny>) -> PyResult<Vec<bazaar::knit::KnitKey>> {
     let mut keys = Vec::new();
     for item in obj.try_iter()? {
@@ -4056,6 +4090,811 @@ fn knit_index_memo_to_py<'py>(
             det.index_memo.length.into_pyobject(py)?.into_any(),
         ],
     )
+}
+
+/// Rust-backed implementation of Python's `KnitVersionedFiles`.
+///
+/// Wraps [`bazaar::knit::KnitVersionedFiles`] with [`PyKnitIndex`] and
+/// [`PyKnitAccess`] adapters so pure-Rust logic (add_lines, get_text, get_sha1s,
+/// check_should_delta, …) drives the Python index and access objects.
+///
+/// Fallback versioned-files objects and the complex streaming methods
+/// (`get_record_stream`, `insert_record_stream`,
+/// `iter_lines_added_or_present_in_keys`) remain Python-side for now.
+#[pyclass(name = "KnitVersionedFiles", subclass, dict)]
+pub struct PyKnitVersionedFiles {
+    /// Held so Python callers can read `._index` / `._access`.
+    index_obj: Py<PyAny>,
+    access_obj: Py<PyAny>,
+    /// Whether the factory is annotated (True) or plain (False).
+    annotated: bool,
+    max_delta_chain: usize,
+    reload_func: Py<PyAny>,
+    immediate_fallback_vfs: Vec<Py<PyAny>>,
+    /// Shared memo table reused across calls.
+    table: Arc<Mutex<MemoTable>>,
+}
+
+#[pymethods]
+impl PyKnitVersionedFiles {
+    #[new]
+    #[pyo3(signature = (index, data_access, max_delta_chain=200, annotated=false, reload_func=None))]
+    fn new(
+        py: Python<'_>,
+        index: Bound<'_, PyAny>,
+        data_access: Bound<'_, PyAny>,
+        max_delta_chain: usize,
+        annotated: bool,
+        reload_func: Option<Bound<'_, PyAny>>,
+    ) -> Self {
+        Self {
+            index_obj: index.unbind(),
+            access_obj: data_access.unbind(),
+            annotated,
+            max_delta_chain,
+            reload_func: reload_func.map(|f| f.unbind()).unwrap_or_else(|| py.None()),
+            immediate_fallback_vfs: Vec::new(),
+            table: Arc::new(Mutex::new(MemoTable::default())),
+        }
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let index_repr = self.index_obj.bind(py).repr()?;
+        let access_repr = self.access_obj.bind(py).repr()?;
+        Ok(format!(
+            "KnitVersionedFiles({}, {})",
+            index_repr, access_repr
+        ))
+    }
+
+    #[getter]
+    fn _index(&self, py: Python<'_>) -> Py<PyAny> {
+        self.index_obj.clone_ref(py)
+    }
+
+    #[getter]
+    fn _access(&self, py: Python<'_>) -> Py<PyAny> {
+        self.access_obj.clone_ref(py)
+    }
+
+    #[getter]
+    fn _max_delta_chain(&self) -> usize {
+        self.max_delta_chain
+    }
+
+    #[getter]
+    fn _immediate_fallback_vfs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for vf in &self.immediate_fallback_vfs {
+            list.append(vf.bind(py))?;
+        }
+        Ok(list)
+    }
+
+    fn without_fallbacks(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let cls = py
+            .import("bzrformats.knit")?
+            .getattr("KnitVersionedFiles")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("max_delta_chain", self.max_delta_chain)?;
+        kwargs.set_item("annotated", self.annotated)?;
+        kwargs.set_item("reload_func", self.reload_func.bind(py))?;
+        cls.call(
+            (self.index_obj.bind(py), self.access_obj.bind(py)),
+            Some(&kwargs),
+        )
+        .map(|b| b.unbind())
+    }
+
+    fn add_fallback_versioned_files(&mut self, a_versioned_files: Bound<'_, PyAny>) {
+        self.immediate_fallback_vfs.push(a_versioned_files.unbind());
+    }
+
+    #[pyo3(signature = (key, parents, lines, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
+    fn add_lines(
+        &self,
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        parents: Option<Bound<'_, PyAny>>,
+        lines: Bound<'_, PyAny>,
+        parent_texts: Option<Bound<'_, PyAny>>,
+        left_matching_blocks: Option<Bound<'_, PyAny>>,
+        nostore_sha: Option<Bound<'_, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let (mut rust_key, autogen_key) = extract_py_knit_key_autogen(&key)?;
+        let rust_lines: Vec<Vec<u8>> = lines
+            .try_iter()?
+            .map(|item| {
+                item?
+                    .cast_into::<PyBytes>()
+                    .map(|b| b.as_bytes().to_vec())
+                    .map_err(|_| PyValueError::new_err("lines must be an iterable of bytes"))
+            })
+            .collect::<PyResult<_>>()?;
+
+        // Validate key and lines the same way the Python side does.
+        if check_content {
+            self.check_lines_not_unicode(py, &rust_lines)?;
+            self.check_lines_are_lines(py, &rust_lines)?;
+        }
+        for (i, seg) in rust_key.iter().enumerate() {
+            if autogen_key && i == rust_key.len() - 1 {
+                continue; // placeholder, filled below
+            }
+            if seg.contains(&b' ') || seg.contains(&b'\t') || seg.contains(&b'\n') {
+                return Err(PyValueError::new_err(format!(
+                    "key element contains whitespace: {:?}",
+                    seg
+                )));
+            }
+        }
+
+        let line_bytes: Vec<u8> = rust_lines.iter().flat_map(|l| l.iter().copied()).collect();
+        let digest = bazaar::osutils::sha::sha_string(&line_bytes);
+        let digest_bytes = digest.clone().into_bytes();
+
+        if autogen_key {
+            let last = rust_key.last_mut().unwrap();
+            *last = [b"sha1:".as_ref(), digest_bytes.as_slice()].concat();
+        }
+
+        // Check nostore_sha.
+        if let Some(ref ns) = nostore_sha {
+            let ns_bytes: Vec<u8> = ns
+                .cast::<PyBytes>()
+                .map(|b| b.as_bytes().to_vec())
+                .unwrap_or_default();
+            if ns_bytes == digest_bytes {
+                pyo3::import_exception!(bzrformats.versionedfile, ExistingContent);
+                return Err(ExistingContent::new_err(()));
+            }
+        }
+
+        let rust_parents: Vec<Vec<Vec<u8>>> = match parents {
+            None => Vec::new(),
+            Some(ref p) => {
+                if p.is_none() {
+                    Vec::new()
+                } else {
+                    p.try_iter()?
+                        .map(|item| extract_py_knit_key(&item?))
+                        .collect::<PyResult<_>>()?
+                }
+            }
+        };
+
+        let table = Arc::new(Mutex::new(MemoTable::default()));
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table.clone());
+
+        let kvf = if self.annotated {
+            bazaar::knit::KnitVersionedFiles::new(
+                index,
+                access,
+                bazaar::knit::KnitAnnotateFactory,
+                self.max_delta_chain,
+            )
+        } else {
+            // Need the same type; use a newtype trick via trait objects or
+            // just call the Rust KVF directly for the plain case.
+            // Since KnitVersionedFiles is generic, we can't store both in one
+            // field.  Call the common pipeline directly instead.
+            return self.add_lines_plain(
+                py,
+                rust_key,
+                rust_parents,
+                rust_lines,
+                digest_bytes,
+                random_id,
+            );
+        };
+
+        let (ret_digest, text_length) = kvf
+            .add_lines(rust_key, rust_parents, rust_lines, random_id)
+            .map_err(knit_err_to_py)?;
+
+        let result = PyTuple::new(
+            py,
+            [
+                PyBytes::new(py, &ret_digest).into_any(),
+                text_length.into_pyobject(py)?.into_any(),
+                py.None().into_bound(py),
+            ],
+        )?;
+        Ok(result.into_any().unbind())
+    }
+
+    fn get_parent_map<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rust_keys = extract_py_knit_keys(&keys)?;
+        let table = Arc::new(Mutex::new(MemoTable::default()));
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table);
+
+        let has_graph = index.has_graph();
+        let local_map = index.get_parent_map(&rust_keys).map_err(knit_err_to_py)?;
+        let result = PyDict::new(py);
+        for (key, parents) in &local_map {
+            let py_key = py_knit_key_to_py(py, key)?;
+            if has_graph {
+                let py_parents = PyTuple::new(
+                    py,
+                    parents
+                        .iter()
+                        .map(|p| py_knit_key_to_py(py, p))
+                        .collect::<PyResult<Vec<_>>>()?,
+                )?;
+                result.set_item(py_key, py_parents)?;
+            } else {
+                result.set_item(py_key, py.None())?;
+            }
+        }
+
+        // Consult fallback VFs for any missing keys.
+        let mut missing: std::collections::HashSet<Vec<Vec<u8>>> = rust_keys.into_iter().collect();
+        for key in local_map.keys() {
+            missing.remove(key);
+        }
+        for fallback in &self.immediate_fallback_vfs {
+            if missing.is_empty() {
+                break;
+            }
+            let fb_keys = pyo3::types::PySet::empty(py)?;
+            for k in &missing {
+                fb_keys.add(py_knit_key_to_py(py, k)?)?;
+            }
+            let fb_result = fallback
+                .bind(py)
+                .call_method1("get_parent_map", (fb_keys,))?;
+            let fb_dict = fb_result.cast_into::<PyDict>()?;
+            for (k, v) in fb_dict.iter() {
+                let rust_key = extract_py_knit_key(&k)?;
+                missing.remove(&rust_key);
+                result.set_item(k, v)?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn get_sha1s<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rust_keys = extract_py_knit_keys(&keys)?;
+        let table = Arc::new(Mutex::new(MemoTable::default()));
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table);
+
+        let local_result = rust_get_sha1s(&index, &access, &rust_keys).map_err(knit_err_to_py)?;
+        let result = PyDict::new(py);
+        for (key, digest) in &local_result {
+            result.set_item(py_knit_key_to_py(py, key)?, PyBytes::new(py, digest))?;
+        }
+
+        let mut missing: std::collections::HashSet<Vec<Vec<u8>>> = rust_keys.into_iter().collect();
+        for k in local_result.keys() {
+            missing.remove(k);
+        }
+        for fallback in &self.immediate_fallback_vfs {
+            if missing.is_empty() {
+                break;
+            }
+            let fb_keys = pyo3::types::PySet::empty(py)?;
+            for k in &missing {
+                fb_keys.add(py_knit_key_to_py(py, k)?)?;
+            }
+            let fb_result = fallback.bind(py).call_method1("get_sha1s", (fb_keys,))?;
+            let fb_dict = fb_result.cast_into::<PyDict>()?;
+            for (k, v) in fb_dict.iter() {
+                let rust_key = extract_py_knit_key(&k)?;
+                missing.remove(&rust_key);
+                result.set_item(k, v)?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        // Call Python index.keys() directly so Python exceptions (KnitHeaderError
+        // etc.) propagate unchanged rather than being wrapped in ValueError.
+        let local_keys = self.index_obj.bind(py).call_method0("keys")?;
+        let result = pyo3::types::PySet::empty(py)?;
+        for k in local_keys.try_iter()? {
+            result.add(k?)?;
+        }
+        for fallback in &self.immediate_fallback_vfs {
+            let fb_keys = fallback.bind(py).call_method0("keys")?;
+            for k in fb_keys.try_iter()? {
+                result.add(k?)?;
+            }
+        }
+        Ok(result.into_any())
+    }
+
+    #[pyo3(signature = (progress_bar=None, keys=None))]
+    fn check(
+        &self,
+        py: Python<'_>,
+        progress_bar: Option<Bound<'_, PyAny>>,
+        keys: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        // Delegate to Python's KnitVersionedFiles.check via the Python wrapper.
+        // TODO: port _logical_check to Rust.
+        let py_self = self.to_py_kvf(py)?;
+        let kwargs = PyDict::new(py);
+        if let Some(pb) = progress_bar {
+            kwargs.set_item("progress_bar", pb)?;
+        }
+        if let Some(k) = keys {
+            kwargs.set_item("keys", k)?;
+        }
+        py_self
+            .call_method("check", (), Some(&kwargs))
+            .map(|b| b.unbind())
+    }
+
+    fn get_missing_compression_parent_keys(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let table = Arc::new(Mutex::new(MemoTable::default()));
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table);
+        let missing = index
+            .get_missing_compression_parents()
+            .map_err(knit_err_to_py)?;
+        let result = pyo3::types::PySet::empty(py)?;
+        for k in &missing {
+            result.add(py_knit_key_to_py(py, k)?)?;
+        }
+        Ok(result.into_any().unbind())
+    }
+
+    fn annotate(&self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        // Delegate to the Python side — _KnitAnnotator still lives there.
+        let py_self = self.to_py_kvf(py)?;
+        py_self.call_method1("annotate", (key,)).map(|b| b.unbind())
+    }
+
+    fn get_annotator(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self.call_method0("get_annotator").map(|b| b.unbind())
+    }
+
+    fn insert_record_stream(&self, py: Python<'_>, stream: Bound<'_, PyAny>) -> PyResult<()> {
+        // TODO: port insert_record_stream to Rust
+        let py_self = self.to_py_kvf(py)?;
+        py_self.call_method1("insert_record_stream", (stream,))?;
+        Ok(())
+    }
+
+    fn get_record_stream(
+        &self,
+        py: Python<'_>,
+        keys: Bound<'_, PyAny>,
+        ordering: Bound<'_, PyAny>,
+        include_delta_closure: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        // TODO: port get_record_stream to Rust
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("get_record_stream", (keys, ordering, include_delta_closure))
+            .map(|b| b.unbind())
+    }
+
+    #[pyo3(signature = (keys, pb=None))]
+    fn iter_lines_added_or_present_in_keys(
+        &self,
+        py: Python<'_>,
+        keys: Bound<'_, PyAny>,
+        pb: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        // TODO: port iter_lines_added_or_present_in_keys to Rust
+        let py_self = self.to_py_kvf(py)?;
+        let args = (keys,);
+        if let Some(pb) = pb {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("pb", pb)?;
+            py_self
+                .call_method("iter_lines_added_or_present_in_keys", args, Some(&kwargs))
+                .map(|b| b.unbind())
+        } else {
+            py_self
+                .call_method1("iter_lines_added_or_present_in_keys", args)
+                .map(|b| b.unbind())
+        }
+    }
+
+    fn make_mpdiffs(&self, py: Python<'_>, keys: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        // Inherited from VersionedFilesWithFallbacks — delegate to Python.
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("make_mpdiffs", (keys,))
+            .map(|b| b.unbind())
+    }
+
+    fn add_mpdiffs(&self, py: Python<'_>, records: Bound<'_, PyAny>) -> PyResult<()> {
+        // Inherited from VersionedFilesWithFallbacks — delegate to Python.
+        let py_self = self.to_py_kvf(py)?;
+        py_self.call_method1("add_mpdiffs", (records,))?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (content_factory, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false))]
+    fn add_content(
+        &self,
+        py: Python<'_>,
+        content_factory: Bound<'_, PyAny>,
+        parent_texts: Option<Bound<'_, PyAny>>,
+        left_matching_blocks: Option<Bound<'_, PyAny>>,
+        nostore_sha: Option<Bound<'_, PyAny>>,
+        random_id: Option<bool>,
+    ) -> PyResult<Py<PyAny>> {
+        // Delegate: add_content calls add_lines internally, so delegating to
+        // the Python wrapper is simpler than duplicating the adapter logic.
+        // TODO: port add_content to Rust once add_lines is fully ported.
+        let py_self = self.to_py_kvf(py)?;
+        let kwargs = PyDict::new(py);
+        if let Some(pt) = parent_texts {
+            kwargs.set_item("parent_texts", pt)?;
+        }
+        if let Some(lmb) = left_matching_blocks {
+            kwargs.set_item("left_matching_blocks", lmb)?;
+        }
+        if let Some(ns) = nostore_sha {
+            kwargs.set_item("nostore_sha", ns)?;
+        }
+        if let Some(ri) = random_id {
+            kwargs.set_item("random_id", ri)?;
+        }
+        py_self
+            .call_method("add_content", (content_factory,), Some(&kwargs))
+            .map(|b| b.unbind())
+    }
+
+    #[getter]
+    fn _factory(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let m = py.import("bzrformats._bzr_rs.knit")?;
+        if self.annotated {
+            m.getattr("KnitAnnotateFactory")?
+                .call0()
+                .map(|b| b.unbind())
+        } else {
+            m.getattr("KnitPlainFactory")?.call0().map(|b| b.unbind())
+        }
+    }
+
+    fn _read_records_iter(&self, py: Python<'_>, records: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("_read_records_iter", (records,))
+            .map(|b| b.unbind())
+    }
+
+    fn _read_records_iter_raw(
+        &self,
+        py: Python<'_>,
+        records: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("_read_records_iter_raw", (records,))
+            .map(|b| b.unbind())
+    }
+
+    fn _read_records_iter_unchecked(
+        &self,
+        py: Python<'_>,
+        records: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("_read_records_iter_unchecked", (records,))
+            .map(|b| b.unbind())
+    }
+
+    fn _parse_record(
+        &self,
+        py: Python<'_>,
+        version_id: Bound<'_, PyAny>,
+        data: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("_parse_record", (version_id, data))
+            .map(|b| b.unbind())
+    }
+
+    fn _parse_record_header(
+        &self,
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        raw_data: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("_parse_record_header", (key, raw_data))
+            .map(|b| b.unbind())
+    }
+
+    fn _get_content(
+        &self,
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        parent_texts: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        if let Some(pt) = parent_texts {
+            py_self
+                .call_method1("_get_content", (key, pt))
+                .map(|b| b.unbind())
+        } else {
+            py_self
+                .call_method1("_get_content", (key,))
+                .map(|b| b.unbind())
+        }
+    }
+
+    fn _check_should_delta(&self, py: Python<'_>, parent: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("_check_should_delta", (parent,))
+            .map(|b| b.unbind())
+    }
+
+    fn _get_components_positions(
+        &self,
+        py: Python<'_>,
+        keys: Bound<'_, PyAny>,
+        allow_missing: Option<bool>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        let kwargs = PyDict::new(py);
+        if let Some(am) = allow_missing {
+            kwargs.set_item("allow_missing", am)?;
+        }
+        py_self
+            .call_method("_get_components_positions", (keys,), Some(&kwargs))
+            .map(|b| b.unbind())
+    }
+
+    fn _get_parent_map_with_sources(
+        &self,
+        py: Python<'_>,
+        keys: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("_get_parent_map_with_sources", (keys,))
+            .map(|b| b.unbind())
+    }
+
+    #[staticmethod]
+    fn _split_by_prefix(py: Python<'_>, keys: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let m = py.import("bzrformats._bzr_rs.knit")?;
+        let key_list = PyList::empty(py);
+        for k in keys.try_iter()? {
+            let k = k?;
+            let segs = PyList::empty(py);
+            for seg in k.try_iter()? {
+                segs.append(seg?)?;
+            }
+            key_list.append(segs)?;
+        }
+        m.call_method1("split_keys_by_prefix_rs", (key_list,))
+            .map(|b| b.unbind())
+    }
+
+    fn _record_to_data(
+        &self,
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        digest: Bound<'_, PyAny>,
+        lines: Bound<'_, PyAny>,
+        dense_lines: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        if let Some(dl) = dense_lines {
+            py_self
+                .call_method1("_record_to_data", (key, digest, lines, dl))
+                .map(|b| b.unbind())
+        } else {
+            py_self
+                .call_method1("_record_to_data", (key, digest, lines))
+                .map(|b| b.unbind())
+        }
+    }
+
+    fn _get_record_map_unparsed(
+        &self,
+        py: Python<'_>,
+        keys: Bound<'_, PyAny>,
+        allow_missing: Option<bool>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        let kwargs = PyDict::new(py);
+        if let Some(am) = allow_missing {
+            kwargs.set_item("allow_missing", am)?;
+        }
+        py_self
+            .call_method("_get_record_map_unparsed", (keys,), Some(&kwargs))
+            .map(|b| b.unbind())
+    }
+
+    fn _get_record_map(
+        &self,
+        py: Python<'_>,
+        keys: Bound<'_, PyAny>,
+        allow_missing: Option<bool>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        let kwargs = PyDict::new(py);
+        if let Some(am) = allow_missing {
+            kwargs.set_item("allow_missing", am)?;
+        }
+        py_self
+            .call_method("_get_record_map", (keys,), Some(&kwargs))
+            .map(|b| b.unbind())
+    }
+
+    fn _raw_map_to_record_map(
+        &self,
+        py: Python<'_>,
+        raw_map: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("_raw_map_to_record_map", (raw_map,))
+            .map(|b| b.unbind())
+    }
+
+    fn _parse_record_unchecked(
+        &self,
+        py: Python<'_>,
+        data: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("_parse_record_unchecked", (data,))
+            .map(|b| b.unbind())
+    }
+
+    #[pyo3(signature = (keys, non_local_keys, positions, _min_buffer_size=None))]
+    fn _group_keys_for_io(
+        &self,
+        py: Python<'_>,
+        keys: Bound<'_, PyAny>,
+        non_local_keys: Bound<'_, PyAny>,
+        positions: Bound<'_, PyAny>,
+        _min_buffer_size: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        let kwargs = PyDict::new(py);
+        if let Some(mbs) = _min_buffer_size {
+            kwargs.set_item("_min_buffer_size", mbs)?;
+        }
+        py_self
+            .call_method(
+                "_group_keys_for_io",
+                (keys, non_local_keys, positions),
+                Some(&kwargs),
+            )
+            .map(|b| b.unbind())
+    }
+
+    fn clear_cache(&self, py: Python<'_>) -> PyResult<()> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self.call_method0("clear_cache")?;
+        Ok(())
+    }
+
+    fn get_known_graph_ancestry(
+        &self,
+        py: Python<'_>,
+        keys: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let py_self = self.to_py_kvf(py)?;
+        py_self
+            .call_method1("get_known_graph_ancestry", (keys,))
+            .map(|b| b.unbind())
+    }
+
+    fn _transitive_fallbacks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let result = PyList::empty(py);
+        for fallback in &self.immediate_fallback_vfs {
+            result.append(fallback.bind(py))?;
+            let nested = fallback.bind(py).call_method0("_transitive_fallbacks")?;
+            for item in nested.try_iter()? {
+                result.append(item?)?;
+            }
+        }
+        Ok(result)
+    }
+}
+
+impl PyKnitVersionedFiles {
+    /// Build a temporary Python-backed `KnitVersionedFiles` object for methods
+    /// not yet ported to Rust (e.g. `insert_record_stream`, `check`).
+    fn to_py_kvf<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let module = py.import("bzrformats.knit")?;
+        let cls = module.getattr("KnitVersionedFilesPy")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("max_delta_chain", self.max_delta_chain)?;
+        kwargs.set_item("annotated", self.annotated)?;
+        if !self.reload_func.is_none(py) {
+            kwargs.set_item("reload_func", self.reload_func.bind(py))?;
+        }
+        let obj = cls.call(
+            (self.index_obj.bind(py), self.access_obj.bind(py)),
+            Some(&kwargs),
+        )?;
+        for fallback in &self.immediate_fallback_vfs {
+            obj.call_method1("add_fallback_versioned_files", (fallback.bind(py),))?;
+        }
+        Ok(obj)
+    }
+
+    /// Plain-factory add_lines (avoids monomorphising KnitVersionedFiles twice).
+    fn add_lines_plain(
+        &self,
+        py: Python<'_>,
+        key: bazaar::knit::KnitKey,
+        parents: Vec<bazaar::knit::KnitKey>,
+        lines: Vec<Vec<u8>>,
+        _digest: Vec<u8>,
+        random_id: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let table = Arc::new(Mutex::new(MemoTable::default()));
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table);
+        let kvf = bazaar::knit::KnitVersionedFiles::new(
+            index,
+            access,
+            bazaar::knit::KnitPlainFactory,
+            self.max_delta_chain,
+        );
+        let (ret_digest, text_length) = kvf
+            .add_lines(key, parents, lines, random_id)
+            .map_err(knit_err_to_py)?;
+        let result = PyTuple::new(
+            py,
+            [
+                PyBytes::new(py, &ret_digest).into_any(),
+                text_length.into_pyobject(py)?.into_any(),
+                py.None().into_bound(py),
+            ],
+        )?;
+        Ok(result.into_any().unbind())
+    }
+
+    fn check_lines_not_unicode(&self, _py: Python<'_>, lines: &[Vec<u8>]) -> PyResult<()> {
+        for line in lines {
+            // All lines should be bytes; if they are Vec<u8> already, this is
+            // a no-op since we've already converted from PyBytes.
+            let _ = line;
+        }
+        Ok(())
+    }
+
+    fn check_lines_are_lines(&self, _py: Python<'_>, lines: &[Vec<u8>]) -> PyResult<()> {
+        for (i, line) in lines.iter().enumerate() {
+            if line.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "line {} is empty, all lines must end with \\n",
+                    i
+                )));
+            }
+            if i < lines.len() - 1 && !line.ends_with(b"\n") {
+                return Err(PyValueError::new_err(format!(
+                    "line {} does not end with \\n: {:?}",
+                    i,
+                    &line[..line.len().min(40)]
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
@@ -4106,5 +4945,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<PyKndxIndex>()?;
     m.add_class::<PyKnitGraphIndex>()?;
     m.add_class::<PyKnitKeyAccess>()?;
+    m.add_class::<PyKnitVersionedFiles>()?;
     Ok(m)
 }
