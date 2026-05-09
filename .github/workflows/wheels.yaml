@@ -121,7 +121,7 @@ jobs:
       - name: Download wheels
         uses: actions/download-artifact@v8
       - name: Collect wheels
-        run: mkdir -p dist && cp artifact*/*.whl dist/
+        run: mkdir -p dist && find artifact* -name '*.whl' -exec cp -n {} dist/ \;
       - name: Publish wheels
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
