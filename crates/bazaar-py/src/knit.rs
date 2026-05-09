@@ -1,9 +1,10 @@
 use bazaar::knit::{
     lower_fulltext, lower_line_delta_annotated, lower_line_delta_raw, parse_fulltext,
     parse_line_delta_annotated, parse_line_delta_plain, parse_line_delta_raw,
-    parse_network_record_header, AnnotatedLine, DeltaHunk, KnitAccess as KnitAccessTrait,
-    KnitAnnotateFactory, KnitError, KnitIndex as KnitIndexTrait, KnitIndexMemo, KnitKey,
-    KnitMethod, KnitPlainFactory, KnitRecordDetails,
+    parse_network_record_header, AnnotatedKnitContent, AnnotatedLine, DeltaHunk,
+    KnitAccess as KnitAccessTrait, KnitAnnotateFactory, KnitContent as KnitContentTrait,
+    KnitError, KnitFactory as KnitFactoryTrait, KnitIndex as KnitIndexTrait, KnitIndexMemo,
+    KnitKey, KnitMethod, KnitPlainFactory, KnitRecordDetails, PlainKnitContent,
 };
 use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
@@ -1161,7 +1162,6 @@ fn record_to_data_rs<'py>(
 
 use bazaar::knit::{
     get_content as rust_get_content, get_sha1s as rust_get_sha1s, get_text as rust_get_text,
-    KnitContent as KnitContentTrait,
 };
 use std::sync::{Arc, Mutex};
 
@@ -1585,6 +1585,684 @@ fn dictionary_compress_rs<'py>(
     Ok(PyBytes::new(py, &out))
 }
 
+/// Python-accessible wrapper around [`bazaar::knit::AnnotatedKnitContent`].
+///
+/// Exposes the same public interface as the Python `AnnotatedKnitContent`:
+/// `annotate()`, `text()`, `copy()`, `apply_delta()`, `line_delta()`,
+/// `line_delta_iter()`, `get_line_delta_blocks()`, plus the `_lines` and
+/// `_should_strip_eol` attributes for compatibility with callers that access
+/// the internal state directly.
+#[pyclass(name = "AnnotatedKnitContent")]
+pub struct PyAnnotatedKnitContent(AnnotatedKnitContent);
+
+#[pymethods]
+impl PyAnnotatedKnitContent {
+    #[new]
+    fn new(lines: &Bound<PyAny>) -> PyResult<Self> {
+        let pairs = extract_annotated_lines(lines)?;
+        Ok(Self(AnnotatedKnitContent::new(pairs)))
+    }
+
+    #[getter]
+    fn _lines<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        annotated_lines_to_py(py, &self.0.lines)
+    }
+
+    #[setter]
+    fn set__lines(&mut self, lines: &Bound<PyAny>) -> PyResult<()> {
+        self.0.lines = extract_annotated_lines(lines)?;
+        Ok(())
+    }
+
+    #[getter]
+    fn _should_strip_eol(&self) -> bool {
+        self.0.should_strip_eol()
+    }
+
+    #[setter]
+    fn set__should_strip_eol(&mut self, val: bool) {
+        self.0.set_should_strip_eol(val);
+    }
+
+    fn annotate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        annotated_lines_to_py(py, &self.0.annotate())
+    }
+
+    fn text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let lines = self.0.text();
+        let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
+        PyList::new(py, items)
+    }
+
+    fn copy(&self) -> Self {
+        Self(self.0.clone())
+    }
+
+    fn apply_delta(&mut self, delta: &Bound<PyAny>, _new_version_id: &[u8]) -> PyResult<()> {
+        let hunks = extract_annotated_delta_hunks(delta)?;
+        self.0.apply_delta(&hunks, _new_version_id);
+        Ok(())
+    }
+
+    fn line_delta<'py>(
+        slf: PyRef<'_, Self>,
+        py: Python<'py>,
+        new_lines: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let it = Self::line_delta_iter_impl(slf, py, new_lines)?;
+        PyList::new(py, it)
+    }
+
+    fn line_delta_iter<'py>(
+        slf: PyRef<'_, Self>,
+        py: Python<'py>,
+        new_lines: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let items = Self::line_delta_iter_impl(slf, py, new_lines)?;
+        Ok(PyList::new(py, items)?.call_method0("__iter__")?)
+    }
+
+    #[staticmethod]
+    fn get_line_delta_blocks<'py>(
+        py: Python<'py>,
+        knit_delta: Bound<'py, PyAny>,
+        source: Bound<'py, PyAny>,
+        target: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        get_line_delta_blocks_rs(py, knit_delta, source, target)
+    }
+}
+
+impl PyAnnotatedKnitContent {
+    fn line_delta_iter_impl<'py>(
+        slf: PyRef<'_, Self>,
+        py: Python<'py>,
+        new_lines: &Bound<'py, PyAny>,
+    ) -> PyResult<Vec<Bound<'py, PyTuple>>> {
+        // line_delta_iter uses patiencediff, a Python library — call back into Python.
+        let patiencediff = py.import("patiencediff")?;
+        let old_texts = {
+            let lines = slf.0.text();
+            let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
+            PyList::new(py, items)?
+        };
+        // new_lines can be either a PyAnnotatedKnitContent or PyPlainKnitContent
+        let new_texts = new_lines.call_method0("text")?;
+        let new_lines_list = new_lines.getattr("_lines")?;
+
+        let matcher = patiencediff
+            .getattr("PatienceSequenceMatcher")?
+            .call1((py.None(), old_texts, new_texts))?;
+        let opcodes = matcher.call_method0("get_opcodes")?;
+
+        let mut out = Vec::new();
+        for opcode in opcodes.try_iter()? {
+            let op = opcode?;
+            let tag: String = op.get_item(0)?.extract()?;
+            if tag == "equal" {
+                continue;
+            }
+            let i1: usize = op.get_item(1)?.extract()?;
+            let i2: usize = op.get_item(2)?.extract()?;
+            let j1: usize = op.get_item(3)?.extract()?;
+            let j2: usize = op.get_item(4)?.extract()?;
+            let count = j2 - j1;
+            let slice = new_lines_list.get_item(pyo3::types::PySlice::new(py, j1 as isize, j2 as isize, 1))?;
+            out.push(PyTuple::new(
+                py,
+                [
+                    i1.into_pyobject(py)?.into_any(),
+                    i2.into_pyobject(py)?.into_any(),
+                    count.into_pyobject(py)?.into_any(),
+                    slice,
+                ],
+            )?);
+        }
+        Ok(out)
+    }
+}
+
+/// Python-accessible wrapper around [`bazaar::knit::PlainKnitContent`].
+///
+/// Exposes the same public interface as the Python `PlainKnitContent`.
+#[pyclass(name = "PlainKnitContent")]
+pub struct PyPlainKnitContent(PlainKnitContent);
+
+#[pymethods]
+impl PyPlainKnitContent {
+    #[new]
+    fn new(lines: &Bound<PyAny>, version_id: &Bound<PyAny>) -> PyResult<Self> {
+        let lines = extract_byte_lines(lines)?;
+        let vid = extract_version_id(version_id)?;
+        Ok(Self(PlainKnitContent::new(lines, vid)))
+    }
+
+    #[getter]
+    fn _lines<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let items: Vec<Bound<PyBytes>> = self.0.lines.iter().map(|l| PyBytes::new(py, l)).collect();
+        PyList::new(py, items)
+    }
+
+    #[setter]
+    fn set__lines(&mut self, lines: &Bound<PyAny>) -> PyResult<()> {
+        self.0.lines = extract_byte_lines(lines)?;
+        Ok(())
+    }
+
+    #[getter]
+    fn _should_strip_eol(&self) -> bool {
+        self.0.should_strip_eol()
+    }
+
+    #[setter]
+    fn set__should_strip_eol(&mut self, val: bool) {
+        self.0.set_should_strip_eol(val);
+    }
+
+    #[getter]
+    fn _version_id<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.0.version_id)
+    }
+
+    fn annotate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let pairs = self.0.annotate();
+        annotated_lines_to_py(py, &pairs)
+    }
+
+    fn text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let lines = self.0.text();
+        let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
+        PyList::new(py, items)
+    }
+
+    fn copy(&self) -> Self {
+        Self(self.0.clone())
+    }
+
+    fn apply_delta(
+        &mut self,
+        delta: &Bound<PyAny>,
+        new_version_id: &Bound<PyAny>,
+    ) -> PyResult<()> {
+        let hunks = extract_plain_delta_hunks(delta)?;
+        let vid = extract_version_id(new_version_id)?;
+        self.0.apply_delta(&hunks, &vid);
+        Ok(())
+    }
+
+    fn line_delta<'py>(
+        slf: PyRef<'_, Self>,
+        py: Python<'py>,
+        new_lines: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let it = Self::line_delta_iter_impl(slf, py, new_lines)?;
+        PyList::new(py, it)
+    }
+
+    fn line_delta_iter<'py>(
+        slf: PyRef<'_, Self>,
+        py: Python<'py>,
+        new_lines: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let items = Self::line_delta_iter_impl(slf, py, new_lines)?;
+        Ok(PyList::new(py, items)?.call_method0("__iter__")?)
+    }
+
+    #[staticmethod]
+    fn get_line_delta_blocks<'py>(
+        py: Python<'py>,
+        knit_delta: Bound<'py, PyAny>,
+        source: Bound<'py, PyAny>,
+        target: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        get_line_delta_blocks_rs(py, knit_delta, source, target)
+    }
+}
+
+impl PyPlainKnitContent {
+    fn line_delta_iter_impl<'py>(
+        slf: PyRef<'_, Self>,
+        py: Python<'py>,
+        new_lines: &Bound<'py, PyAny>,
+    ) -> PyResult<Vec<Bound<'py, PyTuple>>> {
+        let patiencediff = py.import("patiencediff")?;
+        let old_texts = {
+            let lines = slf.0.text();
+            let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
+            PyList::new(py, items)?
+        };
+        let new_texts = new_lines.call_method0("text")?;
+        let new_lines_list = new_lines.getattr("_lines")?;
+
+        let matcher = patiencediff
+            .getattr("PatienceSequenceMatcher")?
+            .call1((py.None(), old_texts, new_texts))?;
+        let opcodes = matcher.call_method0("get_opcodes")?;
+
+        let mut out = Vec::new();
+        for opcode in opcodes.try_iter()? {
+            let op = opcode?;
+            let tag: String = op.get_item(0)?.extract()?;
+            if tag == "equal" {
+                continue;
+            }
+            let i1: usize = op.get_item(1)?.extract()?;
+            let i2: usize = op.get_item(2)?.extract()?;
+            let j1: usize = op.get_item(3)?.extract()?;
+            let j2: usize = op.get_item(4)?.extract()?;
+            let count = j2 - j1;
+            let slice = new_lines_list.get_item(pyo3::types::PySlice::new(py, j1 as isize, j2 as isize, 1))?;
+            out.push(PyTuple::new(
+                py,
+                [
+                    i1.into_pyobject(py)?.into_any(),
+                    i2.into_pyobject(py)?.into_any(),
+                    count.into_pyobject(py)?.into_any(),
+                    slice,
+                ],
+            )?);
+        }
+        Ok(out)
+    }
+}
+
+/// Extract a version_id as bytes. Accepts either `bytes` directly, or a tuple
+/// of bytes (key tuple), in which case the last element is taken — matching
+/// the breezy convention that `key[-1]` is the bare revision id.
+fn extract_version_id(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(b) = obj.downcast::<PyBytes>() {
+        return Ok(b.as_bytes().to_vec());
+    }
+    if let Ok(t) = obj.downcast::<PyTuple>() {
+        let len = t.len();
+        if len == 0 {
+            return Err(PyValueError::new_err("version_id tuple must be non-empty"));
+        }
+        let last = t.get_item(len - 1)?;
+        return last
+            .downcast::<PyBytes>()
+            .map(|b| b.as_bytes().to_vec())
+            .map_err(|_| PyValueError::new_err("version_id tuple elements must be bytes"));
+    }
+    Err(PyValueError::new_err(
+        "argument 'version_id': expected bytes or tuple of bytes",
+    ))
+}
+
+fn extract_annotated_delta_hunks(delta: &Bound<PyAny>) -> PyResult<Vec<DeltaHunk<AnnotatedLine>>> {
+    let mut hunks = Vec::new();
+    for item in delta.try_iter()? {
+        let tup = item?;
+        let start: usize = tup.get_item(0)?.extract()?;
+        let end: usize = tup.get_item(1)?.extract()?;
+        let count: usize = tup.get_item(2)?.extract()?;
+        let lines = extract_annotated_lines(&tup.get_item(3)?)?;
+        hunks.push(DeltaHunk {
+            start,
+            end,
+            count,
+            lines,
+        });
+    }
+    Ok(hunks)
+}
+
+fn extract_plain_delta_hunks(delta: &Bound<PyAny>) -> PyResult<Vec<DeltaHunk<Vec<u8>>>> {
+    let mut hunks = Vec::new();
+    for item in delta.try_iter()? {
+        let tup = item?;
+        let start: usize = tup.get_item(0)?.extract()?;
+        let end: usize = tup.get_item(1)?.extract()?;
+        let count: usize = tup.get_item(2)?.extract()?;
+        let lines = extract_byte_lines(&tup.get_item(3)?)?;
+        hunks.push(DeltaHunk {
+            start,
+            end,
+            count,
+            lines,
+        });
+    }
+    Ok(hunks)
+}
+
+/// Python-accessible wrapper around [`KnitAnnotateFactory`].
+#[pyclass(name = "KnitAnnotateFactory")]
+pub struct PyKnitAnnotateFactory;
+
+#[pymethods]
+impl PyKnitAnnotateFactory {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    #[getter]
+    fn annotated(&self) -> bool {
+        true
+    }
+
+    fn make<'py>(
+        &self,
+        _py: Python<'py>,
+        lines: Vec<Vec<u8>>,
+        version_id: &[u8],
+    ) -> PyResult<PyAnnotatedKnitContent> {
+        let pairs: Vec<AnnotatedLine> = lines
+            .into_iter()
+            .map(|l| (version_id.to_vec(), l))
+            .collect();
+        Ok(PyAnnotatedKnitContent(AnnotatedKnitContent::new(pairs)))
+    }
+
+    fn parse_fulltext(
+        &self,
+        content: &Bound<'_, PyAny>,
+        version_id: &[u8],
+    ) -> PyResult<PyAnnotatedKnitContent> {
+        let _ = version_id;
+        let owned = extract_byte_lines(content)?;
+        let parsed = parse_fulltext(&as_slices(&owned)).map_err(knit_err_to_py)?;
+        Ok(PyAnnotatedKnitContent(AnnotatedKnitContent::new(parsed)))
+    }
+
+    #[pyo3(signature = (lines, version_id, plain = false))]
+    fn parse_line_delta<'py>(
+        &self,
+        py: Python<'py>,
+        lines: Bound<'py, PyAny>,
+        version_id: &[u8],
+        plain: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let _ = version_id;
+        parse_line_delta_rs(py, lines, plain)
+    }
+
+    fn get_fulltext_content<'py>(
+        &self,
+        py: Python<'py>,
+        lines: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // yields line.split(b" ", 1)[1] for each line — return as a generator-like list
+        let mut out = Vec::new();
+        for item in lines.try_iter()? {
+            let line = item?.cast_into::<PyBytes>()?;
+            let bytes = line.as_bytes();
+            let content = bytes.iter().position(|&b| b == b' ')
+                .map(|i| &bytes[i + 1..])
+                .unwrap_or(bytes);
+            out.push(PyBytes::new(py, content));
+        }
+        Ok(PyList::new(py, out)?.into_any())
+    }
+
+    fn get_linedelta_content<'py>(
+        &self,
+        py: Python<'py>,
+        lines: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut out = Vec::new();
+        let mut iter = lines.try_iter()?;
+        while let Some(header_item) = iter.next() {
+            let header = header_item?.cast_into::<PyBytes>()?;
+            let parts: Vec<&[u8]> = header.as_bytes().split(|&b| b == b',').collect();
+            if parts.len() < 3 {
+                return Err(PyValueError::new_err("invalid delta header"));
+            }
+            let count: usize = std::str::from_utf8(parts[2])
+                .map_err(|_| PyValueError::new_err("invalid count"))?
+                .trim()
+                .parse()
+                .map_err(|_| PyValueError::new_err("invalid count"))?;
+            for _ in 0..count {
+                let line = iter.next()
+                    .ok_or_else(|| PyValueError::new_err("truncated delta"))??
+                    .cast_into::<PyBytes>()?;
+                let bytes = line.as_bytes();
+                let text = bytes.iter().position(|&b| b == b' ')
+                    .map(|i| &bytes[i + 1..])
+                    .unwrap_or(bytes);
+                out.push(PyBytes::new(py, text));
+            }
+        }
+        Ok(PyList::new(py, out)?.into_any())
+    }
+
+    /// Mirrors `_KnitFactory.parse_record(version_id, record, record_details,
+    /// base_content, copy_base_content=True)`. `record_details` is `(method,
+    /// noeol)`.
+    #[pyo3(signature = (version_id, record, record_details, base_content, copy_base_content = true))]
+    fn parse_record<'py>(
+        &self,
+        py: Python<'py>,
+        version_id: &Bound<'py, PyAny>,
+        record: Bound<'py, PyAny>,
+        record_details: Bound<'py, PyAny>,
+        base_content: Option<&PyAnnotatedKnitContent>,
+        copy_base_content: bool,
+    ) -> PyResult<(PyAnnotatedKnitContent, Bound<'py, PyAny>)> {
+        let vid = extract_version_id(version_id)?;
+        let method_obj = record_details.get_item(0)?;
+        let method_str: &str = method_obj.extract()?;
+        let noeol: bool = record_details.get_item(1)?.extract()?;
+        let method = match method_str {
+            "line-delta" => KnitMethod::LineDelta,
+            "fulltext" => KnitMethod::Fulltext,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown knit method: {:?}",
+                    other
+                )));
+            }
+        };
+        let _ = copy_base_content; // Rust always clones; Python default is True
+        let owned = extract_byte_lines(&record)?;
+        let slices = as_slices(&owned);
+        let base = base_content.map(|c| &c.0);
+        let content = KnitAnnotateFactory
+            .parse_record(&vid, &slices, method, noeol, base)
+            .map_err(knit_err_to_py)?;
+        let delta = if method == KnitMethod::LineDelta {
+            // Return the parsed delta as Python list for callers that need it
+            parse_line_delta_rs(py, record, false)?.into_any()
+        } else {
+            py.None().into_bound(py)
+        };
+        Ok((PyAnnotatedKnitContent(content), delta))
+    }
+
+    fn lower_fulltext<'py>(
+        &self,
+        py: Python<'py>,
+        content: &PyAnnotatedKnitContent,
+    ) -> PyResult<Bound<'py, PyList>> {
+        lower_fulltext_rs(py, content._lines(py)?.into_any())
+    }
+
+    fn lower_line_delta<'py>(
+        &self,
+        py: Python<'py>,
+        delta: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        lower_line_delta_rs(py, delta)
+    }
+
+    fn annotate<'py>(
+        &self,
+        py: Python<'py>,
+        knit: Bound<'py, PyAny>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let content = knit.call_method1("_get_content", (&key,))?;
+        let prefix: Bound<PyAny> = if let Ok(tup) = key.cast::<PyTuple>() {
+            let len = tup.len();
+            if len > 1 {
+                PyTuple::new(py, (0..len - 1).map(|i| tup.get_item(i).unwrap()))?.into_any()
+            } else {
+                PyTuple::empty(py).into_any()
+            }
+        } else {
+            return content.call_method0("annotate");
+        };
+        let origins = content.call_method0("annotate")?;
+        let result = PyList::empty(py);
+        for pair in origins.try_iter()? {
+            let pair = pair?;
+            let origin = pair.get_item(0)?;
+            let line = pair.get_item(1)?;
+            let full_origin = prefix.call_method1("__add__", (PyTuple::new(py, [origin])?,))?;
+            result.append(PyTuple::new(py, [full_origin, line])?)?;
+        }
+        Ok(result.into_any())
+    }
+}
+
+/// Python-accessible wrapper around [`KnitPlainFactory`].
+#[pyclass(name = "KnitPlainFactory")]
+pub struct PyKnitPlainFactory;
+
+#[pymethods]
+impl PyKnitPlainFactory {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    #[getter]
+    fn annotated(&self) -> bool {
+        false
+    }
+
+    fn make(&self, lines: Vec<Vec<u8>>, version_id: &[u8]) -> PyPlainKnitContent {
+        PyPlainKnitContent(PlainKnitContent::new(lines, version_id.to_vec()))
+    }
+
+    fn parse_fulltext(&self, content: Vec<Vec<u8>>, version_id: &[u8]) -> PyPlainKnitContent {
+        PyPlainKnitContent(PlainKnitContent::new(content, version_id.to_vec()))
+    }
+
+    fn parse_line_delta_iter<'py>(
+        &self,
+        py: Python<'py>,
+        lines: Bound<'py, PyAny>,
+        _version_id: &[u8],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Ok(parse_line_delta_raw_rs(py, lines)?.into_any())
+    }
+
+    fn parse_line_delta<'py>(
+        &self,
+        py: Python<'py>,
+        lines: Bound<'py, PyAny>,
+        _version_id: &[u8],
+    ) -> PyResult<Bound<'py, PyList>> {
+        parse_line_delta_raw_rs(py, lines)
+    }
+
+    fn get_fulltext_content<'py>(&self, lines: Bound<'py, PyAny>) -> Bound<'py, PyAny> {
+        // plain: lines are the content directly
+        lines
+    }
+
+    fn get_linedelta_content<'py>(
+        &self,
+        py: Python<'py>,
+        lines: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut out = Vec::new();
+        let mut iter = lines.try_iter()?;
+        while let Some(header_item) = iter.next() {
+            let header = header_item?.cast_into::<PyBytes>()?;
+            let parts: Vec<&[u8]> = header.as_bytes().split(|&b| b == b',').collect();
+            if parts.len() < 3 {
+                return Err(PyValueError::new_err("invalid delta header"));
+            }
+            let count: usize = std::str::from_utf8(parts[2])
+                .map_err(|_| PyValueError::new_err("invalid count"))?
+                .trim()
+                .parse()
+                .map_err(|_| PyValueError::new_err("invalid count"))?;
+            for _ in 0..count {
+                let line = iter.next()
+                    .ok_or_else(|| PyValueError::new_err("truncated delta"))??;
+                out.push(line);
+            }
+        }
+        Ok(PyList::new(py, out)?.into_any())
+    }
+
+    fn lower_fulltext<'py>(
+        &self,
+        py: Python<'py>,
+        content: &PyPlainKnitContent,
+    ) -> PyResult<Bound<'py, PyList>> {
+        content.text(py)
+    }
+
+    fn lower_line_delta<'py>(
+        &self,
+        py: Python<'py>,
+        delta: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        lower_line_delta_raw_rs(py, delta)
+    }
+
+    /// Mirrors `_KnitFactory.parse_record(version_id, record, record_details,
+    /// base_content, copy_base_content=True)`. `record_details` is `(method,
+    /// noeol)`.
+    #[pyo3(signature = (version_id, record, record_details, base_content, copy_base_content = true))]
+    fn parse_record<'py>(
+        &self,
+        py: Python<'py>,
+        version_id: &Bound<'py, PyAny>,
+        record: Bound<'py, PyAny>,
+        record_details: Bound<'py, PyAny>,
+        base_content: Option<&PyPlainKnitContent>,
+        copy_base_content: bool,
+    ) -> PyResult<(PyPlainKnitContent, Bound<'py, PyAny>)> {
+        let vid = extract_version_id(version_id)?;
+        let method_obj = record_details.get_item(0)?;
+        let method_str: &str = method_obj.extract()?;
+        let noeol: bool = record_details.get_item(1)?.extract()?;
+        let method = match method_str {
+            "line-delta" => KnitMethod::LineDelta,
+            "fulltext" => KnitMethod::Fulltext,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown knit method: {:?}",
+                    other
+                )));
+            }
+        };
+        let _ = copy_base_content; // Rust always clones; Python default is True
+        let owned = extract_byte_lines(&record)?;
+        let slices = as_slices(&owned);
+        let base = base_content.map(|c| &c.0);
+        let content = KnitPlainFactory
+            .parse_record(&vid, &slices, method, noeol, base)
+            .map_err(knit_err_to_py)?;
+        let delta = if method == KnitMethod::LineDelta {
+            parse_line_delta_raw_rs(py, record)?.into_any()
+        } else {
+            py.None().into_bound(py)
+        };
+        Ok((PyPlainKnitContent(content), delta))
+    }
+
+    fn annotate<'py>(
+        &self,
+        py: Python<'py>,
+        knit: Bound<'py, PyAny>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Plain factory delegates to _KnitAnnotator.annotate_flat
+        let annotator_class = py
+            .import("bzrformats.knit")?
+            .getattr("_KnitAnnotator")?;
+        let annotator = annotator_class.call1((knit,))?;
+        annotator.call_method1("annotate_flat", (key,))
+    }
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data, &m)?)?;
@@ -1626,5 +2304,9 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(get_total_build_size_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(dictionary_compress_rs, &m)?)?;
+    m.add_class::<PyAnnotatedKnitContent>()?;
+    m.add_class::<PyPlainKnitContent>()?;
+    m.add_class::<PyKnitAnnotateFactory>()?;
+    m.add_class::<PyKnitPlainFactory>()?;
     Ok(m)
 }
