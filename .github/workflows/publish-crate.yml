@@ -15,5 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
       - name: Publish bazaar crate
         run: cargo publish -p bazaar --no-default-features
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
