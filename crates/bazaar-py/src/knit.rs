@@ -4659,26 +4659,25 @@ impl PyKnitVersionedFiles {
         nostore_sha: Option<Bound<'_, PyAny>>,
         random_id: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
-        // Delegate: add_content calls add_lines internally, so delegating to
-        // the Python wrapper is simpler than duplicating the adapter logic.
-        // TODO: port add_content to Rust once add_lines is fully ported.
-        let py_self = self.to_py_kvf(py)?;
-        let kwargs = PyDict::new(py);
-        if let Some(pt) = parent_texts {
-            kwargs.set_item("parent_texts", pt)?;
-        }
-        if let Some(lmb) = left_matching_blocks {
-            kwargs.set_item("left_matching_blocks", lmb)?;
-        }
-        if let Some(ns) = nostore_sha {
-            kwargs.set_item("nostore_sha", ns)?;
-        }
-        if let Some(ri) = random_id {
-            kwargs.set_item("random_id", ri)?;
-        }
-        py_self
-            .call_method("add_content", (content_factory,), Some(&kwargs))
-            .map(|b| b.unbind())
+        let key = content_factory.getattr("key")?;
+        let parents_obj = content_factory.getattr("parents")?;
+        let parents: Option<Bound<'_, PyAny>> = if parents_obj.is_none() {
+            None
+        } else {
+            Some(parents_obj)
+        };
+        let lines = content_factory.call_method1("get_bytes_as", ("lines",))?;
+        self.add_lines(
+            py,
+            key,
+            parents,
+            lines,
+            parent_texts,
+            left_matching_blocks,
+            nostore_sha,
+            random_id.unwrap_or(false),
+            false,
+        )
     }
 
     #[getter]
