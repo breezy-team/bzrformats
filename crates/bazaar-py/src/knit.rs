@@ -1,12 +1,14 @@
+use bazaar::key_mapper::Mapper as _;
 use bazaar::knit::{
     lower_fulltext, lower_line_delta_annotated, lower_line_delta_raw, parse_fulltext,
     parse_line_delta_annotated, parse_line_delta_plain, parse_line_delta_raw,
-    parse_network_record_header, AnnotatedKnitContent, AnnotatedLine, DeltaHunk,
-    KnitAccess as KnitAccessTrait, KnitAnnotateFactory, KnitContent as KnitContentTrait,
-    KnitError, KnitFactory as KnitFactoryTrait, KnitIndex as KnitIndexTrait, KnitIndexMemo,
-    KnitKey, KnitMethod, KnitPlainFactory, KnitRecordDetails, PlainKnitContent,
+    parse_network_record_header, AnnotatedKnitContent, AnnotatedLine, DeltaHunk, KndxLoadError,
+    KnitAccess as KnitAccessTrait, KnitAnnotateFactory, KnitContent as KnitContentTrait, KnitError,
+    KnitFactory as KnitFactoryTrait, KnitIndex as KnitIndexTrait, KnitIndexMemo, KnitKey,
+    KnitMethod, KnitPlainFactory, KnitRecordDetails, PlainKnitContent,
 };
-use pyo3::exceptions::{PyIndexError, PyValueError};
+use bazaar::transport::Transport as _;
+use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
@@ -1140,10 +1142,6 @@ fn record_to_data_rs<'py>(
     Ok((len, list))
 }
 
-// ============================================================
-// PyKnitIndex / PyKnitAccess adapters
-// ============================================================
-//
 // These wrap a Python `_KnitGraphIndex` / `_KndxIndex` and a
 // `_KnitKeyAccess` / `_DirectPackAccess` respectively, exposing them
 // as pure-Rust `bazaar::knit::KnitIndex` / `KnitAccess` implementors so
@@ -1690,9 +1688,11 @@ impl PyAnnotatedKnitContent {
         let new_texts = new_lines.call_method0("text")?;
         let new_lines_list = new_lines.getattr("_lines")?;
 
-        let matcher = patiencediff
-            .getattr("PatienceSequenceMatcher")?
-            .call1((py.None(), old_texts, new_texts))?;
+        let matcher = patiencediff.getattr("PatienceSequenceMatcher")?.call1((
+            py.None(),
+            old_texts,
+            new_texts,
+        ))?;
         let opcodes = matcher.call_method0("get_opcodes")?;
 
         let mut out = Vec::new();
@@ -1707,7 +1707,12 @@ impl PyAnnotatedKnitContent {
             let j1: usize = op.get_item(3)?.extract()?;
             let j2: usize = op.get_item(4)?.extract()?;
             let count = j2 - j1;
-            let slice = new_lines_list.get_item(pyo3::types::PySlice::new(py, j1 as isize, j2 as isize, 1))?;
+            let slice = new_lines_list.get_item(pyo3::types::PySlice::new(
+                py,
+                j1 as isize,
+                j2 as isize,
+                1,
+            ))?;
             out.push(PyTuple::new(
                 py,
                 [
@@ -1779,11 +1784,7 @@ impl PyPlainKnitContent {
         Self(self.0.clone())
     }
 
-    fn apply_delta(
-        &mut self,
-        delta: &Bound<PyAny>,
-        new_version_id: &Bound<PyAny>,
-    ) -> PyResult<()> {
+    fn apply_delta(&mut self, delta: &Bound<PyAny>, new_version_id: &Bound<PyAny>) -> PyResult<()> {
         let hunks = extract_plain_delta_hunks(delta)?;
         let vid = extract_version_id(new_version_id)?;
         self.0.apply_delta(&hunks, &vid);
@@ -1834,9 +1835,11 @@ impl PyPlainKnitContent {
         let new_texts = new_lines.call_method0("text")?;
         let new_lines_list = new_lines.getattr("_lines")?;
 
-        let matcher = patiencediff
-            .getattr("PatienceSequenceMatcher")?
-            .call1((py.None(), old_texts, new_texts))?;
+        let matcher = patiencediff.getattr("PatienceSequenceMatcher")?.call1((
+            py.None(),
+            old_texts,
+            new_texts,
+        ))?;
         let opcodes = matcher.call_method0("get_opcodes")?;
 
         let mut out = Vec::new();
@@ -1851,7 +1854,12 @@ impl PyPlainKnitContent {
             let j1: usize = op.get_item(3)?.extract()?;
             let j2: usize = op.get_item(4)?.extract()?;
             let count = j2 - j1;
-            let slice = new_lines_list.get_item(pyo3::types::PySlice::new(py, j1 as isize, j2 as isize, 1))?;
+            let slice = new_lines_list.get_item(pyo3::types::PySlice::new(
+                py,
+                j1 as isize,
+                j2 as isize,
+                1,
+            ))?;
             out.push(PyTuple::new(
                 py,
                 [
@@ -1987,7 +1995,9 @@ impl PyKnitAnnotateFactory {
         for item in lines.try_iter()? {
             let line = item?.cast_into::<PyBytes>()?;
             let bytes = line.as_bytes();
-            let content = bytes.iter().position(|&b| b == b' ')
+            let content = bytes
+                .iter()
+                .position(|&b| b == b' ')
                 .map(|i| &bytes[i + 1..])
                 .unwrap_or(bytes);
             out.push(PyBytes::new(py, content));
@@ -2014,11 +2024,14 @@ impl PyKnitAnnotateFactory {
                 .parse()
                 .map_err(|_| PyValueError::new_err("invalid count"))?;
             for _ in 0..count {
-                let line = iter.next()
+                let line = iter
+                    .next()
                     .ok_or_else(|| PyValueError::new_err("truncated delta"))??
                     .cast_into::<PyBytes>()?;
                 let bytes = line.as_bytes();
-                let text = bytes.iter().position(|&b| b == b' ')
+                let text = bytes
+                    .iter()
+                    .position(|&b| b == b' ')
                     .map(|i| &bytes[i + 1..])
                     .unwrap_or(bytes);
                 out.push(PyBytes::new(py, text));
@@ -2182,7 +2195,8 @@ impl PyKnitPlainFactory {
                 .parse()
                 .map_err(|_| PyValueError::new_err("invalid count"))?;
             for _ in 0..count {
-                let line = iter.next()
+                let line = iter
+                    .next()
                     .ok_or_else(|| PyValueError::new_err("truncated delta"))??;
                 out.push(line);
             }
@@ -2255,12 +2269,909 @@ impl PyKnitPlainFactory {
         key: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         // Plain factory delegates to _KnitAnnotator.annotate_flat
-        let annotator_class = py
-            .import("bzrformats.knit")?
-            .getattr("_KnitAnnotator")?;
+        let annotator_class = py.import("bzrformats.knit")?.getattr("_KnitAnnotator")?;
         let annotator = annotator_class.call1((knit,))?;
         annotator.call_method1("annotate_flat", (key,))
     }
+}
+
+fn transport_err_to_py(e: bazaar::transport::TransportError) -> PyErr {
+    PyValueError::new_err(e.to_string())
+}
+
+fn kndx_load_err_to_py(py: Python<'_>, e: KndxLoadError) -> PyErr {
+    match e {
+        KndxLoadError::Transport(te) => transport_err_to_py(te),
+        KndxLoadError::Knit(ke) => match &ke {
+            bazaar::knit::KnitError::BadKnitHeader { path } => py
+                .import("bzrformats.knit")
+                .and_then(|m| m.getattr("KnitHeaderError"))
+                .and_then(|cls| {
+                    let badline = pyo3::types::PyBytes::new(py, b"");
+                    cls.call1((badline, path.as_str()))
+                })
+                .map(|exc| PyErr::from_value(exc.unbind().into_bound(py)))
+                .unwrap_or_else(|import_err| import_err),
+            bazaar::knit::KnitError::KndxCorrupt { line, detail } => py
+                .import("bzrformats.knit")
+                .and_then(|m| m.getattr("KnitCorrupt"))
+                .and_then(|cls| {
+                    let py_line = pyo3::types::PyBytes::new(py, line);
+                    cls.call1((py_line, detail.as_str()))
+                })
+                .map(|exc| PyErr::from_value(exc.unbind().into_bound(py)))
+                .unwrap_or_else(|import_err| import_err),
+            _ => PyValueError::new_err(ke.to_string()),
+        },
+    }
+}
+
+type PyKndxIndexInner =
+    bazaar::knit::KndxIndex<crate::transport::PyTransport, crate::transport::PyMapper>;
+
+/// pyo3 wrapper around `bazaar::knit::KndxIndex`.
+///
+/// Exposes the same interface as the Python `_KndxIndex` class but
+/// delegates all parsing and caching to the pure-Rust implementation.
+/// The `transport` and `mapper` arguments accept any Python object
+/// satisfying the respective duck-typed interfaces.
+#[pyclass(name = "_KndxIndex")]
+pub struct PyKndxIndex {
+    inner: PyKndxIndexInner,
+    // Keep hold of the Python transport and mapper so Python code can
+    // still reach `._transport` / `._mapper` if needed.
+    transport_obj: Py<PyAny>,
+    mapper_obj: Py<PyAny>,
+    get_scope: Py<PyAny>,
+    allow_writes: Py<PyAny>,
+    is_locked: Py<PyAny>,
+    scope: Py<PyAny>,
+    mode: String,
+}
+
+#[pymethods]
+impl PyKndxIndex {
+    #[new]
+    fn new(
+        py: Python<'_>,
+        transport: Bound<'_, PyAny>,
+        mapper: Bound<'_, PyAny>,
+        get_scope: Bound<'_, PyAny>,
+        allow_writes: Bound<'_, PyAny>,
+        is_locked: Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        use crate::transport::{PyMapper, PyTransport};
+        use bazaar::knit::KndxIndex;
+        let py_transport = PyTransport::new(transport.clone());
+        let py_mapper = PyMapper::new(mapper.clone());
+        let inner = KndxIndex::new(py_transport, py_mapper);
+        let scope = get_scope.call0()?;
+        let mode_bool: bool = allow_writes.call0()?.extract()?;
+        let mode = if mode_bool { "w" } else { "r" }.to_string();
+        Ok(Self {
+            inner,
+            transport_obj: transport.unbind(),
+            mapper_obj: mapper.unbind(),
+            get_scope: get_scope.unbind(),
+            allow_writes: allow_writes.unbind(),
+            is_locked: is_locked.unbind(),
+            scope: scope.unbind(),
+            mode,
+        })
+    }
+
+    #[getter]
+    fn _transport(&self, py: Python<'_>) -> Py<PyAny> {
+        self.transport_obj.clone_ref(py)
+    }
+
+    #[getter]
+    fn _mapper(&self, py: Python<'_>) -> Py<PyAny> {
+        self.mapper_obj.clone_ref(py)
+    }
+
+    #[classattr]
+    fn HEADER(py: Python<'_>) -> Py<PyBytes> {
+        PyBytes::new(py, bazaar::knit::KNDX_HEADER).unbind()
+    }
+
+    #[getter]
+    fn has_graph(&self) -> bool {
+        true
+    }
+
+    fn _check_read(&mut self, py: Python<'_>) -> PyResult<()> {
+        let locked: bool = self.is_locked.bind(py).call0()?.extract()?;
+        if !locked {
+            return Err(PyValueError::new_err("object not locked"));
+        }
+        let current_scope = self.get_scope.bind(py).call0()?;
+        if !current_scope.eq(self.scope.bind(py))? {
+            self._reset_cache(py)?;
+        }
+        Ok(())
+    }
+
+    fn _check_write_ok(&mut self, py: Python<'_>) -> PyResult<()> {
+        self._check_read(py)?;
+        if self.mode != "w" {
+            return Err(PyValueError::new_err("read only object dirtied"));
+        }
+        Ok(())
+    }
+
+    fn _reset_cache(&mut self, py: Python<'_>) -> PyResult<()> {
+        use crate::transport::{PyMapper, PyTransport};
+        use bazaar::knit::KndxIndex;
+        let py_transport = PyTransport::new(self.transport_obj.bind(py).clone());
+        let py_mapper = PyMapper::new(self.mapper_obj.bind(py).clone());
+        self.inner = KndxIndex::new(py_transport, py_mapper);
+        let scope = self.get_scope.bind(py).call0()?;
+        self.scope = scope.unbind();
+        let mode_bool: bool = self.allow_writes.bind(py).call0()?.extract()?;
+        self.mode = if mode_bool { "w" } else { "r" }.to_string();
+        Ok(())
+    }
+
+    fn get_build_details<'py>(
+        &mut self,
+        py: Python<'py>,
+        keys: Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self._check_read(py)?;
+        let rust_keys = extract_py_knit_keys(&keys)?;
+        use bazaar::knit::KnitIndex;
+        let details = self
+            .inner
+            .get_build_details(&rust_keys)
+            .map_err(knit_err_to_py)?;
+        let result = PyDict::new(py);
+        for (key, det) in &details {
+            let py_key = py_knit_key_to_py(py, key)?;
+            let index_memo = knit_index_memo_to_py(py, key, det)?;
+            let compression_parent = match &det.compression_parent {
+                Some(p) => py_knit_key_to_py(py, p)?.into_any(),
+                None => py.None().into_bound(py),
+            };
+            let parents = PyTuple::new(
+                py,
+                det.parents
+                    .iter()
+                    .map(|p| py_knit_key_to_py(py, p))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )?
+            .into_any();
+            let record_details = PyTuple::new(
+                py,
+                [
+                    det.method.as_str().into_pyobject(py)?.into_any(),
+                    det.noeol.into_pyobject(py)?.to_owned().into_any(),
+                ],
+            )?;
+            let value = PyTuple::new(
+                py,
+                [
+                    index_memo.into_any(),
+                    compression_parent,
+                    parents,
+                    record_details.into_any(),
+                ],
+            )?;
+            result.set_item(py_key, value)?;
+        }
+        Ok(result)
+    }
+
+    fn get_parent_map<'py>(
+        &mut self,
+        py: Python<'py>,
+        keys: Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self._check_read(py)?;
+        let rust_keys = extract_py_knit_keys(&keys)?;
+        use bazaar::knit::KnitIndex;
+        let details = self
+            .inner
+            .get_build_details(&rust_keys)
+            .map_err(knit_err_to_py)?;
+        let result = PyDict::new(py);
+        for key in &rust_keys {
+            if let Some(det) = details.get(key) {
+                let py_key = py_knit_key_to_py(py, key)?;
+                let py_parents = PyTuple::new(
+                    py,
+                    det.parents
+                        .iter()
+                        .map(|p| py_knit_key_to_py(py, p))
+                        .collect::<PyResult<Vec<_>>>()?,
+                )?;
+                result.set_item(py_key, py_parents)?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn get_position(&mut self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<Py<PyTuple>> {
+        self._check_read(py)?;
+        let rust_key = extract_py_knit_key(&key)?;
+        use bazaar::knit::KnitIndex;
+        let details = self
+            .inner
+            .get_build_details(&[rust_key.clone()])
+            .map_err(knit_err_to_py)?;
+        let det = details
+            .get(&rust_key)
+            .ok_or_else(|| PyValueError::new_err("key not present"))?;
+        let py_key = py_knit_key_to_py(py, &rust_key)?;
+        Ok(PyTuple::new(
+            py,
+            [
+                py_key.into_any(),
+                det.index_memo.offset.into_pyobject(py)?.into_any(),
+                det.index_memo.length.into_pyobject(py)?.into_any(),
+            ],
+        )?
+        .unbind())
+    }
+
+    fn get_options(&mut self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<Py<PyList>> {
+        self._check_read(py)?;
+        let rust_key = extract_py_knit_key_or_bytes(&key)?;
+        let prefix = PyKndxIndexInner::prefix_of(&rust_key);
+        let suffix = PyKndxIndexInner::suffix_of(&rust_key);
+        self.inner
+            .load_prefix_shared(prefix.clone())
+            .map_err(transport_err_to_py)?;
+        let cache = self.inner.kndx_cache().lock().unwrap();
+        let pc = cache
+            .get(&prefix)
+            .ok_or_else(|| PyValueError::new_err("prefix not in cache"))?;
+        let entry = pc
+            .cache
+            .get(&suffix)
+            .ok_or_else(|| PyValueError::new_err("key not present"))?;
+        let list = PyList::empty(py);
+        for opt in &entry.options {
+            list.append(PyBytes::new(py, opt))?;
+        }
+        Ok(list.unbind())
+    }
+
+    fn get_method(&mut self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<String> {
+        let options = self.get_options(py, key)?;
+        let options_bound = options.bind(py);
+        let opts: Vec<Vec<u8>> = options_bound
+            .iter()
+            .map(|o| Ok(o.extract::<Vec<u8>>()?))
+            .collect::<PyResult<_>>()?;
+        let refs: Vec<&[u8]> = opts.iter().map(|o| o.as_slice()).collect();
+        let (method, _noeol) = bazaar::knit::decode_kndx_options(&refs).map_err(|_| {
+            py.import("bzrformats.knit")
+                .and_then(|m| m.getattr("KnitIndexUnknownMethod"))
+                .and_then(|cls| cls.call1((self.transport_obj.bind(py), options.bind(py))))
+                .map(|exc| PyErr::from_value(exc.unbind().into_bound(py)))
+                .unwrap_or_else(|e| e)
+        })?;
+        Ok(method.as_str().to_string())
+    }
+
+    fn _dictionary_compress(
+        &mut self,
+        py: Python<'_>,
+        keys: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyBytes>> {
+        let rust_keys = extract_py_knit_keys(&keys)?;
+        if rust_keys.is_empty() {
+            return Ok(PyBytes::new(py, b"").unbind());
+        }
+        let prefix = PyKndxIndexInner::prefix_of(&rust_keys[0]);
+        let suffixes: Vec<Vec<u8>> = rust_keys
+            .iter()
+            .map(|k| PyKndxIndexInner::suffix_of(k))
+            .collect();
+        self.inner
+            .load_prefix_shared(prefix.clone())
+            .map_err(transport_err_to_py)?;
+        let index_map: std::collections::HashMap<Vec<u8>, u64> = {
+            let cache = self.inner.kndx_cache().lock().unwrap();
+            cache
+                .get(&prefix)
+                .map(|pc| {
+                    pc.cache
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.index as u64))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let lookup: std::collections::HashMap<&[u8], u64> =
+            index_map.iter().map(|(k, v)| (k.as_slice(), *v)).collect();
+        let refs: Vec<&[u8]> = suffixes.iter().map(|s| s.as_slice()).collect();
+        let compressed = bazaar::knit::dictionary_compress_suffixes(&refs, &lookup);
+        Ok(PyBytes::new(py, &compressed).unbind())
+    }
+
+    #[pyo3(signature = (records, random_id=None, missing_compression_parents=None))]
+    fn add_records(
+        &mut self,
+        py: Python<'_>,
+        records: Bound<'_, PyAny>,
+        random_id: Option<bool>,
+        missing_compression_parents: Option<bool>,
+    ) -> PyResult<()> {
+        let _ = random_id;
+        if missing_compression_parents.unwrap_or(false) {
+            let err_cls = py
+                .import("bzrformats.errors")?
+                .getattr("RevisionNotPresent")?;
+            let exc = err_cls.call1((py.None(), py.None()))?;
+            return Err(PyErr::from_value(exc.unbind().into_bound(py)));
+        }
+        // Collect all records first so we can group them
+        let mut all_recs: Vec<(
+            Vec<Vec<u8>>,      // key
+            Vec<Vec<u8>>,      // options
+            u64,               // pos
+            usize,             // size
+            Vec<Vec<Vec<u8>>>, // parent keys
+        )> = Vec::new();
+        for rec in records.try_iter()? {
+            let rec = rec?;
+            let key = extract_py_knit_key_or_bytes(&rec.get_item(0)?)?;
+            let options: Vec<Vec<u8>> = rec
+                .get_item(1)?
+                .try_iter()?
+                .map(|item| {
+                    item?
+                        .cast_into::<PyBytes>()
+                        .map(|b| b.as_bytes().to_vec())
+                        .map_err(|_| PyValueError::new_err("options must be bytes"))
+                })
+                .collect::<PyResult<_>>()?;
+            let memo = rec.get_item(2)?;
+            let pos: u64 = memo.get_item(1)?.extract()?;
+            let size: u64 = memo.get_item(2)?.extract()?;
+            let parents_obj = rec.get_item(3)?;
+            let parents: Vec<Vec<Vec<u8>>> = if parents_obj.is_none() {
+                vec![]
+            } else {
+                parents_obj
+                    .try_iter()?
+                    .map(|p| extract_py_knit_key_or_bytes(&p?))
+                    .collect::<PyResult<_>>()?
+            };
+            all_recs.push((key, options, pos, size as usize, parents));
+        }
+        // Group by kndx path (sorted for determinism)
+        let mut path_groups: std::collections::BTreeMap<String, (Vec<Vec<u8>>, Vec<usize>)> =
+            std::collections::BTreeMap::new();
+        for (i, (key, _, _, _, _)) in all_recs.iter().enumerate() {
+            let prefix = PyKndxIndexInner::prefix_of(key);
+            let path = self.inner.prefix_path(&prefix);
+            let entry = path_groups
+                .entry(path)
+                .or_insert_with(|| (prefix, Vec::new()));
+            entry.1.push(i);
+        }
+        for (path, (prefix, indices)) in path_groups {
+            self.inner
+                .load_prefix_shared(prefix.clone())
+                .map_err(transport_err_to_py)?;
+            // Snapshot whether history was non-empty before we add any records
+            // for this prefix (mirrors Python's `orig_history` check).
+            let had_history = self
+                .inner
+                .kndx_cache()
+                .lock()
+                .unwrap()
+                .get(&prefix)
+                .map(|p| !p.history.is_empty())
+                .unwrap_or(false);
+            let mut lines: Vec<Vec<u8>> = Vec::new();
+            for idx in indices {
+                let (key, options, pos, size, parents) = &all_recs[idx];
+                let suffix = PyKndxIndexInner::suffix_of(key);
+                let parent_suffixes: Vec<Vec<u8>> = parents
+                    .iter()
+                    .map(|p| PyKndxIndexInner::suffix_of(p))
+                    .collect();
+                let cache_lookup: std::collections::HashMap<Vec<u8>, u64> = {
+                    let cache = self.inner.kndx_cache().lock().unwrap();
+                    cache
+                        .get(&prefix)
+                        .map(|pc| {
+                            pc.cache
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.index as u64))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let lookup_refs: std::collections::HashMap<&[u8], u64> = cache_lookup
+                    .iter()
+                    .map(|(k, v)| (k.as_slice(), *v))
+                    .collect();
+                let parent_refs = bazaar::knit::dictionary_compress_suffixes(
+                    &parent_suffixes
+                        .iter()
+                        .map(|s| s.as_slice())
+                        .collect::<Vec<_>>(),
+                    &lookup_refs,
+                );
+                let mut line = b"\n".to_vec();
+                line.extend_from_slice(&suffix);
+                line.push(b' ');
+                line.extend_from_slice(&options.join(b",".as_ref()));
+                line.push(b' ');
+                line.extend_from_slice(pos.to_string().as_bytes());
+                line.push(b' ');
+                line.extend_from_slice(size.to_string().as_bytes());
+                line.push(b' ');
+                line.extend_from_slice(&parent_refs);
+                line.extend_from_slice(b" :");
+                // Update the in-memory cache
+                {
+                    let mut cache = self.inner.kndx_cache().lock().unwrap();
+                    let pc = cache.entry(prefix.clone()).or_default();
+                    let index = if !pc.cache.contains_key(&suffix) {
+                        let idx = pc.history.len();
+                        pc.history.push(suffix.clone());
+                        idx
+                    } else {
+                        pc.cache[&suffix].index
+                    };
+                    pc.cache.insert(
+                        suffix.clone(),
+                        bazaar::knit::KndxCacheEntry {
+                            version_id: suffix,
+                            options: options.clone(),
+                            pos: *pos,
+                            size: *size,
+                            parents: parent_suffixes,
+                            index,
+                        },
+                    );
+                }
+                lines.push(line);
+            }
+            let all_bytes: Vec<u8> = lines.into_iter().flatten().collect();
+            if had_history {
+                self.inner
+                    .transport()
+                    .append_bytes(&path, &all_bytes)
+                    .map_err(transport_err_to_py)?;
+            } else {
+                let mut content = bazaar::knit::KNDX_HEADER.to_vec();
+                content.extend_from_slice(&all_bytes);
+                self.inner
+                    .transport()
+                    .put_file_non_atomic(&path, &content, true)
+                    .map_err(transport_err_to_py)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn keys(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self._check_read(py)?;
+        use bazaar::key_mapper::Mapper as _;
+        // Collect the prefixes to load: for a ConstantMapper there is exactly
+        // one (the empty prefix); for other mappers we enumerate the transport.
+        let prefixes: Vec<Vec<Vec<u8>>> = if self.inner.mapper().is_constant() {
+            vec![vec![]]
+        } else {
+            self.inner
+                .transport()
+                .iter_files_recursive()
+                .map_err(transport_err_to_py)?
+                .into_iter()
+                .filter_map(|relpath| {
+                    let path = std::path::Path::new(&relpath);
+                    if path.extension().and_then(|e| e.to_str()) == Some("kndx") {
+                        let stem = path.with_extension("").to_string_lossy().into_owned();
+                        Some(self.inner.mapper().unmap(&stem))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        for prefix in &prefixes {
+            self.inner
+                .load_prefix_typed(prefix.clone())
+                .map_err(|e| kndx_load_err_to_py(py, e))?;
+        }
+        let result = pyo3::types::PySet::empty(py)?;
+        let cache = self.inner.kndx_cache().lock().unwrap();
+        for prefix in &prefixes {
+            if let Some(pc) = cache.get(prefix) {
+                for suffix in &pc.history {
+                    let mut key = prefix.clone();
+                    key.push(suffix.clone());
+                    result.add(py_knit_key_to_py(py, &key)?)?;
+                }
+            }
+        }
+        Ok(result.into_any().unbind())
+    }
+
+    fn scan_unvalidated_index(&self, _graph_index: Bound<'_, PyAny>) -> PyResult<()> {
+        Err(PyNotImplementedError::new_err("scan_unvalidated_index"))
+    }
+
+    fn _get_total_build_size(
+        &self,
+        py: Python<'_>,
+        keys: Bound<'_, PyAny>,
+        positions: Bound<'_, PyDict>,
+    ) -> PyResult<usize> {
+        get_total_build_size_rs(py, keys, positions)
+    }
+
+    fn __contains__(&mut self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<bool> {
+        let rust_key = extract_py_knit_key_or_bytes(&key)?;
+        let prefix = PyKndxIndexInner::prefix_of(&rust_key);
+        let suffix = PyKndxIndexInner::suffix_of(&rust_key);
+        self.inner
+            .load_prefix_shared(prefix.clone())
+            .map_err(transport_err_to_py)?;
+        let cache = self.inner.kndx_cache().lock().unwrap();
+        Ok(cache
+            .get(&prefix)
+            .map(|pc| pc.cache.contains_key(&suffix))
+            .unwrap_or(false))
+    }
+
+    fn get_missing_compression_parents(&self) -> PyResult<()> {
+        Err(PyNotImplementedError::new_err(
+            "get_missing_compression_parents",
+        ))
+    }
+
+    fn check_header(&self, py: Python<'_>, fp: Bound<'_, PyAny>) -> PyResult<()> {
+        let line = fp.call_method0("readline")?;
+        let line = line
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyValueError::new_err("check_header: expected bytes from readline"))?;
+        if line.as_bytes().is_empty() {
+            let err_cls = py.import("bzrformats.errors")?.getattr("NoSuchFile")?;
+            let exc = err_cls.call1((py.None(),))?;
+            return Err(PyErr::from_value(exc.unbind().into_bound(py)));
+        }
+        if line.as_bytes() != bazaar::knit::KNDX_HEADER {
+            let err_cls = py.import("bzrformats.knit")?.getattr("KnitHeaderError")?;
+            let exc = err_cls.call1((line, py.None()))?;
+            return Err(PyErr::from_value(exc.unbind().into_bound(py)));
+        }
+        Ok(())
+    }
+
+    fn find_ancestry(
+        &mut self,
+        py: Python<'_>,
+        keys: Bound<'_, PyAny>,
+    ) -> PyResult<(Py<PyDict>, Py<PyAny>)> {
+        self._check_read(py)?;
+        let rust_keys = extract_py_knit_keys(&keys)?;
+        // Load all prefix files first
+        let prefixes: std::collections::HashSet<Vec<Vec<u8>>> =
+            rust_keys.iter().map(PyKndxIndexInner::prefix_of).collect();
+        for prefix in &prefixes {
+            self.inner
+                .load_prefix_shared(prefix.clone())
+                .map_err(transport_err_to_py)?;
+        }
+        let mut parent_map: std::collections::HashMap<Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>> =
+            std::collections::HashMap::new();
+        let mut missing: std::collections::HashSet<Vec<Vec<u8>>> = std::collections::HashSet::new();
+        let mut pending = rust_keys.clone();
+        while let Some(key) = pending.pop() {
+            if parent_map.contains_key(&key) {
+                continue;
+            }
+            let prefix = PyKndxIndexInner::prefix_of(&key);
+            let suffix = PyKndxIndexInner::suffix_of(&key);
+            self.inner
+                .load_prefix_shared(prefix.clone())
+                .map_err(transport_err_to_py)?;
+            let cache = self.inner.kndx_cache().lock().unwrap();
+            if let Some(pc) = cache.get(&prefix) {
+                if let Some(entry) = pc.cache.get(&suffix) {
+                    let parent_keys: Vec<Vec<Vec<u8>>> = entry
+                        .parents
+                        .iter()
+                        .map(|p| {
+                            let mut pk = prefix.clone();
+                            pk.push(p.clone());
+                            pk
+                        })
+                        .collect();
+                    for pk in &parent_keys {
+                        if !parent_map.contains_key(pk) {
+                            pending.push(pk.clone());
+                        }
+                    }
+                    drop(cache);
+                    parent_map.insert(key, parent_keys);
+                } else {
+                    missing.insert(key);
+                }
+            } else {
+                missing.insert(key);
+            }
+        }
+        let py_parent_map = PyDict::new(py);
+        for (key, parents) in parent_map {
+            let py_key = py_knit_key_to_py(py, &key)?;
+            let py_parents = PyTuple::new(
+                py,
+                parents
+                    .iter()
+                    .map(|p| py_knit_key_to_py(py, p))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )?;
+            py_parent_map.set_item(py_key, py_parents)?;
+        }
+        let py_missing = pyo3::types::PySet::empty(py)?;
+        for key in missing {
+            py_missing.add(py_knit_key_to_py(py, &key)?)?;
+        }
+        Ok((py_parent_map.unbind(), py_missing.into_any().unbind()))
+    }
+
+    fn _sort_keys_by_io(
+        &self,
+        py: Python<'_>,
+        keys: Bound<'_, pyo3::types::PyList>,
+        positions: Bound<'_, PyDict>,
+    ) -> PyResult<()> {
+        // Sort keys in-place grouped by index file and ordered by byte position.
+        // positions[key] = (record_details, index_memo, next, parents)
+        // For _KndxIndex, index_memo = (key_tuple, pos, size).
+        // Group by the .kndx path (derived from the key's prefix via the
+        // mapper), then sort by byte offset within each file.
+        let n = keys.len();
+        let mut keyed: Vec<(String, u64, Bound<'_, PyAny>)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let k = keys.get_item(i)?;
+            let rust_key = extract_py_knit_key(&k)?;
+            let prefix = PyKndxIndexInner::prefix_of(&rust_key);
+            let path = self.inner.prefix_path(&prefix);
+            let pos_entry = positions.get_item(&k)?.ok_or_else(|| {
+                PyValueError::new_err("_sort_keys_by_io: key not in positions")
+            })?;
+            let index_memo = pos_entry.get_item(1)?;
+            let pos: u64 = index_memo.get_item(1)?.extract()?;
+            keyed.push((path, pos, k));
+        }
+        keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (i, (_, _, k)) in keyed.into_iter().enumerate() {
+            keys.set_item(i, k)?;
+        }
+        Ok(())
+    }
+}
+
+/// pyo3 wrapper around `bazaar::knit::KnitKeyAccess`.
+///
+/// Exposes the same interface as the Python `_KnitKeyAccess` class.
+#[pyclass(name = "_KnitKeyAccess")]
+pub struct PyKnitKeyAccess {
+    inner: bazaar::knit::KnitKeyAccess<crate::transport::PyTransport, crate::transport::PyMapper>,
+    transport_obj: Py<PyAny>,
+    mapper_obj: Py<PyAny>,
+}
+
+#[pymethods]
+impl PyKnitKeyAccess {
+    #[new]
+    fn new(transport: Bound<'_, PyAny>, mapper: Bound<'_, PyAny>) -> Self {
+        use crate::transport::{PyMapper, PyTransport};
+        use bazaar::knit::KnitKeyAccess;
+        Self {
+            inner: KnitKeyAccess::new(
+                PyTransport::new(transport.clone()),
+                PyMapper::new(mapper.clone()),
+            ),
+            transport_obj: transport.unbind(),
+            mapper_obj: mapper.unbind(),
+        }
+    }
+
+    #[getter]
+    fn _transport(&self, py: Python<'_>) -> Py<PyAny> {
+        self.transport_obj.clone_ref(py)
+    }
+
+    #[getter]
+    fn _mapper(&self, py: Python<'_>) -> Py<PyAny> {
+        self.mapper_obj.clone_ref(py)
+    }
+
+    fn add_raw_record(
+        &self,
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        size: usize,
+        raw_data: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyTuple>> {
+        let rust_key = extract_py_knit_key_or_bytes(&key)?;
+        let data: Vec<u8> = {
+            let mut buf = Vec::new();
+            for chunk in raw_data.try_iter()? {
+                let b = chunk?
+                    .cast_into::<PyBytes>()
+                    .map_err(|_| PyValueError::new_err("raw_data must be iterable of bytes"))?;
+                buf.extend_from_slice(b.as_bytes());
+            }
+            buf
+        };
+        let _ = size;
+        let (ret_key, offset, ret_size) = self
+            .inner
+            .add_raw_record(rust_key, &data)
+            .map_err(transport_err_to_py)?;
+        let py_key = py_knit_key_to_py(py, &ret_key)?;
+        Ok(PyTuple::new(
+            py,
+            [
+                py_key.into_any(),
+                offset.into_pyobject(py)?.into_any(),
+                ret_size.into_pyobject(py)?.into_any(),
+            ],
+        )?
+        .unbind())
+    }
+
+    fn add_raw_records(
+        &self,
+        py: Python<'_>,
+        key_sizes: Bound<'_, PyAny>,
+        raw_data: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyList>> {
+        let all_data: Vec<u8> = {
+            let mut buf = Vec::new();
+            for chunk in raw_data.try_iter()? {
+                let b = chunk?
+                    .cast_into::<PyBytes>()
+                    .map_err(|_| PyValueError::new_err("raw_data must be iterable of bytes"))?;
+                buf.extend_from_slice(b.as_bytes());
+            }
+            buf
+        };
+        let result = PyList::empty(py);
+        let mut offset = 0usize;
+        for item in key_sizes.try_iter()? {
+            let item = item?;
+            let key = extract_py_knit_key_or_bytes(&item.get_item(0)?)?;
+            let size: usize = item.get_item(1)?.extract()?;
+            let slice = &all_data[offset..offset + size];
+            let (ret_key, ret_offset, ret_size) = self
+                .inner
+                .add_raw_record(key, slice)
+                .map_err(transport_err_to_py)?;
+            let py_key = py_knit_key_to_py(py, &ret_key)?;
+            let memo = PyTuple::new(
+                py,
+                [
+                    py_key.into_any(),
+                    ret_offset.into_pyobject(py)?.into_any(),
+                    ret_size.into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            result.append(memo)?;
+            offset += size;
+        }
+        Ok(result.unbind())
+    }
+
+    fn flush(&self) {}
+
+    fn get_raw_records<'py>(
+        &self,
+        py: Python<'py>,
+        memos_for_retrieval: Bound<'py, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        use bazaar::knit::{KnitAccess, KnitIndexMemo};
+        let list = PyList::empty(py);
+        // Group by prefix path for efficient readv batching
+        let mut request_lists: Vec<(String, Vec<(u64, usize)>)> = Vec::new();
+        let mut current_path: Option<String> = None;
+        for memo in memos_for_retrieval.try_iter()? {
+            let memo = memo?;
+            let key = extract_py_knit_key(&memo.get_item(0)?)?;
+            let offset: u64 = memo.get_item(1)?.extract()?;
+            let length: usize = memo.get_item(2)?.extract()?;
+            // Derive path from key prefix
+            let prefix = PyKndxIndexInner::prefix_of(&key);
+            let path = {
+                let refs: Vec<&[u8]> = prefix.iter().map(|s| s.as_slice()).collect();
+                self.inner.mapper().map(&refs) + ".knit"
+            };
+            match current_path.as_deref() {
+                Some(p) if p == path => {
+                    request_lists.last_mut().unwrap().1.push((offset, length));
+                }
+                _ => {
+                    current_path = Some(path.clone());
+                    request_lists.push((path, vec![(offset, length)]));
+                }
+            }
+        }
+        for (path, read_vector) in request_lists {
+            let ranges: Vec<bazaar::transport::ReadRange> = read_vector
+                .iter()
+                .map(|&(offset, length)| bazaar::transport::ReadRange { offset, length })
+                .collect();
+            let results = self
+                .inner
+                .transport()
+                .readv(&path, &ranges)
+                .map_err(transport_err_to_py)?;
+            for r in results {
+                list.append(PyBytes::new(py, &r.bytes))?;
+            }
+        }
+        Ok(list.into_any().call_method0("__iter__")?.unbind())
+    }
+}
+
+// ── helpers used by PyKndxIndex ────────────────────────────────────────────
+
+/// Extract a knit key from a Python object that is either a tuple of bytes
+/// (the normal case) or a plain bytes object (accepted by the legacy
+/// `get_method` / `get_options` API that some tests rely on).
+fn extract_py_knit_key_or_bytes(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::knit::KnitKey> {
+    if let Ok(b) = obj.clone().cast_into::<PyBytes>() {
+        return Ok(vec![b.as_bytes().to_vec()]);
+    }
+    extract_py_knit_key(obj)
+}
+
+fn extract_py_knit_key(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::knit::KnitKey> {
+    let tup = obj
+        .downcast::<PyTuple>()
+        .map_err(|_| PyValueError::new_err("knit key must be a tuple of bytes"))?;
+    let mut key = Vec::with_capacity(tup.len());
+    for item in tup.iter() {
+        let b = item
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyValueError::new_err("knit key elements must be bytes"))?;
+        key.push(b.as_bytes().to_vec());
+    }
+    Ok(key)
+}
+
+fn extract_py_knit_keys(obj: &Bound<'_, PyAny>) -> PyResult<Vec<bazaar::knit::KnitKey>> {
+    let mut keys = Vec::new();
+    for item in obj.try_iter()? {
+        keys.push(extract_py_knit_key(&item?)?);
+    }
+    Ok(keys)
+}
+
+fn py_knit_key_to_py<'py>(
+    py: Python<'py>,
+    key: &bazaar::knit::KnitKey,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let parts: Vec<Bound<'py, PyBytes>> = key.iter().map(|s| PyBytes::new(py, s)).collect();
+    PyTuple::new(py, parts)
+}
+
+fn knit_index_memo_to_py<'py>(
+    py: Python<'py>,
+    key: &bazaar::knit::KnitKey,
+    det: &bazaar::knit::KnitRecordDetails,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let py_key = py_knit_key_to_py(py, key)?;
+    PyTuple::new(
+        py,
+        [
+            py_key.into_any(),
+            det.index_memo.offset.into_pyobject(py)?.into_any(),
+            det.index_memo.length.into_pyobject(py)?.into_any(),
+        ],
+    )
 }
 
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
@@ -2308,5 +3219,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<PyPlainKnitContent>()?;
     m.add_class::<PyKnitAnnotateFactory>()?;
     m.add_class::<PyKnitPlainFactory>()?;
+    m.add_class::<PyKndxIndex>()?;
+    m.add_class::<PyKnitKeyAccess>()?;
     Ok(m)
 }

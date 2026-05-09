@@ -264,6 +264,16 @@ class MockTransport:
         else:
             return BytesIO(b"\n".join(self.file_lines))
 
+    def get_bytes(self, filename):
+        if self.file_lines is None:
+            raise _NoSuchFile(filename)
+        else:
+            return b"\n".join(self.file_lines)
+
+    def append_bytes(self, relpath, raw_bytes):
+        self.calls.append(("append_bytes", (relpath, raw_bytes), {}))
+        return 0
+
     def readv(self, relpath, offsets):
         fp = self.get(relpath)
         for offset, size in offsets:
@@ -504,7 +514,6 @@ class LowLevelKnitIndexTests(TestCase):
         index = self.get_knit_index(transport, "filename", "w")
         index.keys()
         call = transport.calls.pop(0)
-        # call[1][1] is a BytesIO - we can't test it by simple equality.
         self.assertEqual("put_file_non_atomic", call[0])
         self.assertEqual("filename.kndx", call[1][0])
         # With no history, _KndxIndex writes a new index:
@@ -598,7 +607,6 @@ class LowLevelKnitIndexTests(TestCase):
             [((utf8_revision_id,), [b"option"], ((utf8_revision_id,), 0, 1), [])]
         )
         call = transport.calls.pop(0)
-        # call[1][1] is a BytesIO - we can't test it by simple equality.
         self.assertEqual("put_file_non_atomic", call[0])
         self.assertEqual("filename.kndx", call[1][0])
         # With no history, _KndxIndex writes a new index:
@@ -617,7 +625,6 @@ class LowLevelKnitIndexTests(TestCase):
             [((b"version",), [b"option"], ((b"version",), 0, 1), [(utf8_revision_id,)])]
         )
         call = transport.calls.pop(0)
-        # call[1][1] is a BytesIO - we can't test it by simple equality.
         self.assertEqual("put_file_non_atomic", call[0])
         self.assertEqual("filename.kndx", call[1][0])
         # With no history, _KndxIndex writes a new index:
@@ -673,7 +680,6 @@ class LowLevelKnitIndexTests(TestCase):
 
         self.add_a_b(index)
         call = transport.calls.pop(0)
-        # call[1][1] is a BytesIO - we can't test it by simple equality.
         self.assertEqual("put_file_non_atomic", call[0])
         self.assertEqual("filename.kndx", call[1][0])
         # With no history, _KndxIndex writes a new index:
