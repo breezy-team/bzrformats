@@ -116,8 +116,8 @@ class KnitContentTestsMixin:
             else:
                 return line
 
-        source_content = self._make_content([(None, nl(l)) for l in source_lines])
-        target_content = self._make_content([(None, nl(l)) for l in target_lines])
+        source_content = self._make_content([(b"", nl(l).encode()) for l in source_lines])
+        target_content = self._make_content([(b"", nl(l).encode()) for l in target_lines])
         line_delta = source_content.line_delta(target_content)
         delta_blocks = list(
             KnitContent.get_line_delta_blocks(line_delta, source_lines, target_lines)
@@ -201,25 +201,25 @@ Boeuf bourguignon
 class TestPlainKnitContent(TestCase, KnitContentTestsMixin):
     def _make_content(self, lines):
         annotated_content = AnnotatedKnitContent(lines)
-        return PlainKnitContent(annotated_content.text(), "bogus")
+        return PlainKnitContent(annotated_content.text(), b"bogus")
 
     def test_annotate(self):
         content = self._make_content([])
         self.assertEqual(content.annotate(), [])
 
-        content = self._make_content([("origin1", "text1"), ("origin2", "text2")])
-        self.assertEqual(content.annotate(), [("bogus", "text1"), ("bogus", "text2")])
+        content = self._make_content([(b"origin1", b"text1"), (b"origin2", b"text2")])
+        self.assertEqual(content.annotate(), [(b"bogus", b"text1"), (b"bogus", b"text2")])
 
     def test_line_delta(self):
-        content1 = self._make_content([("", "a"), ("", "b")])
-        content2 = self._make_content([("", "a"), ("", "a"), ("", "c")])
-        self.assertEqual(content1.line_delta(content2), [(1, 2, 2, ["a", "c"])])
+        content1 = self._make_content([(b"", b"a"), (b"", b"b")])
+        content2 = self._make_content([(b"", b"a"), (b"", b"a"), (b"", b"c")])
+        self.assertEqual(content1.line_delta(content2), [(1, 2, 2, [b"a", b"c"])])
 
     def test_line_delta_iter(self):
-        content1 = self._make_content([("", "a"), ("", "b")])
-        content2 = self._make_content([("", "a"), ("", "a"), ("", "c")])
+        content1 = self._make_content([(b"", b"a"), (b"", b"b")])
+        content2 = self._make_content([(b"", b"a"), (b"", b"a"), (b"", b"c")])
         it = content1.line_delta_iter(content2)
-        self.assertEqual(next(it), (1, 2, 2, ["a", "c"]))
+        self.assertEqual(next(it), (1, 2, 2, [b"a", b"c"]))
         self.assertRaises(StopIteration, next, it)
 
 
@@ -237,17 +237,17 @@ class TestAnnotatedKnitContent(TestCase, KnitContentTestsMixin):
         )
 
     def test_line_delta(self):
-        content1 = self._make_content([("", "a"), ("", "b")])
-        content2 = self._make_content([("", "a"), ("", "a"), ("", "c")])
+        content1 = self._make_content([(b"", b"a"), (b"", b"b")])
+        content2 = self._make_content([(b"", b"a"), (b"", b"a"), (b"", b"c")])
         self.assertEqual(
-            content1.line_delta(content2), [(1, 2, 2, [("", "a"), ("", "c")])]
+            content1.line_delta(content2), [(1, 2, 2, [(b"", b"a"), (b"", b"c")])]
         )
 
     def test_line_delta_iter(self):
-        content1 = self._make_content([("", "a"), ("", "b")])
-        content2 = self._make_content([("", "a"), ("", "a"), ("", "c")])
+        content1 = self._make_content([(b"", b"a"), (b"", b"b")])
+        content2 = self._make_content([(b"", b"a"), (b"", b"a"), (b"", b"c")])
         it = content1.line_delta_iter(content2)
-        self.assertEqual(next(it), (1, 2, 2, [("", "a"), ("", "c")]))
+        self.assertEqual(next(it), (1, 2, 2, [(b"", b"a"), (b"", b"c")]))
         self.assertRaises(StopIteration, next, it)
 
 
