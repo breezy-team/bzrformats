@@ -1373,6 +1373,257 @@ impl KnitIndexTrait for PyKnitIndex {
             },
         )
     }
+
+    fn keys(&self) -> Result<Vec<KnitKey>, KnitError> {
+        Python::attach(|py| -> Result<Vec<KnitKey>, KnitError> {
+            let result = self
+                .py_index
+                .bind(py)
+                .call_method0("keys")
+                .map_err(|e| knit_err_from_py(py, e))?;
+            let mut out = Vec::new();
+            for item in result.try_iter().map_err(|e| knit_err_from_py(py, e))? {
+                let item = item.map_err(|e| knit_err_from_py(py, e))?;
+                out.push(extract_knit_key(&item)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn get_parent_map(
+        &self,
+        keys: &[KnitKey],
+    ) -> Result<std::collections::HashMap<KnitKey, Vec<KnitKey>>, KnitError> {
+        Python::attach(
+            |py| -> Result<std::collections::HashMap<KnitKey, Vec<KnitKey>>, KnitError> {
+                let py_keys = pyo3::types::PyList::empty(py);
+                for k in keys {
+                    let tup = knit_key_to_py(py, k).map_err(|e| knit_err_from_py(py, e))?;
+                    py_keys.append(tup).map_err(|e| knit_err_from_py(py, e))?;
+                }
+                let result = self
+                    .py_index
+                    .bind(py)
+                    .call_method1("get_parent_map", (py_keys,))
+                    .map_err(|e| knit_err_from_py(py, e))?;
+                let dict = result.cast_into::<PyDict>().map_err(|_| {
+                    KnitError::BadIndexValue(b"get_parent_map did not return a dict".to_vec())
+                })?;
+                let mut out = std::collections::HashMap::new();
+                for (k, v) in dict.iter() {
+                    let key = extract_knit_key(&k)?;
+                    let mut parents = Vec::new();
+                    for p in v.try_iter().map_err(|e| knit_err_from_py(py, e))? {
+                        let p = p.map_err(|e| knit_err_from_py(py, e))?;
+                        parents.push(extract_knit_key(&p)?);
+                    }
+                    out.insert(key, parents);
+                }
+                Ok(out)
+            },
+        )
+    }
+
+    fn get_method(&self, key: &KnitKey) -> Result<KnitMethod, KnitError> {
+        Python::attach(|py| -> Result<KnitMethod, KnitError> {
+            let py_key = knit_key_to_py(py, key).map_err(|e| knit_err_from_py(py, e))?;
+            let result = self
+                .py_index
+                .bind(py)
+                .call_method1("get_method", (py_key,))
+                .map_err(|e| knit_err_from_py(py, e))?;
+            let s: String = result.extract().map_err(|e| knit_err_from_py(py, e))?;
+            match s.as_str() {
+                "fulltext" => Ok(KnitMethod::Fulltext),
+                "line-delta" => Ok(KnitMethod::LineDelta),
+                other => Err(KnitError::BadIndexValue(other.as_bytes().to_vec())),
+            }
+        })
+    }
+
+    fn get_total_build_size(
+        &self,
+        keys: &[KnitKey],
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+    ) -> usize {
+        Python::attach(|py| -> usize {
+            let py_keys = pyo3::types::PyList::empty(py);
+            for k in keys {
+                if let Ok(tup) = knit_key_to_py(py, k) {
+                    let _ = py_keys.append(tup);
+                }
+            }
+            // Build a Python dict of positions to pass to _get_total_build_size.
+            // We reconstruct the Python (index_memo, cp, parents, record_details)
+            // tuples from KnitRecordDetails — but the Python side only needs the
+            // size, so we can pass a simplified mapping.
+            // Simplest: just call `_get_total_build_size` if available, otherwise
+            // compute it ourselves from positions.
+            if let Ok(result) = self
+                .py_index
+                .bind(py)
+                .call_method1("_get_total_build_size", (py_keys, py.None()))
+            {
+                if let Ok(n) = result.extract::<usize>() {
+                    return n;
+                }
+            }
+            // Fallback: sum sizes from the Rust positions map.
+            let mut total = 0usize;
+            let mut seen = std::collections::HashSet::new();
+            let mut queue: std::collections::VecDeque<&KnitKey> = keys.iter().collect();
+            while let Some(key) = queue.pop_front() {
+                if !seen.insert(key) {
+                    continue;
+                }
+                if let Some(det) = positions.get(key) {
+                    total += det.index_memo.length;
+                    if let Some(ref cp) = det.compression_parent {
+                        if positions.contains_key(cp) {
+                            queue.push_back(cp);
+                        }
+                    }
+                }
+            }
+            total
+        })
+    }
+
+    fn sort_keys_by_io(
+        &self,
+        keys: &mut [KnitKey],
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+    ) {
+        // Delegate to the Python index's _sort_keys_by_io if possible,
+        // otherwise sort by (path, offset) from the positions map.
+        keys.sort_by(|a, b| {
+            let a_key = positions
+                .get(a)
+                .map(|d| (&d.index_memo.path, d.index_memo.offset));
+            let b_key = positions
+                .get(b)
+                .map(|d| (&d.index_memo.path, d.index_memo.offset));
+            a_key.cmp(&b_key)
+        });
+    }
+
+    fn has_graph(&self) -> bool {
+        Python::attach(|py| {
+            self.py_index
+                .bind(py)
+                .getattr("has_graph")
+                .and_then(|v| v.extract::<bool>())
+                .unwrap_or(true)
+        })
+    }
+
+    fn contains(&self, key: &KnitKey) -> Result<bool, KnitError> {
+        Python::attach(|py| -> Result<bool, KnitError> {
+            let py_key = knit_key_to_py(py, key).map_err(|e| knit_err_from_py(py, e))?;
+            let result = self
+                .py_index
+                .bind(py)
+                .call_method1("__contains__", (py_key,))
+                .map_err(|e| knit_err_from_py(py, e))?;
+            result
+                .extract::<bool>()
+                .map_err(|e| knit_err_from_py(py, e))
+        })
+    }
+
+    fn get_missing_compression_parents(&self) -> Result<Vec<KnitKey>, KnitError> {
+        Python::attach(|py| -> Result<Vec<KnitKey>, KnitError> {
+            let result = self
+                .py_index
+                .bind(py)
+                .call_method0("get_missing_compression_parents")
+                .map_err(|e| knit_err_from_py(py, e))?;
+            let mut out = Vec::new();
+            for item in result.try_iter().map_err(|e| knit_err_from_py(py, e))? {
+                let item = item.map_err(|e| knit_err_from_py(py, e))?;
+                out.push(extract_knit_key(&item)?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn check_write_ok(&self) -> Result<(), KnitError> {
+        Python::attach(|py| -> Result<(), KnitError> {
+            self.py_index
+                .bind(py)
+                .call_method0("_check_write_ok")
+                .map_err(|e| knit_err_from_py(py, e))?;
+            Ok(())
+        })
+    }
+
+    fn add_records(
+        &self,
+        records: &[(KnitKey, Vec<KnitMethod>, KnitIndexMemo, Vec<KnitKey>)],
+        random_id: bool,
+        missing_compression_parents: bool,
+    ) -> Result<(), KnitError> {
+        Python::attach(|py| -> Result<(), KnitError> {
+            let py_records = pyo3::types::PyList::empty(py);
+            // Collect all memo lookups first, then release the lock.
+            let py_memos: Vec<Py<PyAny>> = {
+                let table = self.table.lock().unwrap();
+                records
+                    .iter()
+                    .map(|(_, _, memo, _)| {
+                        let slot = parse_slot_path(&memo.path).ok_or_else(|| {
+                            KnitError::BadIndexValue(memo.path.as_bytes().to_vec())
+                        })?;
+                        table
+                            .get(slot)
+                            .ok_or_else(|| KnitError::BadIndexValue(memo.path.as_bytes().to_vec()))
+                            .map(|r| r.clone_ref(py))
+                    })
+                    .collect::<Result<_, _>>()?
+            };
+            for ((key, methods, _memo, parents), py_memo) in records.iter().zip(py_memos) {
+                let py_key = knit_key_to_py(py, key).map_err(|e| knit_err_from_py(py, e))?;
+                // Reconstruct options bytes from methods.
+                let options: Vec<&[u8]> = methods.iter().map(|m| m.as_str().as_bytes()).collect();
+                let options_bytes = options.join(&b","[..]);
+                let py_options = pyo3::types::PyBytes::new(py, &options_bytes);
+                let py_parents = pyo3::types::PyTuple::new(
+                    py,
+                    parents
+                        .iter()
+                        .map(|p| knit_key_to_py(py, p))
+                        .collect::<PyResult<Vec<_>>>()
+                        .map_err(|e| knit_err_from_py(py, e))?,
+                )
+                .map_err(|e| knit_err_from_py(py, e))?;
+                let entry = pyo3::types::PyTuple::new(
+                    py,
+                    [
+                        py_key.into_any(),
+                        py_options.into_any(),
+                        py_memo.into_bound(py).into_any(),
+                        py_parents.into_any(),
+                    ],
+                )
+                .map_err(|e| knit_err_from_py(py, e))?;
+                py_records
+                    .append(entry)
+                    .map_err(|e| knit_err_from_py(py, e))?;
+            }
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs
+                .set_item("random_id", random_id)
+                .map_err(|e| knit_err_from_py(py, e))?;
+            kwargs
+                .set_item("missing_compression_parents", missing_compression_parents)
+                .map_err(|e| knit_err_from_py(py, e))?;
+            self.py_index
+                .bind(py)
+                .call_method("add_records", (py_records,), Some(&kwargs))
+                .map_err(|e| knit_err_from_py(py, e))?;
+            Ok(())
+        })
+    }
 }
 
 /// Adapter that exposes a Python `_KnitKeyAccess` / `_DirectPackAccess`
@@ -1429,6 +1680,82 @@ impl KnitAccessTrait for PyKnitAccess {
             })?;
             Ok(bytes.as_bytes().to_vec())
         })
+    }
+
+    fn get_raw_records(&self, memos: &[KnitIndexMemo]) -> Result<Vec<Vec<u8>>, KnitError> {
+        Python::attach(|py| -> Result<Vec<Vec<u8>>, KnitError> {
+            let table = self.table.lock().unwrap();
+            let py_memos = pyo3::types::PyList::empty(py);
+            for memo in memos {
+                let slot = parse_slot_path(&memo.path)
+                    .ok_or_else(|| KnitError::BadIndexValue(memo.path.as_bytes().to_vec()))?;
+                let py_memo = table
+                    .get(slot)
+                    .ok_or_else(|| KnitError::BadIndexValue(memo.path.as_bytes().to_vec()))?
+                    .clone_ref(py);
+                py_memos
+                    .append(py_memo.bind(py))
+                    .map_err(|e| knit_err_from_py(py, e))?;
+            }
+            drop(table);
+            let iter = self
+                .py_access
+                .bind(py)
+                .call_method1("get_raw_records", (py_memos,))
+                .map_err(|e| knit_err_from_py(py, e))?;
+            let mut out = Vec::with_capacity(memos.len());
+            for item in iter.try_iter().map_err(|e| knit_err_from_py(py, e))? {
+                let item = item.map_err(|e| knit_err_from_py(py, e))?;
+                let bytes = item.cast_into::<PyBytes>().map_err(|_| {
+                    KnitError::BadIndexValue(b"get_raw_records yielded non-bytes".to_vec())
+                })?;
+                out.push(bytes.as_bytes().to_vec());
+            }
+            Ok(out)
+        })
+    }
+
+    fn add_raw_record(
+        &self,
+        key: &KnitKey,
+        size: usize,
+        data: Vec<Vec<u8>>,
+    ) -> Result<KnitIndexMemo, KnitError> {
+        Python::attach(|py| -> Result<KnitIndexMemo, KnitError> {
+            let py_key = knit_key_to_py(py, key).map_err(|e| knit_err_from_py(py, e))?;
+            let flat: Vec<u8> = data.into_iter().flatten().collect();
+            let py_data = pyo3::types::PyList::new(py, [PyBytes::new(py, &flat)])
+                .map_err(|e| knit_err_from_py(py, e))?;
+            let result = self
+                .py_access
+                .bind(py)
+                .call_method1("add_raw_record", (py_key, size, py_data))
+                .map_err(|e| knit_err_from_py(py, e))?;
+            // The returned memo is an opaque Python tuple; intern it.
+            let slot = self.table.lock().unwrap().intern(result.unbind());
+            Ok(KnitIndexMemo {
+                path: slot_path(slot),
+                offset: 0,
+                length: size,
+            })
+        })
+    }
+
+    fn flush(&self) -> Result<(), KnitError> {
+        Python::attach(|py| -> Result<(), KnitError> {
+            self.py_access
+                .bind(py)
+                .call_method0("flush")
+                .map_err(|e| knit_err_from_py(py, e))?;
+            Ok(())
+        })
+    }
+
+    fn reload_or_raise(&self, err: KnitError) -> Result<(), KnitError> {
+        // The Python `reload_or_raise` takes the original exception object.
+        // We can't easily reconstruct it from a KnitError, so we just
+        // propagate the Rust error.
+        Err(err)
     }
 }
 
@@ -3566,7 +3893,7 @@ impl PyKnitKeyAccess {
         let _ = size;
         let (ret_key, offset, ret_size) = self
             .inner
-            .add_raw_record(rust_key, &data)
+            .add_raw_record_bytes(rust_key, &data)
             .map_err(transport_err_to_py)?;
         let py_key = py_knit_key_to_py(py, &ret_key)?;
         Ok(PyTuple::new(
@@ -3605,7 +3932,7 @@ impl PyKnitKeyAccess {
             let slice = &all_data[offset..offset + size];
             let (ret_key, ret_offset, ret_size) = self
                 .inner
-                .add_raw_record(key, slice)
+                .add_raw_record_bytes(key, slice)
                 .map_err(transport_err_to_py)?;
             let py_key = py_knit_key_to_py(py, &ret_key)?;
             let memo = PyTuple::new(

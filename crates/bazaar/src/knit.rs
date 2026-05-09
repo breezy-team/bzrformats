@@ -508,6 +508,11 @@ pub trait KnitContent {
     /// Return `(origin, text)` pairs. For [`PlainKnitContent`] the
     /// `origin` is always the content's `version_id`.
     fn annotate(&self) -> Vec<AnnotatedLine>;
+
+    /// Convert an `(origin, text)` pair into the `DeltaLine` type for this
+    /// content.  Used by [`compute_line_delta`] to build typed delta hunks
+    /// without knowing the concrete content type.
+    fn delta_line_from_annotated(pair: &AnnotatedLine) -> Self::DeltaLine;
 }
 
 /// In-memory view of an annotated knit version: a flat list of
@@ -579,6 +584,10 @@ impl KnitContent for AnnotatedKnitContent {
         }
         out
     }
+
+    fn delta_line_from_annotated(pair: &AnnotatedLine) -> Self::DeltaLine {
+        pair.clone()
+    }
 }
 
 /// In-memory view of an unannotated knit version: a flat list of text
@@ -644,6 +653,11 @@ impl KnitContent for PlainKnitContent {
             .map(|l| (self.version_id.clone(), l.clone()))
             .collect()
     }
+
+    fn delta_line_from_annotated(pair: &AnnotatedLine) -> Self::DeltaLine {
+        // Plain content uses bare text bytes as its delta line type.
+        pair.1.clone()
+    }
 }
 
 /// Strategy for parsing raw knit body lines into [`KnitContent`] values
@@ -682,6 +696,26 @@ pub trait KnitFactory {
         &self,
         lines: &[&[u8]],
     ) -> Result<Vec<DeltaHunk<<Self::Content as KnitContent>::DeltaLine>>, KnitError>;
+
+    // --- write side ---
+
+    /// Build a new content object from plain text lines and a version id.
+    ///
+    /// For the annotated factory each line is tagged with `version_id` as
+    /// its origin (matching the Python `KnitAnnotateFactory.make` behaviour).
+    /// For the plain factory the lines are stored as-is.
+    fn make(&self, lines: Vec<Vec<u8>>, version_id: Vec<u8>) -> Self::Content;
+
+    /// Serialize a content object to the wire/storage byte lines for a
+    /// fulltext record.  This is the inverse of `parse_fulltext_content`.
+    fn lower_fulltext(&self, content: &Self::Content) -> Vec<Vec<u8>>;
+
+    /// Serialize a line delta to the wire/storage byte lines.
+    /// This is the inverse of `parse_line_delta`.
+    fn lower_line_delta(
+        &self,
+        delta: &[DeltaHunk<<Self::Content as KnitContent>::DeltaLine>],
+    ) -> Vec<Vec<u8>>;
 
     /// Build a content object from a record's body lines and its
     /// `(method, noeol)` pair. For `LineDelta` records `base_content`
@@ -738,10 +772,24 @@ impl KnitFactory for KnitAnnotateFactory {
         &self,
         lines: &[&[u8]],
     ) -> Result<Vec<DeltaHunk<AnnotatedLine>>, KnitError> {
-        // Parse with the annotated parser — preserves the per-line
-        // `(origin, text)` pairs so AnnotatedKnitContent.apply_delta
-        // can splice them in with their origins intact.
         parse_line_delta_annotated(lines)
+    }
+
+    fn make(&self, lines: Vec<Vec<u8>>, version_id: Vec<u8>) -> Self::Content {
+        AnnotatedKnitContent::new(
+            lines
+                .into_iter()
+                .map(|text| (version_id.clone(), text))
+                .collect(),
+        )
+    }
+
+    fn lower_fulltext(&self, content: &Self::Content) -> Vec<Vec<u8>> {
+        lower_fulltext(&content.lines)
+    }
+
+    fn lower_line_delta(&self, delta: &[DeltaHunk<AnnotatedLine>]) -> Vec<Vec<u8>> {
+        lower_line_delta_annotated(delta)
     }
 }
 
@@ -768,6 +816,18 @@ impl KnitFactory for KnitPlainFactory {
 
     fn parse_line_delta(&self, lines: &[&[u8]]) -> Result<Vec<DeltaHunk<Vec<u8>>>, KnitError> {
         parse_line_delta_raw(lines)
+    }
+
+    fn make(&self, lines: Vec<Vec<u8>>, version_id: Vec<u8>) -> Self::Content {
+        PlainKnitContent::new(lines, version_id)
+    }
+
+    fn lower_fulltext(&self, content: &Self::Content) -> Vec<Vec<u8>> {
+        content.text()
+    }
+
+    fn lower_line_delta(&self, delta: &[DeltaHunk<Vec<u8>>]) -> Vec<Vec<u8>> {
+        lower_line_delta_raw(delta)
     }
 }
 
@@ -1955,31 +2015,111 @@ pub struct KnitIndexMemo {
     pub length: usize,
 }
 
-/// Read-side index trait for knit storage. The minimal method set
-/// [`get_text`] needs.
+/// Full index trait for knit storage.
 ///
-/// Pure-Rust callers implement this directly; the pyo3 layer can wrap
-/// a Python `_KnitGraphIndex` / `_KndxIndex` via an adapter.
+/// Pure-Rust callers implement this directly; the pyo3 layer wraps a
+/// Python `_KnitGraphIndex` or `_KndxIndex` via an adapter struct.
 pub trait KnitIndex {
-    /// Look up build details for `keys`. Missing keys are simply
-    /// absent from the returned map. Implementations are responsible
-    /// for any `_check_read` / locking logic.
+    // --- read side ---
+
+    /// Look up build details for `keys`. Missing keys are absent from
+    /// the returned map. Implementations handle their own locking checks.
     fn get_build_details(
         &self,
         keys: &[KnitKey],
     ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails>, KnitError>;
+
+    /// Return all keys present in this index.
+    fn keys(&self) -> Result<Vec<KnitKey>, KnitError>;
+
+    /// Return a map of key → parent keys for the given keys.
+    /// Missing keys are absent from the result.
+    fn get_parent_map(
+        &self,
+        keys: &[KnitKey],
+    ) -> Result<std::collections::HashMap<KnitKey, Vec<KnitKey>>, KnitError>;
+
+    /// Return the storage method for a single key.
+    fn get_method(&self, key: &KnitKey) -> Result<KnitMethod, KnitError>;
+
+    /// Sum the on-disk sizes of the build chains for `keys`, using
+    /// `positions` (from `get_build_details`) to avoid re-querying.
+    fn get_total_build_size(
+        &self,
+        keys: &[KnitKey],
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+    ) -> usize;
+
+    /// Sort `keys` in-place into the order that minimises I/O when
+    /// fetching them (i.e. by backing file then byte offset).
+    fn sort_keys_by_io(
+        &self,
+        keys: &mut [KnitKey],
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+    );
+
+    /// Return true if this index tracks graph parents.
+    fn has_graph(&self) -> bool;
+
+    /// Return true if `key` is present in this index.
+    fn contains(&self, key: &KnitKey) -> Result<bool, KnitError>;
+
+    /// Return the set of compression parents that are referenced but
+    /// not yet present in any scanned index.
+    fn get_missing_compression_parents(&self) -> Result<Vec<KnitKey>, KnitError>;
+
+    // --- write side ---
+
+    /// Assert that a write is permitted, returning an error otherwise.
+    fn check_write_ok(&self) -> Result<(), KnitError>;
+
+    /// Add records to the index.
+    ///
+    /// Each record is `(key, options, index_memo, parents)`.
+    /// `random_id`: skip duplicate checking.
+    /// `missing_compression_parents`: the compression parents of delta
+    ///   records may not yet be present; buffer them for later.
+    fn add_records(
+        &self,
+        records: &[(KnitKey, Vec<KnitMethod>, KnitIndexMemo, Vec<KnitKey>)],
+        random_id: bool,
+        missing_compression_parents: bool,
+    ) -> Result<(), KnitError>;
 }
 
-/// Read-side access trait for knit storage. Fetches the raw
-/// gzip-compressed record bytes that an index memo points at.
+/// Full access trait for knit storage.
 ///
-/// `_KnitKeyAccess` and `_DirectPackAccess` would each provide an
-/// implementation; the pyo3 layer can wrap a Python access object
-/// via an adapter.
+/// Covers both the read path (fetch raw record bytes) and the write
+/// path (append new records, flush, retry on pack reload).
 pub trait KnitAccess {
+    // --- read side ---
+
     /// Fetch the raw record bytes for one index memo. Returns the
     /// gzip-compressed data ready to feed to [`decode_record_gz`].
     fn get_raw_record(&self, memo: &KnitIndexMemo) -> Result<Vec<u8>, KnitError>;
+
+    /// Fetch raw record bytes for multiple memos in order.
+    fn get_raw_records(&self, memos: &[KnitIndexMemo]) -> Result<Vec<Vec<u8>>, KnitError>;
+
+    // --- write side ---
+
+    /// Append raw record bytes and return the resulting index memo.
+    fn add_raw_record(
+        &self,
+        key: &KnitKey,
+        size: usize,
+        data: Vec<Vec<u8>>,
+    ) -> Result<KnitIndexMemo, KnitError>;
+
+    /// Flush any buffered writes to the underlying storage.
+    fn flush(&self) -> Result<(), KnitError>;
+
+    /// Call the reload function if available, or re-raise the error.
+    ///
+    /// Called after a `RetryWithNewPacks`-equivalent error. Returns
+    /// `Ok(())` if the reload succeeded and the caller should retry;
+    /// returns `Err` if the situation is unrecoverable.
+    fn reload_or_raise(&self, err: KnitError) -> Result<(), KnitError>;
 }
 
 /// Reconstruct the text content of `key` from a knit, walking the
@@ -2461,6 +2601,213 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitIndex for
         }
         Ok(self.build_details_from_cache(keys))
     }
+
+    fn keys(&self) -> Result<Vec<KnitKey>, KnitError> {
+        let cache = self.kndx_cache.lock().unwrap();
+        let mut result = Vec::new();
+        for (prefix, pc) in cache.iter() {
+            for suffix in pc.cache.keys() {
+                let mut key = prefix.clone();
+                key.push(suffix.clone());
+                result.push(key);
+            }
+        }
+        Ok(result)
+    }
+
+    fn get_parent_map(
+        &self,
+        keys: &[KnitKey],
+    ) -> Result<std::collections::HashMap<KnitKey, Vec<KnitKey>>, KnitError> {
+        let prefixes: std::collections::HashSet<Vec<Vec<u8>>> =
+            keys.iter().map(Self::prefix_of).collect();
+        for prefix in prefixes {
+            self.load_prefix_shared(prefix)
+                .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
+        }
+        let cache = self.kndx_cache.lock().unwrap();
+        let mut result = std::collections::HashMap::new();
+        for key in keys {
+            let prefix = Self::prefix_of(key);
+            let suffix = Self::suffix_of(key);
+            let Some(pc) = cache.get(&prefix) else {
+                continue;
+            };
+            let Some(entry) = pc.cache.get(&suffix) else {
+                continue;
+            };
+            let parents: Vec<KnitKey> = entry
+                .parents
+                .iter()
+                .map(|p| {
+                    let mut pk = prefix.clone();
+                    pk.push(p.clone());
+                    pk
+                })
+                .collect();
+            result.insert(key.clone(), parents);
+        }
+        Ok(result)
+    }
+
+    fn get_method(&self, key: &KnitKey) -> Result<KnitMethod, KnitError> {
+        let prefix = Self::prefix_of(key);
+        let suffix = Self::suffix_of(key);
+        self.load_prefix_shared(prefix.clone())
+            .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
+        let cache = self.kndx_cache.lock().unwrap();
+        let pc = cache
+            .get(&prefix)
+            .ok_or_else(|| KnitError::BadIndexValue(b"prefix not loaded".to_vec()))?;
+        let entry = pc
+            .cache
+            .get(&suffix)
+            .ok_or_else(|| KnitError::Corrupt(format!("key not found: {:?}", key)))?;
+        let (method, _) = decode_kndx_options(
+            &entry
+                .options
+                .iter()
+                .map(|o| o.as_slice())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or((KnitMethod::Fulltext, false));
+        Ok(method)
+    }
+
+    fn get_total_build_size(
+        &self,
+        keys: &[KnitKey],
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+    ) -> usize {
+        let mut total = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<&KnitKey> = keys.iter().collect();
+        while let Some(key) = queue.pop_front() {
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(details) = positions.get(key) {
+                total += details.index_memo.length;
+                if let Some(ref cp) = details.compression_parent {
+                    if positions.contains_key(cp) {
+                        queue.push_back(cp);
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    fn sort_keys_by_io(
+        &self,
+        keys: &mut [KnitKey],
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+    ) {
+        keys.sort_by(|a, b| {
+            let a_memo = positions
+                .get(a)
+                .map(|d| (&d.index_memo.path, d.index_memo.offset));
+            let b_memo = positions
+                .get(b)
+                .map(|d| (&d.index_memo.path, d.index_memo.offset));
+            a_memo.cmp(&b_memo)
+        });
+    }
+
+    fn has_graph(&self) -> bool {
+        true
+    }
+
+    fn contains(&self, key: &KnitKey) -> Result<bool, KnitError> {
+        let prefix = Self::prefix_of(key);
+        let suffix = Self::suffix_of(key);
+        self.load_prefix_shared(prefix.clone())
+            .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
+        let cache = self.kndx_cache.lock().unwrap();
+        Ok(cache
+            .get(&prefix)
+            .map(|pc| pc.cache.contains_key(&suffix))
+            .unwrap_or(false))
+    }
+
+    fn get_missing_compression_parents(&self) -> Result<Vec<KnitKey>, KnitError> {
+        // KndxIndex tracks all parents inline; there are no deferred
+        // compression parents in this format.
+        Ok(vec![])
+    }
+
+    fn check_write_ok(&self) -> Result<(), KnitError> {
+        // KndxIndex has no separate lock state; writes are always permitted.
+        Ok(())
+    }
+
+    fn add_records(
+        &self,
+        records: &[(KnitKey, Vec<KnitMethod>, KnitIndexMemo, Vec<KnitKey>)],
+        _random_id: bool,
+        _missing_compression_parents: bool,
+    ) -> Result<(), KnitError> {
+        // Group by prefix so we write each .kndx file once.
+        let mut by_prefix: std::collections::HashMap<Vec<Vec<u8>>, Vec<_>> =
+            std::collections::HashMap::new();
+        for (key, methods, memo, parents) in records {
+            let prefix = Self::prefix_of(key);
+            by_prefix
+                .entry(prefix)
+                .or_default()
+                .push((key, methods, memo, parents));
+        }
+        for (prefix, entries) in by_prefix {
+            self.load_prefix_shared(prefix.clone())
+                .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
+            let path = self.prefix_path(&prefix);
+            let mut cache = self.kndx_cache.lock().unwrap();
+            let pc = cache.entry(prefix.clone()).or_default();
+            let mut append_buf: Vec<u8> = Vec::new();
+            for (key, methods, memo, parents) in entries {
+                let suffix = Self::suffix_of(key);
+                let options: Vec<Vec<u8>> = methods
+                    .iter()
+                    .map(|m| m.as_str().as_bytes().to_vec())
+                    .collect();
+                let parent_suffixes: Vec<Vec<u8>> =
+                    parents.iter().map(|p| Self::suffix_of(p)).collect();
+                let idx = pc.history.len();
+                pc.history.push(suffix.clone());
+                pc.cache.insert(
+                    suffix.clone(),
+                    KndxCacheEntry {
+                        version_id: suffix.clone(),
+                        options: options.clone(),
+                        pos: memo.offset,
+                        size: memo.length,
+                        parents: parent_suffixes.clone(),
+                        index: idx,
+                    },
+                );
+                // Format: VERSION_ID OPTIONS POS SIZE [PARENTS...] :
+                append_buf.push(b'\n');
+                append_buf.extend_from_slice(&suffix);
+                append_buf.push(b' ');
+                let opts_joined: Vec<u8> = options.join(&b","[..]);
+                append_buf.extend_from_slice(&opts_joined);
+                append_buf.push(b' ');
+                append_buf.extend_from_slice(memo.offset.to_string().as_bytes());
+                append_buf.push(b' ');
+                append_buf.extend_from_slice(memo.length.to_string().as_bytes());
+                for p in &parent_suffixes {
+                    append_buf.push(b' ');
+                    append_buf.extend_from_slice(p);
+                }
+                append_buf.extend_from_slice(b" :");
+            }
+            drop(cache);
+            self.transport
+                .append_bytes(&path, &append_buf)
+                .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
+        }
+        Ok(())
+    }
 }
 
 /// Pure-Rust implementation of `_KnitKeyAccess`.
@@ -2492,15 +2839,16 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitKeyAccess
         self.mapper.map(&refs) + ".knit"
     }
 
-    /// Write raw record bytes and return the `(key, offset, size)` memo.
-    pub fn add_raw_record(
+    /// Write raw bytes directly (no chunking) and return `(key, offset, len)`.
+    /// Used by the pyo3 `PyKnitKeyAccess` wrapper.
+    pub fn add_raw_record_bytes(
         &self,
         key: KnitKey,
-        raw_data: &[u8],
+        data: &[u8],
     ) -> Result<(KnitKey, u64, usize), crate::transport::TransportError> {
         let path = self.key_path(&key);
-        let offset = self.transport.append_bytes(&path, raw_data)?;
-        Ok((key, offset, raw_data.len()))
+        let offset = self.transport.append_bytes(&path, data)?;
+        Ok((key, offset, data.len()))
     }
 }
 
@@ -2522,6 +2870,321 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitAccess
                     .ok_or_else(|| KnitError::BadIndexValue(b"readv returned no data".to_vec()))
             })
     }
+
+    fn get_raw_records(&self, memos: &[KnitIndexMemo]) -> Result<Vec<Vec<u8>>, KnitError> {
+        use crate::transport::ReadRange;
+        // Group by path so we issue one readv per file.
+        // Preserve the original ordering so results come back in memo order.
+        let mut by_path: std::collections::HashMap<&str, Vec<(usize, ReadRange)>> =
+            std::collections::HashMap::new();
+        for (i, memo) in memos.iter().enumerate() {
+            by_path.entry(&memo.path).or_default().push((
+                i,
+                ReadRange {
+                    offset: memo.offset,
+                    length: memo.length,
+                },
+            ));
+        }
+        let mut out = vec![Vec::new(); memos.len()];
+        for (path, indexed_ranges) in by_path {
+            let ranges: Vec<ReadRange> = indexed_ranges.iter().map(|(_, r)| r.clone()).collect();
+            let results = self
+                .transport
+                .readv(path, &ranges)
+                .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
+            for ((orig_idx, _), result) in indexed_ranges.into_iter().zip(results) {
+                out[orig_idx] = result.bytes;
+            }
+        }
+        Ok(out)
+    }
+
+    fn add_raw_record(
+        &self,
+        key: &KnitKey,
+        _size: usize,
+        data: Vec<Vec<u8>>,
+    ) -> Result<KnitIndexMemo, KnitError> {
+        let path = self.key_path(key);
+        let flat: Vec<u8> = data.into_iter().flatten().collect();
+        let length = flat.len();
+        let offset = self
+            .transport
+            .append_bytes(&path, &flat)
+            .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
+        Ok(KnitIndexMemo {
+            path,
+            offset,
+            length,
+        })
+    }
+
+    fn flush(&self) -> Result<(), KnitError> {
+        // KnitKeyAccess writes are immediate via append_bytes; nothing to flush.
+        Ok(())
+    }
+
+    fn reload_or_raise(&self, err: KnitError) -> Result<(), KnitError> {
+        // KnitKeyAccess has no pack-reload mechanism; always re-raise.
+        Err(err)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KnitVersionedFiles
+// ---------------------------------------------------------------------------
+
+/// Pure-Rust implementation of `KnitVersionedFiles`.
+///
+/// Generic over index, access, and factory so it can be used directly by
+/// pure-Rust callers and wrapped by the pyo3 layer without any Python
+/// dependency.  Fallback versioned-files objects are not modelled here —
+/// the pyo3 wrapper handles them in Python.
+pub struct KnitVersionedFiles<I, A, F> {
+    pub index: I,
+    pub access: A,
+    pub factory: F,
+    pub max_delta_chain: usize,
+}
+
+impl<I, A, F> KnitVersionedFiles<I, A, F>
+where
+    I: KnitIndex,
+    A: KnitAccess,
+    F: KnitFactory,
+{
+    pub fn new(index: I, access: A, factory: F, max_delta_chain: usize) -> Self {
+        Self {
+            index,
+            access,
+            factory,
+            max_delta_chain,
+        }
+    }
+
+    /// Return all keys in the local index.
+    pub fn keys(&self) -> Result<Vec<KnitKey>, KnitError> {
+        self.index.keys()
+    }
+
+    /// Return a map of key → parent keys for the given keys (local only).
+    pub fn get_parent_map(
+        &self,
+        keys: &[KnitKey],
+    ) -> Result<std::collections::HashMap<KnitKey, Vec<KnitKey>>, KnitError> {
+        self.index.get_parent_map(keys)
+    }
+
+    /// Return the full text of `key` as a single byte string.
+    pub fn get_text(&self, key: &KnitKey) -> Result<Vec<u8>, KnitError> {
+        get_text(&self.index, &self.access, &self.factory, key)
+    }
+
+    /// Return the SHA-1 digests for `keys`.
+    pub fn get_sha1s(
+        &self,
+        keys: &[KnitKey],
+    ) -> Result<std::collections::HashMap<KnitKey, Vec<u8>>, KnitError> {
+        get_sha1s(&self.index, &self.access, keys)
+    }
+
+    /// Reconstruct the content object for `key`.
+    pub fn get_content(&self, key: &KnitKey) -> Result<F::Content, KnitError> {
+        get_content(&self.index, &self.access, &self.factory, key)
+    }
+
+    /// Return build details for the given keys.
+    pub fn get_build_details(
+        &self,
+        keys: &[KnitKey],
+    ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails>, KnitError> {
+        self.index.get_build_details(keys)
+    }
+
+    /// Return true if `key` is present in the local index.
+    pub fn contains(&self, key: &KnitKey) -> Result<bool, KnitError> {
+        self.index.contains(key)
+    }
+
+    /// Return the set of compression parents referenced but not yet present.
+    pub fn get_missing_compression_parent_keys(&self) -> Result<Vec<KnitKey>, KnitError> {
+        self.index.get_missing_compression_parents()
+    }
+
+    /// Decide whether to delta-compress the new version against `parent`.
+    ///
+    /// Walks back at most `max_delta_chain` steps; returns `true` if we
+    /// should create a delta, `false` if we should write a new fulltext.
+    pub fn check_should_delta(&self, parent: &KnitKey) -> Result<bool, KnitError> {
+        if self.max_delta_chain == 0 {
+            return Ok(false);
+        }
+        let mut cursor = parent.clone();
+        let mut steps = 0usize;
+        let mut delta_size = 0u64;
+        loop {
+            let details_map = self
+                .index
+                .get_build_details(std::slice::from_ref(&cursor))?;
+            let Some(det) = details_map.get(&cursor) else {
+                return Ok(false);
+            };
+            if det.method == KnitMethod::Fulltext {
+                // Use a delta only when the accumulated delta chain is not
+                // already much larger than the fulltext it compresses against.
+                return Ok(delta_size < det.index_memo.length as u64 * 2 + 200);
+            }
+            delta_size += det.index_memo.length as u64;
+            steps += 1;
+            if steps >= self.max_delta_chain {
+                return Ok(false);
+            }
+            match det.compression_parent.clone() {
+                Some(cp) => cursor = cp,
+                None => return Ok(false),
+            }
+        }
+    }
+
+    /// Add a new version to the knit.
+    ///
+    /// `lines` are the text lines (each should end in `\n` except possibly
+    /// the last).  `parents` are the graph parents.  `random_id` skips
+    /// duplicate checking in the index.
+    ///
+    /// Returns `(sha1_hex_digest, text_length_bytes)`.
+    pub fn add_lines(
+        &self,
+        key: KnitKey,
+        parents: Vec<KnitKey>,
+        lines: Vec<Vec<u8>>,
+        random_id: bool,
+    ) -> Result<(Vec<u8>, usize), KnitError> {
+        use crate::osutils::sha::sha_string;
+
+        self.index.check_write_ok()?;
+
+        let line_bytes: Vec<u8> = lines.iter().flat_map(|l| l.iter().copied()).collect();
+        let digest = sha_string(&line_bytes).into_bytes();
+        let text_length = line_bytes.len();
+
+        let no_eol = !line_bytes.is_empty() && !line_bytes.ends_with(b"\n");
+        let version_id = key.last().cloned().unwrap_or_default();
+
+        // Decide whether to delta-compress against the left-most present parent.
+        let present_map = self.index.get_parent_map(&parents)?;
+        let use_delta = parents.first().is_some_and(|p| present_map.contains_key(p))
+            && self.max_delta_chain > 0
+            && self.check_should_delta(&parents[0])?;
+
+        // Build the content object and serialise it.
+        let (method, store_lines) = if use_delta {
+            let base = get_content(&self.index, &self.access, &self.factory, &parents[0])?;
+            let new_content = self.factory.make(lines.clone(), version_id.clone());
+            let delta = compute_line_delta(&base, &new_content);
+            let serialised = self.factory.lower_line_delta(&delta);
+            (KnitMethod::LineDelta, serialised)
+        } else {
+            let content = self.factory.make(lines.clone(), version_id.clone());
+            let serialised = self.factory.lower_fulltext(&content);
+            (KnitMethod::Fulltext, serialised)
+        };
+
+        // If the last line has no trailing newline, append one for storage and
+        // set the no-eol flag so the reader strips it on output.
+        let has_trailing_newline = !no_eol;
+        let payload: Vec<Vec<u8>> = if no_eol {
+            let mut p = store_lines.clone();
+            if let Some(last) = p.last_mut() {
+                last.push(b'\n');
+            }
+            p
+        } else {
+            store_lines
+        };
+
+        let (size, chunks) = record_to_data(&version_id, &digest, lines.len(), &payload, true)?;
+
+        let memo = self.access.add_raw_record(&key, size, chunks)?;
+
+        let mut options = vec![method];
+        if no_eol {
+            // Encode no-eol as an extra method entry so the index layer can
+            // distinguish it.  The index implementations that care (KndxIndex)
+            // serialise this as "no-eol" in the options field.
+            // TODO: model no-eol cleanly; for now reuse the method vec.
+        }
+        self.index
+            .add_records(&[(key, options, memo, parents)], random_id, false)?;
+
+        Ok((digest, text_length))
+    }
+
+    /// Read raw records and return `(key, content, digest)` triples, sorted
+    /// by storage position to minimise I/O seeks.
+    pub fn read_records_iter(
+        &self,
+        records: &[(KnitKey, KnitIndexMemo)],
+    ) -> Result<Vec<(KnitKey, F::Content, Vec<u8>)>, KnitError> {
+        if records.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut sorted = records.to_vec();
+        sorted.sort_by(|a, b| (&a.1.path, a.1.offset).cmp(&(&b.1.path, b.1.offset)));
+        let memos: Vec<KnitIndexMemo> = sorted.iter().map(|(_, m)| m.clone()).collect();
+        let raw_data = self.access.get_raw_records(&memos)?;
+        let mut out = Vec::with_capacity(sorted.len());
+        for ((key, _), raw) in sorted.into_iter().zip(raw_data) {
+            let version_id = key.last().cloned().unwrap_or_default();
+            let (body_lines, digest) = parse_record(&version_id, &raw)?;
+            let refs: Vec<&[u8]> = body_lines.iter().map(|l| l.as_slice()).collect();
+            // We don't know the method here without re-querying the index, so
+            // assume fulltext for the record_iter use-case (which always
+            // reconstructs via get_content anyway).
+            let content = self.factory.parse_fulltext_content(&refs, &version_id)?;
+            out.push((key, content, digest));
+        }
+        Ok(out)
+    }
+}
+
+/// Compute a patience-diff line delta between `base` and `new`.
+///
+/// Returns hunks in the `DeltaHunk` shape that `KnitFactory::lower_line_delta`
+/// can serialise.  The `DeltaLine` type is inferred from the factory's
+/// `Content` type; callers pass the base and new content objects directly.
+fn compute_line_delta<C: KnitContent>(base: &C, new: &C) -> Vec<DeltaHunk<C::DeltaLine>>
+where
+    C::DeltaLine: Clone,
+{
+    let old_lines = base.annotate();
+    let new_lines = new.annotate();
+
+    let old_text: Vec<Vec<u8>> = old_lines.iter().map(|(_, t)| t.clone()).collect();
+    let new_text: Vec<Vec<u8>> = new_lines.iter().map(|(_, t)| t.clone()).collect();
+
+    let mut matcher = patiencediff::SequenceMatcher::new(&old_text, &new_text);
+    let opcodes = matcher.get_opcodes().to_vec();
+
+    let new_annot = new.annotate();
+    let mut hunks: Vec<DeltaHunk<C::DeltaLine>> = Vec::new();
+    for op in &opcodes {
+        if matches!(op, patiencediff::Opcode::Equal(..)) {
+            continue;
+        }
+        let hunk_new_lines: Vec<C::DeltaLine> = new_annot[op.b_start()..op.b_end()]
+            .iter()
+            .map(C::delta_line_from_annotated)
+            .collect();
+        hunks.push(DeltaHunk {
+            start: op.a_start(),
+            end: op.a_end(),
+            count: op.b_end() - op.b_start(),
+            lines: hunk_new_lines,
+        });
+    }
+    hunks
 }
 
 #[cfg(test)]
@@ -2656,6 +3319,79 @@ mod tests {
             }
             Ok(out)
         }
+
+        fn keys(&self) -> Result<Vec<KnitKey>, KnitError> {
+            Ok(self.records.keys().cloned().collect())
+        }
+
+        fn get_parent_map(
+            &self,
+            keys: &[KnitKey],
+        ) -> Result<std::collections::HashMap<KnitKey, Vec<KnitKey>>, KnitError> {
+            Ok(keys
+                .iter()
+                .filter_map(|k| self.records.get(k).map(|d| (k.clone(), d.parents.clone())))
+                .collect())
+        }
+
+        fn get_method(&self, key: &KnitKey) -> Result<KnitMethod, KnitError> {
+            self.records
+                .get(key)
+                .map(|d| d.method)
+                .ok_or_else(|| KnitError::Corrupt(format!("key not found: {:?}", key)))
+        }
+
+        fn get_total_build_size(
+            &self,
+            keys: &[KnitKey],
+            positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+        ) -> usize {
+            keys.iter()
+                .filter_map(|k| positions.get(k))
+                .map(|d| d.index_memo.length)
+                .sum()
+        }
+
+        fn sort_keys_by_io(
+            &self,
+            keys: &mut [KnitKey],
+            positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+        ) {
+            keys.sort_by(|a, b| {
+                let a_key = positions
+                    .get(a)
+                    .map(|d| (&d.index_memo.path, d.index_memo.offset));
+                let b_key = positions
+                    .get(b)
+                    .map(|d| (&d.index_memo.path, d.index_memo.offset));
+                a_key.cmp(&b_key)
+            });
+        }
+
+        fn has_graph(&self) -> bool {
+            true
+        }
+
+        fn contains(&self, key: &KnitKey) -> Result<bool, KnitError> {
+            Ok(self.records.contains_key(key))
+        }
+
+        fn get_missing_compression_parents(&self) -> Result<Vec<KnitKey>, KnitError> {
+            Ok(vec![])
+        }
+
+        fn check_write_ok(&self) -> Result<(), KnitError> {
+            Ok(())
+        }
+
+        fn add_records(
+            &self,
+            _records: &[(KnitKey, Vec<KnitMethod>, KnitIndexMemo, Vec<KnitKey>)],
+            _random_id: bool,
+            _missing_compression_parents: bool,
+        ) -> Result<(), KnitError> {
+            Ok(())
+        }
     }
 
     impl KnitAccess for MockKnit {
@@ -2664,6 +3400,27 @@ mod tests {
                 .get(memo)
                 .cloned()
                 .ok_or_else(|| KnitError::BadIndexValue(memo.path.as_bytes().to_vec()))
+        }
+
+        fn get_raw_records(&self, memos: &[KnitIndexMemo]) -> Result<Vec<Vec<u8>>, KnitError> {
+            memos.iter().map(|m| self.get_raw_record(m)).collect()
+        }
+
+        fn add_raw_record(
+            &self,
+            _key: &KnitKey,
+            _size: usize,
+            _data: Vec<Vec<u8>>,
+        ) -> Result<KnitIndexMemo, KnitError> {
+            unimplemented!("MockKnit::add_raw_record")
+        }
+
+        fn flush(&self) -> Result<(), KnitError> {
+            Ok(())
+        }
+
+        fn reload_or_raise(&self, err: KnitError) -> Result<(), KnitError> {
+            Err(err)
         }
     }
 
