@@ -82,18 +82,3 @@ __all__ = [
     "version_info",
     "version_string",
 ]
-
-
-import sys as _sys
-
-from . import _bzr_rs
-
-rio = _bzr_rs.rio
-hashcache = _bzr_rs.hashcache
-
-# Register Rust submodules in sys.modules so ``from bzrformats.rio
-# import ...`` works — assigning the module as an attribute on the
-# package isn't enough for Python's dotted-import machinery.
-_sys.modules["bzrformats.rio"] = rio
-_sys.modules["bzrformats.hashcache"] = hashcache
-del _sys
