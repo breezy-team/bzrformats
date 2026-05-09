@@ -665,6 +665,7 @@ from ._bzr_rs.knit import (  # noqa: E402
     AnnotatedKnitContent,
     KnitAnnotateFactory,
     KnitPlainFactory,
+    KnitVersionedFiles,
     PlainKnitContent,
     _KndxIndex,
     _KnitGraphIndex,
@@ -760,7 +761,7 @@ def _get_total_build_size(self, keys, positions):
     return _knit_rs.get_total_build_size_rs(keys, positions)
 
 
-class KnitVersionedFiles(VersionedFilesWithFallbacks):
+class KnitVersionedFilesPy(VersionedFilesWithFallbacks):
     """Storage for many versioned files using knit compression.
 
     Backend storage is managed by indices and data objects.
@@ -807,7 +808,7 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
 
     def without_fallbacks(self):
         """Return a clone of this object without any fallbacks configured."""
-        return KnitVersionedFiles(
+        return KnitVersionedFilesPy(
             self._index,
             self._access,
             self._max_delta_chain,

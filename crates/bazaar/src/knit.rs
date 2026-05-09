@@ -509,6 +509,21 @@ pub trait KnitContent {
     /// `origin` is always the content's `version_id`.
     fn annotate(&self) -> Vec<AnnotatedLine>;
 
+    /// Return a mutable reference to the `(origin, text)` pairs so that
+    /// [`merge_annotations`] can update line origins in place.
+    ///
+    /// Only valid for annotated content ([`AnnotatedKnitContent`]). Calling
+    /// this on plain content panics; `merge_annotations` guards the call
+    /// behind `factory.annotated()`.
+    fn annotate_mut(&mut self) -> &mut Vec<AnnotatedLine> {
+        unimplemented!("annotate_mut is only supported for annotated content")
+    }
+
+    /// Return `(origin, text)` pairs from the raw internal storage, without
+    /// applying the `should_strip_eol` flag. Used by [`compute_line_delta`]
+    /// to build delta hunks that preserve trailing newlines on stored lines.
+    fn annotate_raw(&self) -> Vec<AnnotatedLine>;
+
     /// Convert an `(origin, text)` pair into the `DeltaLine` type for this
     /// content.  Used by [`compute_line_delta`] to build typed delta hunks
     /// without knowing the concrete content type.
@@ -585,6 +600,14 @@ impl KnitContent for AnnotatedKnitContent {
         out
     }
 
+    fn annotate_mut(&mut self) -> &mut Vec<AnnotatedLine> {
+        &mut self.lines
+    }
+
+    fn annotate_raw(&self) -> Vec<AnnotatedLine> {
+        self.lines.clone()
+    }
+
     fn delta_line_from_annotated(pair: &AnnotatedLine) -> Self::DeltaLine {
         pair.clone()
     }
@@ -648,6 +671,22 @@ impl KnitContent for PlainKnitContent {
     }
 
     fn annotate(&self) -> Vec<AnnotatedLine> {
+        let mut out: Vec<AnnotatedLine> = self
+            .lines
+            .iter()
+            .map(|l| (self.version_id.clone(), l.clone()))
+            .collect();
+        if self.should_strip_eol {
+            if let Some((_, last)) = out.last_mut() {
+                if last.ends_with(b"\n") {
+                    last.pop();
+                }
+            }
+        }
+        out
+    }
+
+    fn annotate_raw(&self) -> Vec<AnnotatedLine> {
         self.lines
             .iter()
             .map(|l| (self.version_id.clone(), l.clone()))
@@ -741,6 +780,11 @@ pub trait KnitFactory {
                 content.apply_delta(&delta, version_id);
                 content
             }
+            KnitMethod::NoEol => {
+                return Err(KnitError::BadIndexValue(
+                    b"NoEol is not a storage method; use Fulltext or LineDelta".to_vec(),
+                ))
+            }
         };
         content.set_should_strip_eol(noeol);
         Ok(content)
@@ -823,7 +867,9 @@ impl KnitFactory for KnitPlainFactory {
     }
 
     fn lower_fulltext(&self, content: &Self::Content) -> Vec<Vec<u8>> {
-        content.text()
+        // Use the raw storage lines (not text()) so that the trailing '\n' added
+        // by add_lines for noeol content is preserved in the stored record.
+        content.lines.clone()
     }
 
     fn lower_line_delta(&self, delta: &[DeltaHunk<Vec<u8>>]) -> Vec<Vec<u8>> {
@@ -1524,6 +1570,10 @@ where
 pub enum KnitMethod {
     Fulltext,
     LineDelta,
+    /// The `no-eol` option flag, stored alongside `Fulltext` or `LineDelta`
+    /// in the index options list when the last line of the record has no
+    /// trailing newline.
+    NoEol,
 }
 
 impl KnitMethod {
@@ -1533,6 +1583,7 @@ impl KnitMethod {
         match self {
             KnitMethod::Fulltext => "fulltext",
             KnitMethod::LineDelta => "line-delta",
+            KnitMethod::NoEol => "no-eol",
         }
     }
 }
@@ -3079,41 +3130,54 @@ where
             && self.check_should_delta(&parents[0])?;
 
         // Build the content object and serialise it.
-        let (method, store_lines) = if use_delta {
-            let base = get_content(&self.index, &self.access, &self.factory, &parents[0])?;
-            let new_content = self.factory.make(lines.clone(), version_id.clone());
-            let delta = compute_line_delta(&base, &new_content);
-            let serialised = self.factory.lower_line_delta(&delta);
-            (KnitMethod::LineDelta, serialised)
-        } else {
-            let content = self.factory.make(lines.clone(), version_id.clone());
-            let serialised = self.factory.lower_fulltext(&content);
-            (KnitMethod::Fulltext, serialised)
-        };
+        let present_parents: Vec<KnitKey> = parents
+            .iter()
+            .filter(|p| present_map.contains_key(*p))
+            .cloned()
+            .collect();
 
-        // If the last line has no trailing newline, append one for storage and
-        // set the no-eol flag so the reader strips it on output.
-        let has_trailing_newline = !no_eol;
-        let payload: Vec<Vec<u8>> = if no_eol {
-            let mut p = store_lines.clone();
-            if let Some(last) = p.last_mut() {
+        // When the last line has no trailing newline, add one before building
+        // the content so that all serialisers see complete lines. The no-eol
+        // flag in the index record lets the reader strip it back on output.
+        let content_lines = if no_eol {
+            let mut l = lines.clone();
+            if let Some(last) = l.last_mut() {
                 last.push(b'\n');
             }
-            p
+            l
         } else {
-            store_lines
+            lines
         };
 
-        let (size, chunks) = record_to_data(&version_id, &digest, lines.len(), &payload, true)?;
+        let (method, payload) = {
+            let mut content = self.factory.make(content_lines, version_id.clone());
+            if no_eol {
+                content.set_should_strip_eol(true);
+            }
+            let delta_opt = merge_annotations(
+                &self.index,
+                &self.access,
+                &self.factory,
+                &mut content,
+                &present_parents,
+                use_delta,
+            )?;
+            if let Some(delta) = delta_opt {
+                let serialised = self.factory.lower_line_delta(&delta);
+                (KnitMethod::LineDelta, serialised)
+            } else {
+                let serialised = self.factory.lower_fulltext(&content);
+                (KnitMethod::Fulltext, serialised)
+            }
+        };
+
+        let (size, chunks) = record_to_data(&version_id, &digest, payload.len(), &payload, true)?;
 
         let memo = self.access.add_raw_record(&key, size, chunks)?;
 
         let mut options = vec![method];
         if no_eol {
-            // Encode no-eol as an extra method entry so the index layer can
-            // distinguish it.  The index implementations that care (KndxIndex)
-            // serialise this as "no-eol" in the options field.
-            // TODO: model no-eol cleanly; for now reuse the method vec.
+            options.push(KnitMethod::NoEol);
         }
         self.index
             .add_records(&[(key, options, memo, parents)], random_id, false)?;
@@ -3149,31 +3213,99 @@ where
     }
 }
 
+/// Port of Python's `KnitVersionedFiles._merge_annotations`.
+///
+/// When the factory is annotated, each line in `content` starts with the new
+/// version's own key as its origin annotation.  This function walks every
+/// parent and, for each run of lines that the parent and the new content share
+/// (same text), copies the parent's `(origin, text)` annotation into the new
+/// content — so that unchanged lines keep the version that first introduced
+/// them rather than being attributed to the current version.
+///
+/// After annotation merging, if `use_delta` is true, a patience-diff delta
+/// against the first present parent is computed and returned.
+///
+/// Returns `Some(delta_hunks)` when `use_delta` is true, `None` otherwise.
+pub(crate) fn merge_annotations<I, A, F>(
+    index: &I,
+    access: &A,
+    factory: &F,
+    content: &mut F::Content,
+    present_parents: &[KnitKey],
+    use_delta: bool,
+) -> Result<Option<Vec<DeltaHunk<<F::Content as KnitContent>::DeltaLine>>>, KnitError>
+where
+    I: KnitIndex,
+    A: KnitAccess,
+    F: KnitFactory,
+    <F::Content as KnitContent>::DeltaLine: Clone,
+{
+    if factory.annotated() {
+        for parent_key in present_parents {
+            let parent_content = get_content(index, access, factory, parent_key)?;
+            let parent_text: Vec<Vec<u8>> = parent_content.text();
+            let new_text: Vec<Vec<u8>> = content.text();
+
+            let mut matcher = patiencediff::SequenceMatcher::new(&parent_text, &new_text);
+            let opcodes = matcher.get_opcodes().to_vec();
+            // Use raw annotation (without strip-eol) so that copied lines
+            // retain their trailing '\n' regardless of the parent's noeol flag.
+            let parent_annot_raw = parent_content.annotate_raw();
+
+            for op in &opcodes {
+                if let patiencediff::Opcode::Equal(a_start, a_end, b_start, b_end) = op {
+                    // Copy annotation from parent for each matching line.
+                    let len = a_end - a_start;
+                    let new_lines = content.annotate_mut();
+                    for k in 0..len {
+                        new_lines[b_start + k] = parent_annot_raw[a_start + k].clone();
+                    }
+                    let _ = b_end;
+                }
+            }
+        }
+    }
+
+    if use_delta {
+        let Some(first_parent) = present_parents.first() else {
+            return Ok(None);
+        };
+        let base = get_content(index, access, factory, first_parent)?;
+        let delta = compute_line_delta(&base, content);
+        Ok(Some(delta))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Compute a patience-diff line delta between `base` and `new`.
 ///
 /// Returns hunks in the `DeltaHunk` shape that `KnitFactory::lower_line_delta`
 /// can serialise.  The `DeltaLine` type is inferred from the factory's
 /// `Content` type; callers pass the base and new content objects directly.
+///
+/// Uses `text()` for line comparison (which correctly applies strip-eol for
+/// the `no_eol` flag) but reads delta line content from the raw annotation
+/// pairs so that stored line text retains its trailing newline.
 fn compute_line_delta<C: KnitContent>(base: &C, new: &C) -> Vec<DeltaHunk<C::DeltaLine>>
 where
     C::DeltaLine: Clone,
 {
-    let old_lines = base.annotate();
-    let new_lines = new.annotate();
-
-    let old_text: Vec<Vec<u8>> = old_lines.iter().map(|(_, t)| t.clone()).collect();
-    let new_text: Vec<Vec<u8>> = new_lines.iter().map(|(_, t)| t.clone()).collect();
+    let old_text = base.text();
+    let new_text = new.text();
 
     let mut matcher = patiencediff::SequenceMatcher::new(&old_text, &new_text);
     let opcodes = matcher.get_opcodes().to_vec();
 
-    let new_annot = new.annotate();
+    // Use annotate_raw() for the delta line content so that lines retain their
+    // trailing '\n' even when should_strip_eol is set on the content.
+    let new_annot_raw = new.annotate_raw();
     let mut hunks: Vec<DeltaHunk<C::DeltaLine>> = Vec::new();
     for op in &opcodes {
         if matches!(op, patiencediff::Opcode::Equal(..)) {
             continue;
         }
-        let hunk_new_lines: Vec<C::DeltaLine> = new_annot[op.b_start()..op.b_end()]
+        let hunk_new_lines: Vec<C::DeltaLine> = new_annot_raw[op.b_start()..op.b_end()]
             .iter()
             .map(C::delta_line_from_annotated)
             .collect();
