@@ -500,14 +500,15 @@ impl WeaveFile {
         }
 
         // Per-version inclusion sets (by name) built incrementally.
-        let mut inclusions_by_name: std::collections::HashMap<Vec<u8>, std::collections::HashSet<Vec<u8>>> =
-            std::collections::HashMap::with_capacity(nv);
+        let mut inclusions_by_name: std::collections::HashMap<
+            Vec<u8>,
+            std::collections::HashSet<Vec<u8>>,
+        > = std::collections::HashMap::with_capacity(nv);
         let mut hashers: std::collections::HashMap<Vec<u8>, Sha1> =
             std::collections::HashMap::with_capacity(nv);
         for v in 0..nv {
             let name = &self.names[v];
-            let mut new_inc: std::collections::HashSet<Vec<u8>> =
-                std::collections::HashSet::new();
+            let mut new_inc: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             new_inc.insert(name.clone());
             for &p in &self.parents[v] {
                 let parent_name = &self.names[p];
@@ -581,7 +582,11 @@ impl WeaveFile {
     /// Translate parent indices in `other` to parent indices in `self`,
     /// looking up by version name. Errors if any of the parents are
     /// missing from `self`. Mirrors `Weave._imported_parents`.
-    pub fn imported_parents(&self, other: &WeaveFile, other_idx: usize) -> Result<Vec<usize>, WeaveError> {
+    pub fn imported_parents(
+        &self,
+        other: &WeaveFile,
+        other_idx: usize,
+    ) -> Result<Vec<usize>, WeaveError> {
         let mut new_parents = Vec::with_capacity(other.parents[other_idx].len());
         for &parent_idx in &other.parents[other_idx] {
             let parent_name = &other.names[parent_idx];
@@ -770,9 +775,7 @@ pub fn reweave(wa: &WeaveFile, wb: &WeaveFile) -> Result<WeaveFile, WeaveError> 
         .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
         .collect();
     let mut sorter = TopoSorter::new(pairs.into_iter());
-    let order = sorter
-        .sorted()
-        .map_err(|_| WeaveError::ReweaveCycle)?;
+    let order = sorter.sorted().map_err(|_| WeaveError::ReweaveCycle)?;
 
     let mut wr = WeaveFile::default();
     for name in order {
@@ -927,19 +930,15 @@ impl std::fmt::Display for WeaveError {
                 "invalid checksum for version {}: expected {:?}, measured {:?}",
                 version, expected, measured
             ),
-            WeaveError::Acyclic { version, max } => write!(
-                f,
-                "invalid included version {} for index {}",
-                max, version
-            ),
+            WeaveError::Acyclic { version, max } => {
+                write!(f, "invalid included version {} for index {}", max, version)
+            }
             WeaveError::AncestryMismatch(name) => {
                 write!(f, "ancestry mismatch for version {:?}", name)
             }
-            WeaveError::MissingParent { parent, child } => write!(
-                f,
-                "missing parent {{{:?}}} of {{{:?}}}",
-                parent, child
-            ),
+            WeaveError::MissingParent { parent, child } => {
+                write!(f, "missing parent {{{:?}}} of {{{:?}}}", parent, child)
+            }
             WeaveError::TextDiffers(name) => {
                 write!(f, "weaves differ on text content for version {:?}", name)
             }
@@ -2052,7 +2051,9 @@ mod tests {
         let mut wf = WeaveFile::default();
         let lines = ls(&[b"x\n"]);
         let parents: &[&[u8]] = &[b"69"];
-        let err = wf.add_lines(b"text0", parents, &lines, None, None).unwrap_err();
+        let err = wf
+            .add_lines(b"text0", parents, &lines, None, None)
+            .unwrap_err();
         assert_eq!(err, WeaveError::RevisionNotPresentByName(b"69".to_vec()));
     }
 
@@ -2061,7 +2062,8 @@ mod tests {
     #[test]
     fn add_lines_by_name_resolves_parent() {
         let mut wf = WeaveFile::default();
-        wf.add_lines(b"v0", &[], &ls(&[b"a\n"]), None, None).unwrap();
+        wf.add_lines(b"v0", &[], &ls(&[b"a\n"]), None, None)
+            .unwrap();
         let p: &[&[u8]] = &[b"v0"];
         let idx = wf
             .add_lines(b"v1", p, &ls(&[b"a\n", b"b\n"]), None, None)
@@ -2092,8 +2094,14 @@ mod tests {
         let mut wf = WeaveFile::default();
         wf.add(Some(b"v0"), &ls(&[b"a\n", b"b\n"]), &[], None, None)
             .unwrap();
-        wf.add(Some(b"v1"), &ls(&[b"a\n", b"b\n", b"c\n"]), &[0], None, None)
-            .unwrap();
+        wf.add(
+            Some(b"v1"),
+            &ls(&[b"a\n", b"b\n", b"c\n"]),
+            &[0],
+            None,
+            None,
+        )
+        .unwrap();
         let names: Vec<&[u8]> = vec![b"v1"];
         let got = wf
             .iter_lines_added_or_present_in_versions(Some(names))
@@ -2105,7 +2113,8 @@ mod tests {
     #[test]
     fn iter_lines_all_versions() {
         let mut wf = WeaveFile::default();
-        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None)
+            .unwrap();
         wf.add(Some(b"v1"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
             .unwrap();
         let got = wf
@@ -2158,8 +2167,10 @@ mod tests {
         let mut wf = WeaveFile::default();
         wf.add(Some(b"base"), &ls(&[b"keep\n", b"drop\n"]), &[], None, None)
             .unwrap();
-        wf.add(Some(b"a"), &ls(&[b"keep\n"]), &[0], None, None).unwrap();
-        wf.add(Some(b"b"), &ls(&[b"keep\n"]), &[0], None, None).unwrap();
+        wf.add(Some(b"a"), &ls(&[b"keep\n"]), &[0], None, None)
+            .unwrap();
+        wf.add(Some(b"b"), &ls(&[b"keep\n"]), &[0], None, None)
+            .unwrap();
         let plan = wf.plan_merge(b"a", b"b").unwrap();
         let drops: Vec<&'static [u8]> = plan
             .iter()
@@ -2174,7 +2185,8 @@ mod tests {
     #[test]
     fn check_passes_on_clean_weave() {
         let mut wf = WeaveFile::default();
-        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None)
+            .unwrap();
         wf.add(Some(b"v1"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
             .unwrap();
         wf.check().unwrap();
@@ -2185,11 +2197,15 @@ mod tests {
     #[test]
     fn check_rejects_corrupt_sha1() {
         let mut wf = WeaveFile::default();
-        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None)
+            .unwrap();
         // Tamper with the stored sha1 for v0.
         wf.sha1s[0] = b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_vec();
         let err = wf.check().unwrap_err();
-        assert!(matches!(err, WeaveError::InvalidChecksum { version: 0, .. }));
+        assert!(matches!(
+            err,
+            WeaveError::InvalidChecksum { version: 0, .. }
+        ));
     }
 
     /// `check` rejects a parents table where any parent index isn't strictly
@@ -2197,18 +2213,14 @@ mod tests {
     #[test]
     fn check_rejects_acyclic_violation() {
         let mut wf = WeaveFile::default();
-        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
-        wf.add(Some(b"v1"), &ls(&[b"a\n"]), &[0], None, None).unwrap();
+        wf.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None)
+            .unwrap();
+        wf.add(Some(b"v1"), &ls(&[b"a\n"]), &[0], None, None)
+            .unwrap();
         // Now manually introduce an invalid self-parent.
         wf.parents[1] = vec![1];
         let err = wf.check().unwrap_err();
-        assert_eq!(
-            err,
-            WeaveError::Acyclic {
-                version: 1,
-                max: 1
-            }
-        );
+        assert_eq!(err, WeaveError::Acyclic { version: 1, max: 1 });
     }
 
     /// `imported_parents` maps `other`'s parent indices to `self`'s, by
@@ -2216,13 +2228,16 @@ mod tests {
     #[test]
     fn imported_parents_translates_indices() {
         let mut wa = WeaveFile::default();
-        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None)
+            .unwrap();
         wa.add(Some(b"v1"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
             .unwrap();
         let mut wb = WeaveFile::default();
         // Different ordering in wb.
-        wb.add(Some(b"v1"), &ls(&[b"x\n"]), &[], None, None).unwrap();
-        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wb.add(Some(b"v1"), &ls(&[b"x\n"]), &[], None, None)
+            .unwrap();
+        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None)
+            .unwrap();
 
         // wa.imported_parents(wb, 0) — wb[0]'s parents in wb are [], so
         // the result is also empty.
@@ -2234,11 +2249,14 @@ mod tests {
     #[test]
     fn imported_parents_missing_parent_errors() {
         let mut wa = WeaveFile::default();
-        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None)
+            .unwrap();
 
         let mut wb = WeaveFile::default();
-        wb.add(Some(b"orphan"), &ls(&[b"x\n"]), &[], None, None).unwrap();
-        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[0], None, None).unwrap();
+        wb.add(Some(b"orphan"), &ls(&[b"x\n"]), &[], None, None)
+            .unwrap();
+        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[0], None, None)
+            .unwrap();
         // wb's v0 has parent "orphan" which doesn't exist in wa.
         let err = wa.imported_parents(&wb, 1).unwrap_err();
         assert!(matches!(err, WeaveError::MissingParent { .. }));
@@ -2250,9 +2268,11 @@ mod tests {
     #[test]
     fn check_version_consistent_states() {
         let mut wa = WeaveFile::default();
-        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None)
+            .unwrap();
         let mut wb = WeaveFile::default();
-        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None)
+            .unwrap();
         wb.add(Some(b"v1"), &ls(&[b"a\n", b"b\n"]), &[0], None, None)
             .unwrap();
 
@@ -2273,12 +2293,20 @@ mod tests {
     #[test]
     fn reweave_merges_disjoint_branches() {
         let mut wa = WeaveFile::default();
-        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
-        wa.add(Some(b"a-only"), &ls(&[b"a\n", b"alpha\n"]), &[0], None, None)
+        wa.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None)
             .unwrap();
+        wa.add(
+            Some(b"a-only"),
+            &ls(&[b"a\n", b"alpha\n"]),
+            &[0],
+            None,
+            None,
+        )
+        .unwrap();
 
         let mut wb = WeaveFile::default();
-        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None).unwrap();
+        wb.add(Some(b"v0"), &ls(&[b"a\n"]), &[], None, None)
+            .unwrap();
         wb.add(Some(b"b-only"), &ls(&[b"a\n", b"beta\n"]), &[0], None, None)
             .unwrap();
 
@@ -2377,7 +2405,8 @@ mod tests {
     #[test]
     fn round_trip_equality() {
         let mut w1 = WeaveFile::default();
-        w1.add(Some(b"text0"), &[b"header".to_vec()], &[], None, None).unwrap();
+        w1.add(Some(b"text0"), &[b"header".to_vec()], &[], None, None)
+            .unwrap();
         w1.add(
             Some(b"text1"),
             &[b"header".to_vec(), b"".to_vec(), b"line from 1".to_vec()],
@@ -2543,11 +2572,7 @@ mod tests {
         ];
         let wf = WeaveFile {
             parents: vec![vec![], vec![0], vec![0]],
-            sha1s: vec![
-                sha_strings(&v0),
-                sha_strings(&v01),
-                sha_strings(&v02),
-            ],
+            sha1s: vec![sha_strings(&v0), sha_strings(&v01), sha_strings(&v02)],
             names: vec![b"0".to_vec(), b"1".to_vec(), b"2".to_vec()],
             weave: weave_body,
         };
