@@ -400,7 +400,9 @@ mod tests {
     use super::*;
 
     fn lines_of(s: &'static [u8]) -> Vec<Vec<u8>> {
-        crate::osutils::split_lines(s).map(|c| c.into_owned()).collect()
+        crate::osutils::split_lines(s)
+            .map(|c| c.into_owned())
+            .collect()
     }
 
     fn cow_lines(s: &'static [u8]) -> Vec<Cow<'static, [u8]>> {

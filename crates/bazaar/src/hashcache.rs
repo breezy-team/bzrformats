@@ -1,6 +1,6 @@
 use crate::filters::{ContentFilter, ContentFilterProvider, ContentFilterStack};
-use log::{debug, info};
 use crate::osutils::sha::sha_string;
+use log::{debug, info};
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, Metadata, Permissions};

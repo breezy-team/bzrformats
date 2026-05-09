@@ -568,8 +568,10 @@ impl ContentFactory for FulltextContentFactory {
         'a: 'b,
     {
         Box::new(
-            crate::osutils::chunks_to_lines(std::iter::once(Ok::<_, std::io::Error>(&self.fulltext)))
-                .map(|v| v.unwrap()),
+            crate::osutils::chunks_to_lines(std::iter::once(Ok::<_, std::io::Error>(
+                &self.fulltext,
+            )))
+            .map(|v| v.unwrap()),
         )
     }
 
