@@ -4896,23 +4896,84 @@ impl PyKnitVersionedFiles {
         key: Bound<'_, PyAny>,
         parent_texts: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        if let Some(pt) = parent_texts {
-            py_self
-                .call_method1("_get_content", (key, pt))
-                .map(|b| b.unbind())
+        // If parent_texts contains this key, return the cached content directly.
+        if let Some(ref pt) = parent_texts {
+            if let Ok(cached) = pt.get_item(&key) {
+                if !cached.is_none() {
+                    return Ok(cached.unbind());
+                }
+            }
+        }
+        // Drive the pure-Rust chain-walk + delta-apply through PyKnitIndex/PyKnitAccess.
+        let table = Arc::new(Mutex::new(MemoTable::default()));
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table);
+        let knit_key = extract_knit_key(&key).map_err(knit_err_to_py)?;
+        let m = py.import("bzrformats._bzr_rs.knit")?;
+        if self.annotated {
+            let content = bazaar::knit::get_content(
+                &index,
+                &access,
+                &bazaar::knit::KnitAnnotateFactory,
+                &knit_key,
+            )
+            .map_err(knit_err_to_py)?;
+            let strip = content.should_strip_eol();
+            let pairs = pyo3::types::PyList::empty(py);
+            for (origin, text) in &content.lines {
+                pairs.append(PyTuple::new(
+                    py,
+                    [PyBytes::new(py, origin), PyBytes::new(py, text)],
+                )?)?;
+            }
+            let obj = m.call_method1("AnnotatedKnitContent", (pairs,))?;
+            obj.setattr("_should_strip_eol", strip)?;
+            Ok(obj.unbind())
         } else {
-            py_self
-                .call_method1("_get_content", (key,))
-                .map(|b| b.unbind())
+            let content = bazaar::knit::get_content(
+                &index,
+                &access,
+                &bazaar::knit::KnitPlainFactory,
+                &knit_key,
+            )
+            .map_err(knit_err_to_py)?;
+            let strip = content.should_strip_eol();
+            let version_id = knit_key.last().cloned().unwrap_or_default();
+            let lines = pyo3::types::PyList::empty(py);
+            for line in &content.lines {
+                lines.append(PyBytes::new(py, line))?;
+            }
+            let obj = m.call_method1(
+                "PlainKnitContent",
+                (lines, PyBytes::new(py, &version_id)),
+            )?;
+            obj.setattr("_should_strip_eol", strip)?;
+            Ok(obj.unbind())
         }
     }
 
-    fn _check_should_delta(&self, py: Python<'_>, parent: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("_check_should_delta", (parent,))
-            .map(|b| b.unbind())
+    fn _check_should_delta(&self, py: Python<'_>, parent: Bound<'_, PyAny>) -> PyResult<bool> {
+        let table = Arc::new(Mutex::new(MemoTable::default()));
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table);
+        let knit_key = extract_knit_key(&parent).map_err(knit_err_to_py)?;
+        if self.annotated {
+            let kvf = bazaar::knit::KnitVersionedFiles::new(
+                index,
+                access,
+                bazaar::knit::KnitAnnotateFactory,
+                self.max_delta_chain,
+            );
+            kvf.check_should_delta(&knit_key).map_err(knit_err_to_py)
+        } else {
+            let kvf = bazaar::knit::KnitVersionedFiles::new(
+                index,
+                access,
+                bazaar::knit::KnitPlainFactory,
+                self.max_delta_chain,
+            );
+            kvf.check_should_delta(&knit_key).map_err(knit_err_to_py)
+        }
     }
 
     fn _get_components_positions(
@@ -4921,14 +4982,18 @@ impl PyKnitVersionedFiles {
         keys: Bound<'_, PyAny>,
         allow_missing: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        let kwargs = PyDict::new(py);
-        if let Some(am) = allow_missing {
-            kwargs.set_item("allow_missing", am)?;
+        let allow_missing = allow_missing.unwrap_or(false);
+        let key_list = PyList::empty(py);
+        for k in keys.try_iter()? {
+            key_list.append(k?)?;
         }
-        py_self
-            .call_method("_get_components_positions", (keys,), Some(&kwargs))
-            .map(|b| b.unbind())
+        let get_build_details = self.index_obj.bind(py).getattr("get_build_details")?;
+        let m = py.import("bzrformats._bzr_rs.knit")?;
+        m.call_method1(
+            "walk_components_positions_rs",
+            (key_list, allow_missing, get_build_details),
+        )
+        .map(|b| b.unbind())
     }
 
     fn _get_parent_map_with_sources(
@@ -4936,10 +5001,40 @@ impl PyKnitVersionedFiles {
         py: Python<'_>,
         keys: Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("_get_parent_map_with_sources", (keys,))
-            .map(|b| b.unbind())
+        let result = PyDict::new(py);
+        let source_results = PyList::empty(py);
+        let missing = pyo3::types::PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            missing.add(k?)?;
+        }
+        // Local index first, then fallback VFs.
+        let local_map = self
+            .index_obj
+            .bind(py)
+            .call_method1("get_parent_map", (missing.clone(),))?
+            .cast_into::<PyDict>()?;
+        for (k, v) in local_map.iter() {
+            result.set_item(&k, &v)?;
+            missing.discard(k)?;
+        }
+        source_results.append(local_map)?;
+        for source in &self.immediate_fallback_vfs {
+            if missing.is_empty() {
+                break;
+            }
+            let new_result = source
+                .bind(py)
+                .call_method1("get_parent_map", (missing.clone(),))?
+                .cast_into::<PyDict>()?;
+            for (k, v) in new_result.iter() {
+                result.set_item(&k, &v)?;
+                missing.discard(k)?;
+            }
+            source_results.append(new_result)?;
+        }
+        Ok(PyTuple::new(py, [result.as_any(), source_results.as_any()])?
+            .into_any()
+            .unbind())
     }
 
     #[staticmethod]
@@ -5017,12 +5112,86 @@ impl PyKnitVersionedFiles {
         keys: Bound<'_, PyAny>,
         allow_missing: bool,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("allow_missing", allow_missing)?;
-        py_self
-            .call_method("_get_record_map_unparsed", (keys,), Some(&kwargs))
-            .map(|b| b.unbind())
+        // Walk the compression closure to build position_map, then fetch raw
+        // bytes for all components and build {key: (raw_bytes, record_details, next)}.
+        let position_map = self
+            ._get_components_positions(py, keys, Some(allow_missing))?
+            .into_bound(py)
+            .cast_into::<PyDict>()?;
+        let mut records: Vec<(Bound<'_, PyAny>, Bound<'_, PyAny>)> = Vec::new();
+        for (key, value) in position_map.iter() {
+            let tup = value.cast_into::<PyTuple>()?;
+            let index_memo = tup.get_item(1)?;
+            records.push((key, index_memo));
+        }
+        records.sort_by(|(_, a), (_, b)| {
+            let ar = a.repr().map(|s| s.to_string()).unwrap_or_default();
+            let br = b.repr().map(|s| s.to_string()).unwrap_or_default();
+            ar.cmp(&br)
+        });
+        let records_list = PyList::empty(py);
+        for (key, memo) in &records {
+            records_list.append(PyTuple::new(py, [key, memo])?)?;
+        }
+        let raw_map = PyDict::new(py);
+        for ((key, _), raw_obj) in records
+            .iter()
+            .zip(self._read_records_iter_unchecked(py, records_list.into_any())?.bind(py).try_iter()?)
+        {
+            let tup = raw_obj?.cast_into::<PyTuple>()?;
+            let raw_data = tup.get_item(1)?;
+            let pos_tup = position_map
+                .get_item(key)?
+                .ok_or_else(|| PyValueError::new_err("key missing from position_map"))?
+                .cast_into::<PyTuple>()?;
+            let record_details = pos_tup.get_item(0)?;
+            let next = pos_tup.get_item(2)?;
+            raw_map.set_item(key, PyTuple::new(py, [&raw_data, &record_details, &next])?)?;
+        }
+        Ok(raw_map.into_any().unbind())
+    }
+
+    fn _raw_map_to_record_map(
+        &self,
+        py: Python<'_>,
+        raw_map: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let raw_map = raw_map.cast_into::<PyDict>()?;
+        let result = PyDict::new(py);
+        for (key, value) in raw_map.iter() {
+            let tup = value.cast_into::<PyTuple>()?;
+            let raw_data = tup.get_item(0)?;
+            let record_details = tup.get_item(1)?;
+            let next = tup.get_item(2)?;
+            let version_id = key
+                .get_item(-1_isize)?
+                .cast_into::<PyBytes>()
+                .map_err(|_| PyValueError::new_err("key[-1] must be bytes"))?;
+            let raw = raw_data
+                .cast_into::<PyBytes>()
+                .map_err(|_| PyValueError::new_err("raw_data must be bytes"))?;
+            let (body, digest) =
+                bazaar::knit::parse_record(version_id.as_bytes(), raw.as_bytes())
+                    .map_err(knit_err_to_py)?;
+            let lines = pyo3::types::PyList::empty(py);
+            for line in &body {
+                lines.append(PyBytes::new(py, line))?;
+            }
+            let py_digest = PyBytes::new(py, &digest);
+            result.set_item(
+                &key,
+                PyTuple::new(
+                    py,
+                    [
+                        lines.as_any(),
+                        record_details.as_any(),
+                        py_digest.as_any(),
+                        next.as_any(),
+                    ],
+                )?,
+            )?;
+        }
+        Ok(result.into_any().unbind())
     }
 
     #[pyo3(signature = (keys, allow_missing=false))]
@@ -5032,23 +5201,10 @@ impl PyKnitVersionedFiles {
         keys: Bound<'_, PyAny>,
         allow_missing: bool,
     ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("allow_missing", allow_missing)?;
-        py_self
-            .call_method("_get_record_map", (keys,), Some(&kwargs))
-            .map(|b| b.unbind())
-    }
-
-    fn _raw_map_to_record_map(
-        &self,
-        py: Python<'_>,
-        raw_map: Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyAny>> {
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("_raw_map_to_record_map", (raw_map,))
-            .map(|b| b.unbind())
+        let raw_map = self
+            ._get_record_map_unparsed(py, keys, allow_missing)?
+            .into_bound(py);
+        self._raw_map_to_record_map(py, raw_map)
     }
 
     fn _parse_record_unchecked(
