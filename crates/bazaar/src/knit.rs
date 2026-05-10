@@ -3498,6 +3498,154 @@ where
     }
 }
 
+/// A record returned by [`KnitVersionedFiles::get_record_stream`].
+///
+/// Mirrors Python's `KnitContentFactory`: holds the key, parents, storage
+/// method, and raw (gzip-compressed) bytes for one revision.  The raw bytes
+/// can be passed directly to [`parse_record`] or [`parse_record_unchecked`].
+#[derive(Debug, Clone)]
+pub struct KnitContentFactory {
+    pub key: KnitKey,
+    /// `None` when there is no graph information (e.g. `has_graph = false`).
+    pub parents: Option<Vec<KnitKey>>,
+    pub record_details: KnitRecordDetails,
+    /// SHA-1 digest of the reconstructed fulltext, or `None` if not yet
+    /// computed (lazy; callers can compute it with [`parse_record_header_only`]).
+    pub sha1: Option<Vec<u8>>,
+    /// Raw gzip bytes as stored on disk.
+    pub raw_record: Vec<u8>,
+    pub annotated: bool,
+}
+
+impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
+    /// Fetch records for `keys`, emitting one [`KnitContentFactory`] per
+    /// locally-present key plus one [`KnitContentFactory`] with absent status
+    /// (empty `raw_record`) for each key that is not found.
+    ///
+    /// Ordering is controlled by `ordering`:
+    /// - `"unordered"` — I/O-efficient order (sorted by file and offset).
+    /// - `"topological"` — parents strictly before children.
+    ///
+    /// When `include_delta_closure` is `false`, raw gzip bytes are fetched
+    /// directly.  When `true`, the full compression closure is walked first
+    /// so that every record's basis is present in the returned slice.
+    ///
+    /// Keys not found locally are returned as absent entries (`raw_record`
+    /// empty and `sha1` `None`); the caller is responsible for consulting
+    /// fallback stores.
+    pub fn get_record_stream(
+        &self,
+        keys: &[KnitKey],
+        ordering: &str,
+        include_delta_closure: bool,
+    ) -> Result<Vec<KnitContentFactory>, KnitError> {
+        use std::collections::{HashMap, HashSet};
+
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // For the delta-closure case we walk the compression chain so that
+        // basis keys are included in the fetch, matching Python's
+        // _get_components_positions(allow_missing=True).
+        let positions: HashMap<KnitKey, KnitRecordDetails> = if include_delta_closure {
+            let closure_result = walk_compression_closure::<KnitKey, KnitRecordDetails, _>(
+                keys.iter().cloned(),
+                true,
+                |batch| {
+                    let details = self.index.get_build_details(batch).unwrap_or_default();
+                    let mut present = HashMap::new();
+                    let mut missing = HashSet::new();
+                    for k in batch {
+                        if let Some(det) = details.get(k) {
+                            present
+                                .insert(k.clone(), (det.compression_parent.clone(), det.clone()));
+                        } else {
+                            missing.insert(k.clone());
+                        }
+                    }
+                    ClosureBatch { present, missing }
+                },
+            );
+            // allow_missing=true so Err never occurs; unwrap is safe.
+            closure_result.unwrap_or_default()
+        } else {
+            self.index.get_build_details(keys)?
+        };
+
+        let present_keys: Vec<KnitKey> = keys
+            .iter()
+            .filter(|k| positions.contains_key(*k))
+            .cloned()
+            .collect();
+        let absent_keys: Vec<KnitKey> = keys
+            .iter()
+            .filter(|k| !positions.contains_key(*k))
+            .cloned()
+            .collect();
+
+        let sorted_keys: Vec<KnitKey> = match ordering {
+            "topological" => {
+                let parent_map = self.index.get_parent_map(&present_keys)?;
+                let mut sorter = vcs_graph::tsort::TopoSorter::new(parent_map.into_iter());
+                sorter
+                    .sorted()
+                    .map_err(|e| KnitError::Corrupt(format!("topo_sort: {e:?}")))?
+            }
+            _ => {
+                // Unordered: sort by I/O position.
+                let mut ks = present_keys.clone();
+                self.index.sort_keys_by_io(&mut ks, &positions);
+                ks
+            }
+        };
+
+        let memos: Vec<KnitIndexMemo> = sorted_keys
+            .iter()
+            .map(|k| positions[k].index_memo.clone())
+            .collect();
+        let raw_records = self.access.get_raw_records(&memos)?;
+
+        let mut out: Vec<KnitContentFactory> = Vec::with_capacity(keys.len());
+
+        // Emit absent entries first, matching Python's ordering.
+        for key in &absent_keys {
+            out.push(KnitContentFactory {
+                key: key.clone(),
+                parents: None,
+                record_details: KnitRecordDetails {
+                    method: KnitMethod::Fulltext,
+                    noeol: false,
+                    index_memo: KnitIndexMemo {
+                        path: String::new(),
+                        offset: 0,
+                        length: 0,
+                    },
+                    compression_parent: None,
+                    parents: vec![],
+                },
+                sha1: None,
+                raw_record: vec![],
+                annotated: self.factory.annotated(),
+            });
+        }
+
+        for (key, raw) in sorted_keys.into_iter().zip(raw_records) {
+            let details = positions[&key].clone();
+            out.push(KnitContentFactory {
+                key,
+                parents: Some(details.parents.clone()),
+                record_details: details,
+                sha1: None,
+                raw_record: raw,
+                annotated: self.factory.annotated(),
+            });
+        }
+
+        Ok(out)
+    }
+}
+
 /// Port of Python's `KnitVersionedFiles._merge_annotations`.
 ///
 /// When the factory is annotated, each line in `content` starts with the new

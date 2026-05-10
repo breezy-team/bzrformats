@@ -4532,9 +4532,9 @@ impl PyKnitVersionedFiles {
             let method = index.get_method(k).map_err(knit_err_to_py)?;
             if method != bazaar::knit::KnitMethod::Fulltext {
                 let py_key = py_knit_key_to_py(py, k)?;
-                let parents_obj = parent_map_raw
-                    .get_item(&py_key)?
-                    .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("{k:?} not in parent_map")))?;
+                let parents_obj = parent_map_raw.get_item(&py_key)?.ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!("{k:?} not in parent_map"))
+                })?;
                 let parents_tup = parents_obj.cast_into::<PyTuple>()?;
                 if parents_tup.is_empty() {
                     continue;
@@ -4572,11 +4572,7 @@ impl PyKnitVersionedFiles {
         Ok(result.into_any().unbind())
     }
 
-    fn annotate<'py>(
-        &self,
-        py: Python<'py>,
-        key: Bound<'py, PyAny>,
-    ) -> PyResult<Py<PyAny>> {
+    fn annotate<'py>(&self, py: Python<'py>, key: Bound<'py, PyAny>) -> PyResult<Py<PyAny>> {
         // KnitVersionedFiles.annotate(key) calls self._factory.annotate(self, key),
         // which in turn calls self._get_content(key).annotate(). Short-circuit by
         // calling _get_content directly and then invoking annotate() on the result.
@@ -4594,7 +4590,11 @@ impl PyKnitVersionedFiles {
             .map(|b| b.unbind())
     }
 
-    fn insert_record_stream(slf: Py<Self>, py: Python<'_>, stream: Bound<'_, PyAny>) -> PyResult<()> {
+    fn insert_record_stream(
+        slf: Py<Self>,
+        py: Python<'_>,
+        stream: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
         // TODO: port insert_record_stream to Rust; for now delegate to Python
         // via the KnitVersionedFilesPy wrapper which knows the full adapter logic.
         let knit_m = py.import("bzrformats.knit")?;
@@ -4638,11 +4638,7 @@ impl PyKnitVersionedFiles {
             return Ok(PyList::empty(py).into_any().unbind());
         }
 
-        let has_graph: bool = this
-            .index_obj
-            .bind(py)
-            .getattr("has_graph")?
-            .extract()?;
+        let has_graph: bool = this.index_obj.bind(py).getattr("has_graph")?.extract()?;
         let effective_ordering = if !has_graph {
             "unordered".to_string()
         } else {
@@ -4655,10 +4651,9 @@ impl PyKnitVersionedFiles {
             // The delta-closure path uses _VFContentMapGenerator. Pass slf directly
             // since PyKnitVersionedFiles exposes all required attributes.
             let py_kvf = this_ref.clone().into_any();
-            let positions = py_kvf.call_method1(
-                "_get_components_positions",
-                (key_set.clone(), true),
-            )?.cast_into::<PyDict>()?;
+            let positions = py_kvf
+                .call_method1("_get_components_positions", (key_set.clone(), true))?
+                .cast_into::<PyDict>()?;
             let absent_keys = pyo3::types::PySet::empty(py)?;
             for k in key_set.try_iter()? {
                 let k = k?;
@@ -4676,18 +4671,19 @@ impl PyKnitVersionedFiles {
                 result_list.append(absent_factory.call1((k,))?)?;
             }
             let generator_cls = knit_m.getattr("_VFContentMapGenerator")?;
-            let present_keys: Vec<Bound<'_, PyAny>> = global_map
-                .cast::<PyDict>()?
-                .keys()
-                .iter()
-                .collect();
-            for sub_keys in this._group_keys_for_io(
-                py,
-                PyList::new(py, &present_keys)?.into_any(),
-                pyo3::types::PySet::empty(py)?.into_any(),
-                positions.clone().into_any(),
-                None,
-            )?.into_bound(py).try_iter()? {
+            let present_keys: Vec<Bound<'_, PyAny>> =
+                global_map.cast::<PyDict>()?.keys().iter().collect();
+            for sub_keys in this
+                ._group_keys_for_io(
+                    py,
+                    PyList::new(py, &present_keys)?.into_any(),
+                    pyo3::types::PySet::empty(py)?.into_any(),
+                    positions.clone().into_any(),
+                    None,
+                )?
+                .into_bound(py)
+                .try_iter()?
+            {
                 let sub_tup = sub_keys?.cast_into::<PyTuple>()?;
                 let chunk_keys = sub_tup.get_item(0)?;
                 let non_local = sub_tup.get_item(1)?;
@@ -4704,179 +4700,117 @@ impl PyKnitVersionedFiles {
             return Ok(result_list.into_any().unbind());
         }
 
-        // Non-delta-closure path: fetch raw bytes and yield KnitContentFactory.
-        let build_details_map = this
-            .index_obj
-            .bind(py)
-            .call_method1("get_build_details", (key_set.clone(),))?
-            .cast_into::<PyDict>()?;
+        // Non-delta-closure path: drive pure-Rust KnitVersionedFiles::get_record_stream.
+        let knit_keys: Vec<KnitKey> = key_set
+            .try_iter()?
+            .map(|k| extract_knit_key(&k?).map_err(knit_err_to_py))
+            .collect::<PyResult<_>>()?;
 
-        // positions: {key: (record_details, index_memo, compression_parent)}
-        let positions = PyDict::new(py);
-        for (key, details) in build_details_map.iter() {
-            let tup = details.cast_into::<PyTuple>()?;
-            let index_memo = tup.get_item(0)?;
-            let record_details = tup.get_item(3)?;
-            let compression_parent = tup.get_item(1)?;
-            positions.set_item(&key, PyTuple::new(py, [&record_details, &index_memo, &compression_parent])?)?;
-        }
+        let table = Arc::new(Mutex::new(MemoTable::default()));
+        let index = PyKnitIndex::new(this.index_obj.bind(py).clone(), table.clone());
+        let access = PyKnitAccess::new(this.access_obj.bind(py).clone(), table);
 
-        // Collect absent keys.
-        let result_list = PyList::empty(py);
-        let global_map_tup = this
-            ._get_parent_map_with_sources(py, key_set.clone().into_any())?
-            .into_bound(py)
-            .cast_into::<PyTuple>()?;
-        let global_map = global_map_tup.get_item(0)?.cast_into::<PyDict>()?;
-        let parent_maps = global_map_tup.get_item(1)?.cast_into::<pyo3::types::PyList>()?;
-
-        let absent_factory = knit_m.getattr("AbsentContentFactory")?;
-        for k in key_set.try_iter()? {
-            let k = k?;
-            if global_map.get_item(&k)?.is_none() {
-                result_list.append(absent_factory.call1((k,))?)?;
-            }
-        }
-
-        // Sort and group present keys by source.
-        let local_parent_map = parent_maps.get_item(0)?.cast_into::<PyDict>()?;
-        let present_keys = PyList::empty(py);
-        for (k, _) in global_map.iter() {
-            present_keys.append(k)?;
-        }
-
-        // Build source_keys: list of (parent_map, [keys]) in output order.
-        let source_keys: Vec<(Bound<'_, PyDict>, Vec<Bound<'_, PyAny>>)>;
-        if effective_ordering == "topological" || effective_ordering == "groupcompress" {
-            let sorted_keys = if effective_ordering == "topological" {
-                let vcsgraph = py.import("vcsgraph.tsort")?;
-                vcsgraph
-                    .call_method1("topo_sort", (global_map.clone(),))?
-                    .cast_into::<pyo3::types::PyList>()?
-            } else {
-                let vf_m = py.import("bzrformats.versionedfile")?;
-                vf_m.call_method1("sort_groupcompress", (global_map.clone(),))?
-                    .cast_into::<pyo3::types::PyList>()?
-            };
-            // Group consecutive keys by source.
-            let mut groups: Vec<(Bound<'_, PyDict>, Vec<Bound<'_, PyAny>>)> = Vec::new();
-            let mut current_source: Option<usize> = None;
-            for k in sorted_keys.iter() {
-                let mut key_source_idx = 0usize;
-                for (i, pm) in parent_maps.iter().enumerate() {
-                    let pm = pm.cast_into::<PyDict>()?;
-                    if pm.get_item(&k)?.is_some() {
-                        key_source_idx = i;
-                        break;
-                    }
-                }
-                if current_source != Some(key_source_idx) {
-                    let pm = parent_maps.get_item(key_source_idx)?.cast_into::<PyDict>()?;
-                    groups.push((pm, Vec::new()));
-                    current_source = Some(key_source_idx);
-                }
-                groups.last_mut().unwrap().1.push(k);
-            }
-            source_keys = groups;
+        let rust_records = if this.annotated {
+            let kvf = bazaar::knit::KnitVersionedFiles::new(
+                index,
+                access,
+                bazaar::knit::KnitAnnotateFactory,
+                this.max_delta_chain,
+            );
+            kvf.get_record_stream(&knit_keys, &effective_ordering, false)
+                .map_err(knit_err_to_py)?
         } else {
-            if effective_ordering != "unordered" {
-                return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
-                    "valid values for ordering are: \"unordered\", \"groupcompress\" or \"topological\" not: {ordering:?}"
-                )));
+            let kvf = bazaar::knit::KnitVersionedFiles::new(
+                index,
+                access,
+                bazaar::knit::KnitPlainFactory,
+                this.max_delta_chain,
+            );
+            kvf.get_record_stream(&knit_keys, &effective_ordering, false)
+                .map_err(knit_err_to_py)?
+        };
+
+        let result_list = PyList::empty(py);
+        let knitcf_cls = knit_m.getattr("KnitContentFactory")?;
+        let absent_factory = knit_m.getattr("AbsentContentFactory")?;
+        let mut absent_keys: Vec<KnitKey> = Vec::new();
+
+        for rec in rust_records {
+            if rec.raw_record.is_empty() {
+                // Absent — may be in a fallback; defer to the fallback loop.
+                absent_keys.push(rec.key);
+                continue;
             }
-            // Unordered: group by source, remote sources first, sort local by I/O.
-            let mut groups: Vec<(Bound<'_, PyDict>, Vec<Bound<'_, PyAny>>)> = Vec::new();
-            let n = parent_maps.len();
-            for i in (0..n).rev() {
-                let pm = parent_maps.get_item(i)?.cast_into::<PyDict>()?;
-                let mut sub_keys: Vec<Bound<'_, PyAny>> = Vec::new();
-                for (k, _) in pm.iter() {
-                    sub_keys.push(k);
-                }
-                if !sub_keys.is_empty() {
-                    groups.push((pm, sub_keys));
-                }
-            }
-            // Sort the local (index 0) group by I/O if present.
-            if let Some(local_group) = groups.iter_mut().find(|(pm, _)| {
-                pm.as_ptr() == local_parent_map.as_ptr()
-            }) {
-                let sub_list = PyList::empty(py);
-                for k in &local_group.1 {
-                    sub_list.append(k)?;
-                }
-                this.index_obj
-                    .bind(py)
-                    .call_method1("_sort_keys_by_io", (sub_list.clone(), positions.clone()))?;
-                local_group.1 = sub_list.iter().collect();
-            }
-            source_keys = groups;
+            let py_key = py_knit_key_to_py(py, &rec.key)?;
+            let parents_obj = if let Some(ref parents) = rec.parents {
+                let tup = PyTuple::new(
+                    py,
+                    parents
+                        .iter()
+                        .map(|p| py_knit_key_to_py(py, p))
+                        .collect::<PyResult<Vec<_>>>()?,
+                )?;
+                tup.into_any()
+            } else {
+                py.None().into_bound(py)
+            };
+            let method_str = match rec.record_details.method {
+                bazaar::knit::KnitMethod::LineDelta => "line-delta",
+                _ => "fulltext",
+            };
+            let noeol = rec.record_details.noeol;
+            let record_details = PyTuple::new(
+                py,
+                [
+                    pyo3::types::PyString::new(py, method_str).as_any(),
+                    pyo3::types::PyBool::new(py, noeol).as_any(),
+                ],
+            )?;
+            let raw = PyBytes::new(py, &rec.raw_record);
+            let factory = knitcf_cls.call1((
+                py_key,
+                parents_obj,
+                record_details,
+                py.None(),
+                raw,
+                rec.annotated,
+                py.None(),
+            ))?;
+            result_list.append(factory)?;
         }
 
-        // Emit records.
-        let knitcf_cls = knit_m.getattr("KnitContentFactory")?;
-        for (source, sub_keys) in source_keys {
-            if source.as_ptr() == local_parent_map.as_ptr() {
-                // Local keys: fetch raw bytes and wrap in KnitContentFactory.
-                let records_list = PyList::empty(py);
-                for k in &sub_keys {
-                    let pos = positions
-                        .get_item(k)?
-                        .ok_or_else(|| PyValueError::new_err("key not in positions"))?
-                        .cast_into::<PyTuple>()?;
-                    let index_memo = pos.get_item(1)?;
-                    records_list.append(PyTuple::new(py, [k, &index_memo])?)?;
-                }
-                let raw_iter = this
-                    ._read_records_iter_unchecked(py, records_list.into_any())?
-                    .into_bound(py);
-                for raw_item in raw_iter.try_iter()? {
-                    let raw_tup = raw_item?.cast_into::<PyTuple>()?;
-                    let key = raw_tup.get_item(0)?;
-                    let raw_data = raw_tup.get_item(1)?;
-                    let parents = global_map.get_item(&key)?;
-                    let pos = positions
-                        .get_item(&key)?
-                        .ok_or_else(|| PyValueError::new_err("key not in positions"))?
-                        .cast_into::<PyTuple>()?;
-                    let record_details = pos.get_item(0)?;
-                    let factory = knitcf_cls.call1((
-                        key,
-                        parents,
-                        record_details,
-                        py.None(),
-                        raw_data,
-                        this.annotated,
-                        py.None(),
-                    ))?;
-                    result_list.append(factory)?;
-                }
-            } else {
-                // Fallback VF: find which fallback this source belongs to.
-                let vf_idx = parent_maps
-                    .iter()
-                    .position(|pm| {
-                        pm.cast::<PyDict>()
-                            .map(|d| d.as_ptr() == source.as_ptr())
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(1)
-                    .saturating_sub(1);
-                if let Some(fallback) = this.immediate_fallback_vfs.get(vf_idx) {
-                    let fb_keys = PyList::empty(py);
-                    for k in &sub_keys {
-                        fb_keys.append(k)?;
-                    }
-                    let fb_stream = fallback.bind(py).call_method1(
-                        "get_record_stream",
-                        (fb_keys, effective_ordering.as_str(), false),
-                    )?;
-                    for item in fb_stream.try_iter()? {
-                        result_list.append(item?)?;
-                    }
+        // Consult fallback VFs for absent keys.
+        for fallback in &this.immediate_fallback_vfs {
+            if absent_keys.is_empty() {
+                break;
+            }
+            let fb_keys = PyList::empty(py);
+            for k in &absent_keys {
+                fb_keys.append(py_knit_key_to_py(py, k)?)?;
+            }
+            let fb_stream = fallback.bind(py).call_method1(
+                "get_record_stream",
+                (fb_keys, effective_ordering.as_str(), false),
+            )?;
+            let mut still_absent: Vec<KnitKey> = Vec::new();
+            for item in fb_stream.try_iter()? {
+                let item = item?;
+                let storage_kind: String = item.getattr("storage_kind")?.extract()?;
+                if storage_kind == "absent" {
+                    let key = extract_knit_key(&item.getattr("key")?).map_err(knit_err_to_py)?;
+                    still_absent.push(key);
+                } else {
+                    result_list.append(item)?;
                 }
             }
+            absent_keys = still_absent;
         }
+
+        // Emit remaining absent entries (not found anywhere).
+        for key in absent_keys {
+            result_list.append(absent_factory.call1((py_knit_key_to_py(py, &key)?,))?)?;
+        }
+
         Ok(result_list.into_any().unbind())
     }
 
@@ -5259,10 +5193,7 @@ impl PyKnitVersionedFiles {
             for line in &content.lines {
                 lines.append(PyBytes::new(py, line))?;
             }
-            let obj = m.call_method1(
-                "PlainKnitContent",
-                (lines, PyBytes::new(py, &version_id)),
-            )?;
+            let obj = m.call_method1("PlainKnitContent", (lines, PyBytes::new(py, &version_id)))?;
             obj.setattr("_should_strip_eol", strip)?;
             Ok(obj.unbind())
         }
@@ -5348,9 +5279,11 @@ impl PyKnitVersionedFiles {
             }
             source_results.append(new_result)?;
         }
-        Ok(PyTuple::new(py, [result.as_any(), source_results.as_any()])?
-            .into_any()
-            .unbind())
+        Ok(
+            PyTuple::new(py, [result.as_any(), source_results.as_any()])?
+                .into_any()
+                .unbind(),
+        )
     }
 
     #[staticmethod]
@@ -5450,10 +5383,11 @@ impl PyKnitVersionedFiles {
             records_list.append(PyTuple::new(py, [key, memo])?)?;
         }
         let raw_map = PyDict::new(py);
-        for ((key, _), raw_obj) in records
-            .iter()
-            .zip(self._read_records_iter_unchecked(py, records_list.into_any())?.bind(py).try_iter()?)
-        {
+        for ((key, _), raw_obj) in records.iter().zip(
+            self._read_records_iter_unchecked(py, records_list.into_any())?
+                .bind(py)
+                .try_iter()?,
+        ) {
             let tup = raw_obj?.cast_into::<PyTuple>()?;
             let raw_data = tup.get_item(1)?;
             let pos_tup = position_map
@@ -5486,9 +5420,8 @@ impl PyKnitVersionedFiles {
             let raw = raw_data
                 .cast_into::<PyBytes>()
                 .map_err(|_| PyValueError::new_err("raw_data must be bytes"))?;
-            let (body, digest) =
-                bazaar::knit::parse_record(version_id.as_bytes(), raw.as_bytes())
-                    .map_err(knit_err_to_py)?;
+            let (body, digest) = bazaar::knit::parse_record(version_id.as_bytes(), raw.as_bytes())
+                .map_err(knit_err_to_py)?;
             let lines = pyo3::types::PyList::empty(py);
             for line in &body {
                 lines.append(PyBytes::new(py, line))?;
@@ -5581,7 +5514,9 @@ impl PyKnitVersionedFiles {
             .call_method1("split_keys_by_prefix_rs", (raw_key_lists,))?
             .cast_into::<PyTuple>()?;
         let prefix_split_keys = split_result.get_item(0)?.cast_into::<PyDict>()?;
-        let prefix_order_list = split_result.get_item(1)?.cast_into::<pyo3::types::PyList>()?;
+        let prefix_order_list = split_result
+            .get_item(1)?
+            .cast_into::<pyo3::types::PyList>()?;
         // Split non-local keys by prefix.
         let raw_nl_lists = PyList::empty(py);
         for k in &non_local_list {
@@ -5663,9 +5598,7 @@ impl PyKnitVersionedFiles {
             .call_method1("find_ancestry", (key_list,))?
             .cast_into::<PyTuple>()?;
         let parent_map = result_tup.get_item(0)?.cast_into::<PyDict>()?;
-        let mut missing_keys = result_tup
-            .get_item(1)?
-            .cast_into::<pyo3::types::PySet>()?;
+        let mut missing_keys = result_tup.get_item(1)?.cast_into::<pyo3::types::PySet>()?;
         for fallback in &self.immediate_fallback_vfs {
             if missing_keys.is_empty() {
                 break;
