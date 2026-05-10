@@ -4595,26 +4595,163 @@ impl PyKnitVersionedFiles {
         py: Python<'_>,
         stream: Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        // TODO: port insert_record_stream to Rust; for now delegate to Python
-        // via the KnitVersionedFilesPy wrapper which knows the full adapter logic.
-        let knit_m = py.import("bzrformats.knit")?;
-        let cls = knit_m.getattr("KnitVersionedFilesPy")?;
-        let this = slf.bind(py).borrow();
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("max_delta_chain", this.max_delta_chain)?;
-        kwargs.set_item("annotated", this.annotated)?;
-        if !this.reload_func.is_none(py) {
-            kwargs.set_item("reload_func", this.reload_func.bind(py))?;
+        let this_ref = slf.bind(py);
+        let this = this_ref.borrow();
+
+        let annotated = this.annotated;
+        let has_delta = this.max_delta_chain > 0;
+        let has_fallbacks = !this.immediate_fallback_vfs.is_empty();
+        let max_delta_chain = this.max_delta_chain;
+
+        // Build the type sets matching Python's insert_record_stream logic.
+        let annotated_prefix = if annotated { "annotated-" } else { "" };
+        let mut native_types: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let ft_native = format!("knit-{annotated_prefix}ft-gz");
+        let delta_native = format!("knit-{annotated_prefix}delta-gz");
+        native_types.insert(&ft_native);
+        if has_delta {
+            native_types.insert(&delta_native);
         }
-        let py_self = cls.call(
-            (this.index_obj.bind(py), this.access_obj.bind(py)),
-            Some(&kwargs),
-        )?;
-        for fallback in &this.immediate_fallback_vfs {
-            py_self.call_method1("add_fallback_versioned_files", (fallback.bind(py),))?;
+        let convertible_annotated_ft = "knit-annotated-ft-gz";
+        let convertible_annotated_delta = "knit-annotated-delta-gz";
+        let mut convertible_types: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        if !annotated {
+            convertible_types.insert(convertible_annotated_ft);
+            if has_delta {
+                convertible_types.insert(convertible_annotated_delta);
+            }
         }
+
+        let table = Arc::new(Mutex::new(MemoTable::default()));
+        let index = PyKnitIndex::new(this.index_obj.bind(py).clone(), table.clone());
+        let index_obj = this.index_obj.clone_ref(py);
+        let access = PyKnitAccess::new(this.access_obj.bind(py).clone(), table);
         drop(this);
-        py_self.call_method1("insert_record_stream", (stream,))?;
+
+        // Marshal the Python stream into KnitStreamRecord items, collecting eagerly.
+        let mut records: Vec<Result<bazaar::knit::KnitStreamRecord, bazaar::knit::KnitError>> =
+            Vec::new();
+
+        for item in stream.try_iter()? {
+            let record = item?;
+            let storage_kind: String = record.getattr("storage_kind")?.extract()?;
+            let sk = storage_kind.as_str();
+
+            if sk == "absent" {
+                let key_obj = record.getattr("key")?;
+                let knit_key = extract_knit_key(&key_obj).map_err(knit_err_to_py)?;
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Absent record in stream: {knit_key:?}"
+                )));
+            }
+
+            let key_obj = record.getattr("key")?;
+            let knit_key = extract_knit_key(&key_obj).map_err(knit_err_to_py)?;
+            let parents_obj = record.getattr("parents")?;
+            let parents: Vec<KnitKey> = if parents_obj.is_none() {
+                vec![]
+            } else {
+                parents_obj
+                    .try_iter()?
+                    .map(|p| extract_knit_key(&p?).map_err(knit_err_to_py))
+                    .collect::<PyResult<_>>()?
+            };
+
+            let is_native = native_types.contains(sk);
+            let is_convertible = convertible_types.contains(sk);
+
+            if is_native || is_convertible {
+                let is_delta = sk.contains("-delta-");
+                let compression_parent = if is_delta {
+                    parents.first().cloned()
+                } else {
+                    None
+                };
+
+                // Mirror Python: store directly unless compression_parent is only in fallbacks.
+                let store_direct = compression_parent.is_none()
+                    || !has_fallbacks
+                    || compression_parent.as_ref().is_some_and(|cp| {
+                        let Ok(py_cp) = py_knit_key_to_py(py, cp) else {
+                            return false;
+                        };
+                        let Ok(map_obj) = index_obj
+                            .bind(py)
+                            .call_method1("get_parent_map", (PyList::new(py, [&py_cp]).unwrap(),))
+                        else {
+                            return false;
+                        };
+                        let Ok(map) = map_obj.cast_into::<PyDict>() else {
+                            return false;
+                        };
+                        map.contains(py_cp).unwrap_or(false)
+                    });
+
+                if store_direct {
+                    let raw_bytes: Vec<u8> = record.getattr("_raw_record")?.extract::<Vec<u8>>()?;
+                    let method = if is_delta {
+                        bazaar::knit::KnitMethod::LineDelta
+                    } else {
+                        bazaar::knit::KnitMethod::Fulltext
+                    };
+                    let build_tup = record.getattr("_build_details")?.cast_into::<PyTuple>()?;
+                    let noeol: bool = build_tup.get_item(1)?.extract()?;
+
+                    if is_native {
+                        records.push(Ok(bazaar::knit::KnitStreamRecord::NativeKnit {
+                            key: knit_key,
+                            parents,
+                            method,
+                            noeol,
+                            compression_parent,
+                            raw_record: raw_bytes,
+                        }));
+                    } else {
+                        records.push(Ok(bazaar::knit::KnitStreamRecord::ConvertAnnotated {
+                            key: knit_key,
+                            parents,
+                            method,
+                            noeol,
+                            compression_parent,
+                            raw_record: raw_bytes,
+                        }));
+                    }
+                    continue;
+                }
+            }
+
+            // For all other cases: reconstruct as plain text lines.
+            let lines_obj = record.call_method1("get_bytes_as", ("lines",))?;
+            let lines: Vec<Vec<u8>> = lines_obj
+                .try_iter()?
+                .map(|l| l?.extract::<Vec<u8>>())
+                .collect::<PyResult<_>>()?;
+            records.push(Ok(bazaar::knit::KnitStreamRecord::Lines {
+                key: knit_key,
+                parents,
+                lines,
+            }));
+        }
+
+        if annotated {
+            let kvf = bazaar::knit::KnitVersionedFiles::new(
+                index,
+                access,
+                bazaar::knit::KnitAnnotateFactory,
+                max_delta_chain,
+            );
+            kvf.insert_record_stream(records).map_err(knit_err_to_py)?;
+        } else {
+            let kvf = bazaar::knit::KnitVersionedFiles::new(
+                index,
+                access,
+                bazaar::knit::KnitPlainFactory,
+                max_delta_chain,
+            );
+            kvf.insert_record_stream(records).map_err(knit_err_to_py)?;
+        }
+
         Ok(())
     }
 

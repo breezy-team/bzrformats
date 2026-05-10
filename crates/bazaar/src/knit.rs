@@ -3498,6 +3498,44 @@ where
     }
 }
 
+/// One record supplied to [`KnitVersionedFiles::insert_record_stream`].
+///
+/// The pyo3 layer inspects each Python stream object and maps it to one of
+/// these variants before calling the pure-Rust implementation.
+pub enum KnitStreamRecord {
+    /// A native knit record whose raw gzip bytes can be blat-copied directly.
+    ///
+    /// `method` is either `Fulltext` or `LineDelta`.
+    /// `noeol` is the `no-eol` build flag.
+    /// `compression_parent` is `Some(parent_key)` for delta records.
+    /// `raw_record` is the gzip-compressed bytes.
+    NativeKnit {
+        key: KnitKey,
+        parents: Vec<KnitKey>,
+        method: KnitMethod,
+        noeol: bool,
+        compression_parent: Option<KnitKey>,
+        raw_record: Vec<u8>,
+    },
+    /// An annotated knit record that must be stripped before storing into an
+    /// unannotated KVF.  Only valid when `self.factory.annotated() == false`.
+    ConvertAnnotated {
+        key: KnitKey,
+        parents: Vec<KnitKey>,
+        method: KnitMethod,
+        noeol: bool,
+        compression_parent: Option<KnitKey>,
+        raw_record: Vec<u8>,
+    },
+    /// A record in some other format; the caller has already decoded it to
+    /// plain text lines.
+    Lines {
+        key: KnitKey,
+        parents: Vec<KnitKey>,
+        lines: Vec<Vec<u8>>,
+    },
+}
+
 /// A record returned by [`KnitVersionedFiles::get_record_stream`].
 ///
 /// Mirrors Python's `KnitContentFactory`: holds the key, parents, storage
@@ -3643,6 +3681,129 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
         }
 
         Ok(out)
+    }
+
+    /// Insert a stream of records into this knit.
+    ///
+    /// Each record must be classified by the caller into one of the three
+    /// [`KnitStreamRecord`] variants.  The method handles:
+    ///
+    /// - [`KnitStreamRecord::NativeKnit`] — raw bytes copied directly to storage,
+    ///   with delta records buffered until their basis is present.
+    /// - [`KnitStreamRecord::ConvertAnnotated`] — annotated bytes stripped to plain
+    ///   before storage (only valid when `self.factory.annotated() == false`).
+    /// - [`KnitStreamRecord::Lines`] — plain text lines passed to `add_lines`.
+    ///
+    /// Mirrors Python's `KnitVersionedFiles.insert_record_stream`.
+    pub fn insert_record_stream(
+        &self,
+        stream: impl IntoIterator<Item = Result<KnitStreamRecord, KnitError>>,
+    ) -> Result<(), KnitError> {
+        use std::collections::HashMap;
+
+        type BufferMap =
+            HashMap<KnitKey, Vec<(KnitKey, Vec<KnitMethod>, KnitIndexMemo, Vec<KnitKey>)>>;
+
+        self.index.check_write_ok()?;
+
+        // key = compression_parent not yet present; value = entries waiting for it.
+        let mut buffered: BufferMap = HashMap::new();
+
+        for item in stream {
+            let record = item?;
+
+            // Determine the raw bytes and metadata to write.
+            let (key, parents, method, noeol, compression_parent, raw_bytes) = match record {
+                KnitStreamRecord::NativeKnit {
+                    key,
+                    parents,
+                    method,
+                    noeol,
+                    compression_parent,
+                    raw_record,
+                } => (key, parents, method, noeol, compression_parent, raw_record),
+                KnitStreamRecord::ConvertAnnotated {
+                    key,
+                    parents,
+                    method,
+                    noeol,
+                    compression_parent,
+                    raw_record,
+                } => {
+                    let converted = match method {
+                        KnitMethod::LineDelta => {
+                            recompress_annotated_to_unannotated_delta(&raw_record)?
+                        }
+                        _ => recompress_annotated_to_unannotated_fulltext(&raw_record)?,
+                    };
+                    (key, parents, method, noeol, compression_parent, converted)
+                }
+                KnitStreamRecord::Lines {
+                    key,
+                    parents,
+                    lines,
+                } => {
+                    self.access.flush()?;
+                    self.add_lines(key.clone(), parents, lines, false)?;
+                    // Drain any entries whose basis is now present.
+                    let mut ready = vec![key];
+                    while let Some(k) = ready.pop() {
+                        if let Some(entries) = buffered.remove(&k) {
+                            let new_keys: Vec<KnitKey> =
+                                entries.iter().map(|(ek, _, _, _)| ek.clone()).collect();
+                            self.index.add_records(&entries, false, false)?;
+                            ready.extend(new_keys);
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            // Write raw bytes and (maybe) register the index entry.
+            parse_record_header_only(&raw_bytes)?;
+            let size = raw_bytes.len();
+            let memo = self.access.add_raw_record(&key, size, vec![raw_bytes])?;
+            let mut options = vec![method];
+            if noeol {
+                options.push(KnitMethod::NoEol);
+            }
+            let entry = (key.clone(), options, memo, parents.to_vec());
+
+            let needs_buffer = compression_parent.as_ref().is_some_and(|cp| {
+                self.index
+                    .get_parent_map(std::slice::from_ref(cp))
+                    .map(|m| !m.contains_key(cp))
+                    .unwrap_or(true)
+            });
+
+            if needs_buffer {
+                buffered
+                    .entry(compression_parent.unwrap())
+                    .or_default()
+                    .push(entry);
+            } else {
+                self.index.add_records(&[entry], false, false)?;
+                // Drain any entries whose basis is now present.
+                let mut ready = vec![key];
+                while let Some(k) = ready.pop() {
+                    if let Some(entries) = buffered.remove(&k) {
+                        let new_keys: Vec<KnitKey> =
+                            entries.iter().map(|(ek, _, _, _)| ek.clone()).collect();
+                        self.index.add_records(&entries, false, false)?;
+                        ready.extend(new_keys);
+                    }
+                }
+            }
+        }
+
+        // Any entries still buffered get registered with missing_compression_parents=true
+        // so pack-format indexes can hold them for deferred resolution.
+        if !buffered.is_empty() {
+            let all_entries: Vec<_> = buffered.into_values().flatten().collect();
+            self.index.add_records(&all_entries, false, true)?;
+        }
+
+        Ok(())
     }
 }
 
