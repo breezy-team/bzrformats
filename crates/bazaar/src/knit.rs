@@ -3536,6 +3536,114 @@ pub enum KnitStreamRecord {
     },
 }
 
+/// One entry in a pre-fetched raw record map for the delta-closure path.
+///
+/// Mirrors the values in `_ContentMapGenerator._raw_record_map`:
+/// `{key: (raw_bytes, (method, noeol), next_key)}`.
+#[derive(Debug, Clone)]
+pub struct DeltaClosureRawEntry {
+    pub raw_bytes: Vec<u8>,
+    pub method: KnitMethod,
+    pub noeol: bool,
+    /// Compression parent key (`None` for fulltexts).
+    pub next: Option<KnitKey>,
+}
+
+/// Pre-fetched raw record map for the delta-closure path.
+///
+/// The map contains all records needed to reconstruct each requested key
+/// as a fulltext by walking the `next` chain.
+pub type DeltaClosureRawMap = std::collections::HashMap<KnitKey, DeltaClosureRawEntry>;
+
+/// Reconstruct the full text for `key` by walking the compression chain in
+/// `raw_map`.
+///
+/// Mirrors `_ContentMapGenerator._get_one_work` for a single key.  Returns
+/// the plain text lines (each ending in `\n` except possibly the last when
+/// `noeol` is set) and the SHA-1 digest from the innermost record header.
+pub fn reconstruct_text_from_raw_map<F: KnitFactory>(
+    factory: &F,
+    raw_map: &DeltaClosureRawMap,
+    key: &KnitKey,
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), KnitError> {
+    // Walk the chain from key outward to the base (fulltext).
+    let mut chain: Vec<KnitKey> = Vec::new();
+    let mut cursor = key.clone();
+    loop {
+        let entry = raw_map.get(&cursor).ok_or_else(|| {
+            KnitError::Corrupt(format!("key {cursor:?} missing from raw record map"))
+        })?;
+        chain.push(cursor.clone());
+        match &entry.next {
+            None => break,
+            Some(next) => cursor = next.clone(),
+        }
+    }
+
+    // Reconstruct from base to tip, applying deltas.
+    let mut content: Option<F::Content> = None;
+    let mut last_digest = Vec::new();
+    for k in chain.iter().rev() {
+        let entry = &raw_map[k];
+        let version_id = k.last().cloned().unwrap_or_default();
+        let (body_lines, digest) = parse_record(&version_id, &entry.raw_bytes)?;
+        let refs: Vec<&[u8]> = body_lines.iter().map(|l| l.as_slice()).collect();
+        let new_content = factory.parse_record(
+            &version_id,
+            &refs,
+            entry.method.clone(),
+            entry.noeol,
+            content.as_ref(),
+        )?;
+        content = Some(new_content);
+        last_digest = digest;
+    }
+
+    let content = content.ok_or_else(|| KnitError::Corrupt("empty chain".to_string()))?;
+    Ok((
+        content.text().into_iter().map(|l| l.to_vec()).collect(),
+        last_digest,
+    ))
+}
+
+/// Build the wire bytes for a delta-closure raw map.
+///
+/// Mirrors `_ContentMapGenerator._wire_bytes`: serializes the full raw record
+/// map (all fetched components) together with `emit_keys` and `global_map`
+/// into the `knit-delta-closure` wire format.
+pub fn build_delta_closure_wire_bytes(
+    annotated: bool,
+    emit_keys: &[KnitKey],
+    raw_map: &DeltaClosureRawMap,
+    global_map: &std::collections::HashMap<KnitKey, Option<Vec<KnitKey>>>,
+) -> Vec<u8> {
+    let parent_slices: Vec<Option<Vec<&[Vec<u8>]>>> = raw_map
+        .iter()
+        .map(|(key, _)| {
+            global_map
+                .get(key)
+                .and_then(|p| p.as_ref())
+                .map(|ps| ps.iter().map(|p| p.as_slice()).collect())
+        })
+        .collect();
+
+    let emit_key_slices: Vec<&[Vec<u8>]> = emit_keys.iter().map(|k| k.as_slice()).collect();
+    let records: Vec<KnitDeltaClosureRecord<'_, Vec<u8>>> = raw_map
+        .iter()
+        .zip(parent_slices.iter())
+        .map(|((key, entry), parents_opt)| KnitDeltaClosureRecord {
+            key: key.as_slice(),
+            parents: parents_opt.as_deref(),
+            method: entry.method.as_str().as_bytes(),
+            noeol: entry.noeol,
+            next: entry.next.as_deref(),
+            record_bytes: &entry.raw_bytes,
+        })
+        .collect();
+
+    build_knit_delta_closure_wire(annotated, &emit_key_slices, &records)
+}
+
 /// A record returned by [`KnitVersionedFiles::get_record_stream`].
 ///
 /// Mirrors Python's `KnitContentFactory`: holds the key, parents, storage
