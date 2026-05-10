@@ -368,9 +368,18 @@ fn mpdiff_collect_parent_chunks<'py>(
 /// each referenced parent key to the set of child keys that reference it,
 /// and `new_keys` (when tracking is enabled) remembers every key added.
 #[pyclass(name = "KeyRefs")]
-struct KeyRefs {
+pub(crate) struct KeyRefs {
     refs: Py<PyDict>,
     new_keys: Option<Py<PySet>>,
+}
+
+impl KeyRefs {
+    pub(crate) fn empty(py: Python<'_>) -> PyResult<Self> {
+        Ok(Self {
+            refs: PyDict::new(py).unbind(),
+            new_keys: None,
+        })
+    }
 }
 
 #[pymethods]
