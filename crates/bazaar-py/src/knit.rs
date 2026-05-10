@@ -4558,11 +4558,216 @@ impl PyKnitVersionedFiles {
         ordering: Bound<'_, PyAny>,
         include_delta_closure: Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        // TODO: port get_record_stream to Rust
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("get_record_stream", (keys, ordering, include_delta_closure))
-            .map(|b| b.unbind())
+        let include_delta_closure: bool = include_delta_closure.extract()?;
+        let ordering: String = ordering.extract()?;
+
+        let key_set = pyo3::types::PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            key_set.add(k?)?;
+        }
+        if key_set.is_empty() {
+            return Ok(PyList::empty(py).into_any().unbind());
+        }
+
+        let has_graph: bool = self
+            .index_obj
+            .bind(py)
+            .getattr("has_graph")?
+            .extract()?;
+        let effective_ordering = if !has_graph {
+            "unordered".to_string()
+        } else {
+            ordering.clone()
+        };
+
+        let knit_m = py.import("bzrformats.knit")?;
+
+        if include_delta_closure {
+            // The delta-closure path uses _VFContentMapGenerator which still lives
+            // in Python. Build a py_self wrapper to drive it.
+            let py_self = self.to_py_kvf(py)?;
+            return py_self
+                .call_method1(
+                    "get_record_stream",
+                    (key_set, effective_ordering.as_str(), true),
+                )
+                .map(|b| b.unbind());
+        }
+
+        // Non-delta-closure path: fetch raw bytes and yield KnitContentFactory.
+        let build_details_map = self
+            .index_obj
+            .bind(py)
+            .call_method1("get_build_details", (key_set.clone(),))?
+            .cast_into::<PyDict>()?;
+
+        // positions: {key: (record_details, index_memo, compression_parent)}
+        let positions = PyDict::new(py);
+        for (key, details) in build_details_map.iter() {
+            let tup = details.cast_into::<PyTuple>()?;
+            let index_memo = tup.get_item(0)?;
+            let record_details = tup.get_item(3)?;
+            let compression_parent = tup.get_item(1)?;
+            positions.set_item(&key, PyTuple::new(py, [&record_details, &index_memo, &compression_parent])?)?;
+        }
+
+        // Collect absent keys.
+        let result_list = PyList::empty(py);
+        let global_map_tup = self
+            ._get_parent_map_with_sources(py, key_set.clone().into_any())?
+            .into_bound(py)
+            .cast_into::<PyTuple>()?;
+        let global_map = global_map_tup.get_item(0)?.cast_into::<PyDict>()?;
+        let parent_maps = global_map_tup.get_item(1)?.cast_into::<pyo3::types::PyList>()?;
+
+        let absent_factory = knit_m.getattr("AbsentContentFactory")?;
+        for k in key_set.try_iter()? {
+            let k = k?;
+            if global_map.get_item(&k)?.is_none() {
+                result_list.append(absent_factory.call1((k,))?)?;
+            }
+        }
+
+        // Sort and group present keys by source.
+        let local_parent_map = parent_maps.get_item(0)?.cast_into::<PyDict>()?;
+        let present_keys = PyList::empty(py);
+        for (k, _) in global_map.iter() {
+            present_keys.append(k)?;
+        }
+
+        // Build source_keys: list of (parent_map, [keys]) in output order.
+        let source_keys: Vec<(Bound<'_, PyDict>, Vec<Bound<'_, PyAny>>)>;
+        if effective_ordering == "topological" || effective_ordering == "groupcompress" {
+            let sorted_keys = if effective_ordering == "topological" {
+                let vcsgraph = py.import("vcsgraph.tsort")?;
+                vcsgraph
+                    .call_method1("topo_sort", (global_map.clone(),))?
+                    .cast_into::<pyo3::types::PyList>()?
+            } else {
+                let vf_m = py.import("bzrformats.versionedfile")?;
+                vf_m.call_method1("sort_groupcompress", (global_map.clone(),))?
+                    .cast_into::<pyo3::types::PyList>()?
+            };
+            // Group consecutive keys by source.
+            let mut groups: Vec<(Bound<'_, PyDict>, Vec<Bound<'_, PyAny>>)> = Vec::new();
+            let mut current_source: Option<usize> = None;
+            for k in sorted_keys.iter() {
+                let mut key_source_idx = 0usize;
+                for (i, pm) in parent_maps.iter().enumerate() {
+                    let pm = pm.cast_into::<PyDict>()?;
+                    if pm.get_item(&k)?.is_some() {
+                        key_source_idx = i;
+                        break;
+                    }
+                }
+                if current_source != Some(key_source_idx) {
+                    let pm = parent_maps.get_item(key_source_idx)?.cast_into::<PyDict>()?;
+                    groups.push((pm, Vec::new()));
+                    current_source = Some(key_source_idx);
+                }
+                groups.last_mut().unwrap().1.push(k);
+            }
+            source_keys = groups;
+        } else {
+            if effective_ordering != "unordered" {
+                return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                    "valid values for ordering are: \"unordered\", \"groupcompress\" or \"topological\" not: {ordering:?}"
+                )));
+            }
+            // Unordered: group by source, remote sources first, sort local by I/O.
+            let mut groups: Vec<(Bound<'_, PyDict>, Vec<Bound<'_, PyAny>>)> = Vec::new();
+            let n = parent_maps.len();
+            for i in (0..n).rev() {
+                let pm = parent_maps.get_item(i)?.cast_into::<PyDict>()?;
+                let mut sub_keys: Vec<Bound<'_, PyAny>> = Vec::new();
+                for (k, _) in pm.iter() {
+                    sub_keys.push(k);
+                }
+                if !sub_keys.is_empty() {
+                    groups.push((pm, sub_keys));
+                }
+            }
+            // Sort the local (index 0) group by I/O if present.
+            if let Some(local_group) = groups.iter_mut().find(|(pm, _)| {
+                pm.as_ptr() == local_parent_map.as_ptr()
+            }) {
+                let sub_list = PyList::empty(py);
+                for k in &local_group.1 {
+                    sub_list.append(k)?;
+                }
+                self.index_obj
+                    .bind(py)
+                    .call_method1("_sort_keys_by_io", (sub_list.clone(), positions.clone()))?;
+                local_group.1 = sub_list.iter().collect();
+            }
+            source_keys = groups;
+        }
+
+        // Emit records.
+        let knitcf_cls = knit_m.getattr("KnitContentFactory")?;
+        for (source, sub_keys) in source_keys {
+            if source.as_ptr() == local_parent_map.as_ptr() {
+                // Local keys: fetch raw bytes and wrap in KnitContentFactory.
+                let records_list = PyList::empty(py);
+                for k in &sub_keys {
+                    let pos = positions
+                        .get_item(k)?
+                        .ok_or_else(|| PyValueError::new_err("key not in positions"))?
+                        .cast_into::<PyTuple>()?;
+                    let index_memo = pos.get_item(1)?;
+                    records_list.append(PyTuple::new(py, [k, &index_memo])?)?;
+                }
+                let raw_iter = self
+                    ._read_records_iter_unchecked(py, records_list.into_any())?
+                    .into_bound(py);
+                for raw_item in raw_iter.try_iter()? {
+                    let raw_tup = raw_item?.cast_into::<PyTuple>()?;
+                    let key = raw_tup.get_item(0)?;
+                    let raw_data = raw_tup.get_item(1)?;
+                    let parents = global_map.get_item(&key)?;
+                    let pos = positions
+                        .get_item(&key)?
+                        .ok_or_else(|| PyValueError::new_err("key not in positions"))?
+                        .cast_into::<PyTuple>()?;
+                    let record_details = pos.get_item(0)?;
+                    let factory = knitcf_cls.call1((
+                        key,
+                        parents,
+                        record_details,
+                        py.None(),
+                        raw_data,
+                        self.annotated,
+                        py.None(),
+                    ))?;
+                    result_list.append(factory)?;
+                }
+            } else {
+                // Fallback VF: find which fallback this source belongs to.
+                let vf_idx = parent_maps
+                    .iter()
+                    .position(|pm| {
+                        pm.cast::<PyDict>()
+                            .map(|d| d.as_ptr() == source.as_ptr())
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+                if let Some(fallback) = self.immediate_fallback_vfs.get(vf_idx) {
+                    let fb_keys = PyList::empty(py);
+                    for k in &sub_keys {
+                        fb_keys.append(k)?;
+                    }
+                    let fb_stream = fallback.bind(py).call_method1(
+                        "get_record_stream",
+                        (fb_keys, effective_ordering.as_str(), false),
+                    )?;
+                    for item in fb_stream.try_iter()? {
+                        result_list.append(item?)?;
+                    }
+                }
+            }
+        }
+        Ok(result_list.into_any().unbind())
     }
 
     #[pyo3(signature = (keys, pb=None))]
