@@ -4570,15 +4570,29 @@ impl PyKnitVersionedFiles {
         Ok(result.into_any().unbind())
     }
 
-    fn annotate(&self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        // Delegate to the Python side — _KnitAnnotator still lives there.
-        let py_self = self.to_py_kvf(py)?;
-        py_self.call_method1("annotate", (key,)).map(|b| b.unbind())
+    fn annotate<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        // KnitVersionedFiles.annotate(key) calls self._factory.annotate(self, key),
+        // which in turn calls self._get_content(key).annotate(). Short-circuit by
+        // calling _get_content directly and then invoking annotate() on the result.
+        let content = self._get_content(py, key, None)?.into_bound(py);
+        content.call_method0("annotate").map(|b| b.unbind())
     }
 
     fn get_annotator(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // _KnitAnnotator(self) — pass this PyKnitVersionedFiles as the knit.
+        // Since PyKnitVersionedFiles is a pyclass, Python callers already hold a
+        // reference to it; we reconstruct it via to_py_kvf only if needed.
+        // _KnitAnnotator uses: vf._get_content, vf.get_parent_map, vf.keys —
+        // all of which are exposed on PyKnitVersionedFiles directly.
+        let knit_m = py.import("bzrformats.knit")?;
         let py_self = self.to_py_kvf(py)?;
-        py_self.call_method0("get_annotator").map(|b| b.unbind())
+        knit_m
+            .call_method1("_KnitAnnotator", (py_self,))
+            .map(|b| b.unbind())
     }
 
     fn insert_record_stream(&self, py: Python<'_>, stream: Bound<'_, PyAny>) -> PyResult<()> {
