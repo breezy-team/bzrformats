@@ -4505,19 +4505,56 @@ impl PyKnitVersionedFiles {
         progress_bar: Option<Bound<'_, PyAny>>,
         keys: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        // Delegate to Python's KnitVersionedFiles.check via the Python wrapper.
-        // TODO: port _logical_check to Rust.
-        let py_self = self.to_py_kvf(py)?;
-        let kwargs = PyDict::new(py);
-        if let Some(pb) = progress_bar {
-            kwargs.set_item("progress_bar", pb)?;
-        }
+        let _ = progress_bar;
         if let Some(k) = keys {
-            kwargs.set_item("keys", k)?;
+            // check(keys=...) is just get_record_stream(keys, "unordered", True)
+            let ordering = pyo3::intern!(py, "unordered").clone().into_any();
+            let idc = pyo3::types::PyBool::new(py, true).to_owned().into_any();
+            return self.get_record_stream(py, k, ordering, idc);
         }
-        py_self
-            .call_method("check", (), Some(&kwargs))
-            .map(|b| b.unbind())
+        // _logical_check: verify all delta keys have their compression parent present.
+        let table = Arc::new(Mutex::new(MemoTable::default()));
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table);
+        let all_keys = index.keys().map_err(knit_err_to_py)?;
+        let py_keys = PyList::empty(py);
+        for k in &all_keys {
+            py_keys.append(py_knit_key_to_py(py, k)?)?;
+        }
+        let parent_map_raw = self
+            .index_obj
+            .bind(py)
+            .call_method1("get_parent_map", (py_keys.clone(),))?
+            .cast_into::<PyDict>()?;
+        let knit_corrupt = py.import("bzrformats.knit")?.getattr("KnitCorrupt")?;
+        for k in &all_keys {
+            let method = index.get_method(k).map_err(knit_err_to_py)?;
+            if method != bazaar::knit::KnitMethod::Fulltext {
+                let py_key = py_knit_key_to_py(py, k)?;
+                let parents_obj = parent_map_raw
+                    .get_item(&py_key)?
+                    .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("{k:?} not in parent_map")))?;
+                let parents_tup = parents_obj.cast_into::<PyTuple>()?;
+                if parents_tup.is_empty() {
+                    continue;
+                }
+                let compression_parent = parents_tup.get_item(0)?;
+                if parent_map_raw.get_item(&compression_parent)?.is_none() {
+                    let exc = knit_corrupt.call1((
+                        py.None(),
+                        format!(
+                            "Missing basis parent {:?} for {:?}",
+                            compression_parent, py_key
+                        ),
+                    ))?;
+                    return Err(PyErr::from_value(exc));
+                }
+            }
+        }
+        // Check fallback VFs.
+        for fallback in &self.immediate_fallback_vfs {
+            fallback.bind(py).call_method0("check")?;
+        }
+        Ok(py.None())
     }
 
     fn get_missing_compression_parent_keys(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
