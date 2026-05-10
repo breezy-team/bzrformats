@@ -4594,9 +4594,26 @@ impl PyKnitVersionedFiles {
             .map(|b| b.unbind())
     }
 
-    fn insert_record_stream(&self, py: Python<'_>, stream: Bound<'_, PyAny>) -> PyResult<()> {
-        // TODO: port insert_record_stream to Rust
-        let py_self = self.to_py_kvf(py)?;
+    fn insert_record_stream(slf: Py<Self>, py: Python<'_>, stream: Bound<'_, PyAny>) -> PyResult<()> {
+        // TODO: port insert_record_stream to Rust; for now delegate to Python
+        // via the KnitVersionedFilesPy wrapper which knows the full adapter logic.
+        let knit_m = py.import("bzrformats.knit")?;
+        let cls = knit_m.getattr("KnitVersionedFilesPy")?;
+        let this = slf.bind(py).borrow();
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("max_delta_chain", this.max_delta_chain)?;
+        kwargs.set_item("annotated", this.annotated)?;
+        if !this.reload_func.is_none(py) {
+            kwargs.set_item("reload_func", this.reload_func.bind(py))?;
+        }
+        let py_self = cls.call(
+            (this.index_obj.bind(py), this.access_obj.bind(py)),
+            Some(&kwargs),
+        )?;
+        for fallback in &this.immediate_fallback_vfs {
+            py_self.call_method1("add_fallback_versioned_files", (fallback.bind(py),))?;
+        }
+        drop(this);
         py_self.call_method1("insert_record_stream", (stream,))?;
         Ok(())
     }
@@ -5684,27 +5701,6 @@ impl PyKnitVersionedFiles {
 }
 
 impl PyKnitVersionedFiles {
-    /// Build a temporary Python-backed `KnitVersionedFiles` object for methods
-    /// not yet ported to Rust (e.g. `insert_record_stream`, `check`).
-    fn to_py_kvf<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let module = py.import("bzrformats.knit")?;
-        let cls = module.getattr("KnitVersionedFilesPy")?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("max_delta_chain", self.max_delta_chain)?;
-        kwargs.set_item("annotated", self.annotated)?;
-        if !self.reload_func.is_none(py) {
-            kwargs.set_item("reload_func", self.reload_func.bind(py))?;
-        }
-        let obj = cls.call(
-            (self.index_obj.bind(py), self.access_obj.bind(py)),
-            Some(&kwargs),
-        )?;
-        for fallback in &self.immediate_fallback_vfs {
-            obj.call_method1("add_fallback_versioned_files", (fallback.bind(py),))?;
-        }
-        Ok(obj)
-    }
-
     /// Plain-factory add_lines (avoids monomorphising KnitVersionedFiles twice).
     fn add_lines_plain(
         &self,
