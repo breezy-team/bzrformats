@@ -4887,18 +4887,20 @@ impl PyKnitVersionedFiles {
         Ok(out.into_any().unbind())
     }
 
-    fn make_mpdiffs(&self, py: Python<'_>, keys: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        // Inherited from VersionedFilesWithFallbacks — delegate to Python.
-        let py_self = self.to_py_kvf(py)?;
-        py_self
-            .call_method1("make_mpdiffs", (keys,))
-            .map(|b| b.unbind())
+    fn make_mpdiffs(slf: Py<Self>, py: Python<'_>, keys: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        // VersionedFiles.make_mpdiffs uses _MPDiffGenerator(self, keys).
+        // Pass this PyKnitVersionedFiles directly since it exposes get_record_stream.
+        let vf_m = py.import("bzrformats.versionedfile")?;
+        let generator = vf_m.call_method1("_MPDiffGenerator", (slf, keys))?;
+        generator.call_method0("compute_diffs").map(|b| b.unbind())
     }
 
-    fn add_mpdiffs(&self, py: Python<'_>, records: Bound<'_, PyAny>) -> PyResult<()> {
-        // Inherited from VersionedFilesWithFallbacks — delegate to Python.
-        let py_self = self.to_py_kvf(py)?;
-        py_self.call_method1("add_mpdiffs", (records,))?;
+    fn add_mpdiffs(slf: Py<Self>, py: Python<'_>, records: Bound<'_, PyAny>) -> PyResult<()> {
+        // VersionedFiles.add_mpdiffs: uses get_record_stream and add_lines,
+        // both of which are exposed on PyKnitVersionedFiles.
+        let vf_m = py.import("bzrformats.versionedfile")?;
+        let base_cls = vf_m.getattr("VersionedFiles")?;
+        base_cls.call_method1("add_mpdiffs", (slf, records))?;
         Ok(())
     }
 
