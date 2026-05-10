@@ -3,8 +3,8 @@ use bazaar::knit::{
     lower_fulltext, lower_line_delta_annotated, lower_line_delta_raw, parse_fulltext,
     parse_line_delta_annotated, parse_line_delta_plain, parse_line_delta_raw,
     parse_network_record_header, AnnotatedKnitContent, AnnotatedLine, DeltaHunk, KndxLoadError,
-    KnitAccess as KnitAccessTrait, KnitAnnotateFactory, KnitContent as KnitContentTrait, KnitError,
-    KnitFactory as KnitFactoryTrait, KnitIndex as KnitIndexTrait, KnitIndexMemo, KnitKey,
+    KnitAccess as KnitAccessTrait, KnitAnnotateFactory, KnitAnnotator, KnitContent as KnitContentTrait,
+    KnitError, KnitFactory as KnitFactoryTrait, KnitIndex as KnitIndexTrait, KnitIndexMemo, KnitKey,
     KnitMethod, KnitPlainFactory, KnitRecordDetails, PlainKnitContent,
 };
 use bazaar::transport::Transport as _;
@@ -2580,13 +2580,115 @@ impl PyKnitPlainFactory {
     fn annotate<'py>(
         &self,
         py: Python<'py>,
-        knit: Bound<'py, PyAny>,
+        knit: Bound<'py, PyKnitVersionedFiles>,
         key: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Plain factory delegates to _KnitAnnotator.annotate_flat
-        let annotator_class = py.import("bzrformats.knit")?.getattr("_KnitAnnotator")?;
-        let annotator = annotator_class.call1((knit,))?;
-        annotator.call_method1("annotate_flat", (key,))
+        let mut annotator = PyKnitAnnotator::from_kvf(py, &knit.borrow())?;
+        annotator.annotate_flat(py, key).map(|l| l.into_any())
+    }
+}
+
+/// Enum so the pyclass doesn't need to be generic.
+enum AnyKnitAnnotator {
+    Annotated(KnitAnnotator<PyKnitIndex, PyKnitAccess, KnitAnnotateFactory>),
+    Plain(KnitAnnotator<PyKnitIndex, PyKnitAccess, KnitPlainFactory>),
+}
+
+impl AnyKnitAnnotator {
+    fn annotate_flat(&mut self, key: &KnitKey) -> Result<Vec<(KnitKey, Vec<u8>)>, KnitError> {
+        match self {
+            AnyKnitAnnotator::Annotated(a) => a.annotate_flat(key),
+            AnyKnitAnnotator::Plain(a) => a.annotate_flat(key),
+        }
+    }
+
+    fn annotate(
+        &mut self,
+        key: &KnitKey,
+    ) -> Result<(Vec<bazaar::knit::LineAnnotation>, Vec<Vec<u8>>), KnitError> {
+        match self {
+            AnyKnitAnnotator::Annotated(a) => a.annotate(key),
+            AnyKnitAnnotator::Plain(a) => a.annotate(key),
+        }
+    }
+}
+
+/// Python-accessible wrapper around [`KnitAnnotator`].
+#[pyclass(name = "_KnitAnnotator")]
+pub struct PyKnitAnnotator {
+    inner: AnyKnitAnnotator,
+}
+
+impl PyKnitAnnotator {
+    fn from_kvf(py: Python<'_>, kvf: &PyKnitVersionedFiles) -> PyResult<Self> {
+        let index = PyKnitIndex::new(kvf.index_obj.bind(py).clone(), Arc::clone(&kvf.table));
+        let access = PyKnitAccess::new(kvf.access_obj.bind(py).clone(), Arc::clone(&kvf.table));
+        let inner = if kvf.annotated {
+            AnyKnitAnnotator::Annotated(KnitAnnotator::new(index, access, KnitAnnotateFactory))
+        } else {
+            AnyKnitAnnotator::Plain(KnitAnnotator::new(index, access, KnitPlainFactory))
+        };
+        Ok(PyKnitAnnotator { inner })
+    }
+}
+
+fn knit_annotation_to_py<'py>(
+    py: Python<'py>,
+    annotation: Vec<KnitKey>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let items: Vec<Bound<'py, PyTuple>> = annotation
+        .into_iter()
+        .map(|k| knit_key_to_py(py, &k))
+        .collect::<PyResult<_>>()?;
+    PyTuple::new(py, items)
+}
+
+#[pymethods]
+impl PyKnitAnnotator {
+    #[new]
+    fn new(py: Python<'_>, vf: Bound<'_, PyKnitVersionedFiles>) -> PyResult<Self> {
+        Self::from_kvf(py, &vf.borrow())
+    }
+
+    fn annotate_flat<'py>(
+        &mut self,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let rust_key = extract_knit_key(&key)
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        let pairs = self
+            .inner
+            .annotate_flat(&rust_key)
+            .map_err(knit_err_to_py)?;
+        let out = PyList::empty(py);
+        for (ann_key, line) in pairs {
+            let ann_py = knit_key_to_py(py, &ann_key)?;
+            let line_py = PyBytes::new(py, &line);
+            let pair = PyTuple::new(py, [ann_py.into_any(), line_py.into_any()])?;
+            out.append(pair)?;
+        }
+        Ok(out)
+    }
+
+    fn annotate<'py>(
+        &mut self,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let rust_key = extract_knit_key(&key)
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        let (annotations, lines) = self.inner.annotate(&rust_key).map_err(knit_err_to_py)?;
+        let anns_py: Vec<Bound<'py, PyTuple>> = annotations
+            .into_iter()
+            .map(|ann| knit_annotation_to_py(py, ann))
+            .collect::<PyResult<_>>()?;
+        let anns_list = PyList::new(py, anns_py)?;
+        let lines_list = PyList::new(
+            py,
+            lines.iter().map(|l| PyBytes::new(py, l)),
+        )?;
+        PyTuple::new(py, [anns_list.into_any(), lines_list.into_any()])
     }
 }
 
@@ -4800,13 +4902,8 @@ impl PyKnitVersionedFiles {
     }
 
     fn get_annotator(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        // Pass this PyKnitVersionedFiles directly to _KnitAnnotator — it only
-        // calls get_parent_map, _get_content, and keys, all of which are exposed
-        // on PyKnitVersionedFiles.
-        let knit_m = py.import("bzrformats.knit")?;
-        knit_m
-            .call_method1("_KnitAnnotator", (slf,))
-            .map(|b| b.unbind())
+        let annotator = PyKnitAnnotator::from_kvf(py, &slf.bind(py).borrow())?;
+        Py::new(py, annotator).map(|p| p.into_any())
     }
 
     fn insert_record_stream(
@@ -6168,6 +6265,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<PyPlainKnitContent>()?;
     m.add_class::<PyKnitAnnotateFactory>()?;
     m.add_class::<PyKnitPlainFactory>()?;
+    m.add_class::<PyKnitAnnotator>()?;
     m.add_class::<PyKndxIndex>()?;
     m.add_class::<PyKnitGraphIndex>()?;
     m.add_class::<PyKnitKeyAccess>()?;

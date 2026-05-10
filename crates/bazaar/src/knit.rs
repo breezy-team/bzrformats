@@ -4021,6 +4021,456 @@ where
     hunks
 }
 
+/// Annotation for one line: set of keys that could be the origin of this line.
+/// Usually contains a single key.
+pub type LineAnnotation = Vec<KnitKey>;
+
+/// Build per-line annotations for a knit versioned file.
+///
+/// Mirrors `bzrformats.knit._KnitAnnotator` (and its base class
+/// `bzrformats.annotate.VersionedFileAnnotator`).
+pub struct KnitAnnotator<I, A, F>
+where
+    I: KnitIndex,
+    A: KnitAccess,
+    F: KnitFactory,
+{
+    index: I,
+    access: A,
+    factory: F,
+    /// Map key → parent keys.
+    parent_map: std::collections::HashMap<KnitKey, Vec<KnitKey>>,
+    /// Cached plain-text lines per key (freed as soon as no longer needed).
+    text_cache: std::collections::HashMap<KnitKey, Vec<Vec<u8>>>,
+    /// Number of as-yet-unannotated children that still need this key's text.
+    num_needed_children: std::collections::HashMap<KnitKey, usize>,
+    /// Completed per-line annotations.
+    annotations_cache: std::collections::HashMap<KnitKey, Vec<LineAnnotation>>,
+    /// Build details fetched during `get_build_graph`.
+    all_build_details: std::collections::HashMap<KnitKey, KnitRecordDetails>,
+    /// Number of delta-children still waiting on a compression parent.
+    num_compression_children: std::collections::HashMap<KnitKey, usize>,
+    /// Content objects kept alive while delta children depend on them.
+    content_objects: std::collections::HashMap<KnitKey, F::Content>,
+    /// Delta records queued until their compression parent is ready.
+    pending_deltas: std::collections::HashMap<
+        KnitKey,
+        Vec<(KnitKey, Vec<KnitKey>, Vec<u8>, KnitRecordDetails)>,
+    >,
+    /// Keys whose text is ready but that still await parent annotations.
+    pending_annotation:
+        std::collections::HashMap<KnitKey, Vec<(KnitKey, Vec<KnitKey>)>>,
+    /// Pre-computed matching blocks from delta expansion, consumed once.
+    matching_blocks:
+        std::collections::HashMap<(KnitKey, KnitKey), Vec<(usize, usize, usize)>>,
+}
+
+impl<I, A, F> KnitAnnotator<I, A, F>
+where
+    I: KnitIndex,
+    A: KnitAccess,
+    F: KnitFactory,
+    F::Content: Clone,
+{
+    pub fn new(index: I, access: A, factory: F) -> Self {
+        Self {
+            index,
+            access,
+            factory,
+            parent_map: Default::default(),
+            text_cache: Default::default(),
+            num_needed_children: Default::default(),
+            annotations_cache: Default::default(),
+            all_build_details: Default::default(),
+            num_compression_children: Default::default(),
+            content_objects: Default::default(),
+            pending_deltas: Default::default(),
+            pending_annotation: Default::default(),
+            matching_blocks: Default::default(),
+        }
+    }
+
+    /// Walk the compression/parent graph for `key`, filling `all_build_details`
+    /// and returning `(records, ann_keys)` — mirrors `_get_build_graph`.
+    fn get_build_graph(
+        &mut self,
+        key: &KnitKey,
+    ) -> Result<(Vec<(KnitKey, KnitIndexMemo)>, Vec<KnitKey>), KnitError> {
+        let mut pending: std::collections::HashSet<KnitKey> =
+            std::iter::once(key.clone()).collect();
+        let mut records: Vec<(KnitKey, KnitIndexMemo)> = Vec::new();
+        let mut ann_keys: Vec<KnitKey> = Vec::new();
+        *self.num_needed_children.entry(key.clone()).or_insert(0) += 1;
+
+        while !pending.is_empty() {
+            let this_iteration: Vec<KnitKey> = pending.drain().collect();
+            let build_details = self.index.get_build_details(&this_iteration)?;
+            self.all_build_details.extend(build_details.clone());
+            pending = std::collections::HashSet::new();
+
+            for k in &this_iteration {
+                if let Some(details) = build_details.get(k) {
+                    let parents = details.parents.clone();
+                    self.parent_map.insert(k.clone(), parents.clone());
+                    self.num_needed_children.entry(k.clone()).or_insert(0);
+                    records.push((k.clone(), details.index_memo.clone()));
+                    for pk in &parents {
+                        if !self.all_build_details.contains_key(pk) {
+                            pending.insert(pk.clone());
+                        }
+                        *self.num_needed_children.entry(pk.clone()).or_insert(0) += 1;
+                    }
+                    if let Some(ref cp) = details.compression_parent {
+                        *self
+                            .num_compression_children
+                            .entry(cp.clone())
+                            .or_insert(0) += 1;
+                    }
+                } else if self.parent_map.contains_key(k) && self.text_cache.contains_key(k) {
+                    // Already have the text (e.g. from a fallback); just annotate it.
+                    ann_keys.push(k.clone());
+                    let parents = self.parent_map[k].clone();
+                    for pk in &parents {
+                        *self.num_needed_children.entry(pk.clone()).or_insert(0) += 1;
+                        if !self.all_build_details.contains_key(pk) {
+                            pending.insert(pk.clone());
+                        }
+                    }
+                } else {
+                    return Err(KnitError::Corrupt(format!(
+                        "Revision not present: {:?}",
+                        k
+                    )));
+                }
+            }
+        }
+
+        records.reverse();
+        Ok((records, ann_keys))
+    }
+
+    /// Decompress a raw on-disk record and invoke `factory.parse_record`.
+    fn parse_raw_record(
+        &self,
+        key: &KnitKey,
+        raw: &[u8],
+        method: KnitMethod,
+        noeol: bool,
+        base: Option<F::Content>,
+    ) -> Result<F::Content, KnitError> {
+        let decompressed = decode_record_gz(raw)?;
+        let (_, body_lines) = parse_record_body_unchecked(&decompressed)?;
+        self.factory.parse_record(
+            key.last().map(|s| s.as_slice()).unwrap_or(&[]),
+            &body_lines,
+            method,
+            noeol,
+            base.as_ref(),
+        )
+    }
+
+    /// Expand one raw record into plain-text lines.  Returns `None` when the
+    /// compression parent is not yet ready (record queued in `pending_deltas`).
+    fn expand_record(
+        &mut self,
+        key: KnitKey,
+        parent_keys: Vec<KnitKey>,
+        compression_parent: Option<KnitKey>,
+        raw: Vec<u8>,
+        method: KnitMethod,
+        noeol: bool,
+    ) -> Result<Option<Vec<Vec<u8>>>, KnitError> {
+        let content = if let Some(ref cp) = compression_parent {
+            if !self.content_objects.contains_key(cp) {
+                self.pending_deltas
+                    .entry(cp.clone())
+                    .or_default()
+                    .push((key, parent_keys, raw, KnitRecordDetails {
+                        method,
+                        noeol,
+                        index_memo: KnitIndexMemo { path: String::new(), offset: 0, length: 0 },
+                        compression_parent: compression_parent.clone(),
+                        parents: vec![],
+                    }));
+                return Ok(None);
+            }
+            let num = self.num_compression_children[cp];
+            let base_content = if num <= 1 {
+                self.num_compression_children.remove(cp);
+                self.content_objects.remove(cp).unwrap()
+            } else {
+                *self.num_compression_children.get_mut(cp).unwrap() -= 1;
+                self.content_objects[cp].clone()
+            };
+            let content = self.parse_raw_record(&key, &raw, method, noeol, Some(base_content))?;
+            // Cache matching blocks from the delta expansion for annotation.
+            if method == KnitMethod::LineDelta {
+                if let Some(parent_lines) = self.text_cache.get(cp).cloned() {
+                    let lines = content.text();
+                    let p_refs: Vec<&[u8]> = parent_lines.iter().map(|l| l.as_slice()).collect();
+                    let l_refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
+                    // Re-parse to get the raw delta hunks for get_line_delta_blocks.
+                    if let Ok(decompressed) = decode_record_gz(&raw) {
+                        if let Ok((_, body_lines)) = parse_record_body_unchecked(&decompressed) {
+                            if let Ok(hunks) = parse_line_delta_raw(&body_lines.iter().copied().collect::<Vec<_>>()) {
+                                let raw_hunks: Vec<(usize, usize, usize)> = hunks
+                                    .iter()
+                                    .map(|h| (h.start, h.end, h.lines.len()))
+                                    .collect();
+                                let blocks = get_line_delta_blocks(&raw_hunks, &p_refs, &l_refs);
+                                self.matching_blocks.insert((key.clone(), cp.clone()), blocks);
+                            }
+                        }
+                    }
+                }
+            }
+            content
+        } else {
+            self.parse_raw_record(&key, &raw, method, noeol, None)?
+        };
+
+        if self.num_compression_children.get(&key).copied().unwrap_or(0) > 0 {
+            self.content_objects.insert(key.clone(), content.clone());
+        }
+        let lines = content.text();
+        self.text_cache.insert(key.clone(), lines.clone());
+        Ok(Some(lines))
+    }
+
+    /// Returns `true` if all parents of `key` have been annotated; otherwise
+    /// queues it under the first missing parent in `pending_annotation`.
+    fn check_ready_for_annotations(&mut self, key: &KnitKey, parent_keys: &[KnitKey]) -> bool {
+        for pk in parent_keys {
+            if !self.annotations_cache.contains_key(pk) {
+                self.pending_annotation
+                    .entry(pk.clone())
+                    .or_default()
+                    .push((key.clone(), parent_keys.to_vec()));
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Called after `key` is processed; drains `pending_deltas` and
+    /// `pending_annotation` for any children now unblocked.
+    fn process_pending(&mut self, key: &KnitKey) -> Result<Vec<KnitKey>, KnitError> {
+        let mut to_return: Vec<KnitKey> = Vec::new();
+
+        if let Some(children) = self.pending_deltas.remove(key) {
+            for (child_key, parent_keys, raw, details) in children {
+                self.expand_record(
+                    child_key.clone(),
+                    parent_keys.clone(),
+                    Some(key.clone()),
+                    raw,
+                    details.method,
+                    details.noeol,
+                )?;
+                if self.check_ready_for_annotations(&child_key, &parent_keys) {
+                    to_return.push(child_key);
+                }
+            }
+        }
+
+        if let Some(children) = self.pending_annotation.remove(key) {
+            for (child_key, parent_keys) in children {
+                if self.check_ready_for_annotations(&child_key, &parent_keys) {
+                    to_return.push(child_key);
+                }
+            }
+        }
+
+        Ok(to_return)
+    }
+
+    /// Fetch raw records from disk, expand them, and return `(key, lines)` in
+    /// topological order (parents before children).
+    fn extract_texts(
+        &mut self,
+        records: Vec<(KnitKey, KnitIndexMemo)>,
+    ) -> Result<Vec<(KnitKey, Vec<Vec<u8>>)>, KnitError> {
+        let memos: Vec<KnitIndexMemo> = records.iter().map(|(_, m)| m.clone()).collect();
+        let raw_bytes = self.access.get_raw_records(&memos)?;
+        let mut out: Vec<(KnitKey, Vec<Vec<u8>>)> = Vec::new();
+
+        for ((key, _memo), raw) in records.into_iter().zip(raw_bytes.into_iter()) {
+            let details = self.all_build_details[&key].clone();
+            let lines = self.expand_record(
+                key.clone(),
+                details.parents.clone(),
+                details.compression_parent.clone(),
+                raw,
+                details.method,
+                details.noeol,
+            )?;
+            let Some(lines) = lines else { continue };
+
+            if self.check_ready_for_annotations(&key, &details.parents) {
+                out.push((key.clone(), lines));
+            }
+
+            let mut to_process = self.process_pending(&key)?;
+            while !to_process.is_empty() {
+                let this_batch = std::mem::take(&mut to_process);
+                for k in this_batch {
+                    let lines = self.text_cache[&k].clone();
+                    out.push((k.clone(), lines));
+                    to_process.extend(self.process_pending(&k)?);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Return the annotations and matching blocks for `(key, parent_key)`,
+    /// using pre-computed blocks from delta expansion where available.
+    fn get_parent_annotations_and_matches(
+        &mut self,
+        key: &KnitKey,
+        text: &[Vec<u8>],
+        parent_key: &KnitKey,
+    ) -> (Vec<LineAnnotation>, Vec<(usize, usize, usize)>) {
+        if let Some(blocks) = self.matching_blocks.remove(&(key.clone(), parent_key.clone())) {
+            let parent_annotations = self.annotations_cache[parent_key].clone();
+            return (parent_annotations, blocks);
+        }
+        let parent_lines = self.text_cache[parent_key].clone();
+        let parent_annotations = self.annotations_cache[parent_key].clone();
+        let p_refs: Vec<&[u8]> = parent_lines.iter().map(|l| l.as_slice()).collect();
+        let t_refs: Vec<&[u8]> = text.iter().map(|l| l.as_slice()).collect();
+        let blocks = patiencediff::SequenceMatcher::new(&p_refs, &t_refs)
+            .get_matching_blocks()
+            .to_vec();
+        (parent_annotations, blocks)
+    }
+
+    fn record_annotation(
+        &mut self,
+        key: &KnitKey,
+        parent_keys: &[KnitKey],
+        annotations: Vec<LineAnnotation>,
+    ) {
+        self.annotations_cache.insert(key.clone(), annotations);
+        for pk in parent_keys {
+            if let Some(n) = self.num_needed_children.get_mut(pk) {
+                *n -= 1;
+                if *n == 0 {
+                    self.text_cache.remove(pk);
+                    self.annotations_cache.remove(pk);
+                }
+            }
+        }
+    }
+
+    fn annotate_one(&mut self, key: &KnitKey, text: &[Vec<u8>]) {
+        let this_annotation: LineAnnotation = vec![key.clone()];
+        let mut annotations: Vec<LineAnnotation> = vec![this_annotation.clone(); text.len()];
+        let parent_keys = self.parent_map[key].clone();
+
+        if let Some(first_parent) = parent_keys.first() {
+            let (parent_annotations, blocks) =
+                self.get_parent_annotations_and_matches(key, text, first_parent);
+            for (parent_idx, lines_idx, match_len) in &blocks {
+                if *match_len == 0 {
+                    continue;
+                }
+                annotations[*lines_idx..*lines_idx + *match_len]
+                    .clone_from_slice(&parent_annotations[*parent_idx..*parent_idx + *match_len]);
+            }
+
+            for other_parent in parent_keys.iter().skip(1) {
+                let (parent_annotations, blocks) =
+                    self.get_parent_annotations_and_matches(key, text, other_parent);
+                for (parent_idx, lines_idx, match_len) in &blocks {
+                    if *match_len == 0 {
+                        continue;
+                    }
+                    let ann_sub = annotations[*lines_idx..*lines_idx + *match_len].to_vec();
+                    let par_sub = &parent_annotations[*parent_idx..*parent_idx + *match_len];
+                    if ann_sub == par_sub {
+                        continue;
+                    }
+                    for idx in 0..*match_len {
+                        let ann = &ann_sub[idx];
+                        let par_ann = &par_sub[idx];
+                        let ann_idx = *lines_idx + idx;
+                        if ann == par_ann || *ann == this_annotation {
+                            annotations[ann_idx] = par_ann.clone();
+                        } else {
+                            let mut new_ann: std::collections::BTreeSet<KnitKey> =
+                                ann.iter().cloned().collect();
+                            new_ann.extend(par_ann.iter().cloned());
+                            annotations[ann_idx] = new_ann.into_iter().collect();
+                        }
+                    }
+                }
+            }
+        }
+
+        self.record_annotation(key, &parent_keys.clone(), annotations);
+    }
+
+    /// Annotate `key` and return `(annotations, lines)`.
+    pub fn annotate(
+        &mut self,
+        key: &KnitKey,
+    ) -> Result<(Vec<LineAnnotation>, Vec<Vec<u8>>), KnitError> {
+        let (records, ann_keys) = self.get_build_graph(key)?;
+        let texts = self.extract_texts(records)?;
+        for (text_key, text) in texts {
+            self.annotate_one(&text_key, &text.clone());
+        }
+        for ann_key in ann_keys {
+            let text = self.text_cache[&ann_key].clone();
+            self.annotate_one(&ann_key, &text);
+        }
+        let annotations = self
+            .annotations_cache
+            .get(key)
+            .cloned()
+            .ok_or_else(|| KnitError::Corrupt(format!("Revision not present: {:?}", key)))?;
+        let lines = self.text_cache.get(key).cloned().unwrap_or_default();
+        Ok((annotations, lines))
+    }
+
+    /// Return `[(annotation_key, line)]` — one best-origin key per line.
+    pub fn annotate_flat(
+        &mut self,
+        key: &KnitKey,
+    ) -> Result<Vec<(KnitKey, Vec<u8>)>, KnitError> {
+        let (annotations, lines) = self.annotate(key)?;
+        let mut kg = vcs_graph::KnownGraph::new(
+            self.parent_map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+            false,
+        );
+        let out = annotations
+            .into_iter()
+            .zip(lines)
+            .map(|(annotation, line)| {
+                let head = if annotation.len() == 1 {
+                    annotation.into_iter().next().unwrap()
+                } else {
+                    let the_heads = kg.heads(annotation.iter().cloned());
+                    if the_heads.len() == 1 {
+                        the_heads.into_iter().next().unwrap()
+                    } else {
+                        // Tie-break: sort and take first (matches Python fallback).
+                        let mut sorted: Vec<KnitKey> = the_heads.into_iter().collect();
+                        sorted.sort();
+                        sorted.into_iter().next().unwrap()
+                    }
+                };
+                (head, line)
+            })
+            .collect();
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
