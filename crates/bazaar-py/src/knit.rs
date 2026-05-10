@@ -4500,7 +4500,7 @@ impl PyKnitVersionedFiles {
 
     #[pyo3(signature = (progress_bar=None, keys=None))]
     fn check(
-        &self,
+        slf: Py<Self>,
         py: Python<'_>,
         progress_bar: Option<Bound<'_, PyAny>>,
         keys: Option<Bound<'_, PyAny>>,
@@ -4510,17 +4510,19 @@ impl PyKnitVersionedFiles {
             // check(keys=...) is just get_record_stream(keys, "unordered", True)
             let ordering = pyo3::intern!(py, "unordered").clone().into_any();
             let idc = pyo3::types::PyBool::new(py, true).to_owned().into_any();
-            return self.get_record_stream(py, k, ordering, idc);
+            return PyKnitVersionedFiles::get_record_stream(slf, py, k, ordering, idc);
         }
+        let this_ref = slf.bind(py);
+        let this = this_ref.borrow();
         // _logical_check: verify all delta keys have their compression parent present.
         let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table);
+        let index = PyKnitIndex::new(this.index_obj.bind(py).clone(), table);
         let all_keys = index.keys().map_err(knit_err_to_py)?;
         let py_keys = PyList::empty(py);
         for k in &all_keys {
             py_keys.append(py_knit_key_to_py(py, k)?)?;
         }
-        let parent_map_raw = self
+        let parent_map_raw = this
             .index_obj
             .bind(py)
             .call_method1("get_parent_map", (py_keys.clone(),))?
@@ -4551,7 +4553,7 @@ impl PyKnitVersionedFiles {
             }
         }
         // Check fallback VFs.
-        for fallback in &self.immediate_fallback_vfs {
+        for fallback in &this.immediate_fallback_vfs {
             fallback.bind(py).call_method0("check")?;
         }
         Ok(py.None())
@@ -4600,12 +4602,14 @@ impl PyKnitVersionedFiles {
     }
 
     fn get_record_stream(
-        &self,
+        slf: Py<Self>,
         py: Python<'_>,
         keys: Bound<'_, PyAny>,
         ordering: Bound<'_, PyAny>,
         include_delta_closure: Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
+        let this_ref = slf.bind(py);
+        let this = this_ref.borrow();
         let include_delta_closure: bool = include_delta_closure.extract()?;
         let ordering: String = ordering.extract()?;
 
@@ -4617,7 +4621,7 @@ impl PyKnitVersionedFiles {
             return Ok(PyList::empty(py).into_any().unbind());
         }
 
-        let has_graph: bool = self
+        let has_graph: bool = this
             .index_obj
             .bind(py)
             .getattr("has_graph")?
@@ -4631,19 +4635,60 @@ impl PyKnitVersionedFiles {
         let knit_m = py.import("bzrformats.knit")?;
 
         if include_delta_closure {
-            // The delta-closure path uses _VFContentMapGenerator which still lives
-            // in Python. Build a py_self wrapper to drive it.
-            let py_self = self.to_py_kvf(py)?;
-            return py_self
-                .call_method1(
-                    "get_record_stream",
-                    (key_set, effective_ordering.as_str(), true),
-                )
-                .map(|b| b.unbind());
+            // The delta-closure path uses _VFContentMapGenerator. Pass slf directly
+            // since PyKnitVersionedFiles exposes all required attributes.
+            let py_kvf = this_ref.clone().into_any();
+            let positions = py_kvf.call_method1(
+                "_get_components_positions",
+                (key_set.clone(), true),
+            )?.cast_into::<PyDict>()?;
+            let absent_keys = pyo3::types::PySet::empty(py)?;
+            for k in key_set.try_iter()? {
+                let k = k?;
+                if positions.get_item(&k)?.is_none() {
+                    absent_keys.add(k)?;
+                }
+            }
+            let global_map_tup = py_kvf
+                .call_method1("_get_parent_map_with_sources", (key_set,))?
+                .cast_into::<PyTuple>()?;
+            let global_map = global_map_tup.get_item(0)?;
+            let absent_factory = knit_m.getattr("AbsentContentFactory")?;
+            let result_list = PyList::empty(py);
+            for k in absent_keys.iter() {
+                result_list.append(absent_factory.call1((k,))?)?;
+            }
+            let generator_cls = knit_m.getattr("_VFContentMapGenerator")?;
+            let present_keys: Vec<Bound<'_, PyAny>> = global_map
+                .cast::<PyDict>()?
+                .keys()
+                .iter()
+                .collect();
+            for sub_keys in this._group_keys_for_io(
+                py,
+                PyList::new(py, &present_keys)?.into_any(),
+                pyo3::types::PySet::empty(py)?.into_any(),
+                positions.clone().into_any(),
+                None,
+            )?.into_bound(py).try_iter()? {
+                let sub_tup = sub_keys?.cast_into::<PyTuple>()?;
+                let chunk_keys = sub_tup.get_item(0)?;
+                let non_local = sub_tup.get_item(1)?;
+                let generator = generator_cls.call1((
+                    py_kvf.clone(),
+                    chunk_keys,
+                    non_local,
+                    global_map.clone(),
+                ))?;
+                for item in generator.call_method0("get_record_stream")?.try_iter()? {
+                    result_list.append(item?)?;
+                }
+            }
+            return Ok(result_list.into_any().unbind());
         }
 
         // Non-delta-closure path: fetch raw bytes and yield KnitContentFactory.
-        let build_details_map = self
+        let build_details_map = this
             .index_obj
             .bind(py)
             .call_method1("get_build_details", (key_set.clone(),))?
@@ -4661,7 +4706,7 @@ impl PyKnitVersionedFiles {
 
         // Collect absent keys.
         let result_list = PyList::empty(py);
-        let global_map_tup = self
+        let global_map_tup = this
             ._get_parent_map_with_sources(py, key_set.clone().into_any())?
             .into_bound(py)
             .cast_into::<PyTuple>()?;
@@ -4743,7 +4788,7 @@ impl PyKnitVersionedFiles {
                 for k in &local_group.1 {
                     sub_list.append(k)?;
                 }
-                self.index_obj
+                this.index_obj
                     .bind(py)
                     .call_method1("_sort_keys_by_io", (sub_list.clone(), positions.clone()))?;
                 local_group.1 = sub_list.iter().collect();
@@ -4765,7 +4810,7 @@ impl PyKnitVersionedFiles {
                     let index_memo = pos.get_item(1)?;
                     records_list.append(PyTuple::new(py, [k, &index_memo])?)?;
                 }
-                let raw_iter = self
+                let raw_iter = this
                     ._read_records_iter_unchecked(py, records_list.into_any())?
                     .into_bound(py);
                 for raw_item in raw_iter.try_iter()? {
@@ -4784,7 +4829,7 @@ impl PyKnitVersionedFiles {
                         record_details,
                         py.None(),
                         raw_data,
-                        self.annotated,
+                        this.annotated,
                         py.None(),
                     ))?;
                     result_list.append(factory)?;
@@ -4800,7 +4845,7 @@ impl PyKnitVersionedFiles {
                     })
                     .unwrap_or(1)
                     .saturating_sub(1);
-                if let Some(fallback) = self.immediate_fallback_vfs.get(vf_idx) {
+                if let Some(fallback) = this.immediate_fallback_vfs.get(vf_idx) {
                     let fb_keys = PyList::empty(py);
                     for k in &sub_keys {
                         fb_keys.append(k)?;
