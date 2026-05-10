@@ -4582,16 +4582,13 @@ impl PyKnitVersionedFiles {
         content.call_method0("annotate").map(|b| b.unbind())
     }
 
-    fn get_annotator(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        // _KnitAnnotator(self) — pass this PyKnitVersionedFiles as the knit.
-        // Since PyKnitVersionedFiles is a pyclass, Python callers already hold a
-        // reference to it; we reconstruct it via to_py_kvf only if needed.
-        // _KnitAnnotator uses: vf._get_content, vf.get_parent_map, vf.keys —
-        // all of which are exposed on PyKnitVersionedFiles directly.
+    fn get_annotator(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // Pass this PyKnitVersionedFiles directly to _KnitAnnotator — it only
+        // calls get_parent_map, _get_content, and keys, all of which are exposed
+        // on PyKnitVersionedFiles.
         let knit_m = py.import("bzrformats.knit")?;
-        let py_self = self.to_py_kvf(py)?;
         knit_m
-            .call_method1("_KnitAnnotator", (py_self,))
+            .call_method1("_KnitAnnotator", (slf,))
             .map(|b| b.unbind())
     }
 
