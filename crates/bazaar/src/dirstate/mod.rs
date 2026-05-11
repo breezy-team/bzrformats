@@ -1885,8 +1885,6 @@ impl DirState {
         stat: &StatInfo,
         transport: &dyn Transport,
     ) -> Result<Option<Vec<u8>>, UpdateEntryError> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         // 1. Derive minikind from st_mode.  Non-file/dir/symlink kinds
         //    are silently skipped (Python returns None via the
         //    KeyError branch).
@@ -1946,15 +1944,9 @@ impl DirState {
         }
 
         // 5. Cache miss — rewrite the row.
-        let now_secs: i64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let cutoff: i64 = self.cutoff_time.unwrap_or_else(|| {
-            let c = now_secs - 3;
-            self.cutoff_time = Some(c);
-            c
-        });
+        let cutoff: i64 = self
+            .cutoff_time
+            .unwrap_or_else(|| self.compute_sha_cutoff_time());
 
         let stat_is_cacheable = stat.mtime < cutoff && stat.ctime < cutoff;
 
@@ -5406,15 +5398,12 @@ impl DirState {
                                 }
                             }
                             Kind::Relocated => {
-                                let (dn, _bn) = split_path_utf8(&tree_info.fingerprint);
+                                let (dn, bn) = split_path_utf8(&tree_info.fingerprint);
                                 if pending_dirs.iter().any(|p| p == dn) {
                                     continue;
                                 }
-                                let dn_vec = dn.to_vec();
-                                let (rdn, rbn) = split_path_utf8(&tree_info.fingerprint);
-                                if !found_dir_names.contains(&(rdn.to_vec(), rbn.to_vec())) {
+                                if !found_dir_names.contains(&(dn.to_vec(), bn.to_vec())) {
                                     paths_to_search.push(tree_info.fingerprint.clone());
-                                    let _ = dn_vec; // silence warning
                                 }
                             }
                             Kind::Absent | Kind::File | Kind::Symlink | Kind::TreeReference => {}
