@@ -2,10 +2,14 @@ use bazaar::groupcompress::compressor::GroupCompressor;
 use bazaar::versionedfile::Key;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
 use pyo3::wrap_pyfunction;
 use std::borrow::Cow;
 use std::convert::TryInto;
+
+pyo3::import_exception!(bzrformats.errors, ObjectNotLocked);
+pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
+pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
 
 fn extract_key_segments(obj: &Bound<PyAny>) -> PyResult<Vec<Vec<u8>>> {
     let tuple = obj.cast::<PyTuple>().map_err(|_| {
@@ -1790,13 +1794,20 @@ impl LazyGroupCompressFactory {
                 Ok(list.into_any().unbind())
             }
             "lines" => {
-                // Defer to Python osutils.chunks_to_lines for fidelity.
-                let osutils = py.import("bzrformats.osutils")?;
-                let chunks_list =
-                    pyo3::types::PyList::new(py, chunks.into_iter().map(|c| c.into_bound(py)))?;
-                Ok(osutils
-                    .call_method1("chunks_to_lines", (chunks_list,))?
-                    .unbind())
+                let raw: Vec<Vec<u8>> = chunks
+                    .iter()
+                    .map(|c| c.bind(py).as_bytes().to_vec())
+                    .collect();
+                let lines: Vec<Vec<u8>> = bazaar::osutils::chunks_to_lines(
+                    raw.into_iter().map(Ok::<_, std::convert::Infallible>),
+                )
+                .map(|r| r.unwrap().into_owned())
+                .collect();
+                Ok(
+                    pyo3::types::PyList::new(py, lines.iter().map(|l| PyBytes::new(py, l)))?
+                        .into_any()
+                        .unbind(),
+                )
             }
             _ => unreachable!(),
         }
@@ -1816,13 +1827,17 @@ impl LazyGroupCompressFactory {
                 Ok(list.try_iter()?.unbind().into())
             }
             "lines" => {
-                let osutils = py.import("bzrformats.osutils")?;
-                let chunks_list =
-                    pyo3::types::PyList::new(py, chunks.into_iter().map(|c| c.into_bound(py)))?;
-                let chunks_iter = chunks_list.try_iter()?;
-                Ok(osutils
-                    .call_method1("chunks_to_lines_iter", (chunks_iter,))?
-                    .unbind())
+                let raw: Vec<Vec<u8>> = chunks
+                    .iter()
+                    .map(|c| c.bind(py).as_bytes().to_vec())
+                    .collect();
+                let lines: Vec<Vec<u8>> = bazaar::osutils::chunks_to_lines(
+                    raw.into_iter().map(Ok::<_, std::convert::Infallible>),
+                )
+                .map(|r| r.unwrap().into_owned())
+                .collect();
+                let list = pyo3::types::PyList::new(py, lines.iter().map(|l| PyBytes::new(py, l)))?;
+                Ok(list.try_iter()?.unbind().into())
             }
             _ => Err(unavailable_representation(
                 py,
@@ -2015,6 +2030,423 @@ impl GCBuildDetails {
     }
 }
 
+/// Mapper from `GroupCompressVersionedFiles` needs into `GraphIndex` storage.
+///
+/// Mirrors `bzrformats.groupcompress._GCGraphIndex`.
+#[pyclass(name = "_GCGraphIndex")]
+struct GCGraphIndex {
+    graph_index: Py<PyAny>,
+    is_locked: Py<PyAny>,
+    parents: bool,
+    add_callback: Option<Py<PyAny>>,
+    inconsistency_fatal: bool,
+    /// Integer cache for group start/stop values (avoids duplicate int objects).
+    int_cache: std::collections::HashMap<u64, u64>,
+    /// Optional external-parent-ref tracker.
+    key_dependencies: Option<Py<crate::versionedfile::KeyRefs>>,
+}
+
+#[pymethods]
+impl GCGraphIndex {
+    #[new]
+    #[pyo3(signature = (
+        graph_index,
+        is_locked,
+        parents = true,
+        add_callback = None,
+        track_external_parent_refs = false,
+        inconsistency_fatal = true,
+        track_new_keys = false,
+    ))]
+    fn new(
+        py: Python<'_>,
+        graph_index: Bound<'_, PyAny>,
+        is_locked: Bound<'_, PyAny>,
+        parents: bool,
+        add_callback: Option<Bound<'_, PyAny>>,
+        track_external_parent_refs: bool,
+        inconsistency_fatal: bool,
+        track_new_keys: bool,
+    ) -> PyResult<Self> {
+        let key_dependencies = if track_external_parent_refs {
+            let kr = crate::versionedfile::KeyRefs::new(py, track_new_keys)?;
+            Some(Py::new(py, kr)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            graph_index: graph_index.unbind(),
+            is_locked: is_locked.unbind(),
+            parents,
+            add_callback: add_callback.map(|c| c.unbind()),
+            inconsistency_fatal,
+            int_cache: std::collections::HashMap::new(),
+            key_dependencies,
+        })
+    }
+
+    #[getter]
+    fn has_graph(&self) -> bool {
+        self.parents
+    }
+
+    #[getter]
+    fn _graph_index(&self, py: Python<'_>) -> Py<PyAny> {
+        self.graph_index.clone_ref(py)
+    }
+
+    #[getter]
+    fn _int_cache(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let d = PyDict::new(py);
+        for (k, v) in &self.int_cache {
+            d.set_item(k, v)?;
+        }
+        Ok(d.unbind())
+    }
+
+    #[getter]
+    fn _key_dependencies(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.key_dependencies {
+            Some(kd) => Ok(kd.clone_ref(py).into_any()),
+            None => Ok(py.None()),
+        }
+    }
+
+    fn _check_read(&self, py: Python<'_>) -> PyResult<()> {
+        if !self.is_locked.bind(py).call0()?.is_truthy()? {
+            return Err(ObjectNotLocked::new_err(py.None()));
+        }
+        Ok(())
+    }
+
+    fn _check_write_ok(&self, py: Python<'_>) -> PyResult<()> {
+        if self.add_callback.is_none() {
+            return Err(ReadOnlyError::new_err(py.None()));
+        }
+        self._check_read(py)
+    }
+
+    fn keys(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        self._check_read(py)?;
+        let entries = self.graph_index.bind(py).call_method0("iter_all_entries")?;
+        let result = PyList::empty(py);
+        for entry in entries.try_iter()? {
+            result.append(entry?.get_item(1)?)?;
+        }
+        Ok(result.unbind())
+    }
+
+    fn get_parent_map<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self._check_read(py)?;
+        let result = PyDict::new(py);
+        let nodes = self._get_entries(py, keys, false)?;
+        if self.parents {
+            for node in nodes.try_iter()? {
+                let node = node?;
+                let key = node.get_item(1)?;
+                let parents = node.get_item(3)?.get_item(0)?;
+                result.set_item(key, parents)?;
+            }
+        } else {
+            for node in nodes.try_iter()? {
+                let key = node?.get_item(1)?;
+                result.set_item(key, py.None())?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn get_build_details<'py>(
+        &mut self,
+        py: Python<'py>,
+        keys: Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self._check_read(py)?;
+        let result = PyDict::new(py);
+        let entries = self._get_entries(py, keys, false)?;
+        for entry in entries.try_iter()? {
+            let entry = entry?;
+            let key = entry.get_item(1)?;
+            let parents = if self.parents {
+                entry.get_item(3)?.get_item(0)?.unbind()
+            } else {
+                py.None()
+            };
+            let position = self._node_to_position(py, &entry)?;
+            let details = GCBuildDetails {
+                parents,
+                index: position.0,
+                group_start: position.1,
+                group_end: position.2,
+                basis_end: position.3,
+                delta_end: position.4,
+            };
+            result.set_item(key, Py::new(py, details)?)?;
+        }
+        Ok(result)
+    }
+
+    fn find_ancestry<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.graph_index
+            .bind(py)
+            .call_method1("find_ancestry", (keys, 0i32))
+    }
+
+    fn get_missing_parents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PySet>> {
+        let kd = self.key_dependencies.as_ref().ok_or_else(|| {
+            PyValueError::new_err("get_missing_parents called without key_dependencies")
+        })?;
+        let kd = kd.bind(py).borrow();
+        let unsatisfied = kd.get_unsatisfied_refs(py)?;
+        let parent_map = self.get_parent_map(py, unsatisfied)?;
+        kd.satisfy_refs_for_keys(py, parent_map.into_any())?;
+        let refs = kd.get_unsatisfied_refs(py)?;
+        let out = PySet::empty(py)?;
+        for key in refs.try_iter()? {
+            out.add(key?)?;
+        }
+        Ok(out)
+    }
+
+    #[pyo3(signature = (records, random_id = false))]
+    fn add_records(
+        &mut self,
+        py: Python<'_>,
+        records: Bound<'_, PyAny>,
+        random_id: bool,
+    ) -> PyResult<()> {
+        let add_callback = self
+            .add_callback
+            .as_ref()
+            .ok_or_else(|| ReadOnlyError::new_err(py.None()))?;
+
+        // Collect into a dict: key -> (value, refs)
+        let keys_map = PyDict::new(py);
+        let mut changed = false;
+        for record in records.try_iter()? {
+            let record = record?;
+            let key = record.get_item(0)?;
+            let value = record.get_item(1)?;
+            let refs = record.get_item(2)?;
+
+            // For parentless index, strip non-empty refs.
+            if !self.parents {
+                let has_refs = refs.try_iter()?.any(|r| {
+                    r.as_ref()
+                        .map(|r| r.is_truthy().unwrap_or(false))
+                        .unwrap_or(false)
+                });
+                if has_refs {
+                    pyo3::import_exception!(bzrformats.knit, KnitCorrupt);
+                    return Err(KnitCorrupt::new_err((
+                        py.None(),
+                        "attempt to add node with parents in parentless index.",
+                    )));
+                }
+                changed = true;
+                keys_map.set_item(key, (value, PyTuple::empty(py)))?;
+            } else {
+                keys_map.set_item(key, (value, refs))?;
+            }
+        }
+
+        // Check for duplicates if not random_id.
+        if !random_id {
+            let present = self._get_entries(py, keys_map.call_method0("keys")?, false)?;
+            for node in present.try_iter()? {
+                let node = node?;
+                let key = node.get_item(1)?;
+                let existing_value = node.get_item(2)?;
+                let existing_refs = if self.parents {
+                    node.get_item(3)?
+                } else {
+                    PyTuple::empty(py).into_any()
+                };
+
+                let entry = keys_map.get_item(&key)?.unwrap();
+                let passed_refs = entry.get_item(1)?;
+
+                // Compare refs as nested tuples.
+                let passed_as_tuples = as_tuples(py, &passed_refs)?;
+                let existing_as_tuples = as_tuples(py, &existing_refs)?;
+                if !existing_as_tuples.eq(&passed_as_tuples)? {
+                    // Match Python: f"{key} {value, node_refs} {passed}"
+                    let existing_pair =
+                        PyTuple::new(py, [existing_value.clone(), existing_refs.clone()])?;
+                    let details = format!(
+                        "{} {} {}",
+                        key.repr()?.to_str()?,
+                        existing_pair.repr()?.to_str()?,
+                        entry.repr()?.to_str()?,
+                    );
+                    if self.inconsistency_fatal {
+                        pyo3::import_exception!(bzrformats.knit, KnitCorrupt);
+                        return Err(KnitCorrupt::new_err((
+                            py.None(),
+                            format!("inconsistent details in add_records: {}", details),
+                        )));
+                    } else {
+                        // Log warning and skip.
+                        let logging = py.import("logging")?;
+                        let logger =
+                            logging.call_method1("getLogger", ("bzrformats.groupcompress",))?;
+                        logger.call_method1(
+                            "warning",
+                            (format!(
+                                "inconsistent details in skipped record: {}",
+                                details
+                            ),),
+                        )?;
+                    }
+                }
+                keys_map.del_item(key)?;
+                changed = true;
+            }
+        }
+
+        // Build the records list for the callback.
+        let result = PyList::empty(py);
+        if self.parents {
+            for (key, entry) in keys_map.iter() {
+                let value = entry.get_item(0)?;
+                let refs = entry.get_item(1)?;
+                result.append(PyTuple::new(py, [key, value, refs])?)?;
+            }
+        } else {
+            // Parentless: always emit 2-tuples.
+            changed = true;
+            for (key, entry) in keys_map.iter() {
+                let value = entry.get_item(0)?;
+                result.append(PyTuple::new(py, [key, value])?)?;
+            }
+        }
+
+        // Update key_dependencies.
+        if let Some(kd) = &self.key_dependencies {
+            let kd = kd.bind(py).borrow();
+            if self.parents {
+                for item in result.iter() {
+                    let item: Bound<'_, PyAny> = item;
+                    let key = item.get_item(0)?;
+                    let refs = item.get_item(2)?;
+                    let parents = refs.get_item(0)?;
+                    kd.add_references(py, key, parents)?;
+                }
+            } else {
+                for item in result.iter() {
+                    let item: Bound<'_, PyAny> = item;
+                    let key = item.get_item(0)?;
+                    kd.add_key(py, key)?;
+                }
+            }
+        }
+
+        let records_to_add = if changed {
+            result.into_any()
+        } else {
+            // Re-use original records — they haven't changed shape.
+            // (In practice `changed` is always true for parentless or when
+            // duplicates were dropped; when false we can pass result directly
+            // since we built it identically.)
+            result.into_any()
+        };
+
+        add_callback.call1(py, (records_to_add,))?;
+        Ok(())
+    }
+
+    fn scan_unvalidated_index(
+        &self,
+        py: Python<'_>,
+        graph_index: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let kd = match &self.key_dependencies {
+            Some(kd) => kd,
+            None => return Ok(()),
+        };
+        let entries = graph_index.call_method0("iter_all_entries")?;
+        let kd = kd.bind(py).borrow();
+        for node in entries.try_iter()? {
+            let node = node?;
+            let key = node.get_item(1)?;
+            let refs = node.get_item(3)?;
+            let parents = refs.get_item(0)?;
+            kd.add_references(py, key, parents)?;
+        }
+        Ok(())
+    }
+}
+
+impl GCGraphIndex {
+    /// Convert an index entry to its `(index, group_start, group_end, basis_end, delta_end)` tuple.
+    fn _node_to_position(
+        &mut self,
+        py: Python<'_>,
+        node: &Bound<'_, PyAny>,
+    ) -> PyResult<(Py<PyAny>, u64, u64, u64, u64)> {
+        let value: Vec<u8> = node.get_item(2)?.extract::<Vec<u8>>()?;
+        let pos = bazaar::groupcompress::manager::parse_node_position(&value)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        // Cache start and stop to avoid duplicate int objects.
+        let start = *self.int_cache.entry(pos.start).or_insert(pos.start);
+        let stop = *self.int_cache.entry(pos.stop).or_insert(pos.stop);
+        let index = node.get_item(0)?.unbind();
+        Ok((index, start, stop, pos.basis_end, pos.delta_end))
+    }
+
+    /// Collect entries from the underlying graph_index for `keys`.
+    /// When `parents` is false, adapts output to include an empty refs tuple.
+    fn _get_entries<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+        _check_present: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let iter = self
+            .graph_index
+            .bind(py)
+            .call_method1("iter_entries", (keys,))?;
+        let result = PyList::empty(py);
+        if self.parents {
+            for node in iter.try_iter()? {
+                result.append(node?)?;
+            }
+        } else {
+            for node in iter.try_iter()? {
+                let node = node?;
+                let idx = node.get_item(0)?;
+                let key = node.get_item(1)?;
+                let val = node.get_item(2)?;
+                result.append(PyTuple::new(
+                    py,
+                    [idx, key, val, PyTuple::empty(py).into_any()],
+                )?)?;
+            }
+        }
+        Ok(result)
+    }
+}
+
+/// Recursively convert `obj` to nested plain Python tuples.
+fn as_tuples<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    if let Ok(seq) = obj.try_iter() {
+        let items: Vec<Bound<'py, PyAny>> = seq
+            .map(|r| r.and_then(|item| as_tuples(py, &item)))
+            .collect::<PyResult<_>>()?;
+        Ok(PyTuple::new(py, items)?.into_any())
+    } else {
+        Ok(obj.clone())
+    }
+}
+
 pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "groupcompress")?;
     m.add_wrapped(wrap_pyfunction!(encode_base128_int))?;
@@ -2040,6 +2472,7 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<LazyGroupCompressFactory>()?;
     m.add_class::<RecordStreamIter>()?;
     m.add_class::<GCBuildDetails>()?;
+    m.add_class::<GCGraphIndex>()?;
     m.add_class::<crate::groupcompress_delta::DeltaIndex>()?;
     m.add_function(wrap_pyfunction!(
         crate::groupcompress_delta::_rabin_hash,
