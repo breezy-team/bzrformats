@@ -1068,6 +1068,20 @@ class _GCGraphIndex:
         else:
             self._key_dependencies = None
 
+    def set_add_callback(self, callback):
+        self._add_callback = callback
+
+    def clear_key_dependencies(self):
+        if self._key_dependencies is not None:
+            self._key_dependencies.clear()
+
+    @property
+    def key_dependencies(self):
+        return self._key_dependencies
+
+    def add_missing_compression_parent(self, key):
+        raise NotImplementedError("_GCGraphIndex does not track missing compression parents")
+
     def add_records(self, records, random_id=False):
         """Add multiple records to the index.
 

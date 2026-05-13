@@ -665,12 +665,22 @@ from ._bzr_rs.knit import (  # noqa: E402
     AnnotatedKnitContent,
     KnitAnnotateFactory,
     KnitPlainFactory,
-    KnitVersionedFiles,
     PlainKnitContent,
     _KndxIndex,
     _KnitGraphIndex,
     _KnitKeyAccess,
 )
+from ._bzr_rs.knit import KnitVersionedFiles as _KnitVersionedFilesRs  # noqa: E402
+
+
+class KnitVersionedFiles(_KnitVersionedFilesRs, VersionedFilesWithFallbacks):
+    """Python view of the Rust-backed KnitVersionedFiles.
+
+    Inherits the Rust pyclass for storage/methods and
+    `VersionedFilesWithFallbacks` so `isinstance(x, VersionedFiles)`
+    holds — the Rust pyclass has `__module__ == 'builtins'` and
+    cannot itself extend a pure-Python class via PyO3.
+    """
 
 
 def make_file_factory(annotated, mapper):

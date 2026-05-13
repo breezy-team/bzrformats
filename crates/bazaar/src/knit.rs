@@ -206,6 +206,12 @@ pub enum KnitError {
     /// A knit index detected an inconsistency (e.g. duplicate with different
     /// metadata, or a delta record in a non-delta index).
     Corrupt(String),
+    /// A write operation was attempted on a read-only index (no add_callback set).
+    ReadOnly,
+    /// The operation is not supported by this index type (e.g. compression
+    /// parent tracking on `_KndxIndex`, which uses an append-only on-disk
+    /// format that cannot defer parents).
+    NotImplemented(&'static str),
 }
 
 impl std::fmt::Display for KnitError {
@@ -264,6 +270,8 @@ impl std::fmt::Display for KnitError {
                 write!(f, "kndx corrupt record {:?}: {}", line, detail)
             }
             KnitError::Corrupt(msg) => write!(f, "knit corrupt: {}", msg),
+            KnitError::ReadOnly => write!(f, "write attempted on read-only knit index"),
+            KnitError::NotImplemented(name) => write!(f, "{}", name),
         }
     }
 }
@@ -2138,6 +2146,203 @@ pub trait KnitIndex {
     ) -> Result<(), KnitError>;
 }
 
+/// Callback invoked by [`KnitGraphIndex`] after encoding a batch of records,
+/// to write them into the backing graph index.
+///
+/// The `entries` slice contains `(key, encoded_value, node_refs)` triples
+/// ready to pass to the graph index's add method.  `has_parents` mirrors the
+/// `parents` flag on the owning `KnitGraphIndex` and controls whether
+/// `node_refs` is meaningful.
+pub trait AddCallback {
+    fn call(
+        &mut self,
+        entries: &[(KnitKey, Vec<u8>, Vec<Vec<KnitKey>>)],
+        has_parents: bool,
+    ) -> Result<(), KnitError>;
+}
+
+/// Pure-Rust state for a graph-index-backed knit index.
+///
+/// Owns the mutable bookkeeping that was previously scattered across
+/// `PyKnitGraphIndex` in `bazaar-py`:
+///
+/// - `missing_compression_parents`: delta-compressed records whose
+///   compression parent has not yet been written to any scanned index.
+/// - `key_dependencies`: optional [`KeyRefs`] tracker for external parent
+///   references (used when `track_external_parent_refs=True`).
+/// - `add_callback`: the sink that receives encoded `(key, value, refs)`
+///   triples when `add_records` is called.
+///
+/// All graph-index I/O (iter_entries, external_references, …) is left to the
+/// caller; only the encoding and state-management logic lives here.
+pub struct KnitGraphIndex<C> {
+    pub deltas: bool,
+    pub parents: bool,
+    pub add_callback: Option<C>,
+    pub missing_compression_parents: std::collections::HashSet<KnitKey>,
+    pub key_dependencies: Option<crate::versionedfile::KeyRefs<KnitKey>>,
+}
+
+impl<C: AddCallback> KnitGraphIndex<C> {
+    pub fn new(deltas: bool, parents: bool) -> Self {
+        Self {
+            deltas,
+            parents,
+            add_callback: None,
+            missing_compression_parents: std::collections::HashSet::new(),
+            key_dependencies: None,
+        }
+    }
+
+    pub fn set_add_callback(&mut self, callback: C) {
+        self.add_callback = Some(callback);
+    }
+
+    pub fn clear_add_callback(&mut self) {
+        self.add_callback = None;
+    }
+
+    /// Enable external-parent-ref tracking.
+    ///
+    /// `track_new_keys`: if true, [`Self::get_new_keys`] will return the set of
+    /// keys added since the last [`Self::clear_key_dependencies`].
+    pub fn enable_key_dependencies(&mut self, track_new_keys: bool) {
+        self.key_dependencies = Some(crate::versionedfile::KeyRefs::new(track_new_keys));
+    }
+
+    pub fn clear_key_dependencies(&mut self) {
+        if let Some(kd) = self.key_dependencies.as_mut() {
+            kd.clear();
+        }
+    }
+
+    /// Record that `key` refers to `parent_keys`. No-op if key_dependencies
+    /// is not enabled.
+    pub fn add_key_dependencies(&mut self, key: KnitKey, parent_keys: Vec<KnitKey>) {
+        if let Some(kd) = self.key_dependencies.as_mut() {
+            kd.add_references(key, parent_keys);
+        }
+    }
+
+    pub fn add_missing_compression_parent(&mut self, key: KnitKey) {
+        self.missing_compression_parents.insert(key);
+    }
+
+    pub fn satisfy_refs_for_keys(&mut self, keys: impl IntoIterator<Item = KnitKey>) {
+        if let Some(kd) = self.key_dependencies.as_mut() {
+            kd.satisfy_refs_for_keys(keys);
+        }
+    }
+
+    /// Keys that still have unsatisfied references (i.e. referenced parents
+    /// not yet present). Returns an empty iterator if key_dependencies is not
+    /// enabled.
+    pub fn unsatisfied_refs(&self) -> impl Iterator<Item = &KnitKey> {
+        self.key_dependencies
+            .iter()
+            .flat_map(|kd| kd.unsatisfied_refs())
+    }
+
+    /// All keys that reference at least one other key. Returns an empty set
+    /// if key_dependencies is not enabled.
+    pub fn referrers(&self) -> std::collections::HashSet<KnitKey> {
+        self.key_dependencies
+            .as_ref()
+            .map(|kd| kd.referrers())
+            .unwrap_or_default()
+    }
+
+    /// Keys added since construction or the last `clear_key_dependencies`.
+    /// Returns `None` if key_dependencies is disabled or was not constructed
+    /// with `track_new_keys=true`.
+    pub fn new_keys(&self) -> Option<&std::collections::HashSet<KnitKey>> {
+        self.key_dependencies.as_ref()?.new_keys()
+    }
+
+    /// Update `missing_compression_parents` after scanning a new (unvalidated)
+    /// index shard.
+    pub fn update_missing_compression_parents(
+        &mut self,
+        new_missing: impl IntoIterator<Item = KnitKey>,
+        present_keys: &std::collections::HashSet<KnitKey>,
+    ) {
+        for key in new_missing {
+            if !present_keys.contains(&key) {
+                self.missing_compression_parents.insert(key);
+            }
+        }
+    }
+
+    /// Encode a batch of records and pass them to the add_callback.
+    ///
+    /// Returns `Err` if no callback is set (read-only index).
+    ///
+    /// `records` is an iterator of `(key, options_bytes, (pos, size), parents)`.
+    /// The caller is responsible for dedup checking (passing `random_id=true`
+    /// skips it on the Python side; pure-Rust callers handle it themselves).
+    pub fn encode_and_dispatch<I>(
+        &mut self,
+        records: I,
+        missing_compression_parents_flag: bool,
+    ) -> Result<(), KnitError>
+    where
+        I: IntoIterator<Item = (KnitKey, Vec<u8>, u64, u64, Vec<KnitKey>)>,
+    {
+        let Some(cb) = self.add_callback.as_mut() else {
+            return Err(KnitError::ReadOnly);
+        };
+
+        let mut entries: Vec<(KnitKey, Vec<u8>, Vec<Vec<KnitKey>>)> = Vec::new();
+        let mut new_compression_parents: std::collections::HashSet<KnitKey> =
+            std::collections::HashSet::new();
+        let mut key_dep_updates: Vec<(KnitKey, Vec<KnitKey>)> = Vec::new();
+
+        for (key, options_bytes, pos, size, parents) in records {
+            let noeol = options_bytes.windows(6).any(|w| w == b"no-eol");
+            let method = if options_bytes.windows(10).any(|w| w == b"line-delta") {
+                KnitMethod::LineDelta
+            } else {
+                KnitMethod::Fulltext
+            };
+
+            if missing_compression_parents_flag && method == KnitMethod::LineDelta {
+                if let Some(cp) = parents.first() {
+                    new_compression_parents.insert(cp.clone());
+                }
+            }
+
+            let (value, node_refs) =
+                encode_graph_index_record(noeol, pos, size, method, self.parents, self.deltas, &parents)?;
+
+            if self.parents && self.key_dependencies.is_some() {
+                key_dep_updates.push((key.clone(), parents));
+            }
+
+            if let Some(existing) = entries.iter_mut().find(|(k, _, _)| k == &key) {
+                *existing = (key, value, node_refs);
+            } else {
+                entries.push((key, value, node_refs));
+            }
+        }
+
+        cb.call(&entries, self.parents)?;
+
+        for (key, parents) in key_dep_updates {
+            self.add_key_dependencies(key, parents);
+        }
+
+        let added_keys: std::collections::HashSet<&KnitKey> =
+            entries.iter().map(|(k, _, _)| k).collect();
+        if missing_compression_parents_flag {
+            new_compression_parents.retain(|k| !added_keys.contains(k));
+            self.missing_compression_parents.extend(new_compression_parents);
+        }
+        self.missing_compression_parents.retain(|k| !added_keys.contains(k));
+
+        Ok(())
+    }
+}
+
 /// Full access trait for knit storage.
 ///
 /// Covers both the read path (fetch raw record bytes) and the write
@@ -2782,9 +2987,10 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitIndex for
     }
 
     fn get_missing_compression_parents(&self) -> Result<Vec<KnitKey>, KnitError> {
-        // KndxIndex tracks all parents inline; there are no deferred
-        // compression parents in this format.
-        Ok(vec![])
+        // kndx is append-only and has no separate atomic-insertion staging
+        // area, so it cannot track deferred compression parents. Callers
+        // distinguish this from "no missing parents" by catching the error.
+        Err(KnitError::NotImplemented("get_missing_compression_parents"))
     }
 
     fn check_write_ok(&self) -> Result<(), KnitError> {
@@ -2898,7 +3104,19 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitKeyAccess
         data: &[u8],
     ) -> Result<(KnitKey, u64, usize), crate::transport::TransportError> {
         let path = self.key_path(&key);
-        let offset = self.transport.append_bytes(&path, data)?;
+        let offset = match self.transport.append_bytes(&path, data) {
+            Ok(off) => off,
+            Err(crate::transport::TransportError::NoSuchFile(_)) => {
+                // Parent directory doesn't exist yet; create it and retry.
+                // For paths without a separator, mkdir("") creates the
+                // transport root, which is what the Python implementation
+                // does via osutils.dirname(path).
+                let parent = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
+                self.transport.mkdir(parent)?;
+                self.transport.append_bytes(&path, data)?
+            }
+            Err(e) => return Err(e),
+        };
         Ok((key, offset, data.len()))
     }
 }

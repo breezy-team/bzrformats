@@ -170,6 +170,9 @@ pub fn _load_data(py: Python, kndx: &Bound<PyAny>, fp: &Bound<PyAny>) -> PyResul
 
 fn knit_err_to_py(err: KnitError) -> PyErr {
     Python::attach(|py| -> PyErr {
+        if let KnitError::NotImplemented(name) = err {
+            return PyNotImplementedError::new_err(name);
+        }
         if let KnitError::Corrupt(ref msg) = err {
             if let Ok(cls) = py
                 .import("bzrformats.knit")
@@ -1226,6 +1229,9 @@ impl PyKnitIndex {
 
 fn knit_err_from_py(py: Python<'_>, err: PyErr) -> KnitError {
     pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
+    if err.is_instance_of::<PyNotImplementedError>(py) {
+        return KnitError::NotImplemented("operation not implemented by Python index");
+    }
     if err.is_instance_of::<RevisionNotPresent>(py) {
         return KnitError::BadIndexValue(err.to_string().into_bytes());
     }
@@ -2730,7 +2736,8 @@ impl PyKndxIndex {
     fn _check_read(&mut self, py: Python<'_>) -> PyResult<()> {
         let locked: bool = self.is_locked.bind(py).call0()?.extract()?;
         if !locked {
-            return Err(PyValueError::new_err("object not locked"));
+            pyo3::import_exception!(bzrformats.errors, ObjectNotLocked);
+            return Err(ObjectNotLocked::new_err((py.None(),)));
         }
         let current_scope = self.get_scope.bind(py).call0()?;
         if !current_scope.eq(self.scope.bind(py))? {
@@ -3169,10 +3176,19 @@ impl PyKndxIndex {
             .unwrap_or(false))
     }
 
-    fn get_missing_compression_parents(&self) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "get_missing_compression_parents",
-        ))
+    fn get_missing_compression_parents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let missing = self
+            .inner
+            .get_missing_compression_parents()
+            .map_err(knit_err_to_py)?;
+        let s = pyo3::types::PyFrozenSet::new(
+            py,
+            missing
+                .iter()
+                .map(|k| py_knit_key_to_py(py, k))
+                .collect::<PyResult<Vec<_>>>()?,
+        )?;
+        Ok(s.into_any())
     }
 
     fn check_header(&self, py: Python<'_>, fp: Bound<'_, PyAny>) -> PyResult<()> {
@@ -3302,25 +3318,83 @@ impl PyKndxIndex {
 pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
 pyo3::import_exception!(bzrformats.errors, ObjectNotLocked);
 
+/// PyO3 wrapper around a Python callable used as the `add_callback` for
+/// [`bazaar::knit::KnitGraphIndex`].
+struct PyAddCallback(Py<PyAny>);
+
+impl bazaar::knit::AddCallback for PyAddCallback {
+    fn call(
+        &mut self,
+        entries: &[(bazaar::knit::KnitKey, Vec<u8>, Vec<Vec<bazaar::knit::KnitKey>>)],
+        has_parents: bool,
+    ) -> Result<(), bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let result = pyo3::types::PyList::empty(py);
+            if has_parents {
+                for (key, value, node_refs) in entries {
+                    let py_key = py_knit_key_to_py(py, key)
+                        .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
+                    let py_value = PyBytes::new(py, value);
+                    let py_refs = PyTuple::new(
+                        py,
+                        node_refs
+                            .iter()
+                            .map(|rl| {
+                                PyTuple::new(
+                                    py,
+                                    rl.iter()
+                                        .map(|k| py_knit_key_to_py(py, k))
+                                        .collect::<PyResult<Vec<_>>>()?,
+                                )
+                            })
+                            .collect::<PyResult<Vec<_>>>()
+                            .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?,
+                    )
+                    .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
+                    result
+                        .append(
+                            PyTuple::new(
+                                py,
+                                [py_key.into_any(), py_value.into_any(), py_refs.into_any()],
+                            )
+                            .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?,
+                        )
+                        .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
+                }
+            } else {
+                for (key, value, _) in entries {
+                    let py_key = py_knit_key_to_py(py, key)
+                        .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
+                    let py_value = PyBytes::new(py, value);
+                    result
+                        .append(
+                            PyTuple::new(py, [py_key.into_any(), py_value.into_any()])
+                                .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?,
+                        )
+                        .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
+                }
+            }
+            self.0
+                .bind(py)
+                .call1((result,))
+                .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
+            Ok(())
+        })
+    }
+}
+
 /// pyo3 wrapper that exposes `_KnitGraphIndex` to Python.
 ///
 /// Wraps a Python `CombinedGraphIndex` (or any compatible graph index) and
 /// implements the same public interface as the Python `_KnitGraphIndex` class.
-/// All graph-index operations are delegated back to the wrapped Python object;
-/// only the knit-specific encoding/decoding logic runs in Rust.
+/// Graph-index I/O is delegated back to the wrapped Python object; all
+/// knit-specific encoding/decoding and state management runs in Rust via
+/// [`bazaar::knit::KnitGraphIndex`].
 #[pyclass(name = "_KnitGraphIndex")]
 pub struct PyKnitGraphIndex {
     graph_index: Py<PyAny>,
     is_locked: Py<PyAny>,
-    deltas: bool,
-    parents: bool,
-    add_callback: Option<Py<PyAny>>,
-    /// Keys of compression parents that are referenced but not yet present
-    /// in any scanned index.
-    missing_compression_parents: std::collections::HashSet<bazaar::knit::KnitKey>,
-    /// Optional external-parent-ref tracker (used when
-    /// `track_external_parent_refs=True`).
-    key_dependencies: Option<Py<PyAny>>,
+    inner: bazaar::knit::KnitGraphIndex<PyAddCallback>,
 }
 
 #[pymethods]
@@ -3328,7 +3402,6 @@ impl PyKnitGraphIndex {
     #[new]
     #[pyo3(signature = (graph_index, is_locked, deltas=false, parents=true, add_callback=None, track_external_parent_refs=false))]
     fn new(
-        py: Python<'_>,
         graph_index: Bound<'_, PyAny>,
         is_locked: Bound<'_, PyAny>,
         deltas: bool,
@@ -3341,20 +3414,17 @@ impl PyKnitGraphIndex {
                 "Cannot do delta compression without parent tracking.".to_string(),
             )));
         }
-        let key_dependencies = if track_external_parent_refs {
-            let cls = py.import("bzrformats.versionedfile")?.getattr("_KeyRefs")?;
-            Some(cls.call0()?.unbind())
-        } else {
-            None
-        };
+        let mut inner = bazaar::knit::KnitGraphIndex::new(deltas, parents);
+        if let Some(cb) = add_callback {
+            inner.set_add_callback(PyAddCallback(cb.unbind()));
+        }
+        if track_external_parent_refs {
+            inner.enable_key_dependencies(false);
+        }
         Ok(Self {
             graph_index: graph_index.unbind(),
             is_locked: is_locked.unbind(),
-            deltas,
-            parents,
-            add_callback: add_callback.map(|c| c.unbind()),
-            missing_compression_parents: std::collections::HashSet::new(),
-            key_dependencies,
+            inner,
         })
     }
 
@@ -3365,7 +3435,7 @@ impl PyKnitGraphIndex {
 
     #[getter]
     fn has_graph(&self) -> bool {
-        self.parents
+        self.inner.parents
     }
 
     #[getter]
@@ -3373,10 +3443,67 @@ impl PyKnitGraphIndex {
         self.graph_index.clone_ref(py)
     }
 
+    /// Returns `self` when key_dependencies tracking is enabled, else `None`.
+    /// Python callers get back the `_KnitGraphIndex` itself and call
+    /// `get_referrers()` / `satisfy_refs_for_keys()` / `get_new_keys()` on it.
+    #[getter]
+    fn key_dependencies(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if slf.inner.key_dependencies.is_some() {
+            Ok(Py::from(slf).into_any())
+        } else {
+            Ok(py.None())
+        }
+    }
+
+    fn set_add_callback(&mut self, value: Option<Bound<'_, PyAny>>) {
+        self.inner.add_callback = value.map(|v| PyAddCallback(v.unbind()));
+    }
+
+    fn clear_key_dependencies(&mut self) {
+        self.inner.clear_key_dependencies();
+    }
+
+    fn get_referrers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let refs = self.inner.referrers();
+        let result = pyo3::types::PyList::empty(py);
+        for key in refs {
+            result.append(py_knit_key_to_py(py, &key)?)?;
+        }
+        Ok(result.into_any())
+    }
+
+    fn satisfy_refs_for_keys(&mut self, keys: Bound<'_, PyAny>) -> PyResult<()> {
+        let rust_keys = extract_py_knit_keys(&keys)?;
+        self.inner.satisfy_refs_for_keys(rust_keys);
+        Ok(())
+    }
+
+    fn get_new_keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let Some(new_keys) = self.inner.new_keys() else {
+            return Ok(pyo3::types::PyFrozenSet::empty(py)?.into_any());
+        };
+        let result = pyo3::types::PyFrozenSet::new(
+            py,
+            new_keys
+                .iter()
+                .map(|k| py_knit_key_to_py(py, k))
+                .collect::<PyResult<Vec<_>>>()?,
+        )?;
+        Ok(result.into_any())
+    }
+
+    fn add_missing_compression_parent(
+        &mut self,
+        key: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let k = extract_py_knit_key(&key)?;
+        self.inner.add_missing_compression_parent(k);
+        Ok(())
+    }
+
     fn _check_read(&self, py: Python<'_>) -> PyResult<()> {
         if !self.is_locked.bind(py).call0()?.is_truthy()? {
-            let exc = ObjectNotLocked::new_err(py.None());
-            return Err(exc);
+            return Err(ObjectNotLocked::new_err((py.None(),)));
         }
         Ok(())
     }
@@ -3405,7 +3532,7 @@ impl PyKnitGraphIndex {
         let result = PyDict::new(py);
         let nodes = self._get_entries(py, &keys)?;
         let nodes = nodes.bind(py);
-        if self.parents {
+        if self.inner.parents {
             for entry in nodes.try_iter()? {
                 let entry = entry?.cast_into::<PyTuple>()?;
                 let key = entry.get_item(1)?;
@@ -3431,7 +3558,7 @@ impl PyKnitGraphIndex {
         self._check_read(py)?;
         let entries = self._get_entries(py, &keys)?;
         let entries = entries.into_bound(py);
-        knit_entries_to_build_details_rs(py, entries, self.parents, self.deltas)
+        knit_entries_to_build_details_rs(py, entries, self.inner.parents, self.inner.deltas)
     }
 
     fn get_method(&self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<String> {
@@ -3474,7 +3601,8 @@ impl PyKnitGraphIndex {
     }
 
     fn __contains__(&self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<bool> {
-        let result = self.get_parent_map(py, key.clone().into_any())?;
+        let key_list = pyo3::types::PyList::new(py, [key.clone()])?;
+        let result = self.get_parent_map(py, key_list.into_any())?;
         Ok(result.contains(&key)?)
     }
 
@@ -3492,9 +3620,6 @@ impl PyKnitGraphIndex {
         keys: Bound<'_, pyo3::types::PyList>,
         positions: Bound<'_, PyDict>,
     ) -> PyResult<()> {
-        // positions[key] = (record_details, index_memo, next, parents)
-        // index_memo = (graph_index_obj, pos, size)
-        // Group by the graph_index_obj's identity (ptr), sort by offset.
         let n = keys.len();
         let mut keyed: Vec<(usize, u64, Bound<'_, PyAny>)> = Vec::with_capacity(n);
         for i in 0..n {
@@ -3504,8 +3629,6 @@ impl PyKnitGraphIndex {
                 .ok_or_else(|| PyValueError::new_err("_sort_keys_by_io: key not in positions"))?;
             let index_memo = pos_entry.get_item(1)?;
             let file_ref = index_memo.get_item(0)?;
-            // Use the Python object's id() as grouping key — stable for the
-            // lifetime of this call, and unique per GraphIndex shard.
             let file_id: usize = py
                 .import("builtins")?
                 .getattr("id")?
@@ -3533,7 +3656,7 @@ impl PyKnitGraphIndex {
     fn get_missing_compression_parents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let s = pyo3::types::PyFrozenSet::new(
             py,
-            self.missing_compression_parents
+            self.inner.missing_compression_parents
                 .iter()
                 .map(|k| py_knit_key_to_py(py, k))
                 .collect::<PyResult<Vec<_>>>()?,
@@ -3542,18 +3665,30 @@ impl PyKnitGraphIndex {
     }
 
     fn get_missing_parents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let Some(kd) = &self.key_dependencies else {
+        let Some(kd) = &self.inner.key_dependencies else {
             return Ok(pyo3::types::PyFrozenSet::empty(py)?.into_any());
         };
-        let kd = kd.bind(py);
-        let unsatisfied = kd.call_method0("get_unsatisfied_refs")?;
-        let parent_map = self.get_parent_map(py, unsatisfied.clone())?;
-        kd.call_method1("satisfy_refs_for_keys", (parent_map,))?;
-        let remaining = kd.call_method0("get_unsatisfied_refs")?;
-        let s = pyo3::types::PyFrozenSet::new(
+        let unsatisfied_keys: Vec<bazaar::knit::KnitKey> =
+            kd.unsatisfied_refs().cloned().collect();
+        let py_keys = pyo3::types::PyList::new(
             py,
-            remaining.try_iter()?.collect::<PyResult<Vec<_>>>()?,
+            unsatisfied_keys
+                .iter()
+                .map(|k| py_knit_key_to_py(py, k))
+                .collect::<PyResult<Vec<_>>>()?,
         )?;
+        let parent_map = self.get_parent_map(py, py_keys.into_any())?;
+        let satisfied: std::collections::HashSet<bazaar::knit::KnitKey> = parent_map
+            .keys()
+            .try_iter()?
+            .map(|k| extract_py_knit_key(&k?))
+            .collect::<PyResult<_>>()?;
+        let remaining: Vec<_> = unsatisfied_keys
+            .iter()
+            .filter(|k| !satisfied.contains(*k))
+            .map(|k| py_knit_key_to_py(py, k))
+            .collect::<PyResult<_>>()?;
+        let s = pyo3::types::PyFrozenSet::new(py, remaining)?;
         Ok(s.into_any())
     }
 
@@ -3562,7 +3697,7 @@ impl PyKnitGraphIndex {
         py: Python<'_>,
         graph_index: Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        if self.deltas {
+        if self.inner.deltas {
             let new_missing = graph_index.call_method1("external_references", (1usize,))?;
             let new_missing_keys = extract_py_knit_keys(&new_missing)?;
             let parent_map = self.get_parent_map(py, new_missing.clone())?;
@@ -3571,20 +3706,20 @@ impl PyKnitGraphIndex {
                 .try_iter()?
                 .map(|k| extract_py_knit_key(&k?))
                 .collect::<PyResult<_>>()?;
-            for key in new_missing_keys {
-                if !present_keys.contains(&key) {
-                    self.missing_compression_parents.insert(key);
-                }
-            }
+            self.inner
+                .update_missing_compression_parents(new_missing_keys, &present_keys);
         }
-        if let Some(kd) = &self.key_dependencies {
-            let kd = kd.bind(py);
+        if self.inner.key_dependencies.is_some() {
             for node in graph_index.call_method0("iter_all_entries")?.try_iter()? {
                 let node = node?.cast_into::<PyTuple>()?;
-                let key = node.get_item(1)?;
+                let key = extract_py_knit_key(&node.get_item(1)?)?;
                 let refs = node.get_item(3)?;
                 let parent_refs = refs.get_item(0)?;
-                kd.call_method1("add_references", (key, parent_refs))?;
+                let parent_keys: Vec<bazaar::knit::KnitKey> = parent_refs
+                    .try_iter()?
+                    .map(|k| extract_py_knit_key(&k?))
+                    .collect::<PyResult<_>>()?;
+                self.inner.add_key_dependencies(key, parent_keys);
             }
         }
         Ok(())
@@ -3598,23 +3733,18 @@ impl PyKnitGraphIndex {
         random_id: bool,
         missing_compression_parents: bool,
     ) -> PyResult<()> {
-        let Some(add_callback) = &self.add_callback else {
+        if self.inner.add_callback.is_none() {
             let exc_cls = py.import("bzrformats.errors")?.getattr("ReadOnlyError")?;
             return Err(PyErr::from_value(exc_cls.call1((py.None(),))?));
-        };
-        let add_callback = add_callback.clone_ref(py);
+        }
 
         type KnitKey = bazaar::knit::KnitKey;
-        // Ordered vec preserving insertion order for the callback; dedup by key.
-        let mut entries: Vec<(KnitKey, Vec<u8>, Vec<Vec<KnitKey>>)> = Vec::new();
-        let mut new_compression_parents: std::collections::HashSet<KnitKey> =
-            std::collections::HashSet::new();
+        let mut decoded: Vec<(KnitKey, Vec<u8>, u64, u64, Vec<KnitKey>)> = Vec::new();
 
         for rec in records.try_iter()? {
             let rec = rec?.cast_into::<PyTuple>()?;
             let key = extract_py_knit_key_or_bytes(&rec.get_item(0)?)?;
             let options_obj = rec.get_item(1)?;
-            // options is a bytes string like b"fulltext,no-eol" or a list of bytes
             let options_bytes: Vec<u8> = if let Ok(b) = options_obj.clone().cast_into::<PyBytes>() {
                 b.as_bytes().to_vec()
             } else {
@@ -3630,13 +3760,6 @@ impl PyKnitGraphIndex {
                 }
                 buf
             };
-            let noeol = options_bytes.windows(6).any(|w| w == b"no-eol");
-            let method = if options_bytes.windows(10).any(|w| w == b"line-delta") {
-                bazaar::knit::KnitMethod::LineDelta
-            } else {
-                bazaar::knit::KnitMethod::Fulltext
-            };
-            // access_memo = (index_obj, pos, size) — only pos and size matter here
             let memo = rec.get_item(2)?;
             let pos: u64 = memo.get_item(1)?.extract()?;
             let size: u64 = memo.get_item(2)?.extract()?;
@@ -3649,73 +3772,52 @@ impl PyKnitGraphIndex {
                     .map(|p| extract_py_knit_key_or_bytes(&p?))
                     .collect::<PyResult<_>>()?
             };
-
-            let (value, node_refs) = bazaar::knit::encode_graph_index_record(
-                noeol,
-                pos,
-                size,
-                method,
-                self.parents,
-                self.deltas,
-                &parents,
-            )
-            .map_err(knit_err_to_py)?;
-
-            if let Some(kd) = &self.key_dependencies {
-                let py_parents = PyTuple::new(
-                    py,
-                    parents
-                        .iter()
-                        .map(|p| py_knit_key_to_py(py, p))
-                        .collect::<PyResult<Vec<_>>>()?,
-                )?;
-                kd.bind(py)
-                    .call_method1("add_references", (py_knit_key_to_py(py, &key)?, py_parents))?;
-            }
-
-            if missing_compression_parents && method == bazaar::knit::KnitMethod::LineDelta {
-                if let Some(cp) = parents.first() {
-                    new_compression_parents.insert(cp.clone());
-                }
-            }
-
-            // Last entry for a key wins (matches Python dict semantics).
-            if let Some(existing) = entries.iter_mut().find(|(k, _, _)| k == &key) {
-                *existing = (key, value, node_refs);
-            } else {
-                entries.push((key, value, node_refs));
-            }
+            decoded.push((key, options_bytes, pos, size, parents));
         }
 
-        // Dedup check: look up entries that already exist in the index.
+        // Dedup check against the backing graph index.
+        let mut to_remove: std::collections::HashSet<KnitKey> =
+            std::collections::HashSet::new();
         if !random_id {
+            let mut pre_entries: Vec<(KnitKey, Vec<u8>, Vec<Vec<KnitKey>>)> = Vec::new();
+            for (key, options_bytes, pos, size, parents) in &decoded {
+                let noeol = options_bytes.windows(6).any(|w| w == b"no-eol");
+                let method = if options_bytes.windows(10).any(|w| w == b"line-delta") {
+                    bazaar::knit::KnitMethod::LineDelta
+                } else {
+                    bazaar::knit::KnitMethod::Fulltext
+                };
+                let (value, node_refs) = bazaar::knit::encode_graph_index_record(
+                    noeol, *pos, *size, method, self.inner.parents, self.inner.deltas, parents,
+                )
+                .map_err(knit_err_to_py)?;
+                if let Some(existing) = pre_entries.iter_mut().find(|(k, _, _)| k == key) {
+                    *existing = (key.clone(), value, node_refs);
+                } else {
+                    pre_entries.push((key.clone(), value, node_refs));
+                }
+            }
             let py_keys = pyo3::types::PyList::new(
                 py,
-                entries
+                pre_entries
                     .iter()
                     .map(|(k, _, _)| py_knit_key_to_py(py, k))
                     .collect::<PyResult<Vec<_>>>()?,
             )?;
-            let existing = self._get_entries(py, py_keys.as_any())?;
-            let existing = existing.bind(py);
-            let mut to_remove: std::collections::HashSet<KnitKey> =
-                std::collections::HashSet::new();
-            for node in existing.try_iter()? {
+            let existing_iter = self._get_entries(py, py_keys.as_any())?;
+            let existing_iter = existing_iter.bind(py);
+            for node in existing_iter.try_iter()? {
                 let node = node?.cast_into::<PyTuple>()?;
                 let existing_key = extract_py_knit_key(&node.get_item(1)?)?;
                 let existing_value = node.get_item(2)?.cast_into::<PyBytes>()?;
                 let existing_refs = node.get_item(3)?;
-
                 let Some((_, new_value, new_refs)) =
-                    entries.iter().find(|(k, _, _)| k == &existing_key)
+                    pre_entries.iter().find(|(k, _, _)| k == &existing_key)
                 else {
                     continue;
                 };
-
-                // Compare noeol flag byte only — pos/size differ per pack.
                 let existing_flag = existing_value.as_bytes().first().copied().unwrap_or(b' ');
                 let new_flag: u8 = new_value.first().copied().unwrap_or(b' ');
-                // Compare first ref list (parents) for consistency.
                 let existing_parents: Vec<KnitKey> = existing_refs
                     .get_item(0)
                     .ok()
@@ -3726,7 +3828,8 @@ impl PyKnitGraphIndex {
                     })
                     .transpose()?
                     .unwrap_or_default();
-                let new_parents: &[KnitKey] = new_refs.first().map(|v| v.as_slice()).unwrap_or(&[]);
+                let new_parents: &[KnitKey] =
+                    new_refs.first().map(|v| v.as_slice()).unwrap_or(&[]);
                 if existing_flag != new_flag || existing_parents.as_slice() != new_parents {
                     return Err(knit_err_to_py(bazaar::knit::KnitError::Corrupt(format!(
                         "inconsistent details in add_records: \
@@ -3736,54 +3839,14 @@ impl PyKnitGraphIndex {
                 }
                 to_remove.insert(existing_key);
             }
-            entries.retain(|(k, _, _)| !to_remove.contains(k));
         }
+        let filtered = decoded
+            .into_iter()
+            .filter(|(k, _, _, _, _)| !to_remove.contains(k));
 
-        // Build the argument list for add_callback.
-        let result = pyo3::types::PyList::empty(py);
-        if self.parents {
-            for (key, value, node_refs) in &entries {
-                let py_key = py_knit_key_to_py(py, key)?;
-                let py_value = PyBytes::new(py, value);
-                let py_refs = PyTuple::new(
-                    py,
-                    node_refs
-                        .iter()
-                        .map(|rl| {
-                            PyTuple::new(
-                                py,
-                                rl.iter()
-                                    .map(|k| py_knit_key_to_py(py, k))
-                                    .collect::<PyResult<Vec<_>>>()?,
-                            )
-                        })
-                        .collect::<PyResult<Vec<_>>>()?,
-                )?;
-                result.append(PyTuple::new(
-                    py,
-                    [py_key.into_any(), py_value.into_any(), py_refs.into_any()],
-                )?)?;
-            }
-        } else {
-            for (key, value, _) in &entries {
-                let py_key = py_knit_key_to_py(py, key)?;
-                let py_value = PyBytes::new(py, value);
-                result.append(PyTuple::new(py, [py_key.into_any(), py_value.into_any()])?)?;
-            }
-        }
-        add_callback.bind(py).call1((result,))?;
-
-        // Update missing-compression-parent tracking.
-        let added_keys: std::collections::HashSet<&KnitKey> =
-            entries.iter().map(|(k, _, _)| k).collect();
-        if missing_compression_parents {
-            new_compression_parents.retain(|k| !added_keys.contains(k));
-            self.missing_compression_parents
-                .extend(new_compression_parents);
-        }
-        self.missing_compression_parents
-            .retain(|k| !added_keys.contains(k));
-        Ok(())
+        self.inner
+            .encode_and_dispatch(filtered, missing_compression_parents)
+            .map_err(knit_err_to_py)
     }
 }
 
@@ -3793,7 +3856,7 @@ impl PyKnitGraphIndex {
     /// so callers can rebind it to any lifetime.
     fn _get_entries(&self, py: Python<'_>, keys: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let gi = self.graph_index.bind(py);
-        if self.parents {
+        if self.inner.parents {
             let result = gi.call_method1("iter_entries", (keys,))?;
             Ok(result.unbind())
         } else {
@@ -3835,7 +3898,7 @@ impl PyKnitGraphIndex {
     }
 
     fn _get_method_from_node(&self, node: &Bound<'_, PyTuple>) -> PyResult<String> {
-        if !self.deltas {
+        if !self.inner.deltas {
             return Ok("fulltext".to_string());
         }
         let refs = node.get_item(3)?;
@@ -4061,9 +4124,15 @@ fn extract_py_knit_key_autogen(obj: &Bound<'_, PyAny>) -> PyResult<(bazaar::knit
 }
 
 fn extract_py_knit_keys(obj: &Bound<'_, PyAny>) -> PyResult<Vec<bazaar::knit::KnitKey>> {
+    // Silently skip malformed keys: callers (e.g. get_parent_map) treat
+    // unknown keys as absent, so a key that can't be parsed is just absent.
+    // This matches the Python _KnitGraphIndex behaviour of passing keys
+    // through to the underlying graph index which returns no match.
     let mut keys = Vec::new();
     for item in obj.try_iter()? {
-        keys.push(extract_py_knit_key(&item?)?);
+        if let Ok(key) = extract_py_knit_key(&item?) {
+            keys.push(key);
+        }
     }
     Ok(keys)
 }
@@ -4162,6 +4231,11 @@ impl PyKnitVersionedFiles {
         self.max_delta_chain
     }
 
+    #[setter]
+    fn set__max_delta_chain(&mut self, value: usize) {
+        self.max_delta_chain = value;
+    }
+
     #[getter]
     fn _immediate_fallback_vfs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
@@ -4203,6 +4277,11 @@ impl PyKnitVersionedFiles {
         random_id: bool,
         check_content: bool,
     ) -> PyResult<Py<PyAny>> {
+        // TODO: call check_write_ok through the Rust KnitIndex trait once
+        // key parsing can happen after the lock check.
+        self.index_obj
+            .bind(py)
+            .call_method0("_check_write_ok")?;
         let (mut rust_key, autogen_key) = extract_py_knit_key_autogen(&key)?;
         let rust_lines: Vec<Vec<u8>> = lines
             .try_iter()?
@@ -4706,33 +4785,31 @@ impl PyKnitVersionedFiles {
         }
     }
 
+    #[pyo3(signature = (keys, allow_missing=false))]
     fn _get_record_map_unparsed(
         &self,
         py: Python<'_>,
         keys: Bound<'_, PyAny>,
-        allow_missing: Option<bool>,
+        allow_missing: bool,
     ) -> PyResult<Py<PyAny>> {
         let py_self = self.to_py_kvf(py)?;
         let kwargs = PyDict::new(py);
-        if let Some(am) = allow_missing {
-            kwargs.set_item("allow_missing", am)?;
-        }
+        kwargs.set_item("allow_missing", allow_missing)?;
         py_self
             .call_method("_get_record_map_unparsed", (keys,), Some(&kwargs))
             .map(|b| b.unbind())
     }
 
+    #[pyo3(signature = (keys, allow_missing=false))]
     fn _get_record_map(
         &self,
         py: Python<'_>,
         keys: Bound<'_, PyAny>,
-        allow_missing: Option<bool>,
+        allow_missing: bool,
     ) -> PyResult<Py<PyAny>> {
         let py_self = self.to_py_kvf(py)?;
         let kwargs = PyDict::new(py);
-        if let Some(am) = allow_missing {
-            kwargs.set_item("allow_missing", am)?;
-        }
+        kwargs.set_item("allow_missing", allow_missing)?;
         py_self
             .call_method("_get_record_map", (keys,), Some(&kwargs))
             .map(|b| b.unbind())

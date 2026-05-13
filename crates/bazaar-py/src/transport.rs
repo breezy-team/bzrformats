@@ -43,9 +43,15 @@ pyo3::import_exception!(bzrformats.errors, NoSuchFile);
 mod transport_exc {
     pyo3::import_exception!(bzrformats.transport, NoSuchFile);
 }
+mod dromedary_exc {
+    pyo3::import_exception!(dromedary.errors, NoSuchFile);
+}
 
 fn map_py_err(py: Python<'_>, err: PyErr) -> TransportError {
-    if err.is_instance_of::<NoSuchFile>(py) || err.is_instance_of::<transport_exc::NoSuchFile>(py) {
+    if err.is_instance_of::<NoSuchFile>(py)
+        || err.is_instance_of::<transport_exc::NoSuchFile>(py)
+        || err.is_instance_of::<dromedary_exc::NoSuchFile>(py)
+    {
         let msg = err
             .value(py)
             .str()
@@ -91,6 +97,16 @@ impl Transport for PyTransport {
             self.0
                 .bind(py)
                 .call_method("put_file_non_atomic", (path, sio), Some(&kwargs))
+                .map_err(|e| map_py_err(py, e))?;
+            Ok(())
+        })
+    }
+
+    fn mkdir(&self, path: &str) -> Result<(), TransportError> {
+        Python::attach(|py| -> Result<(), TransportError> {
+            self.0
+                .bind(py)
+                .call_method1("mkdir", (path,))
                 .map_err(|e| map_py_err(py, e))?;
             Ok(())
         })
