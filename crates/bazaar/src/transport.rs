@@ -114,6 +114,10 @@ pub trait Transport {
     /// Returns the byte offset where the appended data starts.
     fn append_bytes(&self, path: &str, bytes: &[u8]) -> Result<u64, TransportError>;
 
+    /// Create directory `path`. It is not an error if the directory already
+    /// exists; implementations should silently succeed in that case.
+    fn mkdir(&self, path: &str) -> Result<(), TransportError>;
+
     /// Test whether `path` exists.
     fn has(&self, path: &str) -> Result<bool, TransportError>;
 
@@ -208,6 +212,10 @@ pub(crate) mod testing {
         ) -> Result<(), TransportError> {
             let mut files = self.files.lock().unwrap();
             files.insert(path.to_string(), bytes.to_vec());
+            Ok(())
+        }
+
+        fn mkdir(&self, _path: &str) -> Result<(), TransportError> {
             Ok(())
         }
 
