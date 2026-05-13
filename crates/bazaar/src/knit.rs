@@ -2406,6 +2406,58 @@ impl KnitAdapter for DeltaPlainToFullText {
     }
 }
 
+/// Registry entry produced by [`declare_adapter!`] and consumed by
+/// [`lookup_adapter`].  Carries a static reference to a `KnitAdapter`
+/// implementation; `inventory::collect!` lets `inventory::iter` walk
+/// every entry submitted across the crate.
+pub struct AdapterEntry {
+    pub adapter: &'static dyn KnitAdapter,
+}
+
+inventory::collect!(AdapterEntry);
+
+/// Register a [`KnitAdapter`] implementation so [`lookup_adapter`] can
+/// find it.  Pass a zero-sized type that implements `KnitAdapter`; the
+/// macro builds a static instance and submits it through `inventory`.
+///
+/// ```ignore
+/// declare_adapter!(FtAnnotatedToUnannotated);
+/// ```
+#[macro_export]
+macro_rules! declare_adapter {
+    ($adapter:path) => {
+        inventory::submit! {
+            $crate::knit::AdapterEntry {
+                adapter: &$adapter,
+            }
+        }
+    };
+}
+
+declare_adapter!(FtAnnotatedToUnannotated);
+declare_adapter!(DeltaAnnotatedToUnannotated);
+declare_adapter!(FtAnnotatedToFullText);
+declare_adapter!(FtPlainToFullText);
+declare_adapter!(DeltaAnnotatedToFullText);
+declare_adapter!(DeltaPlainToFullText);
+
+/// Look up a knit adapter for the given `(source_storage_kind,
+/// target_storage_kind)` pair.  Returns `None` if no adapter handles
+/// that transition.
+pub fn lookup_adapter(
+    source_storage_kind: &str,
+    target_storage_kind: &str,
+) -> Option<&'static dyn KnitAdapter> {
+    for entry in inventory::iter::<AdapterEntry> {
+        for &(src, tgt) in entry.adapter.keys() {
+            if src == source_storage_kind && tgt == target_storage_kind {
+                return Some(entry.adapter);
+            }
+        }
+    }
+    None
+}
+
 /// A knit key — a tuple of byte segments, identifying one record in
 /// one knit. The last segment is the version_id; the leading segments
 /// (if any) form the file-id prefix used by per-file knits.
@@ -7177,6 +7229,19 @@ mod tests {
             .get_bytes(&input, "fulltext", None)
             .unwrap_err();
         assert!(matches!(err, AdapterError::Knit(KnitError::Corrupt(_))));
+    }
+
+    #[test]
+    fn lookup_adapter_finds_all_six_pairs() {
+        // Spot-check one (source, target) pair per adapter struct.
+        assert!(lookup_adapter("knit-annotated-ft-gz", "knit-ft-gz").is_some());
+        assert!(lookup_adapter("knit-annotated-delta-gz", "knit-delta-gz").is_some());
+        assert!(lookup_adapter("knit-annotated-ft-gz", "fulltext").is_some());
+        assert!(lookup_adapter("knit-ft-gz", "fulltext").is_some());
+        assert!(lookup_adapter("knit-annotated-delta-gz", "fulltext").is_some());
+        assert!(lookup_adapter("knit-delta-gz", "fulltext").is_some());
+        // Unknown pair returns None.
+        assert!(lookup_adapter("knit-ft-gz", "junk").is_none());
     }
 
     #[test]

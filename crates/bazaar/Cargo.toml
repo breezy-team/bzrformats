@@ -35,6 +35,7 @@ adler = "1.0.2"
 memchr = "2.7.4"
 rand = "0.10"
 unicode-normalization = "0.1.19"
+inventory = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs"] }
