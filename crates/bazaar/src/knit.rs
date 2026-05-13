@@ -2093,6 +2093,319 @@ pub fn recompress_annotated_to_unannotated_delta(raw_record: &[u8]) -> Result<Ve
     Ok(chunks.into_iter().flatten().collect())
 }
 
+/// Data extracted from a `ContentFactory` for adapter consumption.
+///
+/// All fields are borrowed from the factory; the adapter does not need
+/// to own the data.  `parents[0]` is the compression parent when
+/// `storage_kind` starts with `knit-…-delta-gz`.
+#[derive(Debug)]
+pub struct KnitAdapterInput<'a> {
+    pub key: &'a [Vec<u8>],
+    pub raw_record: &'a [u8],
+    pub noeol: bool,
+    pub parents: Option<&'a [Vec<Vec<u8>>]>,
+    pub storage_kind: &'a str,
+}
+
+/// Output of a `KnitAdapter::get_bytes` call.
+///
+/// `RawBytes` is used by the `*-to-unannotated` adapters that return
+/// compressed knit-format bytes.  `Text` is used by adapters that
+/// return reconstructed text (joined or as lines), shaped according to
+/// `materialize_text`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KnitAdapterOutput {
+    RawBytes(Vec<u8>),
+    Text(KnitTextResult),
+}
+
+/// Errors that can occur during adapter execution, separate from
+/// [`KnitError`] so that callers can distinguish unsupported transitions
+/// from corrupt/missing records.
+#[derive(Debug)]
+pub enum AdapterError {
+    /// The requested `target_storage_kind` is not supported by this
+    /// adapter.  Carries the source/target pair so the caller can raise
+    /// a Python `UnavailableRepresentation` with full context.
+    Unavailable {
+        source_storage_kind: String,
+        target_storage_kind: String,
+    },
+    /// The compression parent of a delta record could not be found in
+    /// the basis versioned-file.
+    BasisNotPresent(KnitKey),
+    /// Underlying knit parsing/decoding failure.
+    Knit(KnitError),
+}
+
+impl std::fmt::Display for AdapterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdapterError::Unavailable {
+                source_storage_kind,
+                target_storage_kind,
+            } => write!(
+                f,
+                "knit adapter cannot convert {source_storage_kind} to {target_storage_kind}",
+            ),
+            AdapterError::BasisNotPresent(key) => {
+                write!(f, "basis record not present: {key:?}")
+            }
+            AdapterError::Knit(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for AdapterError {}
+
+impl From<KnitError> for AdapterError {
+    fn from(e: KnitError) -> Self {
+        AdapterError::Knit(e)
+    }
+}
+
+/// Trait that an adapter uses to fetch basis-record lines from another
+/// versioned file when applying a delta against a parent.
+///
+/// In production this is implemented in the pyo3 layer by a wrapper
+/// around a Python `versioned_files` object that calls
+/// `get_record_stream([compression_parent], "unordered", True)`.  Unit
+/// tests provide an in-memory implementation.
+pub trait BasisVfBridge {
+    /// Look up `compression_parent` and return its text as a list of
+    /// line bytes.  Implementations should return
+    /// `Err(AdapterError::BasisNotPresent(key))` if the basis record
+    /// has `storage_kind == "absent"`.
+    fn get_basis_lines(
+        &self,
+        compression_parent: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, AdapterError>;
+}
+
+/// A streamed record adapter — turns the bytes of one `storage_kind`
+/// into the bytes of another.
+///
+/// Adapters that don't need a basis-vf (`FT*ToUnannotated`, the
+/// `FT*ToFullText` variants) ignore the `basis` argument; the two
+/// delta-to-fulltext adapters require it.
+pub trait KnitAdapter: Send + Sync + 'static {
+    /// The `(source_storage_kind, target_storage_kind)` pair this
+    /// adapter handles.  The registry uses this to dispatch.
+    fn keys(&self) -> &'static [(&'static str, &'static str)];
+
+    fn get_bytes(
+        &self,
+        input: &KnitAdapterInput<'_>,
+        target_storage_kind: &str,
+        basis: Option<&dyn BasisVfBridge>,
+    ) -> Result<KnitAdapterOutput, AdapterError>;
+}
+
+fn unavailable(input: &KnitAdapterInput<'_>, target: &str) -> AdapterError {
+    AdapterError::Unavailable {
+        source_storage_kind: input.storage_kind.to_owned(),
+        target_storage_kind: target.to_owned(),
+    }
+}
+
+fn compression_parent<'a>(input: &'a KnitAdapterInput<'_>) -> Result<&'a [Vec<u8>], AdapterError> {
+    input
+        .parents
+        .and_then(|ps| ps.first())
+        .map(|p| p.as_slice())
+        .ok_or_else(|| {
+            AdapterError::Knit(KnitError::Corrupt(
+                "delta record missing compression parent".to_owned(),
+            ))
+        })
+}
+
+fn version_id<'a>(input: &'a KnitAdapterInput<'_>) -> &'a [u8] {
+    input.key.last().map(|s| s.as_slice()).unwrap_or(b"")
+}
+
+/// `knit-annotated-ft-gz` → `knit-ft-gz`.
+pub struct FtAnnotatedToUnannotated;
+
+impl KnitAdapter for FtAnnotatedToUnannotated {
+    fn keys(&self) -> &'static [(&'static str, &'static str)] {
+        &[("knit-annotated-ft-gz", "knit-ft-gz")]
+    }
+
+    fn get_bytes(
+        &self,
+        input: &KnitAdapterInput<'_>,
+        target_storage_kind: &str,
+        _basis: Option<&dyn BasisVfBridge>,
+    ) -> Result<KnitAdapterOutput, AdapterError> {
+        if target_storage_kind != "knit-ft-gz" {
+            return Err(unavailable(input, target_storage_kind));
+        }
+        Ok(KnitAdapterOutput::RawBytes(
+            recompress_annotated_to_unannotated_fulltext(input.raw_record)?,
+        ))
+    }
+}
+
+/// `knit-annotated-delta-gz` → `knit-delta-gz`.
+pub struct DeltaAnnotatedToUnannotated;
+
+impl KnitAdapter for DeltaAnnotatedToUnannotated {
+    fn keys(&self) -> &'static [(&'static str, &'static str)] {
+        &[("knit-annotated-delta-gz", "knit-delta-gz")]
+    }
+
+    fn get_bytes(
+        &self,
+        input: &KnitAdapterInput<'_>,
+        target_storage_kind: &str,
+        _basis: Option<&dyn BasisVfBridge>,
+    ) -> Result<KnitAdapterOutput, AdapterError> {
+        if target_storage_kind != "knit-delta-gz" {
+            return Err(unavailable(input, target_storage_kind));
+        }
+        Ok(KnitAdapterOutput::RawBytes(
+            recompress_annotated_to_unannotated_delta(input.raw_record)?,
+        ))
+    }
+}
+
+/// `knit-annotated-ft-gz` → `fulltext` / `chunked` / `lines`.
+pub struct FtAnnotatedToFullText;
+
+impl KnitAdapter for FtAnnotatedToFullText {
+    fn keys(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("knit-annotated-ft-gz", "fulltext"),
+            ("knit-annotated-ft-gz", "chunked"),
+            ("knit-annotated-ft-gz", "lines"),
+        ]
+    }
+
+    fn get_bytes(
+        &self,
+        input: &KnitAdapterInput<'_>,
+        target_storage_kind: &str,
+        _basis: Option<&dyn BasisVfBridge>,
+    ) -> Result<KnitAdapterOutput, AdapterError> {
+        if !matches!(target_storage_kind, "fulltext" | "chunked" | "lines") {
+            return Err(unavailable(input, target_storage_kind));
+        }
+        let lines = extract_annotated_fulltext_to_plain_lines(input.raw_record, input.noeol)?;
+        let result = materialize_text(lines, target_storage_kind)
+            .expect("target validated to be a text kind");
+        Ok(KnitAdapterOutput::Text(result))
+    }
+}
+
+/// `knit-ft-gz` → `fulltext` / `chunked` / `lines`.
+pub struct FtPlainToFullText;
+
+impl KnitAdapter for FtPlainToFullText {
+    fn keys(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("knit-ft-gz", "fulltext"),
+            ("knit-ft-gz", "chunked"),
+            ("knit-ft-gz", "lines"),
+        ]
+    }
+
+    fn get_bytes(
+        &self,
+        input: &KnitAdapterInput<'_>,
+        target_storage_kind: &str,
+        _basis: Option<&dyn BasisVfBridge>,
+    ) -> Result<KnitAdapterOutput, AdapterError> {
+        if !matches!(target_storage_kind, "fulltext" | "chunked" | "lines") {
+            return Err(unavailable(input, target_storage_kind));
+        }
+        let lines = extract_plain_fulltext_lines(input.raw_record, input.noeol)?;
+        let result = materialize_text(lines, target_storage_kind)
+            .expect("target validated to be a text kind");
+        Ok(KnitAdapterOutput::Text(result))
+    }
+}
+
+/// `knit-annotated-delta-gz` → `fulltext` / `chunked` / `lines`.
+pub struct DeltaAnnotatedToFullText;
+
+impl KnitAdapter for DeltaAnnotatedToFullText {
+    fn keys(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("knit-annotated-delta-gz", "fulltext"),
+            ("knit-annotated-delta-gz", "chunked"),
+            ("knit-annotated-delta-gz", "lines"),
+        ]
+    }
+
+    fn get_bytes(
+        &self,
+        input: &KnitAdapterInput<'_>,
+        target_storage_kind: &str,
+        basis: Option<&dyn BasisVfBridge>,
+    ) -> Result<KnitAdapterOutput, AdapterError> {
+        if !matches!(target_storage_kind, "fulltext" | "chunked" | "lines") {
+            return Err(unavailable(input, target_storage_kind));
+        }
+        let basis = basis.ok_or_else(|| {
+            AdapterError::Knit(KnitError::Corrupt(
+                "DeltaAnnotatedToFullText requires basis_vf".to_owned(),
+            ))
+        })?;
+        let cp = compression_parent(input)?;
+        let basis_lines = basis.get_basis_lines(cp)?;
+        let lines = apply_annotated_delta_to_plain_basis(
+            input.raw_record,
+            basis_lines,
+            version_id(input),
+            input.noeol,
+        )?;
+        let result = materialize_text(lines, target_storage_kind)
+            .expect("target validated to be a text kind");
+        Ok(KnitAdapterOutput::Text(result))
+    }
+}
+
+/// `knit-delta-gz` → `fulltext` / `chunked` / `lines`.
+pub struct DeltaPlainToFullText;
+
+impl KnitAdapter for DeltaPlainToFullText {
+    fn keys(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("knit-delta-gz", "fulltext"),
+            ("knit-delta-gz", "chunked"),
+            ("knit-delta-gz", "lines"),
+        ]
+    }
+
+    fn get_bytes(
+        &self,
+        input: &KnitAdapterInput<'_>,
+        target_storage_kind: &str,
+        basis: Option<&dyn BasisVfBridge>,
+    ) -> Result<KnitAdapterOutput, AdapterError> {
+        if !matches!(target_storage_kind, "fulltext" | "chunked" | "lines") {
+            return Err(unavailable(input, target_storage_kind));
+        }
+        let basis = basis.ok_or_else(|| {
+            AdapterError::Knit(KnitError::Corrupt(
+                "DeltaPlainToFullText requires basis_vf".to_owned(),
+            ))
+        })?;
+        let cp = compression_parent(input)?;
+        let basis_lines = basis.get_basis_lines(cp)?;
+        let lines = apply_plain_delta_to_plain_basis(
+            input.raw_record,
+            basis_lines,
+            version_id(input),
+            input.noeol,
+        )?;
+        let result = materialize_text(lines, target_storage_kind)
+            .expect("target validated to be a text kind");
+        Ok(KnitAdapterOutput::Text(result))
+    }
+}
+
 /// A knit key — a tuple of byte segments, identifying one record in
 /// one knit. The last segment is the version_id; the leading segments
 /// (if any) form the file-id prefix used by per-file knits.
@@ -6202,6 +6515,21 @@ mod tests {
     }
 
     #[test]
+    fn materialize_text_fulltext_joins_lines() {
+        let r = materialize_text(vec![b"a\n".to_vec(), b"b\n".to_vec()], "fulltext").unwrap();
+        assert_eq!(r, KnitTextResult::Bytes(b"a\nb\n".to_vec()));
+    }
+
+    #[test]
+    fn materialize_text_chunked_returns_lines() {
+        let r = materialize_text(vec![b"a\n".to_vec(), b"b\n".to_vec()], "chunked").unwrap();
+        assert_eq!(
+            r,
+            KnitTextResult::Lines(vec![b"a\n".to_vec(), b"b\n".to_vec()])
+        );
+    }
+
+    #[test]
     fn annotated_content_line_delta_keeps_annotations() {
         // Mirrors TestAnnotatedKnitContent.test_line_delta:
         //   content1 = [("", "a"), ("", "b")]
@@ -6510,20 +6838,26 @@ mod tests {
                 b"c option 1 2 1 0 .e :",
             ],
         );
-        let key_a: KnitKey = vec![b"a".to_vec()];
-        let key_b: KnitKey = vec![b"b".to_vec()];
-        let key_c: KnitKey = vec![b"c".to_vec()];
+        let key_a: KnitKey = KnitKey::fixed(vec![b"a".to_vec()]);
+        let key_b: KnitKey = KnitKey::fixed(vec![b"b".to_vec()]);
+        let key_c: KnitKey = KnitKey::fixed(vec![b"c".to_vec()]);
         let pm = idx
             .get_parent_map(&[key_a.clone(), key_b.clone(), key_c.clone()])
             .unwrap();
         assert_eq!(pm[&key_a], Vec::<KnitKey>::new());
-        assert_eq!(pm[&key_b], vec![vec![b"a".to_vec()], vec![b"c".to_vec()]]);
+        assert_eq!(
+            pm[&key_b],
+            vec![
+                KnitKey::fixed(vec![b"a".to_vec()]),
+                KnitKey::fixed(vec![b"c".to_vec()]),
+            ]
+        );
         assert_eq!(
             pm[&key_c],
             vec![
-                vec![b"b".to_vec()],
-                vec![b"a".to_vec()],
-                vec![b"e".to_vec()],
+                KnitKey::fixed(vec![b"b".to_vec()]),
+                KnitKey::fixed(vec![b"a".to_vec()]),
+                KnitKey::fixed(vec![b"e".to_vec()]),
             ]
         );
     }
@@ -6535,8 +6869,8 @@ mod tests {
             "filename",
             &[b"a fulltext,unknown 0 1 :", b"b unknown,line-delta 1 2 :"],
         );
-        let key_a: KnitKey = vec![b"a".to_vec()];
-        let key_b: KnitKey = vec![b"b".to_vec()];
+        let key_a: KnitKey = KnitKey::fixed(vec![b"a".to_vec()]);
+        let key_b: KnitKey = KnitKey::fixed(vec![b"b".to_vec()]);
         assert_eq!(idx.get_method(&key_a).unwrap(), KnitMethod::Fulltext);
         assert_eq!(idx.get_method(&key_b).unwrap(), KnitMethod::LineDelta);
     }
@@ -6547,9 +6881,9 @@ mod tests {
         // verify the appended bytes have the expected per-line shape and
         // that subsequent reads come back from the in-memory cache.
         let idx = make_kndx_index("filename", &[]);
-        let key: KnitKey = vec![b"a".to_vec()];
+        let key: KnitKey = KnitKey::fixed(vec![b"a".to_vec()]);
         let memo = KnitIndexMemo {
-            path: "filename.knit".to_string(),
+            file_ref: "filename.knit".to_string(),
             offset: 0,
             length: 1,
         };
@@ -6599,7 +6933,7 @@ mod tests {
             method: KnitMethod::Fulltext,
             noeol: false,
             index_memo: KnitIndexMemo {
-                path: path.to_string(),
+                file_ref: path.to_string(),
                 offset,
                 length,
             },
@@ -6618,7 +6952,7 @@ mod tests {
             method: KnitMethod::LineDelta,
             noeol: false,
             index_memo: KnitIndexMemo {
-                path: path.to_string(),
+                file_ref: path.to_string(),
                 offset,
                 length,
             },
@@ -6628,15 +6962,49 @@ mod tests {
     }
 
     #[test]
+    fn materialize_text_unknown_kind_returns_none() {
+        assert!(materialize_text(vec![b"a\n".to_vec()], "knit-ft-gz").is_none());
+    }
+
+    fn adapter_input<'a>(
+        key: &'a [Vec<u8>],
+        raw_record: &'a [u8],
+        noeol: bool,
+        parents: Option<&'a [Vec<Vec<u8>>]>,
+        storage_kind: &'a str,
+    ) -> KnitAdapterInput<'a> {
+        KnitAdapterInput {
+            key,
+            raw_record,
+            noeol,
+            parents,
+            storage_kind,
+        }
+    }
+
+    struct StaticBasis {
+        lines: Vec<Vec<u8>>,
+    }
+
+    impl BasisVfBridge for StaticBasis {
+        fn get_basis_lines(
+            &self,
+            _compression_parent: &[Vec<u8>],
+        ) -> Result<Vec<Vec<u8>>, AdapterError> {
+            Ok(self.lines.clone())
+        }
+    }
+
+    #[test]
     fn kndx_index_total_build_size_walks_compression_chain() {
         // Mirrors LowLevelKnitIndexTests.test__get_total_build_size: the
         // size of a delta key is the cumulative size of its chain back to
         // the fulltext, with shared ancestors only counted once.
         let idx = make_kndx_index("filename", &[]);
-        let key_a: KnitKey = vec![b"a".to_vec()];
-        let key_b: KnitKey = vec![b"b".to_vec()];
-        let key_c: KnitKey = vec![b"c".to_vec()];
-        let key_d: KnitKey = vec![b"d".to_vec()];
+        let key_a: KnitKey = KnitKey::fixed(vec![b"a".to_vec()]);
+        let key_b: KnitKey = KnitKey::fixed(vec![b"b".to_vec()]);
+        let key_c: KnitKey = KnitKey::fixed(vec![b"c".to_vec()]);
+        let key_d: KnitKey = KnitKey::fixed(vec![b"d".to_vec()]);
         let mut positions = std::collections::HashMap::new();
         positions.insert(key_a.clone(), fulltext_pos("p", 0, 100));
         positions.insert(key_b.clone(), delta_pos("p", 100, 21, key_a.clone()));
@@ -6676,7 +7044,7 @@ mod tests {
             KnitMethod::Fulltext,
             false,
             false,
-            &[vec![b"p".to_vec()]],
+            &[KnitKey::fixed(vec![b"p".to_vec()])],
         )
         .unwrap_err();
         assert!(matches!(err, KnitError::Corrupt(_)));
@@ -6699,8 +7067,8 @@ mod tests {
         // line-delta refs: `[parents, [parents[0]]]` — the second column
         // carries the compression parent (always the left-most parent on
         // the Python side).
-        let parent_a: KnitKey = vec![b"file".to_vec(), b"a".to_vec()];
-        let parent_b: KnitKey = vec![b"file".to_vec(), b"b".to_vec()];
+        let parent_a: KnitKey = KnitKey::fixed(vec![b"file".to_vec(), b"a".to_vec()]);
+        let parent_b: KnitKey = KnitKey::fixed(vec![b"file".to_vec(), b"b".to_vec()]);
         let (value, refs) = encode_graph_index_record(
             false,
             10,
@@ -6723,5 +7091,124 @@ mod tests {
                 .unwrap();
         assert_eq!(value, b" 5 7");
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn ft_annotated_to_unannotated_strips_origins() {
+        let raw = fulltext_raw(b"rev-id", &[b"line1\n", b"line2\n"], false);
+        let key = vec![b"rev-id".to_vec()];
+        let input = adapter_input(&key, &raw, false, None, "knit-annotated-ft-gz");
+        let out = FtAnnotatedToUnannotated
+            .get_bytes(&input, "knit-ft-gz", None)
+            .unwrap();
+        match out {
+            KnitAdapterOutput::RawBytes(bytes) => {
+                // Re-decode and check the origin column is gone.
+                let plain_lines = extract_plain_fulltext_lines(&bytes, false).unwrap();
+                assert_eq!(plain_lines, vec![b"line1\n".to_vec(), b"line2\n".to_vec()]);
+            }
+            _ => panic!("expected RawBytes"),
+        }
+    }
+
+    #[test]
+    fn ft_annotated_to_unannotated_rejects_text_target() {
+        let raw = fulltext_raw(b"rev-id", &[b"x\n"], false);
+        let key = vec![b"rev-id".to_vec()];
+        let input = adapter_input(&key, &raw, false, None, "knit-annotated-ft-gz");
+        let err = FtAnnotatedToUnannotated
+            .get_bytes(&input, "fulltext", None)
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::Unavailable { .. }));
+    }
+
+    #[test]
+    fn ft_annotated_to_fulltext_returns_joined() {
+        let raw = fulltext_raw(b"rev-id", &[b"a\n", b"b\n"], false);
+        let key = vec![b"rev-id".to_vec()];
+        let input = adapter_input(&key, &raw, false, None, "knit-annotated-ft-gz");
+        let out = FtAnnotatedToFullText
+            .get_bytes(&input, "fulltext", None)
+            .unwrap();
+        assert_eq!(
+            out,
+            KnitAdapterOutput::Text(KnitTextResult::Bytes(b"a\nb\n".to_vec()))
+        );
+    }
+
+    #[test]
+    fn ft_annotated_to_fulltext_returns_lines_for_chunked() {
+        let raw = fulltext_raw(b"rev-id", &[b"a\n", b"b\n"], false);
+        let key = vec![b"rev-id".to_vec()];
+        let input = adapter_input(&key, &raw, false, None, "knit-annotated-ft-gz");
+        let out = FtAnnotatedToFullText
+            .get_bytes(&input, "chunked", None)
+            .unwrap();
+        assert_eq!(
+            out,
+            KnitAdapterOutput::Text(KnitTextResult::Lines(vec![
+                b"a\n".to_vec(),
+                b"b\n".to_vec()
+            ]))
+        );
+    }
+
+    #[test]
+    fn delta_annotated_to_fulltext_requires_basis() {
+        let raw = delta_raw_annotated(
+            b"rev-id",
+            &[DeltaHunk {
+                start: 0,
+                end: 0,
+                count: 1,
+                lines: vec![(b"rev-id".to_vec(), b"x\n".to_vec())],
+            }],
+        );
+        let key = vec![b"rev-id".to_vec()];
+        let parents = vec![vec![b"parent-id".to_vec()]];
+        let input = adapter_input(
+            &key,
+            &raw,
+            false,
+            Some(&parents),
+            "knit-annotated-delta-gz",
+        );
+        let err = DeltaAnnotatedToFullText
+            .get_bytes(&input, "fulltext", None)
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::Knit(KnitError::Corrupt(_))));
+    }
+
+    #[test]
+    fn delta_annotated_to_fulltext_applies_delta_with_basis() {
+        // Basis is "a\nb\n"; delta inserts "X\n" at the start.
+        let raw = delta_raw_annotated(
+            b"child",
+            &[DeltaHunk {
+                start: 0,
+                end: 0,
+                count: 1,
+                lines: vec![(b"child".to_vec(), b"X\n".to_vec())],
+            }],
+        );
+        let key = vec![b"child".to_vec()];
+        let parents = vec![vec![b"parent".to_vec()]];
+        let input = adapter_input(
+            &key,
+            &raw,
+            false,
+            Some(&parents),
+            "knit-annotated-delta-gz",
+        );
+        let basis = StaticBasis {
+            lines: vec![b"a\n".to_vec(), b"b\n".to_vec()],
+        };
+        let out = DeltaAnnotatedToFullText
+            .get_bytes(&input, "fulltext", Some(&basis))
+            .unwrap();
+        assert_eq!(
+            out,
+            KnitAdapterOutput::Text(KnitTextResult::Bytes(b"X\na\nb\n".to_vec()))
+        );
     }
 }
