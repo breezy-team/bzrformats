@@ -3325,7 +3325,11 @@ struct PyAddCallback(Py<PyAny>);
 impl bazaar::knit::AddCallback for PyAddCallback {
     fn call(
         &mut self,
-        entries: &[(bazaar::knit::KnitKey, Vec<u8>, Vec<Vec<bazaar::knit::KnitKey>>)],
+        entries: &[(
+            bazaar::knit::KnitKey,
+            Vec<u8>,
+            Vec<Vec<bazaar::knit::KnitKey>>,
+        )],
         has_parents: bool,
     ) -> Result<(), bazaar::knit::KnitError> {
         Python::attach(|py| {
@@ -3492,10 +3496,7 @@ impl PyKnitGraphIndex {
         Ok(result.into_any())
     }
 
-    fn add_missing_compression_parent(
-        &mut self,
-        key: Bound<'_, PyAny>,
-    ) -> PyResult<()> {
+    fn add_missing_compression_parent(&mut self, key: Bound<'_, PyAny>) -> PyResult<()> {
         let k = extract_py_knit_key(&key)?;
         self.inner.add_missing_compression_parent(k);
         Ok(())
@@ -3656,7 +3657,8 @@ impl PyKnitGraphIndex {
     fn get_missing_compression_parents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let s = pyo3::types::PyFrozenSet::new(
             py,
-            self.inner.missing_compression_parents
+            self.inner
+                .missing_compression_parents
                 .iter()
                 .map(|k| py_knit_key_to_py(py, k))
                 .collect::<PyResult<Vec<_>>>()?,
@@ -3668,8 +3670,7 @@ impl PyKnitGraphIndex {
         let Some(kd) = &self.inner.key_dependencies else {
             return Ok(pyo3::types::PyFrozenSet::empty(py)?.into_any());
         };
-        let unsatisfied_keys: Vec<bazaar::knit::KnitKey> =
-            kd.unsatisfied_refs().cloned().collect();
+        let unsatisfied_keys: Vec<bazaar::knit::KnitKey> = kd.unsatisfied_refs().cloned().collect();
         let py_keys = pyo3::types::PyList::new(
             py,
             unsatisfied_keys
@@ -3776,8 +3777,7 @@ impl PyKnitGraphIndex {
         }
 
         // Dedup check against the backing graph index.
-        let mut to_remove: std::collections::HashSet<KnitKey> =
-            std::collections::HashSet::new();
+        let mut to_remove: std::collections::HashSet<KnitKey> = std::collections::HashSet::new();
         if !random_id {
             let mut pre_entries: Vec<(KnitKey, Vec<u8>, Vec<Vec<KnitKey>>)> = Vec::new();
             for (key, options_bytes, pos, size, parents) in &decoded {
@@ -3788,7 +3788,13 @@ impl PyKnitGraphIndex {
                     bazaar::knit::KnitMethod::Fulltext
                 };
                 let (value, node_refs) = bazaar::knit::encode_graph_index_record(
-                    noeol, *pos, *size, method, self.inner.parents, self.inner.deltas, parents,
+                    noeol,
+                    *pos,
+                    *size,
+                    method,
+                    self.inner.parents,
+                    self.inner.deltas,
+                    parents,
                 )
                 .map_err(knit_err_to_py)?;
                 if let Some(existing) = pre_entries.iter_mut().find(|(k, _, _)| k == key) {
@@ -3828,8 +3834,7 @@ impl PyKnitGraphIndex {
                     })
                     .transpose()?
                     .unwrap_or_default();
-                let new_parents: &[KnitKey] =
-                    new_refs.first().map(|v| v.as_slice()).unwrap_or(&[]);
+                let new_parents: &[KnitKey] = new_refs.first().map(|v| v.as_slice()).unwrap_or(&[]);
                 if existing_flag != new_flag || existing_parents.as_slice() != new_parents {
                     return Err(knit_err_to_py(bazaar::knit::KnitError::Corrupt(format!(
                         "inconsistent details in add_records: \
@@ -4279,9 +4284,7 @@ impl PyKnitVersionedFiles {
     ) -> PyResult<Py<PyAny>> {
         // TODO: call check_write_ok through the Rust KnitIndex trait once
         // key parsing can happen after the lock check.
-        self.index_obj
-            .bind(py)
-            .call_method0("_check_write_ok")?;
+        self.index_obj.bind(py).call_method0("_check_write_ok")?;
         let (mut rust_key, autogen_key) = extract_py_knit_key_autogen(&key)?;
         let rust_lines: Vec<Vec<u8>> = lines
             .try_iter()?
