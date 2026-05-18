@@ -6,6 +6,7 @@
 //! method dispatch here is intentionally one-to-one with the trait's
 //! method set — every Rust call becomes a single Python `call_method1`.
 
+use bazaar::key_mapper::Mapper;
 use bazaar::transport::{ReadRange, ReadResult, Transport, TransportError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
@@ -38,9 +39,19 @@ impl PyTransport {
 /// everything else to [`TransportError::Other`] with the exception's
 /// `repr()`.
 #[allow(dead_code)]
+pyo3::import_exception!(bzrformats.errors, NoSuchFile);
+mod transport_exc {
+    pyo3::import_exception!(bzrformats.transport, NoSuchFile);
+}
+mod dromedary_exc {
+    pyo3::import_exception!(dromedary.errors, NoSuchFile);
+}
+
 fn map_py_err(py: Python<'_>, err: PyErr) -> TransportError {
-    pyo3::import_exception!(bzrformats.errors, NoSuchFile);
-    if err.is_instance_of::<NoSuchFile>(py) {
+    if err.is_instance_of::<NoSuchFile>(py)
+        || err.is_instance_of::<transport_exc::NoSuchFile>(py)
+        || err.is_instance_of::<dromedary_exc::NoSuchFile>(py)
+    {
         let msg = err
             .value(py)
             .str()
@@ -66,12 +77,36 @@ impl Transport for PyTransport {
         })
     }
 
-    fn put_bytes(&self, path: &str, bytes: &[u8]) -> Result<(), TransportError> {
+    fn put_file_non_atomic(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        create_parent_dir: bool,
+    ) -> Result<(), TransportError> {
         Python::attach(|py| -> Result<(), TransportError> {
-            let py_bytes = PyBytes::new(py, bytes);
+            let io = py
+                .import("io")
+                .map_err(|e| TransportError::Other(e.to_string()))?;
+            let sio = io
+                .call_method1("BytesIO", (PyBytes::new(py, bytes),))
+                .map_err(|e| TransportError::Other(e.to_string()))?;
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs
+                .set_item("create_parent_dir", create_parent_dir)
+                .map_err(|e| TransportError::Other(e.to_string()))?;
             self.0
                 .bind(py)
-                .call_method1("put_bytes", (path, py_bytes))
+                .call_method("put_file_non_atomic", (path, sio), Some(&kwargs))
+                .map_err(|e| map_py_err(py, e))?;
+            Ok(())
+        })
+    }
+
+    fn mkdir(&self, path: &str) -> Result<(), TransportError> {
+        Python::attach(|py| -> Result<(), TransportError> {
+            self.0
+                .bind(py)
+                .call_method1("mkdir", (path,))
                 .map_err(|e| map_py_err(py, e))?;
             Ok(())
         })
@@ -159,6 +194,27 @@ impl Transport for PyTransport {
         })
     }
 
+    fn iter_files_recursive(&self) -> Result<Vec<String>, TransportError> {
+        Python::attach(|py| -> Result<Vec<String>, TransportError> {
+            let iter = self
+                .0
+                .bind(py)
+                .call_method0("iter_files_recursive")
+                .map_err(|e| map_py_err(py, e))?;
+            let mut out = Vec::new();
+            for item in iter.try_iter().map_err(|e| map_py_err(py, e))? {
+                let item = item.map_err(|e| map_py_err(py, e))?;
+                let s = item.extract::<String>().map_err(|_| {
+                    TransportError::Other(
+                        "transport.iter_files_recursive yielded a non-string".to_string(),
+                    )
+                })?;
+                out.push(s);
+            }
+            Ok(out)
+        })
+    }
+
     fn abspath(&self, path: &str) -> Result<String, TransportError> {
         Python::attach(|py| -> Result<String, TransportError> {
             let result = self
@@ -169,6 +225,71 @@ impl Transport for PyTransport {
             result.extract::<String>().map_err(|_| {
                 TransportError::Other("transport.abspath did not return a string".to_string())
             })
+        })
+    }
+}
+
+/// Wraps a Python `KeyMapper` object so it can be passed to pure-Rust
+/// code that expects a [`Mapper`] trait object.
+///
+/// The Python `KeyMapper.map(key)` method takes a tuple of bytes and
+/// returns a `str`. The `unmap(partition_id)` method takes a `str` and
+/// returns a tuple of bytes.  This adapter handles the conversion.
+pub struct PyMapper(pub Py<PyAny>);
+
+// SAFETY: Py<PyAny> is Send; all calls re-acquire the GIL via Python::attach.
+unsafe impl Send for PyMapper {}
+unsafe impl Sync for PyMapper {}
+
+impl PyMapper {
+    pub fn new(obj: Bound<'_, PyAny>) -> Self {
+        Self(obj.unbind())
+    }
+}
+
+impl Mapper for PyMapper {
+    fn is_constant(&self) -> bool {
+        Python::attach(|py| {
+            py.import("bzrformats.versionedfile")
+                .and_then(|m| m.getattr("ConstantMapper"))
+                .map(|cls| self.0.bind(py).is_instance(&cls).unwrap_or(false))
+                .unwrap_or(false)
+        })
+    }
+
+    fn map(&self, key: &[&[u8]]) -> String {
+        Python::attach(|py| -> String {
+            let parts: Vec<Bound<'_, PyBytes>> = key.iter().map(|s| PyBytes::new(py, s)).collect();
+            let tuple = PyTuple::new(py, parts).expect("PyTuple::new failed");
+            let result = self
+                .0
+                .bind(py)
+                .call_method1("map", (tuple,))
+                .expect("mapper.map() failed");
+            result
+                .extract::<String>()
+                .expect("mapper.map() did not return a string")
+        })
+    }
+
+    fn unmap(&self, path: &str) -> Vec<Vec<u8>> {
+        Python::attach(|py| -> Vec<Vec<u8>> {
+            let result = self
+                .0
+                .bind(py)
+                .call_method1("unmap", (path,))
+                .expect("mapper.unmap() failed");
+            let tup = result
+                .cast_into::<PyTuple>()
+                .expect("mapper.unmap() did not return a tuple");
+            tup.iter()
+                .map(|item| {
+                    item.cast_into::<PyBytes>()
+                        .expect("mapper.unmap() tuple element must be bytes")
+                        .as_bytes()
+                        .to_vec()
+                })
+                .collect()
         })
     }
 }

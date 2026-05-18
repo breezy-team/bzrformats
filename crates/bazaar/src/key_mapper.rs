@@ -6,6 +6,92 @@
 
 use adler::adler32_slice;
 
+/// Translate between key tuples and storage paths.
+///
+/// Implementations mirror the Python `KeyMapper` hierarchy:
+/// [`ConstantMapper`], `PrefixMapper`, `HashPrefixMapper`, etc.
+/// The pyo3 layer provides a `PyMapper` adapter so pure-Rust code
+/// accepts any Python mapper object.
+pub trait Mapper: Send + Sync {
+    /// Map a key (sequence of byte segments) to a relative storage path.
+    fn map(&self, key: &[&[u8]]) -> String;
+    /// Invert `map`, recovering the prefix bytes from a storage path.
+    fn unmap(&self, path: &str) -> Vec<Vec<u8>>;
+    /// Return true if every key maps to the same path (i.e. this is a
+    /// `ConstantMapper`). Used by `KndxIndex::keys` to skip the file-scan
+    /// path and by `load_prefix_inner` to decide whether to create the index
+    /// file when it is missing.
+    fn is_constant(&self) -> bool {
+        false
+    }
+}
+
+/// A `Mapper` that always returns the same path regardless of the key.
+///
+/// Mirrors `bzrformats.versionedfile.ConstantMapper`.
+pub struct ConstantMapper {
+    pub result: String,
+}
+
+impl Mapper for ConstantMapper {
+    fn map(&self, _key: &[&[u8]]) -> String {
+        self.result.clone()
+    }
+
+    fn unmap(&self, _path: &str) -> Vec<Vec<u8>> {
+        vec![]
+    }
+
+    fn is_constant(&self) -> bool {
+        true
+    }
+}
+
+/// A `Mapper` that uses the first key element as the storage path (url-quoted).
+///
+/// Mirrors `bzrformats.versionedfile.PrefixMapper`.
+pub struct PrefixMapper;
+
+impl Mapper for PrefixMapper {
+    fn map(&self, key: &[&[u8]]) -> String {
+        prefix_map(key[0])
+    }
+
+    fn unmap(&self, path: &str) -> Vec<Vec<u8>> {
+        vec![prefix_unmap(path)]
+    }
+}
+
+/// A `Mapper` that prefixes the path with a two-hex adler32 bucket.
+///
+/// Mirrors `bzrformats.versionedfile.HashPrefixMapper`.
+pub struct HashPrefixMapper;
+
+impl Mapper for HashPrefixMapper {
+    fn map(&self, key: &[&[u8]]) -> String {
+        hash_prefix_map(key[0])
+    }
+
+    fn unmap(&self, path: &str) -> Vec<Vec<u8>> {
+        vec![hash_prefix_unmap(path)]
+    }
+}
+
+/// A `Mapper` that escapes non-filesystem-safe bytes before bucketing.
+///
+/// Mirrors `bzrformats.versionedfile.HashEscapedPrefixMapper`.
+pub struct HashEscapedPrefixMapper;
+
+impl Mapper for HashEscapedPrefixMapper {
+    fn map(&self, key: &[&[u8]]) -> String {
+        hash_escaped_prefix_map(key[0])
+    }
+
+    fn unmap(&self, path: &str) -> Vec<Vec<u8>> {
+        vec![hash_escaped_prefix_unmap(path)]
+    }
+}
+
 /// Percent-encode `s` matching Python's `urllib.parse.quote(s, safe='/')`.
 ///
 /// Safe characters are ASCII letters, digits, `_.-~` and `/`.

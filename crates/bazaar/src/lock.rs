@@ -21,20 +21,20 @@
 
 #[cfg(unix)]
 use nix::libc;
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 #[cfg(windows)]
 use winapi::um::fileapi::{LockFileEx, UnlockFileEx};
 #[cfg(windows)]
 use winapi::um::minwinbase::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OVERLAPPED};
 #[cfg(windows)]
 use winapi::um::winnt::HANDLE;
-use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug)]
 pub enum LockError {
@@ -189,7 +189,14 @@ fn fcntl_lockf(file: &File, op: FcntlOp, path: &Path) -> Result<(), LockError> {
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
     let res = match op {
         FcntlOp::LockShared => unsafe {
-            LockFileEx(handle, LOCKFILE_FAIL_IMMEDIATELY, 0, !0, !0, &mut overlapped)
+            LockFileEx(
+                handle,
+                LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                !0,
+                !0,
+                &mut overlapped,
+            )
         },
         FcntlOp::LockExclusive => unsafe {
             LockFileEx(

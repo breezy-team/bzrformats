@@ -3,8 +3,8 @@ use bazaar::inventory_delta::{
     InventoryDeltaEntry, InventoryDeltaInconsistency, InventoryDeltaParseError,
     InventoryDeltaSerializeError,
 };
-use bazaar::{FileId, RevisionId};
 use bazaar::osutils::Kind;
+use bazaar::{FileId, RevisionId};
 use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::{
     PyIndexError, PyKeyError, PyNotImplementedError, PyTypeError, PyValueError,

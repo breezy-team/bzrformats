@@ -538,8 +538,12 @@ impl PyWeave {
     }
 
     fn versions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let items: Vec<Bound<PyBytes>> =
-            self.inner.names.iter().map(|n| PyBytes::new(py, n)).collect();
+        let items: Vec<Bound<PyBytes>> = self
+            .inner
+            .names
+            .iter()
+            .map(|n| PyBytes::new(py, n))
+            .collect();
         PyList::new(py, items)
     }
 
@@ -584,7 +588,11 @@ impl PyWeave {
         Ok(outer)
     }
     #[setter]
-    fn set__parents<'py>(&mut self, py: Python<'py>, new_parents: Bound<'py, PyAny>) -> PyResult<()> {
+    fn set__parents<'py>(
+        &mut self,
+        py: Python<'py>,
+        new_parents: Bound<'py, PyAny>,
+    ) -> PyResult<()> {
         let mut outer = Vec::new();
         for ps in new_parents.try_iter()? {
             let mut inner = Vec::new();
@@ -596,7 +604,6 @@ impl PyWeave {
         self.inner.parents = outer;
         Ok(())
     }
-
 
     /// Snapshot of the per-version sha1 list.
     #[getter]
@@ -611,14 +618,14 @@ impl PyWeave {
     fn set__names<'py>(&mut self, py: Python<'py>, new_names: Bound<'py, PyAny>) -> PyResult<()> {
         let mut names = Vec::new();
         for n in new_names.try_iter()? {
-            let b = n?.cast_into::<PyBytes>()
+            let b = n?
+                .cast_into::<PyBytes>()
                 .map_err(|_| PyTypeError::new_err("_names must be bytes"))?;
             names.push(b.as_bytes().to_vec());
         }
         self.inner.names = names;
         Ok(())
     }
-
 
     /// Snapshot of the per-version name list.
     #[getter]
@@ -679,7 +686,9 @@ impl PyWeave {
                 Some(s) => s.clone_ref(py),
             };
             if !current.bind(py).eq(stored.bind(py))? {
-                let exc = py.import("bzrformats.errors")?.getattr("OutSideTransaction")?;
+                let exc = py
+                    .import("bzrformats.errors")?
+                    .getattr("OutSideTransaction")?;
                 return Err(PyErr::from_value(exc.call0()?));
             }
         }
@@ -713,17 +722,18 @@ impl PyWeave {
     /// `Weave._idx_to_name`.
     fn _idx_to_name<'py>(&self, py: Python<'py>, idx: usize) -> PyResult<Bound<'py, PyBytes>> {
         if idx >= self.inner.names.len() {
-            return Err(PyValueError::new_err(format!(
-                "index {} out of range",
-                idx
-            )));
+            return Err(PyValueError::new_err(format!("index {} out of range", idx)));
         }
         Ok(PyBytes::new(py, &self.inner.names[idx]))
     }
 
     /// Convert either an integer index or a symbolic name to an integer
     /// index. Mirrors `Weave._maybe_lookup`.
-    fn _maybe_lookup(slf: PyRef<'_, Self>, py: Python<'_>, name_or_index: Py<PyAny>) -> PyResult<usize> {
+    fn _maybe_lookup(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        name_or_index: Py<PyAny>,
+    ) -> PyResult<usize> {
         if let Ok(i) = name_or_index.extract::<usize>(py) {
             return Ok(i);
         }
@@ -772,8 +782,11 @@ impl PyWeave {
         let items: Vec<Bound<PyTuple>> = walked
             .into_iter()
             .map(|w| {
-                let delete_names: Vec<Bound<PyBytes>> =
-                    w.deletes.iter().map(|&d| PyBytes::new(py, &names[d])).collect();
+                let delete_names: Vec<Bound<PyBytes>> = w
+                    .deletes
+                    .iter()
+                    .map(|&d| PyBytes::new(py, &names[d]))
+                    .collect();
                 let deletes = PyFrozenSet::new(py, delete_names.iter())?;
                 PyTuple::new(
                     py,
@@ -799,9 +812,9 @@ impl PyWeave {
         let mut idxs = Vec::new();
         for v in versions.try_iter()? {
             let v = v?;
-            let i = v.extract::<usize>().map_err(|_| {
-                PyValueError::new_err("_extract requires integer version indices")
-            })?;
+            let i = v
+                .extract::<usize>()
+                .map_err(|_| PyValueError::new_err("_extract requires integer version indices"))?;
             idxs.push(i);
         }
         let included = inclusions(&self.inner.parents, &idxs);
@@ -834,9 +847,9 @@ impl PyWeave {
         let result = pyo3::types::PyDict::new(py);
         for v in version_ids.try_iter()? {
             let v = v?;
-            let bytes = v.cast_into::<PyBytes>().map_err(|_| {
-                PyTypeError::new_err("get_parent_map version_ids must be bytes")
-            })?;
+            let bytes = v
+                .cast_into::<PyBytes>()
+                .map_err(|_| PyTypeError::new_err("get_parent_map version_ids must be bytes"))?;
             let name = bytes.as_bytes();
             if name == bazaar::NULL_REVISION {
                 let empty = PyTuple::empty(py);
@@ -937,11 +950,7 @@ impl PyWeave {
 
     /// Return `[(origin_name, line), ...]` for the given version. Mirrors
     /// `Weave.annotate`.
-    fn annotate<'py>(
-        &self,
-        py: Python<'py>,
-        version_id: &[u8],
-    ) -> PyResult<Bound<'py, PyList>> {
+    fn annotate<'py>(&self, py: Python<'py>, version_id: &[u8]) -> PyResult<Bound<'py, PyList>> {
         let idx = self.inner.lookup(version_id).ok_or_else(|| {
             RevisionNotPresent::new_err((
                 PyBytes::new(py, version_id).unbind(),
@@ -1086,8 +1095,8 @@ impl PyWeave {
         let items: Vec<Bound<PyTuple>> = plan
             .into_iter()
             .map(|(state, line): (PlanMergeState, Vec<u8>)| {
-                let tag_str = std::str::from_utf8(state.tag())
-                    .expect("PlanMergeState tags are ASCII");
+                let tag_str =
+                    std::str::from_utf8(state.tag()).expect("PlanMergeState tags are ASCII");
                 PyTuple::new(
                     py,
                     [
@@ -1360,9 +1369,8 @@ impl PyWeave {
         // matching the `set(versions).difference(set(parents))` fallback
         // in the Python implementation.
         let weave_ref = slf.borrow(py);
-        let ordered_names = order_record_stream(&weave_ref.inner, &names, ordering).ok_or_else(
-            || PyValueError::new_err(format!("unknown ordering {:?}", ordering)),
-        )?;
+        let ordered_names = order_record_stream(&weave_ref.inner, &names, ordering)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown ordering {:?}", ordering)))?;
         drop(weave_ref);
 
         // Build the result list: one factory per name.
@@ -1517,10 +1525,7 @@ impl WeaveContentFactory {
                 // Concatenate the lines into a single bytes blob.
                 let weave_ref = self.weave.borrow(py);
                 let idx = weave_ref.inner.lookup(&self.name).ok_or_else(|| {
-                    RevisionNotPresent::new_err((
-                        PyBytes::new(py, &self.name).unbind(),
-                        py.None(),
-                    ))
+                    RevisionNotPresent::new_err((PyBytes::new(py, &self.name).unbind(), py.None()))
                 })?;
                 let lines = weave_ref
                     .inner
@@ -1532,9 +1537,7 @@ impl WeaveContentFactory {
                 }
                 Ok(PyBytes::new(py, &buf).into_any())
             }
-            "chunked" | "lines" => self
-                .get_lines_as_pylist(py)
-                .map(|l| l.into_any()),
+            "chunked" | "lines" => self.get_lines_as_pylist(py).map(|l| l.into_any()),
             other => Err(UnavailableRepresentation::new_err((
                 self.key.clone_ref(py),
                 other.to_string(),

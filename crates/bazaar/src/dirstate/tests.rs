@@ -2250,7 +2250,16 @@ fn set_state_from_inventory_rename_same_id_bug_395556() {
     let mut state = add_fixture();
     let stat = b"x".repeat(32);
     state
-        .add(b"b", b"", b"b", b"b-id", crate::osutils::Kind::File, 0, &stat, b"")
+        .add(
+            b"b",
+            b"",
+            b"b",
+            b"b-id",
+            crate::osutils::Kind::File,
+            0,
+            &stat,
+            b"",
+        )
         .expect("add");
 
     let inv_after_rename: Vec<(Vec<u8>, Vec<u8>, Kind, Vec<u8>, bool)> = vec![
@@ -2745,7 +2754,16 @@ fn set_parent_trees_ghost_parent_has_no_entries() {
     let mut state = add_fixture();
     let stat = b"x".repeat(32);
     state
-        .add(b"x", b"", b"x", b"x-id", crate::osutils::Kind::File, 0, &stat, b"")
+        .add(
+            b"x",
+            b"",
+            b"x",
+            b"x-id",
+            crate::osutils::Kind::File,
+            0,
+            &stat,
+            b"",
+        )
         .expect("add");
 
     state
@@ -5606,7 +5624,10 @@ fn kind_is_absent_or_relocated_only_those_two() {
 
 #[test]
 fn kind_to_osutils_kind_maps_real_kinds() {
-    assert_eq!(Kind::File.to_osutils_kind(), Some(crate::osutils::Kind::File));
+    assert_eq!(
+        Kind::File.to_osutils_kind(),
+        Some(crate::osutils::Kind::File)
+    );
     assert_eq!(
         Kind::Directory.to_osutils_kind(),
         Some(crate::osutils::Kind::Directory)

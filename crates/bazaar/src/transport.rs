@@ -101,13 +101,22 @@ pub trait Transport {
     /// Read the entire contents of `path`.
     fn get_bytes(&self, path: &str) -> Result<Vec<u8>, TransportError>;
 
-    /// Atomically replace the contents of `path` with `bytes`. If the
-    /// transport is read-only, returns `TransportError::ReadOnly`.
-    fn put_bytes(&self, path: &str, bytes: &[u8]) -> Result<(), TransportError>;
+    /// Write `bytes` to `path`, creating parent directories if
+    /// `create_parent_dir` is true. Replaces any existing content.
+    fn put_file_non_atomic(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        create_parent_dir: bool,
+    ) -> Result<(), TransportError>;
 
     /// Append `bytes` to the end of `path`, creating it if missing.
     /// Returns the byte offset where the appended data starts.
     fn append_bytes(&self, path: &str, bytes: &[u8]) -> Result<u64, TransportError>;
+
+    /// Create directory `path`. It is not an error if the directory already
+    /// exists; implementations should silently succeed in that case.
+    fn mkdir(&self, path: &str) -> Result<(), TransportError>;
 
     /// Test whether `path` exists.
     fn has(&self, path: &str) -> Result<bool, TransportError>;
@@ -151,6 +160,11 @@ pub trait Transport {
         Ok(out)
     }
 
+    /// List all files under the transport root recursively, returning
+    /// relative paths. Used by [`crate::knit::KndxIndex::keys`] to
+    /// enumerate prefixes when the mapper is not constant.
+    fn iter_files_recursive(&self) -> Result<Vec<String>, TransportError>;
+
     /// Resolve `path` relative to the transport root into an absolute
     /// identifier (typically a filesystem path or URL). Used for error
     /// messages and reload-tracking; implementations are free to
@@ -190,9 +204,18 @@ pub(crate) mod testing {
                 .ok_or_else(|| TransportError::NoSuchFile(path.to_string()))
         }
 
-        fn put_bytes(&self, path: &str, bytes: &[u8]) -> Result<(), TransportError> {
+        fn put_file_non_atomic(
+            &self,
+            path: &str,
+            bytes: &[u8],
+            _create_parent_dir: bool,
+        ) -> Result<(), TransportError> {
             let mut files = self.files.lock().unwrap();
             files.insert(path.to_string(), bytes.to_vec());
+            Ok(())
+        }
+
+        fn mkdir(&self, _path: &str) -> Result<(), TransportError> {
             Ok(())
         }
 
@@ -209,6 +232,11 @@ pub(crate) mod testing {
             Ok(files.contains_key(path))
         }
 
+        fn iter_files_recursive(&self) -> Result<Vec<String>, TransportError> {
+            let files = self.files.lock().unwrap();
+            Ok(files.keys().cloned().collect())
+        }
+
         fn abspath(&self, path: &str) -> Result<String, TransportError> {
             Ok(format!("{}{}", self.root, path))
         }
@@ -218,7 +246,7 @@ pub(crate) mod testing {
     fn memory_transport_basic_round_trip() {
         let t = MemoryTransport::new();
         assert!(!t.has("foo").unwrap());
-        t.put_bytes("foo", b"hello").unwrap();
+        t.put_file_non_atomic("foo", b"hello", false).unwrap();
         assert!(t.has("foo").unwrap());
         assert_eq!(t.get_bytes("foo").unwrap(), b"hello".to_vec());
     }
@@ -243,7 +271,7 @@ pub(crate) mod testing {
     #[test]
     fn default_readv_slices_via_get_bytes() {
         let t = MemoryTransport::new();
-        t.put_bytes("data", b"0123456789").unwrap();
+        t.put_file_non_atomic("data", b"0123456789", false).unwrap();
         let ranges = vec![
             ReadRange {
                 offset: 0,
@@ -263,7 +291,7 @@ pub(crate) mod testing {
     #[test]
     fn default_readv_rejects_past_end() {
         let t = MemoryTransport::new();
-        t.put_bytes("data", b"hi").unwrap();
+        t.put_file_non_atomic("data", b"hi", false).unwrap();
         let err = t
             .readv(
                 "data",

@@ -643,9 +643,7 @@ impl InventorySerializer {
             // step always fails. We replicate that by passing an empty
             // sentinel that won't match any real revision id.
             let line_key = tuple.get_item(1)?;
-            let revid: Vec<u8> = if let Ok(key_tuple) =
-                line_key.cast::<pyo3::types::PyTuple>()
-            {
+            let revid: Vec<u8> = if let Ok(key_tuple) = line_key.cast::<pyo3::types::PyTuple>() {
                 if key_tuple.is_empty() {
                     return Err(PyTypeError::new_err("line_key tuple must be non-empty"));
                 }

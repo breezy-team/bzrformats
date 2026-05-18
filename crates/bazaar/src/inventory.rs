@@ -1,6 +1,6 @@
 use crate::inventory_delta::{InventoryDelta, InventoryDeltaEntry, InventoryDeltaInconsistency};
-use crate::{FileId, RevisionId};
 use crate::osutils::Kind;
+use crate::{FileId, RevisionId};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -783,7 +783,9 @@ impl MutableInventory {
     }
 
     pub fn get_entry_by_path(&self, relpath: &str) -> Option<&Entry> {
-        self.get_entry_by_path_segments(crate::osutils::path::splitpath(relpath).unwrap().as_slice())
+        self.get_entry_by_path_segments(
+            crate::osutils::path::splitpath(relpath).unwrap().as_slice(),
+        )
     }
 
     pub fn get_entry_by_path_segments(&self, names: &[&str]) -> Option<&Entry> {
@@ -1446,9 +1448,10 @@ impl Eq for MutableInventory {}
 
 // Normalize name
 pub fn ensure_normalized_name(name: &std::path::Path) -> Result<std::path::PathBuf, Error> {
-    let (norm_name, can_access) = crate::osutils::path::normalized_filename(name).ok_or_else(|| {
-        Error::InvalidNormalization(name.to_path_buf(), "name is not normalized".to_string())
-    })?;
+    let (norm_name, can_access) =
+        crate::osutils::path::normalized_filename(name).ok_or_else(|| {
+            Error::InvalidNormalization(name.to_path_buf(), "name is not normalized".to_string())
+        })?;
 
     if norm_name != name {
         if can_access {

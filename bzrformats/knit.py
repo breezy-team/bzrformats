@@ -54,8 +54,6 @@ in the deltas to provide line annotation
 import contextlib
 import logging
 import operator
-import os
-from io import BytesIO
 
 from vcsgraph import tsort
 
@@ -67,18 +65,14 @@ from .annotate import VersionedFileAnnotator
 from .errors import (
     BzrFormatsError,
     InvalidRevisionId,
-    NoSuchFile,
     ObjectNotLocked,
     ReadOnlyError,
-    ReadOnlyObjectDirtiedError,
     RevisionAlreadyPresent,
     RevisionNotPresent,
 )
 from .osutils import contains_whitespace, sha_string, sha_strings
-from .transport import TransportNoSuchFile
 from .versionedfile import (
     AbsentContentFactory,
-    ConstantMapper,
     ContentFactory,
     ExistingContent,
     UnavailableRepresentation,
@@ -648,44 +642,12 @@ def knit_network_to_record(storage_kind, bytes, line_end):
 
 
 class KnitContent:
-    r"""Content of a knit version to which deltas can be applied.
+    r"""Base class for knit content objects.
 
-    This is always stored in memory as a list of lines with \n at the end,
-    plus a flag saying if the final ending is really there or not, because that
-    corresponds to the on-disk knit representation.
+    Provides the static get_line_delta_blocks helper used by callers that
+    hold a plain KnitContent reference.  The concrete implementations
+    (AnnotatedKnitContent, PlainKnitContent) are backed by Rust.
     """
-
-    def __init__(self):
-        """Initialize KnitContent."""
-        self._should_strip_eol = False
-
-    def apply_delta(self, delta, new_version_id):
-        """Apply delta to this object to become new_version_id."""
-        raise NotImplementedError(self.apply_delta)
-
-    def line_delta_iter(self, new_lines):
-        """Generate line-based delta from this content to new_lines."""
-        import patiencediff
-
-        new_texts = new_lines.text()
-        old_texts = self.text()
-        s = patiencediff.PatienceSequenceMatcher(None, old_texts, new_texts)
-        for tag, i1, i2, j1, j2 in s.get_opcodes():
-            if tag == "equal":
-                continue
-            # ofrom, oto, length, data
-            yield i1, i2, j2 - j1, new_lines._lines[j1:j2]
-
-    def line_delta(self, new_lines):
-        """Get the line delta between this content and new_lines.
-
-        Args:
-            new_lines: The target content to generate a delta to.
-
-        Returns:
-            A list of delta operations.
-        """
-        return list(self.line_delta_iter(new_lines))
 
     @staticmethod
     def get_line_delta_blocks(knit_delta, source, target):
@@ -693,352 +655,26 @@ class KnitContent:
         yield from _knit_rs.get_line_delta_blocks_rs(knit_delta, source, target)
 
 
-class AnnotatedKnitContent(KnitContent):
-    """Annotated content."""
-
-    def __init__(self, lines):
-        """Initialize AnnotatedKnitContent.
-
-        Args:
-            lines: An iterable of (origin, text) tuples representing annotated lines.
-        """
-        KnitContent.__init__(self)
-        self._lines = list(lines)
-
-    def annotate(self):
-        """Return a list of (origin, text) for each content line."""
-        lines = self._lines[:]
-        if self._should_strip_eol:
-            origin, last_line = lines[-1]
-            lines[-1] = (origin, last_line.rstrip(b"\n"))
-        return lines
-
-    def apply_delta(self, delta, new_version_id):
-        """Apply delta to this object to become new_version_id."""
-        offset = 0
-        lines = self._lines
-        for start, end, count, delta_lines in delta:
-            lines[offset + start : offset + end] = delta_lines
-            offset = offset + (start - end) + count
-
-    def text(self):
-        """Return the text content without annotations.
-
-        Returns:
-            A list of text lines.
-
-        Raises:
-            KnitCorrupt: If annotation information is missing.
-        """
-        try:
-            lines = [text for origin, text in self._lines]
-        except ValueError as e:
-            # most commonly (only?) caused by the internal form of the knit
-            # missing annotation information because of a bug - see thread
-            # around 20071015
-            raise KnitCorrupt(
-                self, f"line in annotated knit missing annotation information: {e}"
-            ) from e
-        if self._should_strip_eol:
-            lines[-1] = lines[-1].rstrip(b"\n")
-        return lines
-
-    def copy(self):
-        """Create a copy of this annotated content.
-
-        Returns:
-            A new AnnotatedKnitContent instance with the same lines.
-        """
-        return AnnotatedKnitContent(self._lines)
+from ._bzr_rs.knit import (
+    AnnotatedKnitContent,
+    KnitAnnotateFactory,
+    KnitPlainFactory,
+    PlainKnitContent,
+    _KndxIndex,
+    _KnitGraphIndex,
+    _KnitKeyAccess,
+)
+from ._bzr_rs.knit import KnitVersionedFiles as _KnitVersionedFilesRs
 
 
-class PlainKnitContent(KnitContent):
-    """Unannotated content.
+class KnitVersionedFiles(_KnitVersionedFilesRs, VersionedFilesWithFallbacks):
+    """Python view of the Rust-backed KnitVersionedFiles.
 
-    When annotate[_iter] is called on this content, the same version is reported
-    for all lines. Generally, annotate[_iter] is not useful on PlainKnitContent
-    objects.
+    Inherits the Rust pyclass for storage/methods and
+    `VersionedFilesWithFallbacks` so `isinstance(x, VersionedFiles)`
+    holds — the Rust pyclass has `__module__ == 'builtins'` and
+    cannot itself extend a pure-Python class via PyO3.
     """
-
-    def __init__(self, lines, version_id):
-        """Initialize PlainKnitContent.
-
-        Args:
-            lines: A list of text lines.
-            version_id: The version identifier for this content.
-        """
-        KnitContent.__init__(self)
-        self._lines = lines
-        self._version_id = version_id
-
-    def annotate(self):
-        """Return a list of (origin, text) for each content line."""
-        return [(self._version_id, line) for line in self._lines]
-
-    def apply_delta(self, delta, new_version_id):
-        """Apply delta to this object to become new_version_id."""
-        offset = 0
-        lines = self._lines
-        for start, end, count, delta_lines in delta:
-            lines[offset + start : offset + end] = delta_lines
-            offset = offset + (start - end) + count
-        self._version_id = new_version_id
-
-    def copy(self):
-        """Create a copy of this plain content.
-
-        Returns:
-            A new PlainKnitContent instance with the same lines and version.
-        """
-        return PlainKnitContent(self._lines[:], self._version_id)
-
-    def text(self):
-        """Return the text content.
-
-        Returns:
-            A list of text lines, possibly with the final EOL stripped.
-        """
-        lines = self._lines
-        if self._should_strip_eol:
-            lines = lines[:]
-            lines[-1] = lines[-1].rstrip(b"\n")
-        return lines
-
-
-class _KnitFactory:
-    """Base class for common Factory functions."""
-
-    def parse_record(
-        self, version_id, record, record_details, base_content, copy_base_content=True
-    ):
-        """Parse a record into a full content object.
-
-        :param version_id: The official version id for this content
-        :param record: The data returned by read_records_iter()
-        :param record_details: Details about the record returned by
-            get_build_details
-        :param base_content: If get_build_details returns a compression_parent,
-            you must return a base_content here, else use None
-        :param copy_base_content: When building from the base_content, decide
-            you can either copy it and return a new object, or modify it in
-            place.
-        :return: (content, delta) A Content object and possibly a line-delta,
-            delta may be None
-        """
-        method, noeol = record_details
-        if method == "line-delta":
-            content = base_content.copy() if copy_base_content else base_content
-            delta = self.parse_line_delta(record, version_id)
-            content.apply_delta(delta, version_id)
-        else:
-            content = self.parse_fulltext(record, version_id)
-            delta = None
-        content._should_strip_eol = noeol
-        return (content, delta)
-
-
-class KnitAnnotateFactory(_KnitFactory):
-    """Factory for creating annotated Content objects."""
-
-    annotated = True
-
-    def make(self, lines, version_id):
-        """Create an AnnotatedKnitContent from lines and version_id.
-
-        Args:
-            lines: The text lines to annotate.
-            version_id: The version identifier to assign to all lines.
-
-        Returns:
-            An AnnotatedKnitContent instance.
-        """
-        num_lines = len(lines)
-        return AnnotatedKnitContent(zip([version_id] * num_lines, lines, strict=False))
-
-    def parse_fulltext(self, content, version_id):
-        r"""Convert fulltext to internal representation.
-
-        fulltext content is of the format
-        revid(utf8) plaintext\n
-        internal representation is of the format:
-        (revid, plaintext)
-        """
-        return AnnotatedKnitContent(_knit_rs.parse_fulltext_rs(content))
-
-    def parse_line_delta(self, lines, version_id, plain=False):
-        r"""Convert a line based delta into internal representation.
-
-        line delta is in the form of:
-        intstart intend intcount
-        1..count lines:
-        revid(utf8) newline\n
-        internal representation is
-        (start, end, count, [1..count tuples (revid, newline)])
-
-        :param plain: If True, the lines are returned as a plain
-            list without annotations, not as a list of (origin, content) tuples, i.e.
-            (start, end, count, [1..count newline])
-        """
-        return _knit_rs.parse_line_delta_rs(lines, plain=plain)
-
-    def get_fulltext_content(self, lines):
-        """Extract just the content lines from a fulltext."""
-        return (line.split(b" ", 1)[1] for line in lines)
-
-    def get_linedelta_content(self, lines):
-        """Extract just the content from a line delta.
-
-        This doesn't return all of the extra information stored in a delta.
-        Only the actual content lines.
-        """
-        lines = iter(lines)
-        for header in lines:
-            header = header.split(b",")
-            count = int(header[2])
-            for _ in range(count):
-                _origin, text = next(lines).split(b" ", 1)
-                yield text
-
-    def lower_fulltext(self, content):
-        """Convert a fulltext content record into a serializable form.
-
-        see parse_fulltext which this inverts.
-        """
-        return _knit_rs.lower_fulltext_rs(content._lines)
-
-    def lower_line_delta(self, delta):
-        """Convert a delta into a serializable form.
-
-        See parse_line_delta which this inverts.
-        """
-        return _knit_rs.lower_line_delta_rs(delta)
-
-    def annotate(self, knit, key):
-        """Get annotated lines for a given key.
-
-        Args:
-            knit: The knit storage to read from.
-            key: The version key to annotate.
-
-        Returns:
-            A list of (origin, text) tuples for each line.
-        """
-        content = knit._get_content(key)
-        # adjust for the fact that serialised annotations are only key suffixes
-        # for this factory.
-        if isinstance(key, tuple):
-            prefix = key[:-1]
-            origins = content.annotate()
-            result = []
-            for origin, line in origins:
-                result.append((prefix + (origin,), line))
-            return result
-        else:
-            # XXX: This smells a bit.  Why would key ever be a non-tuple here?
-            # Aren't keys defined to be tuples?  -- spiv 20080618
-            return content.annotate()
-
-
-class KnitPlainFactory(_KnitFactory):
-    """Factory for creating plain Content objects."""
-
-    annotated = False
-
-    def make(self, lines, version_id):
-        """Create a PlainKnitContent from lines and version_id.
-
-        Args:
-            lines: The text lines.
-            version_id: The version identifier.
-
-        Returns:
-            A PlainKnitContent instance.
-        """
-        return PlainKnitContent(lines, version_id)
-
-    def parse_fulltext(self, content, version_id):
-        """This parses an unannotated fulltext.
-
-        Note that this is not a noop - the internal representation
-        has (versionid, line) - its just a constant versionid.
-        """
-        return self.make(content, version_id)
-
-    def parse_line_delta_iter(self, lines, version_id):
-        """Parse line delta records into an iterator of delta operations.
-
-        Args:
-            lines: The delta lines to parse.
-            version_id: The version identifier (unused for plain content).
-
-        Yields:
-            Tuples of (start, end, count, lines) for each delta operation.
-        """
-        yield from _knit_rs.parse_line_delta_raw_rs(lines)
-
-    def parse_line_delta(self, lines, version_id):
-        """Parse line delta records into a list of delta operations.
-
-        Args:
-            lines: The delta lines to parse.
-            version_id: The version identifier (unused for plain content).
-
-        Returns:
-            A list of (start, end, count, lines) tuples.
-        """
-        return _knit_rs.parse_line_delta_raw_rs(lines)
-
-    def get_fulltext_content(self, lines):
-        """Extract just the content lines from a fulltext."""
-        return iter(lines)
-
-    def get_linedelta_content(self, lines):
-        """Extract just the content from a line delta.
-
-        This doesn't return all of the extra information stored in a delta.
-        Only the actual content lines.
-        """
-        lines = iter(lines)
-        for header in lines:
-            header = header.split(b",")
-            count = int(header[2])
-            for _ in range(count):
-                yield next(lines)
-
-    def lower_fulltext(self, content):
-        """Convert a fulltext content record into a serializable form.
-
-        Args:
-            content: The PlainKnitContent to serialize.
-
-        Returns:
-            The text lines.
-        """
-        return content.text()
-
-    def lower_line_delta(self, delta):
-        """Convert a delta into a serializable form.
-
-        Args:
-            delta: The delta to serialize.
-
-        Returns:
-            A list of serialized delta lines.
-        """
-        return _knit_rs.lower_line_delta_raw_rs(delta)
-
-    def annotate(self, knit, key):
-        """Get annotated lines for a given key using a KnitAnnotator.
-
-        Args:
-            knit: The knit storage to read from.
-            key: The version key to annotate.
-
-        Returns:
-            A list of (origin, text) tuples for each line.
-        """
-        annotator = _KnitAnnotator(knit)
-        return annotator.annotate_flat(key)
 
 
 def make_file_factory(annotated, mapper):
@@ -1129,7 +765,7 @@ def _get_total_build_size(self, keys, positions):
     return _knit_rs.get_total_build_size_rs(keys, positions)
 
 
-class KnitVersionedFiles(VersionedFilesWithFallbacks):
+class KnitVersionedFilesPy(VersionedFilesWithFallbacks):
     """Storage for many versioned files using knit compression.
 
     Backend storage is managed by indices and data objects.
@@ -1176,7 +812,7 @@ class KnitVersionedFiles(VersionedFilesWithFallbacks):
 
     def without_fallbacks(self):
         """Return a clone of this object without any fallbacks configured."""
-        return KnitVersionedFiles(
+        return KnitVersionedFilesPy(
             self._index,
             self._access,
             self._max_delta_chain,
@@ -2614,451 +2250,8 @@ class _NetworkContentMapGenerator(_ContentMapGenerator):
         return self._bytes
 
 
-class _KndxIndex:
-    r"""Manages knit index files.
-
-    The index is kept in memory and read on startup, to enable
-    fast lookups of revision information.  The cursor of the index
-    file is always pointing to the end, making it easy to append
-    entries.
-
-    _cache is a cache for fast mapping from version id to a Index
-    object.
-
-    _history is a cache for fast mapping from indexes to version ids.
-
-    The index data format is dictionary compressed when it comes to
-    parent references; a index entry may only have parents that with a
-    lover index number.  As a result, the index is topological sorted.
-
-    Duplicate entries may be written to the index for a single version id
-    if this is done then the latter one completely replaces the former:
-    this allows updates to correct version and parent information.
-    Note that the two entries may share the delta, and that successive
-    annotations and references MUST point to the first entry.
-
-    The index file on disc contains a header, followed by one line per knit
-    record. The same revision can be present in an index file more than once.
-    The first occurrence gets assigned a sequence number starting from 0.
-
-    The format of a single line is
-    REVISION_ID FLAGS BYTE_OFFSET LENGTH( PARENT_ID|PARENT_SEQUENCE_ID)* :\n
-    REVISION_ID is a utf8-encoded revision id
-    FLAGS is a comma separated list of flags about the record. Values include
-        no-eol, line-delta, fulltext.
-    BYTE_OFFSET is the ascii representation of the byte offset in the data file
-        that the compressed data starts at.
-    LENGTH is the ascii representation of the length of the data file.
-    PARENT_ID a utf-8 revision id prefixed by a '.' that is a parent of
-        REVISION_ID.
-    PARENT_SEQUENCE_ID the ascii representation of the sequence number of a
-        revision id already in the knit that is a parent of REVISION_ID.
-    The ' :' marker is the end of record marker.
-
-    partial writes:
-    when a write is interrupted to the index file, it will result in a line
-    that does not end in ' :'. If the ' :' is not present at the end of a line,
-    or at the end of the file, then the record that is missing it will be
-    ignored by the parser.
-
-    When writing new records to the index file, the data is preceded by '\n'
-    to ensure that records always start on new lines even if the last write was
-    interrupted. As a result its normal for the last line in the index to be
-    missing a trailing newline. One can be added with no harmful effects.
-
-    :ivar _kndx_cache: dict from prefix to the old state of KnitIndex objects,
-        where prefix is e.g. the (fileid,) for .texts instances or () for
-        constant-mapped things like .revisions, and the old state is
-        tuple(history_vector, cache_dict).  This is used to prevent having an
-        ABI change with the C extension that reads .kndx files.
-    """
-
-    HEADER = b"# bzr knit index 8\n"
-
-    def __init__(self, transport, mapper, get_scope, allow_writes, is_locked):
-        """Create a _KndxIndex on transport using mapper."""
-        self._transport = transport
-        self._mapper = mapper
-        self._get_scope = get_scope
-        self._allow_writes = allow_writes
-        self._is_locked = is_locked
-        self._reset_cache()
-        self.has_graph = True
-
-    def add_records(self, records, random_id=False, missing_compression_parents=False):
-        """Add multiple records to the index.
-
-        :param records: a list of tuples:
-                         (key, options, access_memo, parents).
-        :param random_id: If True the ids being added were randomly generated
-            and no check for existence will be performed.
-        :param missing_compression_parents: If True the records being added are
-            only compressed against texts already in the index (or inside
-            records). If False the records all refer to unavailable texts (or
-            texts inside records) as compression parents.
-        """
-        if missing_compression_parents:
-            # It might be nice to get the edge of the records. But keys isn't
-            # _wrong_.
-            keys = sorted(record[0] for record in records)
-            raise RevisionNotPresent(keys, self)
-        paths = {}
-        for record in records:
-            key = record[0]
-            prefix = key[:-1]
-            path = self._mapper.map(key) + ".kndx"
-            path_keys = paths.setdefault(path, (prefix, []))
-            path_keys[1].append(record)
-        for path in sorted(paths):
-            prefix, path_keys = paths[path]
-            self._load_prefixes([prefix])
-            lines = []
-            orig_history = self._kndx_cache[prefix][1][:]
-            orig_cache = self._kndx_cache[prefix][0].copy()
-
-            try:
-                for key, options, (_, pos, size), parents in path_keys:
-                    if not all(isinstance(option, bytes) for option in options):
-                        raise TypeError(options)
-                    if parents is None:
-                        # kndx indices cannot be parentless.
-                        parents = ()
-                    line = b" ".join(
-                        [
-                            b"\n" + key[-1],
-                            b",".join(options),
-                            b"%d" % pos,
-                            b"%d" % size,
-                            self._dictionary_compress(parents),
-                            b":",
-                        ]
-                    )
-                    if not isinstance(line, bytes):
-                        raise AssertionError(f"data must be utf8 was {type(line)}")
-                    lines.append(line)
-                    self._cache_key(key, options, pos, size, parents)
-                if len(orig_history):
-                    self._transport.append_bytes(path, b"".join(lines))
-                else:
-                    self._init_index(path, lines)
-            except:
-                # If any problems happen, restore the original values and re-raise
-                self._kndx_cache[prefix] = (orig_cache, orig_history)
-                raise
-
-    def scan_unvalidated_index(self, graph_index):
-        """See _KnitGraphIndex.scan_unvalidated_index."""
-        # Because kndx files do not support atomic insertion via separate index
-        # files, they do not support this method.
-        raise NotImplementedError(self.scan_unvalidated_index)
-
-    def get_missing_compression_parents(self):
-        """See _KnitGraphIndex.get_missing_compression_parents."""
-        # Because kndx files do not support atomic insertion via separate index
-        # files, they do not support this method.
-        raise NotImplementedError(self.get_missing_compression_parents)
-
-    def _cache_key(self, key, options, pos, size, parent_keys):
-        """Cache a version record in the history array and index cache."""
-        prefix = key[:-1]
-        version_id = key[-1]
-        # last-element only for compatibilty with the C load_data.
-        parents = tuple(parent[-1] for parent in parent_keys)
-        for parent in parent_keys:
-            if parent[:-1] != prefix:
-                raise ValueError(f"mismatched prefixes for {key!r}, {parent_keys!r}")
-        cache, history = self._kndx_cache[prefix]
-        # only want the _history index to reference the 1st index entry
-        # for version_id
-        if version_id not in cache:
-            index = len(history)
-            history.append(version_id)
-        else:
-            index = cache[version_id][5]
-        cache[version_id] = (version_id, options, pos, size, parents, index)
-
-    def check_header(self, fp):
-        line = fp.readline()
-        if line == b"":
-            # An empty file can actually be treated as though the file doesn't
-            # exist yet.
-            raise NoSuchFile(self)
-        if line != self.HEADER:
-            raise KnitHeaderError(badline=line, filename=self)
-
-    def _check_read(self):
-        if not self._is_locked():
-            raise ObjectNotLocked(self)
-        if self._get_scope() != self._scope:
-            self._reset_cache()
-
-    def _check_write_ok(self):
-        """Assert if not writes are permitted."""
-        if not self._is_locked():
-            raise ObjectNotLocked(self)
-        if self._get_scope() != self._scope:
-            self._reset_cache()
-        if self._mode != "w":
-            raise ReadOnlyObjectDirtiedError(self)
-
-    def get_build_details(self, keys):
-        """Get the method, index_memo and compression parent for keys.
-
-        Ghosts are omitted from the result.
-
-        :param keys: An iterable of keys.
-        :return: A dict of key:(index_memo, compression_parent, parents,
-            record_details).
-            index_memo
-                opaque structure to pass to read_records to extract the raw
-                data
-            compression_parent
-                Content that this record is built upon, may be None
-            parents
-                Logical parents of this node
-            record_details
-                extra information about the content which needs to be passed to
-                Factory.parse_record
-        """
-        parent_map = self.get_parent_map(keys)
-        result = {}
-        for key in keys:
-            if key not in parent_map:
-                continue  # Ghost
-            prefix, suffix = self._split_key(key)
-            entry = self._kndx_cache[prefix][0][suffix]
-            options = entry[1]
-            try:
-                method, noeol = _knit_rs.decode_kndx_options_rs(options)
-            except ValueError as e:
-                raise KnitIndexUnknownMethod(self, options) from e
-            parents = parent_map[key]
-            compression_parent = None if method == "fulltext" else parents[0]
-            index_memo = (key, entry[2], entry[3])
-            result[key] = (index_memo, compression_parent, parents, (method, noeol))
-        return result
-
-    def get_method(self, key):
-        """Return compression method of specified key."""
-        options = self.get_options(key)
-        try:
-            method, _noeol = _knit_rs.decode_kndx_options_rs(options)
-        except ValueError as e:
-            raise KnitIndexUnknownMethod(self, options) from e
-        return method
-
-    def get_options(self, key):
-        """Return a list representing options.
-
-        e.g. ['foo', 'bar']
-        """
-        prefix, suffix = self._split_key(key)
-        self._load_prefixes([prefix])
-        try:
-            return self._kndx_cache[prefix][0][suffix][1]
-        except KeyError as e:
-            raise RevisionNotPresent(key, self) from e
-
-    def find_ancestry(self, keys):
-        """See CombinedGraphIndex.find_ancestry()."""
-        prefixes = {key[:-1] for key in keys}
-        self._load_prefixes(prefixes)
-        parent_map = {}
-        missing_keys = set()
-        pending_keys = list(keys)
-        # This assumes that keys will not reference parents in a different
-        # prefix, which is accurate so far.
-        while pending_keys:
-            key = pending_keys.pop()
-            if key in parent_map:
-                continue
-            prefix = key[:-1]
-            try:
-                suffix_parents = self._kndx_cache[prefix][0][key[-1]][4]
-            except KeyError:
-                missing_keys.add(key)
-            else:
-                parent_keys = tuple([prefix + (suffix,) for suffix in suffix_parents])
-                parent_map[key] = parent_keys
-                pending_keys.extend([p for p in parent_keys if p not in parent_map])
-        return parent_map, missing_keys
-
-    def get_parent_map(self, keys):
-        """Get a map of the parents of keys.
-
-        :param keys: The keys to look up parents for.
-        :return: A mapping from keys to parents. Absent keys are absent from
-            the mapping.
-        """
-        # Parse what we need to up front, this potentially trades off I/O
-        # locality (.kndx and .knit in the same block group for the same file
-        # id) for less checking in inner loops.
-        prefixes = {key[:-1] for key in keys}
-        self._load_prefixes(prefixes)
-        result = {}
-        for key in keys:
-            prefix = key[:-1]
-            try:
-                suffix_parents = self._kndx_cache[prefix][0][key[-1]][4]
-            except KeyError:
-                pass
-            else:
-                result[key] = tuple(prefix + (suffix,) for suffix in suffix_parents)
-        return result
-
-    def get_position(self, key):
-        """Return details needed to access the version.
-
-        :return: a tuple (key, data position, size) to hand to the access
-            logic to get the record.
-        """
-        prefix, suffix = self._split_key(key)
-        self._load_prefixes([prefix])
-        entry = self._kndx_cache[prefix][0][suffix]
-        return key, entry[2], entry[3]
-
-    __contains__ = _mod_index._has_key_from_parent_map
-
-    def _init_index(self, path, extra_lines=None):
-        """Initialize an index."""
-        if extra_lines is None:
-            extra_lines = []
-        sio = BytesIO()
-        sio.write(self.HEADER)
-        sio.writelines(extra_lines)
-        sio.seek(0)
-        self._transport.put_file_non_atomic(path, sio, create_parent_dir=True)
-        # self._create_parent_dir)
-        # mode=self._file_mode,
-        # dir_mode=self._dir_mode)
-
-    def keys(self):
-        """Get all the keys in the collection.
-
-        The keys are not ordered.
-        """
-        result = set()
-        # Identify all key prefixes.
-        # XXX: A bit hacky, needs polish.
-        if isinstance(self._mapper, ConstantMapper):
-            prefixes = [()]
-        else:
-            relpaths = set()
-            for quoted_relpath in self._transport.iter_files_recursive():
-                path, _ext = os.path.splitext(quoted_relpath)
-                relpaths.add(path)
-            prefixes = [self._mapper.unmap(path) for path in relpaths]
-        self._load_prefixes(prefixes)
-        for prefix in prefixes:
-            for suffix in self._kndx_cache[prefix][1]:
-                result.add(prefix + (suffix,))
-        return result
-
-    def _load_prefixes(self, prefixes):
-        """Load the indices for prefixes."""
-        self._check_read()
-        for prefix in prefixes:
-            if prefix not in self._kndx_cache:
-                # the load_data interface writes to these variables.
-                self._cache = {}
-                self._history = []
-                self._filename = prefix
-                try:
-                    path = self._mapper.map(prefix) + ".kndx"
-                    with self._transport.get(path) as fp:
-                        # _load_data may raise NoSuchFile if the target knit is
-                        # completely empty.
-                        _load_data(self, fp)
-                    self._kndx_cache[prefix] = (self._cache, self._history)
-                    del self._cache
-                    del self._filename
-                    del self._history
-                except TransportNoSuchFile:
-                    self._kndx_cache[prefix] = ({}, [])
-                    if isinstance(self._mapper, ConstantMapper):
-                        # preserve behaviour for revisions.kndx etc.
-                        self._init_index(path)
-                    del self._cache
-                    del self._filename
-                    del self._history
-
-    missing_keys = _mod_index._missing_keys_from_parent_map
-
-    def _partition_keys(self, keys):
-        """Turn keys into a dict of prefix:suffix_list."""
-        result = {}
-        for key in keys:
-            prefix_keys = result.setdefault(key[:-1], [])
-            prefix_keys.append(key[-1])
-        return result
-
-    def _dictionary_compress(self, keys):
-        """Dictionary compress keys.
-
-        :param keys: The keys to generate references to.
-        :return: A string representation of keys. keys which are present are
-            dictionary compressed, and others are emitted as fulltext with a
-            '.' prefix.
-        """
-        if not keys:
-            return b""
-        prefix = keys[0][:-1]
-        suffixes = []
-        for key in keys:
-            if key[:-1] != prefix:
-                raise ValueError(f"mismatched prefixes for {keys!r}")
-            suffixes.append(key[-1])
-        return _knit_rs.dictionary_compress_rs(suffixes, self._kndx_cache[prefix][0])
-
-    def _reset_cache(self):
-        # Possibly this should be a LRU cache. A dictionary from key_prefix to
-        # (cache_dict, history_vector) for parsed kndx files.
-        self._kndx_cache = {}
-        self._scope = self._get_scope()
-        allow_writes = self._allow_writes()
-        if allow_writes:
-            self._mode = "w"
-        else:
-            self._mode = "r"
-
-    def _sort_keys_by_io(self, keys, positions):
-        """Figure out an optimal order to read the records for the given keys.
-
-        Sort keys, grouped by index and sorted by position.
-
-        :param keys: A list of keys whose records we want to read. This will be
-            sorted 'in-place'.
-        :param positions: A dict, such as the one returned by
-            _get_components_positions()
-        :return: None
-        """
-
-        def get_sort_key(key):
-            index_memo = positions[key][1]
-            # Group by prefix and position. index_memo[0] is the key, so it is
-            # (file_id, revision_id) and we don't want to sort on revision_id,
-            # index_memo[1] is the position, and index_memo[2] is the size,
-            # which doesn't matter for the sort
-            return index_memo[0][:-1], index_memo[1]
-
-        return keys.sort(key=get_sort_key)
-
-    _get_total_build_size = _get_total_build_size
-
-    def _split_key(self, key):
-        """Split key into a prefix and suffix."""
-        # GZ 2018-07-03: This is intentionally either a sequence or bytes?
-        if isinstance(key, bytes):
-            return key[:-1], key[-1:]
-        return key[:-1], key[-1]
-
-
 def as_tuples(obj):
-    """Ensure that the object and any referenced objects are plain tuples.
-
-    :param obj: a list or a tuple
-    :return: a plain tuple instance, with all children also being tuples.
-    """
+    """Ensure that the object and any referenced objects are plain tuples."""
     result = []
     for item in obj:
         if isinstance(item, (tuple, list)):
@@ -3067,8 +2260,8 @@ def as_tuples(obj):
     return tuple(result)
 
 
-class _KnitGraphIndex:
-    """A KnitVersionedFiles index layered on GraphIndex."""
+class _KnitGraphIndexPy:
+    """Pure-Python fallback for _KnitGraphIndex (unused; kept for reference)."""
 
     def __init__(
         self,
@@ -3393,102 +2586,6 @@ class _KnitGraphIndex:
     _get_total_build_size = _get_total_build_size
 
 
-class _KnitKeyAccess:
-    """Access to records in .knit files."""
-
-    def __init__(self, transport, mapper):
-        """Create a _KnitKeyAccess with transport and mapper.
-
-        :param transport: The transport the access object is rooted at.
-        :param mapper: The mapper used to map keys to .knit files.
-        """
-        self._transport = transport
-        self._mapper = mapper
-
-    def add_raw_record(self, key, size, raw_data):
-        """Add raw knit bytes to a storage area.
-
-        The data is spooled to the container writer in one bytes-record per
-        raw data item.
-
-        :param key: The key of the raw data segment
-        :param size: The size of the raw data segment
-        :param raw_data: A chunked bytestring containing the data.
-        :return: opaque index memo to retrieve the record later.
-            For _KnitKeyAccess the memo is (key, pos, length), where the key is
-            the record key.
-        """
-        path = self._mapper.map(key)
-        try:
-            base = self._transport.append_bytes(path + ".knit", b"".join(raw_data))
-        except TransportNoSuchFile:
-            self._transport.mkdir(osutils.dirname(path))
-            base = self._transport.append_bytes(path + ".knit", b"".join(raw_data))
-        # if base == 0:
-        # chmod.
-        return (key, base, size)
-
-    def add_raw_records(self, key_sizes, raw_data):
-        """Add raw knit bytes to a storage area.
-
-        The data is spooled to the container writer in one bytes-record per
-        raw data item.
-
-        :param sizes: An iterable of tuples containing the key and size of each
-            raw data segment.
-        :param raw_data: A chunked bytestring containing the data.
-        :return: A list of memos to retrieve the record later. Each memo is an
-            opaque index memo. For _KnitKeyAccess the memo is (key, pos,
-            length), where the key is the record key.
-        """
-        raw_data = b"".join(raw_data)
-        if not isinstance(raw_data, bytes):
-            raise AssertionError(f"data must be plain bytes was {type(raw_data)}")
-        result = []
-        offset = 0
-        # TODO: This can be tuned for writing to sftp and other servers where
-        # append() is relatively expensive by grouping the writes to each key
-        # prefix.
-        for key, size in key_sizes:
-            record_bytes = [raw_data[offset : offset + size]]
-            result.append(self.add_raw_record(key, size, record_bytes))
-            offset += size
-        return result
-
-    def flush(self):
-        """Flush pending writes on this access object.
-
-        For .knit files this is a no-op.
-        """
-        pass
-
-    def get_raw_records(self, memos_for_retrieval):
-        """Get the raw bytes for a records.
-
-        :param memos_for_retrieval: An iterable containing the access memo for
-            retrieving the bytes.
-        :return: An iterator over the bytes of the records.
-        """
-        # first pass, group into same-index request to minimise readv's issued.
-        request_lists = []
-        current_prefix = None
-        for key, offset, length in memos_for_retrieval:
-            if current_prefix == key[:-1]:
-                current_list.append((offset, length))
-            else:
-                if current_prefix is not None:
-                    request_lists.append((current_prefix, current_list))
-                current_prefix = key[:-1]
-                current_list = [(offset, length)]
-        # handle the last entry
-        if current_prefix is not None:
-            request_lists.append((current_prefix, current_list))
-        for prefix, read_vector in request_lists:
-            path = self._mapper.map(prefix) + ".knit"
-            for _pos, data in self._transport.readv(path, read_vector):
-                yield data
-
-
 def annotate_knit(knit, revision_id):
     """Annotate a knit with no cached annotations.
 
@@ -3787,4 +2884,3 @@ class _KnitAnnotator(VersionedFileAnnotator):
 
 
 from ._bzr_rs import knit as _knit_rs
-from ._bzr_rs.knit import _load_data
