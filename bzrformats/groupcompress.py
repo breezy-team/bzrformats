@@ -1080,7 +1080,9 @@ class _GCGraphIndex:
         return self._key_dependencies
 
     def add_missing_compression_parent(self, key):
-        raise NotImplementedError("_GCGraphIndex does not track missing compression parents")
+        raise NotImplementedError(
+            "_GCGraphIndex does not track missing compression parents"
+        )
 
     def add_records(self, records, random_id=False):
         """Add multiple records to the index.

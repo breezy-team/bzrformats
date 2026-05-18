@@ -54,8 +54,6 @@ in the deltas to provide line annotation
 import contextlib
 import logging
 import operator
-import os
-from io import BytesIO
 
 from vcsgraph import tsort
 
@@ -67,18 +65,14 @@ from .annotate import VersionedFileAnnotator
 from .errors import (
     BzrFormatsError,
     InvalidRevisionId,
-    NoSuchFile,
     ObjectNotLocked,
     ReadOnlyError,
-    ReadOnlyObjectDirtiedError,
     RevisionAlreadyPresent,
     RevisionNotPresent,
 )
 from .osutils import contains_whitespace, sha_string, sha_strings
-from .transport import TransportNoSuchFile
 from .versionedfile import (
     AbsentContentFactory,
-    ConstantMapper,
     ContentFactory,
     ExistingContent,
     UnavailableRepresentation,
@@ -661,7 +655,7 @@ class KnitContent:
         yield from _knit_rs.get_line_delta_blocks_rs(knit_delta, source, target)
 
 
-from ._bzr_rs.knit import (  # noqa: E402
+from ._bzr_rs.knit import (
     AnnotatedKnitContent,
     KnitAnnotateFactory,
     KnitPlainFactory,
@@ -670,7 +664,7 @@ from ._bzr_rs.knit import (  # noqa: E402
     _KnitGraphIndex,
     _KnitKeyAccess,
 )
-from ._bzr_rs.knit import KnitVersionedFiles as _KnitVersionedFilesRs  # noqa: E402
+from ._bzr_rs.knit import KnitVersionedFiles as _KnitVersionedFilesRs
 
 
 class KnitVersionedFiles(_KnitVersionedFilesRs, VersionedFilesWithFallbacks):
@@ -2890,4 +2884,3 @@ class _KnitAnnotator(VersionedFileAnnotator):
 
 
 from ._bzr_rs import knit as _knit_rs
-from ._bzr_rs.knit import _load_data
