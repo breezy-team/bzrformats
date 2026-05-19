@@ -1,5 +1,5 @@
 use memchr::memchr;
-use rand::Rng;
+use rand::RngExt;
 use std::borrow::Cow;
 
 pub fn is_well_formed_line(line: &[u8]) -> bool {
