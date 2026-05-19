@@ -6,7 +6,7 @@ use std::path::Path;
 const BUFSIZE: usize = 128 << 10;
 
 /// Encode bytes as a lowercase hex string.
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         s.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
