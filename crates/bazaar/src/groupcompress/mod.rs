@@ -36,5 +36,12 @@ pub mod wire;
 use sha1::{Digest as _, Sha1};
 
 lazy_static::lazy_static! {
-    pub static ref NULL_SHA1: Vec<u8> = format!("{:x}", Sha1::new().finalize()).as_bytes().to_vec();
+    pub static ref NULL_SHA1: Vec<u8> = {
+        let mut hex = Vec::with_capacity(40);
+        for byte in Sha1::new().finalize() {
+            hex.push(b"0123456789abcdef"[(byte >> 4) as usize]);
+            hex.push(b"0123456789abcdef"[(byte & 0x0f) as usize]);
+        }
+        hex
+    };
 }

@@ -3,15 +3,33 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+const BUFSIZE: usize = 128 << 10;
+
+/// Encode bytes as a lowercase hex string.
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        s.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+    }
+    s
+}
+
 pub fn sha_file(f: &mut dyn Read) -> Result<String, std::io::Error> {
     let mut s = Sha1::new();
-    std::io::copy(f, &mut s)?;
-    Ok(format!("{:x}", s.finalize()))
+    let mut buffer = [0; BUFSIZE];
+    loop {
+        let bytes_read = f.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        s.update(&buffer[..bytes_read]);
+    }
+    Ok(to_hex(&s.finalize()))
 }
 
 pub fn size_sha_file(f: &mut dyn Read) -> Result<(usize, String), std::io::Error> {
     let mut s = Sha1::new();
-    const BUFSIZE: usize = 128 << 10;
     let mut buffer = [0; BUFSIZE];
     let mut size: usize = 0;
     loop {
@@ -22,7 +40,7 @@ pub fn size_sha_file(f: &mut dyn Read) -> Result<(usize, String), std::io::Error
         s.update(&buffer[..bytes_read]);
         size += bytes_read;
     }
-    Ok((size, format!("{:x}", s.finalize())))
+    Ok((size, to_hex(&s.finalize())))
 }
 
 pub fn size_sha_chunks(chunks: impl Iterator<Item = Vec<u8>>) -> (usize, String) {
@@ -32,7 +50,7 @@ pub fn size_sha_chunks(chunks: impl Iterator<Item = Vec<u8>>) -> (usize, String)
         s.update(&chunk);
         size += chunk.len();
     }
-    (size, format!("{:x}", s.finalize()))
+    (size, to_hex(&s.finalize()))
 }
 
 pub fn sha_file_by_name<P: AsRef<Path>>(path: P) -> Result<String, std::io::Error> {
@@ -49,12 +67,12 @@ where
     for string in strings {
         s.update(string.as_ref());
     }
-    format!("{:x}", s.finalize())
+    to_hex(&s.finalize())
 }
 
 pub fn sha_string(string: &[u8]) -> String {
     let mut s = Sha1::new();
     s.update(string);
 
-    format!("{:x}", s.finalize())
+    to_hex(&s.finalize())
 }
