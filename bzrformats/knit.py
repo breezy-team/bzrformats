@@ -663,6 +663,7 @@ from ._bzr_rs.knit import (
     _KndxIndex,
     _KnitGraphIndex,
     _KnitKeyAccess,
+    _load_data,  # noqa: F401  re-exported for breezy's test suite
 )
 from ._bzr_rs.knit import KnitVersionedFiles as _KnitVersionedFilesRs
 

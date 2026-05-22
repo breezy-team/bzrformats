@@ -94,8 +94,11 @@ version = "3.4.3"
 dependencies = [
  "bazaar",
  "chrono",
+ "patiencediff",
  "pyo3",
  "pyo3-filelike",
+ "sha1",
+ "vcs-graph",
  "walkdir",
 ]
 
