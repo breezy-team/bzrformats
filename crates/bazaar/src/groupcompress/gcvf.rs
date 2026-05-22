@@ -207,6 +207,84 @@ pub fn as_requested_source_keys(
     })
 }
 
+/// Accumulates keys into a fetch batch, tracking the read-memos that batch
+/// touches and a running byte estimate.
+///
+/// Ports the state that `_BatchingBlockFetcher.add_key` maintains. The
+/// block cache is a Python `LRUSizeCache`, so the cache lookup is passed in
+/// as a predicate; the actual fetch happens later in the pyo3 layer using
+/// [`Self::memos_to_get`].
+#[derive(Debug, Default)]
+pub struct BatchAccumulator<F: FileRef = String> {
+    keys: Vec<GcKey>,
+    /// Read-memos seen in this batch, in first-seen order.
+    batch_memos: Vec<ReadMemo<F>>,
+    /// Read-memos in this batch that were not cached and must be fetched.
+    memos_to_get: Vec<ReadMemo<F>>,
+    total_bytes: u64,
+}
+
+impl<F: FileRef> BatchAccumulator<F> {
+    pub fn new() -> Self {
+        BatchAccumulator {
+            keys: Vec::new(),
+            batch_memos: Vec::new(),
+            memos_to_get: Vec::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// Add a key to the current batch and return the running byte estimate.
+    ///
+    /// `read_memo` is the key's block memo (`index_memo[0:3]`). `is_cached`
+    /// reports whether that block is already in the Python block cache.
+    /// Mirrors `_BatchingBlockFetcher.add_key`: a memo already in the batch
+    /// is not re-counted; a new uncached memo is queued for fetch and its
+    /// `stop` offset is added to the estimate (Python adds `read_memo[2]`,
+    /// the absolute stop, not the byte length — preserved here so the
+    /// `BATCH_SIZE` threshold behaves identically).
+    pub fn add_key(
+        &mut self,
+        key: GcKey,
+        read_memo: ReadMemo<F>,
+        is_cached: impl Fn(&ReadMemo<F>) -> bool,
+    ) -> u64 {
+        self.keys.push(key);
+        if self.batch_memos.contains(&read_memo) {
+            return self.total_bytes;
+        }
+        if !is_cached(&read_memo) {
+            self.total_bytes += read_memo.stop;
+            self.memos_to_get.push(read_memo.clone());
+        }
+        self.batch_memos.push(read_memo);
+        self.total_bytes
+    }
+
+    /// Keys added to this batch, in insertion order.
+    pub fn keys(&self) -> &[GcKey] {
+        &self.keys
+    }
+
+    /// Uncached read-memos this batch must fetch, in first-seen order.
+    pub fn memos_to_get(&self) -> &[ReadMemo<F>] {
+        &self.memos_to_get
+    }
+
+    /// Running byte estimate for the batch.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Clear all batch state, ready for the next batch.
+    pub fn reset(&mut self) {
+        self.keys.clear();
+        self.batch_memos.clear();
+        self.memos_to_get.clear();
+        self.total_bytes = 0;
+    }
+}
+
 /// Order keys for I/O efficiency: in-memory (unadded) keys first, then
 /// located keys grouped by the block they live in, then fallback runs.
 ///
@@ -381,5 +459,56 @@ mod tests {
                 (Source::Fallback(0), vec![f]),
             ]
         );
+    }
+
+    #[test]
+    fn batch_accumulator_queues_uncached_memos_and_counts_stop() {
+        let mut acc: BatchAccumulator<String> = BatchAccumulator::new();
+        // Two keys in distinct uncached blocks.
+        let t1 = acc.add_key(gckey(b"k1"), ReadMemo::new("g1".into(), 0, 30), |_| false);
+        assert_eq!(t1, 30); // running estimate adds `stop`
+        let t2 = acc.add_key(gckey(b"k2"), ReadMemo::new("g2".into(), 0, 50), |_| false);
+        assert_eq!(t2, 80);
+        assert_eq!(acc.keys(), &[gckey(b"k1"), gckey(b"k2")]);
+        assert_eq!(
+            acc.memos_to_get(),
+            &[
+                ReadMemo::new("g1".into(), 0, 30),
+                ReadMemo::new("g2".into(), 0, 50),
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_accumulator_does_not_recount_repeated_memo() {
+        let mut acc: BatchAccumulator<String> = BatchAccumulator::new();
+        let block = ReadMemo::new("g1".to_string(), 0, 30);
+        acc.add_key(gckey(b"k1"), block.clone(), |_| false);
+        // A second key in the same block adds the key but not the bytes.
+        let total = acc.add_key(gckey(b"k2"), block.clone(), |_| false);
+        assert_eq!(total, 30);
+        assert_eq!(acc.keys().len(), 2);
+        assert_eq!(acc.memos_to_get(), &[block]);
+    }
+
+    #[test]
+    fn batch_accumulator_skips_fetch_for_cached_memo() {
+        let mut acc: BatchAccumulator<String> = BatchAccumulator::new();
+        let block = ReadMemo::new("g1".to_string(), 0, 30);
+        // Cached blocks are not queued and not counted.
+        let total = acc.add_key(gckey(b"k1"), block, |_| true);
+        assert_eq!(total, 0);
+        assert!(acc.memos_to_get().is_empty());
+        assert_eq!(acc.keys().len(), 1);
+    }
+
+    #[test]
+    fn batch_accumulator_reset_clears_state() {
+        let mut acc: BatchAccumulator<String> = BatchAccumulator::new();
+        acc.add_key(gckey(b"k1"), ReadMemo::new("g1".into(), 0, 30), |_| false);
+        acc.reset();
+        assert!(acc.keys().is_empty());
+        assert!(acc.memos_to_get().is_empty());
+        assert_eq!(acc.total_bytes(), 0);
     }
 }
