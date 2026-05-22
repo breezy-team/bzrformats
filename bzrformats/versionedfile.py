@@ -1304,15 +1304,11 @@ class VersionedFiles:
 
     def _check_lines_not_unicode(self, lines):
         """Check that lines being added to a versioned file are not unicode."""
-        for line in lines:
-            if line.__class__ is not bytes:
-                raise TypeError("lines")
+        _versionedfile_rs.check_lines_not_unicode(lines)
 
     def _check_lines_are_lines(self, lines):
         """Check that the lines really are full lines without inline EOL."""
-        for line in lines:
-            if b"\n" in line[:-1]:
-                raise ValueError("lines contain newlines")
+        _versionedfile_rs.check_lines_are_lines(lines)
 
     def get_known_graph_ancestry(self, keys):
         """Get a KnownGraph instance with the ancestry of keys."""

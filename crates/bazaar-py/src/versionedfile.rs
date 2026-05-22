@@ -234,6 +234,33 @@ fn fulltext_network_to_record<'a>(
     vec![Bound::new(py, sub).unwrap()]
 }
 
+/// Raise `TypeError` if any line being added to a versioned file is not
+/// `bytes`. Mirrors `VersionedFiles._check_lines_not_unicode`; the check is
+/// inherently a Python type test, so it stays at the marshalling boundary
+/// rather than in the pure crate.
+#[pyfunction]
+fn check_lines_not_unicode(lines: &Bound<'_, PyAny>) -> PyResult<()> {
+    for line in lines.try_iter()? {
+        if !line?.is_instance_of::<PyBytes>() {
+            return Err(pyo3::exceptions::PyTypeError::new_err("lines"));
+        }
+    }
+    Ok(())
+}
+
+/// Raise `ValueError` if any line carries an embedded newline (a newline
+/// anywhere but its final byte). Mirrors `VersionedFiles._check_lines_are_lines`.
+#[pyfunction]
+fn check_lines_are_lines(lines: Vec<Vec<u8>>) -> PyResult<()> {
+    if bazaar::versionedfile::check_lines_are_lines(&lines) {
+        Ok(())
+    } else {
+        Err(pyo3::exceptions::PyValueError::new_err(
+            "lines contain newlines",
+        ))
+    }
+}
+
 /// First pass of `_MPDiffGenerator._find_needed_keys`: from `ordered_keys` plus
 /// the parent map for those keys, derive:
 ///
@@ -505,5 +532,7 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(hash_escaped_prefix_unmap, &m)?)?;
     m.add_function(wrap_pyfunction!(mpdiff_first_pass, &m)?)?;
     m.add_function(wrap_pyfunction!(mpdiff_collect_parent_chunks, &m)?)?;
+    m.add_function(wrap_pyfunction!(check_lines_not_unicode, &m)?)?;
+    m.add_function(wrap_pyfunction!(check_lines_are_lines, &m)?)?;
     Ok(m)
 }
