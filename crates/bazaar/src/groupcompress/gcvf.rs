@@ -823,6 +823,124 @@ where
         self.index.add_records(&records, random_id)?;
         Ok(())
     }
+
+    /// Add one text given as a list of lines.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles.add_lines` / `add_content`:
+    /// wraps the lines in a content factory and inserts it. Returns the
+    /// text's `(sha1, length)`.
+    pub fn add_lines(
+        &self,
+        key: GcKey,
+        parents: Option<Vec<GcKey>>,
+        lines: Vec<Vec<u8>>,
+    ) -> Result<(Vec<u8>, usize), crate::knit::KnitError> {
+        // _check_add: a version id with embedded whitespace is rejected.
+        let version_id = key.version_id();
+        if version_id
+            .iter()
+            .any(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+        {
+            return Err(crate::knit::KnitError::Corrupt(format!(
+                "invalid revision id: {:?}",
+                version_id
+            )));
+        }
+        let sha1 = crate::weave::sha_strings(&lines);
+        let factory: Box<dyn crate::versionedfile::ContentFactory> = Box::new(
+            crate::versionedfile::ChunkedContentFactory::new(Some(sha1), key, parents, lines),
+        );
+        let mut inserted = self.insert_record_stream(std::iter::once(factory), false)?;
+        inserted
+            .pop()
+            .ok_or_else(|| crate::knit::KnitError::Corrupt("add_lines inserted nothing".into()))
+    }
+
+    /// SHA-1 of every requested key; absent keys are omitted.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles.get_sha1s`.
+    pub fn get_sha1s(
+        &self,
+        keys: &[GcKey],
+    ) -> Result<std::collections::HashMap<GcKey, Vec<u8>>, crate::knit::KnitError> {
+        use crate::versionedfile::ContentFactory;
+        let mut out = std::collections::HashMap::new();
+        for record in self.get_record_stream(keys, "unordered")? {
+            if record.storage_kind() == "absent" {
+                continue;
+            }
+            let digest = match record.sha1() {
+                Some(s) => s,
+                None => {
+                    let chunks: Vec<Vec<u8>> = record.to_chunks().map(|c| c.into_owned()).collect();
+                    crate::weave::sha_strings(&chunks)
+                }
+            };
+            out.insert(record.key(), digest);
+        }
+        Ok(out)
+    }
+
+    /// Keys of missing compression parents.
+    ///
+    /// Mirrors `get_missing_compression_parent_keys`: groupcompress cannot
+    /// reference texts outside the group, so this is always empty.
+    pub fn get_missing_compression_parent_keys(&self) -> Vec<GcKey> {
+        Vec::new()
+    }
+
+    /// Drop the decoded-block cache.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles.clear_cache`.
+    pub fn clear_cache(&self) {
+        self.block_cache.borrow_mut().clear();
+    }
+
+    /// Walk the lines of every requested key.
+    ///
+    /// Mirrors `iter_lines_added_or_present_in_keys`: each key's text is
+    /// read and split into lines, returned as `(line, key)` pairs. A key
+    /// absent from every store is an error.
+    pub fn iter_lines_added_or_present_in_keys(
+        &self,
+        keys: &[GcKey],
+    ) -> Result<Vec<(Vec<u8>, GcKey)>, crate::knit::KnitError> {
+        use crate::versionedfile::ContentFactory;
+        let mut out = Vec::new();
+        for record in self.get_record_stream(keys, "unordered")? {
+            if record.storage_kind() == "absent" {
+                return Err(crate::knit::KnitError::RevisionNotPresent(record.key()));
+            }
+            let key = record.key();
+            let chunks: Vec<Vec<u8>> = record.to_chunks().map(|c| c.into_owned()).collect();
+            let lines =
+                crate::osutils::chunks_to_lines(chunks.into_iter().map(Ok::<_, std::io::Error>));
+            for line in lines {
+                out.push((
+                    line.map_err(|e| crate::knit::KnitError::Corrupt(e.to_string()))?
+                        .into_owned(),
+                    key.clone(),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Check the store reads back: every key's text is fetched and decoded.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles.check` with `keys=None`.
+    pub fn check(&self) -> Result<(), crate::knit::KnitError> {
+        use crate::versionedfile::ContentFactory;
+        let all_keys = self.keys()?;
+        for record in self.get_record_stream(&all_keys, "unordered")? {
+            if record.storage_kind() == "absent" {
+                return Err(crate::knit::KnitError::RevisionNotPresent(record.key()));
+            }
+            // Force decoding of the content.
+            let _ = record.to_fulltext();
+        }
+        Ok(())
+    }
 }
 
 /// Compress one record into `compressor`, mapping the result to plain
@@ -1450,5 +1568,41 @@ mod tests {
         assert_eq!(records[1].key(), key_b);
         assert_eq!(records[1].to_fulltext().as_ref(), text_b.as_slice());
         assert_eq!(records[1].parents(), Some(vec![key_a]));
+    }
+
+    #[test]
+    fn add_lines_then_get_sha1s_and_iter_lines() {
+        let store = std::rc::Rc::new(std::cell::RefCell::new(MemStore::default()));
+        let vf = GroupCompressVersionedFiles::new(
+            MemIndex(store.clone()),
+            MemAccess(store.clone()),
+            true,
+        );
+        let key = gckey(b"v1");
+        let lines = vec![b"alpha line\n".to_vec(), b"beta line\n".to_vec()];
+        let (sha1, length) = vf
+            .add_lines(key.clone(), Some(vec![]), lines.clone())
+            .unwrap();
+        assert_eq!(sha1, crate::weave::sha_strings(&lines));
+        assert_eq!(length, lines.iter().map(|l| l.len()).sum::<usize>());
+
+        // get_sha1s returns the same digest.
+        let sha1s = vf.get_sha1s(&[key.clone()]).unwrap();
+        assert_eq!(sha1s.get(&key), Some(&sha1));
+
+        // iter_lines yields each line paired with the key.
+        let iter_lines = vf
+            .iter_lines_added_or_present_in_keys(&[key.clone()])
+            .unwrap();
+        assert_eq!(
+            iter_lines,
+            vec![
+                (b"alpha line\n".to_vec(), key.clone()),
+                (b"beta line\n".to_vec(), key.clone()),
+            ]
+        );
+
+        // check passes over a sound store.
+        vf.check().unwrap();
     }
 }
