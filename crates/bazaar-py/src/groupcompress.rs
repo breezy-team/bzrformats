@@ -3032,6 +3032,80 @@ impl GroupCompressVersionedFiles {
         // the original generator.
         Ok(result.try_iter()?.into_any())
     }
+
+    /// Get a stream of records for `keys`.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles.get_record_stream`: drives
+    /// `_get_remaining_record_stream`, retrying on `RetryWithNewPacks`.
+    /// Returns the records as a list (the Python generator is consumed by
+    /// iteration anyway).
+    fn get_record_stream<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+        ordering: Bound<'py, PyAny>,
+        include_delta_closure: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let retry_cls = py
+            .import("bzrformats.pack_repo")?
+            .getattr("RetryWithNewPacks")?;
+        // keys might be a generator; materialise it once.
+        let orig_keys = PyList::empty(py);
+        for k in keys.try_iter()? {
+            orig_keys.append(k?)?;
+        }
+        let out = PyList::empty(py);
+        if orig_keys.is_empty() {
+            return Ok(out.try_iter()?.into_any());
+        }
+        let mut ordering: String = ordering.extract()?;
+        let has_graph: bool = slf
+            .borrow()
+            .index_obj
+            .bind(py)
+            .getattr("has_graph")?
+            .extract()?;
+        if !has_graph && (ordering == "topological" || ordering == "groupcompress") {
+            // No graph stored: a topological ordering is not possible.
+            ordering = "unordered".to_string();
+        }
+        // remaining_keys shrinks as records come back; on a retry only the
+        // still-missing keys are re-requested.
+        let remaining: Bound<'py, PySet> = PySet::empty(py)?;
+        for k in orig_keys.iter() {
+            remaining.add(k)?;
+        }
+        loop {
+            let request = PySet::empty(py)?;
+            for k in remaining.iter() {
+                request.add(k)?;
+            }
+            match Self::get_remaining_record_stream(
+                slf,
+                py,
+                &request,
+                &orig_keys,
+                &ordering,
+                include_delta_closure,
+            ) {
+                Ok(records) => {
+                    for record in records.iter() {
+                        remaining.discard(record.getattr("key")?)?;
+                        out.append(record)?;
+                    }
+                    return Ok(out.try_iter()?.into_any());
+                }
+                Err(e) if e.is_instance(py, &retry_cls) => {
+                    slf.borrow()
+                        .access_obj
+                        .bind(py)
+                        .call_method1("reload_or_raise", (e.value(py),))?;
+                    // Loop and retry with the still-remaining keys.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
 impl GroupCompressVersionedFiles {
@@ -3068,6 +3142,331 @@ impl GroupCompressVersionedFiles {
             }
         }
         Ok((result, source_results))
+    }
+
+    /// Find whatever `missing` keys the fallback stores can supply.
+    ///
+    /// Mirrors `_find_from_fallback`. Returns `(parent_map,
+    /// key_to_source_map, source_results)`; `missing` is mutated to drop
+    /// keys a fallback supplied. `key_to_source_map` maps a key to the
+    /// fallback object that has it.
+    fn find_from_fallback<'py>(
+        &self,
+        py: Python<'py>,
+        missing: &Bound<'py, PySet>,
+    ) -> PyResult<(Bound<'py, PyDict>, Bound<'py, PyDict>, Bound<'py, PyList>)> {
+        let parent_map = PyDict::new(py);
+        let key_to_source = PyDict::new(py);
+        let source_results = PyList::empty(py);
+        for fb in &self.immediate_fallback_vfs {
+            if missing.is_empty() {
+                break;
+            }
+            let source = fb.bind(py);
+            let source_parents = source
+                .call_method1("get_parent_map", (&*missing,))?
+                .cast_into::<PyDict>()?;
+            let found = PyList::empty(py);
+            for (k, v) in source_parents.iter() {
+                parent_map.set_item(&k, v)?;
+                key_to_source.set_item(&k, source)?;
+                found.append(&k)?;
+                missing.discard(k)?;
+            }
+            source_results.append(PyTuple::new(py, [source.as_any(), found.as_any()])?)?;
+        }
+        Ok((parent_map, key_to_source, source_results))
+    }
+
+    /// Group `present_keys` into `(source, [keys])` runs.
+    ///
+    /// `source_of` returns the Python source object for a key; consecutive
+    /// keys from the same source (compared by identity) merge into one run.
+    fn group_by_source<'py>(
+        py: Python<'py>,
+        present_keys: impl IntoIterator<Item = Bound<'py, PyAny>>,
+        source_of: impl Fn(&Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let runs = PyList::empty(py);
+        let mut current: Option<Bound<'py, PyAny>> = None;
+        for key in present_keys {
+            let source = source_of(&key)?;
+            let same = current.as_ref().is_some_and(|c| c.is(&source));
+            if !same {
+                runs.append(PyTuple::new(py, [&source, &PyList::empty(py).into_any()])?)?;
+                current = Some(source);
+            }
+            let last = runs.get_item(runs.len() - 1)?;
+            last.get_item(1)?.call_method1("append", (key,))?;
+        }
+        Ok(runs)
+    }
+
+    /// Topologically (or groupcompress-) order `parent_map`'s keys and group
+    /// them by source. Mirrors `_get_ordered_source_keys`.
+    fn ordered_source_keys<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        ordering: &str,
+        parent_map: &Bound<'py, PyDict>,
+        key_to_source: &Bound<'py, PyDict>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        // Marshal the parent map to the (key, parents) segment form the
+        // pure sorters use, remembering each key's Python object.
+        let mut raw: Vec<(Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>)> = Vec::new();
+        let mut key_obj: std::collections::HashMap<Vec<Vec<u8>>, Bound<'py, PyAny>> =
+            std::collections::HashMap::new();
+        for (k, v) in parent_map.iter() {
+            let segs: Vec<Vec<u8>> = k.extract()?;
+            let parents: Vec<Vec<Vec<u8>>> = v.extract()?;
+            key_obj.insert(segs.clone(), k);
+            raw.push((segs, parents));
+        }
+        let present: Vec<Vec<Vec<u8>>> = if ordering == "topological" {
+            let mut sorter = vcs_graph::tsort::TopoSorter::new(raw.into_iter());
+            sorter
+                .sorted()
+                .map_err(|e| PyValueError::new_err(format!("topo_sort: {e:?}")))?
+        } else {
+            bazaar::groupcompress::sort::sort_gc_optimal(raw)
+        };
+        let ordered = present
+            .into_iter()
+            .filter_map(|segs| key_obj.get(&segs).cloned());
+        Self::group_by_source(py, ordered, |key| match key_to_source.get_item(key)? {
+            Some(src) => Ok(src),
+            None => Ok(slf.clone().into_any()),
+        })
+    }
+
+    /// Keep `orig_keys` order, grouping by source, dropping absent keys.
+    /// Mirrors `_get_as_requested_source_keys`.
+    fn as_requested_source_keys<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        orig_keys: &Bound<'py, PyList>,
+        locations: &Bound<'py, PyDict>,
+        unadded: &Bound<'py, PySet>,
+        key_to_source: &Bound<'py, PyDict>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let mut present: Vec<Bound<'py, PyAny>> = Vec::new();
+        for key in orig_keys.iter() {
+            if locations.contains(&key)?
+                || unadded.contains(&key)?
+                || key_to_source.contains(&key)?
+            {
+                present.push(key);
+            }
+        }
+        Self::group_by_source(py, present, |key| {
+            if locations.contains(key)? || unadded.contains(key)? {
+                Ok(slf.clone().into_any())
+            } else {
+                match key_to_source.get_item(key)? {
+                    Some(src) => Ok(src),
+                    None => Ok(slf.clone().into_any()),
+                }
+            }
+        })
+    }
+
+    /// In-memory keys first, then located keys grouped by block, then
+    /// fallback runs. Mirrors `_get_io_ordered_source_keys`.
+    fn io_ordered_source_keys<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        locations: &Bound<'py, PyDict>,
+        unadded: &Bound<'py, PySet>,
+        source_result: &Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let present = PyList::empty(py);
+        for k in unadded.iter() {
+            present.append(k)?;
+        }
+        // Sort located keys by their block (index_memo's start/stop offsets)
+        // so keys in one block stay contiguous and blocks come out in file
+        // order. Python sorts by the whole index_memo; the index object is
+        // equal within a single index, so ordering falls to the offsets.
+        // The sort is stable, matching `sorted(locations, key=get_group)`.
+        let mut located: Vec<Bound<'py, PyAny>> = locations.keys().iter().collect();
+        located.sort_by(|a, b| {
+            let group = |k: &Bound<'py, PyAny>| -> (u64, u64) {
+                locations
+                    .get_item(k)
+                    .ok()
+                    .flatten()
+                    .and_then(|d| d.get_item(0).ok())
+                    .map(|im| {
+                        let start = im
+                            .get_item(1)
+                            .ok()
+                            .and_then(|v| v.extract::<u64>().ok())
+                            .unwrap_or(0);
+                        let stop = im
+                            .get_item(2)
+                            .ok()
+                            .and_then(|v| v.extract::<u64>().ok())
+                            .unwrap_or(0);
+                        (start, stop)
+                    })
+                    .unwrap_or((0, 0))
+            };
+            group(a).cmp(&group(b))
+        });
+        for k in located {
+            present.append(k)?;
+        }
+        let runs = PyList::empty(py);
+        runs.append(PyTuple::new(
+            py,
+            [slf.clone().into_any(), present.into_any()],
+        )?)?;
+        for sr in source_result.iter() {
+            runs.append(sr)?;
+        }
+        Ok(runs)
+    }
+
+    /// The non-retrying core of `get_record_stream`.
+    ///
+    /// Mirrors `_get_remaining_record_stream`: locate keys, find what
+    /// fallbacks can supply, order the keys per `ordering`, then walk the
+    /// `(source, keys)` runs — batching local keys through a
+    /// `_BatchingBlockFetcher`, extracting unadded keys from the compressor,
+    /// and delegating fallback runs. Returns the records as a list.
+    fn get_remaining_record_stream<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        keys: &Bound<'py, PySet>,
+        orig_keys: &Bound<'py, PyList>,
+        ordering: &str,
+        include_delta_closure: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let me = slf.borrow();
+        let index = me.index_obj.bind(py);
+        let unadded_refs = me.unadded_refs.bind(py).clone();
+        let out = PyList::empty(py);
+
+        let locations = index
+            .call_method1("get_build_details", (&*keys,))?
+            .cast_into::<PyDict>()?;
+        // unadded_keys = unadded_refs ∩ keys
+        let unadded_keys = PySet::empty(py)?;
+        for k in keys.iter() {
+            if unadded_refs.contains(&k)? {
+                unadded_keys.add(k)?;
+            }
+        }
+        // missing = keys − locations − unadded_keys
+        let missing = PySet::empty(py)?;
+        for k in keys.iter() {
+            if !locations.contains(&k)? && !unadded_keys.contains(&k)? {
+                missing.add(k)?;
+            }
+        }
+        let (fallback_parent_map, key_to_source, source_result) =
+            me.find_from_fallback(py, &missing)?;
+
+        let source_keys = if ordering == "topological" || ordering == "groupcompress" {
+            // parent_map = {key: details[2]} ∪ unadded ∪ fallback
+            let parent_map = PyDict::new(py);
+            for (k, details) in locations.iter() {
+                parent_map.set_item(k, details.get_item(2)?)?;
+            }
+            for k in unadded_keys.iter() {
+                parent_map.set_item(
+                    &k,
+                    unadded_refs
+                        .get_item(&k)?
+                        .ok_or_else(|| PyKeyError::new_err("unadded ref vanished"))?,
+                )?;
+            }
+            parent_map.update(fallback_parent_map.as_mapping())?;
+            Self::ordered_source_keys(slf, py, ordering, &parent_map, &key_to_source)?
+        } else if ordering == "as-requested" {
+            Self::as_requested_source_keys(
+                slf,
+                py,
+                orig_keys,
+                &locations,
+                &unadded_keys,
+                &key_to_source,
+            )?
+        } else {
+            Self::io_ordered_source_keys(slf, py, &locations, &unadded_keys, &source_result)?
+        };
+
+        let absent_cls = py
+            .import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("AbsentContentFactory")?;
+        for k in missing.iter() {
+            out.append(absent_cls.call1((k,))?)?;
+        }
+
+        let chunked_cls = py
+            .import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("ChunkedContentFactory")?;
+        let get_compressor_settings = slf.getattr("_get_compressor_settings")?;
+        let batcher = py.get_type::<BatchingBlockFetcher>().call1((
+            slf,
+            &locations,
+            get_compressor_settings,
+        ))?;
+
+        for entry in source_keys.iter() {
+            let source = entry.get_item(0)?;
+            let run_keys = entry.get_item(1)?;
+            if source.is(slf) {
+                for key in run_keys.try_iter()? {
+                    let key = key?;
+                    if unadded_refs.contains(&key)? {
+                        // Flush, then yield the unadded ref from the compressor.
+                        for r in batcher
+                            .call_method1("yield_factories", (true,))?
+                            .try_iter()?
+                        {
+                            out.append(r?)?;
+                        }
+                        let compressor = slf.getattr("_compressor")?;
+                        let extracted = compressor.call_method1("extract", (&key,))?;
+                        let chunks = extracted.get_item(0)?;
+                        let sha1 = extracted.get_item(1)?;
+                        let parents = unadded_refs
+                            .get_item(&key)?
+                            .ok_or_else(|| PyKeyError::new_err("unadded ref vanished"))?;
+                        out.append(chunked_cls.call1((&key, parents, sha1, chunks))?)?;
+                        continue;
+                    }
+                    let total: u64 = batcher.call_method1("add_key", (&key,))?.extract()?;
+                    if total > bazaar::groupcompress::gcvf::BATCH_SIZE {
+                        for r in batcher.call_method0("yield_factories")?.try_iter()? {
+                            out.append(r?)?;
+                        }
+                    }
+                }
+            } else {
+                for r in batcher
+                    .call_method1("yield_factories", (true,))?
+                    .try_iter()?
+                {
+                    out.append(r?)?;
+                }
+                let stream = source.call_method1(
+                    "get_record_stream",
+                    (run_keys, ordering, include_delta_closure),
+                )?;
+                for r in stream.try_iter()? {
+                    out.append(r?)?;
+                }
+            }
+        }
+        for r in batcher
+            .call_method1("yield_factories", (true,))?
+            .try_iter()?
+        {
+            out.append(r?)?;
+        }
+        Ok(out)
     }
 }
 
