@@ -421,6 +421,85 @@ impl bazaar::groupcompress::gcvf::GcAccess for PyGcAccess {
     }
 }
 
+/// `BlockCache` adapter that mirrors its contents into a Python
+/// `LRUSizeCache`.
+///
+/// The pure store reads / writes blocks through the trait; the Python
+/// cache is kept in lockstep so `vf._group_cache` (which Python callers
+/// can inspect for size or `clear()` behaviour) sees the same membership.
+/// Blocks are stored Rust-side as `Rc<RefCell<GroupCompressBlock>>` (the
+/// shape the pure trait expects); the Python side stores a sentinel value
+/// keyed by the read-memo tuple so its `len` matches.
+pub struct PyBlockCache {
+    rust: std::cell::RefCell<
+        std::collections::HashMap<
+            bazaar::groupcompress::gcvf::ReadMemo<GcFileRef>,
+            std::rc::Rc<std::cell::RefCell<bazaar::groupcompress::block::GroupCompressBlock>>,
+        >,
+    >,
+    /// The Python `LRUSizeCache` (or compatible dict-like) the pyclass
+    /// exposes as `_group_cache`.
+    py_cache: Py<PyAny>,
+}
+
+impl PyBlockCache {
+    pub fn new(py_cache: Py<PyAny>) -> Self {
+        PyBlockCache {
+            rust: std::cell::RefCell::new(std::collections::HashMap::new()),
+            py_cache,
+        }
+    }
+
+    /// The wrapped Python cache (`vf._group_cache`).
+    pub fn py_cache(&self, py: Python<'_>) -> Py<PyAny> {
+        self.py_cache.clone_ref(py)
+    }
+}
+
+impl bazaar::groupcompress::gcvf::BlockCache<GcFileRef> for PyBlockCache {
+    fn get(
+        &self,
+        memo: &bazaar::groupcompress::gcvf::ReadMemo<GcFileRef>,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<bazaar::groupcompress::block::GroupCompressBlock>>>
+    {
+        self.rust.borrow().get(memo).cloned()
+    }
+
+    fn insert(
+        &self,
+        memo: bazaar::groupcompress::gcvf::ReadMemo<GcFileRef>,
+        block: std::rc::Rc<std::cell::RefCell<bazaar::groupcompress::block::GroupCompressBlock>>,
+    ) {
+        Python::attach(|py| {
+            // Mirror into the Python cache so vf._group_cache reflects the
+            // same membership. The value is a sentinel: the real block lives
+            // in `self.rust`. LRUSizeCache.add takes (key, value, size).
+            let key = read_memo_to_py(py, &memo);
+            let size = memo.byte_length() as usize;
+            let _ = self
+                .py_cache
+                .bind(py)
+                .call_method1("add", (key, py.None(), size));
+        });
+        self.rust.borrow_mut().insert(memo, block);
+    }
+
+    fn contains(&self, memo: &bazaar::groupcompress::gcvf::ReadMemo<GcFileRef>) -> bool {
+        self.rust.borrow().contains_key(memo)
+    }
+
+    fn clear(&self) {
+        self.rust.borrow_mut().clear();
+        Python::attach(|py| {
+            let _ = self.py_cache.bind(py).call_method0("clear");
+        });
+    }
+
+    fn len(&self) -> usize {
+        self.rust.borrow().len()
+    }
+}
+
 fn extract_key_segments(obj: &Bound<PyAny>) -> PyResult<Vec<Vec<u8>>> {
     let tuple = obj.cast::<PyTuple>().map_err(|_| {
         PyValueError::new_err("sort_gc_optimal keys and parents must be tuples of bytes")
