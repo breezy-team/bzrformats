@@ -2505,6 +2505,26 @@ pub struct KnitRecordDetails {
     pub parents: Vec<KnitKey>,
 }
 
+/// Identifies which backing file (or shard) a record lives in.
+///
+/// For file-based backends this is the path string; for Python-backed
+/// indices it can be any type that uniquely identifies the shard object.
+/// Must be `Clone + Eq + Hash + Ord + Debug` so it can serve as a
+/// `HashMap` key and be sorted for I/O-optimal ordering.
+pub trait FileRef:
+    Clone + Eq + std::hash::Hash + Ord + std::fmt::Debug + Send + Sync + 'static
+{
+    /// A zero-cost sentinel value used for index memos that have no real
+    /// file backing (e.g. absent / queued records not yet written to disk).
+    fn placeholder() -> Self;
+}
+
+impl FileRef for String {
+    fn placeholder() -> Self {
+        String::new()
+    }
+}
+
 /// Opaque storage handle tying a key to its raw bytes on disk.
 ///
 /// The `path` identifies which file on the underlying transport the

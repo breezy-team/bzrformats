@@ -169,19 +169,23 @@ pub trait GcAccess {
     }
 }
 
+/// A shared, mutable reference to a decoded block.
+///
+/// `Arc<Mutex<..>>` rather than `Rc<RefCell<..>>` so the cache and the store
+/// are `Send + Sync`-compatible — the pyo3 layer can hold the store in a
+/// regular `#[pyclass]` without resorting to `unsendable`.
+pub type SharedBlock = std::sync::Arc<std::sync::Mutex<GroupCompressBlock>>;
+
 /// The decoded-block cache the store consults before fetching.
 ///
 /// Decoupled into a trait so the pyo3 layer can back it with the Python
 /// `LRUSizeCache` (size-bounded) while pure-Rust callers use a plain map.
-pub trait BlockCache<F: FileRef> {
+pub trait BlockCache<F: FileRef>: Send + Sync {
     /// Fetch a cached block by read-memo.
-    fn get(
-        &self,
-        memo: &ReadMemo<F>,
-    ) -> Option<std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>>;
+    fn get(&self, memo: &ReadMemo<F>) -> Option<SharedBlock>;
 
     /// Store a freshly decoded block.
-    fn insert(&self, memo: ReadMemo<F>, block: std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>);
+    fn insert(&self, memo: ReadMemo<F>, block: SharedBlock);
 
     /// Whether a block is in the cache.
     fn contains(&self, memo: &ReadMemo<F>) -> bool {
@@ -202,38 +206,29 @@ pub trait BlockCache<F: FileRef> {
 
 /// Unbounded in-memory `BlockCache` for pure-Rust callers.
 pub struct MapBlockCache<F: FileRef> {
-    inner: std::cell::RefCell<
-        std::collections::HashMap<ReadMemo<F>, std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>>,
-    >,
+    inner: std::sync::Mutex<std::collections::HashMap<ReadMemo<F>, SharedBlock>>,
 }
 
 impl<F: FileRef> Default for MapBlockCache<F> {
     fn default() -> Self {
         MapBlockCache {
-            inner: std::cell::RefCell::new(std::collections::HashMap::new()),
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
 
 impl<F: FileRef> BlockCache<F> for MapBlockCache<F> {
-    fn get(
-        &self,
-        memo: &ReadMemo<F>,
-    ) -> Option<std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>> {
-        self.inner.borrow().get(memo).cloned()
+    fn get(&self, memo: &ReadMemo<F>) -> Option<SharedBlock> {
+        self.inner.lock().unwrap().get(memo).cloned()
     }
-    fn insert(
-        &self,
-        memo: ReadMemo<F>,
-        block: std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>,
-    ) {
-        self.inner.borrow_mut().insert(memo, block);
+    fn insert(&self, memo: ReadMemo<F>, block: SharedBlock) {
+        self.inner.lock().unwrap().insert(memo, block);
     }
     fn clear(&self) {
-        self.inner.borrow_mut().clear();
+        self.inner.lock().unwrap().clear();
     }
     fn len(&self) -> usize {
-        self.inner.borrow().len()
+        self.inner.lock().unwrap().len()
     }
 }
 
@@ -560,13 +555,7 @@ where
     pub fn get_blocks(
         &self,
         read_memos: &[ReadMemo<I::F>],
-    ) -> Result<
-        Vec<(
-            ReadMemo<I::F>,
-            std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>,
-        )>,
-        crate::knit::KnitError,
-    > {
+    ) -> Result<Vec<(ReadMemo<I::F>, SharedBlock)>, crate::knit::KnitError> {
         let to_fetch = memos_to_fetch(read_memos, |m| self.block_cache.contains(m));
         let raw = self.access.get_raw_records(&to_fetch)?;
         if raw.len() != to_fetch.len() {
@@ -580,7 +569,7 @@ where
                 .map_err(|e| crate::knit::KnitError::Corrupt(e.to_string()))?;
             self.block_cache.insert(
                 memo.clone(),
-                std::rc::Rc::new(std::cell::RefCell::new(block)),
+                std::sync::Arc::new(std::sync::Mutex::new(block)),
             );
         }
         // Now every requested read-memo is in the cache; yield in order.
@@ -731,17 +720,16 @@ where
             .map(|k| locations[k].index_memo.read_memo.clone())
             .collect();
         let blocks = self.get_blocks(&read_memos)?;
-        let block_of: std::collections::HashMap<
-            ReadMemo<I::F>,
-            std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>,
-        > = blocks.into_iter().collect();
+        let block_of: std::collections::HashMap<ReadMemo<I::F>, SharedBlock> =
+            blocks.into_iter().collect();
         for key in &ordered {
             let memo = &locations[key].index_memo;
             let block = block_of.get(&memo.read_memo).ok_or_else(|| {
                 crate::knit::KnitError::Corrupt("block missing for located key".to_string())
             })?;
             let chunks = block
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .extract(memo.entry_start as usize, memo.entry_end as usize)
                 .map_err(|e| crate::knit::KnitError::Corrupt(format!("{:?}", e)))?;
             out.push(Box::new(crate::versionedfile::ChunkedContentFactory::new(

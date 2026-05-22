@@ -431,21 +431,27 @@ impl bazaar::groupcompress::gcvf::GcAccess for PyGcAccess {
 /// shape the pure trait expects); the Python side stores a sentinel value
 /// keyed by the read-memo tuple so its `len` matches.
 pub struct PyBlockCache {
-    rust: std::cell::RefCell<
-        std::collections::HashMap<
-            bazaar::groupcompress::gcvf::ReadMemo<GcFileRef>,
-            std::rc::Rc<std::cell::RefCell<bazaar::groupcompress::block::GroupCompressBlock>>,
+    /// Rust-side mirror of the cache, shared across clones via `Arc` so a
+    /// `without_fallbacks` clone of the pyclass keeps the same cache as the
+    /// original. `Mutex` (not `RefCell`) keeps the cache `Send + Sync` so
+    /// the pyclass doesn't need `unsendable`.
+    rust: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                bazaar::groupcompress::gcvf::ReadMemo<GcFileRef>,
+                bazaar::groupcompress::gcvf::SharedBlock,
+            >,
         >,
     >,
     /// The Python `LRUSizeCache` (or compatible dict-like) the pyclass
-    /// exposes as `_group_cache`.
+    /// exposes as `_group_cache`. Shared the same way (`Py::clone_ref`).
     py_cache: Py<PyAny>,
 }
 
 impl PyBlockCache {
     pub fn new(py_cache: Py<PyAny>) -> Self {
         PyBlockCache {
-            rust: std::cell::RefCell::new(std::collections::HashMap::new()),
+            rust: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             py_cache,
         }
     }
@@ -456,19 +462,27 @@ impl PyBlockCache {
     }
 }
 
+impl Clone for PyBlockCache {
+    fn clone(&self) -> Self {
+        Python::attach(|py| PyBlockCache {
+            rust: std::sync::Arc::clone(&self.rust),
+            py_cache: self.py_cache.clone_ref(py),
+        })
+    }
+}
+
 impl bazaar::groupcompress::gcvf::BlockCache<GcFileRef> for PyBlockCache {
     fn get(
         &self,
         memo: &bazaar::groupcompress::gcvf::ReadMemo<GcFileRef>,
-    ) -> Option<std::rc::Rc<std::cell::RefCell<bazaar::groupcompress::block::GroupCompressBlock>>>
-    {
-        self.rust.borrow().get(memo).cloned()
+    ) -> Option<bazaar::groupcompress::gcvf::SharedBlock> {
+        self.rust.lock().unwrap().get(memo).cloned()
     }
 
     fn insert(
         &self,
         memo: bazaar::groupcompress::gcvf::ReadMemo<GcFileRef>,
-        block: std::rc::Rc<std::cell::RefCell<bazaar::groupcompress::block::GroupCompressBlock>>,
+        block: bazaar::groupcompress::gcvf::SharedBlock,
     ) {
         Python::attach(|py| {
             // Mirror into the Python cache so vf._group_cache reflects the
@@ -481,22 +495,22 @@ impl bazaar::groupcompress::gcvf::BlockCache<GcFileRef> for PyBlockCache {
                 .bind(py)
                 .call_method1("add", (key, py.None(), size));
         });
-        self.rust.borrow_mut().insert(memo, block);
+        self.rust.lock().unwrap().insert(memo, block);
     }
 
     fn contains(&self, memo: &bazaar::groupcompress::gcvf::ReadMemo<GcFileRef>) -> bool {
-        self.rust.borrow().contains_key(memo)
+        self.rust.lock().unwrap().contains_key(memo)
     }
 
     fn clear(&self) {
-        self.rust.borrow_mut().clear();
+        self.rust.lock().unwrap().clear();
         Python::attach(|py| {
             let _ = self.py_cache.bind(py).call_method0("clear");
         });
     }
 
     fn len(&self) -> usize {
-        self.rust.borrow().len()
+        self.rust.lock().unwrap().len()
     }
 }
 
@@ -3172,28 +3186,36 @@ impl BatchingBlockFetcher {
     }
 }
 
-/// Rust-backed implementation of Python's `GroupCompressVersionedFiles`.
+/// Concrete instantiation of the pure `GroupCompressVersionedFiles` that
+/// drives Python index / access / cache objects.
+type PureGcvf =
+    bazaar::groupcompress::gcvf::GroupCompressVersionedFiles<PyGcIndex, PyGcAccess, PyBlockCache>;
+
+/// Python binding for `GroupCompressVersionedFiles`.
 ///
-/// At this stage the pyclass is only a state container: it holds the
-/// Python index / access objects, the block cache, fallbacks and config,
-/// and exposes construction, the `_index` / `_access` accessors, fallback
-/// management and `clear_cache`. The record-stream and insert logic is
-/// still provided by Python method overrides on the subclass; they migrate
-/// onto this pyclass one step at a time.
+/// Holds the pure-Rust store plus the Python-visible state the test surface
+/// expects (the Python-side `_group_cache`, `_unadded_refs`, the original
+/// fallback objects, etc.). Methods marshal arguments in, call the pure
+/// store, and marshal results back.
 #[pyclass(name = "GroupCompressVersionedFiles", subclass, dict)]
 pub struct GroupCompressVersionedFiles {
-    /// The `_GCGraphIndex` (or compatible) index object.
+    /// The pure-Rust store; all real operations go through this.
+    pure: PureGcvf,
+    /// The `_GCGraphIndex` (or compatible) index object, kept for the
+    /// `_index` getter.
     index_obj: Py<PyAny>,
-    /// The raw-record access object.
+    /// The raw-record access object, kept for the `_access` getter.
     access_obj: Py<PyAny>,
     /// Whether to delta-compress (True) or only entropy-compress.
     delta: bool,
     /// In-memory records added but not yet flushed, keyed by key.
     unadded_refs: Py<PyDict>,
-    /// Block cache (`LRUSizeCache`), shared with clones from
-    /// `without_fallbacks`.
+    /// Block cache (`LRUSizeCache`); also the Python side of [`PyBlockCache`]
+    /// inside the pure store.
     group_cache: Py<PyAny>,
-    /// Fallback stores consulted for keys absent from this one.
+    /// Python fallback VF objects, kept for the `_immediate_fallback_vfs`
+    /// getter; the pure store holds the matching `PyVersionedFiles`
+    /// wrappers in its own fallback list.
     immediate_fallback_vfs: Vec<Py<PyAny>>,
     /// Cap on bytes a `GroupCompressor` indexes; `None` until first use.
     max_bytes_to_index: Option<usize>,
@@ -3225,7 +3247,14 @@ impl GroupCompressVersionedFiles {
                 cls.call((), Some(&kwargs))?.unbind()
             }
         };
+        let pure = bazaar::groupcompress::gcvf::GroupCompressVersionedFiles::with_cache(
+            PyGcIndex::new(index.clone().unbind()),
+            PyGcAccess::new(access.clone().unbind()),
+            delta,
+            PyBlockCache::new(group_cache.clone_ref(py)),
+        );
         Ok(Self {
+            pure,
             index_obj: index.unbind(),
             access_obj: access.unbind(),
             delta,
