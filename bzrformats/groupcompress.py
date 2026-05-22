@@ -43,7 +43,6 @@ from .versionedfile import (
     adapter_registry,
 )
 
-evil_logger = logging.getLogger("bzrformats.evil")
 logger = logging.getLogger("bzrformats.groupcompress")
 
 _null_sha1 = _groupcompress_rs.NULL_SHA1
@@ -428,38 +427,6 @@ class GroupCompressVersionedFiles(
         # probably check that the existing content is identical to what is
         # being inserted, and otherwise raise an exception.  This would make
         # the bundle code simpler.
-
-    def get_parent_map(self, keys):
-        """Get a map of the graph parents of keys.
-
-        :param keys: The keys to look up parents for.
-        :return: A mapping from keys to parents. Absent keys are absent from
-            the mapping.
-        """
-        return self._get_parent_map_with_sources(keys)[0]
-
-    def _get_parent_map_with_sources(self, keys):
-        """Get a map of the parents of keys.
-
-        :param keys: The keys to look up parents for.
-        :return: A tuple. The first element is a mapping from keys to parents.
-            Absent keys are absent from the mapping. The second element is a
-            list with the locations each key was found in. The first element
-            is the in-this-knit parents, the second the first fallback source,
-            and so on.
-        """
-        result = {}
-        sources = [self._index] + self._immediate_fallback_vfs
-        source_results = []
-        missing = set(keys)
-        for source in sources:
-            if not missing:
-                break
-            new_result = source.get_parent_map(missing)
-            source_results.append(new_result)
-            result.update(new_result)
-            missing.difference_update(set(new_result))
-        return result, source_results
 
     def _get_blocks(self, read_memos):
         """Get GroupCompressBlocks for the given read_memos.
@@ -972,15 +939,6 @@ class GroupCompressVersionedFiles(
                 yield line, key
         if pb is not None:
             pb.update("Walking content", total, total)
-
-    def keys(self):
-        """See VersionedFiles.keys."""
-        evil_logger.debug("keys scales with size of history")
-        sources = [self._index] + self._immediate_fallback_vfs
-        result = set()
-        for source in sources:
-            result.update(source.keys())
-        return result
 
 
 from ._bzr_rs import groupcompress

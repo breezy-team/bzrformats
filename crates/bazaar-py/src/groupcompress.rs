@@ -2595,6 +2595,84 @@ impl GroupCompressVersionedFiles {
         index.getattr("_int_cache")?.call_method0("clear")?;
         Ok(())
     }
+
+    /// Get a map of the graph parents of `keys`; absent keys are omitted.
+    fn get_parent_map<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let (result, _sources) = self.parent_map_with_sources(py, &keys)?;
+        Ok(result)
+    }
+
+    /// Get the parent map together with the per-source result list.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles._get_parent_map_with_sources`:
+    /// the local index is consulted first, then each fallback in order;
+    /// `source_results[i]` is the slice of the answer that source i
+    /// supplied.
+    fn _get_parent_map_with_sources<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<(Bound<'py, PyDict>, Bound<'py, PyList>)> {
+        self.parent_map_with_sources(py, &keys)
+    }
+
+    /// All keys present in this store or any fallback.
+    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PySet>> {
+        py.import("logging")?
+            .call_method1("getLogger", ("bzrformats.evil",))?
+            .call_method1("debug", ("keys scales with size of history",))?;
+        let result = PySet::empty(py)?;
+        for k in self.index_obj.bind(py).call_method0("keys")?.try_iter()? {
+            result.add(k?)?;
+        }
+        for fallback in &self.immediate_fallback_vfs {
+            for k in fallback.bind(py).call_method0("keys")?.try_iter()? {
+                result.add(k?)?;
+            }
+        }
+        Ok(result)
+    }
+}
+
+impl GroupCompressVersionedFiles {
+    /// Shared implementation behind `get_parent_map` /
+    /// `_get_parent_map_with_sources`: walk the local index then each
+    /// fallback, merging their `get_parent_map` answers and recording what
+    /// each source contributed.
+    fn parent_map_with_sources<'py>(
+        &self,
+        py: Python<'py>,
+        keys: &Bound<'py, PyAny>,
+    ) -> PyResult<(Bound<'py, PyDict>, Bound<'py, PyList>)> {
+        let result = PyDict::new(py);
+        let source_results = PyList::empty(py);
+        let missing = PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            missing.add(k?)?;
+        }
+        let mut sources: Vec<Bound<'py, PyAny>> = vec![self.index_obj.bind(py).clone()];
+        for fb in &self.immediate_fallback_vfs {
+            sources.push(fb.bind(py).clone());
+        }
+        for source in sources {
+            if missing.is_empty() {
+                break;
+            }
+            let new_result = source
+                .call_method1("get_parent_map", (&missing,))?
+                .cast_into::<PyDict>()?;
+            source_results.append(&new_result)?;
+            for (k, v) in new_result.iter() {
+                result.set_item(&k, v)?;
+                missing.discard(k)?;
+            }
+        }
+        Ok((result, source_results))
+    }
 }
 
 pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
