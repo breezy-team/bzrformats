@@ -1414,6 +1414,10 @@ class DirState:
         # parents, ghosts, dirblocks, id_index, end_of_header,
         # cutoff_time.
         self._rs.wipe_state()
+        # Drop the cached Python-side IdIndex so the next _get_id_index
+        # rebuilds it from the wiped Rust state rather than serving stale
+        # pre-wipe entries.
+        self._id_index = None
 
     def lock_read(self):
         """Acquire a read lock on the dirstate."""
