@@ -11,6 +11,88 @@ pyo3::import_exception!(bzrformats.errors, ObjectNotLocked);
 pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
 pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
 
+/// A [`FileRef`](bazaar::knit::FileRef) backed by a Python graph-index
+/// object.
+///
+/// A groupcompress read-memo is `(index, start, stop)`; `index` is a
+/// long-lived `BTreeGraphIndex`-like object with no custom `__eq__`, so
+/// Python equality is object identity. `GcFileRef` hashes and compares by
+/// that object's pointer, which agrees with how the Python `LRUSizeCache`
+/// keys its read-memo tuples.
+pub struct GcFileRef(Py<PyAny>);
+
+impl GcFileRef {
+    pub fn new(obj: Py<PyAny>) -> Self {
+        GcFileRef(obj)
+    }
+
+    fn ptr(&self) -> usize {
+        self.0.as_ptr() as usize
+    }
+
+    /// Borrow the wrapped index object.
+    pub fn bind<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
+        self.0.bind(py).clone()
+    }
+}
+
+impl Clone for GcFileRef {
+    fn clone(&self) -> Self {
+        Python::attach(|py| GcFileRef(self.0.clone_ref(py)))
+    }
+}
+
+impl std::fmt::Debug for GcFileRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GcFileRef(0x{:x})", self.ptr())
+    }
+}
+
+impl PartialEq for GcFileRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr() == other.ptr()
+    }
+}
+impl Eq for GcFileRef {}
+
+impl std::hash::Hash for GcFileRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ptr().hash(state);
+    }
+}
+
+impl PartialOrd for GcFileRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for GcFileRef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ptr().cmp(&other.ptr())
+    }
+}
+
+impl bazaar::knit::FileRef for GcFileRef {
+    fn placeholder() -> Self {
+        Python::attach(|py| GcFileRef(py.None()))
+    }
+}
+
+/// The pure-crate read-memo type with its file ref backed by a Python
+/// graph-index object.
+type GcReadMemo = bazaar::groupcompress::gcvf::ReadMemo<GcFileRef>;
+
+/// Convert a Python `(index, start, stop)` read-memo tuple to [`GcReadMemo`].
+fn extract_read_memo(obj: &Bound<'_, PyAny>) -> PyResult<GcReadMemo> {
+    let tup = obj
+        .cast::<PyTuple>()
+        .map_err(|_| PyValueError::new_err("read_memo must be a (index, start, stop) tuple"))?;
+    let index = tup.get_item(0)?.unbind();
+    let start: u64 = tup.get_item(1)?.extract()?;
+    let stop: u64 = tup.get_item(2)?.extract()?;
+    Ok(GcReadMemo::new(GcFileRef::new(index), start, stop))
+}
+
 fn extract_key_segments(obj: &Bound<PyAny>) -> PyResult<Vec<Vec<u8>>> {
     let tuple = obj.cast::<PyTuple>().map_err(|_| {
         PyValueError::new_err("sort_gc_optimal keys and parents must be tuples of bytes")
@@ -2635,6 +2717,72 @@ impl GroupCompressVersionedFiles {
             }
         }
         Ok(result)
+    }
+
+    /// Fetch `GroupCompressBlock`s for `read_memos`, in request order.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles._get_blocks`: blocks already in
+    /// the cache are reused; uncached read-memos are de-duplicated, fetched
+    /// in one `get_raw_records` call, decoded and cached. Returns an
+    /// iterator of `(read_memo, block)` pairs matching the input order, so
+    /// callers can `next()` over it as they did the original generator.
+    fn _get_blocks<'py>(
+        &self,
+        py: Python<'py>,
+        read_memos: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Keep each original Python read-memo tuple (the cache key) paired
+        // with its typed form, which de-duplication compares by.
+        let mut requested: Vec<(Bound<'py, PyAny>, GcReadMemo)> = Vec::new();
+        for item in read_memos.try_iter()? {
+            let obj = item?;
+            let typed = extract_read_memo(&obj)?;
+            requested.push((obj, typed));
+        }
+        let cache = self.group_cache.bind(py);
+        // Map each typed memo back to its cache-key tuple for the fetch call.
+        let tuple_of: std::collections::HashMap<GcReadMemo, Bound<'py, PyAny>> = requested
+            .iter()
+            .map(|(obj, typed)| (typed.clone(), obj.clone()))
+            .collect();
+        // Which read-memos still need fetching: de-duplicated, in request
+        // order, skipping any already in the block cache.
+        let typed_only: Vec<GcReadMemo> = requested.iter().map(|(_, t)| t.clone()).collect();
+        let to_fetch = bazaar::groupcompress::gcvf::memos_to_fetch(&typed_only, |m| {
+            tuple_of
+                .get(m)
+                .map(|obj| cache.contains(obj).unwrap_or(false))
+                .unwrap_or(false)
+        });
+        let fetch_tuples = PyList::empty(py);
+        for memo in &to_fetch {
+            fetch_tuples.append(&tuple_of[memo])?;
+        }
+        let raw_records = self
+            .access_obj
+            .bind(py)
+            .call_method1("get_raw_records", (fetch_tuples,))?;
+        let mut raw_iter = raw_records.try_iter()?;
+        let block_type = py.get_type::<GroupCompressBlock>();
+        let result = PyList::empty(py);
+        for (obj, _) in &requested {
+            let cached = cache.get_item(obj).ok();
+            let block = match cached {
+                Some(block) => block,
+                None => {
+                    let zdata = raw_iter.next().ok_or_else(|| {
+                        PyRuntimeError::new_err("get_raw_records yielded too few records")
+                    })??;
+                    let block = block_type.call_method1("from_bytes", (zdata,))?;
+                    cache.set_item(obj, &block)?;
+                    block
+                }
+            };
+            result.append(PyTuple::new(py, [obj, &block])?)?;
+        }
+        // Return an iterator so callers can `next()` over it, as they did
+        // the original generator.
+        Ok(result.try_iter()?.into_any())
     }
 }
 

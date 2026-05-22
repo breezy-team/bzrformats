@@ -20,7 +20,7 @@ import logging
 
 from . import osutils
 from ._bzr_rs import groupcompress as _groupcompress_rs
-from ._bzr_rs.groupcompress import (
+from ._bzr_rs.groupcompress import (  # noqa: F401
     GroupCompressBlock,
     RabinGroupCompressor,
     sort_gc_optimal,
@@ -427,43 +427,6 @@ class GroupCompressVersionedFiles(
         # probably check that the existing content is identical to what is
         # being inserted, and otherwise raise an exception.  This would make
         # the bundle code simpler.
-
-    def _get_blocks(self, read_memos):
-        """Get GroupCompressBlocks for the given read_memos.
-
-        :returns: a series of (read_memo, block) pairs, in the order they were
-            originally passed.
-        """
-        cached = {}
-        for read_memo in read_memos:
-            try:
-                block = self._group_cache[read_memo]
-            except KeyError:
-                pass
-            else:
-                cached[read_memo] = block
-        not_cached = []
-        not_cached_seen = set()
-        for read_memo in read_memos:
-            if read_memo in cached:
-                # Don't fetch what we already have
-                continue
-            if read_memo in not_cached_seen:
-                # Don't try to fetch the same data twice
-                continue
-            not_cached.append(read_memo)
-            not_cached_seen.add(read_memo)
-        raw_records = self._access.get_raw_records(not_cached)
-        for read_memo in read_memos:
-            try:
-                yield read_memo, cached[read_memo]
-            except KeyError:
-                # Read the block, and cache it.
-                zdata = next(raw_records)
-                block = GroupCompressBlock.from_bytes(zdata)
-                self._group_cache[read_memo] = block
-                cached[read_memo] = block
-                yield read_memo, block
 
     def get_missing_compression_parent_keys(self):
         """Return the keys of missing compression parents.
