@@ -169,6 +169,74 @@ pub trait GcAccess {
     }
 }
 
+/// The decoded-block cache the store consults before fetching.
+///
+/// Decoupled into a trait so the pyo3 layer can back it with the Python
+/// `LRUSizeCache` (size-bounded) while pure-Rust callers use a plain map.
+pub trait BlockCache<F: FileRef> {
+    /// Fetch a cached block by read-memo.
+    fn get(
+        &self,
+        memo: &ReadMemo<F>,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>>;
+
+    /// Store a freshly decoded block.
+    fn insert(&self, memo: ReadMemo<F>, block: std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>);
+
+    /// Whether a block is in the cache.
+    fn contains(&self, memo: &ReadMemo<F>) -> bool {
+        self.get(memo).is_some()
+    }
+
+    /// Drop every cached block.
+    fn clear(&self);
+
+    /// Number of cached blocks.
+    fn len(&self) -> usize;
+
+    /// Whether the cache currently holds nothing.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Unbounded in-memory `BlockCache` for pure-Rust callers.
+pub struct MapBlockCache<F: FileRef> {
+    inner: std::cell::RefCell<
+        std::collections::HashMap<ReadMemo<F>, std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>>,
+    >,
+}
+
+impl<F: FileRef> Default for MapBlockCache<F> {
+    fn default() -> Self {
+        MapBlockCache {
+            inner: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl<F: FileRef> BlockCache<F> for MapBlockCache<F> {
+    fn get(
+        &self,
+        memo: &ReadMemo<F>,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>> {
+        self.inner.borrow().get(memo).cloned()
+    }
+    fn insert(
+        &self,
+        memo: ReadMemo<F>,
+        block: std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>,
+    ) {
+        self.inner.borrow_mut().insert(memo, block);
+    }
+    fn clear(&self) {
+        self.inner.borrow_mut().clear();
+    }
+    fn len(&self) -> usize {
+        self.inner.borrow().len()
+    }
+}
+
 /// Given the read-memos a batch wants and which of them are already
 /// cached, return the de-duplicated, order-preserving list of memos that
 /// still need to be fetched.
@@ -407,47 +475,55 @@ pub fn io_ordered_source_keys<F: FileRef>(
 /// [`crate::knit::KnitVersionedFiles`] is over `KnitIndex` / `KnitAccess`.
 /// A pure-Rust caller implements those two traits; the pyo3 layer wraps a
 /// Python index / access object.
-pub struct GroupCompressVersionedFiles<I, A>
+pub struct GroupCompressVersionedFiles<I, A, C = MapBlockCache<<I as GcIndex>::F>>
 where
     I: GcIndex,
     A: GcAccess<F = I::F>,
+    C: BlockCache<I::F>,
 {
     index: I,
     access: A,
     /// Whether to delta-compress; carried for parity with the Python store.
     delta: bool,
-    /// Decoded blocks keyed by read-memo.
-    ///
-    /// Blocks are wrapped in `Rc<RefCell<..>>` because `GroupCompressBlock`
-    /// needs `&mut self` to decompress on demand, yet a block is shared by
-    /// every record that lives in it.
-    ///
-    /// TODO: this grows unbounded; the Python store caps it with an
-    /// `LRUSizeCache`. A bound can be added once the read paths settle.
-    block_cache: std::cell::RefCell<
-        std::collections::HashMap<
-            ReadMemo<I::F>,
-            std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>,
-        >,
-    >,
+    /// Decoded-block cache. Decoupled via [`BlockCache`] so the pyo3 layer
+    /// can back it with the Python `LRUSizeCache` (size-bounded) while
+    /// pure-Rust callers get an unbounded [`MapBlockCache`] by default.
+    block_cache: C,
     /// Fallback stores consulted for keys absent from this one.
     fallbacks: Vec<Box<dyn crate::versionedfile::VersionedFiles>>,
 }
 
-impl<I, A> GroupCompressVersionedFiles<I, A>
+impl<I, A> GroupCompressVersionedFiles<I, A, MapBlockCache<I::F>>
 where
     I: GcIndex,
     A: GcAccess<F = I::F>,
 {
-    /// Create a store over the given index and access objects.
+    /// Create a store with the default in-memory block cache.
     pub fn new(index: I, access: A, delta: bool) -> Self {
+        GroupCompressVersionedFiles::with_cache(index, access, delta, MapBlockCache::default())
+    }
+}
+
+impl<I, A, C> GroupCompressVersionedFiles<I, A, C>
+where
+    I: GcIndex,
+    A: GcAccess<F = I::F>,
+    C: BlockCache<I::F>,
+{
+    /// Create a store with a caller-supplied block cache.
+    pub fn with_cache(index: I, access: A, delta: bool, block_cache: C) -> Self {
         GroupCompressVersionedFiles {
             index,
             access,
             delta,
-            block_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            block_cache,
             fallbacks: Vec::new(),
         }
+    }
+
+    /// The block cache.
+    pub fn block_cache(&self) -> &C {
+        &self.block_cache
     }
 
     /// Add a fallback store for keys not present in this one.
@@ -491,7 +567,7 @@ where
         )>,
         crate::knit::KnitError,
     > {
-        let to_fetch = memos_to_fetch(read_memos, |m| self.block_cache.borrow().contains_key(m));
+        let to_fetch = memos_to_fetch(read_memos, |m| self.block_cache.contains(m));
         let raw = self.access.get_raw_records(&to_fetch)?;
         if raw.len() != to_fetch.len() {
             return Err(crate::knit::KnitError::Corrupt(
@@ -499,25 +575,21 @@ where
             ));
         }
         // Decode and cache the freshly fetched blocks.
-        {
-            let mut cache = self.block_cache.borrow_mut();
-            for (memo, zdata) in to_fetch.iter().zip(raw) {
-                let block = GroupCompressBlock::from_bytes(&zdata[..])
-                    .map_err(|e| crate::knit::KnitError::Corrupt(e.to_string()))?;
-                cache.insert(
-                    memo.clone(),
-                    std::rc::Rc::new(std::cell::RefCell::new(block)),
-                );
-            }
+        for (memo, zdata) in to_fetch.iter().zip(raw) {
+            let block = GroupCompressBlock::from_bytes(&zdata[..])
+                .map_err(|e| crate::knit::KnitError::Corrupt(e.to_string()))?;
+            self.block_cache.insert(
+                memo.clone(),
+                std::rc::Rc::new(std::cell::RefCell::new(block)),
+            );
         }
         // Now every requested read-memo is in the cache; yield in order.
-        let cache = self.block_cache.borrow();
         let mut out = Vec::with_capacity(read_memos.len());
         for memo in read_memos {
-            let block = cache.get(memo).ok_or_else(|| {
+            let block = self.block_cache.get(memo).ok_or_else(|| {
                 crate::knit::KnitError::Corrupt("block missing after fetch".to_string())
             })?;
-            out.push((memo.clone(), std::rc::Rc::clone(block)));
+            out.push((memo.clone(), block));
         }
         Ok(out)
     }
@@ -893,7 +965,7 @@ where
     ///
     /// Mirrors `GroupCompressVersionedFiles.clear_cache`.
     pub fn clear_cache(&self) {
-        self.block_cache.borrow_mut().clear();
+        self.block_cache.clear();
     }
 
     /// Walk the lines of every requested key.
