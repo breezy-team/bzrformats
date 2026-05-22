@@ -206,12 +206,25 @@ pub enum KnitError {
     /// A knit index detected an inconsistency (e.g. duplicate with different
     /// metadata, or a delta record in a non-delta index).
     Corrupt(String),
+    /// A revision (knit key) was requested but is not present in this index
+    /// or any of the configured fallbacks.
+    RevisionNotPresent(KnitKey),
     /// A write operation was attempted on a read-only index (no add_callback set).
     ReadOnly,
     /// The operation is not supported by this index type (e.g. compression
     /// parent tracking on `_KndxIndex`, which uses an append-only on-disk
     /// format that cannot defer parents).
     NotImplemented(&'static str),
+    /// The pack listing changed underneath a read (a `RetryWithNewPacks`
+    /// on the Python side). Read pipelines catch this, call
+    /// [`KnitAccess::reload_or_raise`], and retry the whole operation.
+    /// The string is a human-readable context message for diagnostics.
+    Retry(String),
+    /// A retry could not recover (e.g. the pack files are gone for good).
+    /// The originating error has been stashed by the access layer and
+    /// must be surfaced verbatim at the language boundary rather than
+    /// remapped. The string is a diagnostic message.
+    Aborted(String),
 }
 
 impl std::fmt::Display for KnitError {
@@ -270,8 +283,11 @@ impl std::fmt::Display for KnitError {
                 write!(f, "kndx corrupt record {:?}: {}", line, detail)
             }
             KnitError::Corrupt(msg) => write!(f, "knit corrupt: {}", msg),
+            KnitError::RevisionNotPresent(key) => write!(f, "Revision not present: {:?}", key),
             KnitError::ReadOnly => write!(f, "write attempted on read-only knit index"),
             KnitError::NotImplemented(name) => write!(f, "{}", name),
+            KnitError::Retry(ctx) => write!(f, "pack listing changed, retry needed: {}", ctx),
+            KnitError::Aborted(ctx) => write!(f, "operation aborted: {}", ctx),
         }
     }
 }
@@ -764,6 +780,15 @@ pub trait KnitFactory {
         delta: &[DeltaHunk<<Self::Content as KnitContent>::DeltaLine>],
     ) -> Vec<Vec<u8>>;
 
+    /// Yield the plain text lines stored by a fulltext body. For the plain
+    /// factory this is just `body_lines`; for the annotated factory the
+    /// per-line origin prefix is stripped.
+    fn fulltext_payload_lines(&self, body_lines: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, KnitError>;
+
+    /// Yield only the *new* text lines a delta body contributes (each delta
+    /// hunk's replacement lines). Mirrors Python's `get_linedelta_content`.
+    fn linedelta_payload_lines(&self, body_lines: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, KnitError>;
+
     /// Build a content object from a record's body lines and its
     /// `(method, noeol)` pair. For `LineDelta` records `base_content`
     /// must contain the parent fulltext; it's cloned and patched.
@@ -843,6 +868,24 @@ impl KnitFactory for KnitAnnotateFactory {
     fn lower_line_delta(&self, delta: &[DeltaHunk<AnnotatedLine>]) -> Vec<Vec<u8>> {
         lower_line_delta_annotated(delta)
     }
+
+    fn fulltext_payload_lines(&self, body_lines: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, KnitError> {
+        // Strip the per-line origin prefix to recover the plain text.
+        let refs: Vec<&[u8]> = body_lines.iter().map(|l| l.as_slice()).collect();
+        let pairs = parse_fulltext(&refs)?;
+        Ok(pairs.into_iter().map(|(_, text)| text).collect())
+    }
+
+    fn linedelta_payload_lines(&self, body_lines: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, KnitError> {
+        // Walk delta hunks; each carries annotated (origin, text) pairs whose
+        // text we want to emit.
+        let refs: Vec<&[u8]> = body_lines.iter().map(|l| l.as_slice()).collect();
+        let hunks = parse_line_delta_annotated(&refs)?;
+        Ok(hunks
+            .into_iter()
+            .flat_map(|h| h.lines.into_iter().map(|(_, text)| text))
+            .collect())
+    }
 }
 
 /// Plain (unannotated) knit codec strategy. Builds [`PlainKnitContent`]
@@ -882,6 +925,16 @@ impl KnitFactory for KnitPlainFactory {
 
     fn lower_line_delta(&self, delta: &[DeltaHunk<Vec<u8>>]) -> Vec<Vec<u8>> {
         lower_line_delta_raw(delta)
+    }
+
+    fn fulltext_payload_lines(&self, body_lines: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, KnitError> {
+        Ok(body_lines.to_vec())
+    }
+
+    fn linedelta_payload_lines(&self, body_lines: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, KnitError> {
+        let refs: Vec<&[u8]> = body_lines.iter().map(|l| l.as_slice()).collect();
+        let hunks = parse_line_delta_raw(&refs)?;
+        Ok(hunks.into_iter().flat_map(|h| h.lines).collect())
     }
 }
 
@@ -2471,15 +2524,8 @@ where
         },
     )
     .map_err(|missing| {
-        let one = missing
-            .into_iter()
-            .next()
-            .map(|k| {
-                let last = k.last().cloned().unwrap_or_default();
-                last
-            })
-            .unwrap_or_default();
-        KnitError::BadIndexValue(one)
+        let one = missing.into_iter().next().unwrap_or_else(|| key.clone());
+        KnitError::RevisionNotPresent(one)
     })?;
 
     // 2. Order the chain ancestor-first by following compression_parent
@@ -3237,6 +3283,25 @@ where
         }
     }
 
+    /// Run `op`, retrying it if it fails with [`KnitError::Retry`].
+    ///
+    /// On a retry error the pack listing changed underneath the read
+    /// (`RetryWithNewPacks` on the Python side). [`KnitAccess::reload_or_raise`]
+    /// decides whether the situation is recoverable: it returns `Ok(())`
+    /// to retry, or `Err` to give up. This mirrors the `while True` /
+    /// `except RetryWithNewPacks` loops in Python's `KnitVersionedFiles`.
+    ///
+    /// `op` is re-run from scratch — including re-fetching build details —
+    /// because a reload invalidates the previous `index_memo`s.
+    fn with_retry<T>(&self, mut op: impl FnMut() -> Result<T, KnitError>) -> Result<T, KnitError> {
+        loop {
+            match op() {
+                Err(err @ KnitError::Retry(_)) => self.access.reload_or_raise(err)?,
+                other => return other,
+            }
+        }
+    }
+
     /// Return all keys in the local index.
     pub fn keys(&self) -> Result<Vec<KnitKey>, KnitError> {
         self.index.keys()
@@ -3478,20 +3543,49 @@ where
         &self,
         keys: &[KnitKey],
     ) -> Result<Vec<(Vec<u8>, KnitKey)>, KnitError> {
+        self.with_retry(|| self.iter_lines_added_or_present_in_keys_once(keys))
+    }
+
+    fn iter_lines_added_or_present_in_keys_once(
+        &self,
+        keys: &[KnitKey],
+    ) -> Result<Vec<(Vec<u8>, KnitKey)>, KnitError> {
         if keys.is_empty() {
             return Ok(vec![]);
         }
         let build_details = self.index.get_build_details(keys)?;
         let key_records: Vec<(KnitKey, KnitIndexMemo)> = build_details
             .iter()
+            .filter(|(k, _)| keys.contains(k))
             .map(|(k, det)| (k.clone(), det.index_memo.clone()))
             .collect();
-        // read_records_iter fully reconstructs content (applying deltas).
-        let triples = self.read_records_iter(&key_records)?;
+        // Fetch raw bytes and decode bodies once per record. For each record,
+        // emit either the fulltext lines or the new lines from the delta
+        // payload — mirrors `_factory.get_fulltext_content` /
+        // `get_linedelta_content` in Python.
+        let memos: Vec<KnitIndexMemo> = key_records.iter().map(|(_, m)| m.clone()).collect();
+        let raw_data = self.access.get_raw_records(&memos)?;
         let mut out = Vec::new();
-        for (key, content, _digest) in triples {
-            for line in content.text() {
-                out.push((line, key.clone()));
+        for ((key, _), raw) in key_records.iter().zip(raw_data) {
+            let version_id = key.last().cloned().unwrap_or_default();
+            let (body_lines, _digest) = parse_record(&version_id, &raw)?;
+            let details = &build_details[key];
+            match details.method {
+                KnitMethod::Fulltext => {
+                    for line in self.factory.fulltext_payload_lines(&body_lines)? {
+                        out.push((line, key.clone()));
+                    }
+                }
+                KnitMethod::LineDelta => {
+                    for line in self.factory.linedelta_payload_lines(&body_lines)? {
+                        out.push((line, key.clone()));
+                    }
+                }
+                KnitMethod::NoEol => {
+                    return Err(KnitError::BadIndexValue(
+                        b"NoEol is not a storage method".to_vec(),
+                    ));
+                }
             }
         }
         Ok(out)
@@ -3680,6 +3774,15 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
     /// empty and `sha1` `None`); the caller is responsible for consulting
     /// fallback stores.
     pub fn get_record_stream(
+        &self,
+        keys: &[KnitKey],
+        ordering: &str,
+        include_delta_closure: bool,
+    ) -> Result<Vec<KnitContentFactory>, KnitError> {
+        self.with_retry(|| self.get_record_stream_once(keys, ordering, include_delta_closure))
+    }
+
+    fn get_record_stream_once(
         &self,
         keys: &[KnitKey],
         ordering: &str,
@@ -4058,11 +4161,9 @@ where
         Vec<(KnitKey, Vec<KnitKey>, Vec<u8>, KnitRecordDetails)>,
     >,
     /// Keys whose text is ready but that still await parent annotations.
-    pending_annotation:
-        std::collections::HashMap<KnitKey, Vec<(KnitKey, Vec<KnitKey>)>>,
+    pending_annotation: std::collections::HashMap<KnitKey, Vec<(KnitKey, Vec<KnitKey>)>>,
     /// Pre-computed matching blocks from delta expansion, consumed once.
-    matching_blocks:
-        std::collections::HashMap<(KnitKey, KnitKey), Vec<(usize, usize, usize)>>,
+    matching_blocks: std::collections::HashMap<(KnitKey, KnitKey), Vec<(usize, usize, usize)>>,
 }
 
 impl<I, A, F> KnitAnnotator<I, A, F>
@@ -4088,6 +4189,23 @@ where
             pending_annotation: Default::default(),
             matching_blocks: Default::default(),
         }
+    }
+
+    /// Borrow the access adapter, e.g. to inspect retry state.
+    pub fn access(&self) -> &A {
+        &self.access
+    }
+
+    /// Seed a key's plain-text lines and parents into the annotator's caches.
+    ///
+    /// Used to inject content fetched externally (e.g. from a fallback
+    /// VersionedFile) so the build-graph walk treats the key as already-known:
+    /// the [`get_build_graph`](Self::get_build_graph) loop will route it to
+    /// the "already have the text" branch rather than calling
+    /// `index.get_build_details` for it.
+    pub fn seed_text(&mut self, key: KnitKey, parents: Vec<KnitKey>, lines: Vec<Vec<u8>>) {
+        self.parent_map.insert(key.clone(), parents);
+        self.text_cache.insert(key, lines);
     }
 
     /// Walk the compression/parent graph for `key`, filling `all_build_details`
@@ -4121,10 +4239,7 @@ where
                         *self.num_needed_children.entry(pk.clone()).or_insert(0) += 1;
                     }
                     if let Some(ref cp) = details.compression_parent {
-                        *self
-                            .num_compression_children
-                            .entry(cp.clone())
-                            .or_insert(0) += 1;
+                        *self.num_compression_children.entry(cp.clone()).or_insert(0) += 1;
                     }
                 } else if self.parent_map.contains_key(k) && self.text_cache.contains_key(k) {
                     // Already have the text (e.g. from a fallback); just annotate it.
@@ -4137,10 +4252,7 @@ where
                         }
                     }
                 } else {
-                    return Err(KnitError::Corrupt(format!(
-                        "Revision not present: {:?}",
-                        k
-                    )));
+                    return Err(KnitError::RevisionNotPresent(k.clone()));
                 }
             }
         }
@@ -4182,16 +4294,22 @@ where
     ) -> Result<Option<Vec<Vec<u8>>>, KnitError> {
         let content = if let Some(ref cp) = compression_parent {
             if !self.content_objects.contains_key(cp) {
-                self.pending_deltas
-                    .entry(cp.clone())
-                    .or_default()
-                    .push((key, parent_keys, raw, KnitRecordDetails {
+                self.pending_deltas.entry(cp.clone()).or_default().push((
+                    key,
+                    parent_keys,
+                    raw,
+                    KnitRecordDetails {
                         method,
                         noeol,
-                        index_memo: KnitIndexMemo { path: String::new(), offset: 0, length: 0 },
+                        index_memo: KnitIndexMemo {
+                            path: String::new(),
+                            offset: 0,
+                            length: 0,
+                        },
                         compression_parent: compression_parent.clone(),
                         parents: vec![],
-                    }));
+                    },
+                ));
                 return Ok(None);
             }
             let num = self.num_compression_children[cp];
@@ -4212,13 +4330,16 @@ where
                     // Re-parse to get the raw delta hunks for get_line_delta_blocks.
                     if let Ok(decompressed) = decode_record_gz(&raw) {
                         if let Ok((_, body_lines)) = parse_record_body_unchecked(&decompressed) {
-                            if let Ok(hunks) = parse_line_delta_raw(&body_lines.iter().copied().collect::<Vec<_>>()) {
+                            if let Ok(hunks) = parse_line_delta_raw(
+                                &body_lines.iter().copied().collect::<Vec<_>>(),
+                            ) {
                                 let raw_hunks: Vec<(usize, usize, usize)> = hunks
                                     .iter()
                                     .map(|h| (h.start, h.end, h.lines.len()))
                                     .collect();
                                 let blocks = get_line_delta_blocks(&raw_hunks, &p_refs, &l_refs);
-                                self.matching_blocks.insert((key.clone(), cp.clone()), blocks);
+                                self.matching_blocks
+                                    .insert((key.clone(), cp.clone()), blocks);
                             }
                         }
                     }
@@ -4229,7 +4350,13 @@ where
             self.parse_raw_record(&key, &raw, method, noeol, None)?
         };
 
-        if self.num_compression_children.get(&key).copied().unwrap_or(0) > 0 {
+        if self
+            .num_compression_children
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            > 0
+        {
             self.content_objects.insert(key.clone(), content.clone());
         }
         let lines = content.text();
@@ -4284,15 +4411,15 @@ where
         Ok(to_return)
     }
 
-    /// Fetch raw records from disk, expand them, and return `(key, lines)` in
-    /// topological order (parents before children).
-    fn extract_texts(
+    /// Fetch raw records, expand them, and call [`annotate_one`](Self::annotate_one)
+    /// on each ready text immediately. Mirrors the Python generator loop in
+    /// `VersionedFileAnnotator.annotate`.
+    fn extract_and_annotate(
         &mut self,
         records: Vec<(KnitKey, KnitIndexMemo)>,
-    ) -> Result<Vec<(KnitKey, Vec<Vec<u8>>)>, KnitError> {
+    ) -> Result<(), KnitError> {
         let memos: Vec<KnitIndexMemo> = records.iter().map(|(_, m)| m.clone()).collect();
         let raw_bytes = self.access.get_raw_records(&memos)?;
-        let mut out: Vec<(KnitKey, Vec<Vec<u8>>)> = Vec::new();
 
         for ((key, _memo), raw) in records.into_iter().zip(raw_bytes.into_iter()) {
             let details = self.all_build_details[&key].clone();
@@ -4307,7 +4434,7 @@ where
             let Some(lines) = lines else { continue };
 
             if self.check_ready_for_annotations(&key, &details.parents) {
-                out.push((key.clone(), lines));
+                self.annotate_one(&key, &lines);
             }
 
             let mut to_process = self.process_pending(&key)?;
@@ -4315,13 +4442,13 @@ where
                 let this_batch = std::mem::take(&mut to_process);
                 for k in this_batch {
                     let lines = self.text_cache[&k].clone();
-                    out.push((k.clone(), lines));
+                    self.annotate_one(&k, &lines);
                     to_process.extend(self.process_pending(&k)?);
                 }
             }
         }
 
-        Ok(out)
+        Ok(())
     }
 
     /// Return the annotations and matching blocks for `(key, parent_key)`,
@@ -4332,7 +4459,10 @@ where
         text: &[Vec<u8>],
         parent_key: &KnitKey,
     ) -> (Vec<LineAnnotation>, Vec<(usize, usize, usize)>) {
-        if let Some(blocks) = self.matching_blocks.remove(&(key.clone(), parent_key.clone())) {
+        if let Some(blocks) = self
+            .matching_blocks
+            .remove(&(key.clone(), parent_key.clone()))
+        {
             let parent_annotations = self.annotations_cache[parent_key].clone();
             return (parent_annotations, blocks);
         }
@@ -4418,10 +4548,11 @@ where
         key: &KnitKey,
     ) -> Result<(Vec<LineAnnotation>, Vec<Vec<u8>>), KnitError> {
         let (records, ann_keys) = self.get_build_graph(key)?;
-        let texts = self.extract_texts(records)?;
-        for (text_key, text) in texts {
-            self.annotate_one(&text_key, &text.clone());
-        }
+        // Interleave text extraction with annotation: each extracted text is
+        // annotated immediately so its annotations_cache entry is ready before
+        // any child invokes `check_ready_for_annotations`. The Python
+        // VersionedFileAnnotator.annotate loop has the same shape.
+        self.extract_and_annotate(records)?;
         for ann_key in ann_keys {
             let text = self.text_cache[&ann_key].clone();
             self.annotate_one(&ann_key, &text);
@@ -4430,21 +4561,57 @@ where
             .annotations_cache
             .get(key)
             .cloned()
-            .ok_or_else(|| KnitError::Corrupt(format!("Revision not present: {:?}", key)))?;
+            .ok_or_else(|| KnitError::RevisionNotPresent(key.clone()))?;
         let lines = self.text_cache.get(key).cloned().unwrap_or_default();
         Ok((annotations, lines))
     }
 
-    /// Return `[(annotation_key, line)]` — one best-origin key per line.
-    pub fn annotate_flat(
+    /// Annotate `key` using only data seeded via [`seed_text`].
+    ///
+    /// `topological_order` lists every key needed to annotate `key`,
+    /// ancestors first; each key must already have its parents and text
+    /// seeded. Mirrors `VersionedFileAnnotator.annotate`'s loop body but
+    /// skips the `extract_texts` chain-walk entirely.
+    pub fn annotate_seeded(
         &mut self,
         key: &KnitKey,
+        topological_order: &[KnitKey],
+    ) -> Result<(Vec<LineAnnotation>, Vec<Vec<u8>>), KnitError> {
+        for k in topological_order {
+            let text = self
+                .text_cache
+                .get(k)
+                .cloned()
+                .ok_or_else(|| KnitError::Corrupt(format!("text not seeded: {:?}", k)))?;
+            self.annotate_one(k, &text);
+        }
+        let annotations = self
+            .annotations_cache
+            .get(key)
+            .cloned()
+            .ok_or_else(|| KnitError::RevisionNotPresent(key.clone()))?;
+        let lines = self.text_cache.get(key).cloned().unwrap_or_default();
+        Ok((annotations, lines))
+    }
+
+    /// Like [`annotate_flat`](Self::annotate_flat) but driven from seeded
+    /// data — see [`annotate_seeded`](Self::annotate_seeded).
+    pub fn annotate_flat_seeded(
+        &mut self,
+        key: &KnitKey,
+        topological_order: &[KnitKey],
     ) -> Result<Vec<(KnitKey, Vec<u8>)>, KnitError> {
-        let (annotations, lines) = self.annotate(key)?;
+        let (annotations, lines) = self.annotate_seeded(key, topological_order)?;
+        self.heads_to_flat(annotations, lines)
+    }
+
+    fn heads_to_flat(
+        &self,
+        annotations: Vec<LineAnnotation>,
+        lines: Vec<Vec<u8>>,
+    ) -> Result<Vec<(KnitKey, Vec<u8>)>, KnitError> {
         let mut kg = vcs_graph::KnownGraph::new(
-            self.parent_map
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone())),
+            self.parent_map.iter().map(|(k, v)| (k.clone(), v.clone())),
             false,
         );
         let out = annotations
@@ -4458,7 +4625,6 @@ where
                     if the_heads.len() == 1 {
                         the_heads.into_iter().next().unwrap()
                     } else {
-                        // Tie-break: sort and take first (matches Python fallback).
                         let mut sorted: Vec<KnitKey> = the_heads.into_iter().collect();
                         sorted.sort();
                         sorted.into_iter().next().unwrap()
@@ -4468,6 +4634,12 @@ where
             })
             .collect();
         Ok(out)
+    }
+
+    /// Return `[(annotation_key, line)]` — one best-origin key per line.
+    pub fn annotate_flat(&mut self, key: &KnitKey) -> Result<Vec<(KnitKey, Vec<u8>)>, KnitError> {
+        let (annotations, lines) = self.annotate(key)?;
+        self.heads_to_flat(annotations, lines)
     }
 }
 
