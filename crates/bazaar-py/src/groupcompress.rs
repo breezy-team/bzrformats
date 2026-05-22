@@ -2447,6 +2447,149 @@ fn as_tuples<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'p
     }
 }
 
+/// Rust-backed implementation of Python's `GroupCompressVersionedFiles`.
+///
+/// At this stage the pyclass is only a state container: it holds the
+/// Python index / access objects, the block cache, fallbacks and config,
+/// and exposes construction, the `_index` / `_access` accessors, fallback
+/// management and `clear_cache`. The record-stream and insert logic is
+/// still provided by Python method overrides on the subclass; they migrate
+/// onto this pyclass one step at a time.
+#[pyclass(name = "GroupCompressVersionedFiles", subclass, dict)]
+pub struct GroupCompressVersionedFiles {
+    /// The `_GCGraphIndex` (or compatible) index object.
+    index_obj: Py<PyAny>,
+    /// The raw-record access object.
+    access_obj: Py<PyAny>,
+    /// Whether to delta-compress (True) or only entropy-compress.
+    delta: bool,
+    /// In-memory records added but not yet flushed, keyed by key.
+    unadded_refs: Py<PyDict>,
+    /// Block cache (`LRUSizeCache`), shared with clones from
+    /// `without_fallbacks`.
+    group_cache: Py<PyAny>,
+    /// Fallback stores consulted for keys absent from this one.
+    immediate_fallback_vfs: Vec<Py<PyAny>>,
+    /// Cap on bytes a `GroupCompressor` indexes; `None` until first use.
+    max_bytes_to_index: Option<usize>,
+}
+
+#[pymethods]
+impl GroupCompressVersionedFiles {
+    #[new]
+    #[pyo3(signature = (index, access, delta=true, _unadded_refs=None, _group_cache=None))]
+    fn new(
+        py: Python<'_>,
+        index: Bound<'_, PyAny>,
+        access: Bound<'_, PyAny>,
+        delta: bool,
+        _unadded_refs: Option<Bound<'_, PyDict>>,
+        _group_cache: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let unadded_refs = match _unadded_refs {
+            Some(d) => d.unbind(),
+            None => PyDict::new(py).unbind(),
+        };
+        let group_cache = match _group_cache {
+            Some(c) => c.unbind(),
+            None => {
+                // Default: LRUSizeCache(max_size=50 * 1024 * 1024)
+                let cls = py.import("bzrformats.lru_cache")?.getattr("LRUSizeCache")?;
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("max_size", 50 * 1024 * 1024)?;
+                cls.call((), Some(&kwargs))?.unbind()
+            }
+        };
+        Ok(Self {
+            index_obj: index.unbind(),
+            access_obj: access.unbind(),
+            delta,
+            unadded_refs,
+            group_cache,
+            immediate_fallback_vfs: Vec::new(),
+            max_bytes_to_index: None,
+        })
+    }
+
+    #[getter]
+    fn _index(&self, py: Python<'_>) -> Py<PyAny> {
+        self.index_obj.clone_ref(py)
+    }
+
+    #[getter]
+    fn _access(&self, py: Python<'_>) -> Py<PyAny> {
+        self.access_obj.clone_ref(py)
+    }
+
+    #[getter]
+    fn _delta(&self) -> bool {
+        self.delta
+    }
+
+    #[getter]
+    fn _unadded_refs(&self, py: Python<'_>) -> Py<PyDict> {
+        self.unadded_refs.clone_ref(py)
+    }
+
+    #[getter]
+    fn _group_cache(&self, py: Python<'_>) -> Py<PyAny> {
+        self.group_cache.clone_ref(py)
+    }
+
+    #[getter]
+    fn _immediate_fallback_vfs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for vf in &self.immediate_fallback_vfs {
+            list.append(vf.bind(py))?;
+        }
+        Ok(list)
+    }
+
+    #[getter]
+    fn _max_bytes_to_index(&self) -> Option<usize> {
+        self.max_bytes_to_index
+    }
+
+    #[setter]
+    fn set__max_bytes_to_index(&mut self, value: Option<usize>) {
+        self.max_bytes_to_index = value;
+    }
+
+    /// Return a clone of this object without any fallbacks configured.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles.without_fallbacks`: the clone
+    /// shares the block cache and gets a shallow copy of the unadded refs.
+    fn without_fallbacks(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let unadded_copy = self.unadded_refs.bind(py).copy()?;
+        let result = GroupCompressVersionedFiles {
+            index_obj: self.index_obj.clone_ref(py),
+            access_obj: self.access_obj.clone_ref(py),
+            delta: self.delta,
+            unadded_refs: unadded_copy.unbind(),
+            group_cache: self.group_cache.clone_ref(py),
+            immediate_fallback_vfs: Vec::new(),
+            max_bytes_to_index: self.max_bytes_to_index,
+        };
+        Py::new(py, result).map(|p| p.into_any())
+    }
+
+    /// Add a fallback store for texts not present in this one.
+    fn add_fallback_versioned_files(&mut self, a_versioned_files: Bound<'_, PyAny>) {
+        self.immediate_fallback_vfs.push(a_versioned_files.unbind());
+    }
+
+    /// Drop the block cache and the index's caches.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles.clear_cache`.
+    fn clear_cache(&self, py: Python<'_>) -> PyResult<()> {
+        self.group_cache.bind(py).call_method0("clear")?;
+        let index = self.index_obj.bind(py);
+        index.getattr("_graph_index")?.call_method0("clear_cache")?;
+        index.getattr("_int_cache")?.call_method0("clear")?;
+        Ok(())
+    }
+}
+
 pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "groupcompress")?;
     m.add_wrapped(wrap_pyfunction!(encode_base128_int))?;
@@ -2473,6 +2616,7 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<RecordStreamIter>()?;
     m.add_class::<GCBuildDetails>()?;
     m.add_class::<GCGraphIndex>()?;
+    m.add_class::<GroupCompressVersionedFiles>()?;
     m.add_class::<crate::groupcompress_delta::DeltaIndex>()?;
     m.add_function(wrap_pyfunction!(
         crate::groupcompress_delta::_rabin_hash,
