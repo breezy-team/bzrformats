@@ -112,6 +112,133 @@ pub fn memos_to_fetch<F: FileRef>(
     out
 }
 
+/// Which store a record-stream key is served from.
+///
+/// The Python code carries the `GroupCompressVersionedFiles` object itself
+/// (`self`) or a fallback VF object. The pure crate cannot hold Python
+/// objects, so a fallback is identified by its index into the ordered
+/// fallback list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// This versioned-files store (the Python `self`).
+    Local,
+    /// The fallback at this index in the immediate-fallback list.
+    Fallback(usize),
+}
+
+/// Group an ordered key sequence into `(source, [keys])` runs.
+///
+/// `source_of` maps each key to its [`Source`]; consecutive keys from the
+/// same source are collected into one run. Mirrors the "Now group by
+/// source" loops shared by the three Python ordering helpers.
+fn group_by_source(
+    keys: impl IntoIterator<Item = GcKey>,
+    source_of: impl Fn(&GcKey) -> Source,
+) -> Vec<(Source, Vec<GcKey>)> {
+    let mut runs: Vec<(Source, Vec<GcKey>)> = Vec::new();
+    for key in keys {
+        let source = source_of(&key);
+        match runs.last_mut() {
+            Some((s, run)) if *s == source => run.push(key),
+            _ => runs.push((source, vec![key])),
+        }
+    }
+    runs
+}
+
+/// Order keys topologically (or in groupcompress order) and group by source.
+///
+/// Mirrors `GroupCompressVersionedFiles._get_ordered_source_keys`. `ordering`
+/// is `"topological"` or `"groupcompress"`; any key absent from
+/// `key_to_source` is served locally.
+pub fn ordered_source_keys(
+    ordering: &str,
+    parent_map: &[(GcKey, Vec<GcKey>)],
+    key_to_source: &std::collections::HashMap<GcKey, Source>,
+) -> Vec<(Source, Vec<GcKey>)> {
+    let raw: Vec<(Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>)> = parent_map
+        .iter()
+        .map(|(k, ps)| {
+            (
+                k.segments().to_vec(),
+                ps.iter().map(|p| p.segments().to_vec()).collect(),
+            )
+        })
+        .collect();
+    let present: Vec<Vec<Vec<u8>>> = if ordering == "topological" {
+        let mut sorter = vcs_graph::tsort::TopoSorter::new(raw.into_iter());
+        sorter
+            .sorted()
+            .expect("groupcompress parent_map should not contain cycles")
+    } else {
+        crate::groupcompress::sort::sort_gc_optimal(raw)
+    };
+    let keys = present.into_iter().map(GcKey::fixed);
+    group_by_source(keys, |k| {
+        key_to_source.get(k).copied().unwrap_or(Source::Local)
+    })
+}
+
+/// Keep the caller's requested order, grouping by source and dropping keys
+/// that are absent from every store.
+///
+/// Mirrors `GroupCompressVersionedFiles._get_as_requested_source_keys`. A
+/// key present in `locations` or `unadded` is local; otherwise its
+/// `key_to_source` entry is used; a key in none of them is skipped.
+pub fn as_requested_source_keys(
+    orig_keys: &[GcKey],
+    locations: &std::collections::HashSet<GcKey>,
+    unadded: &std::collections::HashSet<GcKey>,
+    key_to_source: &std::collections::HashMap<GcKey, Source>,
+) -> Vec<(Source, Vec<GcKey>)> {
+    let present: Vec<GcKey> = orig_keys
+        .iter()
+        .filter(|k| {
+            locations.contains(*k) || unadded.contains(*k) || key_to_source.contains_key(*k)
+        })
+        .cloned()
+        .collect();
+    group_by_source(present, |k| {
+        if locations.contains(k) || unadded.contains(k) {
+            Source::Local
+        } else {
+            key_to_source.get(k).copied().unwrap_or(Source::Local)
+        }
+    })
+}
+
+/// Order keys for I/O efficiency: in-memory (unadded) keys first, then
+/// located keys grouped by the block they live in, then fallback runs.
+///
+/// Mirrors `GroupCompressVersionedFiles._get_io_ordered_source_keys`.
+/// `located_keys` is the located keys in the caller's order; each must have
+/// an entry in `locations`. They are stably sorted by their block index so
+/// keys in one group stay together while keeping their relative order, as
+/// Python's `sorted(locations, key=get_group)` does over an insertion-
+/// ordered dict. `fallback_runs` is the already-grouped `(source, keys)`
+/// list for keys served by fallbacks.
+pub fn io_ordered_source_keys<F: FileRef>(
+    located_keys: &[GcKey],
+    locations: &std::collections::HashMap<GcKey, IndexMemo<F>>,
+    unadded: &[GcKey],
+    fallback_runs: Vec<(Source, Vec<GcKey>)>,
+) -> Vec<(Source, Vec<GcKey>)> {
+    let mut local: Vec<GcKey> = unadded.to_vec();
+    let mut located: Vec<GcKey> = located_keys.to_vec();
+    // Python sorts located keys by the group object alone (index_memo[0]);
+    // the sort is stable, so keys within one group keep their relative order.
+    located.sort_by(|a, b| {
+        locations[a]
+            .read_memo
+            .index
+            .cmp(&locations[b].read_memo.index)
+    });
+    local.extend(located);
+    let mut runs = vec![(Source::Local, local)];
+    runs.extend(fallback_runs);
+    runs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +299,87 @@ mod tests {
         let req = vec![memo("a", 0), memo("b", 0)];
         let out = memos_to_fetch(&req, |_| true);
         assert!(out.is_empty());
+    }
+
+    fn gckey(id: &[u8]) -> GcKey {
+        GcKey::fixed(vec![id.to_vec()])
+    }
+
+    #[test]
+    fn ordered_source_keys_topological_groups_by_source() {
+        // Chain a -> b -> c; b is served by fallback 0, the rest locally.
+        let a = gckey(b"a");
+        let b = gckey(b"b");
+        let c = gckey(b"c");
+        let parent_map = vec![
+            (a.clone(), vec![]),
+            (b.clone(), vec![a.clone()]),
+            (c.clone(), vec![b.clone()]),
+        ];
+        let mut k2s = std::collections::HashMap::new();
+        k2s.insert(b.clone(), Source::Fallback(0));
+        let runs = ordered_source_keys("topological", &parent_map, &k2s);
+        assert_eq!(
+            runs,
+            vec![
+                (Source::Local, vec![a]),
+                (Source::Fallback(0), vec![b]),
+                (Source::Local, vec![c]),
+            ]
+        );
+    }
+
+    #[test]
+    fn as_requested_source_keys_keeps_order_and_drops_absent() {
+        let a = gckey(b"a");
+        let b = gckey(b"b");
+        let absent = gckey(b"absent");
+        let f = gckey(b"f");
+        let locations: std::collections::HashSet<GcKey> = vec![a.clone()].into_iter().collect();
+        let unadded: std::collections::HashSet<GcKey> = vec![b.clone()].into_iter().collect();
+        let mut k2s = std::collections::HashMap::new();
+        k2s.insert(f.clone(), Source::Fallback(1));
+        let runs = as_requested_source_keys(
+            &[a.clone(), absent, b.clone(), f.clone()],
+            &locations,
+            &unadded,
+            &k2s,
+        );
+        // `absent` is dropped; a and b are both local and merge into one run.
+        assert_eq!(
+            runs,
+            vec![(Source::Local, vec![a, b]), (Source::Fallback(1), vec![f])]
+        );
+    }
+
+    #[test]
+    fn io_ordered_source_keys_unadded_first_then_grouped_then_fallbacks() {
+        let u = gckey(b"u");
+        let x = gckey(b"x");
+        let y = gckey(b"y");
+        let f = gckey(b"f");
+        let mut locations = std::collections::HashMap::new();
+        // x in block "g2", y in block "g1" — sort pulls y ahead of x.
+        locations.insert(
+            x.clone(),
+            IndexMemo::new(ReadMemo::new("g2".to_string(), 0, 10), 0, 5),
+        );
+        locations.insert(
+            y.clone(),
+            IndexMemo::new(ReadMemo::new("g1".to_string(), 0, 10), 0, 5),
+        );
+        let runs = io_ordered_source_keys(
+            &[x.clone(), y.clone()],
+            &locations,
+            &[u.clone()],
+            vec![(Source::Fallback(0), vec![f.clone()])],
+        );
+        assert_eq!(
+            runs,
+            vec![
+                (Source::Local, vec![u, y, x]),
+                (Source::Fallback(0), vec![f]),
+            ]
+        );
     }
 }
