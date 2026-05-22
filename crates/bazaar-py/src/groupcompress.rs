@@ -3950,39 +3950,21 @@ impl GroupCompressVersionedFiles {
 
     /// SHA-1 of every key. Mirrors `get_sha1s`.
     fn get_sha1s<'py>(
-        slf: &Bound<'py, Self>,
+        &self,
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let mut key_vec: Vec<bazaar::groupcompress::gcvf::GcKey> = Vec::new();
+        for k in keys.try_iter()? {
+            key_vec.push(k?.extract()?);
+        }
+        let map = self
+            .pure
+            .get_sha1s(&key_vec)
+            .map_err(crate::knit::knit_err_to_py)?;
         let result = PyDict::new(py);
-        let stream = Self::get_record_stream(
-            slf,
-            py,
-            keys,
-            "unordered".into_pyobject(py)?.into_any(),
-            true,
-        )?;
-        for record in stream.try_iter()? {
-            let record = record?;
-            let sha1 = record.getattr("sha1")?;
-            if !sha1.is_none() {
-                result.set_item(record.getattr("key")?, sha1)?;
-            } else {
-                let kind: String = record.getattr("storage_kind")?.extract()?;
-                if kind != "absent" {
-                    // iter_bytes_as yields a generator; collect it by hand
-                    // since pyo3 cannot extract a Vec from a non-sequence.
-                    let mut chunks: Vec<Vec<u8>> = Vec::new();
-                    for chunk in record
-                        .call_method1("iter_bytes_as", ("chunked",))?
-                        .try_iter()?
-                    {
-                        chunks.push(chunk?.extract()?);
-                    }
-                    let digest = bazaar::weave::sha_strings(&chunks);
-                    result.set_item(record.getattr("key")?, PyBytes::new(py, &digest))?;
-                }
-            }
+        for (k, digest) in map {
+            result.set_item(k, PyBytes::new(py, &digest))?;
         }
         Ok(result)
     }
@@ -4011,31 +3993,20 @@ impl GroupCompressVersionedFiles {
         keys: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
         let _ = progress_bar;
-        let unordered =
-            || -> PyResult<Bound<'py, PyAny>> { Ok("unordered".into_pyobject(py)?.into_any()) };
         match keys {
             None => {
-                let all_keys = Self::keys(&slf.borrow(), py)?;
-                let stream =
-                    Self::get_record_stream(slf, py, all_keys.into_any(), unordered()?, true)?;
-                for record in stream.try_iter()? {
-                    let record = record?;
-                    for chunk in record
-                        .call_method1("iter_bytes_as", ("chunked",))?
-                        .try_iter()?
-                    {
-                        chunk?;
-                    }
-                }
+                slf.borrow()
+                    .pure
+                    .check()
+                    .map_err(crate::knit::knit_err_to_py)?;
                 Ok(None)
             }
-            Some(keys) => Ok(Some(Self::get_record_stream(
-                slf,
-                py,
-                keys,
-                unordered()?,
-                true,
-            )?)),
+            Some(keys) => {
+                let unordered = "unordered".into_pyobject(py)?.into_any();
+                Ok(Some(Self::get_record_stream(
+                    slf, py, keys, unordered, true,
+                )?))
+            }
         }
     }
 
@@ -4045,46 +4016,29 @@ impl GroupCompressVersionedFiles {
     /// text is read and split into lines. Returns the pairs as a list.
     #[pyo3(signature = (keys, pb=None))]
     fn iter_lines_added_or_present_in_keys<'py>(
-        slf: &Bound<'py, Self>,
+        &self,
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
         pb: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let key_set = PySet::empty(py)?;
+        let _ = pb;
+        let mut key_vec: Vec<bazaar::groupcompress::gcvf::GcKey> = Vec::new();
         for k in keys.try_iter()? {
-            key_set.add(k?)?;
+            key_vec.push(k?.extract()?);
         }
-        let total = key_set.len();
-        let revision_not_present = py
-            .import("bzrformats.errors")?
-            .getattr("RevisionNotPresent")?;
+        let pairs = self
+            .pure
+            .iter_lines_added_or_present_in_keys(&key_vec)
+            .map_err(crate::knit::knit_err_to_py)?;
         let out = PyList::empty(py);
-        let stream = Self::get_record_stream(
-            slf,
-            py,
-            key_set.into_any(),
-            "unordered".into_pyobject(py)?.into_any(),
-            true,
-        )?;
-        for (idx, record) in stream.try_iter()?.enumerate() {
-            let record = record?;
-            let key = record.getattr("key")?;
-            if let Some(pb) = &pb {
-                pb.call_method1("update", ("Walking content", idx, total))?;
-            }
-            let kind: String = record.getattr("storage_kind")?.extract()?;
-            if kind == "absent" {
-                return Err(PyErr::from_value(revision_not_present.call1((&key, slf))?));
-            }
-            for line in record
-                .call_method1("iter_bytes_as", ("lines",))?
-                .try_iter()?
-            {
-                out.append(PyTuple::new(py, [line?, key.clone()])?)?;
-            }
-        }
-        if let Some(pb) = &pb {
-            pb.call_method1("update", ("Walking content", total, total))?;
+        for (line, key) in pairs {
+            out.append(PyTuple::new(
+                py,
+                [
+                    PyBytes::new(py, &line).into_any(),
+                    key.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
         }
         Ok(out)
     }
