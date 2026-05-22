@@ -25,13 +25,15 @@ from ._bzr_rs.groupcompress import (
     RabinGroupCompressor,
     sort_gc_optimal,
 )
+from ._bzr_rs.groupcompress import (
+    GroupCompressVersionedFiles as _GroupCompressVersionedFilesRs,
+)
 from .btree_index import BTreeBuilder
 from .errors import (
     BzrFormatsError,
     InvalidRevisionId,
     RevisionNotPresent,
 )
-from .lru_cache import LRUSizeCache
 from .osutils import sha_strings
 from .versionedfile import (
     AbsentContentFactory,
@@ -264,8 +266,18 @@ class _BatchingBlockFetcher:
         self.total_bytes = 0
 
 
-class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
-    """A group-compress based VersionedFiles implementation."""
+class GroupCompressVersionedFiles(
+    _GroupCompressVersionedFilesRs, VersionedFilesWithFallbacks
+):
+    """A group-compress based VersionedFiles implementation.
+
+    Storage state (the index/access objects, the block cache, fallbacks)
+    and construction, ``without_fallbacks``, ``add_fallback_versioned_files``
+    and ``clear_cache`` come from the Rust pyclass. ``VersionedFilesWithFallbacks``
+    is mixed in so ``isinstance(x, VersionedFiles)`` holds. The remaining
+    record-stream and insert methods are still defined here and migrate onto
+    the Rust class over time.
+    """
 
     # This controls how the GroupCompress DeltaIndex works. Basically, we
     # compute hash pointers into the source blocks (so hash(text) => text).
@@ -277,39 +289,6 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
     # gives 100% sampling of a 1MB file.
     _DEFAULT_MAX_BYTES_TO_INDEX = 1024 * 1024
     _DEFAULT_COMPRESSOR_SETTINGS = {"max_bytes_to_index": _DEFAULT_MAX_BYTES_TO_INDEX}
-
-    def __init__(
-        self, index, access, delta=True, _unadded_refs=None, _group_cache=None
-    ):
-        """Create a GroupCompressVersionedFiles object.
-
-        :param index: The index object storing access and graph data.
-        :param access: The access object storing raw data.
-        :param delta: Whether to delta compress or just entropy compress.
-        :param _unadded_refs: private parameter, don't use.
-        :param _group_cache: private parameter, don't use.
-        """
-        self._index = index
-        self._access = access
-        self._delta = delta
-        if _unadded_refs is None:
-            _unadded_refs = {}
-        self._unadded_refs = _unadded_refs
-        if _group_cache is None:
-            _group_cache = LRUSizeCache(max_size=50 * 1024 * 1024)
-        self._group_cache = _group_cache
-        self._immediate_fallback_vfs = []
-        self._max_bytes_to_index = None
-
-    def without_fallbacks(self):
-        """Return a clone of this object without any fallbacks configured."""
-        return GroupCompressVersionedFiles(
-            self._index,
-            self._access,
-            self._delta,
-            _unadded_refs=dict(self._unadded_refs),
-            _group_cache=self._group_cache,
-        )
 
     def add_lines(
         self,
@@ -414,13 +393,6 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
         )[0]
         return sha1, length, None
 
-    def add_fallback_versioned_files(self, a_versioned_files):
-        """Add a source of texts for texts not present in this knit.
-
-        :param a_versioned_files: A VersionedFiles object.
-        """
-        self._immediate_fallback_vfs.append(a_versioned_files)
-
     def annotate(self, key):
         """See VersionedFiles.annotate."""
         ann = self.get_annotator()
@@ -445,12 +417,6 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
                     pass
         else:
             return self.get_record_stream(keys, "unordered", True)
-
-    def clear_cache(self):
-        """See VersionedFiles.clear_cache()."""
-        self._group_cache.clear()
-        self._index._graph_index.clear_cache()
-        self._index._int_cache.clear()
 
     def _check_add(self, key, random_id):
         """Check that version_id and lines are safe to add."""

@@ -2531,6 +2531,11 @@ impl GroupCompressVersionedFiles {
         self.unadded_refs.clone_ref(py)
     }
 
+    #[setter]
+    fn set__unadded_refs(&mut self, value: Bound<'_, PyDict>) {
+        self.unadded_refs = value.unbind();
+    }
+
     #[getter]
     fn _group_cache(&self, py: Python<'_>) -> Py<PyAny> {
         self.group_cache.clone_ref(py)
@@ -2559,18 +2564,20 @@ impl GroupCompressVersionedFiles {
     ///
     /// Mirrors `GroupCompressVersionedFiles.without_fallbacks`: the clone
     /// shares the block cache and gets a shallow copy of the unadded refs.
-    fn without_fallbacks(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let unadded_copy = self.unadded_refs.bind(py).copy()?;
-        let result = GroupCompressVersionedFiles {
-            index_obj: self.index_obj.clone_ref(py),
-            access_obj: self.access_obj.clone_ref(py),
-            delta: self.delta,
-            unadded_refs: unadded_copy.unbind(),
-            group_cache: self.group_cache.clone_ref(py),
-            immediate_fallback_vfs: Vec::new(),
-            max_bytes_to_index: self.max_bytes_to_index,
-        };
-        Py::new(py, result).map(|p| p.into_any())
+    /// The clone is built via `type(self)` so the Python subclass (which
+    /// still carries the not-yet-ported record-stream methods) is produced,
+    /// not the bare Rust base.
+    fn without_fallbacks<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let me = slf.borrow();
+        let unadded_copy = me.unadded_refs.bind(py).copy()?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("_unadded_refs", unadded_copy)?;
+        kwargs.set_item("_group_cache", me.group_cache.bind(py))?;
+        slf.get_type().call(
+            (me.index_obj.bind(py), me.access_obj.bind(py), me.delta),
+            Some(&kwargs),
+        )
     }
 
     /// Add a fallback store for texts not present in this one.
