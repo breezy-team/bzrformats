@@ -3106,9 +3106,513 @@ impl GroupCompressVersionedFiles {
             }
         }
     }
+
+    /// The GroupCompressor settings dict.
+    ///
+    /// Mirrors `_get_compressor_settings`: defaults `_max_bytes_to_index`
+    /// on first use, then returns `{"max_bytes_to_index": ...}`.
+    fn _get_compressor_settings<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        if self.max_bytes_to_index.is_none() {
+            self.max_bytes_to_index = Some(bazaar::groupcompress::gcvf::DEFAULT_MAX_BYTES_TO_INDEX);
+        }
+        let d = PyDict::new(py);
+        d.set_item("max_bytes_to_index", self.max_bytes_to_index)?;
+        Ok(d)
+    }
+
+    /// Build a fresh GroupCompressor from the current settings.
+    fn _make_group_compressor<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let settings = slf.borrow_mut()._get_compressor_settings(py)?;
+        py.get_type::<RabinGroupCompressor>()
+            .call1((settings,))
+            .map(|c| c.into_any())
+    }
+
+    /// Insert a record stream, returning `(sha1, length)` per record.
+    ///
+    /// Mirrors `_insert_record_stream`. Records are compressed into a
+    /// GroupCompressor; full blocks are flushed to the access object and
+    /// indexed. With `reuse_blocks`, a well-utilised incoming
+    /// groupcompress-block is copied as-is instead of being recompressed.
+    #[pyo3(signature = (stream, random_id=false, nostore_sha=None, reuse_blocks=true))]
+    fn _insert_record_stream<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        stream: Bound<'py, PyAny>,
+        random_id: bool,
+        nostore_sha: Option<Bound<'py, PyAny>>,
+        reuse_blocks: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let results = PyList::empty(py);
+        let adapter_registry = py
+            .import("bzrformats.versionedfile")?
+            .getattr("adapter_registry")?;
+        let unavailable = py
+            .import("bzrformats.versionedfile")?
+            .getattr("UnavailableRepresentation")?;
+        let decompress_corruption = py
+            .import("bzrformats.groupcompress")?
+            .getattr("DecompressCorruption")?;
+        let revision_not_present = py
+            .import("bzrformats.errors")?
+            .getattr("RevisionNotPresent")?;
+
+        // adapter cache: {adapter_key: adapter}
+        let adapters = PyDict::new(py);
+        let get_adapter = |adapter_key: &Bound<'py, PyAny>| -> PyResult<Bound<'py, PyAny>> {
+            if let Some(a) = adapters.get_item(adapter_key)? {
+                return Ok(a);
+            }
+            let factory = adapter_registry.call_method1("get", (adapter_key,))?;
+            let adapter = factory.call1((slf,))?;
+            adapters.set_item(adapter_key, &adapter)?;
+            Ok(adapter)
+        };
+
+        let compressor = Self::_make_group_compressor(slf, py)?;
+        slf.setattr("_compressor", &compressor)?;
+        slf.borrow_mut().unadded_refs = PyDict::new(py).unbind();
+        // keys_to_add: Vec<(key, "start end" reads, refs)>
+        let mut keys_to_add: Vec<(Py<PyAny>, Py<PyAny>, Py<PyAny>)> = Vec::new();
+
+        let mut last_prefix: Option<Py<PyAny>> = None;
+        let mut max_fulltext_len: usize = 0;
+        let mut max_fulltext_prefix: Option<Py<PyAny>> = None;
+        let mut insert_manager: Option<Py<PyAny>> = None;
+        let mut block_start: u64 = 0;
+        let mut block_length: u64 = 0;
+        let mut inserted_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut reuse_this_block = reuse_blocks;
+
+        for record in stream.try_iter()? {
+            let record = record?;
+            let storage_kind: String = record.getattr("storage_kind")?.extract()?;
+            if storage_kind == "absent" {
+                return Err(PyErr::from_value(
+                    revision_not_present.call1((record.getattr("key")?, slf))?,
+                ));
+            }
+            if random_id {
+                let key_repr = record.getattr("key")?.repr()?.to_string();
+                if !inserted_keys.insert(key_repr) {
+                    py.import("logging")?
+                        .call_method1("getLogger", ("bzrformats.groupcompress",))?
+                        .call_method1(
+                            "info",
+                            (
+                                "Insert claimed random_id=True, but then inserted %r two times",
+                                record.getattr("key")?,
+                            ),
+                        )?;
+                    continue;
+                }
+            }
+            if reuse_blocks {
+                // Only the leading groupcompress-block record decides reuse.
+                if storage_kind == "groupcompress-block" {
+                    let manager = record.getattr("_manager")?;
+                    reuse_this_block = manager.call_method0("check_is_well_utilized")?.extract()?;
+                    insert_manager = Some(manager.unbind());
+                }
+            } else {
+                reuse_this_block = false;
+            }
+            if reuse_this_block {
+                if storage_kind == "groupcompress-block" {
+                    let manager = record.getattr("_manager")?;
+                    insert_manager = Some(manager.clone().unbind());
+                    let block = manager.getattr("_block")?;
+                    let (bytes_len, chunks): (usize, Bound<'py, PyAny>) =
+                        block.call_method0("to_chunks")?.extract()?;
+                    let memo = slf
+                        .borrow()
+                        .access_obj
+                        .bind(py)
+                        .call_method1("add_raw_record", (py.None(), bytes_len, chunks))?;
+                    block_start = memo.get_item(1)?.extract()?;
+                    block_length = memo.get_item(2)?.extract()?;
+                }
+                if storage_kind == "groupcompress-block"
+                    || storage_kind == "groupcompress-block-ref"
+                {
+                    let manager = record.getattr("_manager")?;
+                    match &insert_manager {
+                        None => {
+                            return Err(pyo3::exceptions::PyAssertionError::new_err(
+                                "No insert_manager set",
+                            ))
+                        }
+                        Some(im) if !im.bind(py).is(&manager) => {
+                            return Err(pyo3::exceptions::PyAssertionError::new_err(
+                                "insert_manager does not match the current record, we \
+                                 cannot be positive that the appropriate content was \
+                                 inserted.",
+                            ))
+                        }
+                        _ => {}
+                    }
+                    let start: u64 = record.getattr("_start")?.extract()?;
+                    let end: u64 = record.getattr("_end")?.extract()?;
+                    let value = PyBytes::new(
+                        py,
+                        format!("{} {} {} {}", block_start, block_length, start, end).as_bytes(),
+                    );
+                    let parents = record.getattr("parents")?;
+                    let node = PyTuple::new(
+                        py,
+                        [
+                            record.getattr("key")?,
+                            value.into_any(),
+                            PyTuple::new(py, [parents])?.into_any(),
+                        ],
+                    )?;
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item("random_id", random_id)?;
+                    slf.borrow().index_obj.bind(py).call_method(
+                        "add_records",
+                        (PyList::new(py, [node])?,),
+                        Some(&kwargs),
+                    )?;
+                    continue;
+                }
+            }
+            // Ordinary path: get the record's chunked bytes, adapting if needed.
+            let chunks: Bound<'py, PyAny> = match record.call_method1("get_bytes_as", ("chunked",))
+            {
+                Ok(c) => c,
+                Err(e) if e.is_instance(py, &unavailable) => {
+                    let adapter_key = PyTuple::new(
+                        py,
+                        [
+                            record.getattr("storage_kind")?,
+                            "chunked".into_pyobject(py)?.into_any(),
+                        ],
+                    )?;
+                    let adapter = get_adapter(&adapter_key.into_any())?;
+                    adapter.call_method1("get_bytes", (&record, "chunked"))?
+                }
+                Err(e) if e.is_instance_of::<PyValueError>(py) => {
+                    return Err(PyErr::from_value(
+                        decompress_corruption.call1((e.to_string(),))?,
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+            let chunks_vec: Vec<Vec<u8>> = chunks.extract()?;
+            let chunks_len: usize = match record.getattr("size")?.extract::<Option<usize>>()? {
+                Some(s) => s,
+                None => chunks_vec.iter().map(|c| c.len()).sum(),
+            };
+            let key = record.getattr("key")?;
+            let (prefix, soft): (Option<Bound<'py, PyAny>>, bool) = if key.len()? > 1 {
+                let prefix = key.get_item(0)?;
+                let soft = last_prefix
+                    .as_ref()
+                    .is_some_and(|lp| lp.bind(py).eq(&prefix).unwrap_or(false));
+                (Some(prefix), soft)
+            } else {
+                (None, false)
+            };
+            if max_fulltext_len < chunks_len {
+                max_fulltext_len = chunks_len;
+                max_fulltext_prefix = prefix.as_ref().map(|p| p.clone().unbind());
+            }
+            let compressor = slf.getattr("_compressor")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("soft", soft)?;
+            kwargs.set_item("nostore_sha", &nostore_sha)?;
+            let res = compressor.call_method(
+                "compress",
+                (&key, &chunks, chunks_len, record.getattr("sha1")?),
+                Some(&kwargs),
+            )?;
+            let mut found_sha1: Py<PyAny> = res.get_item(0)?.unbind();
+            let mut end_point: usize = res.get_item(2)?.extract()?;
+            let mut start_point: usize = res.get_item(1)?.extract()?;
+            // start-new-block heuristic
+            let same_prefix = match (&prefix, &max_fulltext_prefix) {
+                (Some(p), Some(mp)) => p.eq(mp.bind(py)).unwrap_or(false),
+                (None, None) => true,
+                _ => false,
+            };
+            let start_new_block = if same_prefix && end_point < 2 * max_fulltext_len {
+                false
+            } else if end_point > 4 * 1024 * 1024 {
+                true
+            } else {
+                prefix.is_some()
+                    && !prefix
+                        .as_ref()
+                        .unwrap()
+                        .eq(last_prefix.as_ref().map(|p| p.bind(py)))
+                        .unwrap_or(false)
+                    && end_point > 2 * 1024 * 1024
+            };
+            last_prefix = prefix.as_ref().map(|p| p.clone().unbind());
+            if start_new_block {
+                let block = compressor.call_method0("flush_without_last")?;
+                Self::insert_flush(slf, py, &block, &mut keys_to_add, random_id)?;
+                max_fulltext_len = chunks_len;
+                let res2 = slf.getattr("_compressor")?.call_method1(
+                    "compress",
+                    (&key, &chunks, chunks_len, record.getattr("sha1")?),
+                )?;
+                found_sha1 = res2.get_item(0)?.unbind();
+                start_point = res2.get_item(1)?.extract()?;
+                end_point = res2.get_item(2)?.extract()?;
+            }
+            // key may be content-addressed: replace a None version id.
+            let stored_key = if key.get_item(-1)?.is_none() {
+                let n = key.len()?;
+                let prefix_items = PyList::empty(py);
+                for i in 0..n - 1 {
+                    prefix_items.append(key.get_item(i)?)?;
+                }
+                let mut sha_seg = b"sha1:".to_vec();
+                sha_seg.extend_from_slice(found_sha1.bind(py).extract::<Vec<u8>>()?.as_slice());
+                prefix_items.append(PyBytes::new(py, &sha_seg))?;
+                PyTuple::new(py, prefix_items.iter())?.into_any()
+            } else {
+                key.clone()
+            };
+            let parents = record.getattr("parents")?;
+            slf.borrow()
+                .unadded_refs
+                .bind(py)
+                .set_item(&stored_key, &parents)?;
+            results.append(PyTuple::new(
+                py,
+                [
+                    &found_sha1.bind(py).clone(),
+                    &chunks_len.into_pyobject(py)?.into_any(),
+                ],
+            )?)?;
+            // refs = (parents,) with parents normalised to nested tuples.
+            let refs_parents = if parents.is_none() {
+                py.None().into_bound(py)
+            } else {
+                let outer = PyList::empty(py);
+                for p in parents.try_iter()? {
+                    outer.append(PyTuple::new(
+                        py,
+                        p?.try_iter()?.collect::<PyResult<Vec<_>>>()?,
+                    )?)?;
+                }
+                PyTuple::new(py, outer.iter())?.into_any()
+            };
+            let reads = PyBytes::new(py, format!("{} {}", start_point, end_point).as_bytes());
+            keys_to_add.push((
+                stored_key.unbind(),
+                reads.into_any().unbind(),
+                PyTuple::new(py, [refs_parents])?.into_any().unbind(),
+            ));
+        }
+        if !keys_to_add.is_empty() {
+            let block = slf.getattr("_compressor")?.call_method0("flush")?;
+            Self::insert_flush(slf, py, &block, &mut keys_to_add, random_id)?;
+        }
+        slf.setattr("_compressor", py.None())?;
+        Ok(results)
+    }
+
+    /// Check that a key is safe to add. Mirrors `_check_add`.
+    fn _check_add(slf: &Bound<'_, Self>, key: Bound<'_, PyAny>, random_id: bool) -> PyResult<()> {
+        let _ = random_id;
+        let version_id = key.get_item(-1)?;
+        if !version_id.is_none() {
+            let vid: Vec<u8> = version_id.extract()?;
+            // Mirror osutils.contains_whitespace: ASCII space/tab/CR/LF/VT/FF.
+            if vid
+                .iter()
+                .any(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+            {
+                return Err(PyErr::from_value(
+                    slf.py()
+                        .import("bzrformats.errors")?
+                        .getattr("InvalidRevisionId")?
+                        .call1((version_id, slf))?,
+                ));
+            }
+        }
+        slf.call_method1("check_not_reserved_id", (version_id,))?;
+        Ok(())
+    }
+
+    /// Add a text from a `ContentFactory`. Mirrors `add_content`.
+    #[pyo3(signature = (factory, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false))]
+    fn add_content<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        factory: Bound<'py, PyAny>,
+        parent_texts: Option<Bound<'py, PyAny>>,
+        left_matching_blocks: Option<Bound<'py, PyAny>>,
+        nostore_sha: Option<Bound<'py, PyAny>>,
+        random_id: bool,
+    ) -> PyResult<(Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
+        let _ = (parent_texts, left_matching_blocks);
+        slf.borrow()
+            .index_obj
+            .bind(py)
+            .call_method0("_check_write_ok")?;
+        Self::_check_add(slf, factory.getattr("key")?, random_id)?;
+        let records = PyList::new(py, [&factory])?;
+        let result =
+            Self::_insert_record_stream(slf, py, records.into_any(), random_id, nostore_sha, true)?;
+        let first = result.get_item(0)?;
+        Ok((
+            first.get_item(0)?.unbind(),
+            first.get_item(1)?.unbind(),
+            py.None(),
+        ))
+    }
+
+    /// Add a text given as a list of lines. Mirrors `add_lines`.
+    #[pyo3(signature = (key, parents, lines, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_lines<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+        parents: Bound<'py, PyAny>,
+        lines: Bound<'py, PyAny>,
+        parent_texts: Option<Bound<'py, PyAny>>,
+        left_matching_blocks: Option<Bound<'py, PyAny>>,
+        nostore_sha: Option<Bound<'py, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<(Py<PyAny>, Py<PyAny>, Py<PyAny>)> {
+        slf.borrow()
+            .index_obj
+            .bind(py)
+            .call_method0("_check_write_ok")?;
+        let line_vec: Vec<Vec<u8>> = lines.extract()?;
+        if check_content {
+            for line in &line_vec {
+                if !line.is_empty() && line[..line.len() - 1].contains(&b'\n') {
+                    return Err(PyValueError::new_err("lines contain newlines"));
+                }
+            }
+        }
+        let sha1 = PyBytes::new(py, &bazaar::weave::sha_strings(&line_vec));
+        let chunked_cls = py
+            .import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("ChunkedContentFactory")?;
+        let factory = chunked_cls.call1((&key, &parents, sha1, &lines))?;
+        Self::add_content(
+            slf,
+            py,
+            factory,
+            parent_texts,
+            left_matching_blocks,
+            nostore_sha,
+            random_id,
+        )
+    }
+
+    /// Insert a record stream. Mirrors `insert_record_stream`.
+    fn insert_record_stream<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        stream: Bound<'py, PyAny>,
+    ) -> PyResult<()> {
+        // random_id stays False: see the note in the Python original about
+        // test_insert_record_stream_existing_keys.
+        Self::_insert_record_stream(slf, py, stream, false, None, true)?;
+        Ok(())
+    }
+
+    /// SHA-1 of every key. Mirrors `get_sha1s`.
+    fn get_sha1s<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let result = PyDict::new(py);
+        let stream = Self::get_record_stream(
+            slf,
+            py,
+            keys,
+            "unordered".into_pyobject(py)?.into_any(),
+            true,
+        )?;
+        for record in stream.try_iter()? {
+            let record = record?;
+            let sha1 = record.getattr("sha1")?;
+            if !sha1.is_none() {
+                result.set_item(record.getattr("key")?, sha1)?;
+            } else {
+                let kind: String = record.getattr("storage_kind")?.extract()?;
+                if kind != "absent" {
+                    // iter_bytes_as yields a generator; collect it by hand
+                    // since pyo3 cannot extract a Vec from a non-sequence.
+                    let mut chunks: Vec<Vec<u8>> = Vec::new();
+                    for chunk in record
+                        .call_method1("iter_bytes_as", ("chunked",))?
+                        .try_iter()?
+                    {
+                        chunks.push(chunk?.extract()?);
+                    }
+                    let digest = bazaar::weave::sha_strings(&chunks);
+                    result.set_item(record.getattr("key")?, PyBytes::new(py, &digest))?;
+                }
+            }
+        }
+        Ok(result)
+    }
 }
 
 impl GroupCompressVersionedFiles {
+    /// Flush a finished block: write it via the access object, index every
+    /// buffered key against it, and reset the pending state.
+    ///
+    /// Mirrors the `flush` closure inside `_insert_record_stream`.
+    fn insert_flush<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        block: &Bound<'py, PyAny>,
+        keys_to_add: &mut Vec<(Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
+        random_id: bool,
+    ) -> PyResult<()> {
+        let (bytes_len, chunks): (usize, Bound<'py, PyAny>) =
+            block.call_method0("to_chunks")?.extract()?;
+        // A new compressor starts the next block.
+        let compressor = Self::_make_group_compressor(slf, py)?;
+        slf.setattr("_compressor", &compressor)?;
+        let memo = slf
+            .borrow()
+            .access_obj
+            .bind(py)
+            .call_method1("add_raw_record", (py.None(), bytes_len, chunks))?;
+        let start: u64 = memo.get_item(1)?.extract()?;
+        let length: u64 = memo.get_item(2)?.extract()?;
+        let nodes = PyList::empty(py);
+        for (key, reads, refs) in keys_to_add.iter() {
+            let reads_bytes = reads.bind(py).extract::<Vec<u8>>()?;
+            let mut value = format!("{} {} ", start, length).into_bytes();
+            value.extend_from_slice(&reads_bytes);
+            nodes.append(PyTuple::new(
+                py,
+                [
+                    key.bind(py).clone(),
+                    PyBytes::new(py, &value).into_any(),
+                    refs.bind(py).clone(),
+                ],
+            )?)?;
+        }
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("random_id", random_id)?;
+        slf.borrow()
+            .index_obj
+            .bind(py)
+            .call_method("add_records", (nodes,), Some(&kwargs))?;
+        slf.borrow_mut().unadded_refs = PyDict::new(py).unbind();
+        keys_to_add.clear();
+        Ok(())
+    }
+
     /// Shared implementation behind `get_parent_map` /
     /// `_get_parent_map_with_sources`: walk the local index then each
     /// fallback, merging their `get_parent_map` answers and recording what
@@ -3283,33 +3787,32 @@ impl GroupCompressVersionedFiles {
         for k in unadded.iter() {
             present.append(k)?;
         }
-        // Sort located keys by their block (index_memo's start/stop offsets)
-        // so keys in one block stay contiguous and blocks come out in file
-        // order. Python sorts by the whole index_memo; the index object is
-        // equal within a single index, so ordering falls to the offsets.
-        // The sort is stable, matching `sorted(locations, key=get_group)`.
+        // Sort located keys by their index_memo's numeric fields
+        // (start, stop, basis_end, delta_end): the start/stop pair keeps
+        // keys of one block contiguous and orders blocks by file position,
+        // and the basis_end/delta_end pair orders keys within a block by
+        // their position in it. Python sorts by the whole index_memo; the
+        // index object is equal within a single index, so ordering falls to
+        // exactly these four numbers. The sort is stable, matching
+        // `sorted(locations, key=get_group)`.
         let mut located: Vec<Bound<'py, PyAny>> = locations.keys().iter().collect();
         located.sort_by(|a, b| {
-            let group = |k: &Bound<'py, PyAny>| -> (u64, u64) {
+            let group = |k: &Bound<'py, PyAny>| -> (u64, u64, u64, u64) {
                 locations
                     .get_item(k)
                     .ok()
                     .flatten()
                     .and_then(|d| d.get_item(0).ok())
                     .map(|im| {
-                        let start = im
-                            .get_item(1)
-                            .ok()
-                            .and_then(|v| v.extract::<u64>().ok())
-                            .unwrap_or(0);
-                        let stop = im
-                            .get_item(2)
-                            .ok()
-                            .and_then(|v| v.extract::<u64>().ok())
-                            .unwrap_or(0);
-                        (start, stop)
+                        let num = |i: isize| -> u64 {
+                            im.get_item(i)
+                                .ok()
+                                .and_then(|v| v.extract::<u64>().ok())
+                                .unwrap_or(0)
+                        };
+                        (num(1), num(2), num(3), num(4))
                     })
-                    .unwrap_or((0, 0))
+                    .unwrap_or((0, 0, 0, 0))
             };
             group(a).cmp(&group(b))
         });

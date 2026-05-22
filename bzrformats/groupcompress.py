@@ -18,7 +18,6 @@
 
 import logging
 
-from . import osutils
 from ._bzr_rs import groupcompress as _groupcompress_rs
 from ._bzr_rs.groupcompress import (  # noqa: F401
     GroupCompressBlock,
@@ -31,15 +30,10 @@ from ._bzr_rs.groupcompress import (
 from .btree_index import BTreeBuilder
 from .errors import (
     BzrFormatsError,
-    InvalidRevisionId,
     RevisionNotPresent,
 )
-from .osutils import sha_strings
 from .versionedfile import (
-    ChunkedContentFactory,
-    UnavailableRepresentation,
     VersionedFilesWithFallbacks,
-    adapter_registry,
 )
 
 logger = logging.getLogger("bzrformats.groupcompress")
@@ -179,109 +173,6 @@ class GroupCompressVersionedFiles(
     _DEFAULT_MAX_BYTES_TO_INDEX = 1024 * 1024
     _DEFAULT_COMPRESSOR_SETTINGS = {"max_bytes_to_index": _DEFAULT_MAX_BYTES_TO_INDEX}
 
-    def add_lines(
-        self,
-        key,
-        parents,
-        lines,
-        parent_texts=None,
-        left_matching_blocks=None,
-        nostore_sha=None,
-        random_id=False,
-        check_content=True,
-    ):
-        r"""Add a text to the store.
-
-        :param key: The key tuple of the text to add.
-        :param parents: The parents key tuples of the text to add.
-        :param lines: A list of lines. Each line must be a bytestring. And all
-            of them except the last must be terminated with \n and contain no
-            other \n's. The last line may either contain no \n's or a single
-            terminating \n. If the lines list does meet this constraint the
-            add routine may error or may succeed - but you will be unable to
-            read the data back accurately. (Checking the lines have been split
-            correctly is expensive and extremely unlikely to catch bugs so it
-            is not done at runtime unless check_content is True.)
-        :param parent_texts: An optional dictionary containing the opaque
-            representations of some or all of the parents of version_id to
-            allow delta optimisations.  VERY IMPORTANT: the texts must be those
-            returned by add_lines or data corruption can be caused.
-        :param left_matching_blocks: a hint about which areas are common
-            between the text and its left-hand-parent.  The format is
-            the SequenceMatcher.get_matching_blocks format.
-        :param nostore_sha: Raise ExistingContent and do not add the lines to
-            the versioned file if the digest of the lines matches this.
-        :param random_id: If True a random id has been selected rather than
-            an id determined by some deterministic process such as a converter
-            from a foreign VCS. When True the backend may choose not to check
-            for uniqueness of the resulting key within the versioned file, so
-            this should only be done when the result is expected to be unique
-            anyway.
-        :param check_content: If True, the lines supplied are verified to be
-            bytestrings that are correctly formed lines.
-        :return: The text sha1, the number of bytes in the text, and an opaque
-                 representation of the inserted version which can be provided
-                 back to future add_lines calls in the parent_texts dictionary.
-        """
-        self._index._check_write_ok()
-        if check_content:
-            self._check_lines_not_unicode(lines)
-            self._check_lines_are_lines(lines)
-        return self.add_content(
-            ChunkedContentFactory(key, parents, sha_strings(lines), lines),
-            parent_texts,
-            left_matching_blocks,
-            nostore_sha,
-            random_id,
-        )
-
-    def add_content(
-        self,
-        factory,
-        parent_texts=None,
-        left_matching_blocks=None,
-        nostore_sha=None,
-        random_id=False,
-    ):
-        """Add a text to the store.
-
-        :param factory: A ContentFactory that can be used to retrieve the key,
-            parents and contents.
-        :param parent_texts: An optional dictionary containing the opaque
-            representations of some or all of the parents of version_id to
-            allow delta optimisations.  VERY IMPORTANT: the texts must be those
-            returned by add_lines or data corruption can be caused.
-        :param left_matching_blocks: a hint about which areas are common
-            between the text and its left-hand-parent.  The format is
-            the SequenceMatcher.get_matching_blocks format.
-        :param nostore_sha: Raise ExistingContent and do not add the lines to
-            the versioned file if the digest of the lines matches this.
-        :param random_id: If True a random id has been selected rather than
-            an id determined by some deterministic process such as a converter
-            from a foreign VCS. When True the backend may choose not to check
-            for uniqueness of the resulting key within the versioned file, so
-            this should only be done when the result is expected to be unique
-            anyway.
-        :return: The text sha1, the number of bytes in the text, and an opaque
-                 representation of the inserted version which can be provided
-                 back to future add_lines calls in the parent_texts dictionary.
-        """
-        self._index._check_write_ok()
-        parents = factory.parents
-        self._check_add(factory.key, random_id)
-        if parents is None:
-            # The caller might pass None if there is no graph data, but kndx
-            # indexes can't directly store that, so we give them
-            # an empty tuple instead.
-            parents = ()
-        # double handling for now. Make it work until then.
-        sha1, length = list(
-            self._insert_record_stream(
-                [factory], random_id=random_id, nostore_sha=nostore_sha
-            )
-        )[0]
-        return sha1, length, None
-
     def annotate(self, key):
         """See VersionedFiles.annotate."""
         ann = self.get_annotator()
@@ -307,17 +198,6 @@ class GroupCompressVersionedFiles(
         else:
             return self.get_record_stream(keys, "unordered", True)
 
-    def _check_add(self, key, random_id):
-        """Check that version_id and lines are safe to add."""
-        version_id = key[-1]
-        if version_id is not None and osutils.contains_whitespace(version_id):
-            raise InvalidRevisionId(version_id, self)
-        self.check_not_reserved_id(version_id)
-        # TODO: If random_id==False and the key is already present, we should
-        # probably check that the existing content is identical to what is
-        # being inserted, and otherwise raise an exception.  This would make
-        # the bundle code simpler.
-
     def get_missing_compression_parent_keys(self):
         """Return the keys of missing compression parents.
 
@@ -327,231 +207,6 @@ class GroupCompressVersionedFiles(
         # GroupCompress cannot currently reference texts that are not in the
         # group, so this is valid for now
         return frozenset()
-
-    def get_sha1s(self, keys):
-        """See VersionedFiles.get_sha1s()."""
-        result = {}
-        for record in self.get_record_stream(keys, "unordered", True):
-            if record.sha1 is not None:
-                result[record.key] = record.sha1
-            else:
-                if record.storage_kind != "absent":
-                    result[record.key] = sha_strings(record.iter_bytes_as("chunked"))
-        return result
-
-    def insert_record_stream(self, stream):
-        """Insert a record stream into this container.
-
-        :param stream: A stream of records to insert.
-        :return: None
-        :seealso VersionedFiles.get_record_stream:
-        """
-        # XXX: Setting random_id=True makes
-        # test_insert_record_stream_existing_keys fail for groupcompress and
-        # groupcompress-nograph, this needs to be revisited while addressing
-        # 'bzr branch' performance issues.
-        for _, _ in self._insert_record_stream(stream, random_id=False):
-            pass
-
-    def _get_compressor_settings(self):
-        if self._max_bytes_to_index is None:
-            self._max_bytes_to_index = self._DEFAULT_MAX_BYTES_TO_INDEX
-        return {"max_bytes_to_index": self._max_bytes_to_index}
-
-    def _make_group_compressor(self):
-        return GroupCompressor(self._get_compressor_settings())
-
-    def _insert_record_stream(
-        self, stream, random_id=False, nostore_sha=None, reuse_blocks=True
-    ):
-        """Internal core to insert a record stream into this container.
-
-        This helper function has a different interface than insert_record_stream
-        to allow add_lines to be minimal, but still return the needed data.
-
-        :param stream: A stream of records to insert.
-        :param nostore_sha: If the sha1 of a given text matches nostore_sha,
-            raise ExistingContent, rather than committing the new text.
-        :param reuse_blocks: If the source is streaming from
-            groupcompress-blocks, just insert the blocks as-is, rather than
-            expanding the texts and inserting again.
-        :return: An iterator over (sha1, length) of the inserted records.
-        :seealso insert_record_stream:
-        :seealso add_lines:
-        """
-        adapters = {}
-
-        def get_adapter(adapter_key):
-            try:
-                return adapters[adapter_key]
-            except KeyError:
-                adapter_factory = adapter_registry.get(adapter_key)
-                adapter = adapter_factory(self)
-                adapters[adapter_key] = adapter
-                return adapter
-
-        # This will go up to fulltexts for gc to gc fetching, which isn't
-        # ideal.
-        self._compressor = self._make_group_compressor()
-        self._unadded_refs = {}
-        keys_to_add = []
-
-        def flush(block):
-            bytes_len, chunks = block.to_chunks()
-            self._compressor = self._make_group_compressor()
-            # Note: At this point we still have 1 copy of the fulltext (in
-            #       record and the var 'bytes'), and this generates 2 copies of
-            #       the compressed text (one for bytes, one in chunks)
-            # TODO: Figure out how to indicate that we would be happy to free
-            #       the fulltext content at this point. Note that sometimes we
-            #       will want it later (streaming CHK pages), but most of the
-            #       time we won't (everything else)
-            _index, start, length = self._access.add_raw_record(None, bytes_len, chunks)
-            nodes = []
-            for key, reads, refs in keys_to_add:
-                nodes.append((key, b"%d %d %s" % (start, length, reads), refs))
-            self._index.add_records(nodes, random_id=random_id)
-            self._unadded_refs = {}
-            del keys_to_add[:]
-
-        last_prefix = None
-        max_fulltext_len = 0
-        max_fulltext_prefix = None
-        insert_manager = None
-        block_start = None
-        block_length = None
-        # XXX: TODO: remove this, it is just for safety checking for now
-        inserted_keys = set()
-        reuse_this_block = reuse_blocks
-        for record in stream:
-            # Raise an error when a record is missing.
-            if record.storage_kind == "absent":
-                raise RevisionNotPresent(record.key, self)
-            if random_id:
-                if record.key in inserted_keys:
-                    logger.info(
-                        "Insert claimed random_id=True, but then inserted %r two times",
-                        record.key,
-                    )
-                    continue
-                inserted_keys.add(record.key)
-            if reuse_blocks:
-                # If the reuse_blocks flag is set, check to see if we can just
-                # copy a groupcompress block as-is.
-                # We only check on the first record (groupcompress-block) not
-                # on all of the (groupcompress-block-ref) entries.
-                # The reuse_this_block flag is then kept for as long as
-                if record.storage_kind == "groupcompress-block":
-                    # Check to see if we really want to re-use this block
-                    insert_manager = record._manager
-                    reuse_this_block = insert_manager.check_is_well_utilized()
-            else:
-                reuse_this_block = False
-            if reuse_this_block:
-                # We still want to reuse this block
-                if record.storage_kind == "groupcompress-block":
-                    # Insert the raw block into the target repo
-                    insert_manager = record._manager
-                    bytes_len, chunks = record._manager._block.to_chunks()
-                    _, start, length = self._access.add_raw_record(
-                        None, bytes_len, chunks
-                    )
-                    block_start = start
-                    block_length = length
-                if record.storage_kind in (
-                    "groupcompress-block",
-                    "groupcompress-block-ref",
-                ):
-                    if insert_manager is None:
-                        raise AssertionError("No insert_manager set")
-                    if insert_manager is not record._manager:
-                        raise AssertionError(
-                            "insert_manager does not match"
-                            " the current record, we cannot be positive"
-                            " that the appropriate content was inserted."
-                        )
-                    value = b"%d %d %d %d" % (
-                        block_start,
-                        block_length,
-                        record._start,
-                        record._end,
-                    )
-                    nodes = [(record.key, value, (record.parents,))]
-                    # TODO: Consider buffering up many nodes to be added, not
-                    #       sure how much overhead this has, but we're seeing
-                    #       ~23s / 120s in add_records calls
-                    self._index.add_records(nodes, random_id=random_id)
-                    continue
-            try:
-                chunks = record.get_bytes_as("chunked")
-            except UnavailableRepresentation:
-                adapter_key = record.storage_kind, "chunked"
-                adapter = get_adapter(adapter_key)
-                chunks = adapter.get_bytes(record, "chunked")
-            except ValueError as e:
-                # Rust groupcompress raises ValueError for corrupt
-                # deflate / mismatched length / unparseable content;
-                # surface a structured BzrFormatsError so callers see
-                # the same class regardless of source.
-                raise DecompressCorruption(str(e)) from e
-            chunks_len = record.size
-            if chunks_len is None:
-                chunks_len = sum(map(len, chunks))
-            if len(record.key) > 1:
-                prefix = record.key[0]
-                soft = prefix == last_prefix
-            else:
-                prefix = None
-                soft = False
-            if max_fulltext_len < chunks_len:
-                max_fulltext_len = chunks_len
-                max_fulltext_prefix = prefix
-            (found_sha1, start_point, end_point, _type) = self._compressor.compress(
-                record.key,
-                chunks,
-                chunks_len,
-                record.sha1,
-                soft=soft,
-                nostore_sha=nostore_sha,
-            )
-            # delta_ratio = float(chunks_len) / (end_point - start_point)
-            # Check if we want to continue to include that text
-            if prefix == max_fulltext_prefix and end_point < 2 * max_fulltext_len:
-                # As long as we are on the same file_id, we will fill at least
-                # 2 * max_fulltext_len
-                start_new_block = False
-            elif end_point > 4 * 1024 * 1024:
-                start_new_block = True
-            elif (
-                prefix is not None
-                and prefix != last_prefix
-                and end_point > 2 * 1024 * 1024
-            ):
-                start_new_block = True
-            else:
-                start_new_block = False
-            last_prefix = prefix
-            if start_new_block:
-                flush(self._compressor.flush_without_last())
-                max_fulltext_len = chunks_len
-                (found_sha1, start_point, end_point, _type) = self._compressor.compress(
-                    record.key, chunks, chunks_len, record.sha1
-                )
-            if record.key[-1] is None:
-                key = record.key[:-1] + (b"sha1:" + found_sha1,)
-            else:
-                key = record.key
-            self._unadded_refs[key] = record.parents
-            yield found_sha1, chunks_len
-            if record.parents is not None:
-                parents = tuple([tuple(p) for p in record.parents])
-            else:
-                parents = None
-            refs = (parents,)
-            keys_to_add.append((key, b"%d %d" % (start_point, end_point), refs))
-        if len(keys_to_add):
-            flush(self._compressor.flush())
-        self._compressor = None
 
     def iter_lines_added_or_present_in_keys(self, keys, pb=None):
         r"""Iterate over the lines in the versioned files from keys.
