@@ -860,6 +860,44 @@ pub trait VersionedFiles<CF: ContentFactory, I> {
         ordering: Ordering,
         include_delta_closure: bool,
     ) -> Box<dyn Iterator<Item = CF>>;
+
+    /// Keys of missing compression parents left behind by a prior
+    /// `insert_record_stream`.
+    ///
+    /// Mirrors `VersionedFiles.get_missing_compression_parent_keys`, which
+    /// is abstract on the Python base; stores that do not track this raise
+    /// `NotImplementedError`.
+    fn get_missing_compression_parent_keys(&self) -> Result<Vec<Key>, crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented(
+            "get_missing_compression_parent_keys",
+        ))
+    }
+
+    /// Drop whatever caches this store holds.
+    ///
+    /// Mirrors `VersionedFiles.clear_cache`, whose base implementation is a
+    /// no-op; stores with caches override this.
+    fn clear_cache(&self) {}
+
+    /// Check this store for integrity.
+    ///
+    /// Mirrors `VersionedFiles.check`, which is abstract on the Python base.
+    fn check(&self) -> Result<(), crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented("check"))
+    }
+}
+
+/// Whether every entry in `lines` is a single full line.
+///
+/// A full line carries a newline only as its final byte; an embedded `\n`
+/// anywhere before the last position means the caller passed text that was
+/// not split into lines. Mirrors `VersionedFiles._check_lines_are_lines`,
+/// which raises `ValueError` when this returns false.
+pub fn check_lines_are_lines(lines: &[Vec<u8>]) -> bool {
+    lines.iter().all(|line| {
+        let body = line.split_last().map_or(&[][..], |(_, rest)| rest);
+        !body.contains(&b'\n')
+    })
 }
 
 /// Encode a record's metadata + fulltext into the `fulltext\n<len><meta><body>`
@@ -1010,4 +1048,34 @@ pub fn fulltext_network_to_record(bytes: &[u8], line_end: usize) -> FulltextCont
     let fulltext = &bytes[line_end + 4 + meta_len..];
 
     FulltextContentFactory::new(None, key, parents, fulltext.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_lines_are_lines_accepts_proper_lines() {
+        assert!(check_lines_are_lines(&[]));
+        assert!(check_lines_are_lines(&[b"a\n".to_vec(), b"b\n".to_vec()]));
+        // A final line without a trailing newline is still a single line.
+        assert!(check_lines_are_lines(&[
+            b"a\n".to_vec(),
+            b"no-eol".to_vec()
+        ]));
+        // A bare newline is one (empty) line.
+        assert!(check_lines_are_lines(&[b"\n".to_vec()]));
+        // An empty entry has no embedded newline.
+        assert!(check_lines_are_lines(&[b"".to_vec()]));
+    }
+
+    #[test]
+    fn check_lines_are_lines_rejects_embedded_newlines() {
+        // A newline before the last byte means the text was not split.
+        assert!(!check_lines_are_lines(&[b"a\nb\n".to_vec()]));
+        assert!(!check_lines_are_lines(&[
+            b"ok\n".to_vec(),
+            b"a\nb".to_vec()
+        ]));
+    }
 }
