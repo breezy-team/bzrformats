@@ -1,6 +1,6 @@
 use bazaar::groupcompress::compressor::GroupCompressor;
 use bazaar::versionedfile::Key;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
 use pyo3::wrap_pyfunction;
@@ -84,13 +84,25 @@ type GcReadMemo = bazaar::groupcompress::gcvf::ReadMemo<GcFileRef>;
 
 /// Convert a Python `(index, start, stop)` read-memo tuple to [`GcReadMemo`].
 fn extract_read_memo(obj: &Bound<'_, PyAny>) -> PyResult<GcReadMemo> {
-    let tup = obj
-        .cast::<PyTuple>()
-        .map_err(|_| PyValueError::new_err("read_memo must be a (index, start, stop) tuple"))?;
-    let index = tup.get_item(0)?.unbind();
-    let start: u64 = tup.get_item(1)?.extract()?;
-    let stop: u64 = tup.get_item(2)?.extract()?;
+    let index = obj.get_item(0)?.unbind();
+    let start: u64 = obj.get_item(1)?.extract()?;
+    let stop: u64 = obj.get_item(2)?.extract()?;
     Ok(GcReadMemo::new(GcFileRef::new(index), start, stop))
+}
+
+/// The `(index, start, stop)` read-memo triple from a full `index_memo`.
+fn read_memo_tuple<'py>(
+    py: Python<'py>,
+    index_memo: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    PyTuple::new(
+        py,
+        [
+            index_memo.get_item(0)?,
+            index_memo.get_item(1)?,
+            index_memo.get_item(2)?,
+        ],
+    )
 }
 
 fn extract_key_segments(obj: &Bound<PyAny>) -> PyResult<Vec<Vec<u8>>> {
@@ -2529,6 +2541,242 @@ fn as_tuples<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'p
     }
 }
 
+/// Fetches groupcompress blocks in batches and turns them into record
+/// factories.
+///
+/// Port of the Python `_BatchingBlockFetcher`. Keys are accumulated with
+/// `add_key`; `yield_factories` fetches the batch's blocks, builds one
+/// `LazyGroupContentManager` per block, registers each key as a factory,
+/// and returns the resulting record factories.
+#[pyclass(name = "_BatchingBlockFetcher")]
+pub struct BatchingBlockFetcher {
+    /// The owning `GroupCompressVersionedFiles` (for `_get_blocks`).
+    gcvf: Py<PyAny>,
+    /// `{key: index_memo}` for every key that might be fetched.
+    locations: Py<PyDict>,
+    /// Keys added to the current batch, in order.
+    keys: Vec<Py<PyAny>>,
+    /// Read-memos seen this batch -> cached block, or `None` if to-fetch.
+    batch_memos: std::collections::HashMap<GcReadMemo, Option<Py<PyAny>>>,
+    /// Uncached read-memos to fetch: typed memo paired with its tuple.
+    memos_to_get: Vec<(GcReadMemo, Py<PyAny>)>,
+    /// Running byte estimate for the pending batch.
+    total_bytes: u64,
+    /// Read-memo of the block the current manager covers.
+    last_read_memo: Option<GcReadMemo>,
+    /// The manager accumulating factories for the current block.
+    manager: Option<Py<LazyGroupContentManager>>,
+    /// Optional compressor-settings callback passed to each manager.
+    get_compressor_settings: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl BatchingBlockFetcher {
+    #[new]
+    #[pyo3(signature = (gcvf, locations, get_compressor_settings=None))]
+    fn new(
+        gcvf: Bound<'_, PyAny>,
+        locations: Bound<'_, PyDict>,
+        get_compressor_settings: Option<Bound<'_, PyAny>>,
+    ) -> Self {
+        BatchingBlockFetcher {
+            gcvf: gcvf.unbind(),
+            locations: locations.unbind(),
+            keys: Vec::new(),
+            batch_memos: std::collections::HashMap::new(),
+            memos_to_get: Vec::new(),
+            total_bytes: 0,
+            last_read_memo: None,
+            manager: None,
+            get_compressor_settings: get_compressor_settings.map(|s| s.unbind()),
+        }
+    }
+
+    /// Add a key to the current batch; return the running byte estimate.
+    ///
+    /// Mirrors `_BatchingBlockFetcher.add_key`: a read-memo already in the
+    /// batch is not re-counted; an uncached one is queued for fetch and its
+    /// `stop` offset added to the estimate (matching the Python code, which
+    /// adds `read_memo[2]`).
+    fn add_key(&mut self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<u64> {
+        // locations[key] is a GCBuildDetails; index_memo is its element 0.
+        let details = self
+            .locations
+            .bind(py)
+            .get_item(&key)?
+            .ok_or_else(|| PyKeyError::new_err("key not in locations"))?;
+        let index_memo = details.get_item(0)?;
+        // read_memo = index_memo[0:3]
+        let read_memo_obj = read_memo_tuple(py, &index_memo)?;
+        let read_memo = extract_read_memo(&read_memo_obj)?;
+        self.keys.push(key.unbind());
+        if self.batch_memos.contains_key(&read_memo) {
+            return Ok(self.total_bytes);
+        }
+        let cached = self
+            .gcvf
+            .bind(py)
+            .getattr("_group_cache")?
+            .call_method1("get", (&read_memo_obj, py.None()))?;
+        if cached.is_none() {
+            self.batch_memos.insert(read_memo.clone(), None);
+            self.memos_to_get
+                .push((read_memo, read_memo_obj.into_any().unbind()));
+            self.total_bytes += index_memo.get_item(2)?.extract::<u64>()?;
+        } else {
+            self.batch_memos.insert(read_memo, Some(cached.unbind()));
+        }
+        Ok(self.total_bytes)
+    }
+
+    /// Keys added to the current batch, in order.
+    #[getter]
+    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for k in &self.keys {
+            list.append(k.bind(py))?;
+        }
+        Ok(list)
+    }
+
+    /// Read-memo tuples this batch still needs to fetch, in first-seen order.
+    #[getter]
+    fn memos_to_get<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for (_, tuple) in &self.memos_to_get {
+            list.append(tuple.bind(py))?;
+        }
+        Ok(list)
+    }
+
+    /// Running byte estimate for the pending batch.
+    #[getter]
+    fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Build and return the record factories for the keys added so far.
+    ///
+    /// Mirrors `_BatchingBlockFetcher.yield_factories`: blocks are fetched,
+    /// a `LazyGroupContentManager` is started per block, each key is
+    /// registered, and the managers' record streams are collected. With
+    /// `full_flush` the final manager is flushed too. Returns the factories
+    /// as a list (the Python generator is consumed eagerly by callers).
+    #[pyo3(signature = (full_flush=false))]
+    fn yield_factories<'py>(
+        &mut self,
+        py: Python<'py>,
+        full_flush: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        if self.manager.is_none() && self.keys.is_empty() {
+            return Ok(out);
+        }
+        // Fetch every block this batch needs, as a (read_memo, block) iter.
+        let memos_list = PyList::empty(py);
+        for (_, tuple) in &self.memos_to_get {
+            memos_list.append(tuple.bind(py))?;
+        }
+        let blocks = self
+            .gcvf
+            .bind(py)
+            .call_method1("_get_blocks", (memos_list,))?;
+        let mut blocks_iter = blocks.try_iter()?;
+        // memos_to_get_stack: the to-fetch memos in reverse, so the next
+        // expected block is always at the end.
+        let mut memos_stack: Vec<GcReadMemo> = self
+            .memos_to_get
+            .iter()
+            .rev()
+            .map(|(m, _)| m.clone())
+            .collect();
+        let keys = std::mem::take(&mut self.keys);
+        for key in &keys {
+            // locations[key] is a GCBuildDetails: details[0] is index_memo,
+            // details[2] is the key's parents.
+            let details = self
+                .locations
+                .bind(py)
+                .get_item(key.bind(py))?
+                .ok_or_else(|| PyKeyError::new_err("key not in locations"))?;
+            let index_memo = details.get_item(0)?;
+            let read_memo = extract_read_memo(&index_memo)?;
+            if self.last_read_memo.as_ref() != Some(&read_memo) {
+                // Crossing into a new block: flush the previous manager.
+                self.flush_manager(py, &out)?;
+                let block: Py<PyAny> = if memos_stack.last() == Some(&read_memo) {
+                    // The next block from _get_blocks is the one we need.
+                    let pair = blocks_iter.next().ok_or_else(|| {
+                        PyRuntimeError::new_err("_get_blocks yielded too few blocks")
+                    })??;
+                    let block_read_memo = extract_read_memo(&pair.get_item(0)?)?;
+                    if block_read_memo != read_memo {
+                        return Err(pyo3::exceptions::PyAssertionError::new_err(
+                            "block_read_memo out of sync with read_memo",
+                        ));
+                    }
+                    let block = pair.get_item(1)?.unbind();
+                    self.batch_memos
+                        .insert(read_memo.clone(), Some(block.clone_ref(py)));
+                    memos_stack.pop();
+                    block
+                } else {
+                    self.batch_memos
+                        .get(&read_memo)
+                        .and_then(|b| b.as_ref())
+                        .ok_or_else(|| {
+                            PyRuntimeError::new_err("batch_memos missing a cached block")
+                        })?
+                        .clone_ref(py)
+                };
+                let block_obj = block.bind(py).clone().cast_into::<GroupCompressBlock>()?;
+                let settings = self
+                    .get_compressor_settings
+                    .as_ref()
+                    .map(|s| s.bind(py).clone());
+                let manager = Bound::new(
+                    py,
+                    LazyGroupContentManager::new(block_obj.unbind(), settings.map(|s| s.unbind())),
+                )?;
+                self.manager = Some(manager.unbind());
+                self.last_read_memo = Some(read_memo);
+            }
+            // index_memo[3:5] -> (start, end); parents is details[2].
+            let start: u64 = index_memo.get_item(3)?.extract()?;
+            let end: u64 = index_memo.get_item(4)?.extract()?;
+            let parents = details.get_item(2)?;
+            self.manager
+                .as_ref()
+                .expect("manager set above")
+                .bind(py)
+                .call_method1("add_factory", (key.bind(py), parents, start, end))?;
+        }
+        if full_flush {
+            self.flush_manager(py, &out)?;
+        }
+        self.batch_memos.clear();
+        self.memos_to_get.clear();
+        self.total_bytes = 0;
+        Ok(out)
+    }
+}
+
+impl BatchingBlockFetcher {
+    /// Drain the current manager's record stream into `out` and drop it.
+    ///
+    /// Mirrors `_BatchingBlockFetcher._flush_manager`.
+    fn flush_manager(&mut self, py: Python<'_>, out: &Bound<'_, PyList>) -> PyResult<()> {
+        if let Some(manager) = self.manager.take() {
+            let stream = manager.bind(py).call_method0("get_record_stream")?;
+            for record in stream.try_iter()? {
+                out.append(record?)?;
+            }
+            self.last_read_memo = None;
+        }
+        Ok(())
+    }
+}
+
 /// Rust-backed implementation of Python's `GroupCompressVersionedFiles`.
 ///
 /// At this stage the pyclass is only a state container: it holds the
@@ -2849,6 +3097,7 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<RecordStreamIter>()?;
     m.add_class::<GCBuildDetails>()?;
     m.add_class::<GCGraphIndex>()?;
+    m.add_class::<BatchingBlockFetcher>()?;
     m.add_class::<GroupCompressVersionedFiles>()?;
     m.add_class::<crate::groupcompress_delta::DeltaIndex>()?;
     m.add_function(wrap_pyfunction!(

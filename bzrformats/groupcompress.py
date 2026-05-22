@@ -23,6 +23,7 @@ from ._bzr_rs import groupcompress as _groupcompress_rs
 from ._bzr_rs.groupcompress import (  # noqa: F401
     GroupCompressBlock,
     RabinGroupCompressor,
+    _BatchingBlockFetcher,
     sort_gc_optimal,
 )
 from ._bzr_rs.groupcompress import (
@@ -154,115 +155,6 @@ def cleanup_pack_group(versioned_files):
     """
     versioned_files.writer.end()
     versioned_files.stream.close()
-
-
-class _BatchingBlockFetcher:
-    """Fetch group compress blocks in batches.
-
-    :ivar total_bytes: int of expected number of bytes needed to fetch the
-        currently pending batch.
-    """
-
-    def __init__(self, gcvf, locations, get_compressor_settings=None):
-        self.gcvf = gcvf
-        self.locations = locations
-        self.keys = []
-        self.batch_memos = {}
-        self.memos_to_get = []
-        self.total_bytes = 0
-        self.last_read_memo = None
-        self.manager = None
-        self._get_compressor_settings = get_compressor_settings
-
-    def add_key(self, key):
-        """Add another to key to fetch.
-
-        :return: The estimated number of bytes needed to fetch the batch so
-            far.
-        """
-        self.keys.append(key)
-        index_memo, _, _, _ = self.locations[key]
-        read_memo = index_memo[0:3]
-        # Three possibilities for this read_memo:
-        #  - it's already part of this batch; or
-        #  - it's not yet part of this batch, but is already cached; or
-        #  - it's not yet part of this batch and will need to be fetched.
-        if read_memo in self.batch_memos:
-            # This read memo is already in this batch.
-            return self.total_bytes
-        try:
-            cached_block = self.gcvf._group_cache[read_memo]
-        except KeyError:
-            # This read memo is new to this batch, and the data isn't cached
-            # either.
-            self.batch_memos[read_memo] = None
-            self.memos_to_get.append(read_memo)
-            byte_length = read_memo[2]
-            self.total_bytes += byte_length
-        else:
-            # This read memo is new to this batch, but cached.
-            # Keep a reference to the cached block in batch_memos because it's
-            # certain that we'll use it when this batch is processed, but
-            # there's a risk that it would fall out of _group_cache between now
-            # and then.
-            self.batch_memos[read_memo] = cached_block
-        return self.total_bytes
-
-    def _flush_manager(self):
-        if self.manager is not None:
-            yield from self.manager.get_record_stream()
-            self.manager = None
-            self.last_read_memo = None
-
-    def yield_factories(self, full_flush=False):
-        """Yield factories for keys added since the last yield.  They will be
-        returned in the order they were added via add_key.
-
-        :param full_flush: by default, some results may not be returned in case
-            they can be part of the next batch.  If full_flush is True, then
-            all results are returned.
-        """
-        if self.manager is None and not self.keys:
-            return
-        # Fetch all memos in this batch.
-        blocks = self.gcvf._get_blocks(self.memos_to_get)
-        # Turn blocks into factories and yield them.
-        memos_to_get_stack = list(self.memos_to_get)
-        memos_to_get_stack.reverse()
-        for key in self.keys:
-            index_memo, _, parents, _ = self.locations[key]
-            read_memo = index_memo[:3]
-            if self.last_read_memo != read_memo:
-                # We are starting a new block. If we have a
-                # manager, we have found everything that fits for
-                # now, so yield records
-                yield from self._flush_manager()
-                # Now start a new manager.
-                if memos_to_get_stack and memos_to_get_stack[-1] == read_memo:
-                    # The next block from _get_blocks will be the block we
-                    # need.
-                    block_read_memo, block = next(blocks)
-                    if block_read_memo != read_memo:
-                        raise AssertionError(
-                            "block_read_memo out of sync with read_memo"
-                            f"({block_read_memo!r} != {read_memo!r})"
-                        )
-                    self.batch_memos[read_memo] = block
-                    memos_to_get_stack.pop()
-                else:
-                    block = self.batch_memos[read_memo]
-                self.manager = _LazyGroupContentManager(
-                    block, get_compressor_settings=self._get_compressor_settings
-                )
-                self.last_read_memo = read_memo
-            start, end = index_memo[3:5]
-            self.manager.add_factory(key, parents, start, end)
-        if full_flush:
-            yield from self._flush_manager()
-        del self.keys[:]
-        self.batch_memos.clear()
-        del self.memos_to_get[:]
-        self.total_bytes = 0
 
 
 class GroupCompressVersionedFiles(
