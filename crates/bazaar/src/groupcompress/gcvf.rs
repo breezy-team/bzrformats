@@ -430,6 +430,8 @@ where
             std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>,
         >,
     >,
+    /// Fallback stores consulted for keys absent from this one.
+    fallbacks: Vec<Box<dyn crate::versionedfile::VersionedFiles>>,
 }
 
 impl<I, A> GroupCompressVersionedFiles<I, A>
@@ -444,7 +446,18 @@ where
             access,
             delta,
             block_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fallbacks: Vec::new(),
         }
+    }
+
+    /// Add a fallback store for keys not present in this one.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles.add_fallback_versioned_files`.
+    pub fn add_fallback_versioned_files(
+        &mut self,
+        fallback: Box<dyn crate::versionedfile::VersionedFiles>,
+    ) {
+        self.fallbacks.push(fallback);
     }
 
     /// The backing index.
@@ -511,19 +524,39 @@ where
 
     /// Graph parents for `keys`; absent keys are omitted.
     ///
-    /// Mirrors `GroupCompressVersionedFiles.get_parent_map` without
-    /// fallbacks (the pure store has no fallback list; the pyo3 wrapper
-    /// layers fallbacks on top, matching how it is done for knit).
+    /// Mirrors `GroupCompressVersionedFiles.get_parent_map`: the local
+    /// index is consulted first, then each fallback in turn for keys still
+    /// missing.
     pub fn get_parent_map(
         &self,
         keys: &[GcKey],
     ) -> Result<std::collections::HashMap<GcKey, Vec<GcKey>>, crate::knit::KnitError> {
-        self.index.get_parent_map(keys)
+        let mut result = self.index.get_parent_map(keys)?;
+        let mut missing: Vec<GcKey> = keys
+            .iter()
+            .filter(|k| !result.contains_key(*k))
+            .cloned()
+            .collect();
+        for fb in &self.fallbacks {
+            if missing.is_empty() {
+                break;
+            }
+            let found = fb.get_parent_map(&missing)?;
+            missing.retain(|k| !found.contains_key(k));
+            result.extend(found);
+        }
+        Ok(result)
     }
 
-    /// All keys present in this store.
+    /// All keys present in this store or any fallback.
     pub fn keys(&self) -> Result<Vec<GcKey>, crate::knit::KnitError> {
-        self.index.keys()
+        let mut seen: std::collections::HashSet<GcKey> = self.index.keys()?.into_iter().collect();
+        for fb in &self.fallbacks {
+            for k in fb.keys()? {
+                seen.insert(k);
+            }
+        }
+        Ok(seen.into_iter().collect())
     }
 
     /// Get a stream of records for `keys`.
@@ -543,14 +576,39 @@ where
         ordering: &str,
     ) -> Result<Vec<Box<dyn crate::versionedfile::ContentFactory>>, crate::knit::KnitError> {
         let locations = self.index.get_build_details(keys)?;
-        // Keys absent from the index.
         let mut out: Vec<Box<dyn crate::versionedfile::ContentFactory>> = Vec::new();
-        for key in keys {
-            if !locations.contains_key(key) {
-                out.push(Box::new(crate::versionedfile::AbsentContentFactory::new(
-                    key.clone(),
-                )));
+        // Keys not in the local index are tried against fallbacks; only keys
+        // absent from every store yield an AbsentContentFactory.
+        let mut nonlocal: Vec<GcKey> = keys
+            .iter()
+            .filter(|k| !locations.contains_key(*k))
+            .cloned()
+            .collect();
+        for fb in &self.fallbacks {
+            if nonlocal.is_empty() {
+                break;
             }
+            let fb_records = fb.get_record_stream(&nonlocal, ordering, true)?;
+            let mut still_missing: Vec<GcKey> = Vec::new();
+            let mut found: std::collections::HashSet<GcKey> = std::collections::HashSet::new();
+            for rec in fb_records {
+                if rec.storage_kind() == "absent" {
+                    continue;
+                }
+                found.insert(rec.key());
+                out.push(rec);
+            }
+            for k in nonlocal {
+                if !found.contains(&k) {
+                    still_missing.push(k);
+                }
+            }
+            nonlocal = still_missing;
+        }
+        for key in nonlocal {
+            out.push(Box::new(crate::versionedfile::AbsentContentFactory::new(
+                key,
+            )));
         }
         // Order the located keys.
         let located: Vec<GcKey> = keys
