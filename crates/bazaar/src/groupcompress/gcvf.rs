@@ -85,6 +85,90 @@ pub struct FetchedBlock<F: FileRef = String> {
     pub block: GroupCompressBlock,
 }
 
+/// What a [`GcIndex`] knows about one stored key.
+///
+/// Mirrors the Python `_GCGraphIndex.get_build_details` result (a
+/// `GCBuildDetails`): where the record's bytes live (`index_memo`) and the
+/// key's graph parents. groupcompress records are always whole entries
+/// inside a block, so there is no separate compression-parent field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcBuildDetails<F: FileRef = String> {
+    /// Locates the record: its block and slice within the block.
+    pub index_memo: IndexMemo<F>,
+    /// The key's graph parents, or `None` if the index stores no graph.
+    pub parents: Option<Vec<GcKey>>,
+}
+
+/// The index half of a groupcompress store.
+///
+/// Resolves keys to build details and graph parents, and accepts new
+/// records. The pyo3 layer implements this by wrapping a Python
+/// `_GCGraphIndex`; pure-Rust callers implement it directly. Mirrors the
+/// `KnitIndex` trait.
+pub trait GcIndex {
+    /// Identifies which backing block-file a record lives in.
+    type F: FileRef;
+
+    /// Build details for `keys`. Missing keys are absent from the result.
+    fn get_build_details(
+        &self,
+        keys: &[GcKey],
+    ) -> Result<std::collections::HashMap<GcKey, GcBuildDetails<Self::F>>, crate::knit::KnitError>;
+
+    /// Graph parents for `keys`. Missing keys are absent from the result.
+    fn get_parent_map(
+        &self,
+        keys: &[GcKey],
+    ) -> Result<std::collections::HashMap<GcKey, Vec<GcKey>>, crate::knit::KnitError>;
+
+    /// All keys present in this index.
+    fn keys(&self) -> Result<Vec<GcKey>, crate::knit::KnitError>;
+
+    /// Whether this index stores graph parents.
+    fn has_graph(&self) -> bool;
+
+    /// Assert that a write is permitted, erroring otherwise.
+    fn check_write_ok(&self) -> Result<(), crate::knit::KnitError>;
+
+    /// Add records to the index.
+    ///
+    /// Each record is `(key, index_memo, parents)`. `random_id` skips the
+    /// duplicate check.
+    fn add_records(
+        &self,
+        records: &[(GcKey, IndexMemo<Self::F>, Option<Vec<GcKey>>)],
+        random_id: bool,
+    ) -> Result<(), crate::knit::KnitError>;
+}
+
+/// The raw-data half of a groupcompress store.
+///
+/// Fetches and appends whole compressed blocks. Mirrors `KnitAccess`.
+pub trait GcAccess {
+    /// Identifies which backing block-file a block lives in.
+    type F: FileRef;
+
+    /// Fetch the raw (compressed) bytes for each read-memo, in order.
+    fn get_raw_records(
+        &self,
+        memos: &[ReadMemo<Self::F>],
+    ) -> Result<Vec<Vec<u8>>, crate::knit::KnitError>;
+
+    /// Append a compressed block and return the read-memo locating it.
+    fn add_raw_record(
+        &self,
+        size: usize,
+        chunks: Vec<Vec<u8>>,
+    ) -> Result<ReadMemo<Self::F>, crate::knit::KnitError>;
+
+    /// Call the reload hook after a stale-pack error, or re-raise it.
+    ///
+    /// Returns `Ok(())` if the caller should retry, `Err` if unrecoverable.
+    fn reload_or_raise(&self, err: crate::knit::KnitError) -> Result<(), crate::knit::KnitError> {
+        Err(err)
+    }
+}
+
 /// Given the read-memos a batch wants and which of them are already
 /// cached, return the de-duplicated, order-preserving list of memos that
 /// still need to be fetched.
