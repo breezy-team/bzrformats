@@ -59,14 +59,12 @@ from . import index as _mod_index
 from . import pack_repo
 from .errors import (
     BzrFormatsError,
-    RevisionNotPresent,
 )
 from .osutils import sha_strings
 from .versionedfile import (
     ContentFactory,
     UnavailableRepresentation,
     VersionedFilesWithFallbacks,
-    adapter_registry,
 )
 
 evil_logger = logging.getLogger("bzrformats.evil")

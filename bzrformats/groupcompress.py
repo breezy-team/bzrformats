@@ -29,8 +29,6 @@ from .btree_index import BTreeBuilder
 from .errors import (
     BzrFormatsError,
     InvalidRevisionId,
-    ObjectNotLocked,
-    ReadOnlyError,
     RevisionNotPresent,
 )
 from .lru_cache import LRUSizeCache
@@ -40,7 +38,6 @@ from .versionedfile import (
     ChunkedContentFactory,
     UnavailableRepresentation,
     VersionedFilesWithFallbacks,
-    _KeyRefs,
     adapter_registry,
 )
 
@@ -1020,11 +1017,9 @@ class GroupCompressVersionedFiles(VersionedFilesWithFallbacks):
         return result
 
 
-from ._bzr_rs.groupcompress import GCBuildDetails as _GCBuildDetails
-from ._bzr_rs.groupcompress import _GCGraphIndex
-
-
 from ._bzr_rs import groupcompress
+from ._bzr_rs.groupcompress import GCBuildDetails as _GCBuildDetails  # noqa: F401
+from ._bzr_rs.groupcompress import _GCGraphIndex
 
 encode_base128_int = groupcompress.encode_base128_int
 encode_copy_instruction = groupcompress.encode_copy_instruction
