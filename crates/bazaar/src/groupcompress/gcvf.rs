@@ -492,6 +492,23 @@ where
         }
         Ok(out)
     }
+
+    /// Graph parents for `keys`; absent keys are omitted.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles.get_parent_map` without
+    /// fallbacks (the pure store has no fallback list; the pyo3 wrapper
+    /// layers fallbacks on top, matching how it is done for knit).
+    pub fn get_parent_map(
+        &self,
+        keys: &[GcKey],
+    ) -> Result<std::collections::HashMap<GcKey, Vec<GcKey>>, crate::knit::KnitError> {
+        self.index.get_parent_map(keys)
+    }
+
+    /// All keys present in this store.
+    pub fn keys(&self) -> Result<Vec<GcKey>, crate::knit::KnitError> {
+        self.index.keys()
+    }
 }
 
 #[cfg(test)]
