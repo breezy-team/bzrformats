@@ -85,6 +85,33 @@ pub struct FetchedBlock<F: FileRef = String> {
     pub block: GroupCompressBlock,
 }
 
+/// Given the read-memos a batch wants and which of them are already
+/// cached, return the de-duplicated, order-preserving list of memos that
+/// still need to be fetched.
+///
+/// Mirrors the partitioning loop in `GroupCompressVersionedFiles._get_blocks`:
+/// a memo that is cached is skipped, and a memo already queued for fetch is
+/// not queued twice. The first-seen request order is preserved so the
+/// fetched raw records line up with the consume order. The actual cache
+/// lookup, raw-record fetch, and block decode stay in the pyo3 layer
+/// because the block cache is a Python `LRUSizeCache`.
+pub fn memos_to_fetch<F: FileRef>(
+    read_memos: &[ReadMemo<F>],
+    is_cached: impl Fn(&ReadMemo<F>) -> bool,
+) -> Vec<ReadMemo<F>> {
+    let mut out: Vec<ReadMemo<F>> = Vec::new();
+    let mut seen: std::collections::HashSet<ReadMemo<F>> = std::collections::HashSet::new();
+    for memo in read_memos {
+        if is_cached(memo) {
+            continue;
+        }
+        if seen.insert(memo.clone()) {
+            out.push(memo.clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +145,32 @@ mod tests {
         assert_eq!(im.read_memo, rm);
         assert_eq!(im.entry_start, 40);
         assert_eq!(im.entry_end, 120);
+    }
+
+    fn memo(idx: &str, start: u64) -> ReadMemo<String> {
+        ReadMemo::new(idx.to_string(), start, start + 10)
+    }
+
+    #[test]
+    fn memos_to_fetch_skips_cached_and_preserves_order() {
+        let req = vec![memo("a", 0), memo("b", 0), memo("c", 0)];
+        let cached = [memo("b", 0)];
+        let out = memos_to_fetch(&req, |m| cached.contains(m));
+        assert_eq!(out, vec![memo("a", 0), memo("c", 0)]);
+    }
+
+    #[test]
+    fn memos_to_fetch_dedups_repeated_memos() {
+        // The same block requested twice is fetched once, in first-seen order.
+        let req = vec![memo("a", 0), memo("b", 0), memo("a", 0), memo("c", 0)];
+        let out = memos_to_fetch(&req, |_| false);
+        assert_eq!(out, vec![memo("a", 0), memo("b", 0), memo("c", 0)]);
+    }
+
+    #[test]
+    fn memos_to_fetch_empty_when_all_cached() {
+        let req = vec![memo("a", 0), memo("b", 0)];
+        let out = memos_to_fetch(&req, |_| true);
+        assert!(out.is_empty());
     }
 }
