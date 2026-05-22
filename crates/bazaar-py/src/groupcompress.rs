@@ -3562,6 +3562,108 @@ impl GroupCompressVersionedFiles {
         }
         Ok(result)
     }
+
+    /// Keys of missing compression parents.
+    ///
+    /// Mirrors `get_missing_compression_parent_keys`: groupcompress cannot
+    /// reference texts outside the group, so this is always empty.
+    fn get_missing_compression_parent_keys<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        py.import("builtins")?
+            .call_method1("frozenset", (PyList::empty(py),))
+    }
+
+    /// Check the store for integrity. Mirrors `check`.
+    ///
+    /// With `keys=None` every record is read and decoded; otherwise the
+    /// record stream for `keys` is returned for the caller to inspect.
+    #[pyo3(signature = (progress_bar=None, keys=None))]
+    fn check<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        progress_bar: Option<Bound<'py, PyAny>>,
+        keys: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let _ = progress_bar;
+        let unordered =
+            || -> PyResult<Bound<'py, PyAny>> { Ok("unordered".into_pyobject(py)?.into_any()) };
+        match keys {
+            None => {
+                let all_keys = Self::keys(&slf.borrow(), py)?;
+                let stream =
+                    Self::get_record_stream(slf, py, all_keys.into_any(), unordered()?, true)?;
+                for record in stream.try_iter()? {
+                    let record = record?;
+                    for chunk in record
+                        .call_method1("iter_bytes_as", ("chunked",))?
+                        .try_iter()?
+                    {
+                        chunk?;
+                    }
+                }
+                Ok(None)
+            }
+            Some(keys) => Ok(Some(Self::get_record_stream(
+                slf,
+                py,
+                keys,
+                unordered()?,
+                true,
+            )?)),
+        }
+    }
+
+    /// Iterate `(line, key)` pairs over the lines in `keys`.
+    ///
+    /// Mirrors `iter_lines_added_or_present_in_keys`: each requested key's
+    /// text is read and split into lines. Returns the pairs as a list.
+    #[pyo3(signature = (keys, pb=None))]
+    fn iter_lines_added_or_present_in_keys<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+        pb: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let key_set = PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            key_set.add(k?)?;
+        }
+        let total = key_set.len();
+        let revision_not_present = py
+            .import("bzrformats.errors")?
+            .getattr("RevisionNotPresent")?;
+        let out = PyList::empty(py);
+        let stream = Self::get_record_stream(
+            slf,
+            py,
+            key_set.into_any(),
+            "unordered".into_pyobject(py)?.into_any(),
+            true,
+        )?;
+        for (idx, record) in stream.try_iter()?.enumerate() {
+            let record = record?;
+            let key = record.getattr("key")?;
+            if let Some(pb) = &pb {
+                pb.call_method1("update", ("Walking content", idx, total))?;
+            }
+            let kind: String = record.getattr("storage_kind")?.extract()?;
+            if kind == "absent" {
+                return Err(PyErr::from_value(revision_not_present.call1((&key, slf))?));
+            }
+            for line in record
+                .call_method1("iter_bytes_as", ("lines",))?
+                .try_iter()?
+            {
+                out.append(PyTuple::new(py, [line?, key.clone()])?)?;
+            }
+        }
+        if let Some(pb) = &pb {
+            pb.call_method1("update", ("Walking content", total, total))?;
+        }
+        Ok(out)
+    }
 }
 
 impl GroupCompressVersionedFiles {

@@ -30,7 +30,6 @@ from ._bzr_rs.groupcompress import (
 from .btree_index import BTreeBuilder
 from .errors import (
     BzrFormatsError,
-    RevisionNotPresent,
 )
 from .versionedfile import (
     VersionedFilesWithFallbacks,
@@ -187,67 +186,6 @@ class GroupCompressVersionedFiles(
         from .annotate import VersionedFileAnnotator
 
         return VersionedFileAnnotator(self)
-
-    def check(self, progress_bar=None, keys=None):
-        """See VersionedFiles.check()."""
-        if keys is None:
-            keys = self.keys()
-            for record in self.get_record_stream(keys, "unordered", True):
-                for _chunk in record.iter_bytes_as("chunked"):
-                    pass
-        else:
-            return self.get_record_stream(keys, "unordered", True)
-
-    def get_missing_compression_parent_keys(self):
-        """Return the keys of missing compression parents.
-
-        Missing compression parents occur when a record stream was missing
-        basis texts, or a index was scanned that had missing basis texts.
-        """
-        # GroupCompress cannot currently reference texts that are not in the
-        # group, so this is valid for now
-        return frozenset()
-
-    def iter_lines_added_or_present_in_keys(self, keys, pb=None):
-        r"""Iterate over the lines in the versioned files from keys.
-
-        This may return lines from other keys. Each item the returned
-        iterator yields is a tuple of a line and a text version that that line
-        is present in (not introduced in).
-
-        Ordering of results is in whatever order is most suitable for the
-        underlying storage format.
-
-        If a progress bar is supplied, it may be used to indicate progress.
-        The caller is responsible for cleaning up progress bars (because this
-        is an iterator).
-
-        Notes:
-         * Lines are normalised by the underlying store: they will all have \n
-           terminators.
-         * Lines are returned in arbitrary order.
-
-        :return: An iterator over (line, key).
-        """
-        keys = set(keys)
-        total = len(keys)
-        # we don't care about inclusions, the caller cares.
-        # but we need to setup a list of records to visit.
-        # we need key, position, length
-        for key_idx, record in enumerate(
-            self.get_record_stream(keys, "unordered", True)
-        ):
-            # XXX: todo - optimise to use less than full texts.
-            key = record.key
-            if pb is not None:
-                pb.update("Walking content", key_idx, total)
-            if record.storage_kind == "absent":
-                raise RevisionNotPresent(key, self)
-            for line in record.iter_bytes_as("lines"):
-                yield line, key
-        if pb is not None:
-            pb.update("Walking content", total, total)
-
 
 from ._bzr_rs import groupcompress
 from ._bzr_rs.groupcompress import GCBuildDetails as _GCBuildDetails  # noqa: F401
