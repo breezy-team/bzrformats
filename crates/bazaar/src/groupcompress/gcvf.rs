@@ -623,6 +623,172 @@ where
         }
         Ok(out)
     }
+
+    /// Insert a stream of records into this store.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles._insert_record_stream` for the
+    /// ordinary (non-block-reuse) path: each record's text is compressed
+    /// into a `RabinGroupCompressor`; when the start-new-block heuristic
+    /// fires the current block is flushed (written via `GcAccess` and
+    /// indexed via `GcIndex`) and a fresh compressor started. Returns the
+    /// `(sha1, length)` of each inserted record.
+    ///
+    /// `nostore_sha`, when set on a record's content, causes
+    /// `KnitError::ExistingContent` if the text is already stored.
+    pub fn insert_record_stream(
+        &self,
+        stream: impl IntoIterator<Item = Box<dyn crate::versionedfile::ContentFactory>>,
+        random_id: bool,
+    ) -> Result<Vec<(Vec<u8>, usize)>, crate::knit::KnitError> {
+        use crate::groupcompress::compressor::{GroupCompressor, RabinGroupCompressor};
+
+        self.index.check_write_ok()?;
+        let mut results: Vec<(Vec<u8>, usize)> = Vec::new();
+        let mut compressor = RabinGroupCompressor::new(None);
+        // Records compressed into the block not yet flushed: their key, the
+        // (entry_start, entry_end) within the block, and graph parents.
+        let mut pending: Vec<(GcKey, usize, usize, Option<Vec<GcKey>>)> = Vec::new();
+        let mut inserted: std::collections::HashSet<GcKey> = std::collections::HashSet::new();
+
+        let mut last_prefix: Option<Vec<u8>> = None;
+        let mut max_fulltext_len: usize = 0;
+        let mut max_fulltext_prefix: Option<Vec<u8>> = None;
+
+        for record in stream {
+            let key = record.key();
+            if record.storage_kind() == "absent" {
+                return Err(crate::knit::KnitError::RevisionNotPresent(key));
+            }
+            if random_id && !inserted.insert(key.clone()) {
+                // Same key offered twice under random_id: skip the dup.
+                continue;
+            }
+            // The record's text, as chunks.
+            let chunks: Vec<Vec<u8>> = record.to_chunks().map(|c| c.into_owned()).collect();
+            let chunks_len: usize = record
+                .size()
+                .unwrap_or_else(|| chunks.iter().map(|c| c.len()).sum());
+            let chunk_refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+
+            // The prefix is the key's first segment for multi-segment keys.
+            let prefix: Option<Vec<u8>> = if key.segments().len() > 1 {
+                Some(key.segments()[0].clone())
+            } else {
+                None
+            };
+            let soft = prefix.is_some() && prefix == last_prefix;
+            if max_fulltext_len < chunks_len {
+                max_fulltext_len = chunks_len;
+                max_fulltext_prefix = prefix.clone();
+            }
+            let (mut sha1, mut start_point, mut end_point) = compress_record(
+                &mut compressor,
+                &key,
+                &chunk_refs,
+                chunks_len,
+                record.sha1(),
+                soft,
+            )?;
+            // Start-new-block heuristic (mirrors the Python conditions).
+            let same_prefix = prefix == max_fulltext_prefix;
+            let start_new_block = if same_prefix && end_point < 2 * max_fulltext_len {
+                false
+            } else if end_point > 4 * 1024 * 1024 {
+                true
+            } else {
+                prefix.is_some() && prefix != last_prefix && end_point > 2 * 1024 * 1024
+            };
+            last_prefix = prefix;
+            if start_new_block {
+                let (content_chunks, content_len) = compressor.flush_without_last();
+                self.flush_block(content_chunks, content_len, &mut pending, random_id)?;
+                compressor = RabinGroupCompressor::new(None);
+                max_fulltext_len = chunks_len;
+                let recompressed = compress_record(
+                    &mut compressor,
+                    &key,
+                    &chunk_refs,
+                    chunks_len,
+                    record.sha1(),
+                    false,
+                )?;
+                sha1 = recompressed.0;
+                start_point = recompressed.1;
+                end_point = recompressed.2;
+            }
+            // A content-addressed key (None version id) gets the sha1 filled in.
+            let stored_key = if key.version_id().is_empty() {
+                GcKey::from_prefix_and_suffix(key.prefix(), {
+                    let mut seg = b"sha1:".to_vec();
+                    seg.extend_from_slice(&sha1);
+                    seg
+                })
+            } else {
+                key.clone()
+            };
+            results.push((sha1, chunks_len));
+            pending.push((stored_key, start_point, end_point, record.parents()));
+        }
+        if !pending.is_empty() {
+            let (content_chunks, content_len) = compressor.flush();
+            self.flush_block(content_chunks, content_len, &mut pending, random_id)?;
+        }
+        Ok(results)
+    }
+
+    /// Wrap the compressor's flushed content into a block, write it via the
+    /// access object, and index every pending record against it.
+    ///
+    /// Mirrors the `flush` closure inside `_insert_record_stream`.
+    fn flush_block(
+        &self,
+        content_chunks: Vec<Vec<u8>>,
+        content_len: usize,
+        pending: &mut Vec<(GcKey, usize, usize, Option<Vec<GcKey>>)>,
+        random_id: bool,
+    ) -> Result<(), crate::knit::KnitError> {
+        let mut block = GroupCompressBlock::new();
+        block.set_chunked_content(&content_chunks, content_len);
+        let on_disk = block.to_bytes();
+        let size = on_disk.len();
+        let read_memo = self.access.add_raw_record(size, vec![on_disk])?;
+        let records: Vec<(GcKey, IndexMemo<I::F>, Option<Vec<GcKey>>)> = pending
+            .drain(..)
+            .map(|(key, start, end, parents)| {
+                (
+                    key,
+                    IndexMemo::new(read_memo.clone(), start as u64, end as u64),
+                    parents,
+                )
+            })
+            .collect();
+        self.index.add_records(&records, random_id)?;
+        Ok(())
+    }
+}
+
+/// Compress one record into `compressor`, mapping the result to plain
+/// types and `nostore_sha` rejection to `KnitError::ExistingContent`.
+fn compress_record(
+    compressor: &mut crate::groupcompress::compressor::RabinGroupCompressor,
+    key: &GcKey,
+    chunks: &[&[u8]],
+    length: usize,
+    expected_sha: Option<Vec<u8>>,
+    soft: bool,
+) -> Result<(Vec<u8>, usize, usize), crate::knit::KnitError> {
+    use crate::groupcompress::compressor::GroupCompressor;
+    let expected = expected_sha
+        .map(|s| String::from_utf8(s))
+        .transpose()
+        .map_err(|e| crate::knit::KnitError::Corrupt(e.to_string()))?;
+    match compressor.compress(key, chunks, length, expected, None, Some(soft)) {
+        Ok((sha, start, end, _kind)) => Ok((sha.into_bytes(), start, end)),
+        Err(crate::versionedfile::Error::ExistingContent(_)) => {
+            Err(crate::knit::KnitError::ExistingContent(Vec::new()))
+        }
+        Err(e) => Err(crate::knit::KnitError::Corrupt(e.to_string())),
+    }
 }
 
 #[cfg(test)]
@@ -1075,5 +1241,156 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].storage_kind(), "absent");
         assert_eq!(records[0].key(), gckey(b"nope"));
+    }
+
+    /// A writable in-memory groupcompress store shared by a `MemIndex` and
+    /// a `MemAccess`, so an insert/read round-trip can be exercised purely.
+    #[derive(Default)]
+    struct MemStore {
+        /// Appended blocks, in write order; the read-memo index is the
+        /// block's position in this vec, rendered as a string.
+        blocks: Vec<Vec<u8>>,
+        details: std::collections::HashMap<GcKey, GcBuildDetails<String>>,
+    }
+
+    #[derive(Clone)]
+    struct MemIndex(std::rc::Rc<std::cell::RefCell<MemStore>>);
+    #[derive(Clone)]
+    struct MemAccess(std::rc::Rc<std::cell::RefCell<MemStore>>);
+
+    impl GcIndex for MemIndex {
+        type F = String;
+        fn get_build_details(
+            &self,
+            keys: &[GcKey],
+        ) -> Result<std::collections::HashMap<GcKey, GcBuildDetails<String>>, crate::knit::KnitError>
+        {
+            let store = self.0.borrow();
+            Ok(keys
+                .iter()
+                .filter_map(|k| store.details.get(k).map(|d| (k.clone(), d.clone())))
+                .collect())
+        }
+        fn get_parent_map(
+            &self,
+            keys: &[GcKey],
+        ) -> Result<std::collections::HashMap<GcKey, Vec<GcKey>>, crate::knit::KnitError> {
+            let store = self.0.borrow();
+            Ok(keys
+                .iter()
+                .filter_map(|k| {
+                    store
+                        .details
+                        .get(k)
+                        .map(|d| (k.clone(), d.parents.clone().unwrap_or_default()))
+                })
+                .collect())
+        }
+        fn keys(&self) -> Result<Vec<GcKey>, crate::knit::KnitError> {
+            Ok(self.0.borrow().details.keys().cloned().collect())
+        }
+        fn has_graph(&self) -> bool {
+            true
+        }
+        fn check_write_ok(&self) -> Result<(), crate::knit::KnitError> {
+            Ok(())
+        }
+        fn add_records(
+            &self,
+            records: &[(GcKey, IndexMemo<String>, Option<Vec<GcKey>>)],
+            _random_id: bool,
+        ) -> Result<(), crate::knit::KnitError> {
+            let mut store = self.0.borrow_mut();
+            for (key, memo, parents) in records {
+                store.details.insert(
+                    key.clone(),
+                    GcBuildDetails {
+                        index_memo: memo.clone(),
+                        parents: parents.clone(),
+                    },
+                );
+            }
+            Ok(())
+        }
+    }
+
+    impl GcAccess for MemAccess {
+        type F = String;
+        fn get_raw_records(
+            &self,
+            memos: &[ReadMemo<String>],
+        ) -> Result<Vec<Vec<u8>>, crate::knit::KnitError> {
+            let store = self.0.borrow();
+            memos
+                .iter()
+                .map(|m| {
+                    let idx: usize = m
+                        .index
+                        .parse()
+                        .map_err(|_| crate::knit::KnitError::Corrupt("bad block index".into()))?;
+                    store
+                        .blocks
+                        .get(idx)
+                        .cloned()
+                        .ok_or_else(|| crate::knit::KnitError::Corrupt("no such block".into()))
+                })
+                .collect()
+        }
+        fn add_raw_record(
+            &self,
+            _size: usize,
+            chunks: Vec<Vec<u8>>,
+        ) -> Result<ReadMemo<String>, crate::knit::KnitError> {
+            let mut store = self.0.borrow_mut();
+            let idx = store.blocks.len();
+            let bytes: Vec<u8> = chunks.concat();
+            let len = bytes.len() as u64;
+            store.blocks.push(bytes);
+            Ok(ReadMemo::new(idx.to_string(), 0, len))
+        }
+    }
+
+    #[test]
+    fn insert_record_stream_then_get_record_stream_round_trips() {
+        use crate::versionedfile::{ChunkedContentFactory, ContentFactory};
+
+        let store = std::rc::Rc::new(std::cell::RefCell::new(MemStore::default()));
+        let vf = GroupCompressVersionedFiles::new(
+            MemIndex(store.clone()),
+            MemAccess(store.clone()),
+            true,
+        );
+
+        let key_a = gckey(b"a");
+        let key_b = gckey(b"b");
+        let text_a = b"the quick brown fox\njumps over\n".to_vec();
+        let text_b = b"the lazy dog\nsleeps all day\n".to_vec();
+        let stream: Vec<Box<dyn ContentFactory>> = vec![
+            Box::new(ChunkedContentFactory::new(
+                None,
+                key_a.clone(),
+                Some(vec![]),
+                vec![text_a.clone()],
+            )),
+            Box::new(ChunkedContentFactory::new(
+                None,
+                key_b.clone(),
+                Some(vec![key_a.clone()]),
+                vec![text_b.clone()],
+            )),
+        ];
+        let inserted = vf.insert_record_stream(stream, false).unwrap();
+        assert_eq!(inserted.len(), 2);
+
+        // Read the records back: the text must round-trip exactly.
+        let records = vf
+            .get_record_stream(&[key_a.clone(), key_b.clone()], "as-requested")
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].key(), key_a);
+        assert_eq!(records[0].to_fulltext().as_ref(), text_a.as_slice());
+        assert_eq!(records[1].key(), key_b);
+        assert_eq!(records[1].to_fulltext().as_ref(), text_b.as_slice());
+        assert_eq!(records[1].parents(), Some(vec![key_a]));
     }
 }

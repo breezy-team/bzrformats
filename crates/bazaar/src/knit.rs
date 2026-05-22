@@ -225,6 +225,17 @@ pub enum KnitError {
     /// must be surfaced verbatim at the language boundary rather than
     /// remapped. The string is a diagnostic message.
     Aborted(String),
+    /// A `nostore_sha` check matched: the text is already stored, so the
+    /// add was refused. Carries the digest that matched.
+    ExistingContent(Vec<u8>),
+    /// The reconstructed text did not match the stored SHA-1 digest.
+    BadSha1 {
+        key: KnitKey,
+        /// Reconstructed text lines (plain bytes, one entry per line).
+        lines: Vec<Vec<u8>>,
+        actual: Vec<u8>,
+        expected: Vec<u8>,
+    },
 }
 
 impl std::fmt::Display for KnitError {
@@ -288,6 +299,21 @@ impl std::fmt::Display for KnitError {
             KnitError::NotImplemented(name) => write!(f, "{}", name),
             KnitError::Retry(ctx) => write!(f, "pack listing changed, retry needed: {}", ctx),
             KnitError::Aborted(ctx) => write!(f, "operation aborted: {}", ctx),
+            KnitError::ExistingContent(digest) => {
+                write!(f, "content already present: {:?}", digest)
+            }
+            KnitError::BadSha1 {
+                key,
+                actual,
+                expected,
+                ..
+            } => write!(
+                f,
+                "sha1 mismatch for {:?}: got {:?}, expected {:?}",
+                key.version_id(),
+                actual,
+                expected
+            ),
         }
     }
 }
