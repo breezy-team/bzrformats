@@ -105,6 +105,322 @@ fn read_memo_tuple<'py>(
     )
 }
 
+/// Map a Python error to a `KnitError` for the pure-crate trait calls.
+///
+/// `RevisionNotPresent` keeps its identity; anything else is folded into
+/// `Corrupt` carrying the message.
+fn gc_err_from_py(py: Python<'_>, err: PyErr) -> bazaar::knit::KnitError {
+    if err
+        .get_type(py)
+        .name()
+        .map(|n| n == "RevisionNotPresent")
+        .unwrap_or(false)
+    {
+        return bazaar::knit::KnitError::RevisionNotPresent(bazaar::knit::KnitKey::fixed(vec![]));
+    }
+    bazaar::knit::KnitError::Corrupt(err.to_string())
+}
+
+/// Rebuild the Python `(index, start, stop)` read-memo tuple from a typed
+/// [`GcReadMemo`].
+fn read_memo_to_py<'py>(py: Python<'py>, memo: &GcReadMemo) -> Bound<'py, PyTuple> {
+    PyTuple::new(
+        py,
+        [
+            memo.index.bind(py),
+            memo.start.into_pyobject(py).unwrap().into_any(),
+            memo.stop.into_pyobject(py).unwrap().into_any(),
+        ],
+    )
+    .unwrap()
+}
+
+/// Adapter exposing a Python `_GCGraphIndex` as the pure [`GcIndex`] trait.
+pub struct PyGcIndex(Py<PyAny>);
+
+impl PyGcIndex {
+    pub fn new(obj: Py<PyAny>) -> Self {
+        PyGcIndex(obj)
+    }
+}
+
+impl bazaar::groupcompress::gcvf::GcIndex for PyGcIndex {
+    type F = GcFileRef;
+
+    fn get_build_details(
+        &self,
+        keys: &[bazaar::groupcompress::gcvf::GcKey],
+    ) -> Result<
+        std::collections::HashMap<
+            bazaar::groupcompress::gcvf::GcKey,
+            bazaar::groupcompress::gcvf::GcBuildDetails<GcFileRef>,
+        >,
+        bazaar::knit::KnitError,
+    > {
+        Python::attach(|py| {
+            let py_keys = PyList::empty(py);
+            for k in keys {
+                py_keys
+                    .append(k.clone())
+                    .map_err(|e| gc_err_from_py(py, e))?;
+            }
+            let result = self
+                .0
+                .bind(py)
+                .call_method1("get_build_details", (py_keys,))
+                .map_err(|e| gc_err_from_py(py, e))?
+                .cast_into::<PyDict>()
+                .map_err(|e| gc_err_from_py(py, e.into()))?;
+            let mut out = std::collections::HashMap::new();
+            for (k, details) in result.iter() {
+                let key: bazaar::groupcompress::gcvf::GcKey =
+                    k.extract().map_err(|e| gc_err_from_py(py, e))?;
+                // details[0] is the (index, start, stop, basis_end, delta_end)
+                // index_memo; details[2] is the key's parents.
+                let index_memo = details.get_item(0).map_err(|e| gc_err_from_py(py, e))?;
+                let read_memo =
+                    extract_read_memo(&index_memo).map_err(|e| gc_err_from_py(py, e))?;
+                let entry_start: u64 = index_memo
+                    .get_item(3)
+                    .and_then(|v| v.extract())
+                    .map_err(|e| gc_err_from_py(py, e))?;
+                let entry_end: u64 = index_memo
+                    .get_item(4)
+                    .and_then(|v| v.extract())
+                    .map_err(|e| gc_err_from_py(py, e))?;
+                let parents_obj = details.get_item(2).map_err(|e| gc_err_from_py(py, e))?;
+                let parents: Option<Vec<bazaar::groupcompress::gcvf::GcKey>> =
+                    if parents_obj.is_none() {
+                        None
+                    } else {
+                        Some(parents_obj.extract().map_err(|e| gc_err_from_py(py, e))?)
+                    };
+                out.insert(
+                    key,
+                    bazaar::groupcompress::gcvf::GcBuildDetails {
+                        index_memo: bazaar::groupcompress::gcvf::IndexMemo::new(
+                            read_memo,
+                            entry_start,
+                            entry_end,
+                        ),
+                        parents,
+                    },
+                );
+            }
+            Ok(out)
+        })
+    }
+
+    fn get_parent_map(
+        &self,
+        keys: &[bazaar::groupcompress::gcvf::GcKey],
+    ) -> Result<
+        std::collections::HashMap<
+            bazaar::groupcompress::gcvf::GcKey,
+            Vec<bazaar::groupcompress::gcvf::GcKey>,
+        >,
+        bazaar::knit::KnitError,
+    > {
+        Python::attach(|py| {
+            let py_keys = PyList::empty(py);
+            for k in keys {
+                py_keys
+                    .append(k.clone())
+                    .map_err(|e| gc_err_from_py(py, e))?;
+            }
+            let result = self
+                .0
+                .bind(py)
+                .call_method1("get_parent_map", (py_keys,))
+                .map_err(|e| gc_err_from_py(py, e))?
+                .cast_into::<PyDict>()
+                .map_err(|e| gc_err_from_py(py, e.into()))?;
+            let mut out = std::collections::HashMap::new();
+            for (k, v) in result.iter() {
+                let key = k.extract().map_err(|e| gc_err_from_py(py, e))?;
+                let parents: Vec<bazaar::groupcompress::gcvf::GcKey> = if v.is_none() {
+                    Vec::new()
+                } else {
+                    v.extract().map_err(|e| gc_err_from_py(py, e))?
+                };
+                out.insert(key, parents);
+            }
+            Ok(out)
+        })
+    }
+
+    fn keys(&self) -> Result<Vec<bazaar::groupcompress::gcvf::GcKey>, bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let result = self
+                .0
+                .bind(py)
+                .call_method0("keys")
+                .map_err(|e| gc_err_from_py(py, e))?;
+            let mut out = Vec::new();
+            for k in result.try_iter().map_err(|e| gc_err_from_py(py, e))? {
+                out.push(
+                    k.and_then(|k| k.extract())
+                        .map_err(|e| gc_err_from_py(py, e))?,
+                );
+            }
+            Ok(out)
+        })
+    }
+
+    fn has_graph(&self) -> bool {
+        Python::attach(|py| {
+            self.0
+                .bind(py)
+                .getattr("has_graph")
+                .and_then(|v| v.extract())
+                .unwrap_or(false)
+        })
+    }
+
+    fn check_write_ok(&self) -> Result<(), bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            self.0
+                .bind(py)
+                .call_method0("_check_write_ok")
+                .map(|_| ())
+                .map_err(|e| gc_err_from_py(py, e))
+        })
+    }
+
+    fn add_records(
+        &self,
+        records: &[(
+            bazaar::groupcompress::gcvf::GcKey,
+            bazaar::groupcompress::gcvf::IndexMemo<GcFileRef>,
+            Option<Vec<bazaar::groupcompress::gcvf::GcKey>>,
+        )],
+        random_id: bool,
+    ) -> Result<(), bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            // Each node is (key, b"block_start block_length entry_start
+            // entry_end", (parents,)) -- the value layout _GCGraphIndex
+            // expects.
+            let nodes = PyList::empty(py);
+            for (key, memo, parents) in records {
+                let value = format!(
+                    "{} {} {} {}",
+                    memo.read_memo.start,
+                    memo.read_memo.byte_length(),
+                    memo.entry_start,
+                    memo.entry_end
+                );
+                let refs = match parents {
+                    Some(ps) => {
+                        let parent_tuple = PyTuple::new(py, ps.iter().cloned())
+                            .map_err(|e| gc_err_from_py(py, e))?;
+                        PyTuple::new(py, [parent_tuple]).map_err(|e| gc_err_from_py(py, e))?
+                    }
+                    None => PyTuple::new(py, [py.None()]).map_err(|e| gc_err_from_py(py, e))?,
+                };
+                nodes
+                    .append(
+                        PyTuple::new(
+                            py,
+                            [
+                                key.clone()
+                                    .into_pyobject(py)
+                                    .map_err(|e| gc_err_from_py(py, e))?
+                                    .into_any(),
+                                PyBytes::new(py, value.as_bytes()).into_any(),
+                                refs.into_any(),
+                            ],
+                        )
+                        .map_err(|e| gc_err_from_py(py, e))?,
+                    )
+                    .map_err(|e| gc_err_from_py(py, e))?;
+            }
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item("random_id", random_id)
+                .map_err(|e| gc_err_from_py(py, e))?;
+            self.0
+                .bind(py)
+                .call_method("add_records", (nodes,), Some(&kwargs))
+                .map(|_| ())
+                .map_err(|e| gc_err_from_py(py, e))
+        })
+    }
+}
+
+/// Adapter exposing a Python access object as the pure [`GcAccess`] trait.
+pub struct PyGcAccess(Py<PyAny>);
+
+impl PyGcAccess {
+    pub fn new(obj: Py<PyAny>) -> Self {
+        PyGcAccess(obj)
+    }
+}
+
+impl bazaar::groupcompress::gcvf::GcAccess for PyGcAccess {
+    type F = GcFileRef;
+
+    fn get_raw_records(
+        &self,
+        memos: &[GcReadMemo],
+    ) -> Result<Vec<Vec<u8>>, bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let py_memos = PyList::empty(py);
+            for m in memos {
+                py_memos
+                    .append(read_memo_to_py(py, m))
+                    .map_err(|e| gc_err_from_py(py, e))?;
+            }
+            let result = self
+                .0
+                .bind(py)
+                .call_method1("get_raw_records", (py_memos,))
+                .map_err(|e| gc_err_from_py(py, e))?;
+            let mut out = Vec::with_capacity(memos.len());
+            for item in result.try_iter().map_err(|e| gc_err_from_py(py, e))? {
+                let item = item.map_err(|e| gc_err_from_py(py, e))?;
+                let bytes: Vec<u8> = item.extract().map_err(|e| gc_err_from_py(py, e))?;
+                out.push(bytes);
+            }
+            Ok(out)
+        })
+    }
+
+    fn add_raw_record(
+        &self,
+        size: usize,
+        chunks: Vec<Vec<u8>>,
+    ) -> Result<GcReadMemo, bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let py_chunks = PyList::empty(py);
+            for c in &chunks {
+                py_chunks
+                    .append(PyBytes::new(py, c))
+                    .map_err(|e| gc_err_from_py(py, e))?;
+            }
+            // add_raw_record(key, size, chunks) -> (index, start, length)
+            let memo = self
+                .0
+                .bind(py)
+                .call_method1("add_raw_record", (py.None(), size, py_chunks))
+                .map_err(|e| gc_err_from_py(py, e))?;
+            let index = memo.get_item(0).map_err(|e| gc_err_from_py(py, e))?;
+            let start: u64 = memo
+                .get_item(1)
+                .and_then(|v| v.extract())
+                .map_err(|e| gc_err_from_py(py, e))?;
+            let length: u64 = memo
+                .get_item(2)
+                .and_then(|v| v.extract())
+                .map_err(|e| gc_err_from_py(py, e))?;
+            Ok(GcReadMemo::new(
+                GcFileRef::new(index.unbind()),
+                start,
+                start + length,
+            ))
+        })
+    }
+}
+
 fn extract_key_segments(obj: &Bound<PyAny>) -> PyResult<Vec<Vec<u8>>> {
     let tuple = obj.cast::<PyTuple>().map_err(|_| {
         PyValueError::new_err("sort_gc_optimal keys and parents must be tuples of bytes")
