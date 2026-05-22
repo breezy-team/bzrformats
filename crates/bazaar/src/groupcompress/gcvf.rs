@@ -418,10 +418,17 @@ where
     delta: bool,
     /// Decoded blocks keyed by read-memo.
     ///
+    /// Blocks are wrapped in `Rc<RefCell<..>>` because `GroupCompressBlock`
+    /// needs `&mut self` to decompress on demand, yet a block is shared by
+    /// every record that lives in it.
+    ///
     /// TODO: this grows unbounded; the Python store caps it with an
     /// `LRUSizeCache`. A bound can be added once the read paths settle.
     block_cache: std::cell::RefCell<
-        std::collections::HashMap<ReadMemo<I::F>, std::rc::Rc<GroupCompressBlock>>,
+        std::collections::HashMap<
+            ReadMemo<I::F>,
+            std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>,
+        >,
     >,
 }
 
@@ -460,11 +467,17 @@ where
     /// Mirrors `GroupCompressVersionedFiles._get_blocks`: cached blocks are
     /// reused, uncached read-memos are de-duplicated and fetched in one
     /// `get_raw_records` call, then decoded and cached.
+    #[allow(clippy::type_complexity)]
     pub fn get_blocks(
         &self,
         read_memos: &[ReadMemo<I::F>],
-    ) -> Result<Vec<(ReadMemo<I::F>, std::rc::Rc<GroupCompressBlock>)>, crate::knit::KnitError>
-    {
+    ) -> Result<
+        Vec<(
+            ReadMemo<I::F>,
+            std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>,
+        )>,
+        crate::knit::KnitError,
+    > {
         let to_fetch = memos_to_fetch(read_memos, |m| self.block_cache.borrow().contains_key(m));
         let raw = self.access.get_raw_records(&to_fetch)?;
         if raw.len() != to_fetch.len() {
@@ -478,7 +491,10 @@ where
             for (memo, zdata) in to_fetch.iter().zip(raw) {
                 let block = GroupCompressBlock::from_bytes(&zdata[..])
                     .map_err(|e| crate::knit::KnitError::Corrupt(e.to_string()))?;
-                cache.insert(memo.clone(), std::rc::Rc::new(block));
+                cache.insert(
+                    memo.clone(),
+                    std::rc::Rc::new(std::cell::RefCell::new(block)),
+                );
             }
         }
         // Now every requested read-memo is in the cache; yield in order.
@@ -508,6 +524,104 @@ where
     /// All keys present in this store.
     pub fn keys(&self) -> Result<Vec<GcKey>, crate::knit::KnitError> {
         self.index.keys()
+    }
+
+    /// Get a stream of records for `keys`.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles.get_record_stream` for a store
+    /// with no fallbacks: locate the keys, order them per `ordering`, fetch
+    /// the blocks they live in, and extract each record into a
+    /// `ChunkedContentFactory`. Keys absent from the index yield an
+    /// `AbsentContentFactory`. Records are returned eagerly as a `Vec`, as
+    /// the knit pure store does.
+    ///
+    /// `ordering` is `"unordered"`, `"topological"`, `"groupcompress"`, or
+    /// `"as-requested"`.
+    pub fn get_record_stream(
+        &self,
+        keys: &[GcKey],
+        ordering: &str,
+    ) -> Result<Vec<Box<dyn crate::versionedfile::ContentFactory>>, crate::knit::KnitError> {
+        let locations = self.index.get_build_details(keys)?;
+        // Keys absent from the index.
+        let mut out: Vec<Box<dyn crate::versionedfile::ContentFactory>> = Vec::new();
+        for key in keys {
+            if !locations.contains_key(key) {
+                out.push(Box::new(crate::versionedfile::AbsentContentFactory::new(
+                    key.clone(),
+                )));
+            }
+        }
+        // Order the located keys.
+        let located: Vec<GcKey> = keys
+            .iter()
+            .filter(|k| locations.contains_key(*k))
+            .cloned()
+            .collect();
+        let ordered: Vec<GcKey> = match ordering {
+            "topological" | "groupcompress" => {
+                let parent_map: Vec<(GcKey, Vec<GcKey>)> = located
+                    .iter()
+                    .map(|k| (k.clone(), locations[k].parents.clone().unwrap_or_default()))
+                    .collect();
+                let empty = std::collections::HashMap::new();
+                ordered_source_keys(ordering, &parent_map, &empty)
+                    .into_iter()
+                    .flat_map(|(_, ks)| ks)
+                    .collect()
+            }
+            "as-requested" => located,
+            // "unordered" and anything else: I/O order, grouped by block.
+            _ => {
+                let mut io = located;
+                io.sort_by(|a, b| {
+                    let ka = &locations[a].index_memo;
+                    let kb = &locations[b].index_memo;
+                    (
+                        &ka.read_memo.index,
+                        ka.read_memo.start,
+                        ka.read_memo.stop,
+                        ka.entry_start,
+                        ka.entry_end,
+                    )
+                        .cmp(&(
+                            &kb.read_memo.index,
+                            kb.read_memo.start,
+                            kb.read_memo.stop,
+                            kb.entry_start,
+                            kb.entry_end,
+                        ))
+                });
+                io
+            }
+        };
+        // Fetch every block the ordered keys touch, then extract records.
+        let read_memos: Vec<ReadMemo<I::F>> = ordered
+            .iter()
+            .map(|k| locations[k].index_memo.read_memo.clone())
+            .collect();
+        let blocks = self.get_blocks(&read_memos)?;
+        let block_of: std::collections::HashMap<
+            ReadMemo<I::F>,
+            std::rc::Rc<std::cell::RefCell<GroupCompressBlock>>,
+        > = blocks.into_iter().collect();
+        for key in &ordered {
+            let memo = &locations[key].index_memo;
+            let block = block_of.get(&memo.read_memo).ok_or_else(|| {
+                crate::knit::KnitError::Corrupt("block missing for located key".to_string())
+            })?;
+            let chunks = block
+                .borrow_mut()
+                .extract(memo.entry_start as usize, memo.entry_end as usize)
+                .map_err(|e| crate::knit::KnitError::Corrupt(format!("{:?}", e)))?;
+            out.push(Box::new(crate::versionedfile::ChunkedContentFactory::new(
+                None,
+                key.clone(),
+                locations[key].parents.clone(),
+                chunks,
+            )));
+        }
+        Ok(out)
     }
 }
 
@@ -820,5 +934,146 @@ mod tests {
         let out = vf.get_blocks(&[m.clone(), m.clone()]).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(vf.access().fetched.borrow().len(), 1);
+    }
+
+    /// A `GcIndex` that serves a fixed build-details map.
+    struct MapIndex {
+        details: std::collections::HashMap<GcKey, GcBuildDetails<String>>,
+    }
+    impl GcIndex for MapIndex {
+        type F = String;
+        fn get_build_details(
+            &self,
+            keys: &[GcKey],
+        ) -> Result<std::collections::HashMap<GcKey, GcBuildDetails<String>>, crate::knit::KnitError>
+        {
+            Ok(keys
+                .iter()
+                .filter_map(|k| self.details.get(k).map(|d| (k.clone(), d.clone())))
+                .collect())
+        }
+        fn get_parent_map(
+            &self,
+            keys: &[GcKey],
+        ) -> Result<std::collections::HashMap<GcKey, Vec<GcKey>>, crate::knit::KnitError> {
+            Ok(keys
+                .iter()
+                .filter_map(|k| {
+                    self.details
+                        .get(k)
+                        .map(|d| (k.clone(), d.parents.clone().unwrap_or_default()))
+                })
+                .collect())
+        }
+        fn keys(&self) -> Result<Vec<GcKey>, crate::knit::KnitError> {
+            Ok(self.details.keys().cloned().collect())
+        }
+        fn has_graph(&self) -> bool {
+            true
+        }
+        fn check_write_ok(&self) -> Result<(), crate::knit::KnitError> {
+            Ok(())
+        }
+        fn add_records(
+            &self,
+            _records: &[(GcKey, IndexMemo<String>, Option<Vec<GcKey>>)],
+            _random_id: bool,
+        ) -> Result<(), crate::knit::KnitError> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn get_record_stream_extracts_records_from_a_block() {
+        use crate::groupcompress::compressor::{GroupCompressor, RabinGroupCompressor};
+        use crate::versionedfile::ContentFactory;
+
+        // Compress two records into one block, capturing their positions.
+        let mut gc = RabinGroupCompressor::new(None);
+        let body_a = b"record a text line one\nrecord a text line two\n";
+        let body_b = b"record b text line one\nrecord b text line two\n";
+        let (_sha, a_start, a_end, _k) = gc
+            .compress(
+                &GcKey::fixed(vec![b"a".to_vec()]),
+                &[body_a.as_slice()],
+                body_a.len(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (_sha, b_start, b_end, _k) = gc
+            .compress(
+                &GcKey::fixed(vec![b"b".to_vec()]),
+                &[body_b.as_slice()],
+                body_b.len(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // flush() returns the raw concatenated content; wrap it in a block.
+        let (content_chunks, content_len) = gc.flush();
+        let mut gcb = GroupCompressBlock::new();
+        gcb.set_chunked_content(&content_chunks, content_len);
+        let block: Vec<u8> = gcb.to_bytes();
+
+        let rm = ReadMemo::new("g".to_string(), 0, block.len() as u64);
+        let key_a = gckey(b"a");
+        let key_b = gckey(b"b");
+        let mut details = std::collections::HashMap::new();
+        details.insert(
+            key_a.clone(),
+            GcBuildDetails {
+                index_memo: IndexMemo::new(rm.clone(), a_start as u64, a_end as u64),
+                parents: Some(vec![]),
+            },
+        );
+        details.insert(
+            key_b.clone(),
+            GcBuildDetails {
+                index_memo: IndexMemo::new(rm.clone(), b_start as u64, b_end as u64),
+                parents: Some(vec![key_a.clone()]),
+            },
+        );
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(rm, block);
+        let access = MockAccess {
+            blocks,
+            fetched: std::cell::RefCell::new(Vec::new()),
+        };
+        let vf = GroupCompressVersionedFiles::new(MapIndex { details }, access, true);
+
+        let records = vf
+            .get_record_stream(&[key_a.clone(), key_b.clone()], "as-requested")
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].key(), key_a);
+        assert_eq!(records[0].to_fulltext().as_ref(), body_a.as_slice());
+        assert_eq!(records[1].key(), key_b);
+        assert_eq!(records[1].to_fulltext().as_ref(), body_b.as_slice());
+        assert_eq!(records[1].parents(), Some(vec![key_a]));
+    }
+
+    #[test]
+    fn get_record_stream_yields_absent_for_missing_keys() {
+        use crate::versionedfile::ContentFactory;
+        let access = MockAccess {
+            blocks: std::collections::HashMap::new(),
+            fetched: std::cell::RefCell::new(Vec::new()),
+        };
+        let vf = GroupCompressVersionedFiles::new(
+            MapIndex {
+                details: std::collections::HashMap::new(),
+            },
+            access,
+            true,
+        );
+        let records = vf
+            .get_record_stream(&[gckey(b"nope")], "unordered")
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].storage_kind(), "absent");
+        assert_eq!(records[0].key(), gckey(b"nope"));
     }
 }
