@@ -1360,6 +1360,62 @@ impl PyKnitIndex {
             table,
         }
     }
+
+    /// Assign a deterministic rank to each distinct file-identity slot
+    /// referenced by `positions`.
+    ///
+    /// The file-identities (the first element of each Python `index_memo`)
+    /// are interned in the shared [`MemoTable`]; their slot numbers follow
+    /// intern order, which is not stable. Ranking them by their Python
+    /// value gives a stable order. Slots that cannot be resolved or
+    /// compared fall back to ranking by slot number, which keeps the sort
+    /// total even for an unexpected index layout.
+    fn rank_file_identities(
+        &self,
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+    ) -> std::collections::HashMap<usize, usize> {
+        let mut slots: Vec<usize> = positions
+            .values()
+            .filter_map(|det| parse_slot_path(&det.index_memo.path))
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        Python::attach(|py| {
+            let table = self.table.lock().unwrap();
+            let mut idents: Vec<(usize, Option<Py<PyAny>>)> = slots
+                .iter()
+                .map(|&slot| (slot, table.get(slot).map(|o| o.clone_ref(py))))
+                .collect();
+            drop(table);
+            // Sort by the Python file-identity value; on a comparison
+            // failure (which a GraphIndex or key tuple never produces) or
+            // an unresolved slot, fall back to the slot number so the
+            // order stays total and deterministic.
+            idents.sort_by(|(a_slot, a_obj), (b_slot, b_obj)| match (a_obj, b_obj) {
+                (Some(a), Some(b)) => a
+                    .bind(py)
+                    .compare(b.bind(py))
+                    .unwrap_or_else(|_| a_slot.cmp(b_slot)),
+                _ => a_slot.cmp(b_slot),
+            });
+            idents
+                .into_iter()
+                .enumerate()
+                .map(|(rank, (slot, _))| (slot, rank))
+                .collect()
+        })
+    }
+}
+
+/// Look up the file-identity rank of a memo (see
+/// [`PyKnitIndex::rank_file_identities`]). An unranked slot sorts last.
+fn file_identity_rank(
+    ranks: &std::collections::HashMap<usize, usize>,
+    memo: &KnitIndexMemo,
+) -> usize {
+    parse_slot_path(&memo.path)
+        .and_then(|slot| ranks.get(&slot).copied())
+        .unwrap_or(usize::MAX)
 }
 
 fn knit_err_from_py(py: Python<'_>, err: PyErr) -> KnitError {
@@ -1651,18 +1707,32 @@ impl KnitIndexTrait for PyKnitIndex {
         keys: &mut [KnitKey],
         positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
     ) {
-        // Each `index_memo.path` is the slot of the file-identity object
-        // in the shared MemoTable (deduplicated, so records from one
-        // pack share a slot). Sorting by (path, offset) therefore groups
-        // by file and reads each file in byte-position order, matching
-        // Python's `_sort_keys_by_io`.
+        // Mirror Python's `_KnitGraphIndex._sort_keys_by_io`, which sorts
+        // by the index_memo tuple: `(file_identity, pos, size)`. The
+        // file_identity (a GraphIndex for a pack, a key tuple for a kndx)
+        // groups records by file; `pos` orders within a file.
+        //
+        // The interned slot in `index_memo.path` is not a usable sort key
+        // on its own: slot numbers follow intern (i.e. dict-iteration)
+        // order, so for a kndx -- where every record interns its own key
+        // as the file_identity -- they would order non-deterministically.
+        // So rank the distinct file_identities by their Python value and
+        // sort by (rank, pos), giving a deterministic order that still
+        // groups records by file.
+        let ranks = self.rank_file_identities(positions);
         keys.sort_by(|a, b| {
-            let a_key = positions
-                .get(a)
-                .map(|d| (&d.index_memo.path, d.index_memo.offset));
-            let b_key = positions
-                .get(b)
-                .map(|d| (&d.index_memo.path, d.index_memo.offset));
+            let a_key = positions.get(a).map(|d| {
+                (
+                    file_identity_rank(&ranks, &d.index_memo),
+                    d.index_memo.offset,
+                )
+            });
+            let b_key = positions.get(b).map(|d| {
+                (
+                    file_identity_rank(&ranks, &d.index_memo),
+                    d.index_memo.offset,
+                )
+            });
             a_key.cmp(&b_key).then_with(|| a.cmp(b))
         });
     }
