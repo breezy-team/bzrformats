@@ -176,9 +176,8 @@ pub trait GcAccess {
 /// Mirrors the partitioning loop in `GroupCompressVersionedFiles._get_blocks`:
 /// a memo that is cached is skipped, and a memo already queued for fetch is
 /// not queued twice. The first-seen request order is preserved so the
-/// fetched raw records line up with the consume order. The actual cache
-/// lookup, raw-record fetch, and block decode stay in the pyo3 layer
-/// because the block cache is a Python `LRUSizeCache`.
+/// fetched raw records line up with the consume order. `is_cached` lets the
+/// caller plug in whatever block cache it holds.
 pub fn memos_to_fetch<F: FileRef>(
     read_memos: &[ReadMemo<F>],
     is_cached: impl Fn(&ReadMemo<F>) -> bool,
@@ -401,6 +400,100 @@ pub fn io_ordered_source_keys<F: FileRef>(
     runs
 }
 
+/// A groupcompress versioned-file store.
+///
+/// The pure-Rust equivalent of Python's `GroupCompressVersionedFiles`,
+/// generic over a [`GcIndex`] and [`GcAccess`] exactly as
+/// [`crate::knit::KnitVersionedFiles`] is over `KnitIndex` / `KnitAccess`.
+/// A pure-Rust caller implements those two traits; the pyo3 layer wraps a
+/// Python index / access object.
+pub struct GroupCompressVersionedFiles<I, A>
+where
+    I: GcIndex,
+    A: GcAccess<F = I::F>,
+{
+    index: I,
+    access: A,
+    /// Whether to delta-compress; carried for parity with the Python store.
+    delta: bool,
+    /// Decoded blocks keyed by read-memo.
+    ///
+    /// TODO: this grows unbounded; the Python store caps it with an
+    /// `LRUSizeCache`. A bound can be added once the read paths settle.
+    block_cache: std::cell::RefCell<
+        std::collections::HashMap<ReadMemo<I::F>, std::rc::Rc<GroupCompressBlock>>,
+    >,
+}
+
+impl<I, A> GroupCompressVersionedFiles<I, A>
+where
+    I: GcIndex,
+    A: GcAccess<F = I::F>,
+{
+    /// Create a store over the given index and access objects.
+    pub fn new(index: I, access: A, delta: bool) -> Self {
+        GroupCompressVersionedFiles {
+            index,
+            access,
+            delta,
+            block_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The backing index.
+    pub fn index(&self) -> &I {
+        &self.index
+    }
+
+    /// The backing access object.
+    pub fn access(&self) -> &A {
+        &self.access
+    }
+
+    /// Whether this store delta-compresses.
+    pub fn delta(&self) -> bool {
+        self.delta
+    }
+
+    /// Fetch decoded blocks for `read_memos`, in request order.
+    ///
+    /// Mirrors `GroupCompressVersionedFiles._get_blocks`: cached blocks are
+    /// reused, uncached read-memos are de-duplicated and fetched in one
+    /// `get_raw_records` call, then decoded and cached.
+    pub fn get_blocks(
+        &self,
+        read_memos: &[ReadMemo<I::F>],
+    ) -> Result<Vec<(ReadMemo<I::F>, std::rc::Rc<GroupCompressBlock>)>, crate::knit::KnitError>
+    {
+        let to_fetch = memos_to_fetch(read_memos, |m| self.block_cache.borrow().contains_key(m));
+        let raw = self.access.get_raw_records(&to_fetch)?;
+        if raw.len() != to_fetch.len() {
+            return Err(crate::knit::KnitError::Corrupt(
+                "get_raw_records returned the wrong number of records".to_string(),
+            ));
+        }
+        // Decode and cache the freshly fetched blocks.
+        {
+            let mut cache = self.block_cache.borrow_mut();
+            for (memo, zdata) in to_fetch.iter().zip(raw) {
+                let block = GroupCompressBlock::from_bytes(&zdata[..])
+                    .map_err(|e| crate::knit::KnitError::Corrupt(e.to_string()))?;
+                cache.insert(memo.clone(), std::rc::Rc::new(block));
+            }
+        }
+        // Now every requested read-memo is in the cache; yield in order.
+        let cache = self.block_cache.borrow();
+        let mut out = Vec::with_capacity(read_memos.len());
+        for memo in read_memos {
+            let block = cache.get(memo).ok_or_else(|| {
+                crate::knit::KnitError::Corrupt("block missing after fetch".to_string())
+            })?;
+            out.push((memo.clone(), std::rc::Rc::clone(block)));
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,5 +687,121 @@ mod tests {
         assert!(acc.keys().is_empty());
         assert!(acc.memos_to_get().is_empty());
         assert_eq!(acc.total_bytes(), 0);
+    }
+
+    /// Serialize a one-record fulltext block to its on-disk bytes.
+    fn block_bytes(body: &[u8]) -> Vec<u8> {
+        let mut b = GroupCompressBlock::new();
+        b.set_content(body);
+        b.to_bytes()
+    }
+
+    /// A `GcAccess` that serves canned block bytes and counts fetches.
+    struct MockAccess {
+        blocks: std::collections::HashMap<ReadMemo<String>, Vec<u8>>,
+        fetched: std::cell::RefCell<Vec<ReadMemo<String>>>,
+    }
+
+    impl GcAccess for MockAccess {
+        type F = String;
+        fn get_raw_records(
+            &self,
+            memos: &[ReadMemo<String>],
+        ) -> Result<Vec<Vec<u8>>, crate::knit::KnitError> {
+            self.fetched.borrow_mut().extend_from_slice(memos);
+            memos
+                .iter()
+                .map(|m| {
+                    self.blocks
+                        .get(m)
+                        .cloned()
+                        .ok_or_else(|| crate::knit::KnitError::Corrupt("no such memo".into()))
+                })
+                .collect()
+        }
+        fn add_raw_record(
+            &self,
+            _size: usize,
+            _chunks: Vec<Vec<u8>>,
+        ) -> Result<ReadMemo<String>, crate::knit::KnitError> {
+            unimplemented!("not needed for get_blocks tests")
+        }
+    }
+
+    /// A `GcIndex` stub; `get_blocks` does not touch the index.
+    struct UnusedIndex;
+    impl GcIndex for UnusedIndex {
+        type F = String;
+        fn get_build_details(
+            &self,
+            _keys: &[GcKey],
+        ) -> Result<std::collections::HashMap<GcKey, GcBuildDetails<String>>, crate::knit::KnitError>
+        {
+            unimplemented!()
+        }
+        fn get_parent_map(
+            &self,
+            _keys: &[GcKey],
+        ) -> Result<std::collections::HashMap<GcKey, Vec<GcKey>>, crate::knit::KnitError> {
+            unimplemented!()
+        }
+        fn keys(&self) -> Result<Vec<GcKey>, crate::knit::KnitError> {
+            unimplemented!()
+        }
+        fn has_graph(&self) -> bool {
+            true
+        }
+        fn check_write_ok(&self) -> Result<(), crate::knit::KnitError> {
+            unimplemented!()
+        }
+        fn add_records(
+            &self,
+            _records: &[(GcKey, IndexMemo<String>, Option<Vec<GcKey>>)],
+            _random_id: bool,
+        ) -> Result<(), crate::knit::KnitError> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn get_blocks_fetches_decodes_and_caches() {
+        let m1 = ReadMemo::new("g".to_string(), 0, 10);
+        let m2 = ReadMemo::new("g".to_string(), 10, 20);
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(m1.clone(), block_bytes(b"first block body\n"));
+        blocks.insert(m2.clone(), block_bytes(b"second block body\n"));
+        let access = MockAccess {
+            blocks,
+            fetched: std::cell::RefCell::new(Vec::new()),
+        };
+        let vf = GroupCompressVersionedFiles::new(UnusedIndex, access, true);
+
+        // First call fetches both, in request order.
+        let out = vf.get_blocks(&[m1.clone(), m2.clone()]).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, m1);
+        assert_eq!(out[1].0, m2);
+        assert_eq!(vf.access().fetched.borrow().len(), 2);
+
+        // Second call is served entirely from the cache: no new fetch.
+        let out2 = vf.get_blocks(&[m1.clone(), m2.clone()]).unwrap();
+        assert_eq!(out2.len(), 2);
+        assert_eq!(vf.access().fetched.borrow().len(), 2);
+    }
+
+    #[test]
+    fn get_blocks_dedups_repeated_memos_in_one_call() {
+        let m = ReadMemo::new("g".to_string(), 0, 10);
+        let mut blocks = std::collections::HashMap::new();
+        blocks.insert(m.clone(), block_bytes(b"body\n"));
+        let access = MockAccess {
+            blocks,
+            fetched: std::cell::RefCell::new(Vec::new()),
+        };
+        let vf = GroupCompressVersionedFiles::new(UnusedIndex, access, true);
+        // The same block requested twice is fetched once, yielded twice.
+        let out = vf.get_blocks(&[m.clone(), m.clone()]).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(vf.access().fetched.borrow().len(), 1);
     }
 }
