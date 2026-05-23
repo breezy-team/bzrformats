@@ -20,7 +20,6 @@ import contextlib
 import os
 from io import BytesIO
 
-from . import errors
 from ._bzr_rs import multiparent as _multiparent_rs
 
 
@@ -455,29 +454,8 @@ class BaseVersionedFile:
         return lines
 
 
-class MultiMemoryVersionedFile(BaseVersionedFile):
-    """Memory-backed pseudo-versionedfile."""
-
-    def __init__(self, snapshot_interval=25, max_snapshots=None):
-        """Initialize a MultiMemoryVersionedFile."""
-        BaseVersionedFile.__init__(self, snapshot_interval, max_snapshots)
-        self._diffs = {}
-
-    def add_diff(self, diff, version_id, parent_ids):
-        """Add a diff to the versioned file."""
-        self._diffs[version_id] = diff
-        self._parents[version_id] = parent_ids
-
-    def get_diff(self, version_id):
-        """Get the diff for a version."""
-        try:
-            return self._diffs[version_id]
-        except KeyError as e:
-            raise errors.RevisionNotPresent(version_id, self) from e
-
-    def destroy(self):
-        """Clear all diffs."""
-        self._diffs = {}
+MultiMemoryVersionedFile = _multiparent_rs.MultiMemoryVersionedFile
+"""Memory-backed pseudo-versionedfile. Backed by Rust."""
 
 
 class MultiVersionedFile(BaseVersionedFile):
