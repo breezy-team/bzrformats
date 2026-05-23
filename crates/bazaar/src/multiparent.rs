@@ -141,6 +141,32 @@ impl MultiParent {
         Self { hunks }
     }
 
+    /// Build a [`MultiParent`] from `text` and its `parents`, computing each
+    /// parent's matching-block sequence with patiencediff. `left_blocks` may
+    /// be supplied to skip the diff against `parents[0]`.
+    ///
+    /// Mirrors `MultiParent.from_lines` in `bzrformats/multiparent.py`.
+    pub fn from_lines(
+        text: &[Vec<u8>],
+        parents: &[&[Vec<u8>]],
+        left_blocks: Option<Vec<(usize, usize, usize)>>,
+    ) -> Self {
+        if parents.is_empty() {
+            return Self::from_lines_with_blocks(text, &[]);
+        }
+        let compare = |parent: &[Vec<u8>]| -> Vec<(usize, usize, usize)> {
+            patiencediff::SequenceMatcher::new(parent, text)
+                .get_matching_blocks()
+                .to_vec()
+        };
+        let mut parent_blocks: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(parents.len());
+        parent_blocks.push(left_blocks.unwrap_or_else(|| compare(parents[0])));
+        for p in &parents[1..] {
+            parent_blocks.push(compare(p));
+        }
+        Self::from_lines_with_blocks(text, &parent_blocks)
+    }
+
     /// Total number of lines in the reconstructed text.
     ///
     /// Mirrors Python's `num_lines`: a trailing ParentText carries absolute
@@ -809,6 +835,44 @@ mod tests {
         let text = lines(&[b"a\n", b"b\n"]);
         let mp = MultiParent::from_lines_with_blocks(&text, &[]);
         assert_eq!(mp.hunks, vec![Hunk::NewText(lines(&[b"a\n", b"b\n"]))]);
+    }
+
+    #[test]
+    fn from_lines_runs_patiencediff_for_each_parent() {
+        // text = parent → single ParentText covering everything.
+        let text = lines(&[b"a\n", b"b\n", b"c\n"]);
+        let p0 = lines(&[b"a\n", b"b\n", b"c\n"]);
+        let parents: Vec<&[Vec<u8>]> = vec![&p0];
+        let mp = MultiParent::from_lines(&text, &parents, None);
+        assert_eq!(
+            mp.hunks,
+            vec![Hunk::ParentText {
+                parent: 0,
+                parent_pos: 0,
+                child_pos: 0,
+                num_lines: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn from_lines_supplied_left_blocks_skip_left_diff() {
+        // Supplied blocks claim a perfect match even though parent doesn't
+        // contain text — proves from_lines used them instead of running
+        // patiencediff.
+        let text = lines(&[b"a\n", b"b\n"]);
+        let p0 = lines(&[b"x\n", b"y\n"]);
+        let parents: Vec<&[Vec<u8>]> = vec![&p0];
+        let mp = MultiParent::from_lines(&text, &parents, Some(vec![(0, 0, 2), (2, 2, 0)]));
+        assert_eq!(
+            mp.hunks,
+            vec![Hunk::ParentText {
+                parent: 0,
+                parent_pos: 0,
+                child_pos: 0,
+                num_lines: 2,
+            }]
+        );
     }
 
     #[test]

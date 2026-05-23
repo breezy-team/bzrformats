@@ -69,26 +69,11 @@ class MultiParent:
     @staticmethod
     def from_lines(text, parents=(), left_blocks=None):
         """Produce a MultiParent from a list of lines and parents."""
-        if len(parents) > 0:
-            try:
-                import patiencediff
-            except ImportError as e:
-                raise ImportError(
-                    "patiencediff module is required for multiparent operations"
-                ) from e
-
-            def compare(parent):
-                matcher = patiencediff.PatienceSequenceMatcher(None, parent, text)
-                return list(matcher.get_matching_blocks())
-
-            if left_blocks is None:
-                left_blocks = compare(parents[0])
-            else:
-                left_blocks = list(left_blocks)
-            parent_blocks = [left_blocks] + [compare(p) for p in parents[1:]]
-        else:
-            parent_blocks = []
-        raw_hunks = _multiparent_rs.from_lines_with_blocks(list(text), parent_blocks)
+        raw_hunks = _multiparent_rs.from_lines(
+            list(text),
+            [list(p) for p in parents],
+            None if left_blocks is None else list(left_blocks),
+        )
         hunks = []
         for kind, payload in raw_hunks:
             if kind == b"n":

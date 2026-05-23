@@ -67,13 +67,9 @@ fn parse_error_to_py(e: ParseError) -> PyErr {
     }
 }
 
-/// Parse a patch into a list of (kind, payload) tuples. `kind` is `b"n"` for a
-/// NewText hunk (payload: list of bytes lines) or `b"p"` for a ParentText hunk
-/// (payload: (parent, parent_pos, child_pos, num_lines)). The Python caller
-/// materializes these as `NewText` / `ParentText` instances.
-#[pyfunction]
-fn parse_patch<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyList>> {
-    let mp = MultiParent::from_patch(data).map_err(parse_error_to_py)?;
+/// Render a `MultiParent`'s hunks as the `(kind, payload)` tuple list shape
+/// that the Python wrapper materialises into `NewText` / `ParentText`.
+fn hunks_to_py<'py>(py: Python<'py>, mp: MultiParent) -> PyResult<Bound<'py, PyList>> {
     let mut out: Vec<Bound<PyTuple>> = Vec::with_capacity(mp.hunks.len());
     for hunk in mp.hunks {
         match hunk {
@@ -103,6 +99,16 @@ fn parse_patch<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyList>
     PyList::new(py, out)
 }
 
+/// Parse a patch into a list of (kind, payload) tuples. `kind` is `b"n"` for a
+/// NewText hunk (payload: list of bytes lines) or `b"p"` for a ParentText hunk
+/// (payload: (parent, parent_pos, child_pos, num_lines)). The Python caller
+/// materializes these as `NewText` / `ParentText` instances.
+#[pyfunction]
+fn parse_patch<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyList>> {
+    let mp = MultiParent::from_patch(data).map_err(parse_error_to_py)?;
+    hunks_to_py(py, mp)
+}
+
 /// Build multi-parent diff hunks from `text` and per-parent matching blocks.
 ///
 /// `text` is the child text as a list of line bytes. `parent_blocks[p]` is
@@ -117,33 +123,24 @@ fn from_lines_with_blocks<'py>(
     parent_blocks: Vec<Vec<(usize, usize, usize)>>,
 ) -> PyResult<Bound<'py, PyList>> {
     let mp = MultiParent::from_lines_with_blocks(&text, &parent_blocks);
-    let mut out: Vec<Bound<PyTuple>> = Vec::with_capacity(mp.hunks.len());
-    for hunk in mp.hunks {
-        match hunk {
-            Hunk::NewText(lines) => {
-                let py_lines: Vec<Bound<PyBytes>> =
-                    lines.iter().map(|l| PyBytes::new(py, l)).collect();
-                let lines_list = PyList::new(py, py_lines)?;
-                out.push(PyTuple::new(
-                    py,
-                    [PyBytes::new(py, b"n").into_any(), lines_list.into_any()],
-                )?);
-            }
-            Hunk::ParentText {
-                parent,
-                parent_pos,
-                child_pos,
-                num_lines,
-            } => {
-                let payload = PyTuple::new(py, [parent, parent_pos, child_pos, num_lines])?;
-                out.push(PyTuple::new(
-                    py,
-                    [PyBytes::new(py, b"p").into_any(), payload.into_any()],
-                )?);
-            }
-        }
-    }
-    PyList::new(py, out)
+    hunks_to_py(py, mp)
+}
+
+/// Build multi-parent diff hunks from `text` and its `parents`, running
+/// patiencediff for each non-skipped parent. `left_blocks`, if supplied,
+/// short-circuits the diff against `parents[0]`. Returns the same
+/// `(kind, payload)` tuple shape as [`from_lines_with_blocks`].
+#[pyfunction]
+#[pyo3(signature = (text, parents, left_blocks=None))]
+fn from_lines<'py>(
+    py: Python<'py>,
+    text: Vec<Vec<u8>>,
+    parents: Vec<Vec<Vec<u8>>>,
+    left_blocks: Option<Vec<(usize, usize, usize)>>,
+) -> PyResult<Bound<'py, PyList>> {
+    let parent_refs: Vec<&[Vec<u8>]> = parents.iter().map(|p| p.as_slice()).collect();
+    let mp = MultiParent::from_lines(&text, &parent_refs, left_blocks);
+    hunks_to_py(py, mp)
 }
 
 /// A hashable Python object whose `Hash` and `Eq` defer to Python. The
@@ -236,5 +233,6 @@ pub fn _multiparent_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(parse_patch, &m)?)?;
     m.add_function(wrap_pyfunction!(topo_iter, &m)?)?;
     m.add_function(wrap_pyfunction!(from_lines_with_blocks, &m)?)?;
+    m.add_function(wrap_pyfunction!(from_lines, &m)?)?;
     Ok(m)
 }
