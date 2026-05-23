@@ -2111,6 +2111,143 @@ pub fn apply_plain_delta_to_plain_basis(
     Ok(content.text())
 }
 
+/// Reconstruct text from a plain (non-annotated) gzip delta record by
+/// fetching the basis from `basis_text` and applying the delta hunks.
+///
+/// `key` is used for parse-record validation: `parse_record` checks that
+/// the record's embedded version id matches the supplied one. `noeol`
+/// strips the trailing newline that `lower_fulltext` added when the
+/// record was stored.
+///
+/// Used by `decode_plain_knit_to_lines` and the fallback-delta path in
+/// `insert_record_stream_with_fallbacks`.
+fn apply_plain_delta_to_basis(
+    key: &KnitKey,
+    raw_record: &[u8],
+    noeol: bool,
+    basis_text: &[u8],
+) -> Result<Vec<Vec<u8>>, KnitError> {
+    let version_id = key.last().map(Vec::as_slice).unwrap_or(&[]);
+    let mut basis_lines: Vec<Vec<u8>> = crate::osutils::chunks_to_lines(std::iter::once(Ok::<
+        _,
+        std::io::Error,
+    >(
+        std::borrow::Cow::Borrowed(basis_text),
+    )))
+    .map(|r| r.unwrap().into_owned())
+    .collect();
+    let (delta_body, _sha1) = parse_record(version_id, raw_record)?;
+    let delta_refs: Vec<&[u8]> = delta_body.iter().map(|l| l.as_slice()).collect();
+    let hunks = parse_line_delta_raw(&delta_refs)?;
+    let mut offset: isize = 0;
+    for hunk in &hunks {
+        let start = (offset + hunk.start as isize) as usize;
+        let end = (offset + hunk.end as isize) as usize;
+        basis_lines.splice(start..end, hunk.lines.iter().cloned());
+        offset += hunk.start as isize - hunk.end as isize + hunk.count as isize;
+    }
+    if noeol {
+        if let Some(last) = basis_lines.last_mut() {
+            if last.ends_with(b"\n") {
+                last.pop();
+            }
+        }
+    }
+    Ok(basis_lines)
+}
+
+/// Decode a plain (non-annotated) gzip knit record to text lines.
+///
+/// For fulltext records, decompresses and returns the body lines. For
+/// delta records, fetches the basis from the local `kvf` index and
+/// applies the delta hunks. Used when inserting a plain-knit stream into
+/// a target that cannot store the raw record directly (e.g. annotated
+/// target, or no-delta target receiving a delta).
+pub(crate) fn decode_plain_knit_to_lines<I, A, F>(
+    kvf: &KnitVersionedFiles<I, A, F>,
+    key: &KnitKey,
+    method: KnitMethod,
+    noeol: bool,
+    compression_parent: Option<&KnitKey>,
+    raw_record: &[u8],
+) -> Result<Vec<Vec<u8>>, KnitError>
+where
+    I: KnitIndex,
+    A: KnitAccess,
+    F: KnitFactory,
+{
+    if method == KnitMethod::Fulltext {
+        return extract_plain_fulltext_lines(raw_record, noeol);
+    }
+    let cp = compression_parent.ok_or_else(|| {
+        KnitError::Corrupt(format!(
+            "delta record {key:?} has no compression parent",
+        ))
+    })?;
+    let basis_text = kvf.get_text(cp)?;
+    apply_plain_delta_to_basis(key, raw_record, noeol, &basis_text)
+}
+
+/// Like [`decode_plain_knit_to_lines`] but also searches `fallbacks` when
+/// the basis is absent from the local index.
+pub(crate) fn decode_plain_knit_to_lines_with_fallbacks<I, A, F>(
+    kvf: &KnitVersionedFiles<I, A, F>,
+    key: &KnitKey,
+    method: KnitMethod,
+    noeol: bool,
+    compression_parent: Option<&KnitKey>,
+    raw_record: &[u8],
+    fallbacks: &[&dyn crate::versionedfile::VersionedFiles],
+) -> Result<Vec<Vec<u8>>, KnitError>
+where
+    I: KnitIndex,
+    A: KnitAccess,
+    F: KnitFactory,
+{
+    if method == KnitMethod::Fulltext {
+        return extract_plain_fulltext_lines(raw_record, noeol);
+    }
+    let cp = compression_parent.ok_or_else(|| {
+        KnitError::Corrupt(format!(
+            "delta record {key:?} has no compression parent",
+        ))
+    })?;
+    // Local first. The pure crate's `KnitVersionedFiles::get_text` raises
+    // `RevisionNotPresent` (or `BadIndexValue`) when the basis is
+    // missing; in that case fall through to fallbacks rather than erroring
+    // out, so stacking works for cross-store deltas.
+    if let Ok(basis_text) = kvf.get_text(cp) {
+        return apply_plain_delta_to_basis(key, raw_record, noeol, &basis_text);
+    }
+    let cp_key = vf_key_from_knit(cp);
+    for fb in fallbacks {
+        let mut stream = fb.get_record_stream(
+            std::slice::from_ref(&cp_key),
+            "unordered",
+            true,
+        )?;
+        let mut basis: Option<Box<dyn crate::versionedfile::ContentFactory>> = None;
+        for rec in stream.by_ref() {
+            let rec = rec?;
+            if rec.storage_kind() != "absent" {
+                basis = Some(rec);
+                break;
+            }
+        }
+        if let Some(basis) = basis {
+            let basis_bytes = basis.to_fulltext().into_owned();
+            return apply_plain_delta_to_basis(key, raw_record, noeol, &basis_bytes);
+        }
+    }
+    Err(KnitError::RevisionNotPresent(cp.clone()))
+}
+
+/// Translate a knit `Vec<Vec<u8>>` key to a `versionedfile::Key` for trait
+/// calls. The trait's pyo3 adapter expects `Key::Fixed`.
+fn vf_key_from_knit(k: &KnitKey) -> crate::versionedfile::Key {
+    crate::versionedfile::Key::Fixed(k.clone())
+}
+
 /// End-to-end conversion of an annotated-fulltext knit record to an
 /// unannotated one.
 ///
@@ -4097,6 +4234,19 @@ pub enum KnitStreamRecord {
         compression_parent: Option<KnitKey>,
         raw_record: Vec<u8>,
     },
+    /// A plain (non-annotated) knit record to be decoded and stored via
+    /// `add_lines`.  Used when the target KVF cannot accept the record
+    /// directly (e.g. annotated target receiving a plain-knit stream, or a
+    /// no-delta target receiving a delta record).  For delta records the pure
+    /// crate fetches the basis from the local index and applies the delta.
+    ConvertPlain {
+        key: KnitKey,
+        parents: Vec<KnitKey>,
+        method: KnitMethod,
+        noeol: bool,
+        compression_parent: Option<KnitKey>,
+        raw_record: Vec<u8>,
+    },
     /// A record in some other format; the caller has already decoded it to
     /// plain text lines.
     Lines {
@@ -4231,6 +4381,125 @@ pub struct KnitContentFactory {
     /// Raw gzip bytes as stored on disk.
     pub raw_record: Vec<u8>,
     pub annotated: bool,
+}
+
+impl KnitContentFactory {
+    /// Decompress, parse and return the record's fulltext as a `Vec<Vec<u8>>`
+    /// of lines. Errors when the record is absent.
+    fn into_lines_inner(&self) -> Result<Vec<Vec<u8>>, KnitError> {
+        if self.raw_record.is_empty() {
+            return Err(KnitError::RevisionNotPresent(self.key.clone()));
+        }
+        let version_id = self.key.last().map(Vec::as_slice).unwrap_or(&[]);
+        let (body_lines, _digest) = parse_record(version_id, &self.raw_record)?;
+        let refs: Vec<&[u8]> = body_lines.iter().map(|l| l.as_slice()).collect();
+        if self.annotated {
+            let content = KnitAnnotateFactory.parse_record(
+                version_id,
+                &refs,
+                self.record_details.method.clone(),
+                self.record_details.noeol,
+                None,
+            )?;
+            Ok(content.text().into_iter().collect())
+        } else {
+            let content = KnitPlainFactory.parse_record(
+                version_id,
+                &refs,
+                self.record_details.method.clone(),
+                self.record_details.noeol,
+                None,
+            )?;
+            Ok(content.text().into_iter().collect())
+        }
+    }
+
+    /// Decompress and return the joined fulltext bytes.
+    fn into_fulltext_inner(&self) -> Result<Vec<u8>, KnitError> {
+        let lines = self.into_lines_inner()?;
+        Ok(lines.into_iter().flatten().collect())
+    }
+}
+
+impl crate::versionedfile::ContentFactory for KnitContentFactory {
+    fn sha1(&self) -> Option<Vec<u8>> {
+        self.sha1.clone()
+    }
+
+    fn size(&self) -> Option<usize> {
+        None
+    }
+
+    fn key(&self) -> crate::versionedfile::Key {
+        crate::versionedfile::Key::Fixed(self.key.clone())
+    }
+
+    fn parents(&self) -> Option<Vec<crate::versionedfile::Key>> {
+        self.parents
+            .as_ref()
+            .map(|ps| ps.iter().cloned().map(crate::versionedfile::Key::Fixed).collect())
+    }
+
+    fn storage_kind(&self) -> String {
+        if self.raw_record.is_empty() {
+            "absent".to_string()
+        } else {
+            let annotated_prefix = if self.annotated { "annotated-" } else { "" };
+            match self.record_details.method {
+                KnitMethod::LineDelta => format!("knit-{annotated_prefix}delta-gz"),
+                KnitMethod::Fulltext | KnitMethod::NoEol => {
+                    format!("knit-{annotated_prefix}ft-gz")
+                }
+            }
+        }
+    }
+
+    fn to_fulltext<'a, 'b>(&'a self) -> std::borrow::Cow<'b, [u8]>
+    where
+        'a: 'b,
+    {
+        std::borrow::Cow::Owned(self.into_fulltext_inner().unwrap_or_default())
+    }
+
+    fn to_chunks<'a, 'b>(&'a self) -> Box<dyn Iterator<Item = std::borrow::Cow<'b, [u8]>> + 'b>
+    where
+        'a: 'b,
+    {
+        Box::new(std::iter::once(std::borrow::Cow::Owned(
+            self.into_fulltext_inner().unwrap_or_default(),
+        )))
+    }
+
+    fn to_lines<'a, 'b>(&'a self) -> Box<dyn Iterator<Item = std::borrow::Cow<'b, [u8]>> + 'b>
+    where
+        'a: 'b,
+    {
+        let lines = self.into_lines_inner().unwrap_or_default();
+        Box::new(lines.into_iter().map(std::borrow::Cow::Owned))
+    }
+
+    fn into_fulltext(self) -> Vec<u8> {
+        self.into_fulltext_inner().unwrap_or_default()
+    }
+
+    fn into_chunks(self) -> Box<dyn Iterator<Item = Vec<u8>>> {
+        Box::new(std::iter::once(self.into_fulltext_inner().unwrap_or_default()))
+    }
+
+    fn map_key(&mut self, f: &dyn Fn(crate::versionedfile::Key) -> crate::versionedfile::Key) {
+        let new_key = f(crate::versionedfile::Key::Fixed(self.key.clone()));
+        self.key = match new_key {
+            crate::versionedfile::Key::Fixed(v) | crate::versionedfile::Key::ContentAddressed(v) => v,
+        };
+        self.parents = self.parents.take().map(|ps| {
+            ps.into_iter()
+                .map(|p| match f(crate::versionedfile::Key::Fixed(p)) {
+                    crate::versionedfile::Key::Fixed(v)
+                    | crate::versionedfile::Key::ContentAddressed(v) => v,
+                })
+                .collect()
+        });
+    }
 }
 
 impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
@@ -4417,6 +4686,30 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
                     compression_parent,
                     raw_record,
                 } => {
+                    if method == KnitMethod::LineDelta && self.max_delta_chain == 0 {
+                        // Target doesn't support deltas: reconstruct to lines.
+                        let plain_delta = recompress_annotated_to_unannotated_delta(&raw_record)?;
+                        let lines = decode_plain_knit_to_lines(
+                            self,
+                            &key,
+                            KnitMethod::LineDelta,
+                            noeol,
+                            compression_parent.as_ref(),
+                            &plain_delta,
+                        )?;
+                        self.access.flush()?;
+                        self.add_lines(key.clone(), parents, lines, false)?;
+                        let mut ready = vec![key];
+                        while let Some(k) = ready.pop() {
+                            if let Some(entries) = buffered.remove(&k) {
+                                let new_keys: Vec<KnitKey> =
+                                    entries.iter().map(|(ek, _, _, _)| ek.clone()).collect();
+                                self.index.add_records(&entries, false, false)?;
+                                ready.extend(new_keys);
+                            }
+                        }
+                        continue;
+                    }
                     let converted = match method {
                         KnitMethod::LineDelta => {
                             recompress_annotated_to_unannotated_delta(&raw_record)?
@@ -4424,6 +4717,35 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
                         _ => recompress_annotated_to_unannotated_fulltext(&raw_record)?,
                     };
                     (key, parents, method, noeol, compression_parent, converted)
+                }
+                KnitStreamRecord::ConvertPlain {
+                    key,
+                    parents,
+                    method,
+                    noeol,
+                    compression_parent,
+                    raw_record,
+                } => {
+                    let lines = decode_plain_knit_to_lines(
+                        self,
+                        &key,
+                        method,
+                        noeol,
+                        compression_parent.as_ref(),
+                        &raw_record,
+                    )?;
+                    self.access.flush()?;
+                    self.add_lines(key.clone(), parents, lines, false)?;
+                    let mut ready = vec![key];
+                    while let Some(k) = ready.pop() {
+                        if let Some(entries) = buffered.remove(&k) {
+                            let new_keys: Vec<KnitKey> =
+                                entries.iter().map(|(ek, _, _, _)| ek.clone()).collect();
+                            self.index.add_records(&entries, false, false)?;
+                            ready.extend(new_keys);
+                        }
+                    }
+                    continue;
                 }
                 KnitStreamRecord::Lines {
                     key,
@@ -4491,6 +4813,381 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
         }
 
         Ok(())
+    }
+
+    /// Like [`Self::get_record_stream`] but consults `fallbacks` for absent keys.
+    ///
+    /// For topological ordering the global parent map (local + all fallbacks)
+    /// is collected first, topo-sorted, then records are emitted from the
+    /// right source in sorted order — matching Python's
+    /// `_get_remaining_record_stream`. Absent keys yield
+    /// `AbsentContentFactory`.
+    pub fn get_record_stream_with_fallbacks(
+        &self,
+        keys: &[KnitKey],
+        ordering: &str,
+        include_delta_closure: bool,
+        fallbacks: &[&dyn crate::versionedfile::VersionedFiles],
+    ) -> Result<Vec<Box<dyn crate::versionedfile::ContentFactory>>, KnitError> {
+        use crate::versionedfile::ContentFactory;
+        use std::collections::{HashMap, HashSet};
+
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Collect the global parent map across the local index + all fallbacks.
+        let mut global_map: HashMap<KnitKey, Vec<KnitKey>> = HashMap::new();
+        let mut missing: HashSet<KnitKey> = keys.iter().cloned().collect();
+
+        // Local index first.
+        let local_map = self.index.get_parent_map(keys)?;
+        for (k, v) in &local_map {
+            global_map.insert(k.clone(), v.clone());
+            missing.remove(k);
+        }
+
+        // Fallbacks, in priority order.
+        for fallback in fallbacks {
+            if missing.is_empty() {
+                break;
+            }
+            let fb_keys: Vec<crate::versionedfile::Key> =
+                missing.iter().map(vf_key_from_knit).collect();
+            let fb_map = fallback.get_parent_map(&fb_keys)?;
+            for (k, v) in &fb_map {
+                let kk = knit_key_from_vf(k);
+                let parents = v.iter().map(knit_key_from_vf).collect();
+                global_map.insert(kk.clone(), parents);
+                missing.remove(&kk);
+            }
+        }
+
+        // Absent keys: requested but not found anywhere.
+        let absent_keys: Vec<KnitKey> = missing.into_iter().collect();
+
+        // Build the sorted list of present keys.
+        let present_keys: Vec<KnitKey> = if ordering == "topological" {
+            vcs_graph::tsort::TopoSorter::new(
+                global_map.iter().map(|(k, v)| (k.clone(), v.clone())),
+            )
+            .sorted()
+            .map_err(|e| KnitError::Corrupt(format!("topo_sort: {e:?}")))?
+        } else {
+            global_map.keys().cloned().collect()
+        };
+
+        // Collect local records (filter out absent placeholders).
+        let local_recs =
+            self.get_record_stream(&present_keys, "unordered", include_delta_closure)?;
+        let local_present: HashSet<KnitKey> = local_map.keys().cloned().collect();
+        let mut local_rec_map: HashMap<KnitKey, Box<dyn ContentFactory>> = local_recs
+            .into_iter()
+            .filter(|r| r.storage_kind() != "absent")
+            .map(|r| {
+                let key = match r.key() {
+                    crate::versionedfile::Key::Fixed(v)
+                    | crate::versionedfile::Key::ContentAddressed(v) => v,
+                };
+                (key, Box::new(r) as Box<dyn ContentFactory>)
+            })
+            .collect();
+
+        // Collect fallback records for keys not found locally.
+        let mut fallback_rec_map: HashMap<KnitKey, Box<dyn ContentFactory>> = HashMap::new();
+        let mut fb_needed: Vec<KnitKey> = present_keys
+            .iter()
+            .filter(|k| !local_present.contains(*k))
+            .cloned()
+            .collect();
+
+        for fallback in fallbacks {
+            if fb_needed.is_empty() {
+                break;
+            }
+            let fb_keys: Vec<crate::versionedfile::Key> =
+                fb_needed.iter().map(vf_key_from_knit).collect();
+            let fb_recs =
+                fallback.get_record_stream(&fb_keys, ordering, include_delta_closure)?;
+            let mut still_needed = Vec::new();
+            for rec in fb_recs {
+                let rec = rec?;
+                let rec_key = knit_key_from_vf(&rec.key());
+                if rec.storage_kind() == "absent" {
+                    still_needed.push(rec_key);
+                } else {
+                    fallback_rec_map.insert(rec_key, rec);
+                }
+            }
+            fb_needed = still_needed;
+        }
+
+        // Emit in present_keys order, then absent entries.
+        let mut out: Vec<Box<dyn ContentFactory>> = Vec::with_capacity(keys.len());
+        for key in &present_keys {
+            if let Some(rec) = local_rec_map.remove(key) {
+                out.push(rec);
+            } else if let Some(rec) = fallback_rec_map.remove(key) {
+                out.push(rec);
+            }
+        }
+        for key in absent_keys {
+            out.push(Box::new(crate::versionedfile::AbsentContentFactory::new(
+                vf_key_from_knit(&key),
+            )));
+        }
+        for key in fb_needed {
+            out.push(Box::new(crate::versionedfile::AbsentContentFactory::new(
+                vf_key_from_knit(&key),
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Like [`Self::insert_record_stream`] but uses `fallbacks` to reconstruct
+    /// records whose compression parent is only present in a fallback store.
+    pub fn insert_record_stream_with_fallbacks(
+        &self,
+        stream: impl IntoIterator<Item = Result<KnitStreamRecord, KnitError>>,
+        fallbacks: &[&dyn crate::versionedfile::VersionedFiles],
+    ) -> Result<(), KnitError> {
+        use std::collections::HashMap;
+
+        type BufferMap =
+            HashMap<KnitKey, Vec<(KnitKey, Vec<KnitMethod>, KnitIndexMemo, Vec<KnitKey>)>>;
+
+        self.index.check_write_ok()?;
+
+        let mut buffered: BufferMap = HashMap::new();
+
+        for item in stream {
+            let record = item?;
+
+            let (key, parents, method, noeol, compression_parent, raw_bytes) = match record {
+                KnitStreamRecord::NativeKnit {
+                    key,
+                    parents,
+                    method,
+                    noeol,
+                    compression_parent,
+                    raw_record,
+                } => (key, parents, method, noeol, compression_parent, raw_record),
+                KnitStreamRecord::ConvertAnnotated {
+                    key,
+                    parents,
+                    method,
+                    noeol,
+                    compression_parent,
+                    raw_record,
+                } => {
+                    if method == KnitMethod::LineDelta && self.max_delta_chain == 0 {
+                        let plain_delta = recompress_annotated_to_unannotated_delta(&raw_record)?;
+                        let lines = decode_plain_knit_to_lines_with_fallbacks(
+                            self,
+                            &key,
+                            KnitMethod::LineDelta,
+                            noeol,
+                            compression_parent.as_ref(),
+                            &plain_delta,
+                            fallbacks,
+                        )?;
+                        self.access.flush()?;
+                        self.add_lines(key.clone(), parents, lines, false)?;
+                        let mut ready = vec![key];
+                        while let Some(k) = ready.pop() {
+                            if let Some(entries) = buffered.remove(&k) {
+                                let new_keys: Vec<KnitKey> =
+                                    entries.iter().map(|(ek, _, _, _)| ek.clone()).collect();
+                                self.index.add_records(&entries, false, false)?;
+                                ready.extend(new_keys);
+                            }
+                        }
+                        continue;
+                    }
+                    let converted = match method {
+                        KnitMethod::LineDelta => {
+                            recompress_annotated_to_unannotated_delta(&raw_record)?
+                        }
+                        _ => recompress_annotated_to_unannotated_fulltext(&raw_record)?,
+                    };
+                    (key, parents, method, noeol, compression_parent, converted)
+                }
+                KnitStreamRecord::ConvertPlain {
+                    key,
+                    parents,
+                    method,
+                    noeol,
+                    compression_parent,
+                    raw_record,
+                } => {
+                    let lines = decode_plain_knit_to_lines_with_fallbacks(
+                        self,
+                        &key,
+                        method,
+                        noeol,
+                        compression_parent.as_ref(),
+                        &raw_record,
+                        fallbacks,
+                    )?;
+                    self.access.flush()?;
+                    self.add_lines(key.clone(), parents, lines, false)?;
+                    let mut ready = vec![key];
+                    while let Some(k) = ready.pop() {
+                        if let Some(entries) = buffered.remove(&k) {
+                            let new_keys: Vec<KnitKey> =
+                                entries.iter().map(|(ek, _, _, _)| ek.clone()).collect();
+                            self.index.add_records(&entries, false, false)?;
+                            ready.extend(new_keys);
+                        }
+                    }
+                    continue;
+                }
+                KnitStreamRecord::Lines {
+                    key,
+                    parents,
+                    lines,
+                } => {
+                    self.access.flush()?;
+                    self.add_lines(key.clone(), parents, lines, false)?;
+                    let mut ready = vec![key];
+                    while let Some(k) = ready.pop() {
+                        if let Some(entries) = buffered.remove(&k) {
+                            let new_keys: Vec<KnitKey> =
+                                entries.iter().map(|(ek, _, _, _)| ek.clone()).collect();
+                            self.index.add_records(&entries, false, false)?;
+                            ready.extend(new_keys);
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            parse_record_header_only(&raw_bytes)?;
+
+            // Decide whether the record can be stored as-is or must be
+            // reconstructed from its basis. When the basis lives only in a
+            // fallback we remember the fallback index so the fetch below
+            // hits the same source the parent-map probe found.
+            let mut cp_fallback_idx: Option<usize> = None;
+            let store_directly = if let Some(cp) = compression_parent.as_ref() {
+                if fallbacks.is_empty() {
+                    true
+                } else {
+                    let in_local = self
+                        .index
+                        .get_parent_map(std::slice::from_ref(cp))
+                        .map(|m| m.contains_key(cp))
+                        .unwrap_or(false);
+                    if in_local {
+                        true
+                    } else {
+                        let cp_vf = vf_key_from_knit(cp);
+                        let fb_idx = fallbacks.iter().position(|fb| {
+                            fb.get_parent_map(std::slice::from_ref(&cp_vf))
+                                .map(|m| !m.is_empty())
+                                .unwrap_or(false)
+                        });
+                        cp_fallback_idx = fb_idx;
+                        fb_idx.is_none()
+                    }
+                }
+            } else {
+                true
+            };
+
+            if store_directly {
+                let size = raw_bytes.len();
+                let memo = self.access.add_raw_record(&key, size, vec![raw_bytes])?;
+                let mut options = vec![method];
+                if noeol {
+                    options.push(KnitMethod::NoEol);
+                }
+                let entry = (key.clone(), options, memo, parents.to_vec());
+                let needs_buffer = compression_parent.as_ref().is_some_and(|cp| {
+                    self.index
+                        .get_parent_map(std::slice::from_ref(cp))
+                        .map(|m| !m.contains_key(cp))
+                        .unwrap_or(true)
+                });
+                if needs_buffer {
+                    buffered
+                        .entry(compression_parent.unwrap())
+                        .or_default()
+                        .push(entry);
+                } else {
+                    self.index.add_records(&[entry], false, false)?;
+                    let mut ready = vec![key];
+                    while let Some(k) = ready.pop() {
+                        if let Some(entries) = buffered.remove(&k) {
+                            let new_keys: Vec<KnitKey> =
+                                entries.iter().map(|(ek, _, _, _)| ek.clone()).collect();
+                            self.index.add_records(&entries, false, false)?;
+                            ready.extend(new_keys);
+                        }
+                    }
+                }
+            } else {
+                // Compression parent is only in a fallback: fetch it as
+                // fulltext, apply the delta, and store as plain lines.
+                let cp = compression_parent.as_ref().unwrap();
+                self.access.flush()?;
+                let fb_idx = cp_fallback_idx.expect(
+                    "store_directly == false implies a fallback was found",
+                );
+                let fb = fallbacks[fb_idx];
+                let cp_vf = vf_key_from_knit(cp);
+                let mut basis_iter = fb.get_record_stream(
+                    std::slice::from_ref(&cp_vf),
+                    "unordered",
+                    true,
+                )?;
+                let basis = loop {
+                    match basis_iter.next() {
+                        Some(Ok(rec)) => {
+                            if rec.storage_kind() != "absent" {
+                                break Some(rec);
+                            }
+                        }
+                        Some(Err(e)) => return Err(e),
+                        None => break None,
+                    }
+                }
+                .ok_or_else(|| {
+                    KnitError::Corrupt(format!(
+                        "compression parent {cp:?} not found in fallback {fb_idx}",
+                    ))
+                })?;
+                let basis_bytes = basis.to_fulltext().into_owned();
+                let result_lines =
+                    apply_plain_delta_to_basis(&key, &raw_bytes, noeol, &basis_bytes)?;
+                self.add_lines(key.clone(), parents, result_lines, false)?;
+                let mut ready = vec![key];
+                while let Some(k) = ready.pop() {
+                    if let Some(entries) = buffered.remove(&k) {
+                        let new_keys: Vec<KnitKey> =
+                            entries.iter().map(|(ek, _, _, _)| ek.clone()).collect();
+                        self.index.add_records(&entries, false, false)?;
+                        ready.extend(new_keys);
+                    }
+                }
+            }
+        }
+
+        if !buffered.is_empty() {
+            let all_entries: Vec<_> = buffered.into_values().flatten().collect();
+            self.index.add_records(&all_entries, false, true)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Convert a `versionedfile::Key` back to a knit-style `Vec<Vec<u8>>`.
+fn knit_key_from_vf(k: &crate::versionedfile::Key) -> KnitKey {
+    match k {
+        crate::versionedfile::Key::Fixed(v) | crate::versionedfile::Key::ContentAddressed(v) => {
+            v.clone()
+        }
     }
 }
 
