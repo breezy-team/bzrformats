@@ -2208,7 +2208,7 @@ pub(crate) fn decode_plain_knit_to_lines<I, A, F>(
 ) -> Result<Vec<Vec<u8>>, KnitError>
 where
     I: KnitIndex,
-    A: KnitAccess,
+    A: KnitAccess<F = I::F>,
     F: KnitFactory,
 {
     if method == KnitMethod::Fulltext {
@@ -2236,7 +2236,7 @@ pub(crate) fn decode_plain_knit_to_lines_with_fallbacks<I, A, F>(
 ) -> Result<Vec<Vec<u8>>, KnitError>
 where
     I: KnitIndex,
-    A: KnitAccess,
+    A: KnitAccess<F = I::F>,
     F: KnitFactory,
 {
     if method == KnitMethod::Fulltext {
@@ -2734,10 +2734,10 @@ pub type KnitKey = Vec<Vec<u8>>;
 /// `(graph_index, pos, size)` tuple, for a `_KndxIndex` it's
 /// `(prefix_key, pos, size)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KnitRecordDetails {
+pub struct KnitRecordDetails<F: FileRef = String> {
     pub method: KnitMethod,
     pub noeol: bool,
-    pub index_memo: KnitIndexMemo,
+    pub index_memo: KnitIndexMemo<F>,
     pub compression_parent: Option<KnitKey>,
     pub parents: Vec<KnitKey>,
 }
@@ -2764,13 +2764,13 @@ impl FileRef for String {
 
 /// Opaque storage handle tying a key to its raw bytes on disk.
 ///
-/// The `path` identifies which file on the underlying transport the
-/// bytes live in; `offset` and `length` are the byte range inside it.
-/// For pure in-memory backends, `path` can be any stable identifier
-/// the access implementation chooses to use.
+/// `file_ref` identifies which backing file the bytes live in;
+/// `offset` and `length` are the byte range inside it. Generic over the
+/// reference type so the pyo3 adapter can stash an opaque Python tuple
+/// directly (via `PyFileRef`) instead of stringifying it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct KnitIndexMemo {
-    pub path: String,
+pub struct KnitIndexMemo<F: FileRef = String> {
+    pub file_ref: F,
     pub offset: u64,
     pub length: usize,
 }
@@ -2780,6 +2780,11 @@ pub struct KnitIndexMemo {
 /// Pure-Rust callers implement this directly; the pyo3 layer wraps a
 /// Python `_KnitGraphIndex` or `_KndxIndex` via an adapter struct.
 pub trait KnitIndex {
+    /// The file-reference type used in this index's memos. Paired with
+    /// the matching `KnitAccess::F` so reads and writes share the same
+    /// addressing scheme.
+    type F: FileRef;
+
     // --- read side ---
 
     /// Look up build details for `keys`. Missing keys are absent from
@@ -2787,7 +2792,7 @@ pub trait KnitIndex {
     fn get_build_details(
         &self,
         keys: &[KnitKey],
-    ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails>, KnitError>;
+    ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails<Self::F>>, KnitError>;
 
     /// Return all keys present in this index.
     fn keys(&self) -> Result<Vec<KnitKey>, KnitError>;
@@ -2807,7 +2812,7 @@ pub trait KnitIndex {
     fn get_total_build_size(
         &self,
         keys: &[KnitKey],
-        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails<Self::F>>,
     ) -> usize;
 
     /// Sort `keys` in-place into the order that minimises I/O when
@@ -2815,7 +2820,7 @@ pub trait KnitIndex {
     fn sort_keys_by_io(
         &self,
         keys: &mut [KnitKey],
-        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails<Self::F>>,
     );
 
     /// Return true if this index tracks graph parents.
@@ -2841,7 +2846,12 @@ pub trait KnitIndex {
     ///   records may not yet be present; buffer them for later.
     fn add_records(
         &self,
-        records: &[(KnitKey, Vec<KnitMethod>, KnitIndexMemo, Vec<KnitKey>)],
+        records: &[(
+            KnitKey,
+            Vec<KnitMethod>,
+            KnitIndexMemo<Self::F>,
+            Vec<KnitKey>,
+        )],
         random_id: bool,
         missing_compression_parents: bool,
     ) -> Result<(), KnitError>;
@@ -3058,14 +3068,21 @@ impl<C: AddCallback> KnitGraphIndex<C> {
 /// Covers both the read path (fetch raw record bytes) and the write
 /// path (append new records, flush, retry on pack reload).
 pub trait KnitAccess {
+    /// The file-reference type used in this access object's memos.
+    /// Paired with the matching `KnitIndex::F`.
+    type F: FileRef;
+
     // --- read side ---
 
     /// Fetch the raw record bytes for one index memo. Returns the
     /// gzip-compressed data ready to feed to [`decode_record_gz`].
-    fn get_raw_record(&self, memo: &KnitIndexMemo) -> Result<Vec<u8>, KnitError>;
+    fn get_raw_record(&self, memo: &KnitIndexMemo<Self::F>) -> Result<Vec<u8>, KnitError>;
 
     /// Fetch raw record bytes for multiple memos in order.
-    fn get_raw_records(&self, memos: &[KnitIndexMemo]) -> Result<Vec<Vec<u8>>, KnitError>;
+    fn get_raw_records(
+        &self,
+        memos: &[KnitIndexMemo<Self::F>],
+    ) -> Result<Vec<Vec<u8>>, KnitError>;
 
     // --- write side ---
 
@@ -3075,7 +3092,7 @@ pub trait KnitAccess {
         key: &KnitKey,
         size: usize,
         data: Vec<Vec<u8>>,
-    ) -> Result<KnitIndexMemo, KnitError>;
+    ) -> Result<KnitIndexMemo<Self::F>, KnitError>;
 
     /// Flush any buffered writes to the underlying storage.
     fn flush(&self) -> Result<(), KnitError>;
@@ -3108,7 +3125,7 @@ pub fn get_text<I, A, F>(
 ) -> Result<Vec<u8>, KnitError>
 where
     I: KnitIndex,
-    A: KnitAccess,
+    A: KnitAccess<F = I::F>,
     F: KnitFactory,
 {
     let content = get_content(index, access, factory, key)?;
@@ -3131,12 +3148,12 @@ pub fn get_content<I, A, F>(
 ) -> Result<F::Content, KnitError>
 where
     I: KnitIndex,
-    A: KnitAccess,
+    A: KnitAccess<F = I::F>,
     F: KnitFactory,
 {
     // 1. Walk the compression chain to discover every ancestor we'll
     //    need to fetch and parse.
-    let chain = walk_compression_closure::<KnitKey, KnitRecordDetails, _>(
+    let chain = walk_compression_closure::<KnitKey, KnitRecordDetails<I::F>, _>(
         std::iter::once(key.clone()),
         false,
         |batch| {
@@ -3228,7 +3245,7 @@ pub fn get_sha1s<I, A>(
 ) -> Result<std::collections::HashMap<KnitKey, Vec<u8>>, KnitError>
 where
     I: KnitIndex,
-    A: KnitAccess,
+    A: KnitAccess<F = I::F>,
 {
     let details_map = index.get_build_details(keys)?;
     let mut out = std::collections::HashMap::new();
@@ -3418,7 +3435,7 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KndxIndex<T, 
                     method,
                     noeol,
                     index_memo: KnitIndexMemo {
-                        path: knit_path,
+                        file_ref: knit_path,
                         offset: entry.pos,
                         length: entry.size,
                     },
@@ -3548,6 +3565,8 @@ pub fn parse_kndx_data(data: &[u8]) -> Result<KndxPrefixCache, KnitError> {
 }
 
 impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitIndex for KndxIndex<T, M> {
+    type F = String;
+
     fn get_build_details(
         &self,
         keys: &[KnitKey],
@@ -3665,10 +3684,10 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitIndex for
         keys.sort_by(|a, b| {
             let a_memo = positions
                 .get(a)
-                .map(|d| (&d.index_memo.path, d.index_memo.offset));
+                .map(|d| (&d.index_memo.file_ref, d.index_memo.offset));
             let b_memo = positions
                 .get(b)
-                .map(|d| (&d.index_memo.path, d.index_memo.offset));
+                .map(|d| (&d.index_memo.file_ref, d.index_memo.offset));
             a_memo.cmp(&b_memo)
         });
     }
@@ -3827,6 +3846,8 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitKeyAccess
 impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitAccess
     for KnitKeyAccess<T, M>
 {
+    type F = String;
+
     fn get_raw_record(&self, memo: &KnitIndexMemo) -> Result<Vec<u8>, KnitError> {
         use crate::transport::ReadRange;
         let ranges = [ReadRange {
@@ -3834,7 +3855,7 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitAccess
             length: memo.length,
         }];
         self.transport
-            .readv(&memo.path, &ranges)
+            .readv(&memo.file_ref, &ranges)
             .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))
             .and_then(|mut v| {
                 v.pop()
@@ -3850,7 +3871,7 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitAccess
         let mut by_path: std::collections::HashMap<&str, Vec<(usize, ReadRange)>> =
             std::collections::HashMap::new();
         for (i, memo) in memos.iter().enumerate() {
-            by_path.entry(&memo.path).or_default().push((
+            by_path.entry(&memo.file_ref).or_default().push((
                 i,
                 ReadRange {
                     offset: memo.offset,
@@ -3886,7 +3907,7 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitAccess
             .append_bytes(&path, &flat)
             .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
         Ok(KnitIndexMemo {
-            path,
+            file_ref: path,
             offset,
             length,
         })
@@ -3919,7 +3940,7 @@ pub struct KnitVersionedFiles<I, A, F> {
 impl<I, A, F> KnitVersionedFiles<I, A, F>
 where
     I: KnitIndex,
-    A: KnitAccess,
+    A: KnitAccess<F = I::F>,
     F: KnitFactory,
 {
     pub fn new(index: I, access: A, factory: F, max_delta_chain: usize) -> Self {
@@ -3985,7 +4006,7 @@ where
     pub fn get_build_details(
         &self,
         keys: &[KnitKey],
-    ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails>, KnitError> {
+    ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails<I::F>>, KnitError> {
         self.index.get_build_details(keys)
     }
 
@@ -4125,14 +4146,14 @@ where
     /// by storage position to minimise I/O seeks.
     pub fn read_records_iter(
         &self,
-        records: &[(KnitKey, KnitIndexMemo)],
+        records: &[(KnitKey, KnitIndexMemo<I::F>)],
     ) -> Result<Vec<(KnitKey, F::Content, Vec<u8>)>, KnitError> {
         if records.is_empty() {
             return Ok(vec![]);
         }
         let mut sorted = records.to_vec();
-        sorted.sort_by(|a, b| (&a.1.path, a.1.offset).cmp(&(&b.1.path, b.1.offset)));
-        let memos: Vec<KnitIndexMemo> = sorted.iter().map(|(_, m)| m.clone()).collect();
+        sorted.sort_by(|a, b| (&a.1.file_ref, a.1.offset).cmp(&(&b.1.file_ref, b.1.offset)));
+        let memos: Vec<KnitIndexMemo<I::F>> = sorted.iter().map(|(_, m)| m.clone()).collect();
         let raw_data = self.access.get_raw_records(&memos)?;
         let mut out = Vec::with_capacity(sorted.len());
         for ((key, _), raw) in sorted.into_iter().zip(raw_data) {
@@ -4152,12 +4173,12 @@ where
     /// the order given, without any parsing or validation.
     pub fn read_records_iter_unchecked(
         &self,
-        records: &[(KnitKey, KnitIndexMemo)],
+        records: &[(KnitKey, KnitIndexMemo<I::F>)],
     ) -> Result<Vec<(KnitKey, Vec<u8>)>, KnitError> {
         if records.is_empty() {
             return Ok(vec![]);
         }
-        let memos: Vec<KnitIndexMemo> = records.iter().map(|(_, m)| m.clone()).collect();
+        let memos: Vec<KnitIndexMemo<I::F>> = records.iter().map(|(_, m)| m.clone()).collect();
         let raw_data = self.access.get_raw_records(&memos)?;
         Ok(records
             .iter()
@@ -4170,7 +4191,7 @@ where
     /// record header, returning `(key, raw_bytes, sha1_digest)`.
     pub fn read_records_iter_raw(
         &self,
-        records: &[(KnitKey, KnitIndexMemo)],
+        records: &[(KnitKey, KnitIndexMemo<I::F>)],
     ) -> Result<Vec<(KnitKey, Vec<u8>, Vec<u8>)>, KnitError> {
         let pairs = self.read_records_iter_unchecked(records)?;
         let mut out = Vec::with_capacity(pairs.len());
@@ -4202,7 +4223,7 @@ where
             return Ok(vec![]);
         }
         let build_details = self.index.get_build_details(keys)?;
-        let key_records: Vec<(KnitKey, KnitIndexMemo)> = build_details
+        let key_records: Vec<(KnitKey, KnitIndexMemo<I::F>)> = build_details
             .iter()
             .filter(|(k, _)| keys.contains(k))
             .map(|(k, det)| (k.clone(), det.index_memo.clone()))
@@ -4211,7 +4232,7 @@ where
         // emit either the fulltext lines or the new lines from the delta
         // payload — mirrors `_factory.get_fulltext_content` /
         // `get_linedelta_content` in Python.
-        let memos: Vec<KnitIndexMemo> = key_records.iter().map(|(_, m)| m.clone()).collect();
+        let memos: Vec<KnitIndexMemo<I::F>> = key_records.iter().map(|(_, m)| m.clone()).collect();
         let raw_data = self.access.get_raw_records(&memos)?;
         let mut out = Vec::new();
         for ((key, _), raw) in key_records.iter().zip(raw_data) {
@@ -4534,11 +4555,11 @@ pub fn build_delta_closure_wire_bytes(
 /// method, and raw (gzip-compressed) bytes for one revision.  The raw bytes
 /// can be passed directly to [`parse_record`] or [`parse_record_unchecked`].
 #[derive(Debug, Clone)]
-pub struct KnitContentFactory {
+pub struct KnitContentFactory<F: FileRef = String> {
     pub key: KnitKey,
     /// `None` when there is no graph information (e.g. `has_graph = false`).
     pub parents: Option<Vec<KnitKey>>,
-    pub record_details: KnitRecordDetails,
+    pub record_details: KnitRecordDetails<F>,
     /// SHA-1 digest of the reconstructed fulltext, or `None` if not yet
     /// computed (lazy; callers can compute it with [`parse_record_header_only`]).
     pub sha1: Option<Vec<u8>>,
@@ -4547,7 +4568,7 @@ pub struct KnitContentFactory {
     pub annotated: bool,
 }
 
-impl KnitContentFactory {
+impl<F: FileRef> KnitContentFactory<F> {
     /// Decompress, parse and return the record's fulltext as a `Vec<Vec<u8>>`
     /// of lines. Errors when the record is absent.
     fn into_lines_inner(&self) -> Result<Vec<Vec<u8>>, KnitError> {
@@ -4585,7 +4606,7 @@ impl KnitContentFactory {
     }
 }
 
-impl crate::versionedfile::ContentFactory for KnitContentFactory {
+impl<F: FileRef> crate::versionedfile::ContentFactory for KnitContentFactory<F> {
     fn sha1(&self) -> Option<Vec<u8>> {
         self.sha1.clone()
     }
@@ -4666,7 +4687,7 @@ impl crate::versionedfile::ContentFactory for KnitContentFactory {
     }
 }
 
-impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
+impl<I: KnitIndex, A: KnitAccess<F = I::F>, F: KnitFactory> KnitVersionedFiles<I, A, F> {
     /// Fetch records for `keys`, emitting one [`KnitContentFactory`] per
     /// locally-present key plus one [`KnitContentFactory`] with absent status
     /// (empty `raw_record`) for each key that is not found.
@@ -4687,7 +4708,7 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
         keys: &[KnitKey],
         ordering: &str,
         include_delta_closure: bool,
-    ) -> Result<Vec<KnitContentFactory>, KnitError> {
+    ) -> Result<Vec<KnitContentFactory<I::F>>, KnitError> {
         self.with_retry(|| self.get_record_stream_once(keys, ordering, include_delta_closure))
     }
 
@@ -4696,7 +4717,7 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
         keys: &[KnitKey],
         ordering: &str,
         include_delta_closure: bool,
-    ) -> Result<Vec<KnitContentFactory>, KnitError> {
+    ) -> Result<Vec<KnitContentFactory<I::F>>, KnitError> {
         use std::collections::{HashMap, HashSet};
 
         if keys.is_empty() {
@@ -4706,8 +4727,8 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
         // For the delta-closure case we walk the compression chain so that
         // basis keys are included in the fetch, matching Python's
         // _get_components_positions(allow_missing=True).
-        let positions: HashMap<KnitKey, KnitRecordDetails> = if include_delta_closure {
-            let closure_result = walk_compression_closure::<KnitKey, KnitRecordDetails, _>(
+        let positions: HashMap<KnitKey, KnitRecordDetails<I::F>> = if include_delta_closure {
+            let closure_result = walk_compression_closure::<KnitKey, KnitRecordDetails<I::F>, _>(
                 keys.iter().cloned(),
                 true,
                 |batch| {
@@ -4758,13 +4779,13 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
             }
         };
 
-        let memos: Vec<KnitIndexMemo> = sorted_keys
+        let memos: Vec<KnitIndexMemo<I::F>> = sorted_keys
             .iter()
             .map(|k| positions[k].index_memo.clone())
             .collect();
         let raw_records = self.access.get_raw_records(&memos)?;
 
-        let mut out: Vec<KnitContentFactory> = Vec::with_capacity(keys.len());
+        let mut out: Vec<KnitContentFactory<I::F>> = Vec::with_capacity(keys.len());
 
         // Emit absent entries first, matching Python's ordering.
         for key in &absent_keys {
@@ -4775,7 +4796,7 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
                     method: KnitMethod::Fulltext,
                     noeol: false,
                     index_memo: KnitIndexMemo {
-                        path: String::new(),
+                        file_ref: I::F::placeholder(),
                         offset: 0,
                         length: 0,
                     },
@@ -4821,13 +4842,14 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
     ) -> Result<(), KnitError> {
         use std::collections::HashMap;
 
-        type BufferMap =
-            HashMap<KnitKey, Vec<(KnitKey, Vec<KnitMethod>, KnitIndexMemo, Vec<KnitKey>)>>;
-
         self.index.check_write_ok()?;
 
         // key = compression_parent not yet present; value = entries waiting for it.
-        let mut buffered: BufferMap = HashMap::new();
+        // (Can't use a `type` alias because it can't capture `I::F`.)
+        let mut buffered: HashMap<
+            KnitKey,
+            Vec<(KnitKey, Vec<KnitMethod>, KnitIndexMemo<I::F>, Vec<KnitKey>)>,
+        > = HashMap::new();
 
         for item in stream {
             let record = item?;
@@ -5117,12 +5139,12 @@ impl<I: KnitIndex, A: KnitAccess, F: KnitFactory> KnitVersionedFiles<I, A, F> {
     ) -> Result<(), KnitError> {
         use std::collections::HashMap;
 
-        type BufferMap =
-            HashMap<KnitKey, Vec<(KnitKey, Vec<KnitMethod>, KnitIndexMemo, Vec<KnitKey>)>>;
-
         self.index.check_write_ok()?;
 
-        let mut buffered: BufferMap = HashMap::new();
+        let mut buffered: HashMap<
+            KnitKey,
+            Vec<(KnitKey, Vec<KnitMethod>, KnitIndexMemo<I::F>, Vec<KnitKey>)>,
+        > = HashMap::new();
 
         for item in stream {
             let record = item?;
@@ -5378,7 +5400,7 @@ pub(crate) fn merge_annotations<I, A, F>(
 ) -> Result<Option<Vec<DeltaHunk<<F::Content as KnitContent>::DeltaLine>>>, KnitError>
 where
     I: KnitIndex,
-    A: KnitAccess,
+    A: KnitAccess<F = I::F>,
     F: KnitFactory,
     <F::Content as KnitContent>::DeltaLine: Clone,
 {
@@ -5472,7 +5494,7 @@ pub type LineAnnotation = Vec<KnitKey>;
 pub struct KnitAnnotator<I, A, F>
 where
     I: KnitIndex,
-    A: KnitAccess,
+    A: KnitAccess<F = I::F>,
     F: KnitFactory,
 {
     index: I,
@@ -5487,7 +5509,7 @@ where
     /// Completed per-line annotations.
     annotations_cache: std::collections::HashMap<KnitKey, Vec<LineAnnotation>>,
     /// Build details fetched during `get_build_graph`.
-    all_build_details: std::collections::HashMap<KnitKey, KnitRecordDetails>,
+    all_build_details: std::collections::HashMap<KnitKey, KnitRecordDetails<I::F>>,
     /// Number of delta-children still waiting on a compression parent.
     num_compression_children: std::collections::HashMap<KnitKey, usize>,
     /// Content objects kept alive while delta children depend on them.
@@ -5495,7 +5517,7 @@ where
     /// Delta records queued until their compression parent is ready.
     pending_deltas: std::collections::HashMap<
         KnitKey,
-        Vec<(KnitKey, Vec<KnitKey>, Vec<u8>, KnitRecordDetails)>,
+        Vec<(KnitKey, Vec<KnitKey>, Vec<u8>, KnitRecordDetails<I::F>)>,
     >,
     /// Keys whose text is ready but that still await parent annotations.
     pending_annotation: std::collections::HashMap<KnitKey, Vec<(KnitKey, Vec<KnitKey>)>>,
@@ -5506,7 +5528,7 @@ where
 impl<I, A, F> KnitAnnotator<I, A, F>
 where
     I: KnitIndex,
-    A: KnitAccess,
+    A: KnitAccess<F = I::F>,
     F: KnitFactory,
     F::Content: Clone,
 {
@@ -5550,10 +5572,10 @@ where
     fn get_build_graph(
         &mut self,
         key: &KnitKey,
-    ) -> Result<(Vec<(KnitKey, KnitIndexMemo)>, Vec<KnitKey>), KnitError> {
+    ) -> Result<(Vec<(KnitKey, KnitIndexMemo<I::F>)>, Vec<KnitKey>), KnitError> {
         let mut pending: std::collections::HashSet<KnitKey> =
             std::iter::once(key.clone()).collect();
-        let mut records: Vec<(KnitKey, KnitIndexMemo)> = Vec::new();
+        let mut records: Vec<(KnitKey, KnitIndexMemo<I::F>)> = Vec::new();
         let mut ann_keys: Vec<KnitKey> = Vec::new();
         *self.num_needed_children.entry(key.clone()).or_insert(0) += 1;
 
@@ -5639,7 +5661,7 @@ where
                         method,
                         noeol,
                         index_memo: KnitIndexMemo {
-                            path: String::new(),
+                            file_ref: I::F::placeholder(),
                             offset: 0,
                             length: 0,
                         },
@@ -5753,9 +5775,9 @@ where
     /// `VersionedFileAnnotator.annotate`.
     fn extract_and_annotate(
         &mut self,
-        records: Vec<(KnitKey, KnitIndexMemo)>,
+        records: Vec<(KnitKey, KnitIndexMemo<I::F>)>,
     ) -> Result<(), KnitError> {
-        let memos: Vec<KnitIndexMemo> = records.iter().map(|(_, m)| m.clone()).collect();
+        let memos: Vec<KnitIndexMemo<I::F>> = records.iter().map(|(_, m)| m.clone()).collect();
         let raw_bytes = self.access.get_raw_records(&memos)?;
 
         for ((key, _memo), raw) in records.into_iter().zip(raw_bytes.into_iter()) {
@@ -6113,6 +6135,8 @@ mod tests {
     }
 
     impl KnitIndex for MockKnit {
+        type F = String;
+
         fn get_build_details(
             &self,
             keys: &[KnitKey],
@@ -6166,10 +6190,10 @@ mod tests {
             keys.sort_by(|a, b| {
                 let a_key = positions
                     .get(a)
-                    .map(|d| (&d.index_memo.path, d.index_memo.offset));
+                    .map(|d| (&d.index_memo.file_ref, d.index_memo.offset));
                 let b_key = positions
                     .get(b)
-                    .map(|d| (&d.index_memo.path, d.index_memo.offset));
+                    .map(|d| (&d.index_memo.file_ref, d.index_memo.offset));
                 a_key.cmp(&b_key)
             });
         }
@@ -6201,11 +6225,13 @@ mod tests {
     }
 
     impl KnitAccess for MockKnit {
+        type F = String;
+
         fn get_raw_record(&self, memo: &KnitIndexMemo) -> Result<Vec<u8>, KnitError> {
             self.bytes
                 .get(memo)
                 .cloned()
-                .ok_or_else(|| KnitError::BadIndexValue(memo.path.as_bytes().to_vec()))
+                .ok_or_else(|| KnitError::BadIndexValue(memo.file_ref.as_bytes().to_vec()))
         }
 
         fn get_raw_records(&self, memos: &[KnitIndexMemo]) -> Result<Vec<Vec<u8>>, KnitError> {
@@ -6238,7 +6264,7 @@ mod tests {
         let (_, chunks) = record_to_data(version_id, b"DIGEST", body.len(), &body, true).unwrap();
         let raw: Vec<u8> = chunks.into_iter().flatten().collect();
         let memo = KnitIndexMemo {
-            path: format!("rec/{}", String::from_utf8_lossy(version_id)),
+            file_ref: format!("rec/{}", String::from_utf8_lossy(version_id)),
             offset: 0,
             length: raw.len(),
         };
@@ -6253,7 +6279,7 @@ mod tests {
         let (_, chunks) = record_to_data(version_id, b"DIGEST", body.len(), &body, true).unwrap();
         let raw: Vec<u8> = chunks.into_iter().flatten().collect();
         let memo = KnitIndexMemo {
-            path: format!("rec/{}", String::from_utf8_lossy(version_id)),
+            file_ref: format!("rec/{}", String::from_utf8_lossy(version_id)),
             offset: 0,
             length: raw.len(),
         };
@@ -7919,7 +7945,7 @@ mod tests {
         let idx = make_kndx_index("filename", &[]);
         let key: KnitKey = vec![b"a".to_vec()];
         let memo = KnitIndexMemo {
-            path: "filename.knit".to_string(),
+            file_ref: "filename.knit".to_string(),
             offset: 0,
             length: 1,
         };
@@ -7969,7 +7995,7 @@ mod tests {
             method: KnitMethod::Fulltext,
             noeol: false,
             index_memo: KnitIndexMemo {
-                path: path.to_string(),
+                file_ref: path.to_string(),
                 offset,
                 length,
             },
@@ -7988,7 +8014,7 @@ mod tests {
             method: KnitMethod::LineDelta,
             noeol: false,
             index_memo: KnitIndexMemo {
-                path: path.to_string(),
+                file_ref: path.to_string(),
                 offset,
                 length,
             },

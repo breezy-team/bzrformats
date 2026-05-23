@@ -1255,19 +1255,19 @@ fn parse_slot_path(path: &str) -> Option<usize> {
 
 /// Rebuild the Python `(file_id, offset, length)` index_memo tuple from
 /// a [`KnitIndexMemo`], looking the file-identity object up in the
-/// shared [`MemoTable`] by the slot encoded in `memo.path`.
+/// shared [`MemoTable`] by the slot encoded in `memo.file_ref`.
 fn rebuild_py_memo(
     py: Python<'_>,
     table: &Mutex<MemoTable>,
     memo: &KnitIndexMemo,
 ) -> Result<Py<PyAny>, KnitError> {
-    let slot = parse_slot_path(&memo.path)
-        .ok_or_else(|| KnitError::BadIndexValue(memo.path.as_bytes().to_vec()))?;
+    let slot = parse_slot_path(&memo.file_ref)
+        .ok_or_else(|| KnitError::BadIndexValue(memo.file_ref.as_bytes().to_vec()))?;
     let file_id = {
         let table = table.lock().unwrap();
         table
             .get(slot)
-            .ok_or_else(|| KnitError::BadIndexValue(memo.path.as_bytes().to_vec()))?
+            .ok_or_else(|| KnitError::BadIndexValue(memo.file_ref.as_bytes().to_vec()))?
             .clone_ref(py)
     };
     let tuple = PyTuple::new(
@@ -1324,7 +1324,7 @@ impl PyKnitIndex {
     ) -> std::collections::HashMap<usize, usize> {
         let mut slots: Vec<usize> = positions
             .values()
-            .filter_map(|det| parse_slot_path(&det.index_memo.path))
+            .filter_map(|det| parse_slot_path(&det.index_memo.file_ref))
             .collect();
         slots.sort_unstable();
         slots.dedup();
@@ -1361,7 +1361,7 @@ fn file_identity_rank(
     ranks: &std::collections::HashMap<usize, usize>,
     memo: &KnitIndexMemo,
 ) -> usize {
-    parse_slot_path(&memo.path)
+    parse_slot_path(&memo.file_ref)
         .and_then(|slot| ranks.get(&slot).copied())
         .unwrap_or(usize::MAX)
 }
@@ -1410,6 +1410,8 @@ fn knit_key_to_py<'py>(py: Python<'py>, key: &KnitKey) -> PyResult<Bound<'py, Py
 }
 
 impl KnitIndexTrait for PyKnitIndex {
+    type F = String;
+
     fn get_build_details(
         &self,
         keys: &[KnitKey],
@@ -1489,7 +1491,7 @@ impl KnitIndexTrait for PyKnitIndex {
                         .map_err(|e| knit_err_from_py(py, e))?;
                     let slot = self.table.lock().unwrap().intern(py, file_id.unbind());
                     let index_memo = KnitIndexMemo {
-                        path: slot_path(slot),
+                        file_ref: slot_path(slot),
                         offset: pos,
                         length: length as usize,
                     };
@@ -1660,7 +1662,7 @@ impl KnitIndexTrait for PyKnitIndex {
         // file_identity (a GraphIndex for a pack, a key tuple for a kndx)
         // groups records by file; `pos` orders within a file.
         //
-        // The interned slot in `index_memo.path` is not a usable sort key
+        // The interned slot in `index_memo.file_ref` is not a usable sort key
         // on its own: slot numbers follow intern (i.e. dict-iteration)
         // order, so for a kndx -- where every record interns its own key
         // as the file_identity -- they would order non-deterministically.
@@ -1858,6 +1860,8 @@ impl PyKnitAccess {
 }
 
 impl KnitAccessTrait for PyKnitAccess {
+    type F = String;
+
     fn get_raw_record(&self, memo: &KnitIndexMemo) -> Result<Vec<u8>, KnitError> {
         Python::attach(|py| -> Result<Vec<u8>, KnitError> {
             let py_memo = rebuild_py_memo(py, &self.table, memo)?;
@@ -1956,7 +1960,7 @@ impl KnitAccessTrait for PyKnitAccess {
                 .map_err(|e| knit_err_from_py(py, e))?;
             let slot = self.table.lock().unwrap().intern(py, file_id.unbind());
             Ok(KnitIndexMemo {
-                path: slot_path(slot),
+                file_ref: slot_path(slot),
                 offset,
                 length: length as usize,
             })
@@ -5503,7 +5507,7 @@ impl KnitRecordStreamLazy {
                     knit_err_to_py(bazaar::knit::KnitError::RevisionNotPresent(k.clone()))
                 })?
                 .index_memo;
-            let slot = parse_slot_path(&memo.path)
+            let slot = parse_slot_path(&memo.file_ref)
                 .ok_or_else(|| PyValueError::new_err("bad memo slot"))?;
             let file_id = {
                 let t = table.lock().unwrap();
