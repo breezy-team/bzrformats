@@ -1217,63 +1217,71 @@ use bazaar::knit::{
 };
 use std::sync::{Arc, Mutex};
 
-#[derive(Default)]
-pub(crate) struct MemoTable {
-    /// File-identity objects (the first element of each Python memo
-    /// tuple), indexed by their slot in this Vec. Deduplicated by value
-    /// equality so records from one pack share a slot.
-    files: Vec<Py<PyAny>>,
-}
+/// File-reference for Python-backed knit indices.
+///
+/// Wraps the first element of a Python `(file_id, offset, length)` index
+/// memo tuple. Equality / hash / ordering use the Python object's
+/// pointer address (a stable per-object id), which is enough to group
+/// records by file in `sort_keys_by_io` without ever needing the GIL.
+///
+/// Replaces the old MemoTable / slot-path indirection — the file id is
+/// carried inline in [`KnitIndexMemo<PyFileRef>`] rather than parked in
+/// a side table keyed by a synthetic `"py:N"` string.
+#[derive(Debug)]
+pub struct PyFileRef(pub(crate) Py<PyAny>);
 
-impl MemoTable {
-    /// Intern a file-identity object, returning its slot. If an equal
-    /// object is already interned, its existing slot is returned so
-    /// records sharing a file end up grouped together.
-    fn intern(&mut self, py: Python<'_>, file_id: Py<PyAny>) -> usize {
-        for (idx, existing) in self.files.iter().enumerate() {
-            if existing.bind(py).eq(file_id.bind(py)).unwrap_or(false) {
-                return idx;
-            }
-        }
-        let idx = self.files.len();
-        self.files.push(file_id);
-        idx
-    }
-
-    fn get(&self, idx: usize) -> Option<&Py<PyAny>> {
-        self.files.get(idx)
+impl Clone for PyFileRef {
+    fn clone(&self) -> Self {
+        Python::attach(|py| PyFileRef(self.0.clone_ref(py)))
     }
 }
 
-fn slot_path(idx: usize) -> String {
-    format!("py:{}", idx)
+impl PartialEq for PyFileRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_ptr() == other.0.as_ptr()
+    }
 }
 
-fn parse_slot_path(path: &str) -> Option<usize> {
-    path.strip_prefix("py:").and_then(|s| s.parse().ok())
+impl Eq for PyFileRef {}
+
+impl std::hash::Hash for PyFileRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self.0.as_ptr() as usize).hash(state);
+    }
+}
+
+impl PartialOrd for PyFileRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PyFileRef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.0.as_ptr() as usize).cmp(&(other.0.as_ptr() as usize))
+    }
+}
+
+impl bazaar::knit::FileRef for PyFileRef {
+    fn placeholder() -> Self {
+        // Use Py_None as the placeholder identity. Acquiring the GIL is
+        // unavoidable here, but the only call sites are absent-record
+        // construction, which already runs under the interpreter.
+        Python::attach(|py| PyFileRef(py.None()))
+    }
 }
 
 /// Rebuild the Python `(file_id, offset, length)` index_memo tuple from
-/// a [`KnitIndexMemo`], looking the file-identity object up in the
-/// shared [`MemoTable`] by the slot encoded in `memo.file_ref`.
+/// a [`KnitIndexMemo<PyFileRef>`]. The file id is carried inline by
+/// `PyFileRef`; just wrap it together with the byte range.
 fn rebuild_py_memo(
     py: Python<'_>,
-    table: &Mutex<MemoTable>,
-    memo: &KnitIndexMemo,
+    memo: &KnitIndexMemo<PyFileRef>,
 ) -> Result<Py<PyAny>, KnitError> {
-    let slot = parse_slot_path(&memo.file_ref)
-        .ok_or_else(|| KnitError::BadIndexValue(memo.file_ref.as_bytes().to_vec()))?;
-    let file_id = {
-        let table = table.lock().unwrap();
-        table
-            .get(slot)
-            .ok_or_else(|| KnitError::BadIndexValue(memo.file_ref.as_bytes().to_vec()))?
-            .clone_ref(py)
-    };
     let tuple = PyTuple::new(
         py,
         [
-            file_id.into_bound(py),
+            memo.file_ref.0.clone_ref(py).into_bound(py),
             memo.offset
                 .into_pyobject(py)
                 .map_err(|e| knit_err_from_py(py, e.into()))?
@@ -1293,76 +1301,63 @@ fn rebuild_py_memo(
 ///
 /// The Python `get_build_details(keys)` returns the dict shape
 /// `{key: (index_memo, compression_parent, parents, (method, noeol))}`;
-/// this adapter walks each entry, parks the opaque Python `index_memo`
-/// in the shared `MemoTable`, and builds a `KnitRecordDetails` with a
-/// synthetic `KnitIndexMemo` whose path points back at the slot.
+/// this adapter walks each entry and stores the opaque Python
+/// `index_memo`'s file id directly as a [`PyFileRef`] inside the
+/// `KnitRecordDetails`.
 pub struct PyKnitIndex {
     py_index: Py<PyAny>,
-    table: Arc<Mutex<MemoTable>>,
 }
 
 impl PyKnitIndex {
-    pub fn new(py_index: Bound<'_, PyAny>, table: Arc<Mutex<MemoTable>>) -> Self {
+    pub fn new(py_index: Bound<'_, PyAny>) -> Self {
         Self {
             py_index: py_index.unbind(),
-            table,
         }
     }
 
-    /// Assign a deterministic rank to each distinct file-identity slot
+    /// Assign a deterministic rank to each distinct file-identity
     /// referenced by `positions`.
     ///
     /// The file-identities (the first element of each Python `index_memo`)
-    /// are interned in the shared [`MemoTable`]; their slot numbers follow
-    /// intern order, which is not stable. Ranking them by their Python
-    /// value gives a stable order. Slots that cannot be resolved or
-    /// compared fall back to ranking by slot number, which keeps the sort
-    /// total even for an unexpected index layout.
+    /// arrive from `get_build_details` in HashMap iteration order, which
+    /// is not stable. Ranking them by their Python value gives a stable
+    /// order. On a comparison failure (which a GraphIndex or key tuple
+    /// never produces) we fall back to pointer-id order so the sort stays
+    /// total and deterministic.
     fn rank_file_identities(
         &self,
-        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
-    ) -> std::collections::HashMap<usize, usize> {
-        let mut slots: Vec<usize> = positions
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails<PyFileRef>>,
+    ) -> std::collections::HashMap<PyFileRef, usize> {
+        let mut idents: Vec<PyFileRef> = positions
             .values()
-            .filter_map(|det| parse_slot_path(&det.index_memo.file_ref))
+            .map(|det| det.index_memo.file_ref.clone())
             .collect();
-        slots.sort_unstable();
-        slots.dedup();
+        idents.sort();
+        idents.dedup();
         Python::attach(|py| {
-            let table = self.table.lock().unwrap();
-            let mut idents: Vec<(usize, Option<Py<PyAny>>)> = slots
-                .iter()
-                .map(|&slot| (slot, table.get(slot).map(|o| o.clone_ref(py))))
-                .collect();
-            drop(table);
-            // Sort by the Python file-identity value; on a comparison
-            // failure (which a GraphIndex or key tuple never produces) or
-            // an unresolved slot, fall back to the slot number so the
-            // order stays total and deterministic.
-            idents.sort_by(|(a_slot, a_obj), (b_slot, b_obj)| match (a_obj, b_obj) {
-                (Some(a), Some(b)) => a
-                    .bind(py)
-                    .compare(b.bind(py))
-                    .unwrap_or_else(|_| a_slot.cmp(b_slot)),
-                _ => a_slot.cmp(b_slot),
+            idents.sort_by(|a, b| {
+                a.0.bind(py)
+                    .compare(b.0.bind(py))
+                    .unwrap_or_else(|_| a.cmp(b))
             });
             idents
                 .into_iter()
                 .enumerate()
-                .map(|(rank, (slot, _))| (slot, rank))
+                .map(|(rank, fr)| (fr, rank))
                 .collect()
         })
     }
 }
 
 /// Look up the file-identity rank of a memo (see
-/// [`PyKnitIndex::rank_file_identities`]). An unranked slot sorts last.
+/// [`PyKnitIndex::rank_file_identities`]). An unranked identity sorts last.
 fn file_identity_rank(
-    ranks: &std::collections::HashMap<usize, usize>,
-    memo: &KnitIndexMemo,
+    ranks: &std::collections::HashMap<PyFileRef, usize>,
+    memo: &KnitIndexMemo<PyFileRef>,
 ) -> usize {
-    parse_slot_path(&memo.file_ref)
-        .and_then(|slot| ranks.get(&slot).copied())
+    ranks
+        .get(&memo.file_ref)
+        .copied()
         .unwrap_or(usize::MAX)
 }
 
@@ -1410,14 +1405,17 @@ fn knit_key_to_py<'py>(py: Python<'py>, key: &KnitKey) -> PyResult<Bound<'py, Py
 }
 
 impl KnitIndexTrait for PyKnitIndex {
-    type F = String;
+    type F = PyFileRef;
 
     fn get_build_details(
         &self,
         keys: &[KnitKey],
-    ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails>, KnitError> {
+    ) -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails<PyFileRef>>, KnitError> {
         Python::attach(
-            |py| -> Result<std::collections::HashMap<KnitKey, KnitRecordDetails>, KnitError> {
+            |py| -> Result<
+                std::collections::HashMap<KnitKey, KnitRecordDetails<PyFileRef>>,
+                KnitError,
+            > {
                 let py_keys = pyo3::types::PyList::empty(py);
                 for k in keys {
                     let tup = knit_key_to_py(py, k).map_err(|e| knit_err_from_py(py, e))?;
@@ -1489,9 +1487,8 @@ impl KnitIndexTrait for PyKnitIndex {
                         .map_err(|e| knit_err_from_py(py, e))?
                         .extract()
                         .map_err(|e| knit_err_from_py(py, e))?;
-                    let slot = self.table.lock().unwrap().intern(py, file_id.unbind());
                     let index_memo = KnitIndexMemo {
-                        file_ref: slot_path(slot),
+                        file_ref: PyFileRef(file_id.unbind()),
                         offset: pos,
                         length: length as usize,
                     };
@@ -1607,7 +1604,7 @@ impl KnitIndexTrait for PyKnitIndex {
     fn get_total_build_size(
         &self,
         keys: &[KnitKey],
-        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails<PyFileRef>>,
     ) -> usize {
         Python::attach(|py| -> usize {
             let py_keys = pyo3::types::PyList::empty(py);
@@ -1655,7 +1652,7 @@ impl KnitIndexTrait for PyKnitIndex {
     fn sort_keys_by_io(
         &self,
         keys: &mut [KnitKey],
-        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails>,
+        positions: &std::collections::HashMap<KnitKey, KnitRecordDetails<PyFileRef>>,
     ) {
         // Mirror Python's `_KnitGraphIndex._sort_keys_by_io`, which sorts
         // by the index_memo tuple: `(file_identity, pos, size)`. The
@@ -1739,7 +1736,12 @@ impl KnitIndexTrait for PyKnitIndex {
 
     fn add_records(
         &self,
-        records: &[(KnitKey, Vec<KnitMethod>, KnitIndexMemo, Vec<KnitKey>)],
+        records: &[(
+            KnitKey,
+            Vec<KnitMethod>,
+            KnitIndexMemo<PyFileRef>,
+            Vec<KnitKey>,
+        )],
         random_id: bool,
         missing_compression_parents: bool,
     ) -> Result<(), KnitError> {
@@ -1749,7 +1751,7 @@ impl KnitIndexTrait for PyKnitIndex {
             // record's index entry needs.
             let py_memos: Vec<Py<PyAny>> = records
                 .iter()
-                .map(|(_, _, memo, _)| rebuild_py_memo(py, &self.table, memo))
+                .map(|(_, _, memo, _)| rebuild_py_memo(py, memo))
                 .collect::<Result<_, _>>()?;
             for ((key, methods, _memo, parents), py_memo) in records.iter().zip(py_memos) {
                 let py_key = knit_key_to_py(py, key).map_err(|e| knit_err_from_py(py, e))?;
@@ -1804,13 +1806,12 @@ impl KnitIndexTrait for PyKnitIndex {
 /// Adapter that exposes a Python `_KnitKeyAccess` / `_DirectPackAccess`
 /// as a pure-Rust [`KnitAccessTrait`].
 ///
-/// Rebuilds each `(file_id, offset, length)` memo tuple from the shared
-/// [`MemoTable`] (where the matching [`PyKnitIndex`] interned the file
-/// identity), then calls `py_access.get_raw_records([memo])` and reads
+/// Rebuilds each `(file_id, offset, length)` memo tuple from the
+/// [`PyFileRef`] in the memo (carried over directly from the Python
+/// index), then calls `py_access.get_raw_records([memo])` and reads
 /// the items from the returned iterator.
 pub struct PyKnitAccess {
     py_access: Py<PyAny>,
-    table: Arc<Mutex<MemoTable>>,
     /// The most recent `RetryWithNewPacks` exception raised by the
     /// Python access layer. `KnitError` cannot carry a `Py<PyAny>`, so a
     /// raised `RetryWithNewPacks` is stashed here and surfaced as
@@ -1825,10 +1826,9 @@ pub struct PyKnitAccess {
 }
 
 impl PyKnitAccess {
-    pub fn new(py_access: Bound<'_, PyAny>, table: Arc<Mutex<MemoTable>>) -> Self {
+    pub fn new(py_access: Bound<'_, PyAny>) -> Self {
         Self {
             py_access: py_access.unbind(),
-            table,
             pending_retry: Mutex::new(None),
             final_error: Mutex::new(None),
         }
@@ -1860,11 +1860,11 @@ impl PyKnitAccess {
 }
 
 impl KnitAccessTrait for PyKnitAccess {
-    type F = String;
+    type F = PyFileRef;
 
-    fn get_raw_record(&self, memo: &KnitIndexMemo) -> Result<Vec<u8>, KnitError> {
+    fn get_raw_record(&self, memo: &KnitIndexMemo<PyFileRef>) -> Result<Vec<u8>, KnitError> {
         Python::attach(|py| -> Result<Vec<u8>, KnitError> {
-            let py_memo = rebuild_py_memo(py, &self.table, memo)?;
+            let py_memo = rebuild_py_memo(py, memo)?;
 
             let memos_list = pyo3::types::PyList::empty(py);
             memos_list
@@ -1894,11 +1894,14 @@ impl KnitAccessTrait for PyKnitAccess {
         })
     }
 
-    fn get_raw_records(&self, memos: &[KnitIndexMemo]) -> Result<Vec<Vec<u8>>, KnitError> {
+    fn get_raw_records(
+        &self,
+        memos: &[KnitIndexMemo<PyFileRef>],
+    ) -> Result<Vec<Vec<u8>>, KnitError> {
         Python::attach(|py| -> Result<Vec<Vec<u8>>, KnitError> {
             let py_memos = pyo3::types::PyList::empty(py);
             for memo in memos {
-                let py_memo = rebuild_py_memo(py, &self.table, memo)?;
+                let py_memo = rebuild_py_memo(py, memo)?;
                 py_memos
                     .append(py_memo.bind(py))
                     .map_err(|e| knit_err_from_py(py, e))?;
@@ -1931,8 +1934,8 @@ impl KnitAccessTrait for PyKnitAccess {
         key: &KnitKey,
         size: usize,
         data: Vec<Vec<u8>>,
-    ) -> Result<KnitIndexMemo, KnitError> {
-        Python::attach(|py| -> Result<KnitIndexMemo, KnitError> {
+    ) -> Result<KnitIndexMemo<PyFileRef>, KnitError> {
+        Python::attach(|py| -> Result<KnitIndexMemo<PyFileRef>, KnitError> {
             let py_key = knit_key_to_py(py, key).map_err(|e| knit_err_from_py(py, e))?;
             let flat: Vec<u8> = data.into_iter().flatten().collect();
             let py_data = pyo3::types::PyList::new(py, [PyBytes::new(py, &flat)])
@@ -1958,9 +1961,8 @@ impl KnitAccessTrait for PyKnitAccess {
                 .map_err(|e| knit_err_from_py(py, e))?
                 .extract()
                 .map_err(|e| knit_err_from_py(py, e))?;
-            let slot = self.table.lock().unwrap().intern(py, file_id.unbind());
             Ok(KnitIndexMemo {
-                file_ref: slot_path(slot),
+                file_ref: PyFileRef(file_id.unbind()),
                 offset,
                 length: length as usize,
             })
@@ -2023,9 +2025,8 @@ fn get_text_via_traits_rs<'py>(
     key: Bound<'py, PyAny>,
     annotated: bool,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let table = Arc::new(Mutex::new(MemoTable::default()));
-    let index = PyKnitIndex::new(py_index, table.clone());
-    let access = PyKnitAccess::new(py_access, table);
+    let index = PyKnitIndex::new(py_index);
+    let access = PyKnitAccess::new(py_access);
     let knit_key = extract_knit_key(&key).map_err(knit_err_to_py)?;
 
     let bytes = if annotated {
@@ -2060,9 +2061,8 @@ fn get_content_via_traits_rs<'py>(
     key: Bound<'py, PyAny>,
     annotated: bool,
 ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyAny>, bool)> {
-    let table = Arc::new(Mutex::new(MemoTable::default()));
-    let index = PyKnitIndex::new(py_index, table.clone());
-    let access = PyKnitAccess::new(py_access, table);
+    let index = PyKnitIndex::new(py_index);
+    let access = PyKnitAccess::new(py_access);
     let knit_key = extract_knit_key(&key).map_err(knit_err_to_py)?;
     let last_segment = knit_key.last().cloned().unwrap_or_default();
 
@@ -2112,9 +2112,8 @@ fn get_sha1s_via_traits_rs<'py>(
     py_access: Bound<'py, PyAny>,
     keys: Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let table = Arc::new(Mutex::new(MemoTable::default()));
-    let index = PyKnitIndex::new(py_index, table.clone());
-    let access = PyKnitAccess::new(py_access, table);
+    let index = PyKnitIndex::new(py_index);
+    let access = PyKnitAccess::new(py_access);
 
     let mut rust_keys: Vec<KnitKey> = Vec::new();
     for item in keys.try_iter()? {
@@ -3210,8 +3209,8 @@ pub struct PyKnitAnnotator {
 
 impl PyKnitAnnotator {
     fn from_kvf(py: Python<'_>, kvf: &PyKnitVersionedFiles) -> PyResult<Self> {
-        let index = PyKnitIndex::new(kvf.index_obj.bind(py).clone(), Arc::clone(&kvf.table));
-        let access = PyKnitAccess::new(kvf.access_obj.bind(py).clone(), Arc::clone(&kvf.table));
+        let index = PyKnitIndex::new(kvf.index_obj.bind(py).clone());
+        let access = PyKnitAccess::new(kvf.access_obj.bind(py).clone());
         let inner = if kvf.annotated {
             AnyKnitAnnotator::Annotated(KnitAnnotator::new(index, access, KnitAnnotateFactory))
         } else {
@@ -5412,7 +5411,7 @@ struct LocalGroupState {
     /// How many of `remaining` have been emitted.
     emitted: usize,
     /// Build details for the keys of this group.
-    positions: std::collections::HashMap<KnitKey, KnitRecordDetails>,
+    positions: std::collections::HashMap<KnitKey, KnitRecordDetails<PyFileRef>>,
     /// Live Python `get_raw_records` generator for `remaining[emitted..]`.
     raw_iter: Py<PyAny>,
 }
@@ -5492,12 +5491,11 @@ impl KnitRecordStreamLazy {
         py: Python<'_>,
         keys: &[KnitKey],
     ) -> PyResult<(
-        std::collections::HashMap<KnitKey, KnitRecordDetails>,
+        std::collections::HashMap<KnitKey, KnitRecordDetails<PyFileRef>>,
         Py<PyAny>,
     )> {
         let vf = self.vf.bind(py).borrow();
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(vf.index_obj.bind(py).clone(), table.clone());
+        let index = PyKnitIndex::new(vf.index_obj.bind(py).clone());
         let positions = index.get_build_details(keys).map_err(knit_err_to_py)?;
         let memos = PyList::empty(py);
         for k in keys {
@@ -5507,18 +5505,10 @@ impl KnitRecordStreamLazy {
                     knit_err_to_py(bazaar::knit::KnitError::RevisionNotPresent(k.clone()))
                 })?
                 .index_memo;
-            let slot = parse_slot_path(&memo.file_ref)
-                .ok_or_else(|| PyValueError::new_err("bad memo slot"))?;
-            let file_id = {
-                let t = table.lock().unwrap();
-                t.get(slot)
-                    .ok_or_else(|| PyValueError::new_err("memo slot not interned"))?
-                    .clone_ref(py)
-            };
             memos.append(PyTuple::new(
                 py,
                 [
-                    file_id.into_bound(py),
+                    memo.file_ref.0.clone_ref(py).into_bound(py),
                     memo.offset.into_pyobject(py)?.into_any(),
                     memo.length.into_pyobject(py)?.into_any(),
                 ],
@@ -5608,8 +5598,6 @@ pub struct PyKnitVersionedFiles {
     max_delta_chain: usize,
     reload_func: Py<PyAny>,
     immediate_fallback_vfs: Vec<Py<PyAny>>,
-    /// Shared memo table reused across calls.
-    table: Arc<Mutex<MemoTable>>,
 }
 
 #[pymethods]
@@ -5631,7 +5619,6 @@ impl PyKnitVersionedFiles {
             max_delta_chain,
             reload_func: reload_func.map(|f| f.unbind()).unwrap_or_else(|| py.None()),
             immediate_fallback_vfs: Vec::new(),
-            table: Arc::new(Mutex::new(MemoTable::default())),
         }
     }
 
@@ -5681,7 +5668,6 @@ impl PyKnitVersionedFiles {
             annotated: self.annotated,
             reload_func: self.reload_func.clone_ref(py),
             immediate_fallback_vfs: Vec::new(),
-            table: Arc::new(Mutex::new(MemoTable::default())),
         };
         Py::new(py, result).map(|p| p.into_any())
     }
@@ -5768,9 +5754,8 @@ impl PyKnitVersionedFiles {
             }
         };
 
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
-        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table.clone());
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone());
 
         let kvf = if self.annotated {
             bazaar::knit::KnitVersionedFiles::new(
@@ -5815,8 +5800,7 @@ impl PyKnitVersionedFiles {
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let rust_keys = extract_py_knit_keys(&keys)?;
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table);
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone());
 
         let has_graph = index.has_graph();
         let local_map = index.get_parent_map(&rust_keys).map_err(knit_err_to_py)?;
@@ -5869,9 +5853,8 @@ impl PyKnitVersionedFiles {
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let rust_keys = extract_py_knit_keys(&keys)?;
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
-        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table);
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone());
 
         let local_result = rust_get_sha1s(&index, &access, &rust_keys).map_err(knit_err_to_py)?;
         let result = PyDict::new(py);
@@ -5936,8 +5919,7 @@ impl PyKnitVersionedFiles {
         let this_ref = slf.bind(py);
         let this = this_ref.borrow();
         // _logical_check: verify all delta keys have their compression parent present.
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(this.index_obj.bind(py).clone(), table);
+        let index = PyKnitIndex::new(this.index_obj.bind(py).clone());
         let all_keys = index.keys().map_err(knit_err_to_py)?;
         let py_keys = PyList::empty(py);
         for k in &all_keys {
@@ -5979,8 +5961,7 @@ impl PyKnitVersionedFiles {
     }
 
     fn get_missing_compression_parent_keys(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table);
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone());
         let missing = index
             .get_missing_compression_parents()
             .map_err(knit_err_to_py)?;
@@ -6043,10 +6024,9 @@ impl PyKnitVersionedFiles {
             }
         }
 
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(this.index_obj.bind(py).clone(), table.clone());
+        let index = PyKnitIndex::new(this.index_obj.bind(py).clone());
         let index_obj = this.index_obj.clone_ref(py);
-        let access = PyKnitAccess::new(this.access_obj.bind(py).clone(), table);
+        let access = PyKnitAccess::new(this.access_obj.bind(py).clone());
         drop(this);
 
         // Lazy iterator: pull one record at a time from the Python stream and
@@ -6396,9 +6376,8 @@ impl PyKnitVersionedFiles {
             .try_iter()?
             .map(|item| extract_knit_key(&item?).map_err(knit_err_to_py))
             .collect::<PyResult<_>>()?;
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
-        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table);
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone());
         let pairs = if self.annotated {
             let kvf = bazaar::knit::KnitVersionedFiles::new(
                 index,
@@ -6690,9 +6669,8 @@ impl PyKnitVersionedFiles {
                 }
             }
         }
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
-        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table);
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone());
         let knit_key = extract_knit_key(&key).map_err(knit_err_to_py)?;
         let local_result: Result<Py<PyAny>, bazaar::knit::KnitError> = if self.annotated {
             bazaar::knit::get_content(
@@ -6774,9 +6752,8 @@ impl PyKnitVersionedFiles {
     }
 
     fn _check_should_delta(&self, py: Python<'_>, parent: Bound<'_, PyAny>) -> PyResult<bool> {
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
-        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table);
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone());
         let knit_key = extract_knit_key(&parent).map_err(knit_err_to_py)?;
         if self.annotated {
             let kvf = bazaar::knit::KnitVersionedFiles::new(
@@ -7279,8 +7256,7 @@ impl PyKnitVersionedFiles {
             .map(|k| extract_knit_key(&k?).map_err(knit_err_to_py))
             .collect::<PyResult<_>>()?;
 
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let local_index = PyKnitIndex::new(this.index_obj.bind(py).clone(), table.clone());
+        let local_index = PyKnitIndex::new(this.index_obj.bind(py).clone());
         let positions = local_index
             .get_build_details(&knit_keys)
             .map_err(knit_err_to_py)?;
@@ -7422,9 +7398,8 @@ impl PyKnitVersionedFiles {
         _digest: Vec<u8>,
         random_id: bool,
     ) -> PyResult<Py<PyAny>> {
-        let table = Arc::new(Mutex::new(MemoTable::default()));
-        let index = PyKnitIndex::new(self.index_obj.bind(py).clone(), table.clone());
-        let access = PyKnitAccess::new(self.access_obj.bind(py).clone(), table);
+        let index = PyKnitIndex::new(self.index_obj.bind(py).clone());
+        let access = PyKnitAccess::new(self.access_obj.bind(py).clone());
         let kvf = bazaar::knit::KnitVersionedFiles::new(
             index,
             access,
