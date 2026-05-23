@@ -653,6 +653,7 @@ where
             let mut still_missing: Vec<GcKey> = Vec::new();
             let mut found: std::collections::HashSet<GcKey> = std::collections::HashSet::new();
             for rec in fb_records {
+                let rec = rec?;
                 if rec.storage_kind() == "absent" {
                     continue;
                 }

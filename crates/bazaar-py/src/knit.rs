@@ -1421,7 +1421,7 @@ fn file_identity_rank(
         .unwrap_or(usize::MAX)
 }
 
-fn knit_err_from_py(py: Python<'_>, err: PyErr) -> KnitError {
+pub(crate) fn knit_err_from_py(py: Python<'_>, err: PyErr) -> KnitError {
     if err.is_instance_of::<PyNotImplementedError>(py) {
         return KnitError::NotImplemented("operation not implemented by Python index");
     }

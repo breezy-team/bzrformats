@@ -3358,15 +3358,31 @@ impl GroupCompressVersionedFiles {
     }
 
     /// Add a fallback store for texts not present in this one.
+    ///
+    /// Registers the object both on the Python-visible
+    /// `_immediate_fallback_vfs` list (read by external callers via the
+    /// getter) and on the pure store's fallback list as a
+    /// [`PyVersionedFiles`] adapter, so trait-driven code paths
+    /// (`get_sha1s`, `iter_lines_added_or_present_in_keys`, `check`, etc.)
+    /// consult fallbacks correctly.
     fn add_fallback_versioned_files(&mut self, a_versioned_files: Bound<'_, PyAny>) {
-        self.immediate_fallback_vfs.push(a_versioned_files.unbind());
+        let unbound = a_versioned_files.unbind();
+        let cloned = Python::attach(|py| unbound.clone_ref(py));
+        self.immediate_fallback_vfs.push(unbound);
+        self.pure
+            .add_fallback_versioned_files(Box::new(crate::versionedfile::PyVersionedFiles::new(
+                cloned,
+            )));
     }
 
     /// Drop the block cache and the index's caches.
     ///
-    /// Mirrors `GroupCompressVersionedFiles.clear_cache`.
+    /// Mirrors `GroupCompressVersionedFiles.clear_cache`. The pure store
+    /// drops its block cache (and the wrapped Python LRUSizeCache via
+    /// `PyBlockCache::clear`); we also clear the index's auxiliary caches
+    /// that live outside the pure store.
     fn clear_cache(&self, py: Python<'_>) -> PyResult<()> {
-        self.group_cache.bind(py).call_method0("clear")?;
+        self.pure.clear_cache();
         let index = self.index_obj.bind(py);
         index.getattr("_graph_index")?.call_method0("clear_cache")?;
         index.getattr("_int_cache")?.call_method0("clear")?;
@@ -3379,7 +3395,29 @@ impl GroupCompressVersionedFiles {
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let (result, _sources) = self.parent_map_with_sources(py, &keys)?;
+        // Iterate `keys` manually -- it may be any iterable (set, dict_keys,
+        // generator), not just a Sequence pyo3 can extract a Vec from.
+        let mut key_vec: Vec<bazaar::groupcompress::gcvf::GcKey> = Vec::new();
+        for k in keys.try_iter()? {
+            key_vec.push(k?.extract()?);
+        }
+        use bazaar::groupcompress::gcvf::GcIndex;
+        let has_graph = self.pure.index().has_graph();
+        let map = self
+            .pure
+            .get_parent_map(&key_vec)
+            .map_err(crate::knit::knit_err_to_py)?;
+        let result = PyDict::new(py);
+        for (k, parents) in map {
+            // A parentless index emits None for parents to distinguish "no
+            // graph info" from "empty parents" (matches
+            // _GCGraphIndex.get_parent_map and the per-vf tests).
+            if has_graph {
+                result.set_item(k, PyTuple::new(py, parents)?)?;
+            } else {
+                result.set_item(k, py.None())?;
+            }
+        }
         Ok(result)
     }
 
@@ -3402,14 +3440,12 @@ impl GroupCompressVersionedFiles {
         py.import("logging")?
             .call_method1("getLogger", ("bzrformats.evil",))?
             .call_method1("debug", ("keys scales with size of history",))?;
+        // The pure store walks its fallback list internally; we just
+        // marshal the result into a Python set.
+        let keys = self.pure.keys().map_err(crate::knit::knit_err_to_py)?;
         let result = PySet::empty(py)?;
-        for k in self.index_obj.bind(py).call_method0("keys")?.try_iter()? {
-            result.add(k?)?;
-        }
-        for fallback in &self.immediate_fallback_vfs {
-            for k in fallback.bind(py).call_method0("keys")?.try_iter()? {
-                result.add(k?)?;
-            }
+        for k in keys {
+            result.add(k)?;
         }
         Ok(result)
     }

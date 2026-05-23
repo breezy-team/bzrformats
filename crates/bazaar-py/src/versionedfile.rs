@@ -1,6 +1,6 @@
 use bazaar::versionedfile::{ContentFactory, Key};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PySet};
+use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
 
 #[pyclass(subclass)]
 struct AbstractContentFactory(Box<dyn ContentFactory + Send + Sync>);
@@ -677,6 +677,352 @@ impl bazaar::versionedfile::ContentFactory for PyContentFactory {
         self.key = f(self.key.clone());
         self.parents = self.parents.take().map(|v| v.into_iter().map(f).collect());
     }
+}
+
+/// Adapter that wraps a Python `VersionedFiles` object so pure-Rust code can
+/// call it through the [`bazaar::versionedfile::VersionedFiles`] trait. All
+/// methods re-enter the interpreter via [`Python::attach`] and marshal the
+/// arguments/results in both directions.
+///
+/// Used by the groupcompress / knit pyclasses to register their Python
+/// fallbacks on the pure store's fallback list, so trait-driven code paths
+/// (e.g. `get_sha1s`, `iter_lines_added_or_present_in_keys`, `check`) consult
+/// fallbacks correctly.
+pub struct PyVersionedFiles {
+    obj: Py<PyAny>,
+}
+
+impl PyVersionedFiles {
+    pub fn new(obj: Py<PyAny>) -> Self {
+        Self { obj }
+    }
+}
+
+/// Map a Python exception raised by a `VersionedFiles` call back to a
+/// `KnitError` variant the trait can carry. The trait error type is
+/// `KnitError` for historical reasons (it predated a dedicated
+/// VersionedFile error enum).
+fn vf_err_from_py(py: Python<'_>, err: PyErr) -> bazaar::knit::KnitError {
+    crate::knit::knit_err_from_py(py, err)
+}
+
+impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
+    fn get_parent_map(
+        &self,
+        keys: &[Key],
+    ) -> Result<std::collections::HashMap<Key, Vec<Key>>, bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let py_keys = PySet::empty(py).map_err(|e| vf_err_from_py(py, e))?;
+            for k in keys {
+                let pk = k.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+                py_keys.add(pk).map_err(|e| vf_err_from_py(py, e))?;
+            }
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("get_parent_map", (py_keys,))
+                .map_err(|e| vf_err_from_py(py, e))?;
+            let result = result.cast_into::<PyDict>().map_err(|e| vf_err_from_py(py, e.into()))?;
+            let mut out = std::collections::HashMap::new();
+            for (k, v) in result.iter() {
+                let key: Key = k.extract().map_err(|e| vf_err_from_py(py, e))?;
+                // A parentless index emits None for parents; map that to an
+                // empty Vec to satisfy the trait's signature.
+                let parents: Vec<Key> = if v.is_none() {
+                    Vec::new()
+                } else {
+                    let mut ps = Vec::new();
+                    for p in v.try_iter().map_err(|e| vf_err_from_py(py, e))? {
+                        let p = p.map_err(|e| vf_err_from_py(py, e))?;
+                        ps.push(p.extract::<Key>().map_err(|e| vf_err_from_py(py, e))?);
+                    }
+                    ps
+                };
+                out.insert(key, parents);
+            }
+            Ok(out)
+        })
+    }
+
+    fn get_record_stream(
+        &self,
+        keys: &[Key],
+        ordering: &str,
+        include_delta_closure: bool,
+    ) -> Result<
+        Box<dyn Iterator<Item = Result<Box<dyn ContentFactory>, bazaar::knit::KnitError>>>,
+        bazaar::knit::KnitError,
+    > {
+        // Initiate the Python call eagerly, then return an iterator that
+        // pulls one record at a time on demand. This preserves the lazy
+        // semantics of Python's get_record_stream so we don't have to
+        // materialise the whole closure up front.
+        Python::attach(|py| {
+            let py_keys = PyList::empty(py);
+            for k in keys {
+                let pk = k.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+                py_keys.append(pk).map_err(|e| vf_err_from_py(py, e))?;
+            }
+            let stream = self
+                .obj
+                .bind(py)
+                .call_method1(
+                    "get_record_stream",
+                    (py_keys, ordering, include_delta_closure),
+                )
+                .map_err(|e| vf_err_from_py(py, e))?;
+            Ok(Box::new(PyRecordStream { stream: stream.unbind() })
+                as Box<
+                    dyn Iterator<
+                        Item = Result<Box<dyn ContentFactory>, bazaar::knit::KnitError>,
+                    >,
+                >)
+        })
+    }
+
+    fn get_sha1s(&self, keys: &[Key]) -> Result<std::collections::HashMap<Key, Vec<u8>>, bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let py_keys = PySet::empty(py).map_err(|e| vf_err_from_py(py, e))?;
+            for k in keys {
+                let pk = k.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+                py_keys.add(pk).map_err(|e| vf_err_from_py(py, e))?;
+            }
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("get_sha1s", (py_keys,))
+                .map_err(|e| vf_err_from_py(py, e))?;
+            let result = result.cast_into::<PyDict>().map_err(|e| vf_err_from_py(py, e.into()))?;
+            let mut out = std::collections::HashMap::new();
+            for (k, v) in result.iter() {
+                let key: Key = k.extract().map_err(|e| vf_err_from_py(py, e))?;
+                let sha1: Vec<u8> = v.extract().map_err(|e| vf_err_from_py(py, e))?;
+                out.insert(key, sha1);
+            }
+            Ok(out)
+        })
+    }
+
+    fn keys(&self) -> Result<Vec<Key>, bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let result = self
+                .obj
+                .bind(py)
+                .call_method0("keys")
+                .map_err(|e| vf_err_from_py(py, e))?;
+            let mut out = Vec::new();
+            for k in result.try_iter().map_err(|e| vf_err_from_py(py, e))? {
+                let k = k.map_err(|e| vf_err_from_py(py, e))?;
+                out.push(k.extract::<Key>().map_err(|e| vf_err_from_py(py, e))?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn add_lines(
+        &self,
+        key: &Key,
+        parents: Option<&[Key]>,
+        lines: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, usize), bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let py_key = key.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+            let py_parents = match parents {
+                None => py.None().into_bound(py),
+                Some(ps) => {
+                    let lst = PyList::empty(py);
+                    for p in ps {
+                        let pp = p.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+                        lst.append(pp).map_err(|e| vf_err_from_py(py, e))?;
+                    }
+                    lst.into_any()
+                }
+            };
+            let py_lines = PyList::empty(py);
+            for l in lines {
+                py_lines.append(PyBytes::new(py, l)).map_err(|e| vf_err_from_py(py, e))?;
+            }
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("add_lines", (py_key, py_parents, py_lines))
+                .map_err(|e| vf_err_from_py(py, e))?;
+            let result = result.cast_into::<PyTuple>().map_err(|e| vf_err_from_py(py, e.into()))?;
+            let digest: Vec<u8> = result
+                .get_item(0)
+                .map_err(|e| vf_err_from_py(py, e))?
+                .extract()
+                .map_err(|e| vf_err_from_py(py, e))?;
+            let text_length: usize = result
+                .get_item(1)
+                .map_err(|e| vf_err_from_py(py, e))?
+                .extract()
+                .map_err(|e| vf_err_from_py(py, e))?;
+            Ok((digest, text_length))
+        })
+    }
+
+    fn insert_record_stream(
+        &self,
+        _stream: Box<dyn Iterator<Item = Box<dyn ContentFactory>>>,
+    ) -> Result<(), bazaar::knit::KnitError> {
+        // TODO: marshal a Rust ContentFactory stream back into Python and call
+        // self.obj.insert_record_stream. No production caller needs this yet
+        // (fallbacks are read-only in practice), so leave it unimplemented.
+        Err(bazaar::knit::KnitError::NotImplemented(
+            "PyVersionedFiles::insert_record_stream",
+        ))
+    }
+
+    fn iter_lines_added_or_present_in_keys(
+        &self,
+        keys: &[Key],
+    ) -> Result<Vec<(Vec<u8>, Key)>, bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let py_keys = PySet::empty(py).map_err(|e| vf_err_from_py(py, e))?;
+            for k in keys {
+                let pk = k.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+                py_keys.add(pk).map_err(|e| vf_err_from_py(py, e))?;
+            }
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("iter_lines_added_or_present_in_keys", (py_keys,))
+                .map_err(|e| vf_err_from_py(py, e))?;
+            let mut out = Vec::new();
+            for item in result.try_iter().map_err(|e| vf_err_from_py(py, e))? {
+                let tup = item.map_err(|e| vf_err_from_py(py, e))?;
+                let tup = tup.cast_into::<PyTuple>().map_err(|e| vf_err_from_py(py, e.into()))?;
+                let line: Vec<u8> = tup
+                    .get_item(0)
+                    .map_err(|e| vf_err_from_py(py, e))?
+                    .extract()
+                    .map_err(|e| vf_err_from_py(py, e))?;
+                let key: Key = tup
+                    .get_item(1)
+                    .map_err(|e| vf_err_from_py(py, e))?
+                    .extract()
+                    .map_err(|e| vf_err_from_py(py, e))?;
+                out.push((line, key));
+            }
+            Ok(out)
+        })
+    }
+
+    fn annotate(&self, key: &Key) -> Result<Vec<(Key, Vec<u8>)>, bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let py_key = key.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+            let result = self
+                .obj
+                .bind(py)
+                .call_method1("annotate", (py_key,))
+                .map_err(|e| vf_err_from_py(py, e))?;
+            let mut out = Vec::new();
+            for item in result.try_iter().map_err(|e| vf_err_from_py(py, e))? {
+                let tup = item.map_err(|e| vf_err_from_py(py, e))?;
+                let tup = tup.cast_into::<PyTuple>().map_err(|e| vf_err_from_py(py, e.into()))?;
+                let key: Key = tup
+                    .get_item(0)
+                    .map_err(|e| vf_err_from_py(py, e))?
+                    .extract()
+                    .map_err(|e| vf_err_from_py(py, e))?;
+                let line: Vec<u8> = tup
+                    .get_item(1)
+                    .map_err(|e| vf_err_from_py(py, e))?
+                    .extract()
+                    .map_err(|e| vf_err_from_py(py, e))?;
+                out.push((key, line));
+            }
+            Ok(out)
+        })
+    }
+
+    fn clear_cache(&self) {
+        Python::attach(|py| {
+            let _ = self.obj.bind(py).call_method0("clear_cache");
+        })
+    }
+
+    fn check(&self) -> Result<(), bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            self.obj
+                .bind(py)
+                .call_method0("check")
+                .map(|_| ())
+                .map_err(|e| vf_err_from_py(py, e))
+        })
+    }
+}
+
+/// Lazy iterator over a Python `get_record_stream` result. Yields one
+/// `ContentFactory` per `__next__` call until the Python iterator is
+/// exhausted or raises.
+struct PyRecordStream {
+    stream: Py<PyAny>,
+}
+
+impl Iterator for PyRecordStream {
+    type Item = Result<Box<dyn ContentFactory>, bazaar::knit::KnitError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Python::attach(|py| {
+            let stream = self.stream.bind(py);
+            let record = match stream.call_method0("__next__") {
+                Ok(r) => r,
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                    return None
+                }
+                Err(e) => return Some(Err(vf_err_from_py(py, e))),
+            };
+            Some(record_to_content_factory(py, &record))
+        })
+    }
+}
+
+fn record_to_content_factory(
+    py: Python<'_>,
+    record: &Bound<'_, PyAny>,
+) -> Result<Box<dyn ContentFactory>, bazaar::knit::KnitError> {
+    let storage_kind: String = record
+        .getattr("storage_kind")
+        .map_err(|e| vf_err_from_py(py, e))?
+        .extract()
+        .map_err(|e| vf_err_from_py(py, e))?;
+    let key: Key = record
+        .getattr("key")
+        .map_err(|e| vf_err_from_py(py, e))?
+        .extract()
+        .map_err(|e| vf_err_from_py(py, e))?;
+    if storage_kind == "absent" {
+        return Ok(Box::new(bazaar::versionedfile::AbsentContentFactory::new(
+            key,
+        )));
+    }
+    let parents_obj = record.getattr("parents").map_err(|e| vf_err_from_py(py, e))?;
+    let parents: Option<Vec<Key>> = if parents_obj.is_none() {
+        None
+    } else {
+        let mut ps = Vec::new();
+        for p in parents_obj.try_iter().map_err(|e| vf_err_from_py(py, e))? {
+            let p = p.map_err(|e| vf_err_from_py(py, e))?;
+            ps.push(p.extract::<Key>().map_err(|e| vf_err_from_py(py, e))?);
+        }
+        Some(ps)
+    };
+    let fulltext: Vec<u8> = record
+        .call_method1("get_bytes_as", ("fulltext",))
+        .map_err(|e| vf_err_from_py(py, e))?
+        .extract()
+        .map_err(|e| vf_err_from_py(py, e))?;
+    let sha1_obj = record.getattr("sha1").map_err(|e| vf_err_from_py(py, e))?;
+    let sha1: Option<Vec<u8>> = if sha1_obj.is_none() {
+        None
+    } else {
+        Some(sha1_obj.extract().map_err(|e| vf_err_from_py(py, e))?)
+    };
+    Ok(Box::new(
+        bazaar::versionedfile::FulltextContentFactory::new(sha1, key, parents, fulltext),
+    ))
 }
 
 pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {

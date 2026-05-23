@@ -906,7 +906,10 @@ pub trait VersionedFiles: Send + Sync {
         keys: &[Key],
         ordering: &str,
         include_delta_closure: bool,
-    ) -> Result<Vec<Box<dyn ContentFactory>>, crate::knit::KnitError>;
+    ) -> Result<
+        Box<dyn Iterator<Item = Result<Box<dyn ContentFactory>, crate::knit::KnitError>>>,
+        crate::knit::KnitError,
+    >;
 
     fn get_sha1s(&self, keys: &[Key]) -> Result<HashMap<Key, Vec<u8>>, crate::knit::KnitError>;
 
