@@ -2615,9 +2615,32 @@ impl GCGraphIndex {
         }
     }
 
+    /// Add-records callback exposed for read access. `None` if the index
+    /// was constructed without one (i.e. read-only).
+    #[getter]
+    fn _add_callback(&self, py: Python<'_>) -> Py<PyAny> {
+        self.add_callback
+            .as_ref()
+            .map(|c| c.clone_ref(py))
+            .unwrap_or_else(|| py.None())
+    }
+
+    /// Install or replace the add-records callback after construction.
+    /// Mirrors the Python `_GCGraphIndex.set_add_callback`.
+    fn set_add_callback(&mut self, callback: Option<Bound<'_, PyAny>>) {
+        self.add_callback = callback.map(|c| c.unbind());
+    }
+
+    /// Whether duplicate-with-different-details adds raise instead of
+    /// warning. Mirrors the Python `_GCGraphIndex._inconsistency_fatal`.
+    #[getter]
+    fn _inconsistency_fatal(&self) -> bool {
+        self.inconsistency_fatal
+    }
+
     fn _check_read(&self, py: Python<'_>) -> PyResult<()> {
         if !self.is_locked.bind(py).call0()?.is_truthy()? {
-            return Err(ObjectNotLocked::new_err(py.None()));
+            return Err(ObjectNotLocked::new_err((py.None(),)));
         }
         Ok(())
     }
