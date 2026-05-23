@@ -116,7 +116,7 @@ fn gc_err_from_py(py: Python<'_>, err: PyErr) -> bazaar::knit::KnitError {
         .map(|n| n == "RevisionNotPresent")
         .unwrap_or(false)
     {
-        return bazaar::knit::KnitError::RevisionNotPresent(bazaar::knit::KnitKey::fixed(vec![]));
+        return bazaar::knit::KnitError::RevisionNotPresent(vec![]);
     }
     bazaar::knit::KnitError::Corrupt(err.to_string())
 }
@@ -2572,7 +2572,7 @@ impl GCGraphIndex {
         track_new_keys: bool,
     ) -> PyResult<Self> {
         let key_dependencies = if track_external_parent_refs {
-            let kr = crate::versionedfile::KeyRefs::new(py, track_new_keys)?;
+            let kr = crate::versionedfile::KeyRefs::new_rust(py, track_new_keys)?;
             Some(Py::new(py, kr)?)
         } else {
             None
@@ -2731,10 +2731,10 @@ impl GCGraphIndex {
             PyValueError::new_err("get_missing_parents called without key_dependencies")
         })?;
         let kd = kd.bind(py).borrow();
-        let unsatisfied = kd.get_unsatisfied_refs(py)?;
+        let unsatisfied = kd.get_unsatisfied_refs_rust(py)?;
         let parent_map = self.get_parent_map(py, unsatisfied)?;
-        kd.satisfy_refs_for_keys(py, parent_map.into_any())?;
-        let refs = kd.get_unsatisfied_refs(py)?;
+        kd.satisfy_refs_for_keys_rust(py, parent_map.into_any())?;
+        let refs = kd.get_unsatisfied_refs_rust(py)?;
         let out = PySet::empty(py)?;
         for key in refs.try_iter()? {
             out.add(key?)?;
@@ -2864,13 +2864,13 @@ impl GCGraphIndex {
                     let key = item.get_item(0)?;
                     let refs = item.get_item(2)?;
                     let parents = refs.get_item(0)?;
-                    kd.add_references(py, key, parents)?;
+                    kd.add_references_rust(py, key, parents)?;
                 }
             } else {
                 for item in result.iter() {
                     let item: Bound<'_, PyAny> = item;
                     let key = item.get_item(0)?;
-                    kd.add_key(py, key)?;
+                    kd.add_key_rust(py, key)?;
                 }
             }
         }
@@ -2905,7 +2905,7 @@ impl GCGraphIndex {
             let key = node.get_item(1)?;
             let refs = node.get_item(3)?;
             let parents = refs.get_item(0)?;
-            kd.add_references(py, key, parents)?;
+            kd.add_references_rust(py, key, parents)?;
         }
         Ok(())
     }

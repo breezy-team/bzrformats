@@ -407,6 +407,45 @@ impl KeyRefs {
             new_keys: None,
         })
     }
+
+    pub(crate) fn new_rust(py: Python<'_>, track_new_keys: bool) -> PyResult<Self> {
+        Ok(Self {
+            refs: PyDict::new(py).unbind(),
+            new_keys: if track_new_keys {
+                Some(PySet::empty(py)?.unbind())
+            } else {
+                None
+            },
+        })
+    }
+
+    pub(crate) fn add_references_rust<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+        refs: Bound<'py, PyAny>,
+    ) -> PyResult<()> {
+        self.add_references(py, key, refs)
+    }
+
+    pub(crate) fn add_key_rust<'py>(&self, py: Python<'py>, key: Bound<'py, PyAny>) -> PyResult<()> {
+        self.add_key(py, key)
+    }
+
+    pub(crate) fn get_unsatisfied_refs_rust<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.get_unsatisfied_refs(py)
+    }
+
+    pub(crate) fn satisfy_refs_for_keys_rust<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<()> {
+        self.satisfy_refs_for_keys(py, keys)
+    }
 }
 
 #[pymethods]

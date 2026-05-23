@@ -158,18 +158,62 @@ impl std::fmt::Display for VersionId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Key {
     Fixed(Vec<Vec<u8>>),
     ContentAddressed(Vec<Vec<u8>>),
 }
 
 impl Key {
+    pub fn fixed(segments: Vec<Vec<u8>>) -> Self {
+        Key::Fixed(segments)
+    }
+
+    /// All segments of the key.
+    pub fn segments(&self) -> &[Vec<u8>] {
+        match self {
+            Key::Fixed(v) | Key::ContentAddressed(v) => v,
+        }
+    }
+
+    fn segments_mut(&mut self) -> &mut Vec<Vec<u8>> {
+        match self {
+            Key::Fixed(v) | Key::ContentAddressed(v) => v,
+        }
+    }
+
+    /// Last segment (the version id / suffix).
+    pub fn version_id(&self) -> &[u8] {
+        self.segments().last().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// All segments except the last (the "prefix" used for file-based routing).
+    pub fn prefix(&self) -> &[Vec<u8>] {
+        let segs = self.segments();
+        if segs.is_empty() {
+            &[]
+        } else {
+            &segs[..segs.len() - 1]
+        }
+    }
+
+    /// Build a new `Key::Fixed` from a prefix slice and a suffix segment.
+    pub fn from_prefix_and_suffix(prefix: &[Vec<u8>], suffix: Vec<u8>) -> Self {
+        let mut v = prefix.to_vec();
+        v.push(suffix);
+        Key::Fixed(v)
+    }
+
+    /// Replace the last segment (the version id) in place.
+    pub fn set_version_id(&mut self, id: Vec<u8>) {
+        let segs = self.segments_mut();
+        if let Some(last) = segs.last_mut() {
+            *last = id;
+        }
+    }
+
     pub fn add_prefix(&mut self, prefix: &[&[u8]]) {
-        let v = match self {
-            Key::Fixed(ref mut v) => v,
-            Key::ContentAddressed(ref mut v) => v,
-        };
+        let v = self.segments_mut();
         for p in prefix.iter().rev() {
             v.insert(0, p.to_vec());
         }
@@ -851,15 +895,41 @@ pub trait VersionedFile<CF: ContentFactory, I> {
 /// :ivar _immediate_fallback_vfs: For subclasses that support stacking,
 ///     this is a list of other VersionedFiles immediately underneath this
 ///     one.  They may in turn each have further fallbacks.
-pub trait VersionedFiles<CF: ContentFactory, I> {
-    fn check_not_reserved_id(id: &VersionId) -> bool;
+pub trait VersionedFiles: Send + Sync {
+    fn get_parent_map(
+        &self,
+        keys: &[Key],
+    ) -> Result<HashMap<Key, Vec<Key>>, crate::knit::KnitError>;
 
     fn get_record_stream(
         &self,
-        keys: &[&Key],
-        ordering: Ordering,
+        keys: &[Key],
+        ordering: &str,
         include_delta_closure: bool,
-    ) -> Box<dyn Iterator<Item = CF>>;
+    ) -> Result<Vec<Box<dyn ContentFactory>>, crate::knit::KnitError>;
+
+    fn get_sha1s(&self, keys: &[Key]) -> Result<HashMap<Key, Vec<u8>>, crate::knit::KnitError>;
+
+    fn keys(&self) -> Result<Vec<Key>, crate::knit::KnitError>;
+
+    fn add_lines(
+        &self,
+        key: &Key,
+        parents: Option<&[Key]>,
+        lines: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, usize), crate::knit::KnitError>;
+
+    fn insert_record_stream(
+        &self,
+        stream: Box<dyn Iterator<Item = Box<dyn ContentFactory>>>,
+    ) -> Result<(), crate::knit::KnitError>;
+
+    fn iter_lines_added_or_present_in_keys(
+        &self,
+        keys: &[Key],
+    ) -> Result<Vec<(Vec<u8>, Key)>, crate::knit::KnitError>;
+
+    fn annotate(&self, key: &Key) -> Result<Vec<(Key, Vec<u8>)>, crate::knit::KnitError>;
 
     /// Keys of missing compression parents left behind by a prior
     /// `insert_record_stream`.

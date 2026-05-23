@@ -775,7 +775,9 @@ where
         for record in stream {
             let key = record.key();
             if record.storage_kind() == "absent" {
-                return Err(crate::knit::KnitError::RevisionNotPresent(key));
+                return Err(crate::knit::KnitError::RevisionNotPresent(
+                    key.segments().to_vec(),
+                ));
             }
             if random_id && !inserted.insert(key.clone()) {
                 // Same key offered twice under random_id: skip the dup.
@@ -969,7 +971,7 @@ where
         let mut out = Vec::new();
         for record in self.get_record_stream(keys, "unordered")? {
             if record.storage_kind() == "absent" {
-                return Err(crate::knit::KnitError::RevisionNotPresent(record.key()));
+                return Err(crate::knit::KnitError::RevisionNotPresent(record.key().segments().to_vec()));
             }
             let key = record.key();
             let chunks: Vec<Vec<u8>> = record.to_chunks().map(|c| c.into_owned()).collect();
@@ -994,7 +996,7 @@ where
         let all_keys = self.keys()?;
         for record in self.get_record_stream(&all_keys, "unordered")? {
             if record.storage_kind() == "absent" {
-                return Err(crate::knit::KnitError::RevisionNotPresent(record.key()));
+                return Err(crate::knit::KnitError::RevisionNotPresent(record.key().segments().to_vec()));
             }
             // Force decoding of the content.
             let _ = record.to_fulltext();

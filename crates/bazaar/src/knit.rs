@@ -310,7 +310,7 @@ impl std::fmt::Display for KnitError {
             } => write!(
                 f,
                 "sha1 mismatch for {:?}: got {:?}, expected {:?}",
-                key.version_id(),
+                key.last().map(Vec::as_slice).unwrap_or(&[]),
                 actual,
                 expected
             ),
@@ -2067,6 +2067,50 @@ pub fn extract_plain_fulltext_lines(
     Ok(lines)
 }
 
+/// Apply an annotated gzip delta record to plain basis lines, returning
+/// plain fulltext lines.  Mirrors `DeltaAnnotatedToFullText.get_bytes`.
+pub fn apply_annotated_delta_to_plain_basis(
+    raw_record: &[u8],
+    basis_lines: Vec<Vec<u8>>,
+    version_id: &[u8],
+    noeol: bool,
+) -> Result<Vec<Vec<u8>>, KnitError> {
+    let decompressed = decode_record_gz(raw_record)?;
+    let (_header, body_lines) = parse_record_body_unchecked(&decompressed)?;
+    let annotated_hunks = parse_line_delta_annotated(&body_lines)?;
+    // Strip annotations to produce plain delta hunks.
+    let plain_hunks: Vec<DeltaHunk<Vec<u8>>> = annotated_hunks
+        .into_iter()
+        .map(|h| DeltaHunk {
+            start: h.start,
+            end: h.end,
+            count: h.count,
+            lines: h.lines.into_iter().map(|(_origin, text)| text).collect(),
+        })
+        .collect();
+    let mut content = PlainKnitContent::new(basis_lines, version_id.to_vec());
+    content.apply_delta(&plain_hunks, version_id);
+    content.set_should_strip_eol(noeol);
+    Ok(content.text())
+}
+
+/// Apply a plain gzip delta record to plain basis lines, returning
+/// plain fulltext lines.  Mirrors `DeltaPlainToFullText.get_bytes`.
+pub fn apply_plain_delta_to_plain_basis(
+    raw_record: &[u8],
+    basis_lines: Vec<Vec<u8>>,
+    version_id: &[u8],
+    noeol: bool,
+) -> Result<Vec<Vec<u8>>, KnitError> {
+    let decompressed = decode_record_gz(raw_record)?;
+    let (_header, body_lines) = parse_record_body_unchecked(&decompressed)?;
+    let plain_hunks = parse_line_delta_plain(&body_lines)?;
+    let mut content = PlainKnitContent::new(basis_lines, version_id.to_vec());
+    content.apply_delta(&plain_hunks, version_id);
+    content.set_should_strip_eol(noeol);
+    Ok(content.text())
+}
+
 /// End-to-end conversion of an annotated-fulltext knit record to an
 /// unannotated one.
 ///
@@ -2131,6 +2175,27 @@ pub struct KnitAdapterInput<'a> {
     pub noeol: bool,
     pub parents: Option<&'a [Vec<Vec<u8>>]>,
     pub storage_kind: &'a str,
+}
+
+/// Result of materialising fulltext lines into the shape requested by
+/// a text-storage_kind: a single `Bytes` payload for `"fulltext"`, or
+/// a `Lines` list for `"chunked"` / `"lines"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KnitTextResult {
+    Bytes(Vec<u8>),
+    Lines(Vec<Vec<u8>>),
+}
+
+/// Shape fulltext `lines` into the form expected for `target_kind`:
+/// joined-bytes for `"fulltext"`, list-of-lines for `"chunked"` and
+/// `"lines"`.  Returns `None` if `target_kind` is not one of those
+/// three.
+pub fn materialize_text(lines: Vec<Vec<u8>>, target_kind: &str) -> Option<KnitTextResult> {
+    match target_kind {
+        "fulltext" => Some(KnitTextResult::Bytes(lines.into_iter().flatten().collect())),
+        "chunked" | "lines" => Some(KnitTextResult::Lines(lines)),
+        _ => None,
+    }
 }
 
 /// Output of a `KnitAdapter::get_bytes` call.
@@ -6936,9 +7001,9 @@ mod tests {
                 b"c option 1 2 1 0 .e :",
             ],
         );
-        let key_a: KnitKey = KnitKey::fixed(vec![b"a".to_vec()]);
-        let key_b: KnitKey = KnitKey::fixed(vec![b"b".to_vec()]);
-        let key_c: KnitKey = KnitKey::fixed(vec![b"c".to_vec()]);
+        let key_a: KnitKey = vec![b"a".to_vec()];
+        let key_b: KnitKey = vec![b"b".to_vec()];
+        let key_c: KnitKey = vec![b"c".to_vec()];
         let pm = idx
             .get_parent_map(&[key_a.clone(), key_b.clone(), key_c.clone()])
             .unwrap();
@@ -6946,16 +7011,16 @@ mod tests {
         assert_eq!(
             pm[&key_b],
             vec![
-                KnitKey::fixed(vec![b"a".to_vec()]),
-                KnitKey::fixed(vec![b"c".to_vec()]),
+                vec![b"a".to_vec()],
+                vec![b"c".to_vec()],
             ]
         );
         assert_eq!(
             pm[&key_c],
             vec![
-                KnitKey::fixed(vec![b"b".to_vec()]),
-                KnitKey::fixed(vec![b"a".to_vec()]),
-                KnitKey::fixed(vec![b"e".to_vec()]),
+                vec![b"b".to_vec()],
+                vec![b"a".to_vec()],
+                vec![b"e".to_vec()],
             ]
         );
     }
@@ -6967,8 +7032,8 @@ mod tests {
             "filename",
             &[b"a fulltext,unknown 0 1 :", b"b unknown,line-delta 1 2 :"],
         );
-        let key_a: KnitKey = KnitKey::fixed(vec![b"a".to_vec()]);
-        let key_b: KnitKey = KnitKey::fixed(vec![b"b".to_vec()]);
+        let key_a: KnitKey = vec![b"a".to_vec()];
+        let key_b: KnitKey = vec![b"b".to_vec()];
         assert_eq!(idx.get_method(&key_a).unwrap(), KnitMethod::Fulltext);
         assert_eq!(idx.get_method(&key_b).unwrap(), KnitMethod::LineDelta);
     }
@@ -6979,9 +7044,9 @@ mod tests {
         // verify the appended bytes have the expected per-line shape and
         // that subsequent reads come back from the in-memory cache.
         let idx = make_kndx_index("filename", &[]);
-        let key: KnitKey = KnitKey::fixed(vec![b"a".to_vec()]);
+        let key: KnitKey = vec![b"a".to_vec()];
         let memo = KnitIndexMemo {
-            file_ref: "filename.knit".to_string(),
+            path: "filename.knit".to_string(),
             offset: 0,
             length: 1,
         };
@@ -7031,7 +7096,7 @@ mod tests {
             method: KnitMethod::Fulltext,
             noeol: false,
             index_memo: KnitIndexMemo {
-                file_ref: path.to_string(),
+                path: path.to_string(),
                 offset,
                 length,
             },
@@ -7050,7 +7115,7 @@ mod tests {
             method: KnitMethod::LineDelta,
             noeol: false,
             index_memo: KnitIndexMemo {
-                file_ref: path.to_string(),
+                path: path.to_string(),
                 offset,
                 length,
             },
@@ -7080,6 +7145,26 @@ mod tests {
         }
     }
 
+    fn fulltext_raw(version_id: &[u8], lines: &[&[u8]], _noeol: bool) -> Vec<u8> {
+        let pairs: Vec<AnnotatedLine> = lines
+            .iter()
+            .map(|l| (version_id.to_vec(), l.to_vec()))
+            .collect();
+        let body = lower_fulltext(&pairs);
+        let count = lines.len();
+        let has_tnl = lines.last().map(|l| l.ends_with(b"\n")).unwrap_or(true);
+        let (_, chunks) = record_to_data(version_id, b"DD", count, &body, has_tnl).unwrap();
+        chunks.into_iter().flatten().collect()
+    }
+
+    fn delta_raw_annotated(version_id: &[u8], hunks: &[DeltaHunk<AnnotatedLine>]) -> Vec<u8> {
+        let body = lower_line_delta_annotated(hunks);
+        let count = body.len();
+        let has_tnl = body.last().map(|l| l.ends_with(b"\n")).unwrap_or(true);
+        let (_, chunks) = record_to_data(version_id, b"DD", count, &body, has_tnl).unwrap();
+        chunks.into_iter().flatten().collect()
+    }
+
     struct StaticBasis {
         lines: Vec<Vec<u8>>,
     }
@@ -7099,10 +7184,10 @@ mod tests {
         // size of a delta key is the cumulative size of its chain back to
         // the fulltext, with shared ancestors only counted once.
         let idx = make_kndx_index("filename", &[]);
-        let key_a: KnitKey = KnitKey::fixed(vec![b"a".to_vec()]);
-        let key_b: KnitKey = KnitKey::fixed(vec![b"b".to_vec()]);
-        let key_c: KnitKey = KnitKey::fixed(vec![b"c".to_vec()]);
-        let key_d: KnitKey = KnitKey::fixed(vec![b"d".to_vec()]);
+        let key_a: KnitKey = vec![b"a".to_vec()];
+        let key_b: KnitKey = vec![b"b".to_vec()];
+        let key_c: KnitKey = vec![b"c".to_vec()];
+        let key_d: KnitKey = vec![b"d".to_vec()];
         let mut positions = std::collections::HashMap::new();
         positions.insert(key_a.clone(), fulltext_pos("p", 0, 100));
         positions.insert(key_b.clone(), delta_pos("p", 100, 21, key_a.clone()));
@@ -7142,7 +7227,7 @@ mod tests {
             KnitMethod::Fulltext,
             false,
             false,
-            &[KnitKey::fixed(vec![b"p".to_vec()])],
+            &[vec![b"p".to_vec()]],
         )
         .unwrap_err();
         assert!(matches!(err, KnitError::Corrupt(_)));
@@ -7165,8 +7250,8 @@ mod tests {
         // line-delta refs: `[parents, [parents[0]]]` — the second column
         // carries the compression parent (always the left-most parent on
         // the Python side).
-        let parent_a: KnitKey = KnitKey::fixed(vec![b"file".to_vec(), b"a".to_vec()]);
-        let parent_b: KnitKey = KnitKey::fixed(vec![b"file".to_vec(), b"b".to_vec()]);
+        let parent_a: KnitKey = vec![b"file".to_vec(), b"a".to_vec()];
+        let parent_b: KnitKey = vec![b"file".to_vec(), b"b".to_vec()];
         let (value, refs) = encode_graph_index_record(
             false,
             10,

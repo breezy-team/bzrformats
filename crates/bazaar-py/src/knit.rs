@@ -208,7 +208,7 @@ pub fn _load_data(py: Python, kndx: &Bound<PyAny>, fp: &Bound<PyAny>) -> PyResul
     Ok(())
 }
 
-fn knit_err_to_py(err: KnitError) -> PyErr {
+pub(crate) fn knit_err_to_py(err: KnitError) -> PyErr {
     match err {
         KnitError::NotImplemented(name) => PyNotImplementedError::new_err(name),
         KnitError::ReadOnly => Python::attach(|py| ReadOnlyError::new_err((py.None(),))),
@@ -241,6 +241,9 @@ fn knit_err_to_py(err: KnitError) -> PyErr {
         // Aborted by the access layer's final-error stash; if either
         // reaches here, surface it rather than swallowing it.
         KnitError::Retry(_) | KnitError::Aborted(_) => PyRuntimeError::new_err(err.to_string()),
+        KnitError::ExistingContent(_) | KnitError::BadSha1 { .. } => {
+            KnitCorrupt::new_err(("", err.to_string()))
+        }
     }
 }
 
