@@ -17,6 +17,7 @@ use std::rc::Rc;
 
 pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
 pyo3::import_exception!(bzrformats.errors, NoSuchFile);
+pyo3::import_exception!(bzrformats.versionedfile, UnavailableRepresentation);
 pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
 pyo3::import_exception!(bzrformats.errors, ObjectNotLocked);
 pyo3::import_exception!(bzrformats.knit, KnitCorrupt);
@@ -1138,62 +1139,6 @@ fn knit_method_to_py<'py>(py: Python<'py>, method: bazaar::knit::KnitMethod) -> 
         bazaar::knit::KnitMethod::NoEol => pyo3::intern!(py, "no-eol"),
     };
     s.clone().into_any()
-}
-
-/// Extract an annotated-fulltext knit record to its plain text lines.
-/// Returns a list of bytes objects. Mirrors
-/// `bzrformats.knit.FTAnnotatedToFullText.get_bytes` (without the
-/// final `b"".join` step that callers do based on storage_kind).
-#[pyfunction]
-fn extract_annotated_fulltext_to_plain_lines_rs<'py>(
-    py: Python<'py>,
-    raw_record: &[u8],
-    noeol: bool,
-) -> PyResult<Bound<'py, PyList>> {
-    let lines = bazaar::knit::extract_annotated_fulltext_to_plain_lines(raw_record, noeol)
-        .map_err(knit_err_to_py)?;
-    let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
-    PyList::new(py, items)
-}
-
-/// Extract a plain (already-unannotated) fulltext knit record to its
-/// text lines. Mirrors `bzrformats.knit.FTPlainToFullText.get_bytes`.
-#[pyfunction]
-fn extract_plain_fulltext_lines_rs<'py>(
-    py: Python<'py>,
-    raw_record: &[u8],
-    noeol: bool,
-) -> PyResult<Bound<'py, PyList>> {
-    let lines =
-        bazaar::knit::extract_plain_fulltext_lines(raw_record, noeol).map_err(knit_err_to_py)?;
-    let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
-    PyList::new(py, items)
-}
-
-/// End-to-end recompression of an annotated-fulltext knit record into
-/// an unannotated one. Mirrors
-/// `bzrformats.knit.FTAnnotatedToUnannotated.get_bytes`.
-#[pyfunction]
-fn recompress_annotated_to_unannotated_fulltext_rs<'py>(
-    py: Python<'py>,
-    raw_record: &[u8],
-) -> PyResult<Bound<'py, PyBytes>> {
-    let out = bazaar::knit::recompress_annotated_to_unannotated_fulltext(raw_record)
-        .map_err(knit_err_to_py)?;
-    Ok(PyBytes::new(py, &out))
-}
-
-/// End-to-end recompression of an annotated-delta knit record into
-/// an unannotated one. Mirrors
-/// `bzrformats.knit.DeltaAnnotatedToUnannotated.get_bytes`.
-#[pyfunction]
-fn recompress_annotated_to_unannotated_delta_rs<'py>(
-    py: Python<'py>,
-    raw_record: &[u8],
-) -> PyResult<Bound<'py, PyBytes>> {
-    let out = bazaar::knit::recompress_annotated_to_unannotated_delta(raw_record)
-        .map_err(knit_err_to_py)?;
-    Ok(PyBytes::new(py, &out))
 }
 
 /// Decompress only enough of a knit record to parse its header. Returns
@@ -7429,6 +7374,265 @@ impl PyKnitVersionedFiles {
     }
 }
 
+// ---------------------------------------------------------------------------
+// KnitAdapter pyclass + adapter_registry shim
+// ---------------------------------------------------------------------------
+
+/// Marshal a `KnitTextResult` (the pure-crate "fulltext bytes vs. list of
+/// lines") into the matching Python object.
+fn text_result_to_py<'py>(
+    py: Python<'py>,
+    result: bazaar::knit::KnitTextResult,
+) -> PyResult<Bound<'py, PyAny>> {
+    match result {
+        bazaar::knit::KnitTextResult::Bytes(b) => Ok(PyBytes::new(py, &b).into_any()),
+        bazaar::knit::KnitTextResult::Lines(lines) => {
+            let py_lines: Vec<Bound<'py, PyBytes>> =
+                lines.iter().map(|l| PyBytes::new(py, l)).collect();
+            Ok(pyo3::types::PyList::new(py, &py_lines)?.into_any())
+        }
+    }
+}
+
+/// Fetch the fulltext lines for `compression_parent` from a Python
+/// `versioned_files` object via `get_record_stream`.
+fn get_basis_lines<'py>(
+    py: Python<'py>,
+    basis_vf: &Bound<'py, PyAny>,
+    compression_parent: &Bound<'py, PyAny>,
+) -> PyResult<Vec<Vec<u8>>> {
+    let stream = basis_vf.call_method1(
+        "get_record_stream",
+        (
+            vec![compression_parent.clone()],
+            pyo3::intern!(py, "unordered"),
+            true,
+        ),
+    )?;
+    let record = stream
+        .try_iter()?
+        .next()
+        .ok_or_else(|| {
+            pyo3::exceptions::PyStopIteration::new_err("no records returned from basis_vf")
+        })??;
+    let kind: String = record.getattr("storage_kind")?.extract()?;
+    if kind == "absent" {
+        return Err(RevisionNotPresent::new_err((
+            compression_parent.clone().unbind(),
+            basis_vf.clone().unbind(),
+        )));
+    }
+    let lines_obj = record.call_method1("get_bytes_as", (pyo3::intern!(py, "lines"),))?;
+    lines_obj
+        .try_iter()?
+        .map(|item| {
+            item?
+                .cast_into::<PyBytes>()
+                .map(|b| b.as_bytes().to_vec())
+                .map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err("basis line must be bytes")
+                })
+        })
+        .collect()
+}
+
+/// Bridge from a `&dyn KnitAdapter` to a Python `versioned_files` object.
+///
+/// PyErr from the Python callback can't cross the pure-crate
+/// `AdapterError` boundary without losing its exception class
+/// (`RevisionNotPresent`, etc.). Stash the PyErr in `last_pyerr` and
+/// surface a sentinel `AdapterError::Knit` to the adapter; the caller
+/// in `PyKnitAdapter::get_bytes` checks `last_pyerr` first and
+/// re-raises the original on its way back to Python.
+struct PyBasisVfBridge<'py> {
+    py: Python<'py>,
+    versioned_files: Bound<'py, PyAny>,
+    last_pyerr: std::cell::Cell<Option<PyErr>>,
+}
+
+impl<'py> bazaar::knit::BasisVfBridge for PyBasisVfBridge<'py> {
+    fn get_basis_lines(
+        &self,
+        compression_parent: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, bazaar::knit::AdapterError> {
+        let py = self.py;
+        let inner = || -> PyResult<Vec<Vec<u8>>> {
+            let parent_tuple =
+                PyTuple::new(py, compression_parent.iter().map(|seg| PyBytes::new(py, seg)))?;
+            get_basis_lines(py, &self.versioned_files, &parent_tuple.into_any())
+        };
+        match inner() {
+            Ok(lines) => Ok(lines),
+            Err(e) => {
+                let msg = e.to_string();
+                self.last_pyerr.set(Some(e));
+                Err(bazaar::knit::AdapterError::Knit(
+                    bazaar::knit::KnitError::Corrupt(msg),
+                ))
+            }
+        }
+    }
+}
+
+/// Pull the borrowed key / raw_record / noeol / parents / storage_kind
+/// off a Python `ContentFactory`. Returns owned data so the adapter can
+/// keep them alive while it runs.
+struct ExtractedFactory {
+    key: Vec<Vec<u8>>,
+    raw_record: Vec<u8>,
+    noeol: bool,
+    parents: Option<Vec<Vec<Vec<u8>>>>,
+    storage_kind: String,
+}
+
+fn extract_factory(factory: &Bound<'_, PyAny>) -> PyResult<ExtractedFactory> {
+    let key: Vec<Vec<u8>> = factory
+        .getattr("key")?
+        .try_iter()?
+        .map(|seg| {
+            seg?.cast_into::<PyBytes>()
+                .map(|b| b.as_bytes().to_vec())
+                .map_err(|_| pyo3::exceptions::PyTypeError::new_err("key segment must be bytes"))
+        })
+        .collect::<PyResult<_>>()?;
+    let raw_record: Vec<u8> = factory
+        .getattr("_raw_record")?
+        .cast_into::<PyBytes>()
+        .map(|b| b.as_bytes().to_vec())
+        .map_err(|_| pyo3::exceptions::PyTypeError::new_err("_raw_record must be bytes"))?;
+    let build_details = factory.getattr("_build_details")?;
+    let noeol: bool = build_details.get_item(1)?.extract()?;
+    let parents_obj = factory.getattr("parents")?;
+    let parents: Option<Vec<Vec<Vec<u8>>>> = if parents_obj.is_none() {
+        None
+    } else {
+        Some(
+            parents_obj
+                .try_iter()?
+                .map(|p| {
+                    p?.try_iter()?
+                        .map(|seg| {
+                            seg?.cast_into::<PyBytes>()
+                                .map(|b| b.as_bytes().to_vec())
+                                .map_err(|_| {
+                                    pyo3::exceptions::PyTypeError::new_err(
+                                        "parent segment must be bytes",
+                                    )
+                                })
+                        })
+                        .collect::<PyResult<_>>()
+                })
+                .collect::<PyResult<_>>()?,
+        )
+    };
+    let storage_kind: String = factory.getattr("storage_kind")?.extract()?;
+    Ok(ExtractedFactory {
+        key,
+        raw_record,
+        noeol,
+        parents,
+        storage_kind,
+    })
+}
+
+fn adapter_err_to_py(
+    py: Python<'_>,
+    e: bazaar::knit::AdapterError,
+    factory_key: &[Vec<u8>],
+) -> PyErr {
+    use bazaar::knit::AdapterError;
+    match e {
+        AdapterError::Unavailable {
+            source_storage_kind,
+            target_storage_kind,
+        } => {
+            let py_key = PyTuple::new(py, factory_key.iter().map(|s| PyBytes::new(py, s)))
+                .map(|t| t.into_any().unbind())
+                .unwrap_or_else(|_| py.None());
+            UnavailableRepresentation::new_err((py_key, target_storage_kind, source_storage_kind))
+        }
+        AdapterError::BasisNotPresent(key) => {
+            let py_key = PyTuple::new(py, key.iter().map(|s| PyBytes::new(py, s)))
+                .map(|t| t.into_any().unbind())
+                .unwrap_or_else(|_| py.None());
+            RevisionNotPresent::new_err((py_key, py.None()))
+        }
+        AdapterError::Knit(k) => knit_err_to_py(k),
+    }
+}
+
+/// Python-facing wrapper around a `&'static dyn KnitAdapter`.
+///
+/// Behaves like the old `KnitAdapter` Python classes: callers do
+/// `adapter = get_knit_adapter(src, tgt, basis_vf)` and then call
+/// `adapter.get_bytes(factory, target_storage_kind)`.
+#[pyclass(name = "KnitAdapter")]
+struct PyKnitAdapter {
+    inner: &'static dyn bazaar::knit::KnitAdapter,
+    basis_vf: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyKnitAdapter {
+    fn get_bytes<'py>(
+        &self,
+        py: Python<'py>,
+        factory: Bound<'py, PyAny>,
+        target_storage_kind: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let extracted = extract_factory(&factory)?;
+        let parents_slice: Option<&[Vec<Vec<u8>>]> = extracted.parents.as_deref();
+        let input = bazaar::knit::KnitAdapterInput {
+            key: &extracted.key,
+            raw_record: &extracted.raw_record,
+            noeol: extracted.noeol,
+            parents: parents_slice,
+            storage_kind: &extracted.storage_kind,
+        };
+        let basis_vf_bound = self.basis_vf.as_ref().map(|v| v.bind(py).clone());
+        let bridge = basis_vf_bound.as_ref().map(|vf| PyBasisVfBridge {
+            py,
+            versioned_files: vf.clone(),
+            last_pyerr: std::cell::Cell::new(None),
+        });
+        let basis: Option<&dyn bazaar::knit::BasisVfBridge> = match &bridge {
+            Some(b) => Some(b),
+            None => None,
+        };
+        let result = self.inner.get_bytes(&input, target_storage_kind, basis);
+        // If the bridge caught a PyErr during the call, re-raise it so the
+        // original exception class is preserved (e.g. RevisionNotPresent).
+        if let Some(b) = &bridge {
+            if let Some(err) = b.last_pyerr.take() {
+                return Err(err);
+            }
+        }
+        let out = result.map_err(|e| adapter_err_to_py(py, e, &extracted.key))?;
+        match out {
+            bazaar::knit::KnitAdapterOutput::RawBytes(b) => Ok(PyBytes::new(py, &b).into_any()),
+            bazaar::knit::KnitAdapterOutput::Text(t) => text_result_to_py(py, t),
+        }
+    }
+}
+
+/// Look up a knit adapter for `(source_storage_kind, target_storage_kind)`,
+/// optionally binding `basis_vf` for the delta-to-fulltext adapters.
+/// Returns `None` if no adapter handles the requested transition.
+#[pyfunction]
+#[pyo3(signature = (source_storage_kind, target_storage_kind, basis_vf=None))]
+fn get_knit_adapter(
+    source_storage_kind: &str,
+    target_storage_kind: &str,
+    basis_vf: Option<Bound<'_, PyAny>>,
+) -> Option<PyKnitAdapter> {
+    bazaar::knit::lookup_adapter(source_storage_kind, target_storage_kind).map(|adapter| {
+        PyKnitAdapter {
+            inner: adapter,
+            basis_vf: basis_vf.map(|v| v.unbind()),
+        }
+    })
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data, &m)?)?;
@@ -7444,19 +7648,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(parse_record_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(record_to_data_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_record_header_only_rs, &m)?)?;
-    m.add_function(wrap_pyfunction!(
-        recompress_annotated_to_unannotated_fulltext_rs,
-        &m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        recompress_annotated_to_unannotated_delta_rs,
-        &m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        extract_annotated_fulltext_to_plain_lines_rs,
-        &m
-    )?)?;
-    m.add_function(wrap_pyfunction!(extract_plain_fulltext_lines_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(knit_entries_to_build_details_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(parse_knit_index_value_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(decode_kndx_options_rs, &m)?)?;
@@ -7480,5 +7671,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<PyKnitKeyAccess>()?;
     m.add_class::<PyKnitVersionedFiles>()?;
     m.add_class::<PyKnitDeltaClosureRecord>()?;
+    m.add_class::<PyKnitAdapter>()?;
+    m.add_function(wrap_pyfunction!(get_knit_adapter, &m)?)?;
     Ok(m)
 }

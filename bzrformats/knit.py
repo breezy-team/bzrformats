@@ -216,7 +216,15 @@ class KnitIndexUnknownMethod(KnitError):
 
 
 class KnitAdapter:
-    """Base class for knit record adaption."""
+    """Adapter shim wrapping the Rust ``KnitAdapter`` registry.
+
+    Subclasses set ``_source_kind``; ``get_bytes`` looks up the
+    ``(source, target)`` adapter at call time via ``get_knit_adapter`` and
+    delegates to it. The real conversion logic lives in
+    ``crates/bazaar/src/knit.rs``.
+    """
+
+    _source_kind: str = ""
 
     def __init__(self, basis_vf):
         """Create an adapter which accesses full texts from basis_vf.
@@ -224,201 +232,53 @@ class KnitAdapter:
         :param basis_vf: A versioned file to access basis texts of deltas from.
             May be None for adapters that do not need to access basis texts.
         """
-        self._data = KnitVersionedFiles(None, None)
-        self._annotate_factory = KnitAnnotateFactory()
-        self._plain_factory = KnitPlainFactory()
         self._basis_vf = basis_vf
+
+    def get_bytes(self, factory, target_storage_kind):
+        adapter = _knit_rs.get_knit_adapter(
+            self._source_kind, target_storage_kind, self._basis_vf
+        )
+        if adapter is None:
+            raise UnavailableRepresentation(
+                factory.key, target_storage_kind, factory.storage_kind
+            )
+        return adapter.get_bytes(factory, target_storage_kind)
 
 
 class FTAnnotatedToUnannotated(KnitAdapter):
-    """An adapter from FT annotated knits to unannotated ones."""
+    """Annotated fulltext -> unannotated fulltext."""
 
-    def get_bytes(self, factory, target_storage_kind):
-        """Convert annotated fulltext knit records to unannotated format.
-
-        Args:
-            factory: The record factory containing the raw knit data.
-            target_storage_kind: The desired storage format for the output.
-
-        Returns:
-            The converted unannotated knit data as bytes.
-
-        Raises:
-            UnavailableRepresentation: If target format is not 'knit-ft-gz'.
-        """
-        if target_storage_kind != "knit-ft-gz":
-            raise UnavailableRepresentation(
-                factory.key, target_storage_kind, factory.storage_kind
-            )
-        return _knit_rs.recompress_annotated_to_unannotated_fulltext_rs(
-            factory._raw_record
-        )
+    _source_kind = "knit-annotated-ft-gz"
 
 
 class DeltaAnnotatedToUnannotated(KnitAdapter):
-    """An adapter for deltas from annotated to unannotated."""
+    """Annotated delta -> unannotated delta."""
 
-    def get_bytes(self, factory, target_storage_kind):
-        """Convert annotated delta knit records to unannotated format.
-
-        Args:
-            factory: The record factory containing the raw knit data.
-            target_storage_kind: The desired storage format for the output.
-
-        Returns:
-            The converted unannotated delta data as bytes.
-
-        Raises:
-            UnavailableRepresentation: If target format is not 'knit-delta-gz'.
-        """
-        if target_storage_kind != "knit-delta-gz":
-            raise UnavailableRepresentation(
-                factory.key, target_storage_kind, factory.storage_kind
-            )
-        return _knit_rs.recompress_annotated_to_unannotated_delta_rs(
-            factory._raw_record
-        )
+    _source_kind = "knit-annotated-delta-gz"
 
 
 class FTAnnotatedToFullText(KnitAdapter):
-    """An adapter from FT annotated knits to unannotated ones."""
+    """Annotated fulltext -> fulltext / chunked / lines."""
 
-    def get_bytes(self, factory, target_storage_kind):
-        """Convert annotated fulltext knit records to plain fulltext.
-
-        Args:
-            factory: The record factory containing the raw knit data.
-            target_storage_kind: The desired storage format ('fulltext', 'chunked', or 'lines').
-
-        Returns:
-            The converted fulltext data in the requested format.
-
-        Raises:
-            UnavailableRepresentation: If target format is not supported.
-        """
-        if target_storage_kind not in ("fulltext", "chunked", "lines"):
-            raise UnavailableRepresentation(
-                factory.key, target_storage_kind, factory.storage_kind
-            )
-        lines = _knit_rs.extract_annotated_fulltext_to_plain_lines_rs(
-            factory._raw_record, bool(factory._build_details[1])
-        )
-        if target_storage_kind == "fulltext":
-            return b"".join(lines)
-        return lines
+    _source_kind = "knit-annotated-ft-gz"
 
 
 class DeltaAnnotatedToFullText(KnitAdapter):
-    """An adapter for deltas from annotated to unannotated."""
+    """Annotated delta -> fulltext / chunked / lines."""
 
-    def get_bytes(self, factory, target_storage_kind):
-        """Apply annotated delta to basis text and return fulltext.
-
-        Args:
-            factory: The record factory containing the raw delta data.
-            target_storage_kind: The desired storage format ('fulltext', 'chunked', or 'lines').
-
-        Returns:
-            The reconstructed fulltext data in the requested format.
-
-        Raises:
-            RevisionNotPresent: If the compression parent is not available.
-            UnavailableRepresentation: If target format is not supported.
-        """
-        annotated_compressed_bytes = factory._raw_record
-        rec, contents = self._data._parse_record_unchecked(annotated_compressed_bytes)
-        delta = self._annotate_factory.parse_line_delta(contents, rec[1], plain=True)
-        compression_parent = factory.parents[0]
-        basis_entry = next(
-            self._basis_vf.get_record_stream([compression_parent], "unordered", True)
-        )
-        if basis_entry.storage_kind == "absent":
-            raise RevisionNotPresent(compression_parent, self._basis_vf)
-        basis_lines = basis_entry.get_bytes_as("lines")
-        # Manually apply the delta because we have one annotated content and
-        # one plain.
-        basis_content = PlainKnitContent(basis_lines, compression_parent)
-        basis_content.apply_delta(delta, rec[1])
-        basis_content._should_strip_eol = factory._build_details[1]
-
-        if target_storage_kind == "fulltext":
-            return b"".join(basis_content.text())
-        elif target_storage_kind in ("chunked", "lines"):
-            return basis_content.text()
-        raise UnavailableRepresentation(
-            factory.key, target_storage_kind, factory.storage_kind
-        )
+    _source_kind = "knit-annotated-delta-gz"
 
 
 class FTPlainToFullText(KnitAdapter):
-    """An adapter from FT plain knits to unannotated ones."""
+    """Plain fulltext -> fulltext / chunked / lines."""
 
-    def get_bytes(self, factory, target_storage_kind):
-        """Convert plain fulltext knit records to fulltext format.
-
-        Args:
-            factory: The record factory containing the raw knit data.
-            target_storage_kind: The desired storage format ('fulltext', 'chunked', or 'lines').
-
-        Returns:
-            The fulltext data in the requested format.
-
-        Raises:
-            UnavailableRepresentation: If target format is not supported.
-        """
-        if target_storage_kind not in ("fulltext", "chunked", "lines"):
-            raise UnavailableRepresentation(
-                factory.key, target_storage_kind, factory.storage_kind
-            )
-        lines = _knit_rs.extract_plain_fulltext_lines_rs(
-            factory._raw_record, bool(factory._build_details[1])
-        )
-        if target_storage_kind == "fulltext":
-            return b"".join(lines)
-        return lines
+    _source_kind = "knit-ft-gz"
 
 
 class DeltaPlainToFullText(KnitAdapter):
-    """An adapter for deltas from annotated to unannotated."""
+    """Plain delta -> fulltext / chunked / lines."""
 
-    def get_bytes(self, factory, target_storage_kind):
-        """Apply plain delta to basis text and return fulltext.
-
-        Args:
-            factory: The record factory containing the raw delta data.
-            target_storage_kind: The desired storage format ('fulltext', 'chunked', or 'lines').
-
-        Returns:
-            The reconstructed fulltext data in the requested format.
-
-        Raises:
-            RevisionNotPresent: If the compression parent is not available.
-            UnavailableRepresentation: If target format is not supported.
-        """
-        compressed_bytes = factory._raw_record
-        rec, contents = self._data._parse_record_unchecked(compressed_bytes)
-        self._plain_factory.parse_line_delta(contents, rec[1])
-        compression_parent = factory.parents[0]
-        # XXX: string splitting overhead.
-        basis_entry = next(
-            self._basis_vf.get_record_stream([compression_parent], "unordered", True)
-        )
-        if basis_entry.storage_kind == "absent":
-            raise RevisionNotPresent(compression_parent, self._basis_vf)
-        basis_lines = basis_entry.get_bytes_as("lines")
-        basis_content = PlainKnitContent(basis_lines, compression_parent)
-        # Manually apply the delta because we have one annotated content and
-        # one plain.
-        content, _ = self._plain_factory.parse_record(
-            rec[1], contents, factory._build_details, basis_content
-        )
-        if target_storage_kind == "fulltext":
-            return b"".join(content.text())
-        elif target_storage_kind in ("chunked", "lines"):
-            return content.text()
-        raise UnavailableRepresentation(
-            factory.key, target_storage_kind, factory.storage_kind
-        )
+    _source_kind = "knit-delta-gz"
 
 
 class KnitContentFactory(ContentFactory):

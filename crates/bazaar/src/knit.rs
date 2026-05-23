@@ -2104,7 +2104,10 @@ pub fn apply_plain_delta_to_plain_basis(
 ) -> Result<Vec<Vec<u8>>, KnitError> {
     let decompressed = decode_record_gz(raw_record)?;
     let (_header, body_lines) = parse_record_body_unchecked(&decompressed)?;
-    let plain_hunks = parse_line_delta_plain(&body_lines)?;
+    // Plain knit deltas carry raw line text (no origin prefix), so we
+    // parse with parse_line_delta_raw; parse_line_delta_plain expects an
+    // annotated body and would garble the lines.
+    let plain_hunks = parse_line_delta_raw(&body_lines)?;
     let mut content = PlainKnitContent::new(basis_lines, version_id.to_vec());
     content.apply_delta(&plain_hunks, version_id);
     content.set_should_strip_eol(noeol);
