@@ -8038,6 +8038,287 @@ mod tests {
         chunks.into_iter().flatten().collect()
     }
 
+    /// Single-segment knit key from a string id, e.g. `key(b"rev-id")`.
+    fn ann_key(id: &[u8]) -> KnitKey {
+        vec![id.to_vec()]
+    }
+
+    fn make_annotator() -> KnitAnnotator<MockKnit, MockKnit, KnitAnnotateFactory> {
+        KnitAnnotator::new(
+            MockKnit::default(),
+            MockKnit::default(),
+            KnitAnnotateFactory,
+        )
+    }
+
+    #[test]
+    fn annotator_expand_fulltext_caches_content_and_text() {
+        // Mirrors Test_KnitAnnotator.test__expand_fulltext
+        let mut ann = make_annotator();
+        let rev_key = ann_key(b"rev-id");
+        ann.num_compression_children.insert(rev_key.clone(), 1);
+        // noeol=true: last line has no trailing newline in the returned text.
+        let raw = fulltext_raw(b"rev-id", &[b"line1\n", b"line2\n"], true);
+        let res = ann
+            .expand_record(
+                rev_key.clone(),
+                vec![ann_key(b"parent-id")],
+                None,
+                raw,
+                KnitMethod::Fulltext,
+                true,
+            )
+            .unwrap();
+        assert_eq!(res, Some(vec![b"line1\n".to_vec(), b"line2".to_vec()]));
+        assert!(ann.content_objects.contains_key(&rev_key));
+        assert_eq!(
+            ann.text_cache[&rev_key],
+            vec![b"line1\n".to_vec(), b"line2".to_vec()]
+        );
+    }
+
+    #[test]
+    fn annotator_expand_delta_queues_when_parent_unavailable() {
+        // Mirrors Test_KnitAnnotator.test__expand_delta_comp_parent_not_available
+        let mut ann = make_annotator();
+        let rev_key = ann_key(b"rev-id");
+        let parent_key = ann_key(b"parent-id");
+        let hunk = DeltaHunk {
+            start: 0,
+            end: 1,
+            count: 1,
+            lines: vec![(b"rev-id".to_vec(), b"new-line\n".to_vec())],
+        };
+        let raw = delta_raw_annotated(b"rev-id", &[hunk]);
+        let res = ann
+            .expand_record(
+                rev_key.clone(),
+                vec![parent_key.clone()],
+                Some(parent_key.clone()),
+                raw,
+                KnitMethod::LineDelta,
+                false,
+            )
+            .unwrap();
+        assert_eq!(res, None);
+        assert!(ann.pending_deltas.contains_key(&parent_key));
+        assert_eq!(ann.pending_deltas[&parent_key].len(), 1);
+    }
+
+    #[test]
+    fn annotator_expand_record_tracks_num_compression_children() {
+        // Mirrors Test_KnitAnnotator.test__expand_record_tracks_num_children
+        let mut ann = make_annotator();
+        let rev_key = ann_key(b"rev-id");
+        let rev2_key = ann_key(b"rev2-id");
+        let parent_key = ann_key(b"parent-id");
+        ann.num_compression_children.insert(parent_key.clone(), 2);
+
+        let raw_parent = fulltext_raw(b"parent-id", &[b"line1\n", b"line2\n"], false);
+        ann.expand_record(
+            parent_key.clone(),
+            vec![],
+            None,
+            raw_parent,
+            KnitMethod::Fulltext,
+            false,
+        )
+        .unwrap();
+
+        let hunk = DeltaHunk {
+            start: 0,
+            end: 1,
+            count: 1,
+            lines: vec![(b"rev-id".to_vec(), b"new-line\n".to_vec())],
+        };
+        let raw_rev = delta_raw_annotated(b"rev-id", &[hunk.clone()]);
+        ann.expand_record(
+            rev_key.clone(),
+            vec![parent_key.clone()],
+            Some(parent_key.clone()),
+            raw_rev,
+            KnitMethod::LineDelta,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ann.num_compression_children[&parent_key], 1);
+
+        // Second child delta drops the parent content + counter.
+        let raw_rev2 = delta_raw_annotated(b"rev2-id", &[hunk]);
+        ann.expand_record(
+            rev2_key.clone(),
+            vec![parent_key.clone()],
+            Some(parent_key.clone()),
+            raw_rev2,
+            KnitMethod::LineDelta,
+            false,
+        )
+        .unwrap();
+        assert!(!ann.content_objects.contains_key(&parent_key));
+        assert!(!ann.num_compression_children.contains_key(&parent_key));
+        assert!(!ann.content_objects.contains_key(&rev_key));
+        assert!(!ann.content_objects.contains_key(&rev2_key));
+    }
+
+    #[test]
+    fn annotator_expand_delta_records_matching_blocks() {
+        // Mirrors Test_KnitAnnotator.test__expand_delta_records_blocks
+        let mut ann = make_annotator();
+        let rev_key = ann_key(b"rev-id");
+        let parent_key = ann_key(b"parent-id");
+        ann.num_compression_children.insert(parent_key.clone(), 2);
+
+        let raw_parent =
+            fulltext_raw(b"parent-id", &[b"line1\n", b"line2\n", b"line3\n"], false);
+        ann.expand_record(
+            parent_key.clone(),
+            vec![],
+            None,
+            raw_parent,
+            KnitMethod::Fulltext,
+            false,
+        )
+        .unwrap();
+
+        // noeol strips the trailing newline from the last child line, so
+        // line3 vs line3\n differs: only one matching block.
+        let hunk_ann = DeltaHunk {
+            start: 0,
+            end: 1,
+            count: 1,
+            lines: vec![(b"rev-id".to_vec(), b"new-line\n".to_vec())],
+        };
+        let raw_rev = delta_raw_annotated(b"rev-id", &[hunk_ann]);
+        ann.expand_record(
+            rev_key.clone(),
+            vec![parent_key.clone()],
+            Some(parent_key.clone()),
+            raw_rev,
+            KnitMethod::LineDelta,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            ann.matching_blocks[&(rev_key.clone(), parent_key.clone())],
+            vec![(1, 1, 1), (3, 3, 0)]
+        );
+
+        // Without noeol, both trailing lines match.
+        let rev2_key = ann_key(b"rev2-id");
+        let hunk_plain = DeltaHunk {
+            start: 0,
+            end: 1,
+            count: 1,
+            lines: vec![(b"rev2-id".to_vec(), b"new-line\n".to_vec())],
+        };
+        let raw_rev2 = delta_raw_annotated(b"rev2-id", &[hunk_plain]);
+        ann.expand_record(
+            rev2_key.clone(),
+            vec![parent_key.clone()],
+            Some(parent_key.clone()),
+            raw_rev2,
+            KnitMethod::LineDelta,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            ann.matching_blocks[&(rev2_key.clone(), parent_key.clone())],
+            vec![(1, 1, 2), (3, 3, 0)]
+        );
+    }
+
+    #[test]
+    fn annotator_get_parent_annotations_uses_precomputed_blocks() {
+        // Mirrors Test_KnitAnnotator.test__get_parent_ann_uses_matching_blocks
+        let mut ann = make_annotator();
+        let rev_key = ann_key(b"rev-id");
+        let parent_key = ann_key(b"parent-id");
+        let parent_ann: Vec<LineAnnotation> = vec![vec![parent_key.clone()]; 3];
+        ann.annotations_cache
+            .insert(parent_key.clone(), parent_ann.clone());
+        ann.matching_blocks.insert(
+            (rev_key.clone(), parent_key.clone()),
+            vec![(0, 1, 1), (3, 3, 0)],
+        );
+        let text = vec![b"1\n".to_vec(), b"2\n".to_vec(), b"3\n".to_vec()];
+        let (par_ann, blocks) =
+            ann.get_parent_annotations_and_matches(&rev_key, &text, &parent_key);
+        assert_eq!(par_ann, parent_ann);
+        assert_eq!(blocks, vec![(0, 1, 1), (3, 3, 0)]);
+        assert!(ann.matching_blocks.is_empty());
+    }
+
+    #[test]
+    fn annotator_process_pending_drains_queues() {
+        // Mirrors Test_KnitAnnotator.test__process_pending
+        let mut ann = make_annotator();
+        let rev_key = ann_key(b"rev-id");
+        let p1_key = ann_key(b"p1-id");
+        let p2_key = ann_key(b"p2-id");
+        ann.num_compression_children.insert(p1_key.clone(), 1);
+
+        let hunk = DeltaHunk {
+            start: 0,
+            end: 1,
+            count: 1,
+            lines: vec![(b"rev-id".to_vec(), b"new-line\n".to_vec())],
+        };
+        let raw_rev = delta_raw_annotated(b"rev-id", &[hunk]);
+        let res = ann
+            .expand_record(
+                rev_key.clone(),
+                vec![p1_key.clone(), p2_key.clone()],
+                Some(p1_key.clone()),
+                raw_rev,
+                KnitMethod::LineDelta,
+                false,
+            )
+            .unwrap();
+        assert_eq!(res, None);
+        assert!(ann.pending_annotation.is_empty());
+
+        let raw_p1 = fulltext_raw(b"p1-id", &[b"line1\n", b"line2\n"], false);
+        let res = ann
+            .expand_record(
+                p1_key.clone(),
+                vec![],
+                None,
+                raw_p1,
+                KnitMethod::Fulltext,
+                false,
+            )
+            .unwrap();
+        assert_eq!(res, Some(vec![b"line1\n".to_vec(), b"line2\n".to_vec()]));
+
+        ann.annotations_cache
+            .insert(p1_key.clone(), vec![vec![p1_key.clone()]; 2]);
+        let ready = ann.process_pending(&p1_key).unwrap();
+        // rev still waits on p2.
+        assert_eq!(ready, Vec::<KnitKey>::new());
+        assert!(!ann.pending_deltas.contains_key(&p1_key));
+        assert!(ann.pending_annotation.contains_key(&p2_key));
+        assert_eq!(
+            ann.pending_annotation[&p2_key],
+            vec![(rev_key.clone(), vec![p1_key.clone(), p2_key.clone()])]
+        );
+
+        let raw_p2 = fulltext_raw(b"p2-id", &[], false);
+        ann.expand_record(
+            p2_key.clone(),
+            vec![],
+            None,
+            raw_p2,
+            KnitMethod::Fulltext,
+            false,
+        )
+        .unwrap();
+        ann.annotations_cache.insert(p2_key.clone(), vec![]);
+        let ready = ann.process_pending(&p2_key).unwrap();
+        assert_eq!(ready, vec![rev_key.clone()]);
+        assert!(ann.pending_annotation.is_empty());
+        assert!(ann.pending_deltas.is_empty());
+    }
+
     struct StaticBasis {
         lines: Vec<Vec<u8>>,
     }
