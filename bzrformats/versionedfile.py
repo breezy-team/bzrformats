@@ -17,7 +17,6 @@
 """Versioned text file storage api."""
 
 import functools
-import itertools
 import os
 from copy import copy
 from io import BytesIO
@@ -1312,16 +1311,10 @@ class VersionedFiles:
 
     def get_known_graph_ancestry(self, keys):
         """Get a KnownGraph instance with the ancestry of keys."""
-        # most basic implementation is a loop around get_parent_map
-        pending = set(keys)
-        parent_map = {}
-        while pending:
-            this_parent_map = self.get_parent_map(pending)
-            parent_map.update(this_parent_map)
-            pending = set(itertools.chain.from_iterable(this_parent_map.values()))
-            pending.difference_update(parent_map)
-        kg = _mod_known_graph.KnownGraph(parent_map)
-        return kg
+        # The get_parent_map walk runs in Rust; it only needs this object's
+        # get_parent_map, which it calls back into.
+        parent_map = _versionedfile_rs.known_graph_ancestry_map(self, list(keys))
+        return _mod_known_graph.KnownGraph(parent_map)
 
     def get_parent_map(self, keys):
         """Get a map of the parents of keys.

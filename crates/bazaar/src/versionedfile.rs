@@ -958,6 +958,38 @@ pub trait VersionedFiles: Send + Sync {
     fn check(&self) -> Result<(), crate::knit::KnitError> {
         Err(crate::knit::KnitError::NotImplemented("check"))
     }
+
+    /// Resolve the full ancestry of `keys` as a `{key: parents}` map.
+    ///
+    /// Walks `get_parent_map` outward from `keys` until no unresolved
+    /// parents remain. Mirrors the loop in
+    /// `VersionedFiles.get_known_graph_ancestry`; the caller wraps the
+    /// result in a `KnownGraph`.
+    fn known_graph_ancestry_map(
+        &self,
+        keys: &[Key],
+    ) -> Result<HashMap<Key, Vec<Key>>, crate::knit::KnitError> {
+        let mut parent_map: HashMap<Key, Vec<Key>> = HashMap::new();
+        let mut pending: Vec<Key> = keys.to_vec();
+        while !pending.is_empty() {
+            let this = self.get_parent_map(&pending)?;
+            let mut next: Vec<Key> = Vec::new();
+            for parents in this.values() {
+                for p in parents {
+                    if !parent_map.contains_key(p) && !this.contains_key(p) {
+                        next.push(p.clone());
+                    }
+                }
+            }
+            for (k, v) in this {
+                parent_map.insert(k, v);
+            }
+            next.sort();
+            next.dedup();
+            pending = next;
+        }
+        Ok(parent_map)
+    }
 }
 
 /// Whether every entry in `lines` is a single full line.

@@ -1025,6 +1025,30 @@ fn record_to_content_factory(
     ))
 }
 
+/// Resolve the full ancestry of `keys` against a Python `VersionedFiles`,
+/// returning a `{key: parents}` dict.
+///
+/// Drives the `get_parent_map` walk in Rust; mirrors the loop in
+/// `VersionedFiles.get_known_graph_ancestry`. The caller wraps the result
+/// in a `KnownGraph`.
+#[pyfunction]
+fn known_graph_ancestry_map<'py>(
+    py: Python<'py>,
+    vf: Py<PyAny>,
+    keys: Vec<Key>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use bazaar::versionedfile::VersionedFiles;
+    let wrapped = PyVersionedFiles::new(vf);
+    let parent_map = wrapped
+        .known_graph_ancestry_map(&keys)
+        .map_err(crate::knit::knit_err_to_py)?;
+    let out = PyDict::new(py);
+    for (key, parents) in parent_map {
+        out.set_item(key, parents)?;
+    }
+    Ok(out)
+}
+
 pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "versionedfile")?;
     m.add_class::<AbstractContentFactory>()?;
@@ -1045,5 +1069,6 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(mpdiff_collect_parent_chunks, &m)?)?;
     m.add_function(wrap_pyfunction!(check_lines_not_unicode, &m)?)?;
     m.add_function(wrap_pyfunction!(check_lines_are_lines, &m)?)?;
+    m.add_function(wrap_pyfunction!(known_graph_ancestry_map, &m)?)?;
     Ok(m)
 }
