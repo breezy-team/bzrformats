@@ -5041,13 +5041,7 @@ impl PyKnitContentFactory {
 
     #[getter]
     fn storage_kind(&self) -> String {
-        let kind = if self.method == KnitMethod::LineDelta {
-            "delta"
-        } else {
-            "ft"
-        };
-        let annotated = if self.annotated { "annotated-" } else { "" };
-        format!("knit-{annotated}{kind}-gz")
+        bazaar::knit::format_storage_kind(self.method.clone(), self.annotated)
     }
 
     #[getter]

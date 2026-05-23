@@ -2669,7 +2669,7 @@ impl GCGraphIndex {
     ) -> PyResult<Bound<'py, PyDict>> {
         self._check_read(py)?;
         let result = PyDict::new(py);
-        let nodes = self._get_entries(py, keys, false)?;
+        let nodes = self._get_entries(py, keys)?;
         if self.parents {
             for node in nodes.try_iter()? {
                 let node = node?;
@@ -2693,7 +2693,7 @@ impl GCGraphIndex {
     ) -> PyResult<Bound<'py, PyDict>> {
         self._check_read(py)?;
         let result = PyDict::new(py);
-        let entries = self._get_entries(py, keys, false)?;
+        let entries = self._get_entries(py, keys)?;
         for entry in entries.try_iter()? {
             let entry = entry?;
             let key = entry.get_item(1)?;
@@ -2702,7 +2702,7 @@ impl GCGraphIndex {
             } else {
                 py.None()
             };
-            let position = self._node_to_position(py, &entry)?;
+            let position = self._node_to_position(&entry)?;
             let details = GCBuildDetails {
                 parents,
                 index: position.0,
@@ -2786,7 +2786,7 @@ impl GCGraphIndex {
 
         // Check for duplicates if not random_id.
         if !random_id {
-            let present = self._get_entries(py, keys_map.call_method0("keys")?, false)?;
+            let present = self._get_entries(py, keys_map.call_method0("keys")?)?;
             for node in present.try_iter()? {
                 let node = node?;
                 let key = node.get_item(1)?;
@@ -2915,7 +2915,6 @@ impl GCGraphIndex {
     /// Convert an index entry to its `(index, group_start, group_end, basis_end, delta_end)` tuple.
     fn _node_to_position(
         &mut self,
-        py: Python<'_>,
         node: &Bound<'_, PyAny>,
     ) -> PyResult<(Py<PyAny>, u64, u64, u64, u64)> {
         let value: Vec<u8> = node.get_item(2)?.extract::<Vec<u8>>()?;
@@ -2934,7 +2933,6 @@ impl GCGraphIndex {
         &self,
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
-        _check_present: bool,
     ) -> PyResult<Bound<'py, PyList>> {
         let iter = self
             .graph_index

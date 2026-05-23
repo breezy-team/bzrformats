@@ -638,16 +638,6 @@ def _get_total_build_size(self, keys, positions):
     return _knit_rs.get_total_build_size_rs(keys, positions)
 
 
-def as_tuples(obj):
-    """Ensure that the object and any referenced objects are plain tuples."""
-    result = []
-    for item in obj:
-        if isinstance(item, (tuple, list)):
-            item = as_tuples(item)
-        result.append(item)
-    return tuple(result)
-
-
 def annotate_knit(knit, revision_id):
     """Annotate a knit with no cached annotations.
 

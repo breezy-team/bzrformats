@@ -1697,6 +1697,16 @@ pub fn delta_closure_storage_kind(first: bool) -> &'static str {
     }
 }
 
+/// Format the storage kind string for a native knit record:
+/// `knit-[annotated-](ft|delta)-gz`.
+pub fn format_storage_kind(method: KnitMethod, annotated: bool) -> String {
+    let annotated_prefix = if annotated { "annotated-" } else { "" };
+    match method {
+        KnitMethod::LineDelta => format!("knit-{annotated_prefix}delta-gz"),
+        KnitMethod::Fulltext | KnitMethod::NoEol => format!("knit-{annotated_prefix}ft-gz"),
+    }
+}
+
 /// Encode a single record for insertion into a `_KnitGraphIndex`.
 ///
 /// Returns `(value_bytes, node_refs)` ready to pass to `add_callback`.
