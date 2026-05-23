@@ -2918,6 +2918,13 @@ impl AnyKnitAnnotator {
         }
     }
 
+    fn add_special_text(&mut self, key: KnitKey, parent_keys: Vec<KnitKey>, lines: Vec<Vec<u8>>) {
+        match self {
+            AnyKnitAnnotator::Annotated(a) => a.add_special_text(key, parent_keys, lines),
+            AnyKnitAnnotator::Plain(a) => a.add_special_text(key, parent_keys, lines),
+        }
+    }
+
     fn annotate_flat_seeded(
         &mut self,
         key: &KnitKey,
@@ -3246,6 +3253,10 @@ fn convert_stream_record<'py>(
 #[pyclass(name = "_KnitAnnotator")]
 pub struct PyKnitAnnotator {
     inner: AnyKnitAnnotator,
+    /// The versioned file this annotator was constructed from.  Exposed as
+    /// `_vf` to match the Python `_KnitAnnotator` / `VersionedFileAnnotator`
+    /// interface (used by tests and callers that need to add special texts).
+    vf: Py<PyAny>,
 }
 
 impl PyKnitAnnotator {
@@ -3257,7 +3268,7 @@ impl PyKnitAnnotator {
         } else {
             AnyKnitAnnotator::Plain(KnitAnnotator::new(index, access, KnitPlainFactory))
         };
-        Ok(PyKnitAnnotator { inner })
+        Ok(PyKnitAnnotator { inner, vf: py.None() })
     }
 }
 
@@ -3276,7 +3287,34 @@ fn knit_annotation_to_py<'py>(
 impl PyKnitAnnotator {
     #[new]
     fn new(py: Python<'_>, vf: Bound<'_, PyKnitVersionedFiles>) -> PyResult<Self> {
-        Self::from_kvf(py, &vf.borrow())
+        let vf_obj = vf.clone().into_any().unbind();
+        let mut this = Self::from_kvf(py, &vf.borrow())?;
+        this.vf = vf_obj;
+        Ok(this)
+    }
+
+    fn add_special_text(
+        &mut self,
+        key: Bound<'_, PyAny>,
+        parent_keys: Bound<'_, PyAny>,
+        text: &[u8],
+    ) -> PyResult<()> {
+        let rust_key = extract_py_knit_key(&key)?;
+        let rust_parents: Vec<KnitKey> = parent_keys
+            .try_iter()?
+            .map(|item| extract_py_knit_key(&item?))
+            .collect::<PyResult<_>>()?;
+        let lines = bazaar::osutils::split_lines(text)
+            .into_iter()
+            .map(|l| l.to_vec())
+            .collect();
+        self.inner.add_special_text(rust_key, rust_parents, lines);
+        Ok(())
+    }
+
+    #[getter]
+    fn _vf<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
+        self.vf.bind(py).clone()
     }
 
     fn annotate_flat<'py>(
@@ -5921,7 +5959,9 @@ impl PyKnitVersionedFiles {
     }
 
     fn get_annotator(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let annotator = PyKnitAnnotator::from_kvf(py, &slf.bind(py).borrow())?;
+        let vf_obj = slf.clone_ref(py).into_any();
+        let mut annotator = PyKnitAnnotator::from_kvf(py, &slf.bind(py).borrow())?;
+        annotator.vf = vf_obj;
         Py::new(py, annotator).map(|p| p.into_any())
     }
 

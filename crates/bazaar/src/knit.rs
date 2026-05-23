@@ -5018,6 +5018,18 @@ where
         self.record_annotation(key, &parent_keys.clone(), annotations);
     }
 
+    /// Inject an external text into the annotator without reading it from the
+    /// backing store.  Mirrors `VersionedFileAnnotator.add_special_text`.
+    pub fn add_special_text(
+        &mut self,
+        key: KnitKey,
+        parent_keys: Vec<KnitKey>,
+        lines: Vec<Vec<u8>>,
+    ) {
+        self.parent_map.insert(key.clone(), parent_keys);
+        self.text_cache.insert(key, lines);
+    }
+
     /// Annotate `key` and return `(annotations, lines)`.
     pub fn annotate(
         &mut self,
