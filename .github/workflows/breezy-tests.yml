@@ -33,7 +33,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -U "setuptools>=60" setuptools-gettext \
-            setuptools-rust cython
+            setuptools-rust
       - name: Install bzrformats from this checkout
         working-directory: bzrformats
         run: |
