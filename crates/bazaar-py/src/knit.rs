@@ -5146,6 +5146,108 @@ impl PyKnitContentFactory {
     }
 }
 
+/// `LazyKnitContentFactory` — the record yielded by a delta-closure
+/// `get_record_stream` iteration.
+///
+/// Holds a back-reference to its `generator` (`_NetworkContentMapGenerator`
+/// or `_VFContentMapGenerator`); `get_bytes_as` dispatches the actual
+/// reconstruction to the generator's `_get_one_work`. The first record in
+/// the stream serialises the whole closure as wire bytes; subsequent
+/// records emit an empty `knit-delta-closure-ref` payload.
+#[pyclass(name = "LazyKnitContentFactory")]
+pub struct PyLazyKnitContentFactory {
+    #[pyo3(get)]
+    key: Py<PyAny>,
+    #[pyo3(get)]
+    parents: Py<PyAny>,
+    #[pyo3(get)]
+    sha1: Py<PyAny>,
+    #[pyo3(get)]
+    storage_kind: String,
+    generator: Py<PyAny>,
+    first: bool,
+}
+
+#[pymethods]
+impl PyLazyKnitContentFactory {
+    #[new]
+    fn new(
+        key: Bound<'_, PyAny>,
+        parents: Bound<'_, PyAny>,
+        generator: Bound<'_, PyAny>,
+        first: bool,
+    ) -> PyResult<Self> {
+        let py = key.py();
+        Ok(Self {
+            key: key.unbind(),
+            parents: parents.unbind(),
+            sha1: py.None(),
+            storage_kind: bazaar::knit::delta_closure_storage_kind(first).to_owned(),
+            generator: generator.unbind(),
+            first,
+        })
+    }
+
+    fn get_bytes_as<'py>(
+        &self,
+        py: Python<'py>,
+        storage_kind: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if storage_kind == self.storage_kind {
+            if self.first {
+                return self.generator.bind(py).call_method0("_wire_bytes");
+            }
+            return Ok(PyBytes::new(py, b"").into_any());
+        }
+        if matches!(storage_kind, "chunked" | "fulltext" | "lines") {
+            let work = self
+                .generator
+                .bind(py)
+                .call_method1("_get_one_work", (self.key.bind(py),))?;
+            let chunks = work.call_method0("text")?;
+            let lines: Vec<Vec<u8>> = chunks
+                .try_iter()?
+                .map(|item| {
+                    item?
+                        .cast_into::<PyBytes>()
+                        .map(|b| b.as_bytes().to_vec())
+                        .map_err(|_| pyo3::exceptions::PyTypeError::new_err("expected bytes"))
+                })
+                .collect::<PyResult<_>>()?;
+            if matches!(storage_kind, "chunked" | "lines") {
+                let py_lines: Vec<Bound<'py, PyBytes>> =
+                    lines.iter().map(|l| PyBytes::new(py, l)).collect();
+                return Ok(pyo3::types::PyList::new(py, &py_lines)?.into_any());
+            }
+            return Ok(PyBytes::new(py, &lines.concat()).into_any());
+        }
+        Err(UnavailableRepresentation::new_err((
+            self.key.clone_ref(py),
+            storage_kind.to_owned(),
+            self.storage_kind.clone(),
+        )))
+    }
+
+    fn iter_bytes_as<'py>(
+        &self,
+        py: Python<'py>,
+        storage_kind: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if matches!(storage_kind, "chunked" | "lines") {
+            let work = self
+                .generator
+                .bind(py)
+                .call_method1("_get_one_work", (self.key.bind(py),))?;
+            return work.call_method0("text");
+        }
+        Err(UnavailableRepresentation::new_err((
+            self.key.clone_ref(py),
+            storage_kind.to_owned(),
+            self.storage_kind.clone(),
+        )))
+    }
+}
+
 fn build_network_record_bytes<'py>(
     py: Python<'py>,
     rec: &PyKnitContentFactory,
@@ -7375,6 +7477,409 @@ impl PyKnitVersionedFiles {
 }
 
 // ---------------------------------------------------------------------------
+// _NetworkContentMapGenerator — Rust port of the Python class
+// ---------------------------------------------------------------------------
+
+/// Rust-backed `_NetworkContentMapGenerator`.
+///
+/// Parses the knit-delta-closure wire bytes once in `__init__` and serves as
+/// the `generator` argument to `LazyKnitContentFactory`. Implements
+/// `_get_one_work`, `_wire_bytes`, and `get_record_stream`.
+#[pyclass(name = "_NetworkContentMapGenerator")]
+struct PyNetworkContentMapGenerator {
+    bytes: Vec<u8>,
+    annotated: bool,
+    keys: Vec<KnitKey>,
+    global_map: std::collections::HashMap<KnitKey, Option<Vec<KnitKey>>>,
+    raw_map: bazaar::knit::DeltaClosureRawMap,
+    /// Cached reconstructed content: key → list of lines.
+    contents_map: std::collections::HashMap<KnitKey, Vec<Vec<u8>>>,
+}
+
+#[pymethods]
+impl PyNetworkContentMapGenerator {
+    #[new]
+    fn new(bytes: &[u8], line_end: usize) -> PyResult<Self> {
+        let parsed = bazaar::knit::parse_delta_closure_wire_bytes(bytes, line_end)
+            .map_err(knit_err_to_py)?;
+        Ok(Self {
+            bytes: bytes.to_vec(),
+            annotated: parsed.annotated,
+            keys: parsed.keys,
+            global_map: parsed.global_map,
+            raw_map: parsed.raw_map,
+            contents_map: std::collections::HashMap::new(),
+        })
+    }
+
+    fn _wire_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.bytes)
+    }
+
+    fn _get_one_work<'py>(
+        &mut self,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let kkey = extract_knit_key(&key).map_err(knit_err_to_py)?;
+        if !self.contents_map.contains_key(&kkey) {
+            // Reconstruct every key in the closure (matches Python).
+            for k in &self.keys {
+                if self.contents_map.contains_key(k) {
+                    continue;
+                }
+                let lines = if self.annotated {
+                    bazaar::knit::reconstruct_text_from_raw_map(
+                        &bazaar::knit::KnitAnnotateFactory,
+                        &self.raw_map,
+                        k,
+                    )
+                } else {
+                    bazaar::knit::reconstruct_text_from_raw_map(
+                        &bazaar::knit::KnitPlainFactory,
+                        &self.raw_map,
+                        k,
+                    )
+                }
+                .map_err(knit_err_to_py)?;
+                self.contents_map.insert(k.clone(), lines.0);
+            }
+        }
+        let lines = self.contents_map.get(&kkey).ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!("key {kkey:?} not in generator"))
+        })?;
+        let version_id = kkey.last().cloned().unwrap_or_default();
+        let plain = PyPlainKnitContent(PlainKnitContent::new(lines.clone(), version_id));
+        Ok(plain.into_pyobject(py)?.into_any())
+    }
+
+    fn get_record_stream(
+        slf: Py<Self>,
+        py: Python<'_>,
+    ) -> PyResult<Bound<'_, pyo3::types::PyList>> {
+        let list = pyo3::types::PyList::empty(py);
+        let keys: Vec<KnitKey> = slf.borrow(py).keys.clone();
+        let global_map: std::collections::HashMap<KnitKey, Option<Vec<KnitKey>>> =
+            slf.borrow(py).global_map.clone();
+        let mut first = true;
+        for key in &keys {
+            let parents = global_map.get(key).cloned().flatten();
+            let py_key = py_knit_key_to_py(py, key)?.into_any().unbind();
+            let py_parents = match parents {
+                None => py.None(),
+                Some(ref ps) => PyTuple::new(
+                    py,
+                    ps.iter()
+                        .map(|p| py_knit_key_to_py(py, p).map(|t| t.into_any()))
+                        .collect::<PyResult<Vec<_>>>()?,
+                )?
+                .into_any()
+                .unbind(),
+            };
+            let factory = PyLazyKnitContentFactory {
+                key: py_key,
+                parents: py_parents,
+                sha1: py.None(),
+                storage_kind: bazaar::knit::delta_closure_storage_kind(first).to_owned(),
+                generator: slf.clone_ref(py).into_any(),
+                first,
+            };
+            list.append(factory.into_pyobject(py)?)?;
+            first = false;
+        }
+        Ok(list)
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// _VFContentMapGenerator — Rust port of the Python class
+// ---------------------------------------------------------------------------
+
+/// Convert the Python `_get_record_map_unparsed` dict into a
+/// `DeltaClosureRawMap`. The dict has the shape
+/// `{key: (raw_bytes, (method_str, noeol_bool), next)}`.
+fn py_raw_map_to_delta_closure_map(
+    raw_map_obj: &Bound<'_, PyAny>,
+) -> PyResult<bazaar::knit::DeltaClosureRawMap> {
+    let dict = raw_map_obj.clone().cast_into::<PyDict>()?;
+    let mut result = bazaar::knit::DeltaClosureRawMap::new();
+    for (key, value) in dict.iter() {
+        let tup = value.cast_into::<PyTuple>()?;
+        let raw_bytes = tup
+            .get_item(0)?
+            .cast_into::<PyBytes>()
+            .map(|b| b.as_bytes().to_vec())
+            .map_err(|_| pyo3::exceptions::PyTypeError::new_err("raw_bytes must be bytes"))?;
+        let record_details = tup.get_item(1)?;
+        let method_str: String = record_details.get_item(0)?.extract()?;
+        let noeol: bool = record_details.get_item(1)?.extract()?;
+        let method = bazaar::knit::KnitMethod::from_str(&method_str).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("unknown method: {method_str}"))
+        })?;
+        let next_obj = tup.get_item(2)?;
+        let next = if next_obj.is_none() {
+            None
+        } else {
+            Some(extract_knit_key(&next_obj).map_err(knit_err_to_py)?)
+        };
+        result.insert(
+            extract_knit_key(&key).map_err(knit_err_to_py)?,
+            bazaar::knit::DeltaClosureRawEntry {
+                raw_bytes,
+                method,
+                noeol,
+                next,
+            },
+        );
+    }
+    Ok(result)
+}
+
+/// Rust-backed `_VFContentMapGenerator`.
+///
+/// Generates `LazyKnitContentFactory` records by pulling from a Python
+/// `KnitVersionedFiles` object. The raw record map and global parent map
+/// are populated lazily on first use (or supplied up front by the caller).
+#[pyclass(name = "_VFContentMapGenerator")]
+struct PyVFContentMapGenerator {
+    vf: Py<PyAny>,
+    keys: Vec<KnitKey>,
+    nonlocal_keys: std::collections::HashSet<KnitKey>,
+    global_map: Option<std::collections::HashMap<KnitKey, Option<Vec<KnitKey>>>>,
+    annotated: bool,
+    raw_map: Option<bazaar::knit::DeltaClosureRawMap>,
+    contents_map: std::collections::HashMap<KnitKey, Vec<Vec<u8>>>,
+}
+
+#[pymethods]
+impl PyVFContentMapGenerator {
+    #[new]
+    #[pyo3(signature = (versioned_files, keys, nonlocal_keys=None, global_map=None, raw_record_map=None, ordering="unordered"))]
+    fn new(
+        versioned_files: Bound<'_, PyAny>,
+        keys: Bound<'_, PyAny>,
+        nonlocal_keys: Option<Bound<'_, PyAny>>,
+        global_map: Option<Bound<'_, PyAny>>,
+        raw_record_map: Option<Bound<'_, PyAny>>,
+        ordering: &str,
+    ) -> PyResult<Self> {
+        let _ = ordering; // accepted for API parity; no per-record ordering yet
+        let annotated: bool = versioned_files
+            .getattr("_factory")?
+            .getattr("annotated")?
+            .extract()?;
+        let knit_keys: Vec<KnitKey> = keys
+            .try_iter()?
+            .map(|item| extract_knit_key(&item?).map_err(knit_err_to_py))
+            .collect::<PyResult<_>>()?;
+        let nonlocal: std::collections::HashSet<KnitKey> = match nonlocal_keys {
+            None => std::collections::HashSet::new(),
+            Some(ref obj) => obj
+                .try_iter()?
+                .map(|item| extract_knit_key(&item?).map_err(knit_err_to_py))
+                .collect::<PyResult<_>>()?,
+        };
+        let parsed_global_map: Option<std::collections::HashMap<KnitKey, Option<Vec<KnitKey>>>> =
+            match global_map {
+                None => None,
+                Some(ref gm) => {
+                    let mut map = std::collections::HashMap::new();
+                    let d = gm.clone().cast_into::<PyDict>()?;
+                    for (key, val) in d.iter() {
+                        let k = extract_knit_key(&key).map_err(knit_err_to_py)?;
+                        let parents = if val.is_none() {
+                            None
+                        } else {
+                            Some(
+                                val.try_iter()?
+                                    .map(|p| extract_knit_key(&p?).map_err(knit_err_to_py))
+                                    .collect::<PyResult<_>>()?,
+                            )
+                        };
+                        map.insert(k, parents);
+                    }
+                    Some(map)
+                }
+            };
+        let preloaded_raw_map = match raw_record_map {
+            None => None,
+            Some(ref rm) => Some(py_raw_map_to_delta_closure_map(rm)?),
+        };
+        Ok(Self {
+            vf: versioned_files.unbind(),
+            keys: knit_keys,
+            nonlocal_keys: nonlocal,
+            global_map: parsed_global_map,
+            annotated,
+            raw_map: preloaded_raw_map,
+            contents_map: std::collections::HashMap::new(),
+        })
+    }
+
+    fn _get_one_work<'py>(
+        &mut self,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let kkey = extract_knit_key(&key).map_err(knit_err_to_py)?;
+        if !self.contents_map.contains_key(&kkey) {
+            if self.raw_map.is_none() {
+                let local_keys: Vec<KnitKey> = self
+                    .keys
+                    .iter()
+                    .filter(|k| !self.nonlocal_keys.contains(*k))
+                    .cloned()
+                    .collect();
+                let py_keys = pyo3::types::PyList::empty(py);
+                for k in &local_keys {
+                    py_keys.append(py_knit_key_to_py(py, k)?)?;
+                }
+                let raw_map_obj = self
+                    .vf
+                    .bind(py)
+                    .call_method1("_get_record_map_unparsed", (py_keys, Some(true)))?;
+                self.raw_map = Some(py_raw_map_to_delta_closure_map(&raw_map_obj)?);
+            }
+            let raw_map = self.raw_map.as_ref().unwrap();
+            for k in &self.keys {
+                if self.nonlocal_keys.contains(k) || self.contents_map.contains_key(k) {
+                    continue;
+                }
+                let lines = if self.annotated {
+                    bazaar::knit::reconstruct_text_from_raw_map(
+                        &bazaar::knit::KnitAnnotateFactory,
+                        raw_map,
+                        k,
+                    )
+                } else {
+                    bazaar::knit::reconstruct_text_from_raw_map(
+                        &bazaar::knit::KnitPlainFactory,
+                        raw_map,
+                        k,
+                    )
+                }
+                .map_err(knit_err_to_py)?;
+                self.contents_map.insert(k.clone(), lines.0);
+            }
+        }
+        let lines = self.contents_map.get(&kkey).ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!("key {kkey:?} not in VF generator"))
+        })?;
+        let version_id = kkey.last().cloned().unwrap_or_default();
+        let plain = PyPlainKnitContent(PlainKnitContent::new(lines.clone(), version_id));
+        Ok(plain.into_pyobject(py)?.into_any())
+    }
+
+    fn _wire_bytes<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        if self.global_map.is_none() {
+            let py_keys = pyo3::types::PyList::empty(py);
+            for k in &self.keys {
+                py_keys.append(py_knit_key_to_py(py, k)?)?;
+            }
+            let gm_obj = self
+                .vf
+                .bind(py)
+                .call_method1("get_parent_map", (py_keys,))?;
+            let mut map = std::collections::HashMap::new();
+            let d = gm_obj.cast_into::<PyDict>()?;
+            for (key, val) in d.iter() {
+                let k = extract_knit_key(&key).map_err(knit_err_to_py)?;
+                let parents = if val.is_none() {
+                    None
+                } else {
+                    Some(
+                        val.try_iter()?
+                            .map(|p| extract_knit_key(&p?).map_err(knit_err_to_py))
+                            .collect::<PyResult<_>>()?,
+                    )
+                };
+                map.insert(k, parents);
+            }
+            self.global_map = Some(map);
+        }
+        if self.raw_map.is_none() {
+            let local_keys: Vec<KnitKey> = self
+                .keys
+                .iter()
+                .filter(|k| !self.nonlocal_keys.contains(*k))
+                .cloned()
+                .collect();
+            let py_keys = pyo3::types::PyList::empty(py);
+            for k in &local_keys {
+                py_keys.append(py_knit_key_to_py(py, k)?)?;
+            }
+            let raw_map_obj = self
+                .vf
+                .bind(py)
+                .call_method1("_get_record_map_unparsed", (py_keys, Some(true)))?;
+            self.raw_map = Some(py_raw_map_to_delta_closure_map(&raw_map_obj)?);
+        }
+        let emit_keys: Vec<KnitKey> = self
+            .keys
+            .iter()
+            .filter(|k| !self.nonlocal_keys.contains(*k))
+            .cloned()
+            .collect();
+        let wire = bazaar::knit::build_delta_closure_wire_bytes(
+            self.annotated,
+            &emit_keys,
+            self.raw_map.as_ref().unwrap(),
+            self.global_map.as_ref().unwrap(),
+        );
+        Ok(PyBytes::new(py, &wire))
+    }
+
+    fn get_record_stream(
+        slf: Py<Self>,
+        py: Python<'_>,
+    ) -> PyResult<Bound<'_, pyo3::types::PyList>> {
+        let list = pyo3::types::PyList::empty(py);
+        let keys: Vec<KnitKey> = slf.borrow(py).keys.clone();
+        let nonlocal_keys: std::collections::HashSet<KnitKey> =
+            slf.borrow(py).nonlocal_keys.clone();
+        let global_map_snapshot: Option<
+            std::collections::HashMap<KnitKey, Option<Vec<KnitKey>>>,
+        > = slf.borrow(py).global_map.clone();
+
+        let mut first = true;
+        for key in &keys {
+            if nonlocal_keys.contains(key) {
+                continue;
+            }
+            let parents = global_map_snapshot
+                .as_ref()
+                .and_then(|m| m.get(key))
+                .cloned()
+                .flatten();
+            let py_key = py_knit_key_to_py(py, key)?.into_any().unbind();
+            let py_parents = match parents {
+                None => py.None(),
+                Some(ref ps) => PyTuple::new(
+                    py,
+                    ps.iter()
+                        .map(|p| py_knit_key_to_py(py, p).map(|t| t.into_any()))
+                        .collect::<PyResult<Vec<_>>>()?,
+                )?
+                .into_any()
+                .unbind(),
+            };
+            let factory = PyLazyKnitContentFactory {
+                key: py_key,
+                parents: py_parents,
+                sha1: py.None(),
+                storage_kind: bazaar::knit::delta_closure_storage_kind(first).to_owned(),
+                generator: slf.clone_ref(py).into_any(),
+                first,
+            };
+            list.append(factory.into_pyobject(py)?)?;
+            first = false;
+        }
+        Ok(list)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // KnitAdapter pyclass + adapter_registry shim
 // ---------------------------------------------------------------------------
 
@@ -7671,6 +8176,9 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<PyKnitKeyAccess>()?;
     m.add_class::<PyKnitVersionedFiles>()?;
     m.add_class::<PyKnitDeltaClosureRecord>()?;
+    m.add_class::<PyLazyKnitContentFactory>()?;
+    m.add_class::<PyNetworkContentMapGenerator>()?;
+    m.add_class::<PyVFContentMapGenerator>()?;
     m.add_class::<PyKnitAdapter>()?;
     m.add_function(wrap_pyfunction!(get_knit_adapter, &m)?)?;
     Ok(m)

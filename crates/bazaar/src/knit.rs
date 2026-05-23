@@ -1673,6 +1673,28 @@ impl KnitMethod {
             KnitMethod::NoEol => "no-eol",
         }
     }
+
+    /// Parse the method name from its Python-facing string form. Returns
+    /// `None` for unrecognised values.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "fulltext" => Some(KnitMethod::Fulltext),
+            "line-delta" => Some(KnitMethod::LineDelta),
+            "no-eol" => Some(KnitMethod::NoEol),
+            _ => None,
+        }
+    }
+}
+
+/// Storage kind for a record in a delta-closure stream. The first record
+/// carries the full wire bytes (`knit-delta-closure`); subsequent records
+/// reference the same closure (`knit-delta-closure-ref`).
+pub fn delta_closure_storage_kind(first: bool) -> &'static str {
+    if first {
+        "knit-delta-closure"
+    } else {
+        "knit-delta-closure-ref"
+    }
 }
 
 /// Encode a single record for insertion into a `_KnitGraphIndex`.
@@ -4277,6 +4299,135 @@ pub struct DeltaClosureRawEntry {
 /// The map contains all records needed to reconstruct each requested key
 /// as a fulltext by walking the `next` chain.
 pub type DeltaClosureRawMap = std::collections::HashMap<KnitKey, DeltaClosureRawEntry>;
+
+/// Parsed result of [`parse_delta_closure_wire_bytes`].
+pub struct ParsedDeltaClosure {
+    pub annotated: bool,
+    pub keys: Vec<KnitKey>,
+    pub global_map: std::collections::HashMap<KnitKey, Option<Vec<KnitKey>>>,
+    pub raw_map: DeltaClosureRawMap,
+}
+
+/// Parse the wire bytes for a knit-delta-closure record.
+///
+/// Inverse of [`build_delta_closure_wire_bytes`] /
+/// [`build_knit_delta_closure_wire`]. The `line_end` parameter points to the
+/// byte *after* the first line (the `"knit-delta-closure\n"` header), which
+/// is already consumed by the caller.
+pub fn parse_delta_closure_wire_bytes(
+    bytes: &[u8],
+    line_end: usize,
+) -> Result<ParsedDeltaClosure, KnitError> {
+    let mut start = line_end;
+
+    let find_nl = |from: usize| -> Result<usize, KnitError> {
+        bytes[from..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| from + p)
+            .ok_or_else(|| KnitError::Corrupt("truncated delta-closure wire bytes".to_string()))
+    };
+
+    let parse_key_bytes = |seg: &[u8]| -> KnitKey {
+        seg.split(|&b| b == b'\x00').map(|s| s.to_vec()).collect()
+    };
+
+    // Line: "annotated" or "" (plain)
+    let nl = find_nl(start)?;
+    let annotated = &bytes[start..nl] == b"annotated";
+    start = nl + 1;
+
+    // Line: emit keys separated by '\t'
+    let nl = find_nl(start)?;
+    let keys_line = &bytes[start..nl];
+    start = nl + 1;
+    let keys: Vec<KnitKey> = keys_line
+        .split(|&b| b == b'\t')
+        .filter(|s| !s.is_empty())
+        .map(parse_key_bytes)
+        .collect();
+
+    let mut global_map = std::collections::HashMap::new();
+    let mut raw_map = DeltaClosureRawMap::new();
+
+    let end = bytes.len();
+    while start < end {
+        // Key line
+        let nl = find_nl(start)?;
+        let key = parse_key_bytes(&bytes[start..nl]);
+        start = nl + 1;
+
+        // Parents line: "None:" -> None, "" -> Some([]), else tab-sep keys
+        let nl = find_nl(start)?;
+        let parents_line = &bytes[start..nl];
+        start = nl + 1;
+        let parents: Option<Vec<KnitKey>> = if parents_line == b"None:" {
+            None
+        } else {
+            Some(
+                parents_line
+                    .split(|&b| b == b'\t')
+                    .filter(|s| !s.is_empty())
+                    .map(parse_key_bytes)
+                    .collect(),
+            )
+        };
+        global_map.insert(key.clone(), parents);
+
+        // Method line
+        let nl = find_nl(start)?;
+        let method_str = std::str::from_utf8(&bytes[start..nl])
+            .map_err(|_| KnitError::Corrupt("non-UTF8 method in delta-closure".to_string()))?;
+        let method = KnitMethod::from_str(method_str)
+            .ok_or_else(|| KnitError::Corrupt(format!("unknown method: {method_str}")))?;
+        start = nl + 1;
+
+        // Noeol line: "T" or "F"
+        let nl = find_nl(start)?;
+        let noeol = bytes[start] == b'T';
+        start = nl + 1;
+
+        // Next line: "" -> None, else key
+        let nl = find_nl(start)?;
+        let next_line = &bytes[start..nl];
+        let next = if next_line.is_empty() {
+            None
+        } else {
+            Some(parse_key_bytes(next_line))
+        };
+        start = nl + 1;
+
+        // Byte count line
+        let nl = find_nl(start)?;
+        let count_str = std::str::from_utf8(&bytes[start..nl])
+            .map_err(|_| KnitError::Corrupt("non-UTF8 byte count".to_string()))?;
+        let count: usize = count_str
+            .parse()
+            .map_err(|_| KnitError::Corrupt(format!("invalid byte count: {count_str}")))?;
+        start = nl + 1;
+
+        // Record bytes
+        let raw_bytes = bytes[start..start + count].to_vec();
+        start += count;
+
+        raw_map.insert(
+            key,
+            DeltaClosureRawEntry {
+                raw_bytes,
+                method,
+                noeol,
+                next,
+            },
+        );
+    }
+
+    Ok(ParsedDeltaClosure {
+        annotated,
+        keys,
+        global_map,
+        raw_map,
+    })
+}
 
 /// Reconstruct the full text for `key` by walking the compression chain in
 /// `raw_map`.
