@@ -1224,42 +1224,10 @@ class VersionedFiles:
         Records should be iterables of version, parents, expected_sha1,
         mpdiff. mpdiff should be a MultiParent instance.
         """
-        vf_parents = {}
-        mpvf = multiparent.MultiMemoryVersionedFile()
-        versions = []
-        for version, parent_ids, _expected_sha1, mpdiff in records:
-            versions.append(version)
-            mpvf.add_diff(mpdiff, version, parent_ids)
-        needed_parents = set()
-        for _version, parent_ids, _expected_sha1, _mpdiff in records:
-            needed_parents.update(p for p in parent_ids if not mpvf.has_version(p))
-        # It seems likely that adding all the present parents as fulltexts can
-        # easily exhaust memory.
-        for record in self.get_record_stream(needed_parents, "unordered", True):
-            if record.storage_kind == "absent":
-                continue
-            mpvf.add_version(record.get_bytes_as("lines"), record.key, [])
-        for (key, parent_keys, expected_sha1, mpdiff), lines in zip(
-            records, mpvf.get_line_list(versions), strict=False
-        ):
-            if len(parent_keys) == 1:
-                left_matching_blocks = list(
-                    mpdiff.get_matching_blocks(
-                        0, mpvf.get_diff(parent_keys[0]).num_lines()
-                    )
-                )
-            else:
-                left_matching_blocks = None
-            version_sha1, _, version_text = self.add_lines(
-                key,
-                parent_keys,
-                lines,
-                vf_parents,
-                left_matching_blocks=left_matching_blocks,
-            )
-            if version_sha1 != expected_sha1:
-                raise VersionedFileInvalidChecksum(version)
-            vf_parents[key] = version_text
+        # Drives the build-mpvf / fetch-parents / reconstruct / add_lines
+        # loop in Rust; the only Python callbacks it invokes are
+        # self.get_record_stream and self.add_lines.
+        _versionedfile_rs.add_mpdiffs(self, records)
 
     def annotate(self, key):
         """Return a list of (version-key, line) tuples for the text of key.

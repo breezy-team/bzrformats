@@ -1049,6 +1049,149 @@ fn known_graph_ancestry_map<'py>(
     Ok(out)
 }
 
+pyo3::import_exception!(bzrformats.errors, VersionedFileInvalidChecksum);
+
+/// Drive `VersionedFiles.add_mpdiffs(records)` in Rust.
+///
+/// `records` is an iterable of `(key, parents, expected_sha1, MultiParent)`
+/// tuples. The orchestration:
+///
+/// 1. Build a [`MultiMemoryVersionedFile`] over the input diffs, indexed
+///    by key.
+/// 2. Pull the needed parent fulltexts via `vf.get_record_stream(needed,
+///    "unordered", True)` and add them to the mpvf as snapshots.
+/// 3. Reconstruct each input key's lines from the mpvf chain, compute
+///    matching blocks for the single-parent case, then call
+///    `vf.add_lines(key, parents, lines, parent_texts, left_matching_blocks)`.
+/// 4. Verify the returned sha1 matches `expected_sha1`; raise
+///    `VersionedFileInvalidChecksum` otherwise.
+///
+/// Mirrors `bzrformats.versionedfile.VersionedFiles.add_mpdiffs` exactly.
+#[pyfunction]
+fn add_mpdiffs(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>) -> PyResult<()> {
+    use bazaar::multiparent::MultiMemoryVersionedFile;
+
+    // Materialise the records once: the original Python loop iterates
+    // twice (build mpvf, find missing parents) so we cache here too.
+    struct Record {
+        key: Key,
+        parents: Vec<Key>,
+        expected_sha1: Vec<u8>,
+        mp: bazaar::multiparent::MultiParent,
+    }
+    let mut rs: Vec<Record> = Vec::new();
+    for item in records.try_iter()? {
+        let tup = item?.cast_into::<PyTuple>()?;
+        let key: Key = tup.get_item(0)?.extract()?;
+        let parents_obj = tup.get_item(1)?;
+        let mut parents: Vec<Key> = Vec::new();
+        for p in parents_obj.try_iter()? {
+            parents.push(p?.extract::<Key>()?);
+        }
+        let expected_sha1: Vec<u8> = tup.get_item(2)?.extract()?;
+        let mp_obj = tup.get_item(3)?;
+        let hunks = mp_obj.getattr("hunks")?.cast_into::<PyList>()?;
+        let mp = crate::multiparent::py_hunks_to_rust(&hunks)?;
+        rs.push(Record {
+            key,
+            parents,
+            expected_sha1,
+            mp,
+        });
+    }
+
+    let mut mpvf: MultiMemoryVersionedFile<Key> = MultiMemoryVersionedFile::default();
+    for r in &rs {
+        mpvf.add_diff(r.mp.clone(), r.key.clone(), r.parents.clone());
+    }
+
+    // Collect parents that aren't already in the mpvf — those are the
+    // ones we have to fetch as fulltexts.
+    let mut needed_parents: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    for r in &rs {
+        for p in &r.parents {
+            if !mpvf.has_version(p) {
+                needed_parents.insert(p.clone());
+            }
+        }
+    }
+
+    if !needed_parents.is_empty() {
+        // Fetch via PyVersionedFiles so we don't have to materialise the
+        // whole iterator into a list. The trait already streams.
+        use bazaar::versionedfile::VersionedFiles;
+        let wrapped = PyVersionedFiles::new(vf.clone_ref(py));
+        let needed_vec: Vec<Key> = needed_parents.into_iter().collect();
+        let stream = wrapped
+            .get_record_stream(&needed_vec, "unordered", true)
+            .map_err(crate::knit::knit_err_to_py)?;
+        for rec in stream {
+            let rec = rec.map_err(crate::knit::knit_err_to_py)?;
+            if rec.storage_kind() == "absent" {
+                continue;
+            }
+            // `get_bytes_as("lines")` semantics: split the fulltext into
+            // newline-terminated lines.
+            let lines: Vec<Vec<u8>> = rec.to_lines().map(|l| l.into_owned()).collect();
+            mpvf.add_version(lines, rec.key(), vec![], None, false);
+        }
+    }
+
+    // Reconstruct each key's lines from the mpvf chain and dispatch to
+    // vf.add_lines. `vf_parents` is the opaque `parent_texts` map the
+    // Python add_lines threads back so the implementation can avoid
+    // re-fetching.
+    let vf_bound = vf.bind(py);
+    let vf_parents = PyDict::new(py);
+    let keys: Vec<Key> = rs.iter().map(|r| r.key.clone()).collect();
+    let reconstructed = mpvf.get_line_list(&keys);
+    for (r, lines) in rs.iter().zip(reconstructed.into_iter()) {
+        let left_matching_blocks_obj: Py<PyAny> = if r.parents.len() == 1 {
+            let parent_len = mpvf
+                .get_diff(&r.parents[0])
+                .map(bazaar::multiparent::MultiParent::num_lines)
+                .unwrap_or(0);
+            let blocks = r.mp.get_matching_blocks(0, parent_len);
+            PyList::new(py, blocks.iter().map(|t| PyTuple::new(py, [t.0, t.1, t.2]).unwrap()))?
+                .into_any()
+                .unbind()
+        } else {
+            py.None()
+        };
+
+        let py_key = r.key.clone().into_pyobject(py)?;
+        let py_parents = PyList::empty(py);
+        for p in &r.parents {
+            py_parents.append(p.clone().into_pyobject(py)?)?;
+        }
+        let py_lines = PyList::empty(py);
+        for l in &lines {
+            py_lines.append(PyBytes::new(py, l))?;
+        }
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("left_matching_blocks", left_matching_blocks_obj)?;
+        let result = vf_bound
+            .call_method(
+                "add_lines",
+                (py_key, py_parents, py_lines, vf_parents.clone()),
+                Some(&kwargs),
+            )?
+            .cast_into::<PyTuple>()?;
+        let version_sha1: Vec<u8> = result.get_item(0)?.extract()?;
+        if version_sha1 != r.expected_sha1 {
+            // Python passes the *version* (key) here, mirroring the
+            // historical message.
+            let version_repr = format!("{:?}", r.key);
+            return Err(VersionedFileInvalidChecksum::new_err(version_repr));
+        }
+        let version_text = result.get_item(2)?;
+        let key_py = r.key.clone().into_pyobject(py)?;
+        vf_parents.set_item(key_py, version_text)?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "versionedfile")?;
     m.add_class::<AbstractContentFactory>()?;
@@ -1070,5 +1213,6 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(check_lines_not_unicode, &m)?)?;
     m.add_function(wrap_pyfunction!(check_lines_are_lines, &m)?)?;
     m.add_function(wrap_pyfunction!(known_graph_ancestry_map, &m)?)?;
+    m.add_function(wrap_pyfunction!(add_mpdiffs, &m)?)?;
     Ok(m)
 }

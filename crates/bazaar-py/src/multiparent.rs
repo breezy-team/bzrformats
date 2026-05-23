@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 /// Convert the Python hunks list into Rust hunks, borrowing the bytes out of
 /// `NewText.lines` and reading integer fields off `ParentText` instances.
-fn py_hunks_to_rust(hunks: &Bound<PyList>) -> PyResult<MultiParent> {
+pub(crate) fn py_hunks_to_rust(hunks: &Bound<PyList>) -> PyResult<MultiParent> {
     let mut out = Vec::with_capacity(hunks.len());
     for hunk in hunks.iter() {
         if let Ok(lines_attr) = hunk.getattr("lines") {
