@@ -1319,8 +1319,7 @@ class DirState:
             that is, if the underlying block has had the entry removed, thus
             shrinking in length.
         """
-        last_reference = self._rs.make_absent(current_old[0])
-        return last_reference
+        return self._rs.make_absent(current_old)
 
     def update_minimal(
         self,
