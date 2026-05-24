@@ -133,34 +133,6 @@ struct BTreeLeafParser {
 }
 
 impl BTreeLeafParser {
-    /// Extract a key of `key_length` segments starting from `pos` within `line`.
-    /// Returns the key tuple and the new position.
-    fn extract_key<'py>(
-        &self,
-        py: Python<'py>,
-        line: &[u8],
-        mut pos: usize,
-    ) -> PyResult<(Bound<'py, PyTuple>, usize)> {
-        let mut parts: Vec<Bound<'py, PyBytes>> = Vec::with_capacity(self.key_length);
-        for i in 0..self.key_length {
-            if let Some(nul_offset) = line[pos..].iter().position(|&b| b == 0) {
-                parts.push(PyBytes::new(py, &line[pos..pos + nul_offset]));
-                pos = pos + nul_offset + 1;
-            } else if i + 1 == self.key_length {
-                // Last segment: capture to end
-                parts.push(PyBytes::new(py, &line[pos..]));
-                pos = line.len();
-            } else {
-                return Err(PyAssertionError::new_err(format!(
-                    "invalid key, wanted segment from {:?}",
-                    &line[pos..]
-                )));
-            }
-        }
-        let key = PyTuple::new(py, parts.iter().map(|b| b.as_any()))?;
-        Ok((key, pos))
-    }
-
     /// Process a single line of leaf node data. Returns true if there is more to process.
     fn process_line<'py>(
         &self,
@@ -184,53 +156,35 @@ impl BTreeLeafParser {
             }
         }
 
-        let (key, pos) = self.extract_key(py, line, 0)?;
+        // Delegate the per-line splitting (key segments / refs / value)
+        // to the pure crate; this wrapper only marshals the resulting
+        // bytes into the Python tuple shape the parser exposes.
+        let (key_segments, value_bytes, ref_lists) =
+            bazaar::btree_index::parse_leaf_line(line, self.key_length, self.ref_list_length)
+                .map_err(|_| PyAssertionError::new_err("Failed to parse leaf line"))?;
 
-        // Find the last \0 to separate references from value
-        let rest = &line[pos..];
-        let last_nul = rest.iter().rposition(|&b| b == 0);
-        let last_nul = match last_nul {
-            Some(idx) => idx,
-            None => {
-                return Err(PyAssertionError::new_err("Failed to find the value area"));
-            }
-        };
-        let value = PyBytes::new(py, &rest[last_nul + 1..]);
-        let refs_area = &rest[..last_nul];
+        let key_parts: Vec<Bound<PyBytes>> =
+            key_segments.iter().map(|s| PyBytes::new(py, s)).collect();
+        let key = PyTuple::new(py, key_parts.iter().map(|b| b.as_any()))?;
+        let value = PyBytes::new(py, &value_bytes);
 
-        let node_value: Bound<PyTuple>;
-        if self.ref_list_length > 0 {
-            let mut ref_lists: Vec<Bound<PyTuple>> = Vec::with_capacity(self.ref_list_length);
-            let ref_sections: Vec<&[u8]> = refs_area.split(|&b| b == b'\t').collect();
-            for ref_section in ref_sections.iter().take(self.ref_list_length) {
-                let mut ref_list: Vec<Bound<PyTuple>> = Vec::new();
-                if !ref_section.is_empty() {
-                    for ref_bytes in ref_section.split(|&b| b == b'\r') {
-                        if ref_bytes.is_empty() {
-                            continue;
-                        }
-                        // Parse a reference key: segments separated by \0
-                        let ref_parts: Vec<Bound<PyBytes>> = ref_bytes
-                            .split(|&b| b == 0)
-                            .map(|s| PyBytes::new(py, s))
-                            .collect();
-                        let ref_key = PyTuple::new(py, ref_parts.iter().map(|b| b.as_any()))?;
-                        ref_list.push(ref_key);
-                    }
+        let node_value: Bound<PyTuple> = if self.ref_list_length > 0 {
+            let mut ref_list_tuples: Vec<Bound<PyTuple>> = Vec::with_capacity(ref_lists.len());
+            for ref_list in &ref_lists {
+                let mut refs: Vec<Bound<PyTuple>> = Vec::with_capacity(ref_list.len());
+                for ref_key in ref_list {
+                    let parts: Vec<Bound<PyBytes>> =
+                        ref_key.iter().map(|s| PyBytes::new(py, s)).collect();
+                    refs.push(PyTuple::new(py, parts.iter().map(|b| b.as_any()))?);
                 }
-                ref_lists.push(PyTuple::new(py, ref_list.iter().map(|t| t.as_any()))?);
+                ref_list_tuples.push(PyTuple::new(py, refs.iter().map(|t| t.as_any()))?);
             }
-            let ref_lists_tuple = PyTuple::new(py, ref_lists.iter().map(|t| t.as_any()))?;
-            node_value = PyTuple::new(py, &[value.as_any(), ref_lists_tuple.as_any()])?;
+            let ref_lists_tuple = PyTuple::new(py, ref_list_tuples.iter().map(|t| t.as_any()))?;
+            PyTuple::new(py, &[value.as_any(), ref_lists_tuple.as_any()])?
         } else {
-            if !refs_area.is_empty() {
-                return Err(PyAssertionError::new_err(
-                    "unexpected reference data present",
-                ));
-            }
             let empty = PyTuple::empty(py);
-            node_value = PyTuple::new(py, &[value.as_any(), empty.as_any()])?;
-        }
+            PyTuple::new(py, &[value.as_any(), empty.as_any()])?
+        };
 
         let entry = PyTuple::new(py, &[key.as_any(), node_value.as_any()])?;
         self.keys.bind(py).append(entry)?;
