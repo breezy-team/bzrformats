@@ -545,6 +545,72 @@ fn extract_references(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<IndexKey>>> {
     Ok(out)
 }
 
+/// Deferred iterator over index entries. Holds a closure that runs the
+/// eager Rust work on first `__next__`, so the call site of `iter_*`
+/// does not raise (matching the historical Python generator semantics
+/// where errors fire when the caller iterates, not when it asks for
+/// the iterator).
+#[pyclass(module = "bzrformats._bzr_rs.index", unsendable)]
+struct DeferredEntryIter {
+    state: std::cell::RefCell<DeferredEntryIterState>,
+}
+
+type DeferredEntryProducer = Box<dyn FnOnce(Python<'_>) -> PyResult<Bound<'_, PyList>>>;
+
+enum DeferredEntryIterState {
+    Pending(DeferredEntryProducer),
+    Ready { items: Vec<Py<PyAny>>, pos: usize },
+}
+
+impl DeferredEntryIter {
+    fn new<F>(producer: F) -> Self
+    where
+        F: FnOnce(Python<'_>) -> PyResult<Bound<'_, PyList>> + 'static,
+    {
+        Self {
+            state: std::cell::RefCell::new(DeferredEntryIterState::Pending(Box::new(producer))),
+        }
+    }
+}
+
+#[pymethods]
+impl DeferredEntryIter {
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let mut state = self.state.borrow_mut();
+        if let DeferredEntryIterState::Pending(_) = &*state {
+            let producer = match std::mem::replace(
+                &mut *state,
+                DeferredEntryIterState::Ready {
+                    items: Vec::new(),
+                    pos: 0,
+                },
+            ) {
+                DeferredEntryIterState::Pending(p) => p,
+                _ => unreachable!(),
+            };
+            let list = producer(py)?;
+            let items: Vec<Py<PyAny>> = list.iter().map(|item| item.unbind()).collect();
+            *state = DeferredEntryIterState::Ready { items, pos: 0 };
+        }
+        match &mut *state {
+            DeferredEntryIterState::Ready { items, pos } => {
+                if *pos >= items.len() {
+                    Ok(None)
+                } else {
+                    let item = items[*pos].clone_ref(py);
+                    *pos += 1;
+                    Ok(Some(item))
+                }
+            }
+            DeferredEntryIterState::Pending(_) => unreachable!(),
+        }
+    }
+}
+
 /// Helper: turn a list of `IndexEntry` into a Python list of tuples
 /// `(self, key, value[, refs])`.
 fn entries_to_pylist<'py>(
@@ -744,75 +810,73 @@ impl PyGraphIndexBuilder {
         Ok(())
     }
 
-    fn iter_all_entries<'py>(
-        slf: Bound<'py, Self>,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let (entries, has_refs) = {
-            let r = slf.borrow();
-            let g = r.inner.lock().unwrap();
-            (
-                g.iter_all_entries().collect::<Vec<_>>(),
-                g.reference_lists() > 0,
-            )
-        };
-        entries_to_pylist(py, slf.into_any(), &entries, has_refs)
+    fn iter_all_entries(slf: Py<Self>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| {
+            let slf_b = slf.bind(py).clone();
+            let (entries, has_refs) = {
+                let r = slf_b.borrow();
+                let g = r.inner.lock().unwrap();
+                (
+                    g.iter_all_entries().collect::<Vec<_>>(),
+                    g.reference_lists() > 0,
+                )
+            };
+            entries_to_pylist(py, slf_b.into_any(), &entries, has_refs)
+        })
     }
 
-    fn iter_entries<'py>(
-        slf: Bound<'py, Self>,
-        py: Python<'py>,
-        keys: Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        // Mirror the lenience of the historical Python implementation:
-        // if a caller hands us something that doesn't shape like a key
-        // (e.g. flat bytes instead of a tuple of bytes), skip it rather
-        // than raising — those values can never be present in the
-        // tuple-keyed index, so the result for them is "no match".
-        let mut requested: Vec<IndexKey> = Vec::new();
-        for k in keys.try_iter()? {
-            if let Ok(key) = extract_key(&k?) {
-                requested.push(key);
+    fn iter_entries(slf: Py<Self>, keys: Py<PyAny>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| {
+            // Mirror the lenience of the historical Python implementation:
+            // if a caller hands us something that doesn't shape like a key
+            // (e.g. flat bytes instead of a tuple of bytes), skip it rather
+            // than raising — those values can never be present in the
+            // tuple-keyed index, so the result for them is "no match".
+            let mut requested: Vec<IndexKey> = Vec::new();
+            for k in keys.bind(py).try_iter()? {
+                if let Ok(key) = extract_key(&k?) {
+                    requested.push(key);
+                }
             }
-        }
-        let (entries, has_refs) = {
-            let r = slf.borrow();
-            let g = r.inner.lock().unwrap();
-            (
-                g.iter_entries(requested).collect::<Vec<_>>(),
-                g.reference_lists() > 0,
-            )
-        };
-        entries_to_pylist(py, slf.into_any(), &entries, has_refs)
+            let slf_b = slf.bind(py).clone();
+            let (entries, has_refs) = {
+                let r = slf_b.borrow();
+                let g = r.inner.lock().unwrap();
+                (
+                    g.iter_entries(requested).collect::<Vec<_>>(),
+                    g.reference_lists() > 0,
+                )
+            };
+            entries_to_pylist(py, slf_b.into_any(), &entries, has_refs)
+        })
     }
 
-    fn iter_entries_prefix<'py>(
-        slf: Bound<'py, Self>,
-        py: Python<'py>,
-        keys: Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let mut prefixes: Vec<KeyPrefix> = Vec::new();
-        for k in keys.try_iter()? {
-            prefixes.push(extract_prefix(&k?)?);
-        }
-        if prefixes.is_empty() {
-            return Ok(PyList::empty(py));
-        }
-        let (entries, has_refs) = {
-            let r = slf.borrow();
-            let g = r.inner.lock().unwrap();
-            let entries = g.iter_entries_prefix(&prefixes).map_err(|e| match e {
-                IndexError::BadKey(k) => Python::attach(|py| {
-                    let py_key = key_to_py(py, &k)
-                        .map(|t| t.unbind().into_any())
-                        .unwrap_or_else(|_| py.None());
-                    BadIndexKey::new_err((py_key,))
-                }),
-                other => index_err_to_py(other),
-            })?;
-            (entries, g.reference_lists() > 0)
-        };
-        entries_to_pylist(py, slf.into_any(), &entries, has_refs)
+    fn iter_entries_prefix(slf: Py<Self>, keys: Py<PyAny>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| {
+            let mut prefixes: Vec<KeyPrefix> = Vec::new();
+            for k in keys.bind(py).try_iter()? {
+                prefixes.push(extract_prefix(&k?)?);
+            }
+            if prefixes.is_empty() {
+                return Ok(PyList::empty(py));
+            }
+            let slf_b = slf.bind(py).clone();
+            let (entries, has_refs) = {
+                let r = slf_b.borrow();
+                let g = r.inner.lock().unwrap();
+                let entries = g.iter_entries_prefix(&prefixes).map_err(|e| match e {
+                    IndexError::BadKey(k) => Python::attach(|py| {
+                        let py_key = key_to_py(py, &k)
+                            .map(|t| t.unbind().into_any())
+                            .unwrap_or_else(|_| py.None());
+                        BadIndexKey::new_err((py_key,))
+                    }),
+                    other => index_err_to_py(other),
+                })?;
+                (entries, g.reference_lists() > 0)
+            };
+            entries_to_pylist(py, slf_b.into_any(), &entries, has_refs)
+        })
     }
 
     fn find_ancestry<'py>(
@@ -895,9 +959,9 @@ impl PyGraphIndexBuilder {
 }
 
 /// pyo3-exposed in-memory index. Subclasses `GraphIndexBuilder` with
-/// `add_nodes`, `__lt__`, and an alternative `validate` (which is a
-/// no-op for in-memory data).
-#[pyclass(name = "InMemoryGraphIndex", extends = PyGraphIndexBuilder, subclass)]
+/// `add_nodes` and an identity-keyed `__lt__` used when sorting a
+/// mixed list of in-memory and on-disk indices.
+#[pyclass(name = "InMemoryGraphIndex", extends = PyGraphIndexBuilder, subclass, dict)]
 struct PyInMemoryGraphIndex;
 
 #[pymethods]
@@ -916,6 +980,24 @@ impl PyInMemoryGraphIndex {
                 combine_backing_indices_py: std::sync::Mutex::new(None),
             },
         )
+    }
+
+    fn __lt__(slf: Bound<'_, Self>, other: Bound<'_, PyAny>) -> PyResult<bool> {
+        // Mirrors the historical Python wrapper: only orderable against
+        // a GraphIndex or another InMemoryGraphIndex, and uses
+        // hash(self) < hash(other) (identity-based) as the tie-breaker.
+        let is_graph_index = other.is_instance_of::<PyGraphIndex>();
+        let is_in_memory = other.is_instance_of::<PyInMemoryGraphIndex>();
+        if !is_graph_index && !is_in_memory {
+            return Err(PyTypeError::new_err(other.unbind()));
+        }
+        Ok(slf.into_any().hash()? < other.hash()?)
+    }
+
+    /// Restore identity-based hashability that pyo3 strips when
+    /// `__lt__` is defined. Matches Python's default `object.__hash__`.
+    fn __hash__(slf: Bound<'_, Self>) -> isize {
+        slf.as_ptr() as isize
     }
 
     /// `add_nodes` accepts an iterable of either 2- or 3-tuples
@@ -1136,231 +1218,20 @@ impl PyCombinedGraphIndex {
         }
     }
 
-    fn iter_all_entries<'py>(
-        slf: Bound<'py, Self>,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let r = slf.borrow();
-        let out = PyList::empty(py);
-        let seen = pyo3::types::PySet::empty(py)?;
-        loop {
-            let snapshot: Vec<Py<PyAny>> = {
-                let list = r.indices_list.bind(py);
-                list.iter().map(|i| i.unbind()).collect()
-            };
-            let mut err: Option<PyErr> = None;
-            'outer: for idx in &snapshot {
-                let entries = match idx.bind(py).call_method0("iter_all_entries") {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if is_no_such_file(py, &e) {
-                            err = Some(e);
-                            break 'outer;
-                        }
-                        return Err(e);
-                    }
-                };
-                let iter = match entries.try_iter() {
-                    Ok(it) => it,
-                    Err(e) => {
-                        if is_no_such_file(py, &e) {
-                            err = Some(e);
-                            break 'outer;
-                        }
-                        return Err(e);
-                    }
-                };
-                for entry_res in iter {
-                    let entry = match entry_res {
-                        Ok(e) => e,
-                        Err(e) => {
-                            if is_no_such_file(py, &e) {
-                                err = Some(e);
-                                break 'outer;
-                            }
-                            return Err(e);
-                        }
-                    };
-                    let key = entry.get_item(1)?;
-                    if !seen.contains(key.clone())? {
-                        seen.add(key)?;
-                        out.append(entry)?;
-                    }
-                }
-            }
-            match err {
-                None => return Ok(out),
-                Some(e) => {
-                    if !r.try_reload(py)? {
-                        return Err(e);
-                    }
-                }
-            }
-        }
+    fn iter_all_entries(slf: Py<Self>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| Self::_iter_all_entries_eager(slf.bind(py).clone(), py))
     }
 
-    fn iter_entries<'py>(
-        slf: Bound<'py, Self>,
-        py: Python<'py>,
-        keys: Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let working_keys = pyo3::types::PySet::empty(py)?;
-        for k in keys.try_iter()? {
-            working_keys.add(k?)?;
-        }
-        let r = slf.borrow();
-        let out = PyList::empty(py);
-        let mut hit_indices: Vec<Py<PyAny>> = Vec::new();
-        loop {
-            let snapshot: Vec<Py<PyAny>> = {
-                let list = r.indices_list.bind(py);
-                list.iter().map(|i| i.unbind()).collect()
-            };
-            let mut err: Option<PyErr> = None;
-            'outer: for idx in &snapshot {
-                if working_keys.is_empty() {
-                    break;
-                }
-                let entries = match idx
-                    .bind(py)
-                    .call_method1("iter_entries", (working_keys.clone(),))
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if is_no_such_file(py, &e) {
-                            err = Some(e);
-                            break 'outer;
-                        }
-                        return Err(e);
-                    }
-                };
-                let iter = match entries.try_iter() {
-                    Ok(it) => it,
-                    Err(e) => {
-                        if is_no_such_file(py, &e) {
-                            err = Some(e);
-                            break 'outer;
-                        }
-                        return Err(e);
-                    }
-                };
-                let mut index_hit = false;
-                for entry_res in iter {
-                    let entry = match entry_res {
-                        Ok(e) => e,
-                        Err(e) => {
-                            if is_no_such_file(py, &e) {
-                                err = Some(e);
-                                break 'outer;
-                            }
-                            return Err(e);
-                        }
-                    };
-                    let key = entry.get_item(1)?;
-                    working_keys.discard(key)?;
-                    out.append(entry)?;
-                    index_hit = true;
-                }
-                if index_hit {
-                    hit_indices.push(idx.clone_ref(py));
-                }
-            }
-            match err {
-                None => {
-                    r.move_to_front(py, &hit_indices)?;
-                    return Ok(out);
-                }
-                Some(e) => {
-                    if !r.try_reload(py)? {
-                        return Err(e);
-                    }
-                }
-            }
-        }
+    fn iter_entries(slf: Py<Self>, keys: Py<PyAny>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| {
+            Self::_iter_entries_eager(slf.bind(py).clone(), py, keys.bind(py).clone())
+        })
     }
 
-    fn iter_entries_prefix<'py>(
-        slf: Bound<'py, Self>,
-        py: Python<'py>,
-        keys: Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let key_set = pyo3::types::PySet::empty(py)?;
-        for k in keys.try_iter()? {
-            key_set.add(k?)?;
-        }
-        if key_set.is_empty() {
-            return Ok(PyList::empty(py));
-        }
-        let r = slf.borrow();
-        let out = PyList::empty(py);
-        let seen = pyo3::types::PySet::empty(py)?;
-        let mut hit_indices: Vec<Py<PyAny>> = Vec::new();
-        loop {
-            let snapshot: Vec<Py<PyAny>> = {
-                let list = r.indices_list.bind(py);
-                list.iter().map(|i| i.unbind()).collect()
-            };
-            let mut err: Option<PyErr> = None;
-            'outer: for idx in &snapshot {
-                let entries = match idx
-                    .bind(py)
-                    .call_method1("iter_entries_prefix", (key_set.clone(),))
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if is_no_such_file(py, &e) {
-                            err = Some(e);
-                            break 'outer;
-                        }
-                        return Err(e);
-                    }
-                };
-                let iter = match entries.try_iter() {
-                    Ok(it) => it,
-                    Err(e) => {
-                        if is_no_such_file(py, &e) {
-                            err = Some(e);
-                            break 'outer;
-                        }
-                        return Err(e);
-                    }
-                };
-                let mut index_hit = false;
-                for entry_res in iter {
-                    let entry = match entry_res {
-                        Ok(e) => e,
-                        Err(e) => {
-                            if is_no_such_file(py, &e) {
-                                err = Some(e);
-                                break 'outer;
-                            }
-                            return Err(e);
-                        }
-                    };
-                    let key = entry.get_item(1)?;
-                    if seen.contains(key.clone())? {
-                        continue;
-                    }
-                    seen.add(key)?;
-                    out.append(entry)?;
-                    index_hit = true;
-                }
-                if index_hit {
-                    hit_indices.push(idx.clone_ref(py));
-                }
-            }
-            match err {
-                None => {
-                    r.move_to_front(py, &hit_indices)?;
-                    return Ok(out);
-                }
-                Some(e) => {
-                    if !r.try_reload(py)? {
-                        return Err(e);
-                    }
-                }
-            }
-        }
+    fn iter_entries_prefix(slf: Py<Self>, keys: Py<PyAny>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| {
+            Self::_iter_entries_prefix_eager(slf.bind(py).clone(), py, keys.bind(py).clone())
+        })
     }
 
     fn validate(&self, py: Python<'_>) -> PyResult<()> {
@@ -1495,7 +1366,7 @@ impl PyCombinedGraphIndex {
             search_keys.discard(null_revision.clone())?;
             found_parents.set_item(null_revision.clone(), PyList::empty(py))?;
         }
-        let entries = Self::iter_entries(slf, py, search_keys.into_any())?;
+        let entries = Self::_iter_entries_eager(slf, py, search_keys.into_any())?;
         for entry in entries.iter() {
             let key = entry.get_item(1)?;
             let refs = entry.get_item(3)?;
@@ -1522,6 +1393,239 @@ impl PyCombinedGraphIndex {
 }
 
 impl PyCombinedGraphIndex {
+    /// Eager body of `iter_all_entries`; the public method wraps this
+    /// in a [`DeferredEntryIter`] so the call site itself does not
+    /// raise. Walks each backing index in turn, deduplicating by key,
+    /// and retries via `reload_func` on `NoSuchFile`.
+    fn _iter_all_entries_eager<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let r = slf.borrow();
+        let out = PyList::empty(py);
+        let seen = pyo3::types::PySet::empty(py)?;
+        loop {
+            let snapshot: Vec<Py<PyAny>> = {
+                let list = r.indices_list.bind(py);
+                list.iter().map(|i| i.unbind()).collect()
+            };
+            let mut err: Option<PyErr> = None;
+            'outer: for idx in &snapshot {
+                let entries = match idx.bind(py).call_method0("iter_all_entries") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if is_no_such_file(py, &e) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                let iter = match entries.try_iter() {
+                    Ok(it) => it,
+                    Err(e) => {
+                        if is_no_such_file(py, &e) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                for entry_res in iter {
+                    let entry = match entry_res {
+                        Ok(e) => e,
+                        Err(e) => {
+                            if is_no_such_file(py, &e) {
+                                err = Some(e);
+                                break 'outer;
+                            }
+                            return Err(e);
+                        }
+                    };
+                    let key = entry.get_item(1)?;
+                    if !seen.contains(key.clone())? {
+                        seen.add(key)?;
+                        out.append(entry)?;
+                    }
+                }
+            }
+            match err {
+                None => return Ok(out),
+                Some(e) => {
+                    if !r.try_reload(py)? {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Eager body of `iter_entries`.
+    fn _iter_entries_eager<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let working_keys = pyo3::types::PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            working_keys.add(k?)?;
+        }
+        let r = slf.borrow();
+        let out = PyList::empty(py);
+        let mut hit_indices: Vec<Py<PyAny>> = Vec::new();
+        loop {
+            let snapshot: Vec<Py<PyAny>> = {
+                let list = r.indices_list.bind(py);
+                list.iter().map(|i| i.unbind()).collect()
+            };
+            let mut err: Option<PyErr> = None;
+            'outer: for idx in &snapshot {
+                if working_keys.is_empty() {
+                    break;
+                }
+                let entries = match idx
+                    .bind(py)
+                    .call_method1("iter_entries", (working_keys.clone(),))
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if is_no_such_file(py, &e) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                let iter = match entries.try_iter() {
+                    Ok(it) => it,
+                    Err(e) => {
+                        if is_no_such_file(py, &e) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                let mut index_hit = false;
+                for entry_res in iter {
+                    let entry = match entry_res {
+                        Ok(e) => e,
+                        Err(e) => {
+                            if is_no_such_file(py, &e) {
+                                err = Some(e);
+                                break 'outer;
+                            }
+                            return Err(e);
+                        }
+                    };
+                    let key = entry.get_item(1)?;
+                    working_keys.discard(key)?;
+                    out.append(entry)?;
+                    index_hit = true;
+                }
+                if index_hit {
+                    hit_indices.push(idx.clone_ref(py));
+                }
+            }
+            match err {
+                None => {
+                    r.move_to_front(py, &hit_indices)?;
+                    return Ok(out);
+                }
+                Some(e) => {
+                    if !r.try_reload(py)? {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Eager body of `iter_entries_prefix`.
+    fn _iter_entries_prefix_eager<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let key_set = pyo3::types::PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            key_set.add(k?)?;
+        }
+        if key_set.is_empty() {
+            return Ok(PyList::empty(py));
+        }
+        let r = slf.borrow();
+        let out = PyList::empty(py);
+        let seen = pyo3::types::PySet::empty(py)?;
+        let mut hit_indices: Vec<Py<PyAny>> = Vec::new();
+        loop {
+            let snapshot: Vec<Py<PyAny>> = {
+                let list = r.indices_list.bind(py);
+                list.iter().map(|i| i.unbind()).collect()
+            };
+            let mut err: Option<PyErr> = None;
+            'outer: for idx in &snapshot {
+                let entries = match idx
+                    .bind(py)
+                    .call_method1("iter_entries_prefix", (key_set.clone(),))
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if is_no_such_file(py, &e) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                let iter = match entries.try_iter() {
+                    Ok(it) => it,
+                    Err(e) => {
+                        if is_no_such_file(py, &e) {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        return Err(e);
+                    }
+                };
+                let mut index_hit = false;
+                for entry_res in iter {
+                    let entry = match entry_res {
+                        Ok(e) => e,
+                        Err(e) => {
+                            if is_no_such_file(py, &e) {
+                                err = Some(e);
+                                break 'outer;
+                            }
+                            return Err(e);
+                        }
+                    };
+                    let key = entry.get_item(1)?;
+                    if seen.contains(key.clone())? {
+                        continue;
+                    }
+                    seen.add(key)?;
+                    out.append(entry)?;
+                    index_hit = true;
+                }
+                if index_hit {
+                    hit_indices.push(idx.clone_ref(py));
+                }
+            }
+            match err {
+                None => {
+                    r.move_to_front(py, &hit_indices)?;
+                    return Ok(out);
+                }
+                Some(e) => {
+                    if !r.try_reload(py)? {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     fn try_reload(&self, py: Python<'_>) -> PyResult<bool> {
         let func_clone = {
             let guard = self.reload_func.lock().unwrap();
@@ -1711,7 +1815,38 @@ impl PyGraphIndexPrefixAdapter {
         Ok(())
     }
 
-    fn iter_all_entries<'py>(
+    fn iter_all_entries(slf: Py<Self>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| Self::_iter_all_entries_eager(slf.bind(py).clone(), py))
+    }
+
+    fn iter_entries(slf: Py<Self>, keys: Py<PyAny>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| {
+            Self::_iter_entries_eager(slf.bind(py).clone(), py, keys.bind(py).clone())
+        })
+    }
+
+    fn iter_entries_prefix(slf: Py<Self>, keys: Py<PyAny>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| {
+            Self::_iter_entries_prefix_eager(slf.bind(py).clone(), py, keys.bind(py).clone())
+        })
+    }
+
+    fn key_count(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<usize> {
+        let entries = Self::_iter_all_entries_eager(slf, py)?;
+        Ok(entries.len())
+    }
+
+    fn validate(&self, py: Python<'_>) -> PyResult<()> {
+        self.adapted.bind(py).call_method0("validate")?;
+        Ok(())
+    }
+}
+
+impl PyGraphIndexPrefixAdapter {
+    /// Eager body of `iter_all_entries`. Queries the adapted index for
+    /// its `prefix_query`, then strips the prefix back off each
+    /// resulting key.
+    fn _iter_all_entries_eager<'py>(
         slf: Bound<'py, Self>,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyList>> {
@@ -1724,7 +1859,8 @@ impl PyGraphIndexPrefixAdapter {
         py_strip_prefix_entries(py, entries, inner.prefix.bind(py).clone(), slf.into_any())
     }
 
-    fn iter_entries<'py>(
+    /// Eager body of `iter_entries`.
+    fn _iter_entries_eager<'py>(
         slf: Bound<'py, Self>,
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
@@ -1752,7 +1888,8 @@ impl PyGraphIndexPrefixAdapter {
         py_strip_prefix_entries(py, entries, prefix, slf.into_any())
     }
 
-    fn iter_entries_prefix<'py>(
+    /// Eager body of `iter_entries_prefix`.
+    fn _iter_entries_prefix_eager<'py>(
         slf: Bound<'py, Self>,
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
@@ -1779,21 +1916,8 @@ impl PyGraphIndexPrefixAdapter {
             .call_method1("iter_entries_prefix", (extended,))?;
         py_strip_prefix_entries(py, entries, prefix, slf.into_any())
     }
-
-    fn key_count(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<usize> {
-        let entries = Self::iter_all_entries(slf, py)?;
-        Ok(entries.len())
-    }
-
-    fn validate(&self, py: Python<'_>) -> PyResult<()> {
-        self.adapted.bind(py).call_method0("validate")?;
-        Ok(())
-    }
 }
 
-/// Build the per-entry tuple matching Python's `iter_all_entries`
-/// shape — kept here for the GraphIndex iter_* methods that already
-/// exist below.
 #[pymethods]
 impl PyGraphIndex {
     #[new]
@@ -1888,166 +2012,27 @@ impl PyGraphIndex {
 
     /// Yield `(self, key, value)` or `(self, key, value, refs)` tuples
     /// matching the Python `GraphIndex.iter_all_entries` shape.
-    fn iter_all_entries<'py>(
-        slf: Bound<'py, Self>,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let (entries, node_ref_lists) = {
-            let r = slf.borrow();
-            let mut g = r.inner.lock().unwrap();
-            let entries = g.iter_all_entries().map_err(reraise_pending_pyerr_or)?;
-            let nrl = g.node_ref_lists().map_err(reraise_pending_pyerr_or)?;
-            (entries, nrl)
-        };
-        emit_entries(py, &slf, &entries, node_ref_lists)
+    fn iter_all_entries(slf: Py<Self>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| Self::_iter_all_entries_eager(slf.bind(py).clone(), py))
     }
 
     /// Same as `iter_all_entries` but restricted to `keys`. When the
     /// index size is known and the key set is small relative to the
     /// total key count, this dispatches through bisection. Otherwise it
     /// promotes to `buffer_all`.
-    fn iter_entries<'py>(
-        slf: Bound<'py, Self>,
-        py: Python<'py>,
-        keys: Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        // Materialise the input keys but defer bytes-extraction until
-        // after we've decided whether to buffer the whole file. The
-        // Python contract is: file-not-found errors should surface
-        // before key-type errors.
-        let key_objs: Vec<Bound<'py, PyAny>> = keys.try_iter()?.collect::<PyResult<Vec<_>>>()?;
-        if key_objs.is_empty() {
-            return Ok(PyList::empty(py));
-        }
-        // Decide whether to buffer the whole file or use bisection.
-        let need_buffer_all = {
-            let r = slf.borrow();
-            let mut g = r.inner.lock().unwrap();
-            match g.size() {
-                None => true,
-                Some(_) => {
-                    if g.is_buffered_already() {
-                        true
-                    } else {
-                        // Read just the header so we know the key count.
-                        if g.key_count_or_zero() == 0 {
-                            g.ensure_header_parsed().map_err(reraise_pending_pyerr_or)?;
-                        }
-                        // After buffer_all may have been triggered by the
-                        // 50%-bytes heuristic.
-                        if g.is_buffered_already() {
-                            true
-                        } else {
-                            key_objs.len() * 20 > g.key_count_or_zero()
-                        }
-                    }
-                }
-            }
-        };
-        // I/O succeeded; now extract keys. Non-bytes elements are
-        // silently dropped — they cannot match any actual key in the
-        // index, which matches the duck-typed lookup the Python
-        // version did via plain dict containment.
-        let mut requested: Vec<IndexKey> = Vec::new();
-        let mut seen: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
-        for key_obj in &key_objs {
-            let Ok(k) = extract_key(key_obj) else {
-                continue;
-            };
-            if seen.insert(k.clone()) {
-                requested.push(k);
-            }
-        }
-        if requested.is_empty() {
-            return Ok(PyList::empty(py));
-        }
-        if need_buffer_all {
-            let (entries, node_ref_lists) = {
-                let r = slf.borrow();
-                let mut g = r.inner.lock().unwrap();
-                let entries = g
-                    .iter_entries(&requested)
-                    .map_err(reraise_pending_pyerr_or)?;
-                let nrl = g.node_ref_lists().map_err(reraise_pending_pyerr_or)?;
-                (entries, nrl)
-            };
-            return emit_entries(py, &slf, &entries, node_ref_lists);
-        }
-        // Bisection path: use bisect_multi via Python.
-        let bisect_multi = py.import("bzrformats.bisect_multi")?;
-        let bisect_fn = bisect_multi.getattr("bisect_multi_bytes")?;
-        let probe = slf.getattr("_lookup_keys_via_location")?;
-        let size_obj = slf.borrow().size.unwrap_or(0).into_pyobject(py)?;
-        let keys_set = pyo3::types::PySet::new(
-            py,
-            requested
-                .iter()
-                .map(|k| key_to_py(py, k))
-                .collect::<PyResult<Vec<_>>>()?,
-        )?;
-        let bisect_result = bisect_fn.call1((probe, size_obj, keys_set))?;
-        let out = PyList::empty(py);
-        for item in bisect_result.try_iter()? {
-            let item = item?;
-            let tup = item
-                .cast_into::<PyTuple>()
-                .map_err(|_| PyTypeError::new_err("bisect_multi yielded non-tuple item"))?;
-            let inner_result = tup.get_item(1)?;
-            if inner_result.is_truthy()? {
-                out.append(inner_result)?;
-            }
-        }
-        Ok(out)
+    fn iter_entries(slf: Py<Self>, keys: Py<PyAny>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| {
+            Self::_iter_entries_eager(slf.bind(py).clone(), py, keys.bind(py).clone())
+        })
     }
 
     /// Same shape as `iter_entries`, but matches by prefix. Always
     /// triggers a full load (`buffer_all`); the pure-Rust prefix
     /// matcher only operates on the post-`buffer_all` node table.
-    fn iter_entries_prefix<'py>(
-        slf: Bound<'py, Self>,
-        py: Python<'py>,
-        keys: Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        // Materialise the keys list once; we may iterate twice.
-        let keys_list = pyo3::types::PyList::empty(py);
-        for k in keys.try_iter()? {
-            keys_list.append(k?)?;
-        }
-        if keys_list.is_empty() {
-            return Ok(PyList::empty(py));
-        }
-        let (key_length, has_refs) = {
-            let r = slf.borrow();
-            let mut g = r.inner.lock().unwrap();
-            g.buffer_all().map_err(reraise_pending_pyerr_or)?;
-            let kl = g.key_length().map_err(reraise_pending_pyerr_or)?;
-            let nrl = g.node_ref_lists().map_err(reraise_pending_pyerr_or)?;
-            (kl, nrl > 0)
-        };
-        let nodes_dict = slf.getattr("_nodes")?;
-        let nodes = nodes_dict
-            .cast_into::<pyo3::types::PyDict>()
-            .map_err(|_| PyTypeError::new_err("_nodes is not a dict"))?;
-        let mode = if has_refs {
-            "reader-refs"
-        } else {
-            "reader-norefs"
-        };
-        let entries = py_iter_entries_prefix(py, nodes, keys_list.into_any(), key_length, mode)?;
-        // Prepend (self,) to each entry tuple.
-        let out = PyList::empty(py);
-        let self_any: Bound<PyAny> = slf.clone().into_any();
-        for entry in entries.iter() {
-            let tup = entry
-                .cast_into::<PyTuple>()
-                .map_err(|_| PyTypeError::new_err("entry must be a tuple"))?;
-            let mut items: Vec<Bound<PyAny>> = vec![self_any.clone()];
-            for it in tup.iter() {
-                items.push(it.into_any());
-            }
-            out.append(PyTuple::new(py, items)?)?;
-        }
-        Ok(out)
+    fn iter_entries_prefix(slf: Py<Self>, keys: Py<PyAny>) -> DeferredEntryIter {
+        DeferredEntryIter::new(move |py| {
+            Self::_iter_entries_prefix_eager(slf.bind(py).clone(), py, keys.bind(py).clone())
+        })
     }
 
     /// Set of keys referenced by `ref_list_num` that aren't present in
@@ -2438,17 +2423,98 @@ impl PyGraphIndex {
     }
 }
 
+impl PyGraphIndex {
+    /// Eager body of `iter_all_entries`; the public method wraps this
+    /// in a [`DeferredEntryIter`] so the call site itself does not
+    /// raise.
+    fn _iter_all_entries_eager<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let (entries, node_ref_lists) = {
+            let r = slf.borrow();
+            let mut g = r.inner.lock().unwrap();
+            let entries = g.iter_all_entries().map_err(reraise_pending_pyerr_or)?;
+            let nrl = g.node_ref_lists().map_err(reraise_pending_pyerr_or)?;
+            (entries, nrl)
+        };
+        emit_entries(py, slf.into_any(), &entries, node_ref_lists)
+    }
+
+    /// Eager body of `iter_entries`. Translates the requested keys
+    /// from Python and dispatches to [`RsGraphIndex::iter_entries`],
+    /// which handles the buffer-vs-bisect strategy choice internally.
+    fn _iter_entries_eager<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        // Mirror the lenience of the historical Python implementation:
+        // non-bytes elements can never be present in the tuple-keyed
+        // index, so skip them rather than raising.
+        let mut requested: Vec<IndexKey> = Vec::new();
+        for key_obj in keys.try_iter()? {
+            if let Ok(k) = extract_key(&key_obj?) {
+                requested.push(k);
+            }
+        }
+        let (entries, node_ref_lists) = {
+            let r = slf.borrow();
+            let mut g = r.inner.lock().unwrap();
+            let entries = g
+                .iter_entries(&requested)
+                .map_err(reraise_pending_pyerr_or)?;
+            let nrl = g.node_ref_lists().map_err(reraise_pending_pyerr_or)?;
+            (entries, nrl)
+        };
+        emit_entries(py, slf.into_any(), &entries, node_ref_lists)
+    }
+
+    /// Eager body of `iter_entries_prefix`. Translates the requested
+    /// prefixes from Python and dispatches to
+    /// [`RsGraphIndex::iter_entries_prefix`], then builds the
+    /// `(self, key, value[, refs])` tuples Python expects.
+    fn _iter_entries_prefix_eager<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let mut prefixes: Vec<KeyPrefix> = Vec::new();
+        for k in keys.try_iter()? {
+            prefixes.push(extract_prefix(&k?)?);
+        }
+        if prefixes.is_empty() {
+            return Ok(PyList::empty(py));
+        }
+        let (entries, node_ref_lists) = {
+            let r = slf.borrow();
+            let mut g = r.inner.lock().unwrap();
+            let entries = g.iter_entries_prefix(&prefixes).map_err(|e| match e {
+                IndexError::BadKey(k) => Python::attach(|py| {
+                    let py_key = key_to_py(py, &k)
+                        .map(|t| t.unbind().into_any())
+                        .unwrap_or_else(|_| py.None());
+                    BadIndexKey::new_err((py_key,))
+                }),
+                other => reraise_pending_pyerr_or(other),
+            })?;
+            let nrl = g.node_ref_lists().map_err(reraise_pending_pyerr_or)?;
+            (entries, nrl)
+        };
+        emit_entries(py, slf.into_any(), &entries, node_ref_lists)
+    }
+}
+
 /// Build the per-entry tuple matching Python's `iter_all_entries`
 /// shape: `(self, key, value)` for zero-ref-list indexes, or
 /// `(self, key, value, refs)` otherwise.
 fn emit_entries<'py>(
     py: Python<'py>,
-    slf: &Bound<'py, PyGraphIndex>,
+    self_any: Bound<'py, PyAny>,
     entries: &[IndexEntry],
     node_ref_lists: usize,
 ) -> PyResult<Bound<'py, PyList>> {
     let out = PyList::empty(py);
-    let self_any: Bound<PyAny> = slf.clone().into_any();
     for (key, value, refs) in entries {
         let key_t = key_to_py(py, key)?;
         let value_b = PyBytes::new(py, value);
