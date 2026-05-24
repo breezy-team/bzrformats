@@ -297,12 +297,11 @@ impl bazaar::groupcompress::gcvf::GcIndex for PyGcIndex {
             // expects.
             let nodes = PyList::empty(py);
             for (key, memo, parents) in records {
-                let value = format!(
-                    "{} {} {} {}",
+                let value = bazaar::groupcompress::manager::format_gc_node_value(
                     memo.read_memo.start,
                     memo.read_memo.byte_length(),
                     memo.entry_start,
-                    memo.entry_end
+                    memo.entry_end,
                 );
                 let refs = match parents {
                     Some(ps) => {
@@ -321,7 +320,7 @@ impl bazaar::groupcompress::gcvf::GcIndex for PyGcIndex {
                                     .into_pyobject(py)
                                     .map_err(|e| gc_err_from_py(py, e))?
                                     .into_any(),
-                                PyBytes::new(py, value.as_bytes()).into_any(),
+                                PyBytes::new(py, &value).into_any(),
                                 refs.into_any(),
                             ],
                         )
@@ -3756,7 +3755,12 @@ impl GroupCompressVersionedFiles {
                     let end: u64 = record.getattr("_end")?.extract()?;
                     let value = PyBytes::new(
                         py,
-                        format!("{} {} {} {}", block_start, block_length, start, end).as_bytes(),
+                        &bazaar::groupcompress::manager::format_gc_node_value(
+                            block_start,
+                            block_length,
+                            start,
+                            end,
+                        ),
                     );
                     let parents = record.getattr("parents")?;
                     let node = PyTuple::new(
