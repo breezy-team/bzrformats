@@ -692,7 +692,7 @@ class DirState:
             self._id_index.fill_from_state(self._rs)
 
     def _empty_parent_info(self):
-        return [DirState.NULL_PARENT_DETAILS] * (len(self._parents) - len(self._ghosts))
+        return [DirState.NULL_PARENT_DETAILS] * self._rs.num_present_parents()
 
     def _ensure_block(self, parent_block_index, parent_row_index, dirname):
         """Ensure a block for dirname exists."""
