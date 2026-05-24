@@ -1242,6 +1242,138 @@ fn add_mpdiffs_singular(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>
     Ok(())
 }
 
+/// Drive `VersionedFile.make_mpdiffs(version_ids)` (the singular flavour) in Rust.
+///
+/// Mirrors the legacy `VersionedFile.make_mpdiffs` body. Records carry bytes
+/// `version_id`s rather than key tuples. The Python callbacks invoked are
+/// `vf.get_parent_map` (called twice — once for inputs+ghost-filter) and
+/// `vf._get_lf_split_line_list` (once, in bulk). The per-record diff
+/// computation runs in pure Rust through `MultiParent::from_lines`.
+#[pyfunction]
+fn make_mpdiffs_singular<'py>(
+    py: Python<'py>,
+    vf: Py<PyAny>,
+    version_ids: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    use bazaar::multiparent::MultiParent;
+
+    let vf_bound = vf.bind(py);
+    let mut requested: Vec<Vec<u8>> = Vec::new();
+    for v in version_ids.try_iter()? {
+        requested.push(v?.cast_into::<PyBytes>()?.as_bytes().to_vec());
+    }
+
+    // First pass: collect all keys we'll need (inputs + their parents).
+    let initial_py = PyList::empty(py);
+    for v in &requested {
+        initial_py.append(PyBytes::new(py, v))?;
+    }
+    let parent_map_py = vf_bound
+        .call_method1("get_parent_map", (initial_py,))?
+        .cast_into::<PyDict>()?;
+
+    // Build a Rust-side {version_id -> parent_ids} dict and detect missing inputs.
+    let mut parent_map: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+        std::collections::HashMap::new();
+    for (k, vparents) in parent_map_py.iter() {
+        let key = k.cast_into::<PyBytes>()?.as_bytes().to_vec();
+        let parents: Vec<Vec<u8>> = if vparents.is_none() {
+            vec![]
+        } else {
+            let mut out = Vec::new();
+            for p in vparents.try_iter()? {
+                out.push(p?.cast_into::<PyBytes>()?.as_bytes().to_vec());
+            }
+            out
+        };
+        parent_map.insert(key, parents);
+    }
+    for v in &requested {
+        if !parent_map.contains_key(v) {
+            let errors = PyModule::import(py, "bzrformats.errors")?;
+            let exc = errors
+                .getattr("RevisionNotPresent")?
+                .call1((PyBytes::new(py, v), vf_bound.clone()))?;
+            return Err(PyErr::from_value(exc));
+        }
+    }
+
+    // Second pass: get_parent_map(all_keys_including_parents) so we can
+    // distinguish present parents from ghosts.
+    let mut all_keys: std::collections::HashSet<Vec<u8>> = requested.iter().cloned().collect();
+    for parents in parent_map.values() {
+        for p in parents {
+            all_keys.insert(p.clone());
+        }
+    }
+    let all_keys_py = PyList::empty(py);
+    for v in &all_keys {
+        all_keys_py.append(PyBytes::new(py, v))?;
+    }
+    let present_map = vf_bound
+        .call_method1("get_parent_map", (all_keys_py,))?
+        .cast_into::<PyDict>()?;
+    let mut present: Vec<Vec<u8>> = Vec::new();
+    for k in present_map.keys() {
+        present.push(k.cast_into::<PyBytes>()?.as_bytes().to_vec());
+    }
+    let present_set: std::collections::HashSet<Vec<u8>> = present.iter().cloned().collect();
+
+    // Bulk-fetch all present keys' lines.
+    let present_py = PyList::empty(py);
+    for v in &present {
+        present_py.append(PyBytes::new(py, v))?;
+    }
+    let lines_lists = vf_bound.call_method1("_get_lf_split_line_list", (present_py,))?;
+    let lines_vec: Vec<Vec<Vec<u8>>> = lines_lists.extract()?;
+    let lines: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+        present.iter().cloned().zip(lines_vec.into_iter()).collect();
+
+    // Now build each diff in pure Rust.
+    let module = PyModule::import(py, "bzrformats.multiparent")?;
+    let mp_cls = module.getattr("MultiParent")?;
+    let new_text_cls = module.getattr("NewText")?;
+    let parent_text_cls = module.getattr("ParentText")?;
+    let out = PyList::empty(py);
+    for version_id in &requested {
+        let target = lines.get(version_id).ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!("missing lines for {:?}", version_id))
+        })?;
+        let parent_lines: Vec<Vec<Vec<u8>>> = parent_map[version_id]
+            .iter()
+            .filter(|p| present_set.contains(*p))
+            .map(|p| lines[p].clone())
+            .collect();
+        let parent_refs: Vec<&[Vec<u8>]> = parent_lines.iter().map(Vec::as_slice).collect();
+        let diff = MultiParent::from_lines(target, &parent_refs, None);
+
+        // Materialise into bzrformats.multiparent.MultiParent.
+        let hunks = PyList::empty(py);
+        for hunk in diff.hunks {
+            match hunk {
+                bazaar::multiparent::Hunk::NewText(lines) => {
+                    let py_lines: Vec<Bound<PyBytes>> =
+                        lines.iter().map(|l| PyBytes::new(py, l)).collect();
+                    let lines_list = PyList::new(py, py_lines)?;
+                    hunks.append(new_text_cls.call1((lines_list,))?)?;
+                }
+                bazaar::multiparent::Hunk::ParentText {
+                    parent,
+                    parent_pos,
+                    child_pos,
+                    num_lines,
+                } => {
+                    hunks.append(
+                        parent_text_cls.call1((parent, parent_pos, child_pos, num_lines))?,
+                    )?;
+                }
+            }
+        }
+        out.append(mp_cls.call1((hunks,))?)?;
+    }
+    Ok(out)
+}
+
 /// Drive `_MPDiffGenerator.compute_diffs(vf, keys)` in Rust.
 ///
 /// The pure-crate helper [`bazaar::versionedfile::make_mpdiffs`] owns the
@@ -1324,5 +1456,6 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(make_mpdiffs, &m)?)?;
     m.add_function(wrap_pyfunction!(add_mpdiffs, &m)?)?;
     m.add_function(wrap_pyfunction!(add_mpdiffs_singular, &m)?)?;
+    m.add_function(wrap_pyfunction!(make_mpdiffs_singular, &m)?)?;
     Ok(m)
 }

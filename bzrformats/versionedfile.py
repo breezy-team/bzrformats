@@ -452,34 +452,14 @@ class VersionedFile:
         raise NotImplementedError(self.get_format_signature)
 
     def make_mpdiffs(self, version_ids):
-        """Create multiparent diffs for specified versions."""
-        # version_ids is a list of strings, not keys, so the tuple-keyed
-        # _MPDiffGenerator doesn't fit. The shape is also simpler than the
-        # plural variant: load every needed text up front, then build one
-        # MultiParent per input.
-        knit_versions = set()
-        knit_versions.update(version_ids)
-        parent_map = self.get_parent_map(version_ids)
-        for version_id in version_ids:
-            try:
-                knit_versions.update(parent_map[version_id])
-            except KeyError as e:
-                raise RevisionNotPresent(version_id, self) from e
-        # We need to filter out ghosts, because we can't diff against them.
-        knit_versions = set(self.get_parent_map(knit_versions))
-        lines = dict(
-            zip(
-                knit_versions, self._get_lf_split_line_list(knit_versions), strict=False
-            )
-        )
-        diffs = []
-        for version_id in version_ids:
-            target = lines[version_id]
-            parents = [
-                lines[p] for p in parent_map[version_id] if p in knit_versions
-            ]
-            diffs.append(multiparent.MultiParent.from_lines(target, parents))
-        return diffs
+        """Create multiparent diffs for specified versions.
+
+        Drives the parent-map / ghost-filter / bulk-fetch / per-record
+        ``MultiParent.from_lines`` loop in Rust; the only Python callbacks
+        it invokes are ``self.get_parent_map`` (twice) and
+        ``self._get_lf_split_line_list`` (once, in bulk).
+        """
+        return list(_versionedfile_rs.make_mpdiffs_singular(self, list(version_ids)))
 
     def add_mpdiffs(self, records):
         """Add mpdiffs to this VersionedFile.
