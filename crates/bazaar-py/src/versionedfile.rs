@@ -1071,6 +1071,177 @@ fn add_mpdiffs(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>) -> PyRe
     Ok(())
 }
 
+/// Drive `VersionedFile.add_mpdiffs(records)` (the singular flavour) in Rust.
+///
+/// Mirrors the legacy `VersionedFile.add_mpdiffs` body. Records carry bytes
+/// `version_id`s rather than key tuples, the parent fetch goes through
+/// `_get_lf_split_line_list` instead of `get_record_stream`, ghosts fall back
+/// from `add_lines_with_ghosts` to `add_lines` on `NotImplementedError`, and
+/// sha1 verification is post-hoc via `get_sha1s`.
+///
+/// The pure-crate helpers `add_mpdiffs_build` and `add_mpdiffs_prepare`
+/// still do the mpvf assembly, needed-parent discovery, reconstruction, and
+/// left-matching-blocks computation; we just wrap each `version_id` as a
+/// single-element `Key` so the same algorithm applies.
+#[pyfunction]
+fn add_mpdiffs_singular(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>) -> PyResult<()> {
+    use bazaar::versionedfile::{add_mpdiffs_build, add_mpdiffs_prepare, MpdiffRecord};
+
+    // Wrap a bytes version_id as a Key::Fixed([version_id]).
+    fn wrap(version_id: Vec<u8>) -> Key {
+        Key::Fixed(vec![version_id])
+    }
+    // Unwrap a single-element Key back into its bytes.
+    fn unwrap(key: &Key) -> &[u8] {
+        key.segments()
+            .first()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    let mut rs: Vec<MpdiffRecord> = Vec::new();
+    let mut version_ids: Vec<Vec<u8>> = Vec::new();
+    for item in records.try_iter()? {
+        let tup = item?.cast_into::<PyTuple>()?;
+        let version_id: Vec<u8> = tup.get_item(0)?.cast_into::<PyBytes>()?.as_bytes().to_vec();
+        let parents_obj = tup.get_item(1)?;
+        let mut parents: Vec<Key> = Vec::new();
+        for p in parents_obj.try_iter()? {
+            parents.push(wrap(p?.cast_into::<PyBytes>()?.as_bytes().to_vec()));
+        }
+        let expected_sha1: Vec<u8> = tup.get_item(2)?.extract()?;
+        let mp_obj = tup.get_item(3)?;
+        let hunks = mp_obj.getattr("hunks")?.cast_into::<PyList>()?;
+        let diff = crate::multiparent::py_hunks_to_rust(&hunks)?;
+        version_ids.push(version_id.clone());
+        rs.push(MpdiffRecord {
+            key: wrap(version_id),
+            parents,
+            expected_sha1,
+            diff,
+        });
+    }
+
+    let (mut mpvf, needed) = add_mpdiffs_build(&rs);
+
+    if !needed.is_empty() {
+        // Filter ghosts via vf.get_parent_map(needed), then fetch the
+        // present parents' lines via _get_lf_split_line_list.
+        let needed_bytes: Vec<&[u8]> = needed.iter().map(|k| unwrap(k)).collect();
+        let needed_py = PyList::empty(py);
+        for b in &needed_bytes {
+            needed_py.append(PyBytes::new(py, b))?;
+        }
+        let parent_map = vf
+            .bind(py)
+            .call_method1("get_parent_map", (needed_py,))?
+            .cast_into::<PyDict>()?;
+        let mut present: Vec<Vec<u8>> = Vec::new();
+        for k in parent_map.keys() {
+            present.push(k.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        if !present.is_empty() {
+            let present_py = PyList::empty(py);
+            for b in &present {
+                present_py.append(PyBytes::new(py, b))?;
+            }
+            let lines_lists = vf
+                .bind(py)
+                .call_method1("_get_lf_split_line_list", (present_py,))?;
+            let lines_vec: Vec<Vec<Vec<u8>>> = lines_lists.extract()?;
+            for (vid, lines) in present.iter().zip(lines_vec.into_iter()) {
+                mpvf.add_version(lines, wrap(vid.clone()), vec![], None, false);
+            }
+        }
+    }
+
+    let prepared = add_mpdiffs_prepare(&mut mpvf, &rs);
+
+    // Dispatch each prepared row through Python. Try add_lines_with_ghosts
+    // first, fall back to add_lines on NotImplementedError so non-ghost-aware
+    // backends still work (and fail naturally if data actually has ghosts).
+    let vf_bound = vf.bind(py);
+    let vf_parents = PyDict::new(py);
+    for row in &prepared {
+        let left_matching_blocks_obj: Py<PyAny> = match &row.left_matching_blocks {
+            Some(blocks) => PyList::new(
+                py,
+                blocks
+                    .iter()
+                    .map(|t| PyTuple::new(py, [t.0, t.1, t.2]).unwrap()),
+            )?
+            .into_any()
+            .unbind(),
+            None => py.None(),
+        };
+
+        let py_version_id = PyBytes::new(py, unwrap(&row.key));
+        let py_parents = PyList::empty(py);
+        for p in &row.parents {
+            py_parents.append(PyBytes::new(py, unwrap(p)))?;
+        }
+        let py_lines = PyList::empty(py);
+        for l in &row.lines {
+            py_lines.append(PyBytes::new(py, l))?;
+        }
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("left_matching_blocks", left_matching_blocks_obj)?;
+        let result = match vf_bound.call_method(
+            "add_lines_with_ghosts",
+            (
+                py_version_id.clone(),
+                py_parents.clone(),
+                py_lines.clone(),
+                vf_parents.clone(),
+            ),
+            Some(&kwargs),
+        ) {
+            Ok(r) => r,
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py) => vf_bound
+                .call_method(
+                "add_lines",
+                (
+                    py_version_id.clone(),
+                    py_parents,
+                    py_lines,
+                    vf_parents.clone(),
+                ),
+                Some(&kwargs),
+            )?,
+            Err(e) => return Err(e),
+        };
+        let result_tuple = result.cast_into::<PyTuple>()?;
+        let version_text = result_tuple.get_item(2)?;
+        vf_parents.set_item(py_version_id, version_text)?;
+    }
+
+    // Post-hoc sha1 check via vf.get_sha1s(versions).
+    let versions_py = PyList::empty(py);
+    for vid in &version_ids {
+        versions_py.append(PyBytes::new(py, vid))?;
+    }
+    let sha1s = vf_bound
+        .call_method1("get_sha1s", (versions_py,))?
+        .cast_into::<PyDict>()?;
+    for r in &rs {
+        let vid_bytes = unwrap(&r.key);
+        let actual = sha1s
+            .get_item(PyBytes::new(py, vid_bytes))?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!("missing sha1 for {:?}", vid_bytes))
+            })?
+            .cast_into::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        if actual != r.expected_sha1 {
+            let version_repr = format!("{:?}", vid_bytes);
+            return Err(VersionedFileInvalidChecksum::new_err(version_repr));
+        }
+    }
+
+    Ok(())
+}
+
 /// Drive `_MPDiffGenerator.compute_diffs(vf, keys)` in Rust.
 ///
 /// The pure-crate helper [`bazaar::versionedfile::make_mpdiffs`] owns the
@@ -1152,5 +1323,6 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(known_graph_ancestry_map, &m)?)?;
     m.add_function(wrap_pyfunction!(make_mpdiffs, &m)?)?;
     m.add_function(wrap_pyfunction!(add_mpdiffs, &m)?)?;
+    m.add_function(wrap_pyfunction!(add_mpdiffs_singular, &m)?)?;
     Ok(m)
 }

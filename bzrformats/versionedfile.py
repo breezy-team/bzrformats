@@ -438,15 +438,11 @@ class VersionedFile:
 
     def _check_lines_not_unicode(self, lines):
         """Check that lines being added to a versioned file are not unicode."""
-        for line in lines:
-            if not isinstance(line, bytes):
-                raise TypeError("lines")
+        _versionedfile_rs.check_lines_not_unicode(lines)
 
     def _check_lines_are_lines(self, lines):
         """Check that the lines really are full lines without inline EOL."""
-        for line in lines:
-            if b"\n" in line[:-1]:
-                raise ValueError("lines contain newlines")
+        _versionedfile_rs.check_lines_are_lines(lines)
 
     def get_format_signature(self):
         """Get a text description of the data encoding in this file.
@@ -491,55 +487,12 @@ class VersionedFile:
         Records should be iterables of version, parents, expected_sha1,
         mpdiff. mpdiff should be a MultiParent instance.
         """
-        # Does this need to call self._check_write_ok()? (IanC 20070919)
-        vf_parents = {}
-        mpvf = multiparent.MultiMemoryVersionedFile()
-        versions = []
-        for version, parent_ids, _expected_sha1, mpdiff in records:
-            versions.append(version)
-            mpvf.add_diff(mpdiff, version, parent_ids)
-        needed_parents = set()
-        for _version, parent_ids, _expected_sha1, _mpdiff in records:
-            needed_parents.update(p for p in parent_ids if not mpvf.has_version(p))
-        present_parents = set(self.get_parent_map(needed_parents))
-        for parent_id, lines in zip(
-            present_parents, self._get_lf_split_line_list(present_parents), strict=False
-        ):
-            mpvf.add_version(lines, parent_id, [])
-        for (version, parent_ids, _expected_sha1, mpdiff), lines in zip(
-            records, mpvf.get_line_list(versions), strict=False
-        ):
-            if len(parent_ids) == 1:
-                left_matching_blocks = list(
-                    mpdiff.get_matching_blocks(
-                        0, mpvf.get_diff(parent_ids[0]).num_lines()
-                    )
-                )
-            else:
-                left_matching_blocks = None
-            try:
-                _, _, version_text = self.add_lines_with_ghosts(
-                    version,
-                    parent_ids,
-                    lines,
-                    vf_parents,
-                    left_matching_blocks=left_matching_blocks,
-                )
-            except NotImplementedError:
-                # The vf can't handle ghosts, so add lines normally, which will
-                # (reasonably) fail if there are ghosts in the data.
-                _, _, version_text = self.add_lines(
-                    version,
-                    parent_ids,
-                    lines,
-                    vf_parents,
-                    left_matching_blocks=left_matching_blocks,
-                )
-            vf_parents[version] = version_text
-        sha1s = self.get_sha1s(versions)
-        for version, _parent_ids, expected_sha1, _mpdiff in records:
-            if expected_sha1 != sha1s[version]:
-                raise VersionedFileInvalidChecksum(version)
+        # Drives the build-mpvf / fetch-parents / reconstruct / add_lines
+        # loop in Rust; the only Python callbacks it invokes are
+        # self.get_parent_map, self._get_lf_split_line_list,
+        # self.add_lines_with_ghosts (with fallback to self.add_lines), and
+        # self.get_sha1s for the post-hoc checksum verification.
+        _versionedfile_rs.add_mpdiffs_singular(self, list(records))
 
     def get_text(self, version_id):
         """Return version contents as a text string.
