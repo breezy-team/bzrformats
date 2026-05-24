@@ -879,32 +879,13 @@ class DirState:
     def _observed_sha1(self, entry, sha1, stat_value):
         """Note the sha1 of a file.
 
-        Thin shim over DirStateRs.observed_sha1.  `stat_value` may be
-        a real os.stat_result or a lightweight stand-in (like
-        breezy.filters.FilteredStat) that only carries st_mode /
-        st_size / st_mtime / st_ctime — fall back to zero for the
-        device/inode fields in that case.
-
-        Callers may pass an unversioned-path entry (``(None, None)``);
-        in that case there is no row to update and we silently do
-        nothing, matching Python ``DirState._observed_sha1``'s no-op
-        behaviour for those paths (its cutoff_time guard skips fresh
-        files before it would dereference ``entry[1][0]``).
+        Thin shim over DirStateRs.observed_sha1, which extracts the
+        key + stat fields, runs the cutoff_time check, and mutates
+        entry[1][0] in place on success. Unversioned-path entries
+        (``(None, None)``) are silently skipped, matching the
+        historical no-op behaviour.
         """
-        if entry[0] is None:
-            return
-        new_tree0 = self._rs.observed_sha1(
-            entry[0],
-            sha1,
-            stat_value.st_mode,
-            stat_value.st_size,
-            stat_value.st_mtime,
-            stat_value.st_ctime,
-            getattr(stat_value, "st_dev", 0),
-            getattr(stat_value, "st_ino", 0),
-        )
-        if new_tree0 is not None:
-            entry[1][0] = new_tree0
+        self._rs.observed_sha1(entry, sha1, stat_value)
 
     def _sha_cutoff_time(self):
         """Return cutoff time.

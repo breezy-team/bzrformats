@@ -1508,24 +1508,44 @@ impl PyDirState {
     /// non-regular file, or uncacheable mtime/ctime).  Mirrors
     /// Python's `DirState._observed_sha1` including the write-back
     /// the Python side used to do with a second `get_entry` call.
-    #[pyo3(signature = (key, sha1, st_mode, st_size, st_mtime, st_ctime, st_dev, st_ino))]
-    fn observed_sha1<'py>(
+    ///
+    /// Accepts the full dirstate entry tuple `(key, tree_states)` and
+    /// the stat-like object; pulls the key, reads `st_mode`/`st_size`/
+    /// `st_mtime`/`st_ctime` (with `getattr(..., 'st_dev', 0)` and
+    /// `'st_ino'` fallbacks to support `breezy.filters.FilteredStat`-
+    /// shaped stand-ins), and on success mutates `entry[1][0]` in place
+    /// with the new tree-0 details. No-op when the entry is the
+    /// `(None, None)` unversioned-path sentinel.
+    fn observed_sha1(
         &mut self,
-        py: Python<'py>,
-        key: &Bound<PyTuple>,
+        py: Python<'_>,
+        entry: &Bound<PyAny>,
         sha1: &[u8],
-        st_mode: u32,
-        st_size: u64,
-        st_mtime: f64,
-        st_ctime: f64,
-        st_dev: u64,
-        st_ino: u64,
-    ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        stat_value: &Bound<PyAny>,
+    ) -> PyResult<()> {
+        let entry_tuple = entry.cast::<PyTuple>()?;
+        if entry_tuple.get_item(0)?.is_none() {
+            return Ok(());
+        }
+        let key = entry_tuple.get_item(0)?.cast_into::<PyTuple>()?;
         let entry_key = bazaar::dirstate::EntryKey {
             dirname: key.get_item(0)?.extract()?,
             basename: key.get_item(1)?.extract()?,
             file_id: key.get_item(2)?.extract()?,
         };
+        let st_mode: u32 = stat_value.getattr("st_mode")?.extract()?;
+        let st_size: u64 = stat_value.getattr("st_size")?.extract()?;
+        let st_mtime: f64 = stat_value.getattr("st_mtime")?.extract()?;
+        let st_ctime: f64 = stat_value.getattr("st_ctime")?.extract()?;
+        // FilteredStat doesn't carry st_dev/st_ino; fall back to 0.
+        let st_dev: u64 = stat_value
+            .getattr("st_dev")
+            .and_then(|v| v.extract())
+            .unwrap_or(0);
+        let st_ino: u64 = stat_value
+            .getattr("st_ino")
+            .and_then(|v| v.extract())
+            .unwrap_or(0);
         let updated = self
             .inner
             .observed_sha1(
@@ -1547,9 +1567,10 @@ impl PyDirState {
                 }
                 other => pyo3::exceptions::PyRuntimeError::new_err(other.to_string()),
             })?;
-        match updated {
-            None => Ok(None),
-            Some(td) => Ok(Some(PyTuple::new(
+        if let Some(td) = updated {
+            // Mutate entry[1][0] in place so the caller's reference
+            // reflects the new tree-0 details.
+            let new_tree0 = PyTuple::new(
                 py,
                 [
                     PyBytes::new(py, &[td.minikind.to_minikind()]).into_any(),
@@ -1560,8 +1581,11 @@ impl PyDirState {
                         .into_any(),
                     PyBytes::new(py, &td.packed_stat).into_any(),
                 ],
-            )?)),
+            )?;
+            let trees = entry_tuple.get_item(1)?;
+            trees.set_item(0, new_tree0)?;
         }
+        Ok(())
     }
 
     /// Refresh the tree-0 slot of the entry at `key` from the
