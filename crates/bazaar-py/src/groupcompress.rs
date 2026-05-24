@@ -2615,6 +2615,23 @@ impl GCGraphIndex {
         }
     }
 
+    /// Public alias for `_key_dependencies`. Mirrors the Python
+    /// `_GCGraphIndex.key_dependencies` property that breezy reads
+    /// directly when materialising missing-parent reports.
+    #[getter]
+    fn key_dependencies(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self._key_dependencies(py)
+    }
+
+    /// Reset the recorded parent references. No-op when the index was
+    /// built without `track_external_parent_refs=True`.
+    fn clear_key_dependencies(&self, py: Python<'_>) -> PyResult<()> {
+        if let Some(kd) = &self.key_dependencies {
+            kd.bind(py).call_method0("clear")?;
+        }
+        Ok(())
+    }
+
     /// Add-records callback exposed for read access. `None` if the index
     /// was constructed without one (i.e. read-only).
     #[getter]
