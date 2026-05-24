@@ -829,9 +829,7 @@ class DirState:
 
     def _check_delta_ids_absent(self, new_ids, tree_index):
         """Check that none of the file_ids in new_ids are present in a tree."""
-        if not new_ids:
-            return
-        self._rs.check_delta_ids_absent(list(new_ids), tree_index)
+        self._rs.check_delta_ids_absent(new_ids, tree_index)
 
     def _update_basis_apply_adds(self, adds):
         """Apply a sequence of adds to tree 1 during update_basis_by_delta.
@@ -876,7 +874,7 @@ class DirState:
             and be a directory.
         :param index: The column in the dirstate to check for parents in.
         """
-        self._rs.after_delta_check_parents(list(parents), index)
+        self._rs.after_delta_check_parents(parents, index)
 
     def _observed_sha1(self, entry, sha1, stat_value):
         """Note the sha1 of a file.
