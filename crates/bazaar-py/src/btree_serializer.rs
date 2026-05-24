@@ -643,24 +643,19 @@ fn _flatten_node<'py>(
         )));
     }
 
-    // Build string_key from node[1] (key tuple joined by \0)
     let key_tuple = node.get_item(1)?;
     let key_tuple: &Bound<PyTuple> = key_tuple
         .cast()
         .map_err(|_| PyTypeError::new_err("Expected a tuple for key"))?;
-    let mut string_key_bytes: Vec<u8> = Vec::new();
+    let mut key: bazaar::btree_builder::Key = Vec::with_capacity(key_tuple.len());
     for i in 0..key_tuple.len() {
-        if i > 0 {
-            string_key_bytes.push(0);
-        }
         let item = key_tuple.get_item(i)?;
         let b: &Bound<PyBytes> = item
             .cast()
             .map_err(|_| PyTypeError::new_err("Expected bytes for key part"))?;
-        string_key_bytes.extend_from_slice(b.as_bytes());
+        key.push(b.as_bytes().to_vec());
     }
 
-    // Get value from node[2]
     let val_obj = node.get_item(2)?;
     let val_bytes: &Bound<PyBytes> = val_obj.cast().map_err(|_| {
         PyTypeError::new_err(format!(
@@ -668,34 +663,24 @@ fn _flatten_node<'py>(
             val_obj.get_type()
         ))
     })?;
-    let value = val_bytes.as_bytes();
+    let value = val_bytes.as_bytes().to_vec();
 
-    // Compute refs bytes
-    let mut refs_bytes: Vec<u8> = Vec::new();
+    let mut references: Vec<Vec<bazaar::btree_builder::Key>> = Vec::new();
     if reference_lists {
         let ref_lists_obj = node.get_item(3)?;
-        let ref_lists_seq: Vec<Bound<'py, PyAny>> =
-            ref_lists_obj.try_iter()?.collect::<PyResult<Vec<_>>>()?;
-        for (rl_idx, ref_list_obj) in ref_lists_seq.iter().enumerate() {
-            if rl_idx > 0 {
-                refs_bytes.push(b'\t');
-            }
-            let ref_list: Vec<Bound<'py, PyAny>> =
-                ref_list_obj.try_iter()?.collect::<PyResult<Vec<_>>>()?;
-            for (ref_idx, reference_obj) in ref_list.iter().enumerate() {
-                if ref_idx > 0 {
-                    refs_bytes.push(b'\r');
-                }
+        for ref_list_obj in ref_lists_obj.try_iter()? {
+            let ref_list_obj = ref_list_obj?;
+            let mut rl: Vec<bazaar::btree_builder::Key> = Vec::new();
+            for reference_obj in ref_list_obj.try_iter()? {
+                let reference_obj = reference_obj?;
                 let reference: &Bound<'py, PyTuple> = reference_obj.cast().map_err(|_| {
                     PyTypeError::new_err(format!(
                         "We expect references to be tuples not: {:?}",
                         reference_obj.get_type()
                     ))
                 })?;
+                let mut r: bazaar::btree_builder::Key = Vec::with_capacity(reference.len());
                 for k in 0..reference.len() {
-                    if k > 0 {
-                        refs_bytes.push(0);
-                    }
                     let ref_bit = reference.get_item(k)?;
                     let ref_bit_bytes: &Bound<'py, PyBytes> = ref_bit.cast().map_err(|_| {
                         PyTypeError::new_err(format!(
@@ -703,22 +688,16 @@ fn _flatten_node<'py>(
                             ref_bit.get_type()
                         ))
                     })?;
-                    refs_bytes.extend_from_slice(ref_bit_bytes.as_bytes());
+                    r.push(ref_bit_bytes.as_bytes().to_vec());
                 }
+                rl.push(r);
             }
+            references.push(rl);
         }
     }
 
-    // Build final line: string_key \0 refs \0 value \n
-    let mut line =
-        Vec::with_capacity(string_key_bytes.len() + 1 + refs_bytes.len() + 1 + value.len() + 1);
-    line.extend_from_slice(&string_key_bytes);
-    line.push(0);
-    line.extend_from_slice(&refs_bytes);
-    line.push(0);
-    line.extend_from_slice(value);
-    line.push(b'\n');
-
+    let (string_key_bytes, line) =
+        bazaar::btree_builder::flatten_node(&key, &value, &references, reference_lists);
     let string_key = PyBytes::new(py, &string_key_bytes);
     let line_bytes = PyBytes::new(py, &line);
     Ok((string_key, line_bytes))
