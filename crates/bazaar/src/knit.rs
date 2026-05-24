@@ -1758,6 +1758,116 @@ pub fn encode_graph_index_record(
     Ok((value, node_refs))
 }
 
+/// One row of input to [`prepare_dedup_records`]: a parsed record from the
+/// caller (Python or otherwise) before it has been encoded for the index.
+#[derive(Debug, Clone)]
+pub struct AddRecordInput {
+    pub key: KnitKey,
+    /// The raw `options` field as a single comma-joined bytes (e.g. `b"fulltext,no-eol"`).
+    pub options: Vec<u8>,
+    pub pos: u64,
+    pub size: u64,
+    pub parents: Vec<KnitKey>,
+}
+
+/// One row of [`prepare_dedup_records`] output: the encoded wire form
+/// ready to compare against the index. Pre-entries are deduplicated by
+/// key (last write wins) so the comparison loop sees each key once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedAddRecord {
+    pub key: KnitKey,
+    pub value: Vec<u8>,
+    pub node_refs: Vec<Vec<KnitKey>>,
+}
+
+/// One pre-existing index entry as reported by the caller (typically
+/// extracted from `_KnitGraphIndex.iter_entries`).
+#[derive(Debug, Clone)]
+pub struct ExistingAddRecord {
+    pub key: KnitKey,
+    pub value: Vec<u8>,
+    /// The graph parents (`refs[0]`) — already extracted from the
+    /// reference tuples, with empty list for parentless indices.
+    pub parents: Vec<KnitKey>,
+}
+
+/// Phase 1 of `_KnitGraphIndex.add_records`: encode every input record
+/// to its wire form, deduplicating by key.
+///
+/// `inputs` may contain duplicate keys; later occurrences overwrite earlier
+/// ones (matching the Python loop). The returned `PreparedAddRecord` list
+/// is in insertion order with at most one entry per key.
+pub fn prepare_dedup_records(
+    inputs: &[AddRecordInput],
+    has_parents: bool,
+    has_deltas: bool,
+) -> Result<Vec<PreparedAddRecord>, KnitError> {
+    let mut out: Vec<PreparedAddRecord> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let noeol = input.options.windows(b"no-eol".len()).any(|w| w == b"no-eol");
+        let method = if input
+            .options
+            .windows(b"line-delta".len())
+            .any(|w| w == b"line-delta")
+        {
+            KnitMethod::LineDelta
+        } else {
+            KnitMethod::Fulltext
+        };
+        let (value, node_refs) = encode_graph_index_record(
+            noeol,
+            input.pos,
+            input.size,
+            method,
+            has_parents,
+            has_deltas,
+            &input.parents,
+        )?;
+        if let Some(existing) = out.iter_mut().find(|p| p.key == input.key) {
+            existing.value = value;
+            existing.node_refs = node_refs;
+        } else {
+            out.push(PreparedAddRecord {
+                key: input.key.clone(),
+                value,
+                node_refs,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Phase 2 of `_KnitGraphIndex.add_records`: compare prepared records
+/// against the index's existing entries.
+///
+/// For every existing key that matches a prepared record, the wire-form
+/// flag byte and the graph parents must match — otherwise the record is
+/// considered an inconsistent re-add and [`KnitError::Corrupt`] is
+/// returned. Matching keys are recorded for the caller to subtract from
+/// the dispatch set, since the index already has them.
+pub fn verify_dedup_records(
+    prepared: &[PreparedAddRecord],
+    existing: &[ExistingAddRecord],
+) -> Result<std::collections::HashSet<KnitKey>, KnitError> {
+    let mut to_remove: std::collections::HashSet<KnitKey> = std::collections::HashSet::new();
+    for ex in existing {
+        let Some(new) = prepared.iter().find(|p| p.key == ex.key) else {
+            continue;
+        };
+        let existing_flag = ex.value.first().copied().unwrap_or(b' ');
+        let new_flag = new.value.first().copied().unwrap_or(b' ');
+        let new_parents: &[KnitKey] = new.node_refs.first().map(|v| v.as_slice()).unwrap_or(&[]);
+        if existing_flag != new_flag || ex.parents.as_slice() != new_parents {
+            return Err(KnitError::Corrupt(format!(
+                "inconsistent details in add_records: existing flag={:?} new flag={:?}",
+                existing_flag as char, new_flag as char,
+            )));
+        }
+        to_remove.insert(ex.key.clone());
+    }
+    Ok(to_remove)
+}
+
 /// Parsed contents of a knit graph index `value` field.
 ///
 /// `value` has the shape `<flag><pos> <size>` where `<flag>` is one byte
@@ -8593,5 +8703,95 @@ mod tests {
             out,
             KnitAdapterOutput::Text(KnitTextResult::Bytes(b"X\na\nb\n".to_vec()))
         );
+    }
+
+    fn knit_key(s: &str) -> KnitKey {
+        vec![s.as_bytes().to_vec()]
+    }
+
+    #[test]
+    fn prepare_dedup_records_keeps_last_per_key() {
+        let inputs = vec![
+            AddRecordInput {
+                key: knit_key("a"),
+                options: b"fulltext".to_vec(),
+                pos: 0,
+                size: 10,
+                parents: vec![],
+            },
+            AddRecordInput {
+                key: knit_key("a"),
+                options: b"line-delta".to_vec(),
+                pos: 10,
+                size: 5,
+                parents: vec![knit_key("p")],
+            },
+        ];
+        let prepared = prepare_dedup_records(&inputs, true, true).unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].key, knit_key("a"));
+        // Last write wins: pos=10 size=5.
+        assert_eq!(prepared[0].value, b" 10 5");
+    }
+
+    #[test]
+    fn prepare_dedup_records_detects_no_eol() {
+        let inputs = vec![AddRecordInput {
+            key: knit_key("a"),
+            options: b"fulltext,no-eol".to_vec(),
+            pos: 0,
+            size: 7,
+            parents: vec![],
+        }];
+        let prepared = prepare_dedup_records(&inputs, true, false).unwrap();
+        assert_eq!(prepared[0].value, b"N0 7");
+    }
+
+    #[test]
+    fn verify_dedup_records_passes_consistent_entries() {
+        let prepared = vec![PreparedAddRecord {
+            key: knit_key("a"),
+            value: b" 0 10".to_vec(),
+            node_refs: vec![vec![knit_key("p")]],
+        }];
+        let existing = vec![ExistingAddRecord {
+            key: knit_key("a"),
+            value: b" 0 10".to_vec(),
+            parents: vec![knit_key("p")],
+        }];
+        let to_remove = verify_dedup_records(&prepared, &existing).unwrap();
+        assert!(to_remove.contains(&knit_key("a")));
+    }
+
+    #[test]
+    fn verify_dedup_records_rejects_mismatched_flag() {
+        let prepared = vec![PreparedAddRecord {
+            key: knit_key("a"),
+            value: b"N0 10".to_vec(),
+            node_refs: vec![vec![]],
+        }];
+        let existing = vec![ExistingAddRecord {
+            key: knit_key("a"),
+            value: b" 0 10".to_vec(),
+            parents: vec![],
+        }];
+        let err = verify_dedup_records(&prepared, &existing).unwrap_err();
+        assert!(matches!(err, KnitError::Corrupt(_)));
+    }
+
+    #[test]
+    fn verify_dedup_records_rejects_mismatched_parents() {
+        let prepared = vec![PreparedAddRecord {
+            key: knit_key("a"),
+            value: b" 0 10".to_vec(),
+            node_refs: vec![vec![knit_key("p")]],
+        }];
+        let existing = vec![ExistingAddRecord {
+            key: knit_key("a"),
+            value: b" 0 10".to_vec(),
+            parents: vec![knit_key("q")],
+        }];
+        let err = verify_dedup_records(&prepared, &existing).unwrap_err();
+        assert!(matches!(err, KnitError::Corrupt(_)));
     }
 }

@@ -107,18 +107,13 @@ fn read_memo_tuple<'py>(
 
 /// Map a Python error to a `KnitError` for the pure-crate trait calls.
 ///
-/// `RevisionNotPresent` keeps its identity; anything else is folded into
-/// `Corrupt` carrying the message.
+/// Convert a Python exception raised by the GC adapter callbacks into a
+/// [`KnitError`]. `RevisionNotPresent` keeps its identity; anything else
+/// is stashed via [`crate::knit::knit_err_from_py`] so the original
+/// exception (e.g. `ObjectNotLocked`) is re-raised verbatim at the
+/// pyo3 boundary.
 fn gc_err_from_py(py: Python<'_>, err: PyErr) -> bazaar::knit::KnitError {
-    if err
-        .get_type(py)
-        .name()
-        .map(|n| n == "RevisionNotPresent")
-        .unwrap_or(false)
-    {
-        return bazaar::knit::KnitError::RevisionNotPresent(vec![]);
-    }
-    bazaar::knit::KnitError::Corrupt(err.to_string())
+    crate::knit::knit_err_from_py(py, err)
 }
 
 /// Rebuild the Python `(index, start, stop)` read-memo tuple from a typed
@@ -2663,10 +2658,15 @@ impl GCGraphIndex {
     }
 
     fn _check_write_ok(&self, py: Python<'_>) -> PyResult<()> {
+        // Match the Python order in `_GCGraphIndex._check_write_ok` (which
+        // just delegates to `_is_locked()`): missing lock is more specific
+        // than read-only. Without this, an unlocked read-only repo raises
+        // ReadOnlyError instead of ObjectNotLocked.
+        self._check_read(py)?;
         if self.add_callback.is_none() {
             return Err(ReadOnlyError::new_err(py.None()));
         }
-        self._check_read(py)
+        Ok(())
     }
 
     fn keys(&self, py: Python<'_>) -> PyResult<Py<PyList>> {

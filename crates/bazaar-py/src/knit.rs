@@ -148,10 +148,16 @@ pub(crate) fn knit_err_to_py(err: KnitError) -> PyErr {
         | KnitError::BadKnitHeader { .. }
         | KnitError::KndxCorrupt { .. }
         | KnitError::Corrupt(_) => KnitCorrupt::new_err(("", err.to_string())),
-        // Retry should be handled by the read pipeline's retry loop and
-        // Aborted by the access layer's final-error stash; if either
-        // reaches here, surface it rather than swallowing it.
-        KnitError::Retry(_) | KnitError::Aborted(_) => PyRuntimeError::new_err(err.to_string()),
+        // Retry should be handled by the read pipeline's retry loop. An
+        // Aborted error may carry a thread-local-stashed PyErr (set by
+        // knit_err_from_py for unknown Python exception classes); restore
+        // it so callers see ObjectNotLocked / ReadOnlyError / etc. as the
+        // original Python exception rather than a generic Corrupt.
+        KnitError::Retry(_) => PyRuntimeError::new_err(err.to_string()),
+        KnitError::Aborted(_) => match take_stashed_py_err() {
+            Some(stashed) => stashed,
+            None => PyRuntimeError::new_err(err.to_string()),
+        },
         KnitError::ExistingContent(_) | KnitError::BadSha1 { .. } => {
             KnitCorrupt::new_err(("", err.to_string()))
         }
@@ -1271,6 +1277,21 @@ fn file_identity_rank(
         .unwrap_or(usize::MAX)
 }
 
+thread_local! {
+    /// Stash for a Python exception that crossed into Rust through
+    /// [`knit_err_from_py`] but did not match a known [`KnitError`] variant.
+    /// [`knit_err_to_py`] checks the stash so the original `PyErr` (e.g.
+    /// `ObjectNotLocked`) is re-raised verbatim rather than being remapped
+    /// to `KnitCorrupt`.
+    static STASHED_PY_ERR: std::cell::RefCell<Option<PyErr>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Pop the stashed Python error (if any). Called by [`knit_err_to_py`]
+/// after it sees the [`KnitError::Aborted`] sentinel.
+fn take_stashed_py_err() -> Option<PyErr> {
+    STASHED_PY_ERR.with(|cell| cell.borrow_mut().take())
+}
+
 pub(crate) fn knit_err_from_py(py: Python<'_>, err: PyErr) -> KnitError {
     if err.is_instance_of::<PyNotImplementedError>(py) {
         return KnitError::NotImplemented("operation not implemented by Python index");
@@ -1290,7 +1311,12 @@ pub(crate) fn knit_err_from_py(py: Python<'_>, err: PyErr) -> KnitError {
         }
         return KnitError::RevisionNotPresent(vec![]);
     }
-    KnitError::BadIndexValue(err.to_string().into_bytes())
+    // Preserve any other Python exception (ObjectNotLocked, ReadOnlyError,
+    // ...) by stashing it on a thread-local and returning the Aborted
+    // sentinel; knit_err_to_py will re-raise it verbatim.
+    let summary = err.to_string();
+    STASHED_PY_ERR.with(|cell| *cell.borrow_mut() = Some(err));
+    KnitError::Aborted(summary)
 }
 
 fn extract_knit_key(obj: &Bound<'_, PyAny>) -> Result<KnitKey, KnitError> {
@@ -3904,56 +3930,48 @@ impl bazaar::knit::AddCallback for PyAddCallback {
         has_parents: bool,
     ) -> Result<(), bazaar::knit::KnitError> {
         Python::attach(|py| {
-            let result = pyo3::types::PyList::empty(py);
-            if has_parents {
-                for (key, value, node_refs) in entries {
-                    let py_key = py_knit_key_to_py(py, key)
-                        .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
-                    let py_value = PyBytes::new(py, value);
-                    let py_refs = PyTuple::new(
-                        py,
-                        node_refs
-                            .iter()
-                            .map(|rl| {
-                                PyTuple::new(
-                                    py,
-                                    rl.iter()
-                                        .map(|k| py_knit_key_to_py(py, k))
-                                        .collect::<PyResult<Vec<_>>>()?,
-                                )
-                            })
-                            .collect::<PyResult<Vec<_>>>()
-                            .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?,
-                    )
-                    .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
-                    result
-                        .append(
-                            PyTuple::new(
-                                py,
-                                [py_key.into_any(), py_value.into_any(), py_refs.into_any()],
-                            )
-                            .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?,
-                        )
-                        .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
+            // Any Python error en route gets stashed via knit_err_from_py
+            // so the boundary can re-raise the original exception verbatim
+            // (e.g. ObjectNotLocked) rather than wrapping it as KnitCorrupt.
+            let build = || -> PyResult<()> {
+                let result = pyo3::types::PyList::empty(py);
+                if has_parents {
+                    for (key, value, node_refs) in entries {
+                        let py_key = py_knit_key_to_py(py, key)?;
+                        let py_value = PyBytes::new(py, value);
+                        let py_refs = PyTuple::new(
+                            py,
+                            node_refs
+                                .iter()
+                                .map(|rl| {
+                                    PyTuple::new(
+                                        py,
+                                        rl.iter()
+                                            .map(|k| py_knit_key_to_py(py, k))
+                                            .collect::<PyResult<Vec<_>>>()?,
+                                    )
+                                })
+                                .collect::<PyResult<Vec<_>>>()?,
+                        )?;
+                        result.append(PyTuple::new(
+                            py,
+                            [py_key.into_any(), py_value.into_any(), py_refs.into_any()],
+                        )?)?;
+                    }
+                } else {
+                    for (key, value, _) in entries {
+                        let py_key = py_knit_key_to_py(py, key)?;
+                        let py_value = PyBytes::new(py, value);
+                        result.append(PyTuple::new(
+                            py,
+                            [py_key.into_any(), py_value.into_any()],
+                        )?)?;
+                    }
                 }
-            } else {
-                for (key, value, _) in entries {
-                    let py_key = py_knit_key_to_py(py, key)
-                        .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
-                    let py_value = PyBytes::new(py, value);
-                    result
-                        .append(
-                            PyTuple::new(py, [py_key.into_any(), py_value.into_any()])
-                                .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?,
-                        )
-                        .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
-                }
-            }
-            self.0
-                .bind(py)
-                .call1((result,))
-                .map_err(|e| bazaar::knit::KnitError::Corrupt(e.to_string()))?;
-            Ok(())
+                self.0.bind(py).call1((result,))?;
+                Ok(())
+            };
+            build().map_err(|e| knit_err_from_py(py, e))
         })
     }
 }
@@ -4310,13 +4328,13 @@ impl PyKnitGraphIndex {
         }
 
         type KnitKey = bazaar::knit::KnitKey;
-        let mut decoded: Vec<(KnitKey, Vec<u8>, u64, u64, Vec<KnitKey>)> = Vec::new();
 
+        let mut inputs: Vec<bazaar::knit::AddRecordInput> = Vec::new();
         for rec in records.try_iter()? {
             let rec = rec?.cast_into::<PyTuple>()?;
             let key = extract_py_knit_key_or_bytes(&rec.get_item(0)?)?;
             let options_obj = rec.get_item(1)?;
-            let options_bytes: Vec<u8> = if let Ok(b) = options_obj.clone().cast_into::<PyBytes>() {
+            let options: Vec<u8> = if let Ok(b) = options_obj.clone().cast_into::<PyBytes>() {
                 b.as_bytes().to_vec()
             } else {
                 let mut buf = Vec::new();
@@ -4343,58 +4361,43 @@ impl PyKnitGraphIndex {
                     .map(|p| extract_py_knit_key_or_bytes(&p?))
                     .collect::<PyResult<_>>()?
             };
-            decoded.push((key, options_bytes, pos, size, parents));
+            inputs.push(bazaar::knit::AddRecordInput {
+                key,
+                options,
+                pos,
+                size,
+                parents,
+            });
         }
 
-        // Dedup check against the backing graph index.
         let mut to_remove: std::collections::HashSet<KnitKey> = std::collections::HashSet::new();
         if !random_id {
-            let mut pre_entries: Vec<(KnitKey, Vec<u8>, Vec<Vec<KnitKey>>)> = Vec::new();
-            for (key, options_bytes, pos, size, parents) in &decoded {
-                let noeol = options_bytes.windows(6).any(|w| w == b"no-eol");
-                let method = if options_bytes.windows(10).any(|w| w == b"line-delta") {
-                    bazaar::knit::KnitMethod::LineDelta
-                } else {
-                    bazaar::knit::KnitMethod::Fulltext
-                };
-                let (value, node_refs) = bazaar::knit::encode_graph_index_record(
-                    noeol,
-                    *pos,
-                    *size,
-                    method,
-                    self.inner.parents,
-                    self.inner.deltas,
-                    parents,
-                )
-                .map_err(knit_err_to_py)?;
-                if let Some(existing) = pre_entries.iter_mut().find(|(k, _, _)| k == key) {
-                    *existing = (key.clone(), value, node_refs);
-                } else {
-                    pre_entries.push((key.clone(), value, node_refs));
-                }
-            }
+            let prepared = bazaar::knit::prepare_dedup_records(
+                &inputs,
+                self.inner.parents,
+                self.inner.deltas,
+            )
+            .map_err(knit_err_to_py)?;
             let py_keys = pyo3::types::PyList::new(
                 py,
-                pre_entries
+                prepared
                     .iter()
-                    .map(|(k, _, _)| py_knit_key_to_py(py, k))
+                    .map(|p| py_knit_key_to_py(py, &p.key))
                     .collect::<PyResult<Vec<_>>>()?,
             )?;
             let existing_iter = self._get_entries(py, py_keys.as_any())?;
             let existing_iter = existing_iter.bind(py);
+            let mut existing: Vec<bazaar::knit::ExistingAddRecord> = Vec::new();
             for node in existing_iter.try_iter()? {
                 let node = node?.cast_into::<PyTuple>()?;
-                let existing_key = extract_py_knit_key(&node.get_item(1)?)?;
-                let existing_value = node.get_item(2)?.cast_into::<PyBytes>()?;
-                let existing_refs = node.get_item(3)?;
-                let Some((_, new_value, new_refs)) =
-                    pre_entries.iter().find(|(k, _, _)| k == &existing_key)
-                else {
-                    continue;
-                };
-                let existing_flag = existing_value.as_bytes().first().copied().unwrap_or(b' ');
-                let new_flag: u8 = new_value.first().copied().unwrap_or(b' ');
-                let existing_parents: Vec<KnitKey> = existing_refs
+                let key = extract_py_knit_key(&node.get_item(1)?)?;
+                let value = node
+                    .get_item(2)?
+                    .cast_into::<PyBytes>()?
+                    .as_bytes()
+                    .to_vec();
+                let parents: Vec<KnitKey> = node
+                    .get_item(3)?
                     .get_item(0)
                     .ok()
                     .map(|rl| {
@@ -4404,20 +4407,23 @@ impl PyKnitGraphIndex {
                     })
                     .transpose()?
                     .unwrap_or_default();
-                let new_parents: &[KnitKey] = new_refs.first().map(|v| v.as_slice()).unwrap_or(&[]);
-                if existing_flag != new_flag || existing_parents.as_slice() != new_parents {
-                    return Err(knit_err_to_py(bazaar::knit::KnitError::Corrupt(format!(
-                        "inconsistent details in add_records: \
-                         existing flag={:?} new flag={:?}",
-                        existing_flag as char, new_flag as char,
-                    ))));
-                }
-                to_remove.insert(existing_key);
+                existing.push(bazaar::knit::ExistingAddRecord {
+                    key,
+                    value,
+                    parents,
+                });
             }
+            to_remove = bazaar::knit::verify_dedup_records(&prepared, &existing)
+                .map_err(knit_err_to_py)?;
         }
-        let filtered = decoded
-            .into_iter()
-            .filter(|(k, _, _, _, _)| !to_remove.contains(k));
+
+        let filtered = inputs.into_iter().filter_map(|i| {
+            if to_remove.contains(&i.key) {
+                None
+            } else {
+                Some((i.key, i.options, i.pos, i.size, i.parents))
+            }
+        });
 
         self.inner
             .encode_and_dispatch(filtered, missing_compression_parents)
