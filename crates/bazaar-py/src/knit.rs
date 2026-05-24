@@ -5083,6 +5083,15 @@ pub struct PyLazyKnitContentFactory {
 
 #[pymethods]
 impl PyLazyKnitContentFactory {
+    /// Size of the content fulltext, or `None` when not known.
+    /// Mirrors Python's `LazyKnitContentFactory.size`, which is always
+    /// `None`; callers such as `groupcompress.insert_record_stream` fall
+    /// back to summing the chunk lengths.
+    #[getter]
+    fn size(&self, py: Python<'_>) -> Py<PyAny> {
+        py.None()
+    }
+
     #[new]
     fn new(
         key: Bound<'_, PyAny>,
