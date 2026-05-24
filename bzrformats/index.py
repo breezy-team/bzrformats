@@ -24,19 +24,8 @@ __all__ = [
     "InMemoryGraphIndex",
 ]
 
-import logging
-
 from ._bzr_rs import index as _index_rs
 from .errors import BzrFormatsError
-
-logger = logging.getLogger("bzrformats.index")
-evil_logger = logging.getLogger("bzrformats.evil")
-
-_HEADER_READV = (0, 200)
-_OPTION_KEY_ELEMENTS = b"key_elements="
-_OPTION_LEN = b"len="
-_OPTION_NODE_REFS = b"node_ref_lists="
-_SIGNATURE = b"Bazaar Graph Index 1\n"
 
 
 class BadIndexFormatSignature(BzrFormatsError):
