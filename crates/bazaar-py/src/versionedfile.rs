@@ -428,7 +428,11 @@ impl KeyRefs {
         self.add_references(py, key, refs)
     }
 
-    pub(crate) fn add_key_rust<'py>(&self, py: Python<'py>, key: Bound<'py, PyAny>) -> PyResult<()> {
+    pub(crate) fn add_key_rust<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<()> {
         self.add_key(py, key)
     }
 
@@ -714,7 +718,10 @@ impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
         Python::attach(|py| {
             let py_keys = PySet::empty(py).map_err(|e| vf_err_from_py(py, e))?;
             for k in keys {
-                let pk = k.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+                let pk = k
+                    .clone()
+                    .into_pyobject(py)
+                    .map_err(|e| vf_err_from_py(py, e))?;
                 py_keys.add(pk).map_err(|e| vf_err_from_py(py, e))?;
             }
             let result = self
@@ -722,7 +729,9 @@ impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
                 .bind(py)
                 .call_method1("get_parent_map", (py_keys,))
                 .map_err(|e| vf_err_from_py(py, e))?;
-            let result = result.cast_into::<PyDict>().map_err(|e| vf_err_from_py(py, e.into()))?;
+            let result = result
+                .cast_into::<PyDict>()
+                .map_err(|e| vf_err_from_py(py, e.into()))?;
             let mut out = std::collections::HashMap::new();
             for (k, v) in result.iter() {
                 let key: Key = k.extract().map_err(|e| vf_err_from_py(py, e))?;
@@ -760,7 +769,10 @@ impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
         Python::attach(|py| {
             let py_keys = PyList::empty(py);
             for k in keys {
-                let pk = k.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+                let pk = k
+                    .clone()
+                    .into_pyobject(py)
+                    .map_err(|e| vf_err_from_py(py, e))?;
                 py_keys.append(pk).map_err(|e| vf_err_from_py(py, e))?;
             }
             let stream = self
@@ -771,20 +783,26 @@ impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
                     (py_keys, ordering, include_delta_closure),
                 )
                 .map_err(|e| vf_err_from_py(py, e))?;
-            Ok(Box::new(PyRecordStream { stream: stream.unbind() })
+            Ok(Box::new(PyRecordStream {
+                stream: stream.unbind(),
+            })
                 as Box<
-                    dyn Iterator<
-                        Item = Result<Box<dyn ContentFactory>, bazaar::knit::KnitError>,
-                    >,
+                    dyn Iterator<Item = Result<Box<dyn ContentFactory>, bazaar::knit::KnitError>>,
                 >)
         })
     }
 
-    fn get_sha1s(&self, keys: &[Key]) -> Result<std::collections::HashMap<Key, Vec<u8>>, bazaar::knit::KnitError> {
+    fn get_sha1s(
+        &self,
+        keys: &[Key],
+    ) -> Result<std::collections::HashMap<Key, Vec<u8>>, bazaar::knit::KnitError> {
         Python::attach(|py| {
             let py_keys = PySet::empty(py).map_err(|e| vf_err_from_py(py, e))?;
             for k in keys {
-                let pk = k.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+                let pk = k
+                    .clone()
+                    .into_pyobject(py)
+                    .map_err(|e| vf_err_from_py(py, e))?;
                 py_keys.add(pk).map_err(|e| vf_err_from_py(py, e))?;
             }
             let result = self
@@ -792,7 +810,9 @@ impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
                 .bind(py)
                 .call_method1("get_sha1s", (py_keys,))
                 .map_err(|e| vf_err_from_py(py, e))?;
-            let result = result.cast_into::<PyDict>().map_err(|e| vf_err_from_py(py, e.into()))?;
+            let result = result
+                .cast_into::<PyDict>()
+                .map_err(|e| vf_err_from_py(py, e.into()))?;
             let mut out = std::collections::HashMap::new();
             for (k, v) in result.iter() {
                 let key: Key = k.extract().map_err(|e| vf_err_from_py(py, e))?;
@@ -826,13 +846,19 @@ impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
         lines: &[Vec<u8>],
     ) -> Result<(Vec<u8>, usize), bazaar::knit::KnitError> {
         Python::attach(|py| {
-            let py_key = key.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+            let py_key = key
+                .clone()
+                .into_pyobject(py)
+                .map_err(|e| vf_err_from_py(py, e))?;
             let py_parents = match parents {
                 None => py.None().into_bound(py),
                 Some(ps) => {
                     let lst = PyList::empty(py);
                     for p in ps {
-                        let pp = p.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+                        let pp = p
+                            .clone()
+                            .into_pyobject(py)
+                            .map_err(|e| vf_err_from_py(py, e))?;
                         lst.append(pp).map_err(|e| vf_err_from_py(py, e))?;
                     }
                     lst.into_any()
@@ -840,14 +866,18 @@ impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
             };
             let py_lines = PyList::empty(py);
             for l in lines {
-                py_lines.append(PyBytes::new(py, l)).map_err(|e| vf_err_from_py(py, e))?;
+                py_lines
+                    .append(PyBytes::new(py, l))
+                    .map_err(|e| vf_err_from_py(py, e))?;
             }
             let result = self
                 .obj
                 .bind(py)
                 .call_method1("add_lines", (py_key, py_parents, py_lines))
                 .map_err(|e| vf_err_from_py(py, e))?;
-            let result = result.cast_into::<PyTuple>().map_err(|e| vf_err_from_py(py, e.into()))?;
+            let result = result
+                .cast_into::<PyTuple>()
+                .map_err(|e| vf_err_from_py(py, e.into()))?;
             let digest: Vec<u8> = result
                 .get_item(0)
                 .map_err(|e| vf_err_from_py(py, e))?
@@ -881,7 +911,10 @@ impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
         Python::attach(|py| {
             let py_keys = PySet::empty(py).map_err(|e| vf_err_from_py(py, e))?;
             for k in keys {
-                let pk = k.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+                let pk = k
+                    .clone()
+                    .into_pyobject(py)
+                    .map_err(|e| vf_err_from_py(py, e))?;
                 py_keys.add(pk).map_err(|e| vf_err_from_py(py, e))?;
             }
             let result = self
@@ -892,7 +925,9 @@ impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
             let mut out = Vec::new();
             for item in result.try_iter().map_err(|e| vf_err_from_py(py, e))? {
                 let tup = item.map_err(|e| vf_err_from_py(py, e))?;
-                let tup = tup.cast_into::<PyTuple>().map_err(|e| vf_err_from_py(py, e.into()))?;
+                let tup = tup
+                    .cast_into::<PyTuple>()
+                    .map_err(|e| vf_err_from_py(py, e.into()))?;
                 let line: Vec<u8> = tup
                     .get_item(0)
                     .map_err(|e| vf_err_from_py(py, e))?
@@ -911,7 +946,10 @@ impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
 
     fn annotate(&self, key: &Key) -> Result<Vec<(Key, Vec<u8>)>, bazaar::knit::KnitError> {
         Python::attach(|py| {
-            let py_key = key.clone().into_pyobject(py).map_err(|e| vf_err_from_py(py, e))?;
+            let py_key = key
+                .clone()
+                .into_pyobject(py)
+                .map_err(|e| vf_err_from_py(py, e))?;
             let result = self
                 .obj
                 .bind(py)
@@ -920,7 +958,9 @@ impl bazaar::versionedfile::VersionedFiles for PyVersionedFiles {
             let mut out = Vec::new();
             for item in result.try_iter().map_err(|e| vf_err_from_py(py, e))? {
                 let tup = item.map_err(|e| vf_err_from_py(py, e))?;
-                let tup = tup.cast_into::<PyTuple>().map_err(|e| vf_err_from_py(py, e.into()))?;
+                let tup = tup
+                    .cast_into::<PyTuple>()
+                    .map_err(|e| vf_err_from_py(py, e.into()))?;
                 let key: Key = tup
                     .get_item(0)
                     .map_err(|e| vf_err_from_py(py, e))?
@@ -969,9 +1009,7 @@ impl Iterator for PyRecordStream {
             let stream = self.stream.bind(py);
             let record = match stream.call_method0("__next__") {
                 Ok(r) => r,
-                Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
-                    return None
-                }
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => return None,
                 Err(e) => return Some(Err(vf_err_from_py(py, e))),
             };
             Some(record_to_content_factory(py, &record))
@@ -998,7 +1036,9 @@ fn record_to_content_factory(
             key,
         )));
     }
-    let parents_obj = record.getattr("parents").map_err(|e| vf_err_from_py(py, e))?;
+    let parents_obj = record
+        .getattr("parents")
+        .map_err(|e| vf_err_from_py(py, e))?;
     let parents: Option<Vec<Key>> = if parents_obj.is_none() {
         None
     } else {
@@ -1053,33 +1093,18 @@ pyo3::import_exception!(bzrformats.errors, VersionedFileInvalidChecksum);
 
 /// Drive `VersionedFiles.add_mpdiffs(records)` in Rust.
 ///
-/// `records` is an iterable of `(key, parents, expected_sha1, MultiParent)`
-/// tuples. The orchestration:
-///
-/// 1. Build a [`MultiMemoryVersionedFile`] over the input diffs, indexed
-///    by key.
-/// 2. Pull the needed parent fulltexts via `vf.get_record_stream(needed,
-///    "unordered", True)` and add them to the mpvf as snapshots.
-/// 3. Reconstruct each input key's lines from the mpvf chain, compute
-///    matching blocks for the single-parent case, then call
-///    `vf.add_lines(key, parents, lines, parent_texts, left_matching_blocks)`.
-/// 4. Verify the returned sha1 matches `expected_sha1`; raise
-///    `VersionedFileInvalidChecksum` otherwise.
-///
-/// Mirrors `bzrformats.versionedfile.VersionedFiles.add_mpdiffs` exactly.
+/// The pure-crate helpers [`add_mpdiffs_build`] and [`add_mpdiffs_prepare`]
+/// own the business logic (mpvf assembly, needed-parent discovery,
+/// reconstruction, matching-blocks computation). This wrapper handles only
+/// the Python ABI: extracting records, fetching missing parents via the
+/// caller's Python `get_record_stream`, dispatching `vf.add_lines` with the
+/// `parent_texts` / `left_matching_blocks` kwargs, and raising
+/// `VersionedFileInvalidChecksum` on sha1 mismatch.
 #[pyfunction]
 fn add_mpdiffs(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>) -> PyResult<()> {
-    use bazaar::multiparent::MultiMemoryVersionedFile;
+    use bazaar::versionedfile::{add_mpdiffs_build, add_mpdiffs_prepare, MpdiffRecord};
 
-    // Materialise the records once: the original Python loop iterates
-    // twice (build mpvf, find missing parents) so we cache here too.
-    struct Record {
-        key: Key,
-        parents: Vec<Key>,
-        expected_sha1: Vec<u8>,
-        mp: bazaar::multiparent::MultiParent,
-    }
-    let mut rs: Vec<Record> = Vec::new();
+    let mut rs: Vec<MpdiffRecord> = Vec::new();
     for item in records.try_iter()? {
         let tup = item?.cast_into::<PyTuple>()?;
         let key: Key = tup.get_item(0)?.extract()?;
@@ -1091,39 +1116,22 @@ fn add_mpdiffs(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>) -> PyRe
         let expected_sha1: Vec<u8> = tup.get_item(2)?.extract()?;
         let mp_obj = tup.get_item(3)?;
         let hunks = mp_obj.getattr("hunks")?.cast_into::<PyList>()?;
-        let mp = crate::multiparent::py_hunks_to_rust(&hunks)?;
-        rs.push(Record {
+        let diff = crate::multiparent::py_hunks_to_rust(&hunks)?;
+        rs.push(MpdiffRecord {
             key,
             parents,
             expected_sha1,
-            mp,
+            diff,
         });
     }
 
-    let mut mpvf: MultiMemoryVersionedFile<Key> = MultiMemoryVersionedFile::default();
-    for r in &rs {
-        mpvf.add_diff(r.mp.clone(), r.key.clone(), r.parents.clone());
-    }
+    let (mut mpvf, needed) = add_mpdiffs_build(&rs);
 
-    // Collect parents that aren't already in the mpvf — those are the
-    // ones we have to fetch as fulltexts.
-    let mut needed_parents: std::collections::HashSet<Key> = std::collections::HashSet::new();
-    for r in &rs {
-        for p in &r.parents {
-            if !mpvf.has_version(p) {
-                needed_parents.insert(p.clone());
-            }
-        }
-    }
-
-    if !needed_parents.is_empty() {
-        // Fetch via PyVersionedFiles so we don't have to materialise the
-        // whole iterator into a list. The trait already streams.
+    if !needed.is_empty() {
         use bazaar::versionedfile::VersionedFiles;
         let wrapped = PyVersionedFiles::new(vf.clone_ref(py));
-        let needed_vec: Vec<Key> = needed_parents.into_iter().collect();
         let stream = wrapped
-            .get_record_stream(&needed_vec, "unordered", true)
+            .get_record_stream(&needed, "unordered", true)
             .map_err(crate::knit::knit_err_to_py)?;
         for rec in stream {
             let rec = rec.map_err(crate::knit::knit_err_to_py)?;
@@ -1137,35 +1145,33 @@ fn add_mpdiffs(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>) -> PyRe
         }
     }
 
-    // Reconstruct each key's lines from the mpvf chain and dispatch to
-    // vf.add_lines. `vf_parents` is the opaque `parent_texts` map the
-    // Python add_lines threads back so the implementation can avoid
-    // re-fetching.
+    let prepared = add_mpdiffs_prepare(&mut mpvf, &rs);
+
+    // Dispatch each prepared row through Python. `vf_parents` threads the
+    // opaque `parent_texts` token returned by add_lines back into
+    // subsequent calls so the implementation can avoid re-fetching.
     let vf_bound = vf.bind(py);
     let vf_parents = PyDict::new(py);
-    let keys: Vec<Key> = rs.iter().map(|r| r.key.clone()).collect();
-    let reconstructed = mpvf.get_line_list(&keys);
-    for (r, lines) in rs.iter().zip(reconstructed.into_iter()) {
-        let left_matching_blocks_obj: Py<PyAny> = if r.parents.len() == 1 {
-            let parent_len = mpvf
-                .get_diff(&r.parents[0])
-                .map(bazaar::multiparent::MultiParent::num_lines)
-                .unwrap_or(0);
-            let blocks = r.mp.get_matching_blocks(0, parent_len);
-            PyList::new(py, blocks.iter().map(|t| PyTuple::new(py, [t.0, t.1, t.2]).unwrap()))?
-                .into_any()
-                .unbind()
-        } else {
-            py.None()
+    for row in &prepared {
+        let left_matching_blocks_obj: Py<PyAny> = match &row.left_matching_blocks {
+            Some(blocks) => PyList::new(
+                py,
+                blocks
+                    .iter()
+                    .map(|t| PyTuple::new(py, [t.0, t.1, t.2]).unwrap()),
+            )?
+            .into_any()
+            .unbind(),
+            None => py.None(),
         };
 
-        let py_key = r.key.clone().into_pyobject(py)?;
+        let py_key = row.key.clone().into_pyobject(py)?;
         let py_parents = PyList::empty(py);
-        for p in &r.parents {
+        for p in &row.parents {
             py_parents.append(p.clone().into_pyobject(py)?)?;
         }
         let py_lines = PyList::empty(py);
-        for l in &lines {
+        for l in &row.lines {
             py_lines.append(PyBytes::new(py, l))?;
         }
         let kwargs = PyDict::new(py);
@@ -1178,14 +1184,12 @@ fn add_mpdiffs(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>) -> PyRe
             )?
             .cast_into::<PyTuple>()?;
         let version_sha1: Vec<u8> = result.get_item(0)?.extract()?;
-        if version_sha1 != r.expected_sha1 {
-            // Python passes the *version* (key) here, mirroring the
-            // historical message.
-            let version_repr = format!("{:?}", r.key);
+        if version_sha1 != row.expected_sha1 {
+            let version_repr = format!("{:?}", row.key);
             return Err(VersionedFileInvalidChecksum::new_err(version_repr));
         }
         let version_text = result.get_item(2)?;
-        let key_py = r.key.clone().into_pyobject(py)?;
+        let key_py = row.key.clone().into_pyobject(py)?;
         vf_parents.set_item(key_py, version_text)?;
     }
 

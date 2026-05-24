@@ -1155,6 +1155,91 @@ pub fn fulltext_network_to_record(bytes: &[u8], line_end: usize) -> FulltextCont
     FulltextContentFactory::new(None, key, parents, fulltext.to_vec())
 }
 
+/// One input to [`add_mpdiffs_build`] / [`add_mpdiffs_prepare`]: the key,
+/// its parents, the expected sha1 of the reconstructed text, and the diff.
+#[derive(Clone, Debug)]
+pub struct MpdiffRecord {
+    pub key: Key,
+    pub parents: Vec<Key>,
+    pub expected_sha1: Vec<u8>,
+    pub diff: crate::multiparent::MultiParent,
+}
+
+/// One dispatch row produced by [`add_mpdiffs_prepare`]: a reconstructed
+/// text ready to hand to `VersionedFiles.add_lines`, plus the
+/// `left_matching_blocks` hint to thread in (when there's exactly one
+/// parent) and the `expected_sha1` for the post-add check.
+#[derive(Clone, Debug)]
+pub struct PreparedAddLines {
+    pub key: Key,
+    pub parents: Vec<Key>,
+    pub lines: Vec<Vec<u8>>,
+    pub left_matching_blocks: Option<Vec<(usize, usize, usize)>>,
+    pub expected_sha1: Vec<u8>,
+}
+
+/// Phase 1 of `add_mpdiffs`: load the input records into a fresh in-memory
+/// multiparent versioned file and report which parent keys are still
+/// missing.
+///
+/// The caller is expected to fetch the missing parents' fulltexts (typically
+/// via `VersionedFiles.get_record_stream`) and seed them into the returned
+/// mpvf with `add_version(lines, key, [], None, false)` before calling
+/// [`add_mpdiffs_prepare`].
+pub fn add_mpdiffs_build(
+    records: &[MpdiffRecord],
+) -> (crate::multiparent::MultiMemoryVersionedFile<Key>, Vec<Key>) {
+    let mut mpvf = crate::multiparent::MultiMemoryVersionedFile::<Key>::default();
+    for r in records {
+        mpvf.add_diff(r.diff.clone(), r.key.clone(), r.parents.clone());
+    }
+    let mut needed: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    for r in records {
+        for p in &r.parents {
+            if !mpvf.has_version(p) {
+                needed.insert(p.clone());
+            }
+        }
+    }
+    (mpvf, needed.into_iter().collect())
+}
+
+/// Phase 2 of `add_mpdiffs`: reconstruct each input record's fulltext from
+/// the now-populated mpvf and pre-compute the `left_matching_blocks` hint
+/// for the single-parent case (matching Python's logic in
+/// `VersionedFiles.add_mpdiffs`).
+///
+/// Returns one [`PreparedAddLines`] per input record, in input order.
+pub fn add_mpdiffs_prepare(
+    mpvf: &mut crate::multiparent::MultiMemoryVersionedFile<Key>,
+    records: &[MpdiffRecord],
+) -> Vec<PreparedAddLines> {
+    let keys: Vec<Key> = records.iter().map(|r| r.key.clone()).collect();
+    let reconstructed = mpvf.get_line_list(&keys);
+    records
+        .iter()
+        .zip(reconstructed.into_iter())
+        .map(|(r, lines)| {
+            let left_matching_blocks = if r.parents.len() == 1 {
+                let parent_len = mpvf
+                    .get_diff(&r.parents[0])
+                    .map(crate::multiparent::MultiParent::num_lines)
+                    .unwrap_or(0);
+                Some(r.diff.get_matching_blocks(0, parent_len))
+            } else {
+                None
+            };
+            PreparedAddLines {
+                key: r.key.clone(),
+                parents: r.parents.clone(),
+                lines,
+                left_matching_blocks,
+                expected_sha1: r.expected_sha1.clone(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1182,5 +1267,105 @@ mod tests {
             b"ok\n".to_vec(),
             b"a\nb".to_vec()
         ]));
+    }
+
+    fn k(s: &str) -> Key {
+        Key::Fixed(vec![s.as_bytes().to_vec()])
+    }
+
+    #[test]
+    fn add_mpdiffs_build_collects_only_missing_parents() {
+        use crate::multiparent::{Hunk, MultiParent};
+        let snap_a = MultiParent::with_hunks(vec![Hunk::NewText(vec![b"a\n".to_vec()])]);
+        let snap_b = MultiParent::with_hunks(vec![Hunk::NewText(vec![b"b\n".to_vec()])]);
+        let records = vec![
+            MpdiffRecord {
+                key: k("a"),
+                parents: vec![],
+                expected_sha1: vec![],
+                diff: snap_a,
+            },
+            MpdiffRecord {
+                key: k("b"),
+                parents: vec![k("a"), k("z")],
+                expected_sha1: vec![],
+                diff: snap_b,
+            },
+        ];
+        let (mpvf, needed) = add_mpdiffs_build(&records);
+        // 'a' is in the mpvf as a record; 'z' is not.
+        assert_eq!(needed, vec![k("z")]);
+        assert!(mpvf.has_version(&k("a")));
+        assert!(mpvf.has_version(&k("b")));
+    }
+
+    #[test]
+    fn add_mpdiffs_prepare_single_parent_emits_blocks() {
+        use crate::multiparent::{Hunk, MultiParent};
+        // 'a' is a fulltext; 'b' is a delta against 'a' that re-uses every
+        // line of the parent.
+        let snap_a =
+            MultiParent::with_hunks(vec![Hunk::NewText(vec![b"x\n".to_vec(), b"y\n".to_vec()])]);
+        let delta_b = MultiParent::with_hunks(vec![Hunk::ParentText {
+            parent: 0,
+            parent_pos: 0,
+            child_pos: 0,
+            num_lines: 2,
+        }]);
+        let records = vec![
+            MpdiffRecord {
+                key: k("a"),
+                parents: vec![],
+                expected_sha1: vec![],
+                diff: snap_a,
+            },
+            MpdiffRecord {
+                key: k("b"),
+                parents: vec![k("a")],
+                expected_sha1: vec![],
+                diff: delta_b,
+            },
+        ];
+        let (mut mpvf, needed) = add_mpdiffs_build(&records);
+        assert!(needed.is_empty());
+        let prepared = add_mpdiffs_prepare(&mut mpvf, &records);
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].lines, vec![b"x\n".to_vec(), b"y\n".to_vec()]);
+        assert_eq!(prepared[0].left_matching_blocks, None);
+        assert_eq!(prepared[1].lines, vec![b"x\n".to_vec(), b"y\n".to_vec()]);
+        // One ParentText hunk plus the trailing sentinel from
+        // get_matching_blocks.
+        let blocks = prepared[1].left_matching_blocks.as_ref().unwrap();
+        assert_eq!(blocks, &vec![(0, 0, 2), (2, 2, 0)]);
+    }
+
+    #[test]
+    fn add_mpdiffs_prepare_multi_parent_no_blocks() {
+        use crate::multiparent::{Hunk, MultiParent};
+        let snap = || MultiParent::with_hunks(vec![Hunk::NewText(vec![b"x\n".to_vec()])]);
+        let records = vec![
+            MpdiffRecord {
+                key: k("p1"),
+                parents: vec![],
+                expected_sha1: vec![],
+                diff: snap(),
+            },
+            MpdiffRecord {
+                key: k("p2"),
+                parents: vec![],
+                expected_sha1: vec![],
+                diff: snap(),
+            },
+            MpdiffRecord {
+                key: k("c"),
+                parents: vec![k("p1"), k("p2")],
+                expected_sha1: vec![],
+                diff: snap(),
+            },
+        ];
+        let (mut mpvf, _) = add_mpdiffs_build(&records);
+        let prepared = add_mpdiffs_prepare(&mut mpvf, &records);
+        // Multi-parent: no left_matching_blocks hint.
+        assert_eq!(prepared[2].left_matching_blocks, None);
     }
 }
