@@ -1,4 +1,7 @@
-use bazaar::chk_map::{deserialise_internal_node, deserialise_leaf_node, Error as ChkError, Key};
+use bazaar::chk_map::{
+    deserialise_internal_node, deserialise_leaf_node, serialise_internal_node, serialise_leaf_node,
+    Error as ChkError, InternalNodeChild, Key,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use pyo3::wrap_pyfunction;
@@ -127,6 +130,81 @@ fn py_deserialise_internal_node<'py>(
     ))
 }
 
+/// Build the line list that `LeafNode.serialise` would hand to
+/// `store.add_lines(...)`. `items` is a list of `(key_tuple, value)`
+/// pairs in already-sorted order; `common_prefix` is `None` only for the
+/// empty-node case.
+#[pyfunction]
+#[pyo3(name = "_serialise_leaf_node", signature = (maximum_size, key_width, items, common_prefix))]
+fn py_serialise_leaf_node<'py>(
+    py: Python<'py>,
+    maximum_size: usize,
+    key_width: usize,
+    items: Bound<'py, PyAny>,
+    common_prefix: Option<&[u8]>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut rust_items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::new();
+    for pair in items.try_iter()? {
+        let pair = pair?.cast_into::<PyTuple>()?;
+        let key_tuple = pair.get_item(0)?.cast_into::<PyTuple>()?;
+        let mut key_parts: Vec<Vec<u8>> = Vec::with_capacity(key_tuple.len());
+        for part in key_tuple.iter() {
+            key_parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        let value = pair
+            .get_item(1)?
+            .cast_into::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        rust_items.push((key_parts, value));
+    }
+    let out = serialise_leaf_node(maximum_size, key_width, &rust_items, common_prefix)
+        .map_err(chk_err_to_py)?;
+    let lines = PyList::empty(py);
+    for line in out {
+        lines.append(PyBytes::new(py, &line))?;
+    }
+    Ok(lines)
+}
+
+/// Build the line list that `InternalNode.serialise` would hand to
+/// `store.add_lines(...)`. `items` is a list of `(prefix, flat_key)`
+/// pairs in already-sorted order. `length` is the InternalNode's
+/// total leaf count (`self._len`), not the direct fan-out.
+#[pyfunction]
+#[pyo3(name = "_serialise_internal_node")]
+fn py_serialise_internal_node<'py>(
+    py: Python<'py>,
+    maximum_size: usize,
+    key_width: usize,
+    length: usize,
+    search_prefix: &[u8],
+    items: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut rust_items: Vec<InternalNodeChild> = Vec::new();
+    for pair in items.try_iter()? {
+        let pair = pair?.cast_into::<PyTuple>()?;
+        let prefix = pair
+            .get_item(0)?
+            .cast_into::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        let flat_key = pair
+            .get_item(1)?
+            .cast_into::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        rust_items.push(InternalNodeChild { prefix, flat_key });
+    }
+    let out = serialise_internal_node(maximum_size, key_width, length, search_prefix, &rust_items)
+        .map_err(chk_err_to_py)?;
+    let lines = PyList::empty(py);
+    for line in out {
+        lines.append(PyBytes::new(py, &line))?;
+    }
+    Ok(lines)
+}
+
 pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "chk_map")?;
     m.add_wrapped(wrap_pyfunction!(_search_key_16))?;
@@ -136,5 +214,7 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(common_prefix_many))?;
     m.add_wrapped(wrap_pyfunction!(py_deserialise_leaf_node))?;
     m.add_wrapped(wrap_pyfunction!(py_deserialise_internal_node))?;
+    m.add_wrapped(wrap_pyfunction!(py_serialise_leaf_node))?;
+    m.add_wrapped(wrap_pyfunction!(py_serialise_internal_node))?;
     Ok(m)
 }

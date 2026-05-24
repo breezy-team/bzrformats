@@ -1056,30 +1056,13 @@ class LeafNode(Node):
         :param store: A VersionedFiles honouring the CHK extensions.
         :return: An iterable of the keys inserted by this operation.
         """
-        lines = [b"chkleaf:\n"]
-        lines.append(b"%d\n" % self._maximum_size)
-        lines.append(b"%d\n" % self._key_width)
-        lines.append(b"%d\n" % self._len)
-        if self._common_serialised_prefix is None:
-            lines.append(b"\n")
-            if len(self._items) != 0:
-                raise AssertionError(
-                    "If _common_serialised_prefix is None we should have no items"
-                )
-        else:
-            lines.append(b"%s\n" % (self._common_serialised_prefix,))
-            prefix_len = len(self._common_serialised_prefix)
-        for key, value in sorted(self._items.items()):
-            # Always add a final newline
-            value_lines = osutils.chunks_to_lines([value + b"\n"])
-            serialized = b"%s\x00%d\n" % (self._serialise_key(key), len(value_lines))
-            if not serialized.startswith(self._common_serialised_prefix):
-                raise AssertionError(
-                    f"We thought the common prefix was {self._common_serialised_prefix!r}"
-                    f" but entry {serialized!r} does not have it in common"
-                )
-            lines.append(serialized[prefix_len:])
-            lines.extend(value_lines)
+        sorted_items = sorted(self._items.items())
+        lines = _chk_map_rs._serialise_leaf_node(
+            self._maximum_size,
+            self._key_width,
+            sorted_items,
+            self._common_serialised_prefix,
+        )
         sha1, _, _ = store.add_lines((None,), (), lines)
         self._key = (b"sha1:" + sha1,)
         data = b"".join(lines)
@@ -1518,22 +1501,19 @@ class InternalNode(Node):
                 raise AssertionError(
                     f"InternalNode._items should only contain tuples or Nodes, not {node.__class__}"
                 )
-        lines = [b"chknode:\n"]
-        lines.append(b"%d\n" % self._maximum_size)
-        lines.append(b"%d\n" % self._key_width)
-        lines.append(b"%d\n" % self._len)
         if self._search_prefix is None:
             raise AssertionError("_search_prefix should not be None")
-        lines.append(b"%s\n" % (self._search_prefix,))
-        prefix_len = len(self._search_prefix)
-        for prefix, node in sorted(self._items.items()):
-            key = node[0] if isinstance(node, tuple) else node._key[0]
-            serialised = b"%s\x00%s\n" % (prefix, key)
-            if not serialised.startswith(self._search_prefix):
-                raise AssertionError(
-                    f"prefixes mismatch: {serialised} must start with {self._search_prefix}"
-                )
-            lines.append(serialised[prefix_len:])
+        sorted_items = [
+            (prefix, node[0] if isinstance(node, tuple) else node._key[0])
+            for prefix, node in sorted(self._items.items())
+        ]
+        lines = _chk_map_rs._serialise_internal_node(
+            self._maximum_size,
+            self._key_width,
+            self._len,
+            self._search_prefix,
+            sorted_items,
+        )
         sha1, _, _ = store.add_lines((None,), (), lines)
         self._key = (b"sha1:" + sha1,)
         _get_cache()[self._key] = b"".join(lines)
