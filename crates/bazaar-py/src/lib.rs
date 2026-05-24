@@ -763,6 +763,49 @@ impl XMLInventorySerializer8 {
     }
 }
 
+/// CHK-based inventory serializer. Parameterised over the wire format
+/// number, max page size, and search-key name; the on-disk format is
+/// otherwise the same as v8/v10 etc. Surfaces `maximum_size` and
+/// `search_key_name` as Python-readable getters because the original
+/// Python `CHKSerializer` exposed them as instance attributes.
+#[pyclass(subclass, extends = InventorySerializer)]
+struct CHKInventorySerializer {
+    maximum_size: usize,
+    search_key_name: Vec<u8>,
+}
+
+#[pymethods]
+impl CHKInventorySerializer {
+    #[new]
+    fn new(
+        format_num: Vec<u8>,
+        maximum_size: usize,
+        search_key_name: Vec<u8>,
+    ) -> (Self, InventorySerializer) {
+        (
+            CHKInventorySerializer {
+                maximum_size,
+                search_key_name: search_key_name.clone(),
+            },
+            InventorySerializer(Box::new(bazaar::xml_serializer::CHKSerializer::new(
+                format_num,
+                maximum_size,
+                search_key_name,
+            ))),
+        )
+    }
+
+    #[getter]
+    fn maximum_size(&self) -> usize {
+        self.maximum_size
+    }
+
+    #[getter]
+    fn search_key_name<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.search_key_name)
+    }
+}
+
 #[pyfunction(name = "is_null")]
 fn is_null_revision(revision_id: RevisionId) -> bool {
     revision_id.is_null()
@@ -844,6 +887,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<XMLInventorySerializer6>()?;
     m.add_class::<XMLInventorySerializer7>()?;
     m.add_class::<XMLInventorySerializer8>()?;
+    m.add_class::<CHKInventorySerializer>()?;
     m.add(
         "revision_bencode_serializer",
         m.getattr("BEncodeRevisionSerializerv1")?.call0()?,
@@ -879,6 +923,25 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add(
         "inventory_serializer_v8",
         m.getattr("XMLInventorySerializer8")?.call0()?,
+    )?;
+    // CHK inventory serializers: same wire format but parameterised
+    // over format number, max page size, and search-key name. Two
+    // instances are pre-built for the (9, 10) formats currently in use.
+    m.add(
+        "inventory_chk_serializer_255_bigpage_9",
+        m.getattr("CHKInventorySerializer")?.call1((
+            PyBytes::new(py, b"9"),
+            65536u32,
+            PyBytes::new(py, b"hash-255-way"),
+        ))?,
+    )?;
+    m.add(
+        "inventory_chk_serializer_255_bigpage_10",
+        m.getattr("CHKInventorySerializer")?.call1((
+            PyBytes::new(py, b"10"),
+            65536u32,
+            PyBytes::new(py, b"hash-255-way"),
+        ))?,
     )?;
     m.add("CURRENT_REVISION", bazaar::CURRENT_REVISION)?;
     m.add("NULL_REVISION", bazaar::NULL_REVISION)?;
