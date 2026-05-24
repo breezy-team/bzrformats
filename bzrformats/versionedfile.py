@@ -457,10 +457,10 @@ class VersionedFile:
 
     def make_mpdiffs(self, version_ids):
         """Create multiparent diffs for specified versions."""
-        # XXX: Can't use _MPDiffGenerator just yet. This is because version_ids
-        #      is a list of strings, not keys. And while self.get_record_stream
-        #      is supported, it takes *keys*, while self.get_parent_map() takes
-        #      strings... *sigh*
+        # version_ids is a list of strings, not keys, so the tuple-keyed
+        # _MPDiffGenerator doesn't fit. The shape is also simpler than the
+        # plural variant: load every needed text up front, then build one
+        # MultiParent per input.
         knit_versions = set()
         knit_versions.update(version_ids)
         parent_map = self.get_parent_map(version_ids)
@@ -479,29 +479,11 @@ class VersionedFile:
         diffs = []
         for version_id in version_ids:
             target = lines[version_id]
-            try:
-                parents = [
-                    lines[p] for p in parent_map[version_id] if p in knit_versions
-                ]
-            except KeyError as e:
-                # I don't know how this could ever trigger.
-                # parent_map[version_id] was already triggered in the previous
-                # for loop, and lines[p] has the 'if p in knit_versions' check,
-                # so we again won't have a KeyError.
-                raise RevisionNotPresent(version_id, self) from e
-            if len(parents) > 0:
-                left_parent_blocks = self._extract_blocks(
-                    version_id, parents[0], target
-                )
-            else:
-                left_parent_blocks = None
-            diffs.append(
-                multiparent.MultiParent.from_lines(target, parents, left_parent_blocks)
-            )
+            parents = [
+                lines[p] for p in parent_map[version_id] if p in knit_versions
+            ]
+            diffs.append(multiparent.MultiParent.from_lines(target, parents))
         return diffs
-
-    def _extract_blocks(self, version_id, source, target):
-        return None
 
     def add_mpdiffs(self, records):
         """Add mpdiffs to this VersionedFile.
@@ -1304,9 +1286,6 @@ class VersionedFiles:
         return VersionedFileAnnotator(self)
 
     missing_keys = index._missing_keys_from_parent_map
-
-    def _extract_blocks(self, version_id, source, target):
-        return None
 
     def _transitive_fallbacks(self):
         """Return the whole stack of fallback versionedfiles.
