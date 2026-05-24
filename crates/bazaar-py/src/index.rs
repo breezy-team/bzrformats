@@ -656,15 +656,15 @@ fn entries_to_pylist<'py>(
 /// so Python subclasses (BTreeBuilder, InMemoryGraphIndex) can extend
 /// it.
 #[pyclass(name = "GraphIndexBuilder", subclass)]
-struct PyGraphIndexBuilder {
-    inner: std::sync::Mutex<RsGraphIndexBuilder>,
+pub(crate) struct PyGraphIndexBuilder {
+    pub(crate) inner: std::sync::Mutex<RsGraphIndexBuilder>,
     // Python-exposed attribute slots. The pure-Python class allowed
     // assigning arbitrary objects to these names (e.g. test fixtures
     // that store sentinels). Mirror that by holding the last-assigned
     // Python value alongside the Rust state, falling back to the Rust
     // bool until something is assigned.
-    optimize_for_size_py: std::sync::Mutex<Option<Py<PyAny>>>,
-    combine_backing_indices_py: std::sync::Mutex<Option<Py<PyAny>>>,
+    pub(crate) optimize_for_size_py: std::sync::Mutex<Option<Py<PyAny>>>,
+    pub(crate) combine_backing_indices_py: std::sync::Mutex<Option<Py<PyAny>>>,
 }
 
 #[pymethods]
