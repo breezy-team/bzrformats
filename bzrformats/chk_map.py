@@ -272,19 +272,6 @@ class CHKMap:
         res.append("")  # Give a trailing '\n'
         return "\n".join(res)
 
-        def decode(x):
-            return x.decode(encoding)
-
-        res = self._dump_tree_node(
-            self._root_node,
-            prefix=b"",
-            indent="",
-            decode=decode,
-            include_keys=include_keys,
-        )
-        res.append("")  # Give a trailing '\n'
-        return "\n".join(res)
-
     def _dump_tree_node(
         self, node: "Node", prefix, indent, decode, include_keys: bool = True
     ) -> list[str]:
