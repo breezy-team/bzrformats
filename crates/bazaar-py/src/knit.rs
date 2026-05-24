@@ -8014,6 +8014,19 @@ fn get_knit_adapter(
     })
 }
 
+/// Format the `storage_kind` string for a knit content record.
+///
+/// Mirrors the Python expression
+/// `f"knit-{annotated_prefix}{kind}-gz"` where `kind` is `"delta"` or
+/// `"ft"` and `annotated_prefix` is `"annotated-"` or `""`.
+#[pyfunction]
+#[pyo3(name = "format_storage_kind")]
+fn py_format_storage_kind(method: &str, annotated: bool) -> PyResult<String> {
+    let m = bazaar::knit::KnitMethod::from_str(method)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown knit method: {}", method)))?;
+    Ok(bazaar::knit::format_storage_kind(m, annotated))
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data, &m)?)?;
@@ -8042,6 +8055,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(split_keys_by_prefix_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(get_total_build_size_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(dictionary_compress_rs, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_format_storage_kind, &m)?)?;
     m.add_class::<PyAnnotatedKnitContent>()?;
     m.add_class::<PyPlainKnitContent>()?;
     m.add_class::<PyKnitAnnotateFactory>()?;

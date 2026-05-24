@@ -312,9 +312,7 @@ class KnitContentFactory(ContentFactory):
         self.sha1 = sha1
         self.key = key
         self.parents = parents
-        kind = "delta" if build_details[0] == "line-delta" else "ft"
-        annotated_kind = "annotated-" if annotated else ""
-        self.storage_kind = f"knit-{annotated_kind}{kind}-gz"
+        self.storage_kind = _knit_rs.format_storage_kind(build_details[0], annotated)
         self._raw_record = raw_record
         self._network_bytes = network_bytes
         self._build_details = build_details

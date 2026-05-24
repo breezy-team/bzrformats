@@ -18,6 +18,11 @@ fn rand_chars(num: usize) -> PyResult<String> {
 }
 
 #[pyfunction]
+fn contains_whitespace(s: &str) -> bool {
+    bazaar::osutils::contains_whitespace(s)
+}
+
+#[pyfunction]
 fn is_inside(dir: &str, fname: &str) -> PyResult<bool> {
     let dir_path = Path::new(dir);
     let fname_path = Path::new(fname);
@@ -98,6 +103,7 @@ pub fn supports_symlinks(path: PathBuf) -> Option<bool> {
 pub fn _osutils_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(split_lines, m)?)?;
     m.add_function(wrap_pyfunction!(rand_chars, m)?)?;
+    m.add_function(wrap_pyfunction!(contains_whitespace, m)?)?;
     m.add_function(wrap_pyfunction!(is_inside, m)?)?;
     m.add_function(wrap_pyfunction!(is_inside_any, m)?)?;
     m.add_function(wrap_pyfunction!(parent_directories, m)?)?;
