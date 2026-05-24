@@ -646,17 +646,27 @@ class DirState:
             path = path.decode("utf-8")
         self._rs.add_path(path, file_id, kind, stat, fingerprint)
 
+    def _prepare_bisect(self):
+        """Common setup shared by the three _bisect* methods.
+
+        Bisection reads the dirstate file directly, which requires a
+        held lock, a parsed header, and the dirblocks not yet
+        materialised in memory. Returns the file size needed by the
+        Rust bisector.
+        """
+        self._requires_lock()
+        self._read_header_if_needed()
+        if self._dirblock_state != DirState.NOT_IN_MEMORY:
+            raise AssertionError(f"bad dirblock state {self._dirblock_state!r}")
+        return os.fstat(self._state_file.fileno()).st_size
+
     def _bisect(self, paths):
         """Bisect through the disk structure for specific rows.
 
         :param paths: A list of paths to find
         :return: A dict mapping path => entries for found entries.
         """
-        self._requires_lock()
-        self._read_header_if_needed()
-        if self._dirblock_state != DirState.NOT_IN_MEMORY:
-            raise AssertionError(f"bad dirblock state {self._dirblock_state!r}")
-        file_size = os.fstat(self._state_file.fileno()).st_size
+        file_size = self._prepare_bisect()
         return self._rs.bisect(self, self._state_file, file_size, paths)
 
     def _bisect_dirblocks(self, dir_list):
@@ -665,11 +675,7 @@ class DirState:
         :param dir_list: A sorted list of directory names ['', 'dir', 'foo'].
         :return: A map from dir => entries_for_dir
         """
-        self._requires_lock()
-        self._read_header_if_needed()
-        if self._dirblock_state != DirState.NOT_IN_MEMORY:
-            raise AssertionError(f"bad dirblock state {self._dirblock_state!r}")
-        file_size = os.fstat(self._state_file.fileno()).st_size
+        file_size = self._prepare_bisect()
         return self._rs.bisect_dirblocks(self, self._state_file, file_size, dir_list)
 
     def _bisect_recursive(self, paths):
@@ -678,11 +684,7 @@ class DirState:
         :param paths: A sorted list of (dir, name) pairs
         :return: A dict mapping (dir, name, file_id) => [tree_info]
         """
-        self._requires_lock()
-        self._read_header_if_needed()
-        if self._dirblock_state != DirState.NOT_IN_MEMORY:
-            raise AssertionError(f"bad dirblock state {self._dirblock_state!r}")
-        file_size = os.fstat(self._state_file.fileno()).st_size
+        file_size = self._prepare_bisect()
         return self._rs.bisect_recursive(self, self._state_file, file_size, paths)
 
     def _discard_merge_parents(self):
