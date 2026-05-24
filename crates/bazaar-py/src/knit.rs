@@ -1271,10 +1271,7 @@ fn file_identity_rank(
     ranks: &std::collections::HashMap<PyFileRef, usize>,
     memo: &KnitIndexMemo<PyFileRef>,
 ) -> usize {
-    ranks
-        .get(&memo.file_ref)
-        .copied()
-        .unwrap_or(usize::MAX)
+    ranks.get(&memo.file_ref).copied().unwrap_or(usize::MAX)
 }
 
 thread_local! {
@@ -2083,25 +2080,17 @@ fn dictionary_compress_rs<'py>(
     if suffixes.is_empty() {
         return Ok(PyBytes::new(py, b""));
     }
-    let mut out = Vec::new();
-    for (i, suffix) in suffixes.iter().enumerate() {
-        if i > 0 {
-            out.push(b' ');
-        }
-        let key = PyBytes::new(py, suffix);
-        match cache.get_item(&key)? {
-            Some(entry) => {
-                let tup = entry.cast_into::<PyTuple>()?;
-                let pos: i64 = tup.get_item(5)?.extract()?;
-                use std::io::Write;
-                write!(out, "{}", pos).unwrap();
-            }
-            None => {
-                out.push(b'.');
-                out.extend_from_slice(suffix);
-            }
-        }
+    // Extract the {suffix: history_index} lookup once from the Python
+    // cache, then hand the bytes-building loop off to the pure crate.
+    let mut owned: Vec<(Vec<u8>, u64)> = Vec::new();
+    for (key, entry) in cache.iter() {
+        let suffix_bytes = key.cast_into::<PyBytes>()?.as_bytes().to_vec();
+        let pos: u64 = entry.cast_into::<PyTuple>()?.get_item(5)?.extract()?;
+        owned.push((suffix_bytes, pos));
     }
+    let lookup: std::collections::HashMap<&[u8], u64> =
+        owned.iter().map(|(k, v)| (k.as_slice(), *v)).collect();
+    let out = bazaar::knit::dictionary_compress_suffixes(&suffixes, &lookup);
     Ok(PyBytes::new(py, &out))
 }
 
@@ -3152,7 +3141,10 @@ impl PyKnitAnnotator {
         } else {
             AnyKnitAnnotator::Plain(KnitAnnotator::new(index, access, KnitPlainFactory))
         };
-        Ok(PyKnitAnnotator { inner, vf: py.None() })
+        Ok(PyKnitAnnotator {
+            inner,
+            vf: py.None(),
+        })
     }
 }
 
@@ -3653,17 +3645,13 @@ impl PyKndxIndex {
                         .collect::<Vec<_>>(),
                     &lookup_refs,
                 );
-                let mut line = b"\n".to_vec();
-                line.extend_from_slice(&suffix);
-                line.push(b' ');
-                line.extend_from_slice(&options.join(b",".as_ref()));
-                line.push(b' ');
-                line.extend_from_slice(pos.to_string().as_bytes());
-                line.push(b' ');
-                line.extend_from_slice(size.to_string().as_bytes());
-                line.push(b' ');
-                line.extend_from_slice(&parent_refs);
-                line.extend_from_slice(b" :");
+                let line = bazaar::knit::format_kndx_record_line(
+                    &suffix,
+                    options,
+                    *pos,
+                    *size as u64,
+                    &parent_refs,
+                );
                 // Update the in-memory cache
                 {
                     let mut cache = self.inner.kndx_cache().lock().unwrap();
@@ -3962,10 +3950,8 @@ impl bazaar::knit::AddCallback for PyAddCallback {
                     for (key, value, _) in entries {
                         let py_key = py_knit_key_to_py(py, key)?;
                         let py_value = PyBytes::new(py, value);
-                        result.append(PyTuple::new(
-                            py,
-                            [py_key.into_any(), py_value.into_any()],
-                        )?)?;
+                        result
+                            .append(PyTuple::new(py, [py_key.into_any(), py_value.into_any()])?)?;
                     }
                 }
                 self.0.bind(py).call1((result,))?;
@@ -4372,12 +4358,9 @@ impl PyKnitGraphIndex {
 
         let mut to_remove: std::collections::HashSet<KnitKey> = std::collections::HashSet::new();
         if !random_id {
-            let prepared = bazaar::knit::prepare_dedup_records(
-                &inputs,
-                self.inner.parents,
-                self.inner.deltas,
-            )
-            .map_err(knit_err_to_py)?;
+            let prepared =
+                bazaar::knit::prepare_dedup_records(&inputs, self.inner.parents, self.inner.deltas)
+                    .map_err(knit_err_to_py)?;
             let py_keys = pyo3::types::PyList::new(
                 py,
                 prepared
@@ -4413,8 +4396,8 @@ impl PyKnitGraphIndex {
                     parents,
                 });
             }
-            to_remove = bazaar::knit::verify_dedup_records(&prepared, &existing)
-                .map_err(knit_err_to_py)?;
+            to_remove =
+                bazaar::knit::verify_dedup_records(&prepared, &existing).map_err(knit_err_to_py)?;
         }
 
         let filtered = inputs.into_iter().filter_map(|i| {
@@ -7489,7 +7472,6 @@ impl PyNetworkContentMapGenerator {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // _VFContentMapGenerator — Rust port of the Python class
 // ---------------------------------------------------------------------------
@@ -7736,9 +7718,8 @@ impl PyVFContentMapGenerator {
         let keys: Vec<KnitKey> = slf.borrow(py).keys.clone();
         let nonlocal_keys: std::collections::HashSet<KnitKey> =
             slf.borrow(py).nonlocal_keys.clone();
-        let global_map_snapshot: Option<
-            std::collections::HashMap<KnitKey, Option<Vec<KnitKey>>>,
-        > = slf.borrow(py).global_map.clone();
+        let global_map_snapshot: Option<std::collections::HashMap<KnitKey, Option<Vec<KnitKey>>>> =
+            slf.borrow(py).global_map.clone();
 
         let mut first = true;
         for key in &keys {
@@ -7812,12 +7793,9 @@ fn get_basis_lines<'py>(
             true,
         ),
     )?;
-    let record = stream
-        .try_iter()?
-        .next()
-        .ok_or_else(|| {
-            pyo3::exceptions::PyStopIteration::new_err("no records returned from basis_vf")
-        })??;
+    let record = stream.try_iter()?.next().ok_or_else(|| {
+        pyo3::exceptions::PyStopIteration::new_err("no records returned from basis_vf")
+    })??;
     let kind: String = record.getattr("storage_kind")?.extract()?;
     if kind == "absent" {
         return Err(RevisionNotPresent::new_err((
@@ -7832,9 +7810,7 @@ fn get_basis_lines<'py>(
             item?
                 .cast_into::<PyBytes>()
                 .map(|b| b.as_bytes().to_vec())
-                .map_err(|_| {
-                    pyo3::exceptions::PyTypeError::new_err("basis line must be bytes")
-                })
+                .map_err(|_| pyo3::exceptions::PyTypeError::new_err("basis line must be bytes"))
         })
         .collect()
 }
@@ -7860,8 +7836,10 @@ impl<'py> bazaar::knit::BasisVfBridge for PyBasisVfBridge<'py> {
     ) -> Result<Vec<Vec<u8>>, bazaar::knit::AdapterError> {
         let py = self.py;
         let inner = || -> PyResult<Vec<Vec<u8>>> {
-            let parent_tuple =
-                PyTuple::new(py, compression_parent.iter().map(|seg| PyBytes::new(py, seg)))?;
+            let parent_tuple = PyTuple::new(
+                py,
+                compression_parent.iter().map(|seg| PyBytes::new(py, seg)),
+            )?;
             get_basis_lines(py, &self.versioned_files, &parent_tuple.into_any())
         };
         match inner() {

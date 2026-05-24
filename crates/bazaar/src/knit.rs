@@ -1202,6 +1202,39 @@ where
     out
 }
 
+/// Build one kndx record line in the on-disk format:
+/// `b"\n" + suffix + b" " + options_csv + b" " + pos + b" " + size + b" "
+/// + parent_refs + b" :"`. The leading `\n` separates this line from the
+/// previous record (or, for the first record, from the header).
+///
+/// `parent_refs` is the already-built output of
+/// [`dictionary_compress_suffixes`].
+pub fn format_kndx_record_line(
+    suffix: &[u8],
+    options: &[Vec<u8>],
+    pos: u64,
+    size: u64,
+    parent_refs: &[u8],
+) -> Vec<u8> {
+    use std::io::Write;
+    let options_csv = options.join(b",".as_ref());
+    let mut line = Vec::with_capacity(
+        1 + suffix.len() + 1 + options_csv.len() + 1 + 20 + 1 + 20 + 1 + parent_refs.len() + 2,
+    );
+    line.push(b'\n');
+    line.extend_from_slice(suffix);
+    line.push(b' ');
+    line.extend_from_slice(&options_csv);
+    line.push(b' ');
+    write!(line, "{}", pos).unwrap();
+    line.push(b' ');
+    write!(line, "{}", size).unwrap();
+    line.push(b' ');
+    line.extend_from_slice(parent_refs);
+    line.extend_from_slice(b" :");
+    line
+}
+
 /// Group keys by their first segment, preserving first-seen order per group
 /// and the global order in which new prefixes appeared.
 ///
@@ -1804,7 +1837,10 @@ pub fn prepare_dedup_records(
 ) -> Result<Vec<PreparedAddRecord>, KnitError> {
     let mut out: Vec<PreparedAddRecord> = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let noeol = input.options.windows(b"no-eol".len()).any(|w| w == b"no-eol");
+        let noeol = input
+            .options
+            .windows(b"no-eol".len())
+            .any(|w| w == b"no-eol");
         let method = if input
             .options
             .windows(b"line-delta".len())
@@ -2273,14 +2309,12 @@ fn apply_plain_delta_to_basis(
     basis_text: &[u8],
 ) -> Result<Vec<Vec<u8>>, KnitError> {
     let version_id = key.last().map(Vec::as_slice).unwrap_or(&[]);
-    let mut basis_lines: Vec<Vec<u8>> = crate::osutils::chunks_to_lines(std::iter::once(Ok::<
-        _,
-        std::io::Error,
-    >(
-        std::borrow::Cow::Borrowed(basis_text),
-    )))
-    .map(|r| r.unwrap().into_owned())
-    .collect();
+    let mut basis_lines: Vec<Vec<u8>> =
+        crate::osutils::chunks_to_lines(std::iter::once(Ok::<_, std::io::Error>(
+            std::borrow::Cow::Borrowed(basis_text),
+        )))
+        .map(|r| r.unwrap().into_owned())
+        .collect();
     let (delta_body, _sha1) = parse_record(version_id, raw_record)?;
     let delta_refs: Vec<&[u8]> = delta_body.iter().map(|l| l.as_slice()).collect();
     let hunks = parse_line_delta_raw(&delta_refs)?;
@@ -2325,9 +2359,7 @@ where
         return extract_plain_fulltext_lines(raw_record, noeol);
     }
     let cp = compression_parent.ok_or_else(|| {
-        KnitError::Corrupt(format!(
-            "delta record {key:?} has no compression parent",
-        ))
+        KnitError::Corrupt(format!("delta record {key:?} has no compression parent",))
     })?;
     let basis_text = kvf.get_text(cp)?;
     apply_plain_delta_to_basis(key, raw_record, noeol, &basis_text)
@@ -2353,9 +2385,7 @@ where
         return extract_plain_fulltext_lines(raw_record, noeol);
     }
     let cp = compression_parent.ok_or_else(|| {
-        KnitError::Corrupt(format!(
-            "delta record {key:?} has no compression parent",
-        ))
+        KnitError::Corrupt(format!("delta record {key:?} has no compression parent",))
     })?;
     // Local first. The pure crate's `KnitVersionedFiles::get_text` raises
     // `RevisionNotPresent` (or `BadIndexValue`) when the basis is
@@ -2366,11 +2396,7 @@ where
     }
     let cp_key = vf_key_from_knit(cp);
     for fb in fallbacks {
-        let mut stream = fb.get_record_stream(
-            std::slice::from_ref(&cp_key),
-            "unordered",
-            true,
-        )?;
+        let mut stream = fb.get_record_stream(std::slice::from_ref(&cp_key), "unordered", true)?;
         let mut basis: Option<Box<dyn crate::versionedfile::ContentFactory>> = None;
         for rec in stream.by_ref() {
             let rec = rec?;
@@ -2549,10 +2575,8 @@ pub trait BasisVfBridge {
     /// line bytes.  Implementations should return
     /// `Err(AdapterError::BasisNotPresent(key))` if the basis record
     /// has `storage_kind == "absent"`.
-    fn get_basis_lines(
-        &self,
-        compression_parent: &[Vec<u8>],
-    ) -> Result<Vec<Vec<u8>>, AdapterError>;
+    fn get_basis_lines(&self, compression_parent: &[Vec<u8>])
+        -> Result<Vec<Vec<u8>>, AdapterError>;
 }
 
 /// A streamed record adapter — turns the bytes of one `storage_kind`
@@ -3189,10 +3213,7 @@ pub trait KnitAccess {
     fn get_raw_record(&self, memo: &KnitIndexMemo<Self::F>) -> Result<Vec<u8>, KnitError>;
 
     /// Fetch raw record bytes for multiple memos in order.
-    fn get_raw_records(
-        &self,
-        memos: &[KnitIndexMemo<Self::F>],
-    ) -> Result<Vec<Vec<u8>>, KnitError>;
+    fn get_raw_records(&self, memos: &[KnitIndexMemo<Self::F>]) -> Result<Vec<Vec<u8>>, KnitError>;
 
     // --- write side ---
 
@@ -4476,9 +4497,8 @@ pub fn parse_delta_closure_wire_bytes(
             .ok_or_else(|| KnitError::Corrupt("truncated delta-closure wire bytes".to_string()))
     };
 
-    let parse_key_bytes = |seg: &[u8]| -> KnitKey {
-        seg.split(|&b| b == b'\x00').map(|s| s.to_vec()).collect()
-    };
+    let parse_key_bytes =
+        |seg: &[u8]| -> KnitKey { seg.split(|&b| b == b'\x00').map(|s| s.to_vec()).collect() };
 
     // Line: "annotated" or "" (plain)
     let nl = find_nl(start)?;
@@ -4737,9 +4757,12 @@ impl<F: FileRef> crate::versionedfile::ContentFactory for KnitContentFactory<F> 
     }
 
     fn parents(&self) -> Option<Vec<crate::versionedfile::Key>> {
-        self.parents
-            .as_ref()
-            .map(|ps| ps.iter().cloned().map(crate::versionedfile::Key::Fixed).collect())
+        self.parents.as_ref().map(|ps| {
+            ps.iter()
+                .cloned()
+                .map(crate::versionedfile::Key::Fixed)
+                .collect()
+        })
     }
 
     fn storage_kind(&self) -> String {
@@ -4785,13 +4808,16 @@ impl<F: FileRef> crate::versionedfile::ContentFactory for KnitContentFactory<F> 
     }
 
     fn into_chunks(self) -> Box<dyn Iterator<Item = Vec<u8>>> {
-        Box::new(std::iter::once(self.into_fulltext_inner().unwrap_or_default()))
+        Box::new(std::iter::once(
+            self.into_fulltext_inner().unwrap_or_default(),
+        ))
     }
 
     fn map_key(&mut self, f: &dyn Fn(crate::versionedfile::Key) -> crate::versionedfile::Key) {
         let new_key = f(crate::versionedfile::Key::Fixed(self.key.clone()));
         self.key = match new_key {
-            crate::versionedfile::Key::Fixed(v) | crate::versionedfile::Key::ContentAddressed(v) => v,
+            crate::versionedfile::Key::Fixed(v)
+            | crate::versionedfile::Key::ContentAddressed(v) => v,
         };
         self.parents = self.parents.take().map(|ps| {
             ps.into_iter()
@@ -5210,8 +5236,7 @@ impl<I: KnitIndex, A: KnitAccess<F = I::F>, F: KnitFactory> KnitVersionedFiles<I
             }
             let fb_keys: Vec<crate::versionedfile::Key> =
                 fb_needed.iter().map(vf_key_from_knit).collect();
-            let fb_recs =
-                fallback.get_record_stream(&fb_keys, ordering, include_delta_closure)?;
+            let fb_recs = fallback.get_record_stream(&fb_keys, ordering, include_delta_closure)?;
             let mut still_needed = Vec::new();
             for rec in fb_recs {
                 let rec = rec?;
@@ -5434,16 +5459,12 @@ impl<I: KnitIndex, A: KnitAccess<F = I::F>, F: KnitFactory> KnitVersionedFiles<I
                 // fulltext, apply the delta, and store as plain lines.
                 let cp = compression_parent.as_ref().unwrap();
                 self.access.flush()?;
-                let fb_idx = cp_fallback_idx.expect(
-                    "store_directly == false implies a fallback was found",
-                );
+                let fb_idx =
+                    cp_fallback_idx.expect("store_directly == false implies a fallback was found");
                 let fb = fallbacks[fb_idx];
                 let cp_vf = vf_key_from_knit(cp);
-                let mut basis_iter = fb.get_record_stream(
-                    std::slice::from_ref(&cp_vf),
-                    "unordered",
-                    true,
-                )?;
+                let mut basis_iter =
+                    fb.get_record_stream(std::slice::from_ref(&cp_vf), "unordered", true)?;
                 let basis = loop {
                     match basis_iter.next() {
                         Some(Ok(rec)) => {
@@ -7646,6 +7667,21 @@ mod tests {
     }
 
     #[test]
+    fn format_kndx_record_line_basic() {
+        let options = vec![b"fulltext".to_vec(), b"no-eol".to_vec()];
+        let line = format_kndx_record_line(b"rev-1", &options, 0, 123, b"0 .rev-x");
+        assert_eq!(line, b"\nrev-1 fulltext,no-eol 0 123 0 .rev-x :");
+    }
+
+    #[test]
+    fn format_kndx_record_line_no_parents() {
+        let options = vec![b"line-delta".to_vec()];
+        let line = format_kndx_record_line(b"rev-2", &options, 17, 99, b"");
+        // Empty parent_refs still produces the trailing space + colon.
+        assert_eq!(line, b"\nrev-2 line-delta 17 99  :");
+    }
+
+    #[test]
     fn annotated_content_text_returns_empty_for_empty_input() {
         // Mirrors KnitContentTestsMixin.test_text (empty case).
         let content = AnnotatedKnitContent::new(vec![]);
@@ -8024,13 +8060,7 @@ mod tests {
             .get_parent_map(&[key_a.clone(), key_b.clone(), key_c.clone()])
             .unwrap();
         assert_eq!(pm[&key_a], Vec::<KnitKey>::new());
-        assert_eq!(
-            pm[&key_b],
-            vec![
-                vec![b"a".to_vec()],
-                vec![b"c".to_vec()],
-            ]
-        );
+        assert_eq!(pm[&key_b], vec![vec![b"a".to_vec()], vec![b"c".to_vec()],]);
         assert_eq!(
             pm[&key_c],
             vec![
@@ -8311,8 +8341,7 @@ mod tests {
         let parent_key = ann_key(b"parent-id");
         ann.num_compression_children.insert(parent_key.clone(), 2);
 
-        let raw_parent =
-            fulltext_raw(b"parent-id", &[b"line1\n", b"line2\n", b"line3\n"], false);
+        let raw_parent = fulltext_raw(b"parent-id", &[b"line1\n", b"line2\n", b"line3\n"], false);
         ann.expand_record(
             parent_key.clone(),
             vec![],
@@ -8646,13 +8675,7 @@ mod tests {
         );
         let key = vec![b"rev-id".to_vec()];
         let parents = vec![vec![b"parent-id".to_vec()]];
-        let input = adapter_input(
-            &key,
-            &raw,
-            false,
-            Some(&parents),
-            "knit-annotated-delta-gz",
-        );
+        let input = adapter_input(&key, &raw, false, Some(&parents), "knit-annotated-delta-gz");
         let err = DeltaAnnotatedToFullText
             .get_bytes(&input, "fulltext", None)
             .unwrap_err();
@@ -8686,13 +8709,7 @@ mod tests {
         );
         let key = vec![b"child".to_vec()];
         let parents = vec![vec![b"parent".to_vec()]];
-        let input = adapter_input(
-            &key,
-            &raw,
-            false,
-            Some(&parents),
-            "knit-annotated-delta-gz",
-        );
+        let input = adapter_input(&key, &raw, false, Some(&parents), "knit-annotated-delta-gz");
         let basis = StaticBasis {
             lines: vec![b"a\n".to_vec(), b"b\n".to_vec()],
         };
