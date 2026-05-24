@@ -2786,28 +2786,35 @@ impl PyDirState {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
     }
 
-    /// Mark the dirstate as modified. `hash_changed_keys` is an
-    /// optional iterable of `(dirname, basename, file_id)` tuples
-    /// indicating hash-only changes; pass `None` for a full
-    /// modification. Mirrors `DirState._mark_modified`.
-    #[pyo3(signature = (hash_changed_keys = None, header_modified = false))]
+    /// Mark the dirstate as modified. `hash_changed_entries` is an
+    /// optional iterable of dirstate entries (each
+    /// `(key, [tree_states])`, where `key` is the
+    /// `(dirname, basename, file_id)` 3-tuple); pass `None` for a
+    /// full modification. Mirrors `DirState._mark_modified`.
+    #[pyo3(signature = (hash_changed_entries = None, header_modified = false))]
     fn mark_modified(
         &mut self,
-        hash_changed_keys: Option<&Bound<PyAny>>,
+        hash_changed_entries: Option<&Bound<PyAny>>,
         header_modified: bool,
     ) -> PyResult<()> {
         let mut keys: Vec<bazaar::dirstate::EntryKey> = Vec::new();
-        if let Some(iter) = hash_changed_keys {
+        if let Some(iter) = hash_changed_entries {
             for item in iter.try_iter()? {
-                let tup = item?.cast_into::<PyTuple>()?;
-                if tup.len() != 3 {
+                let entry = item?.cast_into::<PyTuple>()?;
+                if entry.len() < 1 {
                     return Err(PyTypeError::new_err(
-                        "hash_changed_keys entries must be 3-tuples",
+                        "hash_changed_entries items must be (key, ...) tuples",
                     ));
                 }
-                let dirname: Vec<u8> = tup.get_item(0)?.extract()?;
-                let basename: Vec<u8> = tup.get_item(1)?.extract()?;
-                let file_id: Vec<u8> = tup.get_item(2)?.extract()?;
+                let key_tup = entry.get_item(0)?.cast_into::<PyTuple>()?;
+                if key_tup.len() != 3 {
+                    return Err(PyTypeError::new_err(
+                        "entry key must be a (dirname, basename, file_id) 3-tuple",
+                    ));
+                }
+                let dirname: Vec<u8> = key_tup.get_item(0)?.extract()?;
+                let basename: Vec<u8> = key_tup.get_item(1)?.extract()?;
+                let file_id: Vec<u8> = key_tup.get_item(2)?.extract()?;
                 keys.push(bazaar::dirstate::EntryKey {
                     dirname,
                     basename,

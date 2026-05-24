@@ -604,10 +604,7 @@ class DirState:
         :param header_modified: mark the header modified as well, not just the
             dirblocks.
         """
-        hash_changed_keys = (
-            [e[0] for e in hash_changed_entries] if hash_changed_entries else None
-        )
-        self._rs.mark_modified(hash_changed_keys, header_modified)
+        self._rs.mark_modified(hash_changed_entries, header_modified)
 
     def _mark_unmodified(self):
         """Mark this dirstate as unmodified."""
