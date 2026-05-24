@@ -919,7 +919,8 @@ class DirState:
     def get_parent_ids(self):
         """Return a list of the parent tree ids for the directory state."""
         self._read_header_if_needed()
-        return list(self._parents)
+        # _parents already returns a fresh list from Rust on every read.
+        return self._parents
 
     def _get_block_entry_index(self, dirname, basename, tree_index):
         """Get the coordinates for a path in the state structure.
