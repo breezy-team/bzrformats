@@ -642,8 +642,6 @@ class DirState:
         """
         if file_id.__class__ is not bytes:
             raise AssertionError(f"must be a utf8 file_id not {type(file_id)}")
-        if isinstance(path, bytes):
-            path = path.decode("utf-8")
         self._rs.add_path(path, file_id, kind, stat, fingerprint)
 
     def _prepare_bisect(self):

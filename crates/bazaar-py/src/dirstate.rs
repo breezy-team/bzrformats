@@ -2451,12 +2451,20 @@ impl PyDirState {
     fn add_path(
         &mut self,
         py: Python<'_>,
-        path: &str,
+        path: &Bound<'_, PyAny>,
         file_id: &[u8],
         kind: bazaar::osutils::Kind,
         stat: Option<&Bound<PyAny>>,
         fingerprint: Option<&[u8]>,
     ) -> PyResult<()> {
+        // Accept either `str` (the canonical shape) or `bytes` (a few
+        // legacy callers still pass utf-8 bytes for `path`).
+        let path_owned: String = if let Ok(b) = path.downcast::<PyBytes>() {
+            String::from_utf8(b.as_bytes().to_vec())
+                .map_err(|e| PyTypeError::new_err(format!("path is not valid utf-8: {e}")))?
+        } else {
+            path.extract::<String>()?
+        };
         let stat_info: Option<bazaar::dirstate::StatInfo> = match stat {
             None => None,
             Some(s) if s.is_none() => None,
@@ -2469,10 +2477,13 @@ impl PyDirState {
                 ino: s.getattr("st_ino")?.extract()?,
             }),
         };
-        match self
-            .inner
-            .add_path(path, file_id, kind, stat_info, fingerprint.unwrap_or(b""))
-        {
+        match self.inner.add_path(
+            &path_owned,
+            file_id,
+            kind,
+            stat_info,
+            fingerprint.unwrap_or(b""),
+        ) {
             Ok(()) => {
                 self.refresh_cached_id_index(py);
                 Ok(())
