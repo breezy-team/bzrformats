@@ -865,26 +865,12 @@ class LeafNode(Node):
         This differs from self._raw_size in that it includes the bytes used for
         the header.
         """
-        if self._common_serialised_prefix is None:
-            bytes_for_items = 0
-            prefix_len = 0
-        else:
-            # We will store a single string with the common prefix
-            # And then that common prefix will not be stored in any of the
-            # entry lines
-            prefix_len = len(self._common_serialised_prefix)
-            bytes_for_items = self._raw_size - (prefix_len * self._len)
-        return (
-            9  # 'chkleaf:\n' +
-            + len(str(self._maximum_size))
-            + 1
-            + len(str(self._key_width))
-            + 1
-            + len(str(self._len))
-            + 1
-            + prefix_len
-            + 1
-            + bytes_for_items
+        return _chk_map_rs._leaf_node_current_size(
+            self._maximum_size,
+            self._key_width,
+            self._len,
+            self._raw_size,
+            self._common_serialised_prefix,
         )
 
     @classmethod
@@ -930,16 +916,7 @@ class LeafNode(Node):
             yield from self._items.items()
 
     def _key_value_len(self, key, value):
-        # TODO: Should probably be done without actually joining the key, but
-        #       then that can be done via the C extension
-        return (
-            len(self._serialise_key(key))
-            + 1
-            + len(b"%d" % value.count(b"\n"))
-            + 1
-            + len(value)
-            + 1
-        )
+        return _chk_map_rs._leaf_node_key_value_len(key, value)
 
     def _search_key(self, key: Key) -> bytes:
         return self._search_key_func(key)
@@ -1188,11 +1165,11 @@ class InternalNode(Node):
 
     def _current_size(self):
         """Answer the current serialised size of this node."""
-        return (
-            self._raw_size
-            + len(str(self._len))
-            + len(str(self._key_width))
-            + len(str(self._maximum_size))
+        return _chk_map_rs._internal_node_current_size(
+            self._maximum_size,
+            self._key_width,
+            self._len,
+            self._raw_size,
         )
 
     @classmethod

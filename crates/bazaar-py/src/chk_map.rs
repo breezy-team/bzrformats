@@ -1,5 +1,6 @@
 use bazaar::chk_map::{
-    deserialise_internal_node, deserialise_leaf_node, serialise_internal_node, serialise_leaf_node,
+    deserialise_internal_node, deserialise_leaf_node, internal_node_current_size,
+    leaf_node_current_size, leaf_node_key_value_len, serialise_internal_node, serialise_leaf_node,
     Error as ChkError, InternalNodeChild, Key,
 };
 use pyo3::prelude::*;
@@ -205,6 +206,51 @@ fn py_serialise_internal_node<'py>(
     Ok(lines)
 }
 
+/// Serialised byte cost of one `(key, value)` pair inside a leaf node.
+/// Mirrors `LeafNode._key_value_len`.
+#[pyfunction]
+#[pyo3(name = "_leaf_node_key_value_len")]
+fn py_leaf_node_key_value_len(key: &Bound<'_, PyTuple>, value: &[u8]) -> PyResult<usize> {
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key.len());
+    for i in 0..key.len() {
+        parts.push(key.get_item(i)?.cast_into::<PyBytes>()?.as_bytes().to_vec());
+    }
+    Ok(leaf_node_key_value_len(&parts, value))
+}
+
+/// Serialised byte cost of a leaf node (header + items, with prefix
+/// collapse). Mirrors `LeafNode._current_size`.
+#[pyfunction]
+#[pyo3(name = "_leaf_node_current_size", signature = (maximum_size, key_width, length, raw_size, common_serialised_prefix))]
+fn py_leaf_node_current_size(
+    maximum_size: usize,
+    key_width: usize,
+    length: usize,
+    raw_size: usize,
+    common_serialised_prefix: Option<&[u8]>,
+) -> usize {
+    leaf_node_current_size(
+        maximum_size,
+        key_width,
+        length,
+        raw_size,
+        common_serialised_prefix,
+    )
+}
+
+/// Serialised byte cost of an internal node header + body.
+/// Mirrors `InternalNode._current_size`.
+#[pyfunction]
+#[pyo3(name = "_internal_node_current_size")]
+fn py_internal_node_current_size(
+    maximum_size: usize,
+    key_width: usize,
+    length: usize,
+    raw_size: usize,
+) -> usize {
+    internal_node_current_size(maximum_size, key_width, length, raw_size)
+}
+
 pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "chk_map")?;
     m.add_wrapped(wrap_pyfunction!(_search_key_16))?;
@@ -216,5 +262,8 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(py_deserialise_internal_node))?;
     m.add_wrapped(wrap_pyfunction!(py_serialise_leaf_node))?;
     m.add_wrapped(wrap_pyfunction!(py_serialise_internal_node))?;
+    m.add_wrapped(wrap_pyfunction!(py_leaf_node_key_value_len))?;
+    m.add_wrapped(wrap_pyfunction!(py_leaf_node_current_size))?;
+    m.add_wrapped(wrap_pyfunction!(py_internal_node_current_size))?;
     Ok(m)
 }

@@ -494,6 +494,94 @@ pub fn serialise_internal_node(
     Ok(out)
 }
 
+/// Serialised byte cost of one `(key, value)` pair inside a leaf node.
+///
+/// Mirrors `LeafNode._key_value_len` exactly: the key tuple's NUL-joined
+/// bytes, the count of newlines in the value as a decimal string, the
+/// value bytes themselves, and three separator bytes. The hot path for
+/// every map/unmap is calling this to track `_raw_size`.
+pub fn leaf_node_key_value_len(key: &[Vec<u8>], value: &[u8]) -> usize {
+    let key_len: usize = if key.is_empty() {
+        0
+    } else {
+        key.iter().map(Vec::len).sum::<usize>() + (key.len() - 1)
+    };
+    let newline_count = value.iter().filter(|&&b| b == b'\n').count();
+    let newline_count_digits = if newline_count == 0 {
+        1
+    } else {
+        let mut n = newline_count;
+        let mut digits = 0;
+        while n > 0 {
+            n /= 10;
+            digits += 1;
+        }
+        digits
+    };
+    key_len + 1 + newline_count_digits + 1 + value.len() + 1
+}
+
+/// Serialised byte cost of a leaf node, including its header.
+///
+/// Mirrors `LeafNode._current_size`. `bytes_for_items` is the sum of
+/// per-entry serialised costs (i.e. the running `_raw_size`), with the
+/// common-prefix-collapse applied: subtract `prefix_len * length` so
+/// each entry doesn't pay for the prefix once stored once at the top
+/// of the leaf.
+pub fn leaf_node_current_size(
+    maximum_size: usize,
+    key_width: usize,
+    length: usize,
+    raw_size: usize,
+    common_serialised_prefix: Option<&[u8]>,
+) -> usize {
+    let (bytes_for_items, prefix_len) = match common_serialised_prefix {
+        None => (0, 0),
+        Some(prefix) => {
+            let prefix_len = prefix.len();
+            (raw_size - prefix_len * length, prefix_len)
+        }
+    };
+    // 9 = b"chkleaf:\n".len()
+    9 + decimal_digits(maximum_size)
+        + 1
+        + decimal_digits(key_width)
+        + 1
+        + decimal_digits(length)
+        + 1
+        + prefix_len
+        + 1
+        + bytes_for_items
+}
+
+/// Serialised byte cost of an internal node header.
+///
+/// Mirrors `InternalNode._current_size`. The body bytes are tracked
+/// separately in `_raw_size`; the header adds the four decimal-encoded
+/// integers (maximum_size, key_width, length).
+pub fn internal_node_current_size(
+    maximum_size: usize,
+    key_width: usize,
+    length: usize,
+    raw_size: usize,
+) -> usize {
+    raw_size + decimal_digits(length) + decimal_digits(key_width) + decimal_digits(maximum_size)
+}
+
+#[inline]
+fn decimal_digits(n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut n = n;
+    let mut digits = 0;
+    while n > 0 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
 /// Split `data` into lines, keeping the trailing `\n` on each non-final
 /// line. Mirrors `osutils.chunks_to_lines([b"".join(chunks)])` for a
 /// single chunk input: every `\n` ends a line, and any unterminated
@@ -808,6 +896,56 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         let out = serialise_leaf_node(100, 1, &[], None).unwrap();
         let blob: Vec<u8> = out.iter().flatten().copied().collect();
         assert_eq!(blob, b"chkleaf:\n100\n1\n0\n\n");
+    }
+
+    #[test]
+    fn leaf_node_key_value_len_matches_python_layout() {
+        // Single-segment key, value with one newline.
+        let key = vec![b"foo".to_vec()];
+        let value = b"hello\nworld";
+        // Layout: key\0count\nvalue\n
+        //         "foo" + "\0" + "1" + "\n" + "hello\nworld" + "\n"
+        //          3      1     1     1       11               1   = 18
+        // Note the function returns raw size (no trailing newline yet
+        // collapsed into the value); count `\n` chars in value = 1
+        let got = leaf_node_key_value_len(&key, value);
+        // 3 + 1 (NUL after key) + 1 (digit "1") + 1 (NUL) + 11 (value) + 1 (NUL)
+        assert_eq!(got, 3 + 1 + 1 + 1 + 11 + 1);
+    }
+
+    #[test]
+    fn leaf_node_key_value_len_multi_segment_key_joins_with_nul() {
+        let key = vec![b"a".to_vec(), b"bc".to_vec()];
+        let value = b"x";
+        // key joined: "a\0bc" = 4 bytes; value has 0 newlines so count="0" (1 digit).
+        let got = leaf_node_key_value_len(&key, value);
+        // 4 + 1 + 1 + 1 + 1 + 1
+        assert_eq!(got, 9);
+    }
+
+    #[test]
+    fn leaf_node_current_size_includes_header_and_drops_prefix() {
+        // length=2 items, common prefix "ab" (2 bytes), raw_size=20.
+        // bytes_for_items = 20 - 2*2 = 16.
+        // Header: "chkleaf:\n100\n1\n2\nab\n" = 9 + 3+1 + 1+1 + 1+1 + 2+1 = 20
+        // current = 20 + 16 = 36
+        let got = leaf_node_current_size(100, 1, 2, 20, Some(b"ab"));
+        assert_eq!(got, 36);
+    }
+
+    #[test]
+    fn leaf_node_current_size_empty_prefix() {
+        let got = leaf_node_current_size(15, 1, 0, 0, None);
+        // "chkleaf:\n15\n1\n0\n\n" = 9 + 2+1 + 1+1 + 1+1 + 0+1 = 17
+        assert_eq!(got, 17);
+    }
+
+    #[test]
+    fn internal_node_current_size_adds_header_digits() {
+        // raw_size=50, length=3 (1 digit), key_width=1 (1 digit),
+        // maximum_size=100 (3 digits) → 50 + 1 + 1 + 3 = 55
+        let got = internal_node_current_size(100, 1, 3, 50);
+        assert_eq!(got, 55);
     }
 
     #[test]
