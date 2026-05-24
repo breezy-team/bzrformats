@@ -18,6 +18,7 @@
 //!                   to the width needed to fit the entire file.
 //! ```
 
+use crate::bisect_multi::{bisect_multi_bytes, BisectStatus};
 use std::collections::HashMap;
 
 /// Magic signature written at the start of every format-1 graph index.
@@ -895,20 +896,116 @@ impl<T: IndexTransport> GraphIndex<T> {
 
     /// Iterate over only the entries whose key is in `keys`. Missing
     /// keys are silently skipped, matching Python.
+    ///
+    /// Picks between two strategies: when the index size is known and
+    /// the requested key set is small relative to the total key count,
+    /// dispatch through [`bisect_multi_bytes`] over
+    /// [`Self::lookup_keys_via_location`] to avoid pulling the whole
+    /// file. Otherwise (size unknown, already buffered, or many keys
+    /// requested) buffer the whole file and do dict-style lookups.
     pub fn iter_entries(&mut self, keys: &[IndexKey]) -> Result<Vec<IndexEntry>, IndexError> {
-        self.buffer_all()?;
-        let nodes = self.nodes.as_ref().expect("buffer_all populated nodes");
-        let mut out = Vec::new();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut deduped: Vec<IndexKey> = Vec::with_capacity(keys.len());
         let mut seen: std::collections::HashSet<&IndexKey> = std::collections::HashSet::new();
         for k in keys {
-            if !seen.insert(k) {
-                continue;
-            }
-            if let Some((v, r)) = nodes.get(k) {
-                out.push((k.clone(), v.clone(), r.clone()));
+            if seen.insert(k) {
+                deduped.push(k.clone());
             }
         }
-        Ok(out)
+        if !self.should_bisect_for(deduped.len())? {
+            self.buffer_all()?;
+            let nodes = self.nodes.as_ref().expect("buffer_all populated nodes");
+            let mut out = Vec::with_capacity(deduped.len());
+            for k in &deduped {
+                if let Some((v, r)) = nodes.get(k) {
+                    out.push((k.clone(), v.clone(), r.clone()));
+                }
+            }
+            return Ok(out);
+        }
+        self.iter_entries_via_bisect(deduped)
+    }
+
+    /// True iff `requested_count` keys against this index are best
+    /// served by bisection rather than a full `buffer_all`. Requires
+    /// either a known size and parsed header, or returns false.
+    fn should_bisect_for(&mut self, requested_count: usize) -> Result<bool, IndexError> {
+        if self.size().is_none() || self.is_buffered_already() {
+            return Ok(false);
+        }
+        if self.key_count_or_zero() == 0 {
+            self.ensure_header_parsed()?;
+        }
+        // After ensure_header_parsed the 50%-bytes heuristic inside
+        // buffer-detection may have flipped us into buffered mode.
+        if self.is_buffered_already() {
+            return Ok(false);
+        }
+        Ok(requested_count * 20 <= self.key_count_or_zero())
+    }
+
+    /// Bisection-driven lookup: probe `lookup_keys_via_location`
+    /// repeatedly until every key has been located or proven absent.
+    fn iter_entries_via_bisect(
+        &mut self,
+        keys: Vec<IndexKey>,
+    ) -> Result<Vec<IndexEntry>, IndexError> {
+        let size = self.size().unwrap_or(0) as usize;
+        let stashed_err: std::cell::RefCell<Option<IndexError>> = std::cell::RefCell::new(None);
+        let self_cell = std::cell::RefCell::new(self);
+        let found: Vec<(IndexKey, (Vec<u8>, Vec<Vec<IndexKey>>))> = bisect_multi_bytes(
+            |probes| {
+                if stashed_err.borrow().is_some() {
+                    return probes
+                        .into_iter()
+                        .map(|p| (p, BisectStatus::Absent))
+                        .collect();
+                }
+                let probe_input: Vec<(u64, IndexKey)> = probes
+                    .iter()
+                    .map(|(loc, key)| (*loc as u64, key.clone()))
+                    .collect();
+                let results = match self_cell
+                    .borrow_mut()
+                    .lookup_keys_via_location(&probe_input)
+                {
+                    Ok(rs) => rs,
+                    Err(e) => {
+                        *stashed_err.borrow_mut() = Some(e);
+                        return probes
+                            .into_iter()
+                            .map(|p| (p, BisectStatus::Absent))
+                            .collect();
+                    }
+                };
+                probes
+                    .into_iter()
+                    .zip(results)
+                    .map(|(probe, (_, lookup))| {
+                        let status = match lookup {
+                            LookupResult::Missing => BisectStatus::Absent,
+                            LookupResult::Direction(d) if d < 0 => BisectStatus::Earlier,
+                            LookupResult::Direction(_) => BisectStatus::Later,
+                            LookupResult::Found { value, refs } => {
+                                BisectStatus::Found((value, refs))
+                            }
+                        };
+                        (probe, status)
+                    })
+                    .collect()
+            },
+            size,
+            keys,
+        );
+        if let Some(e) = stashed_err.into_inner() {
+            return Err(e);
+        }
+        Ok(found
+            .into_iter()
+            .map(|(key, (value, refs))| (key, value, refs))
+            .collect())
     }
 
     /// Iterate over entries matching one of the given key prefixes. A
@@ -921,16 +1018,12 @@ impl<T: IndexTransport> GraphIndex<T> {
         self.buffer_all()?;
         let key_length = self.header.as_ref().expect("header").key_length;
         for p in prefixes {
-            if p.len() != key_length {
-                return Err(IndexError::Other(format!(
-                    "BadIndexKey: prefix length {} != key length {}",
-                    p.len(),
-                    key_length
-                )));
-            }
-            if !matches!(p.first(), Some(Some(_))) {
-                return Err(IndexError::Other(
-                    "BadIndexKey: first prefix element may not be None".to_string(),
+            if p.len() != key_length || !matches!(p.first(), Some(Some(_))) {
+                // Mirror the builder's iter_entries_prefix: surface the
+                // offending prefix (with `None` slots squashed to empty
+                // bytes) so the binding can raise `BadIndexKey(prefix)`.
+                return Err(IndexError::BadKey(
+                    p.iter().map(|e| e.clone().unwrap_or_default()).collect(),
                 ));
             }
         }
@@ -3063,10 +3156,7 @@ mod tests {
         t.put("idx", bytes);
         let mut idx = GraphIndex::new(t, "idx", 0);
         let err = idx.iter_entries_prefix(&[vec![None]]).unwrap_err();
-        assert_eq!(
-            err,
-            IndexError::Other("BadIndexKey: first prefix element may not be None".to_string())
-        );
+        assert_eq!(err, IndexError::BadKey(vec![Vec::new()]));
     }
 
     #[test]

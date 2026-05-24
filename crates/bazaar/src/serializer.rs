@@ -36,7 +36,7 @@ pub trait RevisionSerializer: Send + Sync {
 }
 
 pub trait InventorySerializer: Send + Sync {
-    fn format_num(&self) -> &'static [u8];
+    fn format_num(&self) -> &[u8];
 
     /// Whether this serializer supports the "altered-by" hack — extracting
     /// per-text revision references by regex-scanning inventory lines

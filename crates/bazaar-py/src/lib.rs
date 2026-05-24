@@ -323,6 +323,38 @@ impl Revision {
     }
 }
 
+/// Revision plus the v4-only metadata recovered by
+/// [`XMLRevisionSerializer4`]. Subclasses [`Revision`] so it exposes
+/// all the usual revision attributes and is `isinstance(_, Revision)`.
+#[pyclass(extends = Revision)]
+struct RevisionV4 {
+    inventory_id: Option<Vec<u8>>,
+    parent_sha1s: Vec<Option<Vec<u8>>>,
+}
+
+#[pymethods]
+impl RevisionV4 {
+    #[getter]
+    fn inventory_id<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
+        match &self.inventory_id {
+            Some(v) => PyBytes::new(py, v).into_any(),
+            None => py.None().into_bound(py),
+        }
+    }
+
+    #[getter]
+    fn parent_sha1s<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let out = pyo3::types::PyList::empty(py);
+        for entry in &self.parent_sha1s {
+            match entry {
+                Some(v) => out.append(PyBytes::new(py, v))?,
+                None => out.append(py.None())?,
+            }
+        }
+        Ok(out.into_any())
+    }
+}
+
 fn serializer_err_to_py_err(e: bazaar::serializer::Error) -> PyErr {
     PyRuntimeError::new_err(format!("serializer error: {:?}", e))
 }
@@ -388,48 +420,37 @@ impl XMLRevisionSerializer4 {
         &self,
         py: Python<'py>,
         text: &[u8],
-    ) -> PyResult<(
-        Revision,
-        Option<Bound<'py, PyBytes>>,
-        Vec<Option<Bound<'py, PyBytes>>>,
-    )> {
+    ) -> PyResult<Bound<'py, RevisionV4>> {
         let rv4 = py
             .detach(|| {
                 bazaar::xml_serializer::XMLRevisionSerializer4.read_revision_from_string(text)
             })
             .map_err(serializer_err_to_py_err)?;
-        Ok((
-            Revision(rv4.revision),
-            rv4.inventory_id.map(|v| PyBytes::new(py, &v)),
-            rv4.parent_sha1s
-                .into_iter()
-                .map(|s| s.map(|v| PyBytes::new(py, &v)))
-                .collect(),
-        ))
+        build_revision_v4(py, rv4)
     }
 
     fn read_revision<'py>(
         &self,
         py: Python<'py>,
         file: Py<PyAny>,
-    ) -> PyResult<(
-        Revision,
-        Option<Bound<'py, PyBytes>>,
-        Vec<Option<Bound<'py, PyBytes>>>,
-    )> {
+    ) -> PyResult<Bound<'py, RevisionV4>> {
         let mut file = PyBinaryFile::from(file);
         let rv4 = py
             .detach(|| bazaar::xml_serializer::XMLRevisionSerializer4.read_revision(&mut file))
             .map_err(serializer_err_to_py_err)?;
-        Ok((
-            Revision(rv4.revision),
-            rv4.inventory_id.map(|v| PyBytes::new(py, &v)),
-            rv4.parent_sha1s
-                .into_iter()
-                .map(|s| s.map(|v| PyBytes::new(py, &v)))
-                .collect(),
-        ))
+        build_revision_v4(py, rv4)
     }
+}
+
+fn build_revision_v4(
+    py: Python<'_>,
+    rv4: bazaar::xml_serializer::RevisionV4,
+) -> PyResult<Bound<'_, RevisionV4>> {
+    let init = pyo3::PyClassInitializer::from(Revision(rv4.revision)).add_subclass(RevisionV4 {
+        inventory_id: rv4.inventory_id,
+        parent_sha1s: rv4.parent_sha1s,
+    });
+    Bound::new(py, init)
 }
 
 #[pyclass(subclass,extends=RevisionSerializer)]
@@ -742,6 +763,49 @@ impl XMLInventorySerializer8 {
     }
 }
 
+/// CHK-based inventory serializer. Parameterised over the wire format
+/// number, max page size, and search-key name; the on-disk format is
+/// otherwise the same as v8/v10 etc. Surfaces `maximum_size` and
+/// `search_key_name` as Python-readable getters because the original
+/// Python `CHKSerializer` exposed them as instance attributes.
+#[pyclass(subclass, extends = InventorySerializer)]
+struct CHKInventorySerializer {
+    maximum_size: usize,
+    search_key_name: Vec<u8>,
+}
+
+#[pymethods]
+impl CHKInventorySerializer {
+    #[new]
+    fn new(
+        format_num: Vec<u8>,
+        maximum_size: usize,
+        search_key_name: Vec<u8>,
+    ) -> (Self, InventorySerializer) {
+        (
+            CHKInventorySerializer {
+                maximum_size,
+                search_key_name: search_key_name.clone(),
+            },
+            InventorySerializer(Box::new(bazaar::xml_serializer::CHKSerializer::new(
+                format_num,
+                maximum_size,
+                search_key_name,
+            ))),
+        )
+    }
+
+    #[getter]
+    fn maximum_size(&self) -> usize {
+        self.maximum_size
+    }
+
+    #[getter]
+    fn search_key_name<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.search_key_name)
+    }
+}
+
 #[pyfunction(name = "is_null")]
 fn is_null_revision(revision_id: RevisionId) -> bool {
     revision_id.is_null()
@@ -809,6 +873,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m_globbing.add_class::<Replacer>()?;
     m.add_submodule(&m_globbing)?;
     m.add_class::<Revision>()?;
+    m.add_class::<RevisionV4>()?;
     let inventorym = inventory::_inventory_rs(py)?;
     m.add_submodule(&inventorym)?;
     m.add_class::<RevisionSerializer>()?;
@@ -822,6 +887,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<XMLInventorySerializer6>()?;
     m.add_class::<XMLInventorySerializer7>()?;
     m.add_class::<XMLInventorySerializer8>()?;
+    m.add_class::<CHKInventorySerializer>()?;
     m.add(
         "revision_bencode_serializer",
         m.getattr("BEncodeRevisionSerializerv1")?.call0()?,
@@ -835,7 +901,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
         m.getattr("XMLRevisionSerializer5")?.call0()?,
     )?;
     m.add(
-        "_revision_serializer_v4_rs",
+        "revision_serializer_v4",
         m.getattr("XMLRevisionSerializer4")?.call0()?,
     )?;
     m.add(
@@ -857,6 +923,25 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add(
         "inventory_serializer_v8",
         m.getattr("XMLInventorySerializer8")?.call0()?,
+    )?;
+    // CHK inventory serializers: same wire format but parameterised
+    // over format number, max page size, and search-key name. Two
+    // instances are pre-built for the (9, 10) formats currently in use.
+    m.add(
+        "inventory_chk_serializer_255_bigpage_9",
+        m.getattr("CHKInventorySerializer")?.call1((
+            PyBytes::new(py, b"9"),
+            65536u32,
+            PyBytes::new(py, b"hash-255-way"),
+        ))?,
+    )?;
+    m.add(
+        "inventory_chk_serializer_255_bigpage_10",
+        m.getattr("CHKInventorySerializer")?.call1((
+            PyBytes::new(py, b"10"),
+            65536u32,
+            PyBytes::new(py, b"hash-255-way"),
+        ))?,
     )?;
     m.add("CURRENT_REVISION", bazaar::CURRENT_REVISION)?;
     m.add("NULL_REVISION", bazaar::NULL_REVISION)?;

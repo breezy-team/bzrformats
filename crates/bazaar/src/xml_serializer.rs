@@ -916,7 +916,7 @@ const SUPPORTED_KINDS_BASE: &[&str] = &["file", "directory", "symlink"];
 const SUPPORTED_KINDS_WITH_TREE_REF: &[&str] = &["file", "directory", "symlink", "tree-reference"];
 
 impl InventorySerializer for XMLInventorySerializer5 {
-    fn format_num(&self) -> &'static [u8] {
+    fn format_num(&self) -> &[u8] {
         b"5"
     }
 
@@ -959,7 +959,7 @@ impl InventorySerializer for XMLInventorySerializer5 {
 }
 
 impl InventorySerializer for XMLInventorySerializer6 {
-    fn format_num(&self) -> &'static [u8] {
+    fn format_num(&self) -> &[u8] {
         b"6"
     }
 
@@ -993,7 +993,7 @@ impl InventorySerializer for XMLInventorySerializer6 {
 }
 
 impl InventorySerializer for XMLInventorySerializer7 {
-    fn format_num(&self) -> &'static [u8] {
+    fn format_num(&self) -> &[u8] {
         b"7"
     }
 
@@ -1027,7 +1027,7 @@ impl InventorySerializer for XMLInventorySerializer7 {
 }
 
 impl InventorySerializer for XMLInventorySerializer8 {
-    fn format_num(&self) -> &'static [u8] {
+    fn format_num(&self) -> &[u8] {
         b"8"
     }
 
@@ -1057,6 +1057,98 @@ impl InventorySerializer for XMLInventorySerializer8 {
         }
         let elt = parse_inventory_xml_root(&data)?;
         unpack_inventory_flat_v8(&elt, b"8", revision_id)
+    }
+}
+
+/// CHK-based inventory serializer. Same wire format as v8/v10 etc., but
+/// parameterised over format number, max page size and search-key name
+/// because CHK inventories live behind a content-addressable store and
+/// these settings select which on-disk layout is in use.
+///
+/// The plain (non-CHK) flat serializers above implement the
+/// "altered-by" hack — line-by-line regex scanning to discover per-text
+/// revisions. CHK inventories are stored differently (one CHK node per
+/// entry rather than one XML line) so that hack does not apply.
+pub struct CHKSerializer {
+    pub format_num: Vec<u8>,
+    pub maximum_size: usize,
+    pub search_key_name: Vec<u8>,
+}
+
+impl CHKSerializer {
+    pub fn new(format_num: Vec<u8>, maximum_size: usize, search_key_name: Vec<u8>) -> Self {
+        Self {
+            format_num,
+            maximum_size,
+            search_key_name,
+        }
+    }
+}
+
+fn append_chk_root(
+    out: &mut Vec<u8>,
+    format_num: &[u8],
+    inv: &MutableInventory,
+) -> Result<(), Error> {
+    out.extend_from_slice(b"<inventory format=\"");
+    out.extend_from_slice(format_num);
+    out.push(b'"');
+    if let Some(revision_id) = &inv.revision_id {
+        out.extend_from_slice(b" revision_id=\"");
+        out.extend_from_slice(encode_and_escape_bytes(revision_id.as_bytes()).as_bytes());
+        out.push(b'"');
+    }
+    out.extend_from_slice(b">\n");
+
+    // The CHK serializer requires inv.root.revision to be set — unlike
+    // the v8 writer it does not fall back to inv.revision_id.
+    let root = inv
+        .root()
+        .ok_or_else(|| Error::EncodeError("inventory has no root".to_string()))?;
+    let root_revision = root
+        .revision()
+        .ok_or_else(|| Error::EncodeError("inventory root has no revision".to_string()))?;
+    out.extend_from_slice(b"<directory file_id=\"");
+    out.extend_from_slice(encode_and_escape_bytes(root.file_id().as_bytes()).as_bytes());
+    out.extend_from_slice(b"\" name=\"");
+    out.extend_from_slice(encode_and_escape_string(root.name()).as_bytes());
+    out.extend_from_slice(b"\" revision=\"");
+    out.extend_from_slice(encode_and_escape_bytes(root_revision.as_bytes()).as_bytes());
+    out.extend_from_slice(b"\" />\n");
+    Ok(())
+}
+
+impl InventorySerializer for CHKSerializer {
+    fn format_num(&self) -> &[u8] {
+        &self.format_num
+    }
+
+    fn support_altered_by_hack(&self) -> bool {
+        false
+    }
+
+    fn write_inventory_to_lines(
+        &self,
+        inv: &MutableInventory,
+        working: bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        let mut out = Vec::new();
+        append_chk_root(&mut out, &self.format_num, inv)?;
+        serialize_inventory_flat(inv, &mut out, None, SUPPORTED_KINDS_WITH_TREE_REF, working)?;
+        Ok(split_lines_keepends(&out))
+    }
+
+    fn read_inventory_from_lines(
+        &self,
+        lines: &[&[u8]],
+        revision_id: Option<RevisionId>,
+    ) -> Result<MutableInventory, Error> {
+        let mut data = Vec::new();
+        for line in lines {
+            data.extend_from_slice(line);
+        }
+        let elt = parse_inventory_xml_root(&data)?;
+        unpack_inventory_flat_v8(&elt, &self.format_num, revision_id)
     }
 }
 
@@ -1230,7 +1322,7 @@ impl XMLRevisionSerializer4 {
 pub struct XMLInventorySerializer4;
 
 impl InventorySerializer for XMLInventorySerializer4 {
-    fn format_num(&self) -> &'static [u8] {
+    fn format_num(&self) -> &[u8] {
         b"4"
     }
 
@@ -1693,6 +1785,88 @@ mod tests {
         match err {
             Error::DecodeError(msg) => assert!(msg.contains("unknown kind")),
             other => panic!("expected DecodeError, got {:?}", other),
+        }
+    }
+
+    fn chk_sample_inventory() -> MutableInventory {
+        let mut inv = MutableInventory::new();
+        inv.revision_id = Some(RevisionId::from(b"rev_outer".as_slice()));
+        inv.add(Entry::root(
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+        ))
+        .unwrap();
+        inv.add(Entry::directory(
+            FileId::from(b"dir-id".as_slice()),
+            "dir".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+        ))
+        .unwrap();
+        inv.add(Entry::file(
+            FileId::from(b"file-id".as_slice()),
+            "file".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+            Some(b"A".to_vec()),
+            Some(1),
+            Some(false),
+            None,
+        ))
+        .unwrap();
+        inv
+    }
+
+    #[test]
+    fn chk_serializer_format_num_reflects_constructor() {
+        let s = CHKSerializer::new(b"9".to_vec(), 65536, b"hash-255-way".to_vec());
+        assert_eq!(s.format_num(), b"9");
+        assert!(!s.support_altered_by_hack());
+
+        let s10 = CHKSerializer::new(b"10".to_vec(), 65536, b"hash-255-way".to_vec());
+        assert_eq!(s10.format_num(), b"10");
+    }
+
+    #[test]
+    fn chk_serializer_roundtrip_v9() {
+        let s = CHKSerializer::new(b"9".to_vec(), 65536, b"hash-255-way".to_vec());
+        let inv = chk_sample_inventory();
+        let out = s.write_inventory_to_string(&inv, false).unwrap();
+        // CHK header uses the configured format number rather than v8's "8".
+        assert!(out.starts_with(b"<inventory format=\"9\" "));
+        let inv2 = s.read_inventory_from_lines(&[&out], None).unwrap();
+        assert_eq!(inv, inv2);
+    }
+
+    #[test]
+    fn chk_serializer_rejects_mismatched_format() {
+        let s9 = CHKSerializer::new(b"9".to_vec(), 65536, b"hash-255-way".to_vec());
+        let s10 = CHKSerializer::new(b"10".to_vec(), 65536, b"hash-255-way".to_vec());
+        let inv = chk_sample_inventory();
+        let v9_bytes = s9.write_inventory_to_string(&inv, false).unwrap();
+        // Reading v9-shaped bytes with the v10 serializer must fail with a
+        // format-version mismatch.
+        let err = s10
+            .read_inventory_from_lines(&[&v9_bytes], None)
+            .unwrap_err();
+        match err {
+            Error::UnexpectedInventoryFormat(_) => {}
+            other => panic!("expected UnexpectedInventoryFormat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn chk_serializer_root_without_revision_errors() {
+        let s = CHKSerializer::new(b"9".to_vec(), 65536, b"hash-255-way".to_vec());
+        let mut inv = MutableInventory::new();
+        inv.revision_id = Some(RevisionId::from(b"rev_outer".as_slice()));
+        // Root has no revision — CHK requires one.
+        inv.add(Entry::root(FileId::from(b"root".as_slice()), None))
+            .unwrap();
+        let err = s.write_inventory_to_string(&inv, false).unwrap_err();
+        match err {
+            Error::EncodeError(msg) => assert!(msg.contains("root has no revision")),
+            other => panic!("expected EncodeError, got {:?}", other),
         }
     }
 }

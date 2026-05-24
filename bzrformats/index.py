@@ -101,72 +101,8 @@ def _missing_keys_from_parent_map(self, keys):
     return set(keys) - set(self.get_parent_map(keys))
 
 
-_RustGraphIndexBuilder = _index_rs.GraphIndexBuilder
-_RustGraphIndex = _index_rs.GraphIndex
-_RustInMemoryGraphIndex = _index_rs.InMemoryGraphIndex
-_RustCombinedGraphIndex = _index_rs.CombinedGraphIndex
-_RustGraphIndexPrefixAdapter = _index_rs.GraphIndexPrefixAdapter
-
-
-def _wrap_iter(rust_method):
-    """Wrap a Rust pyclass iter_* method to return a generator.
-
-    Many callers rely on the validity checks (`BadIndexKey` etc.) firing
-    only when the caller actually iterates the result, matching the
-    historical Python generator semantics.
-    """
-
-    def wrapper(self, *args, **kwargs):
-        yield from rust_method(self, *args, **kwargs)
-
-    wrapper.__name__ = rust_method.__name__
-    return wrapper
-
-
-class GraphIndexBuilder(_RustGraphIndexBuilder):
-    """A builder that can build a GraphIndex.
-
-    See the Rust implementation for the file format.
-    """
-
-    iter_all_entries = _wrap_iter(_RustGraphIndexBuilder.iter_all_entries)
-    iter_entries = _wrap_iter(_RustGraphIndexBuilder.iter_entries)
-    iter_entries_prefix = _wrap_iter(_RustGraphIndexBuilder.iter_entries_prefix)
-
-
-class GraphIndex(_RustGraphIndex):
-    """Python facade over the pyo3-implemented graph index reader."""
-
-    iter_entries_prefix = _wrap_iter(_RustGraphIndex.iter_entries_prefix)
-    iter_entries = _wrap_iter(_RustGraphIndex.iter_entries)
-    iter_all_entries = _wrap_iter(_RustGraphIndex.iter_all_entries)
-
-
-class InMemoryGraphIndex(_RustInMemoryGraphIndex):
-    """A GraphIndex which operates entirely out of memory and is mutable."""
-
-    iter_all_entries = _wrap_iter(_RustInMemoryGraphIndex.iter_all_entries)
-    iter_entries = _wrap_iter(_RustInMemoryGraphIndex.iter_entries)
-    iter_entries_prefix = _wrap_iter(_RustInMemoryGraphIndex.iter_entries_prefix)
-
-    def __lt__(self, other):
-        """Order InMemoryGraphIndex relative to GraphIndex by hash."""
-        if not isinstance(other, (GraphIndex, InMemoryGraphIndex)):
-            raise TypeError(other)
-        return hash(self) < hash(other)
-
-
-class CombinedGraphIndex(_RustCombinedGraphIndex):
-    """A GraphIndex made up from smaller GraphIndices."""
-
-    iter_all_entries = _wrap_iter(_RustCombinedGraphIndex.iter_all_entries)
-    iter_entries = _wrap_iter(_RustCombinedGraphIndex.iter_entries)
-    iter_entries_prefix = _wrap_iter(_RustCombinedGraphIndex.iter_entries_prefix)
-
-
-class GraphIndexPrefixAdapter(_RustGraphIndexPrefixAdapter):
-    """Adapter that prefixes/strips a key prefix on every call."""
-
-    iter_all_entries = _wrap_iter(_RustGraphIndexPrefixAdapter.iter_all_entries)
-    iter_entries = _wrap_iter(_RustGraphIndexPrefixAdapter.iter_entries)
-    iter_entries_prefix = _wrap_iter(_RustGraphIndexPrefixAdapter.iter_entries_prefix)
+GraphIndexBuilder = _index_rs.GraphIndexBuilder
+GraphIndex = _index_rs.GraphIndex
+InMemoryGraphIndex = _index_rs.InMemoryGraphIndex
+CombinedGraphIndex = _index_rs.CombinedGraphIndex
+GraphIndexPrefixAdapter = _index_rs.GraphIndexPrefixAdapter
