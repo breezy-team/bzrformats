@@ -2544,12 +2544,17 @@ impl PyDirState {
     fn update_basis_by_delta(
         &mut self,
         py: Python<'_>,
-        delta: &crate::inventory::InventoryDelta,
+        delta: Bound<'_, crate::inventory::InventoryDelta>,
         new_revid: Vec<u8>,
     ) -> PyResult<()> {
+        // The Python wrapper used to call delta.check() and delta.sort()
+        // before forwarding; do them here so the binding stays plumbing.
+        delta.borrow().check(py)?;
+        delta.borrow_mut().sort();
+        let delta_ref = delta.borrow();
         match self
             .inner
-            .update_basis_by_delta_from_inventory_delta(&delta.0, new_revid)
+            .update_basis_by_delta_from_inventory_delta(&delta_ref.0, new_revid)
         {
             Ok(()) => {
                 self.refresh_cached_id_index(py);
@@ -2569,14 +2574,24 @@ impl PyDirState {
     fn update_by_delta(
         &mut self,
         py: Python<'_>,
-        delta: &crate::inventory::InventoryDelta,
+        delta: Bound<'_, crate::inventory::InventoryDelta>,
     ) -> PyResult<()> {
-        match self.inner.update_by_delta_from_inventory_delta(&delta.0) {
+        // The Python wrapper used to call delta.check() and delta.sort()
+        // before forwarding; do them here so the binding stays plumbing.
+        delta.borrow().check(py)?;
+        delta.borrow_mut().sort();
+        let delta_ref = delta.borrow();
+        match self
+            .inner
+            .update_by_delta_from_inventory_delta(&delta_ref.0)
+        {
             Ok(()) => {
+                drop(delta_ref);
                 self.refresh_cached_id_index(py);
                 Ok(())
             }
             Err(e) => {
+                drop(delta_ref);
                 self.inner.changes_aborted = true;
                 Err(self.raise_basis_apply_error(py, e))
             }

@@ -803,8 +803,6 @@ class DirState:
             details.
         """
         self._read_dirblocks_if_needed()
-        delta.check()
-        delta.sort()
         self._rs.update_by_delta(delta)
 
     def _apply_removals(self, removals):
@@ -829,8 +827,6 @@ class DirState:
             the changes from the current left most parent revision to new_revid.
         """
         self._read_dirblocks_if_needed()
-        delta.check()
-        delta.sort()
         self._rs.update_basis_by_delta(delta, new_revid)
 
     def _check_delta_ids_absent(self, new_ids, tree_index):
