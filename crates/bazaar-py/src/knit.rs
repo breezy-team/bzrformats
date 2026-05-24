@@ -9,7 +9,7 @@ use bazaar::knit::{
     KnitRecordDetails, PlainKnitContent,
 };
 use bazaar::transport::Transport as _;
-use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::cell::RefCell;
@@ -57,153 +57,63 @@ fn retry_on_new_packs<T>(
     }
 }
 
-/// Parse a knit index record line into its components.
-///
-/// Each line has the format: `version_id options pos size parent1 parent2 ... :`
-/// Returns None if the line is incomplete/corrupt.
-fn process_one_record<'py>(
-    py: Python<'py>,
-    line: &[u8],
-    history: &Bound<'py, PyList>,
-    history_len: &mut i64,
-    cache: &Bound<'py, PyDict>,
-) -> PyResult<bool> {
-    // Split the line by spaces
-    let fields: Vec<&[u8]> = line.split(|&b| b == b' ').collect();
-
-    // Need at least 5 fields: version_id options pos size ... :
-    if fields.len() < 5 || fields[fields.len() - 1] != b":" {
-        return Ok(false);
-    }
-
-    let version_id = PyBytes::new(py, fields[0]);
-    let options: Vec<Bound<'py, PyBytes>> = fields[1]
-        .split(|&b| b == b',')
-        .map(|opt| PyBytes::new(py, opt))
-        .collect();
-    let options_list = PyList::new(py, &options)?;
-
-    let pos_str = std::str::from_utf8(fields[2])
-        .map_err(|_| PyValueError::new_err(format!("{:?} is not a valid integer", fields[2])))?;
-    let pos: i64 = pos_str
-        .parse()
-        .map_err(|_| PyValueError::new_err(format!("{:?} is not a valid integer", pos_str)))?;
-
-    let size_str = std::str::from_utf8(fields[3])
-        .map_err(|_| PyValueError::new_err(format!("{:?} is not a valid integer", fields[3])))?;
-    let size: i64 = size_str
-        .parse()
-        .map_err(|_| PyValueError::new_err(format!("{:?} is not a valid integer", size_str)))?;
-
-    // Parse parents (fields[4..len-1], skipping the trailing ":")
-    // Skip empty fields (from consecutive spaces)
-    let mut parents: Vec<Bound<'py, PyBytes>> = Vec::new();
-    for &parent_field in &fields[4..fields.len() - 1] {
-        if parent_field.is_empty() {
-            continue;
-        }
-        if parent_field.first() == Some(&b'.') {
-            // Explicit revision id (skip the leading '.')
-            parents.push(PyBytes::new(py, &parent_field[1..]));
-        } else {
-            let idx_str = std::str::from_utf8(parent_field).map_err(|_| {
-                PyValueError::new_err(format!("{:?} is not a valid integer", parent_field))
-            })?;
-            let idx: i64 = idx_str.parse().map_err(|_| {
-                PyValueError::new_err(format!("{:?} is not a valid integer", idx_str))
-            })?;
-            if idx >= *history_len {
-                return Err(PyIndexError::new_err(format!(
-                    "Parent index refers to a revision which does not exist yet. {} > {}",
-                    idx, *history_len
-                )));
-            }
-            let parent = history.get_item(idx as usize)?;
-            parents.push(parent.cast_into::<PyBytes>()?);
-        }
-    }
-    let parents_tuple = PyTuple::new(py, &parents)?;
-
-    // Check if version_id is already in cache
-    let index: i64;
-    if let Some(existing) = cache.get_item(&version_id)? {
-        let existing_tuple = existing.cast_into::<PyTuple>()?;
-        index = existing_tuple.get_item(5)?.extract()?;
-    } else {
-        history.append(&version_id)?;
-        index = *history_len;
-        *history_len += 1;
-    }
-
-    let pos_obj = pos.into_pyobject(py)?;
-    let size_obj = size.into_pyobject(py)?;
-    let index_obj = index.into_pyobject(py)?;
-    let entry = PyTuple::new(
-        py,
-        &[
-            version_id.as_any(),
-            options_list.as_any(),
-            pos_obj.as_any(),
-            size_obj.as_any(),
-            parents_tuple.as_any(),
-            index_obj.as_any(),
-        ],
-    )?;
-    cache.set_item(&version_id, &entry)?;
-
-    Ok(true)
-}
-
 /// Load the knit index file into memory.
 ///
 /// Successor to the Cython `_load_data_c`; the `_c` suffix is dropped
-/// because the Rust extension is no longer C-shaped.
+/// because the Rust extension is no longer C-shaped. Delegates parsing
+/// to the pure-crate `parse_kndx_body` and only marshals the resulting
+/// cache + history into the Python `_KndxIndex` instance.
 #[pyfunction]
 pub fn _load_data(py: Python, kndx: &Bound<PyAny>, fp: &Bound<PyAny>) -> PyResult<()> {
-    let cache = kndx.getattr("_cache")?;
-    let cache = cache.cast_into::<PyDict>()?;
-    let history = kndx.getattr("_history")?;
-    let history = history.cast_into::<PyList>()?;
+    let cache = kndx.getattr("_cache")?.cast_into::<PyDict>()?;
+    let history = kndx.getattr("_history")?.cast_into::<PyList>()?;
 
-    // Call kndx.check_header(fp)
     kndx.call_method1("check_header", (fp,))?;
 
-    // Read the entire file content
     let text = fp.call_method0("read")?;
-    let text_bytes = text.cast_into::<PyBytes>()?;
-    let data = text_bytes.as_bytes();
-
-    let mut history_len = history.len() as i64;
-
-    let filename = kndx.getattr("_filename")?;
-
-    // Process line by line
-    for line in data.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
+    let body = text.cast_into::<PyBytes>()?;
+    let parsed = bazaar::knit::parse_kndx_body(body.as_bytes()).map_err(|e| match e {
+        bazaar::knit::KnitError::KndxCorrupt { line, detail } => {
+            let filename = kndx
+                .getattr("_filename")
+                .map(|f| f.unbind())
+                .unwrap_or_else(|_| py.None());
+            let py_line = PyBytes::new(py, &line);
+            KnitCorrupt::new_err((filename, format!("line {:?}: {}", py_line, detail)))
         }
-        // Strip trailing \r if present
-        let line = if line.last() == Some(&b'\r') {
-            &line[..line.len() - 1]
-        } else {
-            line
-        };
-        if line.is_empty() {
-            continue;
-        }
+        other => knit_err_to_py(other),
+    })?;
 
-        match process_one_record(py, line, &history, &mut history_len, &cache) {
-            Ok(_) => {}
-            Err(e) => {
-                // Wrap ValueError/IndexError in KnitCorrupt
-                if e.is_instance_of::<PyValueError>(py) || e.is_instance_of::<PyIndexError>(py) {
-                    let py_line = PyBytes::new(py, line);
-                    let how = format!("line {:?}: {}", py_line, e);
-                    return Err(KnitCorrupt::new_err((filename.clone().unbind(), how)));
-                }
-                return Err(e);
-            }
-        }
+    // Append the freshly-seen history entries (parse_kndx_body builds a
+    // fresh history; merge so the Python list stays append-only across
+    // multiple loads).
+    let base = history.len();
+    for v in &parsed.history {
+        history.append(PyBytes::new(py, v))?;
+    }
+    for entry in parsed.cache.values() {
+        let version_id = PyBytes::new(py, &entry.version_id);
+        let options: Vec<Bound<PyBytes>> =
+            entry.options.iter().map(|o| PyBytes::new(py, o)).collect();
+        let options_list = PyList::new(py, &options)?;
+        let parents: Vec<Bound<PyBytes>> =
+            entry.parents.iter().map(|p| PyBytes::new(py, p)).collect();
+        let parents_tuple = PyTuple::new(py, &parents)?;
+        let index_obj = ((base + entry.index) as i64).into_pyobject(py)?;
+        let pos_obj = (entry.pos as i64).into_pyobject(py)?;
+        let size_obj = (entry.size as i64).into_pyobject(py)?;
+        let tuple = PyTuple::new(
+            py,
+            &[
+                version_id.as_any(),
+                options_list.as_any(),
+                pos_obj.as_any(),
+                size_obj.as_any(),
+                parents_tuple.as_any(),
+                index_obj.as_any(),
+            ],
+        )?;
+        cache.set_item(&version_id, &tuple)?;
     }
 
     Ok(())

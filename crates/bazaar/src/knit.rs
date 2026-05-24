@@ -3461,16 +3461,23 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KndxIndex<T, 
 /// does not start with `KNDX_HEADER`. Returns `Ok` with an empty cache for
 /// an empty file, and `Ok` with the parsed entries otherwise.
 pub fn parse_kndx_data(data: &[u8]) -> Result<KndxPrefixCache, KnitError> {
-    let mut pc = KndxPrefixCache::default();
     if data.is_empty() {
-        return Ok(pc);
+        return Ok(KndxPrefixCache::default());
     }
     if !data.starts_with(KNDX_HEADER) {
         return Err(KnitError::BadKnitHeader {
             path: "<kndx>".to_string(),
         });
     }
-    let rest = &data[KNDX_HEADER.len()..];
+    parse_kndx_body(&data[KNDX_HEADER.len()..])
+}
+
+/// Parse just the body of a kndx file (everything after [`KNDX_HEADER`]).
+///
+/// Use this when the caller has already consumed and validated the header,
+/// e.g. after a streaming `check_header(fp)` call.
+pub fn parse_kndx_body(rest: &[u8]) -> Result<KndxPrefixCache, KnitError> {
+    let mut pc = KndxPrefixCache::default();
     for line in rest.split(|&b| b == b'\n') {
         let line = line.strip_prefix(b"\r").unwrap_or(line);
         let line = if line.first() == Some(&b'\n') {
