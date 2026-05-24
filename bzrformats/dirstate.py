@@ -806,10 +806,10 @@ class DirState:
         self._rs.update_by_delta(delta)
 
     def _apply_removals(self, removals):
-        self._rs.apply_removals(list(removals))
+        self._rs.apply_removals(removals)
 
     def _apply_insertions(self, adds):
-        self._rs.apply_insertions(list(adds))
+        self._rs.apply_insertions(adds)
 
     def update_basis_by_delta(self, delta, new_revid):
         """Update the parents of this tree after a commit.
