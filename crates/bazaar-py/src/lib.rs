@@ -323,6 +323,38 @@ impl Revision {
     }
 }
 
+/// Revision plus the v4-only metadata recovered by
+/// [`XMLRevisionSerializer4`]. Subclasses [`Revision`] so it exposes
+/// all the usual revision attributes and is `isinstance(_, Revision)`.
+#[pyclass(extends = Revision)]
+struct RevisionV4 {
+    inventory_id: Option<Vec<u8>>,
+    parent_sha1s: Vec<Option<Vec<u8>>>,
+}
+
+#[pymethods]
+impl RevisionV4 {
+    #[getter]
+    fn inventory_id<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
+        match &self.inventory_id {
+            Some(v) => PyBytes::new(py, v).into_any(),
+            None => py.None().into_bound(py),
+        }
+    }
+
+    #[getter]
+    fn parent_sha1s<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let out = pyo3::types::PyList::empty(py);
+        for entry in &self.parent_sha1s {
+            match entry {
+                Some(v) => out.append(PyBytes::new(py, v))?,
+                None => out.append(py.None())?,
+            }
+        }
+        Ok(out.into_any())
+    }
+}
+
 fn serializer_err_to_py_err(e: bazaar::serializer::Error) -> PyErr {
     PyRuntimeError::new_err(format!("serializer error: {:?}", e))
 }
@@ -388,48 +420,37 @@ impl XMLRevisionSerializer4 {
         &self,
         py: Python<'py>,
         text: &[u8],
-    ) -> PyResult<(
-        Revision,
-        Option<Bound<'py, PyBytes>>,
-        Vec<Option<Bound<'py, PyBytes>>>,
-    )> {
+    ) -> PyResult<Bound<'py, RevisionV4>> {
         let rv4 = py
             .detach(|| {
                 bazaar::xml_serializer::XMLRevisionSerializer4.read_revision_from_string(text)
             })
             .map_err(serializer_err_to_py_err)?;
-        Ok((
-            Revision(rv4.revision),
-            rv4.inventory_id.map(|v| PyBytes::new(py, &v)),
-            rv4.parent_sha1s
-                .into_iter()
-                .map(|s| s.map(|v| PyBytes::new(py, &v)))
-                .collect(),
-        ))
+        build_revision_v4(py, rv4)
     }
 
     fn read_revision<'py>(
         &self,
         py: Python<'py>,
         file: Py<PyAny>,
-    ) -> PyResult<(
-        Revision,
-        Option<Bound<'py, PyBytes>>,
-        Vec<Option<Bound<'py, PyBytes>>>,
-    )> {
+    ) -> PyResult<Bound<'py, RevisionV4>> {
         let mut file = PyBinaryFile::from(file);
         let rv4 = py
             .detach(|| bazaar::xml_serializer::XMLRevisionSerializer4.read_revision(&mut file))
             .map_err(serializer_err_to_py_err)?;
-        Ok((
-            Revision(rv4.revision),
-            rv4.inventory_id.map(|v| PyBytes::new(py, &v)),
-            rv4.parent_sha1s
-                .into_iter()
-                .map(|s| s.map(|v| PyBytes::new(py, &v)))
-                .collect(),
-        ))
+        build_revision_v4(py, rv4)
     }
+}
+
+fn build_revision_v4(
+    py: Python<'_>,
+    rv4: bazaar::xml_serializer::RevisionV4,
+) -> PyResult<Bound<'_, RevisionV4>> {
+    let init = pyo3::PyClassInitializer::from(Revision(rv4.revision)).add_subclass(RevisionV4 {
+        inventory_id: rv4.inventory_id,
+        parent_sha1s: rv4.parent_sha1s,
+    });
+    Bound::new(py, init)
 }
 
 #[pyclass(subclass,extends=RevisionSerializer)]
@@ -809,6 +830,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m_globbing.add_class::<Replacer>()?;
     m.add_submodule(&m_globbing)?;
     m.add_class::<Revision>()?;
+    m.add_class::<RevisionV4>()?;
     let inventorym = inventory::_inventory_rs(py)?;
     m.add_submodule(&inventorym)?;
     m.add_class::<RevisionSerializer>()?;
@@ -835,7 +857,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
         m.getattr("XMLRevisionSerializer5")?.call0()?,
     )?;
     m.add(
-        "_revision_serializer_v4_rs",
+        "revision_serializer_v4",
         m.getattr("XMLRevisionSerializer4")?.call0()?,
     )?;
     m.add(
