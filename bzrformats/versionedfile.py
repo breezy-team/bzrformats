@@ -239,100 +239,21 @@ def filter_absent(record_stream):
 
 
 class _MPDiffGenerator:
-    """Pull out the functionality for generating mp_diffs."""
+    """Pull out the functionality for generating mp_diffs.
+
+    Thin shim over the pure-Rust `make_mpdiffs` orchestrator. The Rust
+    side walks `vf.get_parent_map` and `vf.get_record_stream`, builds the
+    refcount-released parent cache, and returns one `MultiParent` per
+    input key.
+    """
 
     def __init__(self, vf, keys):
         self.vf = vf
-        # This is the order the keys were requested in
         self.ordered_keys = tuple(keys)
-        # keys + their parents, what we need to compute the diffs
-        self.needed_keys = ()
-        # Map from key: mp_diff
-        self.diffs = {}
-        # Map from key: parents_needed (may have ghosts)
-        self.parent_map = {}
-        # Parents that aren't present
-        self.ghost_parents = ()
-        # Map from parent_key => number of children for this text
-        self.refcounts = {}
-        # Content chunks that are cached while we still need them
-        self.chunks = {}
-
-    def _find_needed_keys(self):
-        """Find the set of keys we need to request.
-
-        This includes all the original keys passed in, and the non-ghost
-        parents of those keys.
-
-        :return: (needed_keys, refcounts)
-            needed_keys is the set of all texts we need to extract
-            refcounts is a dict of {key: num_children} letting us know when we
-                no longer need to cache a given parent text
-        """
-        parent_map = self.vf.get_parent_map(set(self.ordered_keys))
-        self.parent_map = parent_map
-        needed_keys, refcounts, just_parents, missing_keys = (
-            _versionedfile_rs.mpdiff_first_pass(self.ordered_keys, parent_map)
-        )
-        if missing_keys:
-            raise RevisionNotPresent(next(iter(missing_keys)), self.vf)
-        # Remove any parents that are actually ghosts from the needed set
-        self.present_parents = set(self.vf.get_parent_map(just_parents))
-        self.ghost_parents = just_parents.difference(self.present_parents)
-        needed_keys.difference_update(self.ghost_parents)
-        self.needed_keys = needed_keys
-        self.refcounts = refcounts
-        return needed_keys, refcounts
-
-    def _compute_diff(self, key, parent_lines, lines):
-        """Compute a single mp_diff, and store it in self._diffs."""
-        if len(parent_lines) > 0:
-            # XXX: _extract_blocks is not usefully defined anywhere...
-            #      It was meant to extract the left-parent diff without
-            #      having to recompute it for Knit content (pack-0.92,
-            #      etc). That seems to have regressed somewhere
-            left_parent_blocks = self.vf._extract_blocks(key, parent_lines[0], lines)
-        else:
-            left_parent_blocks = None
-        diff = multiparent.MultiParent.from_lines(
-            lines, parent_lines, left_parent_blocks
-        )
-        self.diffs[key] = diff
-
-    def _process_one_record(self, key, this_chunks):
-        parent_keys = None
-        if key in self.parent_map:
-            # This record should be ready to diff, since we requested
-            # content in 'topological' order
-            parent_keys = self.parent_map.pop(key)
-            # If a VersionedFile claims 'no-graph' support, then it may return
-            # None for any parent request, so we replace it with an empty tuple
-            if parent_keys is None:
-                parent_keys = ()
-            parent_chunks_list = _versionedfile_rs.mpdiff_collect_parent_chunks(
-                parent_keys, self.ghost_parents, self.refcounts, self.chunks
-            )
-            parent_lines = [osutils.chunks_to_lines(pc) for pc in parent_chunks_list]
-            lines = osutils.chunks_to_lines(this_chunks)
-            # Since we needed the lines, we'll go ahead and cache them this way
-            this_chunks = lines
-            self._compute_diff(key, parent_lines, lines)
-            del lines
-        # Is this content required for any more children?
-        if key in self.refcounts:
-            self.chunks[key] = this_chunks
-
-    def _extract_diffs(self):
-        needed_keys, _refcounts = self._find_needed_keys()
-        for record in self.vf.get_record_stream(needed_keys, "topological", True):
-            if record.storage_kind == "absent":
-                raise RevisionNotPresent(record.key, self.vf)
-            self._process_one_record(record.key, record.get_bytes_as("chunked"))
 
     def compute_diffs(self):
-        self._extract_diffs()
-        dpop = self.diffs.pop
-        return [dpop(k) for k in self.ordered_keys]
+        """Return one `MultiParent` per ordered key, in input order."""
+        return list(_versionedfile_rs.make_mpdiffs(self.vf, self.ordered_keys))
 
 
 class VersionedFile:

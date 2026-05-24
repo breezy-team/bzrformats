@@ -1240,6 +1240,148 @@ pub fn add_mpdiffs_prepare(
         .collect()
 }
 
+/// Generate multi-parent diffs for `ordered_keys`, in input order.
+///
+/// Mirrors `bzrformats.versionedfile._MPDiffGenerator.compute_diffs`. The
+/// generator pulls every key's text (and its non-ghost parents' texts) out
+/// of `vf` via `get_record_stream`, then walks the stream in topological
+/// order, refcount-releasing parent cache entries as soon as no children
+/// still need them, and computes one [`crate::multiparent::MultiParent`]
+/// per ordered key.
+pub fn make_mpdiffs(
+    vf: &dyn VersionedFiles,
+    ordered_keys: &[Key],
+) -> Result<Vec<crate::multiparent::MultiParent>, crate::knit::KnitError> {
+    let parent_map = vf.get_parent_map(ordered_keys)?;
+
+    let mut missing_keys: Vec<Key> = Vec::new();
+    for k in ordered_keys {
+        if !parent_map.contains_key(k) {
+            missing_keys.push(k.clone());
+        }
+    }
+    if let Some(first) = missing_keys.into_iter().next() {
+        return Err(crate::knit::KnitError::RevisionNotPresent(
+            first.segments().to_vec(),
+        ));
+    }
+
+    // Refcounts and just_parents track which texts we still need to keep
+    // cached so we can pop them as soon as the last child has consumed
+    // them. just_parents is the set of parents that aren't themselves in
+    // ordered_keys (so we have to look them up to distinguish present from
+    // ghost).
+    let mut needed_keys: std::collections::HashSet<Key> = ordered_keys.iter().cloned().collect();
+    let mut refcounts: std::collections::HashMap<Key, usize> = std::collections::HashMap::new();
+    let mut just_parents: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    for parents in parent_map.values() {
+        if parents.is_empty() {
+            continue;
+        }
+        for p in parents {
+            just_parents.insert(p.clone());
+            needed_keys.insert(p.clone());
+            *refcounts.entry(p.clone()).or_insert(0) += 1;
+        }
+    }
+    // just_parents = parents that aren't already in parent_map.
+    just_parents.retain(|p| !parent_map.contains_key(p));
+
+    // Distinguish ghost parents (not present in storage) from real ones; we
+    // only need to fetch the real ones.
+    let just_parents_vec: Vec<Key> = just_parents.iter().cloned().collect();
+    let present_parents = vf.get_parent_map(&just_parents_vec)?;
+    let ghost_parents: std::collections::HashSet<Key> = just_parents
+        .iter()
+        .filter(|p| !present_parents.contains_key(*p))
+        .cloned()
+        .collect();
+    for g in &ghost_parents {
+        needed_keys.remove(g);
+    }
+
+    // Keep parent_map mutable so we can pop entries as we process them
+    // (mirrors Python's `self.parent_map.pop(key)`).
+    let mut parent_map = parent_map;
+    let mut chunks_cache: std::collections::HashMap<Key, Vec<Vec<u8>>> =
+        std::collections::HashMap::new();
+    let mut diffs: std::collections::HashMap<Key, crate::multiparent::MultiParent> =
+        std::collections::HashMap::new();
+
+    let needed_keys_vec: Vec<Key> = needed_keys.into_iter().collect();
+    let stream = vf.get_record_stream(&needed_keys_vec, "topological", true)?;
+    for rec in stream {
+        let rec = rec?;
+        if rec.storage_kind() == "absent" {
+            return Err(crate::knit::KnitError::RevisionNotPresent(
+                rec.key().segments().to_vec(),
+            ));
+        }
+        let key = rec.key();
+        let this_lines: Vec<Vec<u8>> = rec.to_lines().map(|c| c.into_owned()).collect();
+
+        let cache_this = refcounts.contains_key(&key);
+
+        if let Some(parents) = parent_map.remove(&key) {
+            // Collect parent line lists in original order, popping cache
+            // entries whose refcount drops to zero.
+            let mut parent_lines: Vec<Vec<Vec<u8>>> = Vec::with_capacity(parents.len());
+            for p in &parents {
+                if ghost_parents.contains(p) {
+                    continue;
+                }
+                let count = refcounts.get_mut(p).ok_or_else(|| {
+                    crate::knit::KnitError::Corrupt(format!(
+                        "make_mpdiffs: missing refcount for {:?}",
+                        p
+                    ))
+                })?;
+                if *count == 1 {
+                    refcounts.remove(p);
+                    let cached = chunks_cache.remove(p).ok_or_else(|| {
+                        crate::knit::KnitError::Corrupt(format!(
+                            "make_mpdiffs: missing cached chunks for {:?}",
+                            p
+                        ))
+                    })?;
+                    parent_lines.push(cached);
+                } else {
+                    *count -= 1;
+                    let cached = chunks_cache.get(p).cloned().ok_or_else(|| {
+                        crate::knit::KnitError::Corrupt(format!(
+                            "make_mpdiffs: missing cached chunks for {:?}",
+                            p
+                        ))
+                    })?;
+                    parent_lines.push(cached);
+                }
+            }
+            let parent_refs: Vec<&[Vec<u8>]> = parent_lines.iter().map(Vec::as_slice).collect();
+            let diff = crate::multiparent::MultiParent::from_lines(&this_lines, &parent_refs, None);
+            diffs.insert(key.clone(), diff);
+        }
+
+        if cache_this {
+            chunks_cache.insert(key, this_lines);
+        }
+    }
+
+    // Emit results in the original input order.
+    let mut out: Vec<crate::multiparent::MultiParent> = Vec::with_capacity(ordered_keys.len());
+    for k in ordered_keys {
+        match diffs.remove(k) {
+            Some(d) => out.push(d),
+            None => {
+                return Err(crate::knit::KnitError::Corrupt(format!(
+                    "make_mpdiffs: never produced a diff for {:?}",
+                    k
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

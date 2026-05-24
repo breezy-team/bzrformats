@@ -261,131 +261,6 @@ fn check_lines_are_lines(lines: Vec<Vec<u8>>) -> PyResult<()> {
     }
 }
 
-/// First pass of `_MPDiffGenerator._find_needed_keys`: from `ordered_keys` plus
-/// the parent map for those keys, derive:
-///
-/// * `needed_keys` – ordered_keys ∪ all parent keys (may include ghosts)
-/// * `refcounts`   – {parent_key: child_count} over the same parents
-/// * `just_parents` – parent_keys \ keys-present-in-parent_map (i.e. parents
-///   that themselves still need to be looked up to distinguish ghosts)
-/// * `missing_keys` – ordered_keys that are not present in parent_map; the
-///   caller raises `RevisionNotPresent` with its own `vf` reference.
-///
-/// Mirrors the pure set/dict bookkeeping in `versionedfile._MPDiffGenerator`.
-/// Does not touch the VersionedFile – the caller handles the two
-/// `vf.get_parent_map` round trips and the ghost subtraction afterwards.
-#[pyfunction]
-fn mpdiff_first_pass<'py>(
-    py: Python<'py>,
-    ordered_keys: &Bound<'py, PyAny>,
-    parent_map: &Bound<'py, PyDict>,
-) -> PyResult<(
-    Bound<'py, PySet>,
-    Bound<'py, PyDict>,
-    Bound<'py, PySet>,
-    Bound<'py, PySet>,
-)> {
-    let needed_keys = PySet::empty(py)?;
-    for k in ordered_keys.try_iter()? {
-        needed_keys.add(k?)?;
-    }
-
-    // `needed_keys.difference(parent_map)` — returned to the caller so it can
-    // raise `RevisionNotPresent(first, vf)` with its own vf reference.
-    let missing_keys = PySet::empty(py)?;
-    for k in needed_keys.iter() {
-        if !parent_map.contains(&k)? {
-            missing_keys.add(k)?;
-        }
-    }
-
-    let refcounts = PyDict::new(py);
-    let just_parents = PySet::empty(py)?;
-    for (_child_key, parent_keys) in parent_map.iter() {
-        if parent_keys.is_none() {
-            continue;
-        }
-        // `if not parent_keys` also covers the empty-tuple case.
-        if parent_keys.len().unwrap_or(0) == 0 {
-            continue;
-        }
-        for p in parent_keys.try_iter()? {
-            let p = p?;
-            just_parents.add(&p)?;
-            needed_keys.add(&p)?;
-            let new_count = match refcounts.get_item(&p)? {
-                Some(existing) => existing.extract::<i64>()? + 1,
-                None => 1,
-            };
-            refcounts.set_item(&p, new_count)?;
-        }
-    }
-
-    // just_parents.difference_update(parent_map): drop any parent that is
-    // itself a key in parent_map (i.e. already known to be present).
-    let to_remove: Vec<Py<PyAny>> = just_parents
-        .iter()
-        .filter_map(|p| match parent_map.contains(&p) {
-            Ok(true) => Some(Ok(p.unbind())),
-            Ok(false) => None,
-            Err(e) => Some(Err(e)),
-        })
-        .collect::<PyResult<_>>()?;
-    for p in to_remove {
-        just_parents.discard(p.bind(py))?;
-    }
-
-    Ok((needed_keys, refcounts, just_parents, missing_keys))
-}
-
-/// Release satisfied parents for `_MPDiffGenerator._process_one_record`.
-///
-/// For each non-ghost parent key, decrement its refcount in `refcounts`. When
-/// the refcount reaches zero, pop the cached value from `chunks` (last child);
-/// otherwise fetch (not pop) the still-shared cached value. Returns the list
-/// of parent cached values in the original order, ready for the caller to run
-/// `osutils.chunks_to_lines` and `_compute_diff`.
-///
-/// Mutates `refcounts` and `chunks` in place. The caller is responsible for
-/// the per-record `this_chunks` cache write after diffing.
-#[pyfunction]
-fn mpdiff_collect_parent_chunks<'py>(
-    py: Python<'py>,
-    parent_keys: &Bound<'py, PyAny>,
-    ghost_parents: &Bound<'py, PySet>,
-    refcounts: &Bound<'py, PyDict>,
-    chunks: &Bound<'py, PyDict>,
-) -> PyResult<Py<PyAny>> {
-    let out = pyo3::types::PyList::empty(py);
-    for p in parent_keys.try_iter()? {
-        let p = p?;
-        if ghost_parents.contains(&p)? {
-            continue;
-        }
-        let refcount: i64 = refcounts
-            .get_item(&p)?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(format!("missing refcount for {:?}", p))
-            })?
-            .extract()?;
-        let parent_value = if refcount == 1 {
-            let value = chunks.get_item(&p)?.ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(format!("missing chunks for {:?}", p))
-            })?;
-            refcounts.del_item(&p)?;
-            chunks.del_item(&p)?;
-            value
-        } else {
-            refcounts.set_item(&p, refcount - 1)?;
-            chunks.get_item(&p)?.ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(format!("missing chunks for {:?}", p))
-            })?
-        };
-        out.append(parent_value)?;
-    }
-    Ok(out.into_any().unbind())
-}
-
 /// Reference-count bookkeeping for compression-parent satisfaction during
 /// stream insertion. Python-facing counterpart of the pure-Rust
 /// `bazaar::versionedfile::KeyRefs`; stores Python tuples directly via
@@ -1196,6 +1071,66 @@ fn add_mpdiffs(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>) -> PyRe
     Ok(())
 }
 
+/// Drive `_MPDiffGenerator.compute_diffs(vf, keys)` in Rust.
+///
+/// The pure-crate helper [`bazaar::versionedfile::make_mpdiffs`] owns the
+/// orchestration (parent-map walk, ghost detection, refcount-based cache
+/// release, per-record diff computation). This wrapper marshals the
+/// Python `vf` through [`PyVersionedFiles`] and converts the resulting
+/// `MultiParent`s into `bzrformats.multiparent.MultiParent(hunks=[...])`
+/// instances so the Python caller cannot tell the loop now lives in Rust.
+#[pyfunction]
+fn make_mpdiffs<'py>(
+    py: Python<'py>,
+    vf: Py<PyAny>,
+    keys: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    use bazaar::versionedfile::make_mpdiffs as pure_make_mpdiffs;
+
+    let mut ordered_keys: Vec<Key> = Vec::new();
+    for k in keys.try_iter()? {
+        ordered_keys.push(k?.extract::<Key>()?);
+    }
+
+    let wrapped = PyVersionedFiles::new(vf);
+    let diffs = pure_make_mpdiffs(&wrapped, &ordered_keys).map_err(crate::knit::knit_err_to_py)?;
+
+    // Materialise into bzrformats.multiparent.MultiParent / NewText /
+    // ParentText instances so the Python caller (and tests) see real
+    // class instances.
+    let module = PyModule::import(py, "bzrformats.multiparent")?;
+    let mp_cls = module.getattr("MultiParent")?;
+    let new_text_cls = module.getattr("NewText")?;
+    let parent_text_cls = module.getattr("ParentText")?;
+
+    let out = PyList::empty(py);
+    for diff in diffs {
+        let hunks = PyList::empty(py);
+        for hunk in diff.hunks {
+            match hunk {
+                bazaar::multiparent::Hunk::NewText(lines) => {
+                    let py_lines: Vec<Bound<PyBytes>> =
+                        lines.iter().map(|l| PyBytes::new(py, l)).collect();
+                    let lines_list = PyList::new(py, py_lines)?;
+                    hunks.append(new_text_cls.call1((lines_list,))?)?;
+                }
+                bazaar::multiparent::Hunk::ParentText {
+                    parent,
+                    parent_pos,
+                    child_pos,
+                    num_lines,
+                } => {
+                    hunks.append(
+                        parent_text_cls.call1((parent, parent_pos, child_pos, num_lines))?,
+                    )?;
+                }
+            }
+        }
+        out.append(mp_cls.call1((hunks,))?)?;
+    }
+    Ok(out)
+}
+
 pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "versionedfile")?;
     m.add_class::<AbstractContentFactory>()?;
@@ -1212,11 +1147,10 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(hash_prefix_unmap, &m)?)?;
     m.add_function(wrap_pyfunction!(hash_escaped_prefix_map, &m)?)?;
     m.add_function(wrap_pyfunction!(hash_escaped_prefix_unmap, &m)?)?;
-    m.add_function(wrap_pyfunction!(mpdiff_first_pass, &m)?)?;
-    m.add_function(wrap_pyfunction!(mpdiff_collect_parent_chunks, &m)?)?;
     m.add_function(wrap_pyfunction!(check_lines_not_unicode, &m)?)?;
     m.add_function(wrap_pyfunction!(check_lines_are_lines, &m)?)?;
     m.add_function(wrap_pyfunction!(known_graph_ancestry_map, &m)?)?;
+    m.add_function(wrap_pyfunction!(make_mpdiffs, &m)?)?;
     m.add_function(wrap_pyfunction!(add_mpdiffs, &m)?)?;
     Ok(m)
 }
