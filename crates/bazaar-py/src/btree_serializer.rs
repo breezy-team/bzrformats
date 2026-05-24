@@ -789,7 +789,7 @@ fn _py_sha1_to_key<'py>(
 /// graph index. Mirrors `BTreeBuilder._write_nodes` on the Python side.
 #[pyfunction]
 #[pyo3(signature = (nodes, reference_lists, key_elements, optimize_for_size=false, page_size=None, reserved_header_bytes=None))]
-fn serialize_btree_index<'py>(
+pub(crate) fn serialize_btree_index<'py>(
     py: Python<'py>,
     nodes: &Bound<'py, PyAny>,
     reference_lists: usize,

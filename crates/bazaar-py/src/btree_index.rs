@@ -798,17 +798,17 @@ impl BTreeBuilder {
         };
         // Delegate to the existing helper that does validation +
         // duplicate-key check + dict insertion in one shot.
-        let index_mod = py.import("bzrformats._bzr_rs.index")?;
-        let add_node_helper = index_mod.getattr("add_node_to_btree_builder")?;
-        let node_refs = add_node_helper.call1((
+        let node_refs = crate::index::py_add_node_to_btree_builder(
+            py,
             slf.clone().into_any(),
-            key_tuple.clone(),
+            key_tuple.clone().into_any(),
             value,
             refs_arg,
             nodes.clone(),
             reference_lists,
             key_length,
-        ))?;
+        )?;
+        let node_refs: Bound<'_, PyAny> = node_refs.into_any();
         if me.nodes_by_key.lock().unwrap().is_some() && key_length > 1 {
             let val = nodes.get_item(key_tuple.clone())?.unwrap();
             let val_tuple = val.cast_into::<PyTuple>().map_err(|_| {
@@ -931,9 +931,8 @@ impl BTreeBuilder {
             .unwrap()
             .reference_lists()
             > 0;
-        let index_mod = py.import("bzrformats._bzr_rs.index")?;
-        let helper = index_mod.getattr("iter_btree_builder_nodes_sorted")?;
-        let sorted: Bound<'py, PyList> = helper.call1((nodes, has_refs))?.cast_into()?;
+        let sorted: Bound<'py, PyList> =
+            crate::index::py_iter_btree_builder_nodes_sorted(py, nodes, has_refs)?;
         let out = PyList::empty(py);
         let self_any: Bound<'py, PyAny> = slf.into_any();
         for entry in sorted.iter() {
@@ -997,14 +996,12 @@ impl BTreeBuilder {
             .unwrap()
             .reference_lists()
             > 0;
-        let index_mod = py.import("bzrformats._bzr_rs.index")?;
-        let helper = index_mod.getattr("iter_btree_builder_nodes_for_keys")?;
-        let result = helper.call1((nodes, key_set.clone(), has_refs))?;
-        let result_tuple = result.cast_into::<PyTuple>().map_err(|_| {
-            PyTypeError::new_err("iter_btree_builder_nodes_for_keys returned non-tuple")
-        })?;
-        let entries: Bound<'py, PyList> = result_tuple.get_item(0)?.cast_into()?;
-        let local_keys: Bound<'py, PyList> = result_tuple.get_item(1)?.cast_into()?;
+        let (entries, local_keys) = crate::index::py_iter_btree_builder_nodes_for_keys(
+            py,
+            nodes,
+            key_set.clone().into_any(),
+            has_refs,
+        )?;
 
         let out = PyList::empty(py);
         let self_any: Bound<'py, PyAny> = slf.clone().into_any();
@@ -1105,11 +1102,13 @@ impl BTreeBuilder {
         } else {
             "btree-builder-norefs"
         };
-        let index_mod = py.import("bzrformats._bzr_rs.index")?;
-        let helper = index_mod.getattr("iter_entries_prefix")?;
-        let local_entries: Bound<'py, PyList> = helper
-            .call1((nodes, keys_list, key_length, mode))?
-            .cast_into()?;
+        let local_entries: Bound<'py, PyList> = crate::index::py_iter_entries_prefix(
+            py,
+            nodes,
+            keys_list.into_any(),
+            key_length,
+            mode,
+        )?;
         for entry in local_entries.iter() {
             let tup = entry
                 .cast_into::<PyTuple>()
@@ -1516,8 +1515,6 @@ impl BTreeBuilder {
             false
         };
         drop(parent);
-        let btree_serializer = py.import("bzrformats._bzr_rs.btree_serializer")?;
-        let serialize_fn = btree_serializer.getattr("serialize_btree_index")?;
         // Read _PAGE_SIZE and _RESERVED_HEADER_BYTES from the Python
         // btree_index module so the historical test pattern of
         // monkey-patching those module-level constants (via
@@ -1527,14 +1524,15 @@ impl BTreeBuilder {
         let reserved_header_bytes: usize = btree_index_mod
             .getattr("_RESERVED_HEADER_BYTES")?
             .extract()?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("optimize_for_size", optimize_for_size)?;
-        kwargs.set_item("page_size", page_size)?;
-        kwargs.set_item("reserved_header_bytes", reserved_header_bytes)?;
-        let blob = serialize_fn
-            .call((node_iterator, reference_lists, key_length), Some(&kwargs))?
-            .cast_into::<PyBytes>()
-            .map_err(|_| PyTypeError::new_err("serialize_btree_index must return bytes"))?;
+        let blob = crate::btree_serializer::serialize_btree_index(
+            py,
+            &node_iterator,
+            reference_lists,
+            key_length,
+            optimize_for_size,
+            Some(page_size),
+            Some(reserved_header_bytes),
+        )?;
         let blob_bytes = blob.as_bytes();
         let size = blob_bytes.len();
         let file: Bound<'py, PyAny> = if size > page_size {
