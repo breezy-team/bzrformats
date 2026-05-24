@@ -1111,7 +1111,7 @@ class DirState:
 
     def _num_present_parents(self):
         """The number of parent entries in each record row."""
-        return len(self._parents) - len(self._ghosts)
+        return self._rs.num_present_parents()
 
     @classmethod
     def on_file(
