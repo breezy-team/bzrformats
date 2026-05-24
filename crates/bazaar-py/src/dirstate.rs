@@ -1198,6 +1198,11 @@ fn memory_state_from_py(value: i64) -> PyResult<bazaar::dirstate::MemoryState> {
 #[pyclass(name = "DirStateRs")]
 struct PyDirState {
     inner: bazaar::dirstate::DirState,
+    /// Cached `IdIndex` pyclass instance held across calls. Lazily
+    /// created on the first `_get_id_index` call and refreshed in
+    /// place by `refresh_cached_id_index` after every mutation so
+    /// callers that hold the returned object see fresh state.
+    id_index: std::sync::Mutex<Option<Py<IdIndex>>>,
 }
 
 #[pymethods]
@@ -1235,6 +1240,7 @@ impl PyDirState {
                 use_filesystem_for_exec,
                 fdatasync,
             ),
+            id_index: std::sync::Mutex::new(None),
         })
     }
 
@@ -1901,8 +1907,9 @@ impl PyDirState {
     }
 
     /// Forget all in-memory state. Mirrors `DirState._wipe_state`.
-    fn wipe_state(&mut self) {
+    fn wipe_state(&mut self, py: Python<'_>) {
         self.inner.wipe_state();
+        self.refresh_cached_id_index(py);
     }
 
     /// Parse the 5-line dirstate header out of `data`. Mirrors
@@ -1922,8 +1929,9 @@ impl PyDirState {
     /// Discard any parent trees beyond the first, including any
     /// entries that are dead in both tree 0 and tree 1 after the
     /// discard. Mirrors Python's `DirState._discard_merge_parents`.
-    fn discard_merge_parents(&mut self) {
+    fn discard_merge_parents(&mut self, py: Python<'_>) {
         self.inner.discard_merge_parents();
+        self.refresh_cached_id_index(py);
     }
 
     /// Split the root dirblock into two sentinel blocks: block 0 with
@@ -2068,15 +2076,18 @@ impl PyDirState {
     /// Mark the entry at `key` as absent for tree 0, returning True
     /// when the entry row was removed entirely (the "last reference"
     /// case). Mirrors Python's `DirState._make_absent`.
-    fn make_absent(&mut self, key: &Bound<PyTuple>) -> PyResult<bool> {
+    fn make_absent(&mut self, py: Python<'_>, key: &Bound<PyTuple>) -> PyResult<bool> {
         let entry_key = bazaar::dirstate::EntryKey {
             dirname: key.get_item(0)?.extract()?,
             basename: key.get_item(1)?.extract()?,
             file_id: key.get_item(2)?.extract()?,
         };
-        self.inner
+        let result = self
+            .inner
             .make_absent(&entry_key)
-            .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))
+            .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))?;
+        self.refresh_cached_id_index(py);
+        Ok(result)
     }
 
     /// Apply a sequence of "adds" to tree 1. Mirrors Python's
@@ -2092,7 +2103,7 @@ impl PyDirState {
     /// the inner state first, mirroring Python's `_raise_invalid`),
     /// `NotImplementedError` for the basis-relocation branch, and
     /// `AssertionError` for internal invariant violations.
-    fn update_basis_apply_adds(&mut self, adds: &Bound<PyAny>) -> PyResult<()> {
+    fn update_basis_apply_adds(&mut self, py: Python<'_>, adds: &Bound<PyAny>) -> PyResult<()> {
         let mut rust_adds: Vec<bazaar::dirstate::BasisAdd> = Vec::new();
         for item in adds.try_iter()? {
             let tup = item?.cast_into::<PyTuple>()?;
@@ -2136,8 +2147,11 @@ impl PyDirState {
         }
 
         match self.inner.update_basis_apply_adds(&mut rust_adds) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.raise_basis_apply_error(adds.py(), e)),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 
@@ -2374,7 +2388,10 @@ impl PyDirState {
             .inner
             .update_minimal(entry_key, tree0_details, path_utf8, fullscan)
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
@@ -2413,7 +2430,10 @@ impl PyDirState {
             packed_stat,
             fingerprint.unwrap_or(b""),
         ) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(e) => Err(add_error_to_py(py, e)),
         }
     }
@@ -2453,7 +2473,10 @@ impl PyDirState {
             .inner
             .add_path(path, file_id, kind, stat_info, fingerprint.unwrap_or(b""))
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(e) => Err(add_error_to_py(py, e)),
         }
     }
@@ -2462,9 +2485,12 @@ impl PyDirState {
     /// `DirState.set_path_id` for `path=b""` — any other path raises
     /// `NotImplementedError`. Returns silently when `new_id` already
     /// matches the current root id.
-    fn set_path_id(&mut self, path: &[u8], new_id: &[u8]) -> PyResult<()> {
+    fn set_path_id(&mut self, py: Python<'_>, path: &[u8], new_id: &[u8]) -> PyResult<()> {
         match self.inner.set_path_id(path, new_id) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(bazaar::dirstate::SetPathIdError::NonRootPath) => Err(
                 pyo3::exceptions::PyNotImplementedError::new_err("set_path_id non-root path"),
             ),
@@ -2478,7 +2504,7 @@ impl PyDirState {
     /// `DirState._apply_removals`. Input is a Python iterable of
     /// `(file_id, path)` 2-tuples, matching the caller pattern
     /// `update_by_delta` uses: `removals.items()`.
-    fn apply_removals(&mut self, removals: &Bound<PyAny>) -> PyResult<()> {
+    fn apply_removals(&mut self, py: Python<'_>, removals: &Bound<PyAny>) -> PyResult<()> {
         let mut rust_removals: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for item in removals.try_iter()? {
             let tup = item?.cast_into::<PyTuple>()?;
@@ -2492,8 +2518,11 @@ impl PyDirState {
             rust_removals.push((file_id, path));
         }
         match self.inner.apply_removals(&rust_removals) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.raise_basis_apply_error(removals.py(), e)),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 
@@ -2522,7 +2551,10 @@ impl PyDirState {
             .inner
             .update_basis_by_delta_from_inventory_delta(&delta.0, new_revid)
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(e) => {
                 self.inner.changes_aborted = true;
                 Err(self.raise_basis_apply_error(py, e))
@@ -2540,7 +2572,10 @@ impl PyDirState {
         delta: &crate::inventory::InventoryDelta,
     ) -> PyResult<()> {
         match self.inner.update_by_delta_from_inventory_delta(&delta.0) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(e) => {
                 self.inner.changes_aborted = true;
                 Err(self.raise_basis_apply_error(py, e))
@@ -2552,7 +2587,7 @@ impl PyDirState {
     /// `DirState._apply_insertions`. Input is a Python iterable of
     /// `(key, minikind, executable, fingerprint, path_utf8)` 5-tuples
     /// matching the shape assembled by `update_by_delta`.
-    fn apply_insertions(&mut self, adds: &Bound<PyAny>) -> PyResult<()> {
+    fn apply_insertions(&mut self, py: Python<'_>, adds: &Bound<PyAny>) -> PyResult<()> {
         let mut rust_adds: Vec<(
             bazaar::dirstate::EntryKey,
             bazaar::dirstate::Kind,
@@ -2581,8 +2616,11 @@ impl PyDirState {
             rust_adds.push((key, minikind, executable, fingerprint, path_utf8));
         }
         match self.inner.apply_insertions(rust_adds) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.raise_basis_apply_error(adds.py(), e)),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 
@@ -2592,7 +2630,11 @@ impl PyDirState {
     /// 4-tuples; `new_details` is the same 5-tuple layout used by
     /// `update_basis_apply_adds`. Raises `InconsistentDelta` on a
     /// stale entry.
-    fn update_basis_apply_changes(&mut self, changes: &Bound<PyAny>) -> PyResult<()> {
+    fn update_basis_apply_changes(
+        &mut self,
+        py: Python<'_>,
+        changes: &Bound<PyAny>,
+    ) -> PyResult<()> {
         let mut rust_changes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, bazaar::dirstate::TreeData)> =
             Vec::new();
         for item in changes.try_iter()? {
@@ -2617,8 +2659,11 @@ impl PyDirState {
             rust_changes.push((old_path, new_path, file_id, new_details));
         }
         match self.inner.update_basis_apply_changes(&rust_changes) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.raise_basis_apply_error(changes.py(), e)),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 
@@ -2628,7 +2673,11 @@ impl PyDirState {
     /// real_delete)` 5-tuples — the 4th element is unused by the
     /// Python implementation (it carries `None` in the current
     /// caller) but we accept it to preserve the existing wire shape.
-    fn update_basis_apply_deletes(&mut self, deletes: &Bound<PyAny>) -> PyResult<()> {
+    fn update_basis_apply_deletes(
+        &mut self,
+        py: Python<'_>,
+        deletes: &Bound<PyAny>,
+    ) -> PyResult<()> {
         let mut rust_deletes: Vec<(Vec<u8>, Option<Vec<u8>>, Vec<u8>, bool)> = Vec::new();
         for item in deletes.try_iter()? {
             let tup = item?.cast_into::<PyTuple>()?;
@@ -2652,8 +2701,11 @@ impl PyDirState {
             rust_deletes.push((old_path, new_path, file_id, real_delete));
         }
         match self.inner.update_basis_apply_deletes(&rust_deletes) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.raise_basis_apply_error(deletes.py(), e)),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 
@@ -2684,7 +2736,10 @@ impl PyDirState {
             rows.push((path, file_id, minikind, fingerprint, executable));
         }
         match self.inner.set_state_from_inventory(rows) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
@@ -2706,6 +2761,7 @@ impl PyDirState {
     /// order (i.e. root first, then children in lexicographic order).
     fn set_parent_trees(
         &mut self,
+        py: Python<'_>,
         trees: &Bound<PyAny>,
         ghosts: &Bound<PyAny>,
         parent_tree_entries: &Bound<PyAny>,
@@ -2751,17 +2807,25 @@ impl PyDirState {
         }
         self.inner
             .set_parent_trees(rust_trees, rust_ghosts, rust_entries)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))?;
+        self.refresh_cached_id_index(py);
+        Ok(())
     }
 
     /// Replace the entire in-memory state with `parent_ids` and
     /// `dirblocks` (both in the Python tuple shape), marking both the
     /// header and the dirblock data fully modified. Mirrors Python's
     /// `DirState._set_data`. Invalidates the cached id_index.
-    fn set_data(&mut self, parent_ids: &Bound<PyAny>, dirblocks: &Bound<PyAny>) -> PyResult<()> {
+    fn set_data(
+        &mut self,
+        py: Python<'_>,
+        parent_ids: &Bound<PyAny>,
+        dirblocks: &Bound<PyAny>,
+    ) -> PyResult<()> {
         let parents = collect_bytes_vec(parent_ids)?;
         let blocks = crate::dirstate_helpers::dirblocks_from_py(dirblocks)?;
         self.inner.set_data(parents, blocks);
+        self.refresh_cached_id_index(py);
         Ok(())
     }
 
@@ -2830,6 +2894,40 @@ impl PyDirState {
     /// `DirState._mark_unmodified`.
     fn mark_unmodified(&mut self) {
         self.inner.mark_unmodified();
+    }
+
+    /// Read-only view of the cached `IdIndex`: returns `None` if
+    /// nothing has been cached yet. The Python `DirState._id_index`
+    /// property mirrors this for back-compat with code that pokes at
+    /// the cached attribute directly.
+    #[getter(id_index)]
+    fn get_cached_id_index(&self, py: Python<'_>) -> Option<Py<IdIndex>> {
+        self.id_index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.clone_ref(py))
+    }
+
+    /// Return the cached `IdIndex`, creating and filling it on first
+    /// call. Subsequent mutation methods refresh the same object in
+    /// place so callers that hold the reference see fresh state.
+    /// Mirrors `DirState._get_id_index`.
+    fn get_id_index(&mut self, py: Python<'_>) -> PyResult<Py<IdIndex>> {
+        if let Some(idx) = self.id_index.lock().unwrap().as_ref() {
+            return Ok(idx.clone_ref(py));
+        }
+        let fresh = Py::new(py, IdIndex(bazaar::dirstate::IdIndex::new()))?;
+        fresh.bind(py).borrow_mut().fill_from_state(self);
+        *self.id_index.lock().unwrap() = Some(fresh.clone_ref(py));
+        Ok(fresh)
+    }
+
+    /// Drop the cached `IdIndex` so the next `get_id_index` call
+    /// rebuilds from scratch. Mirrors `self._id_index = None` on the
+    /// Python side.
+    fn clear_cached_id_index(&self) {
+        *self.id_index.lock().unwrap() = None;
     }
 
     /// Serialise the in-memory state to the byte chunks that make up
@@ -2952,6 +3050,23 @@ impl PyDirState {
 }
 
 impl PyDirState {
+    /// If a Python caller has previously fetched the cached IdIndex
+    /// (via `_get_id_index`), refresh its contents in place so the
+    /// held reference reflects the latest dirblock state. Called by
+    /// every mutation method on PyDirState. No-op when nothing has
+    /// been cached.
+    fn refresh_cached_id_index(&mut self, py: Python<'_>) {
+        let cached = self
+            .id_index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.clone_ref(py));
+        if let Some(idx) = cached {
+            idx.bind(py).borrow_mut().fill_from_state(self);
+        }
+    }
+
     /// Shared error conversion for the three update_basis_apply_*
     /// methods: `Invalid` becomes `bzrformats.errors.InconsistentDelta`
     /// and also sets `changes_aborted` on the inner state (mirroring
