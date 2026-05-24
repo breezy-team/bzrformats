@@ -466,10 +466,9 @@ def knit_network_to_record(storage_kind, bytes, line_end):
     key, parents, noeol, raw_offset = _knit_rs.parse_network_record_header_rs(
         bytes, line_end
     )
-    method = "fulltext" if "ft" in storage_kind else "line-delta"
+    method, annotated = _knit_rs.parse_storage_kind(storage_kind)
     build_details = (method, noeol)
     raw_record = bytes[raw_offset:]
-    annotated = "annotated" in storage_kind
     return [
         KnitContentFactory(
             key,

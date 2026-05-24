@@ -1740,6 +1740,25 @@ pub fn format_storage_kind(method: KnitMethod, annotated: bool) -> String {
     }
 }
 
+/// Inverse of [`format_storage_kind`]: classify a knit network
+/// storage-kind string by its method (`Fulltext` if it contains `ft`,
+/// else `LineDelta`) and whether it's annotated.
+///
+/// Returns `None` if `storage_kind` doesn't look like a knit storage
+/// kind (must start with `b"knit-"` and end with `b"-gz"`).
+pub fn parse_storage_kind(storage_kind: &str) -> Option<(KnitMethod, bool)> {
+    if !storage_kind.starts_with("knit-") || !storage_kind.ends_with("-gz") {
+        return None;
+    }
+    let annotated = storage_kind.contains("annotated");
+    let method = if storage_kind.contains("ft") {
+        KnitMethod::Fulltext
+    } else {
+        KnitMethod::LineDelta
+    };
+    Some((method, annotated))
+}
+
 /// Encode a single record for insertion into a `_KnitGraphIndex`.
 ///
 /// Returns `(value_bytes, node_refs)` ready to pass to `add_callback`.
@@ -7679,6 +7698,44 @@ mod tests {
         let line = format_kndx_record_line(b"rev-2", &options, 17, 99, b"");
         // Empty parent_refs still produces the trailing space + colon.
         assert_eq!(line, b"\nrev-2 line-delta 17 99  :");
+    }
+
+    #[test]
+    fn parse_storage_kind_classifies_each_variant() {
+        assert_eq!(
+            parse_storage_kind("knit-ft-gz"),
+            Some((KnitMethod::Fulltext, false))
+        );
+        assert_eq!(
+            parse_storage_kind("knit-delta-gz"),
+            Some((KnitMethod::LineDelta, false))
+        );
+        assert_eq!(
+            parse_storage_kind("knit-annotated-ft-gz"),
+            Some((KnitMethod::Fulltext, true))
+        );
+        assert_eq!(
+            parse_storage_kind("knit-annotated-delta-gz"),
+            Some((KnitMethod::LineDelta, true))
+        );
+    }
+
+    #[test]
+    fn parse_storage_kind_rejects_non_knit() {
+        assert!(parse_storage_kind("groupcompress-block").is_none());
+        assert!(parse_storage_kind("knit-ft").is_none());
+        assert!(parse_storage_kind("").is_none());
+    }
+
+    #[test]
+    fn format_and_parse_storage_kind_roundtrip() {
+        for method in [KnitMethod::Fulltext, KnitMethod::LineDelta] {
+            for annotated in [false, true] {
+                let kind = format_storage_kind(method, annotated);
+                let parsed = parse_storage_kind(&kind).expect("valid kind");
+                assert_eq!(parsed, (method, annotated));
+            }
+        }
     }
 
     #[test]

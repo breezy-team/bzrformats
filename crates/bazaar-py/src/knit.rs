@@ -8027,6 +8027,15 @@ fn py_format_storage_kind(method: &str, annotated: bool) -> PyResult<String> {
     Ok(bazaar::knit::format_storage_kind(m, annotated))
 }
 
+/// Inverse of [`format_storage_kind`]: return `(method_str, annotated)`
+/// for a knit network storage-kind string. Returns `None` if the kind
+/// isn't a knit one.
+#[pyfunction]
+#[pyo3(name = "parse_storage_kind")]
+fn py_parse_storage_kind(storage_kind: &str) -> Option<(&'static str, bool)> {
+    bazaar::knit::parse_storage_kind(storage_kind).map(|(m, a)| (m.as_str(), a))
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data, &m)?)?;
@@ -8056,6 +8065,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(get_total_build_size_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(dictionary_compress_rs, &m)?)?;
     m.add_function(wrap_pyfunction!(py_format_storage_kind, &m)?)?;
+    m.add_function(wrap_pyfunction!(py_parse_storage_kind, &m)?)?;
     m.add_class::<PyAnnotatedKnitContent>()?;
     m.add_class::<PyPlainKnitContent>()?;
     m.add_class::<PyKnitAnnotateFactory>()?;
