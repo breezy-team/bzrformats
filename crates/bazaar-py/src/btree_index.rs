@@ -1,3 +1,4 @@
+use bazaar::btree_builder::spill_landing_slot;
 use bazaar::btree_index::{
     parse_btree_header, parse_internal_node, BTreeGraphIndex as RsBTreeGraphIndex, BTreeHeader,
     BTreeIndexError, InternalNode, LeafKey,
@@ -10,8 +11,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::sync::Mutex;
 
+use crate::index::PyGraphIndexBuilder;
+
 import_exception!(bzrformats.index, BadIndexFormatSignature);
 import_exception!(bzrformats.index, BadIndexOptions);
+import_exception!(bzrformats.index, BadIndexDuplicateKey);
 
 fn header_err_to_py(err: BTreeIndexError) -> PyErr {
     match err {
@@ -670,11 +674,909 @@ impl EntryIterator {
     }
 }
 
+/// B+Tree builder. Extends [`PyGraphIndexBuilder`] and adds
+/// spill-to-disk semantics: once the in-memory node dict crosses
+/// `spill_at` entries, the held nodes are serialised into a temporary
+/// file and tracked as a "backing index". On every subsequent spill,
+/// the power-of-2 merge strategy from
+/// [`bazaar::btree_builder::spill_landing_slot`] decides which slot
+/// the new merged blob lands in.
+///
+/// Why bindings code rather than pure crate: the spill output is a
+/// Python `tempfile.NamedTemporaryFile` (or `BytesIO`), the backing
+/// index objects are pyo3 [`BTreeGraphIndex`] instances reading
+/// directly from those Python file handles, and querying a backing
+/// index goes through Python attribute/method calls. The orchestration
+/// is fundamentally over Python objects.
+#[pyclass(
+    module = "bzrformats._bzr_rs.btree_index",
+    name = "BTreeBuilder",
+    extends = PyGraphIndexBuilder,
+    subclass,
+    dict
+)]
+struct BTreeBuilder {
+    spill_at: Mutex<usize>,
+    /// `_backing_indices`. Each slot is either a `BTreeGraphIndex` (or
+    /// `Py<PyAny>` to match the Python contract that other index types
+    /// can be stored) or `None`.
+    backing_indices: Mutex<Vec<Option<Py<PyAny>>>>,
+    /// `_nodes`: `{key_tuple: (refs_tuple, value_bytes)}`. Held as a
+    /// Python dict because the helper `add_node_to_btree_builder` and
+    /// `iter_btree_builder_nodes_sorted` expect that exact shape.
+    nodes: Mutex<Py<PyDict>>,
+    /// `_nodes_by_key`: lazy `{first_segment: {second_segment: ...
+    /// {last_segment: (key, value[, refs])}}}` trie. `None` until
+    /// `_get_nodes_by_key` materialises it.
+    nodes_by_key: Mutex<Option<Py<PyDict>>>,
+}
+
+#[pymethods]
+impl BTreeBuilder {
+    #[new]
+    #[pyo3(signature = (reference_lists = 0, key_elements = 1, spill_at = 100000))]
+    fn new(
+        py: Python<'_>,
+        reference_lists: usize,
+        key_elements: usize,
+        spill_at: usize,
+    ) -> (Self, PyGraphIndexBuilder) {
+        use bazaar::index::GraphIndexBuilder as RsGraphIndexBuilder;
+        let parent = PyGraphIndexBuilder {
+            inner: Mutex::new(RsGraphIndexBuilder::new(reference_lists, key_elements)),
+            optimize_for_size_py: Mutex::new(None),
+            combine_backing_indices_py: Mutex::new(None),
+        };
+        let me = BTreeBuilder {
+            spill_at: Mutex::new(spill_at),
+            backing_indices: Mutex::new(Vec::new()),
+            nodes: Mutex::new(PyDict::new(py).unbind()),
+            nodes_by_key: Mutex::new(None),
+        };
+        (me, parent)
+    }
+
+    #[getter]
+    fn _spill_at(&self) -> usize {
+        *self.spill_at.lock().unwrap()
+    }
+
+    #[setter(_spill_at)]
+    fn set_spill_at(&self, value: usize) {
+        *self.spill_at.lock().unwrap() = value;
+    }
+
+    #[getter]
+    fn _backing_indices<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
+        let guard = self.backing_indices.lock().unwrap();
+        let out = PyList::empty(py);
+        for entry in guard.iter() {
+            match entry {
+                Some(b) => out.append(b.bind(py).clone()).unwrap(),
+                None => out.append(py.None()).unwrap(),
+            }
+        }
+        out
+    }
+
+    #[getter]
+    fn _nodes<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        self.nodes.lock().unwrap().bind(py).clone()
+    }
+
+    #[getter]
+    fn _nodes_by_key<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
+        match self.nodes_by_key.lock().unwrap().as_ref() {
+            Some(d) => d.bind(py).clone().into_any(),
+            None => py.None().into_bound(py),
+        }
+    }
+
+    /// Add a node to the in-memory dict. Once `_nodes` reaches
+    /// `spill_at`, the held nodes are merged into a backing index on
+    /// disk via [`Self::spill_mem_keys_to_disk`].
+    #[pyo3(signature = (key, value, references = None))]
+    fn add_node(
+        slf: Bound<'_, Self>,
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        value: Bound<'_, PyBytes>,
+        references: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let key_tuple = ensure_key_tuple(py, &key)?;
+        let parent = slf.borrow().into_super();
+        let reference_lists = parent.inner.lock().unwrap().reference_lists();
+        let key_length = parent.inner.lock().unwrap().key_length();
+        drop(parent);
+        let me = slf.borrow();
+        let nodes_guard = me.nodes.lock().unwrap();
+        let nodes = nodes_guard.bind(py).clone();
+        drop(nodes_guard);
+        let refs_arg = match references {
+            Some(r) => r,
+            None => PyTuple::empty(py).into_any(),
+        };
+        // Delegate to the existing helper that does validation +
+        // duplicate-key check + dict insertion in one shot.
+        let node_refs = crate::index::py_add_node_to_btree_builder(
+            py,
+            slf.clone().into_any(),
+            key_tuple.clone().into_any(),
+            value,
+            refs_arg,
+            nodes.clone(),
+            reference_lists,
+            key_length,
+        )?;
+        let node_refs: Bound<'_, PyAny> = node_refs.into_any();
+        if me.nodes_by_key.lock().unwrap().is_some() && key_length > 1 {
+            let val = nodes.get_item(key_tuple.clone())?.unwrap();
+            let val_tuple = val.cast_into::<PyTuple>().map_err(|_| {
+                PyTypeError::new_err("btree node value must be a (refs, value) tuple")
+            })?;
+            let value_b = val_tuple.get_item(1)?;
+            Self::update_nodes_by_key_inner(
+                py,
+                &me,
+                reference_lists > 0,
+                key_tuple,
+                value_b,
+                &node_refs,
+            )?;
+        }
+        if nodes.len() < *me.spill_at.lock().unwrap() {
+            return Ok(());
+        }
+        drop(me);
+        Self::spill_mem_keys_to_disk(slf, py)
+    }
+
+    /// Bulk-add nodes accepting either `(key, value, refs)` or
+    /// `(key, value)` tuples depending on whether this builder has
+    /// reference lists configured.
+    fn add_nodes(slf: Bound<'_, Self>, py: Python<'_>, nodes: Bound<'_, PyAny>) -> PyResult<()> {
+        let has_refs = slf
+            .borrow()
+            .into_super()
+            .inner
+            .lock()
+            .unwrap()
+            .reference_lists()
+            > 0;
+        for node in nodes.try_iter()? {
+            let node = node?;
+            let tup = node
+                .cast::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("node must be a tuple"))?;
+            if has_refs {
+                if tup.len() != 3 {
+                    return Err(PyTypeError::new_err(
+                        "node must be a 3-tuple when reference_lists > 0",
+                    ));
+                }
+                let key = tup.get_item(0)?;
+                let value = tup.get_item(1)?;
+                let refs = tup.get_item(2)?;
+                let value_b = value
+                    .cast_into::<PyBytes>()
+                    .map_err(|_| PyTypeError::new_err("value must be bytes"))?;
+                Self::add_node(slf.clone(), py, key, value_b, Some(refs))?;
+            } else {
+                if tup.len() != 2 {
+                    return Err(PyTypeError::new_err(
+                        "node must be a 2-tuple when reference_lists == 0",
+                    ));
+                }
+                let key = tup.get_item(0)?;
+                let value = tup.get_item(1)?;
+                let value_b = value
+                    .cast_into::<PyBytes>()
+                    .map_err(|_| PyTypeError::new_err("value must be bytes"))?;
+                Self::add_node(slf.clone(), py, key, value_b, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Return an estimate of the number of keys (exact, since this is
+    /// an in-memory builder).
+    fn key_count(&self, py: Python<'_>) -> PyResult<usize> {
+        let mem = self.nodes.lock().unwrap().bind(py).len();
+        let mut total = mem;
+        let guard = self.backing_indices.lock().unwrap();
+        for entry in guard.iter().flatten() {
+            let n: usize = entry.bind(py).call_method0("key_count")?.extract()?;
+            total += n;
+        }
+        Ok(total)
+    }
+
+    /// In-memory indices have no on-disk state, so validation is a
+    /// no-op. Matches the historical Python implementation.
+    fn validate(&self) {}
+
+    fn __lt__(slf: Bound<'_, Self>, py: Python<'_>, other: Bound<'_, PyAny>) -> PyResult<bool> {
+        if other.is_instance_of::<BTreeBuilder>() {
+            // Compare on the underlying `_nodes` dict, matching the
+            // Python original's `self._nodes < other._nodes`.
+            let a = slf.borrow().nodes.lock().unwrap().clone_ref(py);
+            let b_borrow = other.downcast::<BTreeBuilder>().unwrap().borrow();
+            let b = b_borrow.nodes.lock().unwrap().clone_ref(py);
+            return a.bind(py).lt(b.bind(py));
+        }
+        // Existing on-disk indices sort before still-being-built ones.
+        // Accept both the Rust pyclass and the Python wrapper class, since
+        // spilled backings are constructed via the Python BTreeGraphIndex.
+        if other.is_instance_of::<BTreeGraphIndex>() {
+            return Ok(false);
+        }
+        let py_btree_graph_index = py
+            .import("bzrformats.btree_index")?
+            .getattr("BTreeGraphIndex")?;
+        if other.is_instance(&py_btree_graph_index)? {
+            return Ok(false);
+        }
+        Err(PyTypeError::new_err(other.unbind()))
+    }
+
+    fn __hash__(slf: Bound<'_, Self>) -> isize {
+        slf.as_ptr() as isize
+    }
+
+    /// `_iter_mem_nodes`: sorted iterator over the in-memory dict,
+    /// each entry prefixed with `self`.
+    fn _iter_mem_nodes<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let me = slf.borrow();
+        let nodes = me.nodes.lock().unwrap().bind(py).clone();
+        let has_refs = slf
+            .borrow()
+            .into_super()
+            .inner
+            .lock()
+            .unwrap()
+            .reference_lists()
+            > 0;
+        let sorted: Bound<'py, PyList> =
+            crate::index::py_iter_btree_builder_nodes_sorted(py, nodes, has_refs)?;
+        let out = PyList::empty(py);
+        let self_any: Bound<'py, PyAny> = slf.into_any();
+        for entry in sorted.iter() {
+            let tup = entry
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("entry must be a tuple"))?;
+            let mut items: Vec<Bound<'py, PyAny>> = vec![self_any.clone()];
+            for it in tup.iter() {
+                items.push(it);
+            }
+            out.append(PyTuple::new(py, items)?)?;
+        }
+        Ok(out)
+    }
+
+    /// `iter_all_entries`: merge-sorted iteration over in-memory +
+    /// backing indices.
+    fn iter_all_entries<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mem = Self::_iter_mem_nodes(slf.clone(), py)?;
+        let mem_iter = mem.try_iter()?;
+        let mut iterators: Vec<Bound<'py, PyAny>> = vec![mem_iter.into_any()];
+        let backings: Vec<Py<PyAny>> = {
+            let me = slf.borrow();
+            let guard = me.backing_indices.lock().unwrap();
+            guard
+                .iter()
+                .filter_map(|e| e.as_ref().map(|p| p.clone_ref(py)))
+                .collect()
+        };
+        for backing in backings {
+            let entries = backing.bind(py).call_method0("iter_all_entries")?;
+            iterators.push(entries.try_iter()?.into_any());
+        }
+        if iterators.len() == 1 {
+            return Ok(iterators.into_iter().next().unwrap());
+        }
+        Self::iter_smallest(slf, py, iterators)
+    }
+
+    /// `iter_entries(keys)`: yields entries for the requested keys in
+    /// (no-defined) order. Looks in the in-memory dict first; any keys
+    /// not found there are searched through the backing indices.
+    fn iter_entries<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let key_set = pyo3::types::PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            key_set.add(k?)?;
+        }
+        let nodes = slf.borrow().nodes.lock().unwrap().bind(py).clone();
+        let has_refs = slf
+            .borrow()
+            .into_super()
+            .inner
+            .lock()
+            .unwrap()
+            .reference_lists()
+            > 0;
+        let (entries, local_keys) = crate::index::py_iter_btree_builder_nodes_for_keys(
+            py,
+            nodes,
+            key_set.clone().into_any(),
+            has_refs,
+        )?;
+
+        let out = PyList::empty(py);
+        let self_any: Bound<'py, PyAny> = slf.clone().into_any();
+        for entry in entries.iter() {
+            let tup = entry
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("entry must be a tuple"))?;
+            let mut items: Vec<Bound<'py, PyAny>> = vec![self_any.clone()];
+            for it in tup.iter() {
+                items.push(it);
+            }
+            out.append(PyTuple::new(py, items)?)?;
+        }
+        for k in local_keys.iter() {
+            key_set.discard(k)?;
+        }
+        let backings: Vec<Py<PyAny>> = {
+            let me = slf.borrow();
+            let guard = me.backing_indices.lock().unwrap();
+            guard
+                .iter()
+                .filter_map(|e| e.as_ref().map(|p| p.clone_ref(py)))
+                .collect()
+        };
+        for backing in backings {
+            if key_set.is_empty() {
+                break;
+            }
+            let entries = backing
+                .bind(py)
+                .call_method1("iter_entries", (key_set.clone(),))?;
+            for entry in entries.try_iter()? {
+                let entry = entry?;
+                let tup = entry
+                    .clone()
+                    .cast_into::<PyTuple>()
+                    .map_err(|_| PyTypeError::new_err("entry must be a tuple"))?;
+                let key = tup.get_item(1)?;
+                key_set.discard(key)?;
+                let mut items: Vec<Bound<'py, PyAny>> = vec![self_any.clone()];
+                for i in 1..tup.len() {
+                    items.push(tup.get_item(i)?);
+                }
+                out.append(PyTuple::new(py, items)?)?;
+            }
+        }
+        Ok(out.try_iter()?.into_any())
+    }
+
+    /// `iter_entries_prefix(keys)`: prefix-keyed lookup. Walks backing
+    /// indices first then the in-memory dict (matching the Python
+    /// original).
+    fn iter_entries_prefix<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let keys_list = PyList::empty(py);
+        for k in keys.try_iter()? {
+            keys_list.append(k?)?;
+        }
+        let out = PyList::empty(py);
+        if keys_list.is_empty() {
+            return Ok(out.try_iter()?.into_any());
+        }
+        let self_any: Bound<'py, PyAny> = slf.clone().into_any();
+        let backings: Vec<Py<PyAny>> = {
+            let me = slf.borrow();
+            let guard = me.backing_indices.lock().unwrap();
+            guard
+                .iter()
+                .filter_map(|e| e.as_ref().map(|p| p.clone_ref(py)))
+                .collect()
+        };
+        for backing in backings {
+            let entries = backing
+                .bind(py)
+                .call_method1("iter_entries_prefix", (keys_list.clone(),))?;
+            for entry in entries.try_iter()? {
+                let entry = entry?;
+                let tup = entry
+                    .cast_into::<PyTuple>()
+                    .map_err(|_| PyTypeError::new_err("entry must be a tuple"))?;
+                let mut items: Vec<Bound<'py, PyAny>> = vec![self_any.clone()];
+                for i in 1..tup.len() {
+                    items.push(tup.get_item(i)?);
+                }
+                out.append(PyTuple::new(py, items)?)?;
+            }
+        }
+        let parent = slf.borrow().into_super();
+        let has_refs = parent.inner.lock().unwrap().reference_lists() > 0;
+        let key_length = parent.inner.lock().unwrap().key_length();
+        drop(parent);
+        let nodes = slf.borrow().nodes.lock().unwrap().bind(py).clone();
+        let mode = if has_refs {
+            "btree-builder-refs"
+        } else {
+            "btree-builder-norefs"
+        };
+        let local_entries: Bound<'py, PyList> = crate::index::py_iter_entries_prefix(
+            py,
+            nodes,
+            keys_list.into_any(),
+            key_length,
+            mode,
+        )?;
+        for entry in local_entries.iter() {
+            let tup = entry
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("entry must be a tuple"))?;
+            let mut items: Vec<Bound<'py, PyAny>> = vec![self_any.clone()];
+            for it in tup.iter() {
+                items.push(it);
+            }
+            out.append(PyTuple::new(py, items)?)?;
+        }
+        Ok(out.try_iter()?.into_any())
+    }
+
+    /// `_get_nodes_by_key`: lazy trie. First call builds it from
+    /// `_nodes`; subsequent calls return the cached dict.
+    fn _get_nodes_by_key<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        {
+            let me = slf.borrow();
+            let guard = me.nodes_by_key.lock().unwrap();
+            if let Some(d) = guard.as_ref() {
+                return Ok(d.bind(py).clone());
+            }
+        }
+        let parent = slf.borrow().into_super();
+        let has_refs = parent.inner.lock().unwrap().reference_lists() > 0;
+        drop(parent);
+        let nodes_by_key = PyDict::new(py);
+        let nodes = slf.borrow().nodes.lock().unwrap().bind(py).clone();
+        for (key_obj, value_obj) in nodes.iter() {
+            let key_tuple = key_obj
+                .cast::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("key must be a tuple"))?;
+            let value_tuple = value_obj
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("btree node must be a 2-tuple"))?;
+            let refs_obj = value_tuple.get_item(0)?;
+            let value_b = value_tuple.get_item(1)?;
+            let leaf_value: Bound<'py, PyAny> = if has_refs {
+                PyTuple::new(
+                    py,
+                    [
+                        key_tuple.clone().into_any(),
+                        value_b.clone(),
+                        refs_obj.clone(),
+                    ],
+                )?
+                .into_any()
+            } else {
+                PyTuple::new(py, [key_tuple.clone().into_any(), value_b.clone()])?.into_any()
+            };
+            let mut key_dict = nodes_by_key.clone();
+            for i in 0..(key_tuple.len() - 1) {
+                let subkey = key_tuple.get_item(i)?;
+                let entry = key_dict.get_item(subkey.clone())?;
+                match entry {
+                    Some(d) => {
+                        key_dict = d.cast_into()?;
+                    }
+                    None => {
+                        let new_dict = PyDict::new(py);
+                        key_dict.set_item(subkey, new_dict.clone())?;
+                        key_dict = new_dict;
+                    }
+                }
+            }
+            let last = key_tuple.get_item(key_tuple.len() - 1)?;
+            key_dict.set_item(last, leaf_value)?;
+        }
+        *slf.borrow().nodes_by_key.lock().unwrap() = Some(nodes_by_key.clone().unbind());
+        Ok(nodes_by_key)
+    }
+
+    /// `find_ancestry`: classic graph walk over `iter_entries`. Each
+    /// iteration looks up the current `pending` keys, records their
+    /// parents, and feeds newly-discovered parents into the next round.
+    fn find_ancestry<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+        ref_list_num: usize,
+    ) -> PyResult<(Bound<'py, PyDict>, Bound<'py, pyo3::types::PySet>)> {
+        let parent_map = PyDict::new(py);
+        let missing = pyo3::types::PySet::empty(py)?;
+        let mut pending = pyo3::types::PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            pending.add(k?)?;
+        }
+        while !pending.is_empty() {
+            let next_pending = pyo3::types::PySet::empty(py)?;
+            let entries = Self::iter_entries(slf.clone(), py, pending.clone().into_any())?;
+            for entry in entries.try_iter()? {
+                let entry = entry?;
+                let tup = entry
+                    .cast_into::<PyTuple>()
+                    .map_err(|_| PyTypeError::new_err("entry must be a tuple"))?;
+                let key = tup.get_item(1)?;
+                let refs: Bound<'py, PyTuple> = tup.get_item(3)?.cast_into()?;
+                let parent_keys: Bound<'py, PyAny> = refs.get_item(ref_list_num)?;
+                let parent_keys_tuple: Bound<'py, PyTuple> = parent_keys.clone().cast_into()?;
+                parent_map.set_item(key, parent_keys.clone())?;
+                for p in parent_keys_tuple.iter() {
+                    if !parent_map.contains(p.clone())? {
+                        next_pending.add(p)?;
+                    }
+                }
+            }
+            // Anything in pending that didn't end up in parent_map this
+            // round is genuinely missing.
+            for k in pending.iter() {
+                if !parent_map.contains(k.clone())? {
+                    missing.add(k)?;
+                }
+            }
+            pending = next_pending;
+        }
+        Ok((parent_map, missing))
+    }
+
+    /// `_find_ancestors`: one-step ancestry walk. Populates
+    /// `parent_map` with each search-key's parents and adds unfound
+    /// keys to `missing_keys`. Returns the set of newly-discovered
+    /// parents not already in `parent_map`.
+    fn _find_ancestors<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        search_keys: Bound<'py, PyAny>,
+        ref_list_num: usize,
+        parent_map: Bound<'py, PyDict>,
+        missing_keys: Bound<'py, pyo3::types::PySet>,
+    ) -> PyResult<Bound<'py, pyo3::types::PySet>> {
+        let found = pyo3::types::PySet::empty(py)?;
+        let new_search = pyo3::types::PySet::empty(py)?;
+        let search_set = pyo3::types::PySet::empty(py)?;
+        for k in search_keys.try_iter()? {
+            search_set.add(k?)?;
+        }
+        let entries = Self::iter_entries(slf, py, search_set.clone().into_any())?;
+        for entry in entries.try_iter()? {
+            let entry = entry?;
+            let tup = entry
+                .cast_into::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("entry must be a tuple"))?;
+            let key = tup.get_item(1)?;
+            let refs: Bound<'py, PyTuple> = tup.get_item(3)?.cast_into()?;
+            let parent_keys: Bound<'py, PyTuple> = refs.get_item(ref_list_num)?.cast_into()?;
+            parent_map.set_item(key.clone(), parent_keys.clone())?;
+            for p in parent_keys.iter() {
+                if !parent_map.contains(p.clone())? {
+                    new_search.add(p)?;
+                }
+            }
+            found.add(key)?;
+        }
+        // search_keys - found = newly-known-missing
+        for k in search_set.iter() {
+            if !found.contains(k.clone())? {
+                missing_keys.add(k)?;
+            }
+        }
+        Ok(new_search)
+    }
+
+    /// `finish`: serialise all entries to a temporary file and return
+    /// its handle.
+    fn finish<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let iter = Self::iter_all_entries(slf.clone(), py)?;
+        let (file, _size) = Self::write_nodes(slf, py, iter, true)?;
+        Ok(file)
+    }
+}
+
+/// Coerce a Python value into a tuple (the historic Python wrapper
+/// did `key = tuple(key)`), preserving the contract that builders
+/// accept any iterable that materialises into a key tuple.
+fn ensure_key_tuple<'py>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    if let Ok(t) = obj.downcast::<PyTuple>() {
+        return Ok(t.clone());
+    }
+    let builtins = py.import("builtins")?;
+    let tuple_class = builtins.getattr("tuple")?;
+    let coerced = tuple_class.call1((obj.clone(),))?;
+    Ok(coerced.cast_into()?)
+}
+
+/// Non-pyo3 helpers for [`BTreeBuilder`]. These are called from the
+/// `#[pymethods]` block above but are not themselves exposed to
+/// Python — they handle spill/merge/serialise orchestration over the
+/// Python tempfile + `BTreeGraphIndex` objects.
+impl BTreeBuilder {
+    /// Update the lazy `_nodes_by_key` trie with a single new key.
+    /// Mirrors Python's `_update_nodes_by_key`. The caller passes
+    /// `has_refs` so this helper doesn't have to re-borrow the parent
+    /// PyGraphIndexBuilder.
+    fn update_nodes_by_key_inner<'py>(
+        py: Python<'py>,
+        me: &PyRef<'_, Self>,
+        has_refs: bool,
+        key_tuple: Bound<'py, PyTuple>,
+        value_b: Bound<'py, PyAny>,
+        node_refs: &Bound<'py, PyAny>,
+    ) -> PyResult<()> {
+        let nbk_guard = me.nodes_by_key.lock().unwrap();
+        let Some(nbk_py) = nbk_guard.as_ref() else {
+            return Ok(());
+        };
+        let leaf_value: Bound<'py, PyAny> = if has_refs {
+            PyTuple::new(
+                py,
+                [
+                    key_tuple.clone().into_any(),
+                    value_b,
+                    node_refs.clone().into_any(),
+                ],
+            )?
+            .into_any()
+        } else {
+            PyTuple::new(py, [key_tuple.clone().into_any(), value_b])?.into_any()
+        };
+        let mut key_dict = nbk_py.bind(py).clone();
+        for i in 0..(key_tuple.len() - 1) {
+            let subkey = key_tuple.get_item(i)?;
+            let entry = key_dict.get_item(subkey.clone())?;
+            match entry {
+                Some(d) => {
+                    key_dict = d.cast_into()?;
+                }
+                None => {
+                    let new_dict = PyDict::new(py);
+                    key_dict.set_item(subkey, new_dict.clone())?;
+                    key_dict = new_dict;
+                }
+            }
+        }
+        let last = key_tuple.get_item(key_tuple.len() - 1)?;
+        key_dict.set_item(last, leaf_value)?;
+        Ok(())
+    }
+
+    /// `_spill_mem_keys_to_disk`: flush the in-memory `_nodes` dict
+    /// into a backing index on disk. If `_combine_backing_indices` is
+    /// true, merge with leading filled slots per the power-of-2 strategy.
+    fn spill_mem_keys_to_disk(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        let combine: bool = {
+            let parent = slf.borrow().into_super();
+            let stored = parent
+                .combine_backing_indices_py
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|v| v.extract::<bool>(py).ok());
+            stored.unwrap_or_else(|| parent.inner.lock().unwrap().combine_backing_indices())
+        };
+        let (file, size, slot) = if combine {
+            let occupancy: Vec<bool> = {
+                let me = slf.borrow();
+                let guard = me.backing_indices.lock().unwrap();
+                guard.iter().map(|e| e.is_some()).collect()
+            };
+            let slot = spill_landing_slot(&occupancy);
+            // Combine mem with every leading non-None backing (slots 0..slot).
+            let mem_entries = Self::_iter_mem_nodes(slf.clone(), py)?;
+            let mut iterators: Vec<Bound<'_, PyAny>> = vec![mem_entries.try_iter()?.into_any()];
+            let leading: Vec<Py<PyAny>> = {
+                let me = slf.borrow();
+                let guard = me.backing_indices.lock().unwrap();
+                guard[..slot]
+                    .iter()
+                    .filter_map(|e| e.as_ref().map(|p| p.clone_ref(py)))
+                    .collect()
+            };
+            for backing in leading {
+                let entries = backing.bind(py).call_method0("iter_all_entries")?;
+                iterators.push(entries.try_iter()?.into_any());
+            }
+            let merged = Self::iter_smallest(slf.clone(), py, iterators)?;
+            let (file, size) = Self::write_nodes(slf.clone(), py, merged, false)?;
+            (file, size, slot)
+        } else {
+            // Plain spill: just write the mem nodes; new backing goes
+            // at the end of the list.
+            let slot = slf.borrow().backing_indices.lock().unwrap().len();
+            let mem_entries = Self::_iter_mem_nodes(slf.clone(), py)?;
+            let (file, size) = Self::write_nodes(slf.clone(), py, mem_entries.into_any(), false)?;
+            (file, size, slot)
+        };
+
+        // Build a Python BTreeGraphIndex over a dummy transport that
+        // returns a fixed recommended_page_size. The transport itself
+        // is never used for I/O because we overwrite `_file` to point
+        // at the just-written tempfile.
+        let btree_index_py = py.import("bzrformats.btree_index")?;
+        let dummy_transport = btree_index_py.getattr("_DummyTransport")?.call0()?;
+        let new_backing_cls = btree_index_py.getattr("BTreeGraphIndex")?;
+        let new_backing = new_backing_cls.call1((dummy_transport, "<temp>", size))?;
+        new_backing.setattr("_file", file)?;
+
+        {
+            let me = slf.borrow();
+            let mut guard = me.backing_indices.lock().unwrap();
+            if combine {
+                if guard.len() == slot {
+                    guard.push(None);
+                }
+                guard[slot] = Some(new_backing.unbind());
+                for prev in &mut guard[..slot] {
+                    *prev = None;
+                }
+            } else {
+                guard.push(Some(new_backing.unbind()));
+            }
+            // Clear mem.
+            *me.nodes.lock().unwrap() = PyDict::new(py).unbind();
+            *me.nodes_by_key.lock().unwrap() = None;
+        }
+        Ok(())
+    }
+
+    /// `_iter_smallest`: k-way merge across pre-sorted iterators, each
+    /// yielding `(self, key, ...)` tuples. Raises `BadIndexDuplicateKey`
+    /// when the same key appears in two iterators back-to-back.
+    fn iter_smallest<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        iterators: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if iterators.len() == 1 {
+            return Ok(iterators.into_iter().next().unwrap());
+        }
+        let mut current: Vec<Option<Bound<'py, PyTuple>>> = Vec::with_capacity(iterators.len());
+        for it in &iterators {
+            current.push(advance_iter(it)?);
+        }
+        let out = PyList::empty(py);
+        let mut last_key: Option<Bound<'py, PyAny>> = None;
+        let self_any: Bound<'py, PyAny> = slf.clone().into_any();
+        let iterators_vec = iterators;
+        loop {
+            // Find the index of the smallest-key current entry.
+            let mut best: Option<(usize, Bound<'py, PyAny>)> = None;
+            for (i, entry) in current.iter().enumerate() {
+                let Some(e) = entry.as_ref() else { continue };
+                let key = e.get_item(1)?;
+                let smaller = match &best {
+                    Some((_, cur_best_key)) => key.lt(cur_best_key)?,
+                    None => true,
+                };
+                if smaller {
+                    best = Some((i, key));
+                }
+            }
+            let Some((idx, key)) = best else {
+                break;
+            };
+            // Duplicate detection — last selected key must not equal this one.
+            if let Some(prev) = &last_key {
+                if prev.eq(key.clone())? {
+                    return Err(BadIndexDuplicateKey::new_err((
+                        prev.clone().unbind(),
+                        slf.clone().into_any().unbind(),
+                    )));
+                }
+            }
+            // Yield: replace the (other-self, ...) prefix with our self.
+            let original = current[idx].clone().unwrap();
+            let mut items: Vec<Bound<'py, PyAny>> = vec![self_any.clone()];
+            for i in 1..original.len() {
+                items.push(original.get_item(i)?);
+            }
+            out.append(PyTuple::new(py, items)?)?;
+            last_key = Some(key);
+            current[idx] = advance_iter(&iterators_vec[idx])?;
+        }
+        Ok(out.try_iter()?.into_any())
+    }
+
+    /// `_write_nodes`: serialise a sorted iterator of nodes into a
+    /// `tempfile.NamedTemporaryFile` (or `BytesIO` for small outputs)
+    /// and return `(file_handle, size)`. The handle is rewound to the
+    /// start so the caller can read it directly.
+    fn write_nodes<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        node_iterator: Bound<'py, PyAny>,
+        allow_optimize: bool,
+    ) -> PyResult<(Bound<'py, PyAny>, usize)> {
+        let parent = slf.borrow().into_super();
+        let reference_lists = parent.inner.lock().unwrap().reference_lists();
+        let key_length = parent.inner.lock().unwrap().key_length();
+        let optimize_for_size = if allow_optimize {
+            parent
+                .optimize_for_size_py
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|v| v.extract::<bool>(py).ok())
+                .unwrap_or_else(|| parent.inner.lock().unwrap().optimize_for_size())
+        } else {
+            false
+        };
+        drop(parent);
+        // Read _PAGE_SIZE and _RESERVED_HEADER_BYTES from the Python
+        // btree_index module so the historical test pattern of
+        // monkey-patching those module-level constants (via
+        // overrideAttr) keeps working.
+        let btree_index_mod = py.import("bzrformats.btree_index")?;
+        let page_size: usize = btree_index_mod.getattr("_PAGE_SIZE")?.extract()?;
+        let reserved_header_bytes: usize = btree_index_mod
+            .getattr("_RESERVED_HEADER_BYTES")?
+            .extract()?;
+        let blob = crate::btree_serializer::serialize_btree_index(
+            py,
+            &node_iterator,
+            reference_lists,
+            key_length,
+            optimize_for_size,
+            Some(page_size),
+            Some(reserved_header_bytes),
+        )?;
+        let blob_bytes = blob.as_bytes();
+        let size = blob_bytes.len();
+        let file: Bound<'py, PyAny> = if size > page_size {
+            let tempfile_mod = py.import("tempfile")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("prefix", "bzr-index-")?;
+            tempfile_mod
+                .getattr("NamedTemporaryFile")?
+                .call((), Some(&kwargs))?
+        } else {
+            let io = py.import("io")?;
+            io.getattr("BytesIO")?.call0()?
+        };
+        file.call_method1("write", (blob.clone(),))?;
+        file.call_method0("flush")?;
+        file.call_method1("seek", (0,))?;
+        Ok((file, size))
+    }
+}
+
+/// Pull the next item from a Python iterator, returning `None` on
+/// `StopIteration`. The iterator must yield tuples for `iter_smallest`.
+fn advance_iter<'py>(iter: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    match iter.call_method0("__next__") {
+        Ok(item) => Ok(Some(item.cast_into()?)),
+        Err(e) if e.is_instance_of::<PyStopIteration>(iter.py()) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn _btree_index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "btree_index")?;
     m.add_function(wrap_pyfunction!(py_parse_btree_header, &m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_internal_node, &m)?)?;
     m.add_class::<BTreeGraphIndex>()?;
     m.add_class::<EntryIterator>()?;
+    m.add_class::<BTreeBuilder>()?;
     Ok(m)
 }

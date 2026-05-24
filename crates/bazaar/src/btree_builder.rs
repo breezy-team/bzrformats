@@ -478,6 +478,27 @@ fn add_key(
     Ok(())
 }
 
+/// Decide where in `backing_indices` a spilled merge should land, and
+/// how many leading slots get merged into it.
+///
+/// Mirrors the power-of-2 strategy implemented in the Python
+/// `BTreeBuilder._spill_mem_keys_and_combine`: scan `backing_indices`
+/// from slot 0; the first `None` slot is the landing position, and
+/// every non-`None` slot before it is included in the merge.
+///
+/// Returns the landing slot index. Caller obligations after the merge:
+///   * extend `backing_indices` with `None` if `slot == len`;
+///   * write the new index into `backing_indices[slot]`;
+///   * null out `backing_indices[0..slot]`.
+///
+/// `occupancy[i]` is `true` iff `backing_indices[i]` is `Some(_)`.
+pub fn spill_landing_slot(occupancy: &[bool]) -> usize {
+    occupancy
+        .iter()
+        .position(|&filled| !filled)
+        .unwrap_or(occupancy.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +651,28 @@ mod tests {
         let (string_key, line) = flatten_node(&key, value, &references, true);
         assert_eq!(string_key, b"f\x00r");
         assert_eq!(line, b"f\x00r\x00f\x00p1\rf\x00p2\x00value:0\n");
+    }
+
+    #[test]
+    fn spill_landing_slot_first_spill_lands_at_zero() {
+        // No backings yet -> new spill lands at slot 0.
+        assert_eq!(spill_landing_slot(&[]), 0);
+    }
+
+    #[test]
+    fn spill_landing_slot_after_one_spill_lands_at_one() {
+        // [Some] -> next spill merges slot 0 with mem, lands at slot 1.
+        assert_eq!(spill_landing_slot(&[true]), 1);
+    }
+
+    #[test]
+    fn spill_landing_slot_skips_filled_to_next_none() {
+        // [Some, Some] -> next spill merges both slots with mem, lands at 2.
+        assert_eq!(spill_landing_slot(&[true, true]), 2);
+        // [None, Some] -> next spill lands at the first None (slot 0); the
+        // populated slot 1 is left undisturbed.
+        assert_eq!(spill_landing_slot(&[false, true]), 0);
+        // [Some, None, Some] -> next spill merges slot 0 with mem, lands at 1.
+        assert_eq!(spill_landing_slot(&[true, false, true]), 1);
     }
 }

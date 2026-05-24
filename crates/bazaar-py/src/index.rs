@@ -656,15 +656,15 @@ fn entries_to_pylist<'py>(
 /// so Python subclasses (BTreeBuilder, InMemoryGraphIndex) can extend
 /// it.
 #[pyclass(name = "GraphIndexBuilder", subclass)]
-struct PyGraphIndexBuilder {
-    inner: std::sync::Mutex<RsGraphIndexBuilder>,
+pub(crate) struct PyGraphIndexBuilder {
+    pub(crate) inner: std::sync::Mutex<RsGraphIndexBuilder>,
     // Python-exposed attribute slots. The pure-Python class allowed
     // assigning arbitrary objects to these names (e.g. test fixtures
     // that store sentinels). Mirror that by holding the last-assigned
     // Python value alongside the Rust state, falling back to the Rust
     // bool until something is assigned.
-    optimize_for_size_py: std::sync::Mutex<Option<Py<PyAny>>>,
-    combine_backing_indices_py: std::sync::Mutex<Option<Py<PyAny>>>,
+    pub(crate) optimize_for_size_py: std::sync::Mutex<Option<Py<PyAny>>>,
+    pub(crate) combine_backing_indices_py: std::sync::Mutex<Option<Py<PyAny>>>,
 }
 
 #[pymethods]
@@ -2610,7 +2610,7 @@ fn py_parse_full<'py>(
 /// Returns a list of result tuples; the caller prepends `self`.
 #[pyfunction]
 #[pyo3(name = "iter_entries_prefix")]
-fn py_iter_entries_prefix<'py>(
+pub(crate) fn py_iter_entries_prefix<'py>(
     py: Python<'py>,
     nodes: Bound<'py, PyDict>,
     prefixes: Bound<'py, PyAny>,
@@ -3043,7 +3043,7 @@ fn py_strip_prefix_entries<'py>(
 /// backing indices.
 #[pyfunction]
 #[pyo3(name = "iter_btree_builder_nodes_for_keys")]
-fn py_iter_btree_builder_nodes_for_keys<'py>(
+pub(crate) fn py_iter_btree_builder_nodes_for_keys<'py>(
     py: Python<'py>,
     nodes: Bound<'py, PyDict>,
     keys: Bound<'py, PyAny>,
@@ -3077,7 +3077,7 @@ fn py_iter_btree_builder_nodes_for_keys<'py>(
 /// `self`.
 #[pyfunction]
 #[pyo3(name = "iter_btree_builder_nodes_sorted")]
-fn py_iter_btree_builder_nodes_sorted<'py>(
+pub(crate) fn py_iter_btree_builder_nodes_sorted<'py>(
     py: Python<'py>,
     nodes: Bound<'py, PyDict>,
     has_refs: bool,
@@ -3189,7 +3189,7 @@ fn py_iter_builder_nodes_for_keys<'py>(
 /// present.
 #[pyfunction]
 #[pyo3(name = "add_node_to_btree_builder")]
-fn py_add_node_to_btree_builder<'py>(
+pub(crate) fn py_add_node_to_btree_builder<'py>(
     py: Python<'py>,
     builder: Bound<'py, PyAny>,
     key: Bound<'py, PyAny>,

@@ -97,6 +97,17 @@ class TestBTreeBuilder(BTreeTestCase):
         # BTreeGraphIndex apis.
         builder.clear_cache()
 
+    def test_sort_with_btree_graph_index(self):
+        # BTreeBuilder.__lt__ and BTreeGraphIndex.__lt__ must agree so that
+        # tuples mixing the two can be sorted (eg. groupcompress index memos).
+        builder = btree_index.BTreeBuilder(reference_lists=0, key_elements=1)
+        transport = MemoryTransport()
+        transport.put_bytes("name", b"")
+        graph_index = btree_index.BTreeGraphIndex(transport, "name", 0)
+        self.assertFalse(builder < graph_index)
+        self.assertTrue(graph_index < builder)
+        sorted([(builder, 1), (graph_index, 2)])
+
     def test_empty_1_0(self):
         builder = btree_index.BTreeBuilder(key_elements=1, reference_lists=0)
         # NamedTemporaryFile dies on builder.finish().read(). weird.
