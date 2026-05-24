@@ -71,25 +71,9 @@ def pumpfile(from_file, to_file, buffer_size=65536):
 
 def chunks_to_lines(chunks):
     """Convert chunks to lines."""
-    if not chunks:
-        return []
+    from ._bzr_rs import osutils as _osutils_rs
 
-    # Join all chunks
-    data = b"".join(chunks)
-
-    # Split into lines, keeping line endings
-    lines = []
-    start = 0
-    for i, byte in enumerate(data):
-        if byte == ord(b"\n"):
-            lines.append(data[start : i + 1])
-            start = i + 1
-
-    # Add remaining data if any
-    if start < len(data):
-        lines.append(data[start:])
-
-    return lines
+    return _osutils_rs.chunks_to_lines(chunks)
 
 
 def normalized_filename(filename):
