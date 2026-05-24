@@ -769,6 +769,18 @@ where
         self.insert_order.iter()
     }
 
+    /// Read-only access to the parent map (version -> list of parent keys).
+    pub fn parents_map(&self) -> &std::collections::HashMap<K, Vec<K>> {
+        &self.parents
+    }
+
+    /// Read-only access to the lines cache (version -> reconstructed
+    /// fulltext lines). A version only appears here after it has been
+    /// reconstructed at least once, or seeded by `add_version`.
+    pub fn lines_cache(&self) -> &std::collections::HashMap<K, Vec<Vec<u8>>> {
+        &self.lines_cache
+    }
+
     /// Snapshot set (versions stored as `NewText` instead of a delta).
     pub fn snapshots(&self) -> &std::collections::HashSet<K> {
         &self.snapshots

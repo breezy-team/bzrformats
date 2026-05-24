@@ -296,6 +296,38 @@ impl PyMultiMemoryVersionedFile {
         self.inner.max_snapshots()
     }
 
+    /// Read-only snapshot of the line cache (mirrors the legacy
+    /// `_lines` attribute on the Python class). Provided so external
+    /// helpers like `_Reconstructor` can keep walking this VF without
+    /// changes.
+    #[getter]
+    fn _lines<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (k, lines) in self.inner.lines_cache() {
+            let inner = PyList::empty(py);
+            for l in lines {
+                inner.append(PyBytes::new(py, l))?;
+            }
+            dict.set_item(k.bind(py), inner)?;
+        }
+        Ok(dict)
+    }
+
+    /// Read-only snapshot of the parent map (mirrors the legacy
+    /// `_parents` attribute on the Python class).
+    #[getter]
+    fn _parents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (k, parents) in self.inner.parents_map() {
+            let inner = PyList::empty(py);
+            for p in parents {
+                inner.append(p.bind(py))?;
+            }
+            dict.set_item(k.bind(py), inner)?;
+        }
+        Ok(dict)
+    }
+
     fn versions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let list = PyList::empty(py);
         for v in self.inner.versions() {
