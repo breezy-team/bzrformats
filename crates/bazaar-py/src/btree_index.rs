@@ -904,8 +904,16 @@ impl BTreeBuilder {
             let b = b_borrow.nodes.lock().unwrap().clone_ref(py);
             return a.bind(py).lt(b.bind(py));
         }
+        // Existing on-disk indices sort before still-being-built ones.
+        // Accept both the Rust pyclass and the Python wrapper class, since
+        // spilled backings are constructed via the Python BTreeGraphIndex.
         if other.is_instance_of::<BTreeGraphIndex>() {
-            // Existing on-disk indices sort before still-being-built ones.
+            return Ok(false);
+        }
+        let py_btree_graph_index = py
+            .import("bzrformats.btree_index")?
+            .getattr("BTreeGraphIndex")?;
+        if other.is_instance(&py_btree_graph_index)? {
             return Ok(false);
         }
         Err(PyTypeError::new_err(other.unbind()))
