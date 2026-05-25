@@ -1227,6 +1227,13 @@ struct PyDirState {
     /// place by `refresh_cached_id_index` after every mutation so
     /// callers that hold the returned object see fresh state.
     id_index: std::sync::Mutex<Option<Py<IdIndex>>>,
+    /// Transport representing the dirstate file on disk. Created at
+    /// construction time as a [`FileTransport`] pointing at the
+    /// dirstate path; its lifetime matches this `DirStateRs`.
+    /// Lock acquisition/release happens *on* the transport via
+    /// `lock_read` / `lock_write` / `unlock`; the transport itself
+    /// is always present.
+    transport: std::sync::Mutex<Box<dyn bazaar::dirstate::Transport + Send>>,
 }
 
 #[pymethods]
@@ -1256,6 +1263,8 @@ impl PyDirState {
             Some(obj) => sha1_provider_from_py(py, obj),
             None => Box::new(bazaar::dirstate::DefaultSHA1Provider::new()),
         };
+        let transport: Box<dyn bazaar::dirstate::Transport + Send> =
+            Box::new(bazaar::dirstate::FileTransport::new(path.clone()));
         Ok(Self {
             inner: bazaar::dirstate::DirState::new(
                 path,
@@ -1265,6 +1274,7 @@ impl PyDirState {
                 fdatasync,
             ),
             id_index: std::sync::Mutex::new(None),
+            transport: std::sync::Mutex::new(transport),
         })
     }
 
