@@ -106,9 +106,10 @@ pub fn _read_dirblocks(py: Python, state: &Bound<PyAny>) -> PyResult<()> {
         return Ok(());
     }
 
-    let num_present_parents: usize = state.call_method0("_num_present_parents")?.extract()?;
+    let rs = state.getattr("_rs")?;
+    let num_present_parents: usize = rs.call_method0("num_present_parents")?.extract()?;
     let num_trees = num_present_parents + 1;
-    let num_entries: usize = state.getattr("_rs")?.getattr("num_entries")?.extract()?;
+    let num_entries: usize = rs.getattr("num_entries")?.extract()?;
 
     let dirblocks =
         parse_dirblocks(text, num_trees, num_entries).map_err(|e| dirblocks_err_to_py(state, e))?;
