@@ -2097,6 +2097,28 @@ impl PyDirState {
             .map(|sha1| PyBytes::new(py, sha1))
     }
 
+    /// `DirState.sha1_from_stat`: pack the stat tuple and look up the
+    /// resulting key in the packed-stat index in one call. Saves the
+    /// Python wrapper from doing pack_stat(stat) before forwarding.
+    fn sha1_from_stat<'py>(
+        &mut self,
+        py: Python<'py>,
+        stat_result: &Bound<'py, PyAny>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let size = stat_result.getattr("st_size")?.extract::<u64>()?;
+        let mtime = extract_fs_time(&stat_result.getattr("st_mtime")?)?;
+        let ctime = extract_fs_time(&stat_result.getattr("st_ctime")?)?;
+        let dev = stat_result.getattr("st_dev")?.extract::<u64>()?;
+        let ino = stat_result.getattr("st_ino")?.extract::<u64>()?;
+        let mode = stat_result.getattr("st_mode")?.extract::<u32>()?;
+        let packed = bazaar::dirstate::pack_stat(size, mtime, ctime, dev, ino, mode);
+        Ok(self
+            .inner
+            .get_or_build_packed_stat_index()
+            .get(packed.as_bytes())
+            .map(|sha1| PyBytes::new(py, sha1)))
+    }
+
     /// Mark the entry at `key` as absent for tree 0, returning True
     /// when the entry row was removed entirely (the "last reference"
     /// case). Mirrors Python's `DirState._make_absent`. Input is the

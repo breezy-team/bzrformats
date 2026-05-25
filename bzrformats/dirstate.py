@@ -1038,7 +1038,7 @@ class DirState:
 
     def sha1_from_stat(self, path, stat_result):
         """Find a sha1 given a stat lookup."""
-        return self._rs.sha1_from_packed_stat(pack_stat(stat_result))
+        return self._rs.sha1_from_stat(stat_result)
 
     def save(self):
         """Save any pending changes created during this session.
