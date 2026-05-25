@@ -64,6 +64,7 @@ from .versionedfile import (
     ContentFactory,
     UnavailableRepresentation,
     VersionedFilesWithFallbacks,
+    adapter_registry,
 )
 
 evil_logger = logging.getLogger("bzrformats.evil")
