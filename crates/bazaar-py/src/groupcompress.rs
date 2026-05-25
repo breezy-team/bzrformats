@@ -3383,10 +3383,9 @@ impl GroupCompressVersionedFiles {
         let unbound = a_versioned_files.unbind();
         let cloned = Python::attach(|py| unbound.clone_ref(py));
         self.immediate_fallback_vfs.push(unbound);
-        self.pure
-            .add_fallback_versioned_files(Box::new(crate::versionedfile::PyVersionedFiles::new(
-                cloned,
-            )));
+        self.pure.add_fallback_versioned_files(Box::new(
+            crate::versionedfile::PyVersionedFiles::new(cloned),
+        ));
     }
 
     /// Drop the block cache and the index's caches.

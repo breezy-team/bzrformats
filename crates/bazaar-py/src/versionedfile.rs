@@ -214,6 +214,109 @@ fn hash_escaped_prefix_unmap<'py>(py: Python<'py>, partition_id: &str) -> Bound<
     )
 }
 
+/// A `KeyMapper` that always returns the same path. Mirrors the Python
+/// `bzrformats.versionedfile.ConstantMapper`.
+#[pyclass(name = "ConstantMapper", module = "bzrformats._bzr_rs.versionedfile")]
+#[derive(Clone)]
+struct PyConstantMapper {
+    result: String,
+}
+
+#[pymethods]
+impl PyConstantMapper {
+    #[new]
+    fn new(result: String) -> Self {
+        Self { result }
+    }
+
+    fn map(&self, _key: &Bound<'_, PyAny>) -> String {
+        self.result.clone()
+    }
+
+    /// Property kept for parity with the previous Python attribute access.
+    #[getter]
+    fn _result(&self) -> &str {
+        &self.result
+    }
+}
+
+/// A `KeyMapper` that uses the first key element as the storage path.
+/// Mirrors the Python `bzrformats.versionedfile.PrefixMapper`.
+#[pyclass(name = "PrefixMapper", module = "bzrformats._bzr_rs.versionedfile")]
+#[derive(Clone)]
+struct PyPrefixMapper;
+
+#[pymethods]
+impl PyPrefixMapper {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn map(&self, key: &Bound<'_, PyAny>) -> PyResult<String> {
+        let first = key.get_item(0)?.cast_into::<PyBytes>()?;
+        Ok(bazaar::key_mapper::prefix_map(first.as_bytes()))
+    }
+
+    fn unmap<'py>(&self, py: Python<'py>, partition_id: &str) -> PyResult<Bound<'py, PyTuple>> {
+        let bytes = bazaar::key_mapper::prefix_unmap(partition_id);
+        PyTuple::new(py, [PyBytes::new(py, &bytes)])
+    }
+}
+
+/// A `KeyMapper` that prefixes the path with a two-hex adler32 bucket.
+/// Mirrors the Python `bzrformats.versionedfile.HashPrefixMapper`.
+#[pyclass(name = "HashPrefixMapper", module = "bzrformats._bzr_rs.versionedfile")]
+#[derive(Clone)]
+struct PyHashPrefixMapper;
+
+#[pymethods]
+impl PyHashPrefixMapper {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn map(&self, key: &Bound<'_, PyAny>) -> PyResult<String> {
+        let first = key.get_item(0)?.cast_into::<PyBytes>()?;
+        Ok(bazaar::key_mapper::hash_prefix_map(first.as_bytes()))
+    }
+
+    fn unmap<'py>(&self, py: Python<'py>, partition_id: &str) -> PyResult<Bound<'py, PyTuple>> {
+        let bytes = bazaar::key_mapper::hash_prefix_unmap(partition_id);
+        PyTuple::new(py, [PyBytes::new(py, &bytes)])
+    }
+}
+
+/// A `KeyMapper` that escapes non-filesystem-safe bytes before bucketing.
+/// Mirrors the Python `bzrformats.versionedfile.HashEscapedPrefixMapper`.
+#[pyclass(
+    name = "HashEscapedPrefixMapper",
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+#[derive(Clone)]
+struct PyHashEscapedPrefixMapper;
+
+#[pymethods]
+impl PyHashEscapedPrefixMapper {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn map(&self, key: &Bound<'_, PyAny>) -> PyResult<String> {
+        let first = key.get_item(0)?.cast_into::<PyBytes>()?;
+        Ok(bazaar::key_mapper::hash_escaped_prefix_map(
+            first.as_bytes(),
+        ))
+    }
+
+    fn unmap<'py>(&self, py: Python<'py>, partition_id: &str) -> PyResult<Bound<'py, PyTuple>> {
+        let bytes = bazaar::key_mapper::hash_escaped_prefix_unmap(partition_id);
+        PyTuple::new(py, [PyBytes::new(py, &bytes)])
+    }
+}
+
 #[pyfunction]
 fn network_bytes_to_kind_and_offset(network_bytes: &[u8]) -> (String, usize) {
     bazaar::versionedfile::network_bytes_to_kind_and_offset(network_bytes)
@@ -1441,6 +1544,10 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<ChunkedContentFactory>()?;
     m.add_class::<AbsentContentFactory>()?;
     m.add_class::<KeyRefs>()?;
+    m.add_class::<PyConstantMapper>()?;
+    m.add_class::<PyPrefixMapper>()?;
+    m.add_class::<PyHashPrefixMapper>()?;
+    m.add_class::<PyHashEscapedPrefixMapper>()?;
     m.add_function(wrap_pyfunction!(record_to_fulltext_bytes, &m)?)?;
     m.add_function(wrap_pyfunction!(fulltext_network_to_record, &m)?)?;
     m.add_function(wrap_pyfunction!(network_bytes_to_kind_and_offset, &m)?)?;

@@ -843,7 +843,12 @@ class OrderingVersionedFilesDecorator(RecordingVersionedFilesDecorator):
 
 
 class KeyMapper:
-    """KeyMappers map between keys and underlying partitioned storage."""
+    """Abstract KeyMapper kept as a Python type for ``isinstance`` checks.
+
+    The concrete mappers (``ConstantMapper``, ``PrefixMapper``,
+    ``HashPrefixMapper``, ``HashEscapedPrefixMapper``) are pyclasses
+    backed by ``crates/bazaar/src/key_mapper.rs``.
+    """
 
     def map(self, key):
         """Map key to an underlying storage identifier.
@@ -864,70 +869,10 @@ class KeyMapper:
         raise NotImplementedError(self.unmap)
 
 
-class ConstantMapper(KeyMapper):
-    """A key mapper that maps to a constant result."""
-
-    def __init__(self, result):
-        """Create a ConstantMapper which will return result for all maps."""
-        self._result = result
-
-    def map(self, key):
-        """See KeyMapper.map()."""
-        return self._result
-
-
-class URLEscapeMapper(KeyMapper):
-    """Base class for use with transport backed storage.
-
-    Subclasses are responsible for url-escaping their `map` output and
-    url-unescaping their `unmap` input; the actual transformations live in
-    the Rust `versionedfile` module.
-    """
-
-
-class PrefixMapper(URLEscapeMapper):
-    """A key mapper that extracts the first component of a key.
-
-    This mapper is for use with a transport based backend.
-    """
-
-    def map(self, key):
-        """See KeyMapper.map()."""
-        return _versionedfile_rs.prefix_map(key[0])
-
-    def unmap(self, partition_id):
-        """See KeyMapper.unmap()."""
-        return (_versionedfile_rs.prefix_unmap(partition_id),)
-
-
-class HashPrefixMapper(URLEscapeMapper):
-    """A key mapper that combines the first component of a key with a hash.
-
-    This mapper is for use with a transport based backend.
-    """
-
-    def map(self, key):
-        """See KeyMapper.map()."""
-        return _versionedfile_rs.hash_prefix_map(key[0])
-
-    def unmap(self, partition_id):
-        """See KeyMapper.unmap()."""
-        return (_versionedfile_rs.hash_prefix_unmap(partition_id),)
-
-
-class HashEscapedPrefixMapper(HashPrefixMapper):
-    """Combines the escaped first component of a key with a hash.
-
-    This mapper is for use with a transport based backend.
-    """
-
-    def map(self, key):
-        """See KeyMapper.map()."""
-        return _versionedfile_rs.hash_escaped_prefix_map(key[0])
-
-    def unmap(self, partition_id):
-        """See KeyMapper.unmap()."""
-        return (_versionedfile_rs.hash_escaped_prefix_unmap(partition_id),)
+ConstantMapper = _versionedfile_rs.ConstantMapper
+PrefixMapper = _versionedfile_rs.PrefixMapper
+HashPrefixMapper = _versionedfile_rs.HashPrefixMapper
+HashEscapedPrefixMapper = _versionedfile_rs.HashEscapedPrefixMapper
 
 
 def make_versioned_files_factory(versioned_file_factory, mapper):
