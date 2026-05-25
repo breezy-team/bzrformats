@@ -3410,9 +3410,14 @@ impl GroupCompressVersionedFiles {
     ) -> PyResult<Bound<'py, PyDict>> {
         // Iterate `keys` manually -- it may be any iterable (set, dict_keys,
         // generator), not just a Sequence pyo3 can extract a Vec from.
+        // Match historical Python leniency: keys with non-bytes elements can
+        // never be present in the index, so silently skip them instead of
+        // raising a TypeError that would mask the caller's own error path.
         let mut key_vec: Vec<bazaar::groupcompress::gcvf::GcKey> = Vec::new();
         for k in keys.try_iter()? {
-            key_vec.push(k?.extract()?);
+            if let Ok(parsed) = k?.extract() {
+                key_vec.push(parsed);
+            }
         }
         use bazaar::groupcompress::gcvf::GcIndex;
         let has_graph = self.pure.index().has_graph();
