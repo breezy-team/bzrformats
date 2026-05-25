@@ -86,11 +86,13 @@ pub(crate) fn dirblocks_to_py<'py>(
 /// :return: None
 /// :postcondition: The dirblocks will be loaded into the appropriate fields
 ///     in the DirState object.
+/// `DirState.IN_MEMORY_UNMODIFIED`. Inlined here so this helper
+/// does not need to round-trip into `bzrformats.dirstate` just to
+/// look up an integer module constant.
+const IN_MEMORY_UNMODIFIED: i32 = 1;
+
 #[pyfunction]
 pub fn _read_dirblocks(py: Python, state: &Bound<PyAny>) -> PyResult<()> {
-    let dirstate_mod = py.import("bzrformats.dirstate")?;
-    let dirstate_cls = dirstate_mod.getattr("DirState")?;
-
     // Seek to end of header and read the rest
     let state_file = state.getattr("_state_file")?;
     let end_of_header = state.getattr("_end_of_header")?;
@@ -100,10 +102,7 @@ pub fn _read_dirblocks(py: Python, state: &Bound<PyAny>) -> PyResult<()> {
 
     if text.is_empty() {
         // No data to parse
-        state.setattr(
-            "_dirblock_state",
-            dirstate_cls.getattr("IN_MEMORY_UNMODIFIED")?,
-        )?;
+        state.setattr("_dirblock_state", IN_MEMORY_UNMODIFIED)?;
         return Ok(());
     }
 
@@ -122,10 +121,7 @@ pub fn _read_dirblocks(py: Python, state: &Bound<PyAny>) -> PyResult<()> {
     // to `bazaar::dirstate::split_root_dirblock_into_contents` once the
     // pure-Rust version is wired into the marshalling path.
     state.call_method0("_split_root_dirblock_into_contents")?;
-    state.setattr(
-        "_dirblock_state",
-        dirstate_cls.getattr("IN_MEMORY_UNMODIFIED")?,
-    )?;
+    state.setattr("_dirblock_state", IN_MEMORY_UNMODIFIED)?;
 
     Ok(())
 }
