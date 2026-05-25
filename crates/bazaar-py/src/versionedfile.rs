@@ -181,6 +181,116 @@ impl AbsentContentFactory {
     }
 }
 
+/// First-pass refcount/needed-key bookkeeping for `_MPDiffGenerator`.
+///
+/// Exposes the per-step intermediate state that breezy's whitebox tests
+/// probe (`_find_needed_keys` + `gen.ghost_parents` / `gen.refcounts`).
+/// The single-shot fast path lives in
+/// [`bazaar::versionedfile::make_mpdiffs`]; this helper backs the
+/// step-by-step Python flavour only.
+#[pyfunction]
+fn mpdiff_first_pass<'py>(
+    py: Python<'py>,
+    ordered_keys: &Bound<'py, PyAny>,
+    parent_map: &Bound<'py, PyDict>,
+) -> PyResult<(
+    Bound<'py, PySet>,
+    Bound<'py, PyDict>,
+    Bound<'py, PySet>,
+    Bound<'py, PySet>,
+)> {
+    let needed_keys = PySet::empty(py)?;
+    for k in ordered_keys.try_iter()? {
+        needed_keys.add(k?)?;
+    }
+
+    let missing_keys = PySet::empty(py)?;
+    for k in needed_keys.iter() {
+        if !parent_map.contains(&k)? {
+            missing_keys.add(k)?;
+        }
+    }
+
+    let refcounts = PyDict::new(py);
+    let just_parents = PySet::empty(py)?;
+    for (_child_key, parent_keys) in parent_map.iter() {
+        if parent_keys.is_none() {
+            continue;
+        }
+        if parent_keys.len().unwrap_or(0) == 0 {
+            continue;
+        }
+        for p in parent_keys.try_iter()? {
+            let p = p?;
+            just_parents.add(&p)?;
+            needed_keys.add(&p)?;
+            let new_count = match refcounts.get_item(&p)? {
+                Some(existing) => existing.extract::<i64>()? + 1,
+                None => 1,
+            };
+            refcounts.set_item(&p, new_count)?;
+        }
+    }
+
+    let to_remove: Vec<Py<PyAny>> = just_parents
+        .iter()
+        .filter_map(|p| match parent_map.contains(&p) {
+            Ok(true) => Some(Ok(p.unbind())),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<PyResult<_>>()?;
+    for p in to_remove {
+        just_parents.discard(p.bind(py))?;
+    }
+
+    Ok((needed_keys, refcounts, just_parents, missing_keys))
+}
+
+/// Release satisfied parents for `_MPDiffGenerator._process_one_record`.
+///
+/// For each non-ghost parent key, decrement its refcount in `refcounts`. When
+/// the refcount reaches zero, pop the cached value from `chunks` (last
+/// child); otherwise fetch (not pop) the still-shared cached value. Mutates
+/// `refcounts` and `chunks` in place.
+#[pyfunction]
+fn mpdiff_collect_parent_chunks<'py>(
+    py: Python<'py>,
+    parent_keys: &Bound<'py, PyAny>,
+    ghost_parents: &Bound<'py, PySet>,
+    refcounts: &Bound<'py, PyDict>,
+    chunks: &Bound<'py, PyDict>,
+) -> PyResult<Py<PyAny>> {
+    let out = PyList::empty(py);
+    for p in parent_keys.try_iter()? {
+        let p = p?;
+        if ghost_parents.contains(&p)? {
+            continue;
+        }
+        let refcount: i64 = refcounts
+            .get_item(&p)?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!("missing refcount for {:?}", p))
+            })?
+            .extract()?;
+        let parent_value = if refcount == 1 {
+            let value = chunks.get_item(&p)?.ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!("missing chunks for {:?}", p))
+            })?;
+            refcounts.del_item(&p)?;
+            chunks.del_item(&p)?;
+            value
+        } else {
+            refcounts.set_item(&p, refcount - 1)?;
+            chunks.get_item(&p)?.ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!("missing chunks for {:?}", p))
+            })?
+        };
+        out.append(parent_value)?;
+    }
+    Ok(out.into_any().unbind())
+}
+
 /// A `KeyMapper` that always returns the same path. Mirrors the Python
 /// `bzrformats.versionedfile.ConstantMapper`.
 #[pyclass(name = "ConstantMapper", module = "bzrformats._bzr_rs.versionedfile")]
@@ -1522,6 +1632,8 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(check_lines_are_lines, &m)?)?;
     m.add_function(wrap_pyfunction!(known_graph_ancestry_map, &m)?)?;
     m.add_function(wrap_pyfunction!(make_mpdiffs, &m)?)?;
+    m.add_function(wrap_pyfunction!(mpdiff_first_pass, &m)?)?;
+    m.add_function(wrap_pyfunction!(mpdiff_collect_parent_chunks, &m)?)?;
     m.add_function(wrap_pyfunction!(add_mpdiffs, &m)?)?;
     m.add_function(wrap_pyfunction!(add_mpdiffs_singular, &m)?)?;
     m.add_function(wrap_pyfunction!(make_mpdiffs_singular, &m)?)?;
