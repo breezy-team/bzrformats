@@ -3272,9 +3272,24 @@ impl IterChanges {
         match result {
             Ok(Some(change)) => {
                 let tup = dirstate_change_to_pytuple(py, &change)?;
-                let ds_mod = py.import("bzrformats.dirstate")?;
-                let cls = ds_mod.getattr("DirstateInventoryChange")?;
-                Ok(Some(cls.call1(tup)?.unbind()))
+                // Construct the Rust-backed DirstateInventoryChange
+                // directly rather than round-tripping through
+                // bzrformats.dirstate to grab the class object.
+                let instance = pyo3::Py::new(
+                    py,
+                    DirstateInventoryChange {
+                        file_id: tup.get_item(0)?.unbind(),
+                        path: tup.get_item(1)?.unbind(),
+                        changed_content: tup.get_item(2)?.unbind(),
+                        versioned: tup.get_item(3)?.unbind(),
+                        parent_id: tup.get_item(4)?.unbind(),
+                        name: tup.get_item(5)?.unbind(),
+                        kind: tup.get_item(6)?.unbind(),
+                        executable: tup.get_item(7)?.unbind(),
+                        copied: tup.get_item(8)?.unbind(),
+                    },
+                )?;
+                Ok(Some(instance.into_any()))
             }
             Ok(None) => Ok(None),
             Err(bazaar::dirstate::ProcessEntryError::DirstateCorrupt(msg)) => {
@@ -3420,6 +3435,216 @@ impl IdIndex {
     }
 }
 
+/// Change record produced by [`IterChanges`]. Mirrors the
+/// Python-side `bzrformats.dirstate.DirstateInventoryChange` class:
+/// a 9-field data carrier with a handful of derived predicates used
+/// by callers that want to compare/transform tree changes without
+/// walking the underlying entry tuples themselves.
+#[pyclass(module = "bzrformats._bzr_rs.dirstate", subclass)]
+struct DirstateInventoryChange {
+    #[pyo3(get, set)]
+    file_id: Py<PyAny>,
+    #[pyo3(get, set)]
+    path: Py<PyAny>,
+    #[pyo3(get, set)]
+    changed_content: Py<PyAny>,
+    #[pyo3(get, set)]
+    versioned: Py<PyAny>,
+    #[pyo3(get, set)]
+    parent_id: Py<PyAny>,
+    #[pyo3(get, set)]
+    name: Py<PyAny>,
+    #[pyo3(get, set)]
+    kind: Py<PyAny>,
+    #[pyo3(get, set)]
+    executable: Py<PyAny>,
+    #[pyo3(get, set)]
+    copied: Py<PyAny>,
+}
+
+#[pymethods]
+impl DirstateInventoryChange {
+    #[new]
+    #[pyo3(signature = (
+        file_id,
+        path,
+        changed_content,
+        versioned,
+        parent_id,
+        name,
+        kind,
+        executable,
+        copied = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        file_id: Py<PyAny>,
+        path: Py<PyAny>,
+        changed_content: Py<PyAny>,
+        versioned: Py<PyAny>,
+        parent_id: Py<PyAny>,
+        name: Py<PyAny>,
+        kind: Py<PyAny>,
+        executable: Py<PyAny>,
+        copied: Option<Py<PyAny>>,
+    ) -> Self {
+        Self {
+            file_id,
+            path,
+            changed_content,
+            versioned,
+            parent_id,
+            name,
+            kind,
+            executable,
+            copied: copied.unwrap_or_else(|| {
+                pyo3::types::PyBool::new(py, false)
+                    .to_owned()
+                    .unbind()
+                    .into_any()
+            }),
+        }
+    }
+
+    /// True iff the file is versioned in both trees and the executable
+    /// bit changed. Used by callers that want to ignore non-meta-only
+    /// changes.
+    fn meta_modified(&self, py: Python<'_>) -> PyResult<bool> {
+        // Mirror Python: `self.versioned == (True, True) and
+        // self.executable[0] != self.executable[1]`.
+        let versioned = self.versioned.bind(py);
+        let both_versioned = versioned.eq(PyTuple::new(
+            py,
+            [
+                pyo3::types::PyBool::new(py, true).to_owned(),
+                pyo3::types::PyBool::new(py, true).to_owned(),
+            ],
+        )?)?;
+        if !both_versioned {
+            return Ok(false);
+        }
+        let exec = self.executable.bind(py);
+        let exec0 = exec.get_item(0)?;
+        let exec1 = exec.get_item(1)?;
+        Ok(!exec0.eq(exec1)?)
+    }
+
+    fn is_reparented(&self, py: Python<'_>) -> PyResult<bool> {
+        let parent_id = self.parent_id.bind(py);
+        let p0 = parent_id.get_item(0)?;
+        let p1 = parent_id.get_item(1)?;
+        Ok(!p0.eq(p1)?)
+    }
+
+    #[getter]
+    fn renamed(&self, py: Python<'_>) -> PyResult<bool> {
+        // not copied and None not in name and None not in parent_id
+        // and (name[0] != name[1] or parent_id[0] != parent_id[1])
+        let copied = self.copied.bind(py).is_truthy()?;
+        if copied {
+            return Ok(false);
+        }
+        let name = self.name.bind(py);
+        let parent_id = self.parent_id.bind(py);
+        if name.contains(py.None())? {
+            return Ok(false);
+        }
+        if parent_id.contains(py.None())? {
+            return Ok(false);
+        }
+        let names_differ = !name.get_item(0)?.eq(name.get_item(1)?)?;
+        let parents_differ = !parent_id.get_item(0)?.eq(parent_id.get_item(1)?)?;
+        Ok(names_differ || parents_differ)
+    }
+
+    /// Return a fresh DirstateInventoryChange with all "new" sides
+    /// of the (old, new) tuples set to None and `copied=False`.
+    fn discard_new<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, DirstateInventoryChange>> {
+        fn old_then_none<'py>(py: Python<'py>, tup: &Py<PyAny>) -> PyResult<Bound<'py, PyTuple>> {
+            let bound = tup.bind(py);
+            PyTuple::new(py, [bound.get_item(0)?, py.None().into_bound(py)])
+        }
+        let path = old_then_none(py, &self.path)?;
+        let versioned = old_then_none(py, &self.versioned)?;
+        let parent_id = old_then_none(py, &self.parent_id)?;
+        let name = old_then_none(py, &self.name)?;
+        let kind = old_then_none(py, &self.kind)?;
+        let executable = old_then_none(py, &self.executable)?;
+        Bound::new(
+            py,
+            DirstateInventoryChange {
+                file_id: self.file_id.clone_ref(py),
+                path: path.into_any().unbind(),
+                changed_content: self.changed_content.clone_ref(py),
+                versioned: versioned.into_any().unbind(),
+                parent_id: parent_id.into_any().unbind(),
+                name: name.into_any().unbind(),
+                kind: kind.into_any().unbind(),
+                executable: executable.into_any().unbind(),
+                copied: pyo3::types::PyBool::new(py, false)
+                    .to_owned()
+                    .unbind()
+                    .into_any(),
+            },
+        )
+    }
+
+    fn _as_tuple<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            [
+                self.file_id.bind(py).clone(),
+                self.path.bind(py).clone(),
+                self.changed_content.bind(py).clone(),
+                self.versioned.bind(py).clone(),
+                self.parent_id.bind(py).clone(),
+                self.name.bind(py).clone(),
+                self.kind.bind(py).clone(),
+                self.executable.bind(py).clone(),
+                self.copied.bind(py).clone(),
+            ],
+        )
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let tup = self._as_tuple(py)?;
+        let tup_repr = tup.repr()?;
+        Ok(format!("DirstateInventoryChange{}", tup_repr))
+    }
+
+    fn __getitem__<'py>(&self, py: Python<'py>, index: isize) -> PyResult<Bound<'py, PyAny>> {
+        let tup = self._as_tuple(py)?;
+        Ok(tup.get_item(if index < 0 {
+            (tup.len() as isize + index) as usize
+        } else {
+            index as usize
+        })?)
+    }
+
+    fn __eq__(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        other: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        if let Ok(other_ref) = other.downcast::<DirstateInventoryChange>() {
+            let a = slf._as_tuple(py)?;
+            let b = other_ref.borrow()._as_tuple(py)?;
+            return Ok(a.eq(b)?.into_pyobject(py)?.to_owned().into_any().unbind());
+        }
+        if other.downcast::<PyTuple>().is_ok() {
+            let a = slf._as_tuple(py)?;
+            return Ok(a
+                .eq(other)?
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind());
+        }
+        Ok(py.NotImplemented())
+    }
+}
+
 #[pyfunction]
 fn inv_entry_to_details<'a>(
     py: Python<'a>,
@@ -3467,6 +3692,7 @@ pub fn _dirstate_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<IdIndex>()?;
     m.add_class::<PyDirState>()?;
     m.add_class::<IterChanges>()?;
+    m.add_class::<DirstateInventoryChange>()?;
     m.add_wrapped(wrap_pyfunction!(inv_entry_to_details))?;
     m.add_wrapped(wrap_pyfunction!(get_output_lines))?;
 
