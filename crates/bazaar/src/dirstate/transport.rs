@@ -177,6 +177,23 @@ pub trait Transport {
     /// or write lock; returns `NotLocked` otherwise.
     fn read_all(&mut self) -> Result<Vec<u8>, TransportError>;
 
+    /// Read `len` bytes starting at `offset`. Used by the bisect path
+    /// to avoid pulling the whole dirstate into memory just to probe a
+    /// handful of locations. The default implementation reads the
+    /// whole file via [`Self::read_all`] and slices; concrete
+    /// implementations should override with a seek+read when possible.
+    /// A read shorter than `len` is acceptable (e.g. when the requested
+    /// range extends past EOF) — callers must tolerate short reads.
+    fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, TransportError> {
+        let all = self.read_all()?;
+        let start = offset as usize;
+        if start >= all.len() {
+            return Ok(Vec::new());
+        }
+        let end = std::cmp::min(start + len, all.len());
+        Ok(all[start..end].to_vec())
+    }
+
     /// Replace the full contents of the backing file, truncating any
     /// trailing bytes from the previous version. Requires a write
     /// lock; returns `NotLocked` if no lock is held, and a generic

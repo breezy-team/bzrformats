@@ -112,6 +112,24 @@ impl Transport for FileTransport {
         Ok(buf)
     }
 
+    fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, TransportError> {
+        let file = self.current_file()?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; len];
+        let mut filled = 0;
+        // Loop because `read` may return fewer bytes than requested on
+        // a partial read; callers tolerate a short final read.
+        while filled < len {
+            let n = file.read(&mut buf[filled..])?;
+            if n == 0 {
+                buf.truncate(filled);
+                return Ok(buf);
+            }
+            filled += n;
+        }
+        Ok(buf)
+    }
+
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
         match &self.lock {
             Some(LockHandle::Write(_)) => {}
@@ -280,6 +298,39 @@ mod tests {
         write!(tmp, "x").unwrap();
         let mut t = FileTransport::new(tmp.path());
         assert!(matches!(t.read_all(), Err(TransportError::NotLocked)));
+    }
+
+    #[test]
+    fn read_at_returns_requested_window() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "0123456789abcdef").unwrap();
+        let mut t = FileTransport::new(tmp.path());
+        t.lock_read().unwrap();
+        assert_eq!(t.read_at(0, 4).unwrap(), b"0123");
+        assert_eq!(t.read_at(4, 4).unwrap(), b"4567");
+        assert_eq!(t.read_at(10, 6).unwrap(), b"abcdef");
+        t.unlock().unwrap();
+    }
+
+    #[test]
+    fn read_at_short_read_at_eof() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "0123").unwrap();
+        let mut t = FileTransport::new(tmp.path());
+        t.lock_read().unwrap();
+        // Requested window extends past EOF — short read.
+        assert_eq!(t.read_at(2, 100).unwrap(), b"23");
+        // Starting past EOF — empty.
+        assert_eq!(t.read_at(100, 4).unwrap(), b"");
+        t.unlock().unwrap();
+    }
+
+    #[test]
+    fn read_at_requires_lock() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "x").unwrap();
+        let mut t = FileTransport::new(tmp.path());
+        assert!(matches!(t.read_at(0, 1), Err(TransportError::NotLocked)));
     }
 
     #[test]

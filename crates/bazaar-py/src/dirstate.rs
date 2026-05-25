@@ -102,6 +102,30 @@ impl bazaar::dirstate::Transport for PyFileTransport {
         })
     }
 
+    fn read_at(
+        &mut self,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, bazaar::dirstate::TransportError> {
+        if self.lock_state.is_none() {
+            return Err(bazaar::dirstate::TransportError::NotLocked);
+        }
+        Python::attach(|py| -> Result<Vec<u8>, bazaar::dirstate::TransportError> {
+            let f = self.file.bind(py);
+            f.call_method1("seek", (offset,))
+                .map_err(|e| Self::map_err(py, e))?;
+            let data = f
+                .call_method1("read", (len,))
+                .map_err(|e| Self::map_err(py, e))?;
+            let bytes = data.cast_into::<PyBytes>().map_err(|_| {
+                bazaar::dirstate::TransportError::Other(
+                    "file.read() did not return bytes".to_string(),
+                )
+            })?;
+            Ok(bytes.as_bytes().to_vec())
+        })
+    }
+
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), bazaar::dirstate::TransportError> {
         if self.lock_state != Some(bazaar::dirstate::LockState::Write) {
             return Err(bazaar::dirstate::TransportError::Other(
