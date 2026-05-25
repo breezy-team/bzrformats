@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 pyo3::import_exception!(bzrformats.errors, NotVersionedError);
 pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
+pyo3::import_exception!(bzrformats.errors, InconsistentDelta);
 pyo3::import_exception!(bzrformats.errors, InvalidNormalization);
 pyo3::import_exception!(bzrformats.errors, BadFileKindError);
 pyo3::import_exception!(bzrformats.inventory, DuplicateFileId);
@@ -2191,19 +2192,14 @@ impl PyDirState {
                         | Some(bazaar::dirstate::Kind::Relocated)
                 )
             {
-                let errors_mod = py.import("bzrformats.errors")?;
-                let bzr_err_cls = errors_mod.getattr("BzrFormatsError")?;
-                let exc = bzr_err_cls.call1(("unversioned entry?",))?;
-                return Err(PyErr::from_value(exc));
+                return Err(BzrFormatsError::new_err("unversioned entry?"));
             }
             if let Some(fid) = fileid_utf8 {
                 if entry.key.file_id != fid {
                     self.inner.changes_aborted = true;
-                    let errors_mod = py.import("bzrformats.errors")?;
-                    let bzr_err_cls = errors_mod.getattr("BzrFormatsError")?;
-                    let exc = bzr_err_cls
-                        .call1(("integrity error ? : mismatching tree_index, file_id and path",))?;
-                    return Err(PyErr::from_value(exc));
+                    return Err(BzrFormatsError::new_err(
+                        "integrity error ? : mismatching tree_index, file_id and path",
+                    ));
                 }
             }
             return Ok(entry_to_py_tuple(py, entry)?.unbind().into());
@@ -2969,20 +2965,11 @@ impl PyDirState {
                 reason,
             } => {
                 self.inner.changes_aborted = true;
-                let errors_mod = match py.import("bzrformats.errors") {
-                    Ok(m) => m,
-                    Err(e) => return e,
-                };
-                let cls = match errors_mod.getattr("InconsistentDelta") {
-                    Ok(c) => c,
-                    Err(e) => return e,
-                };
-                let path_bytes = PyBytes::new(py, &path);
-                let file_id_bytes = PyBytes::new(py, &file_id);
-                match cls.call1((path_bytes, file_id_bytes, reason)) {
-                    Ok(instance) => PyErr::from_value(instance),
-                    Err(e) => e,
-                }
+                InconsistentDelta::new_err((
+                    PyBytes::new(py, &path).unbind(),
+                    PyBytes::new(py, &file_id).unbind(),
+                    reason,
+                ))
             }
             bazaar::dirstate::BasisApplyError::NotImplemented { reason } => {
                 pyo3::exceptions::PyNotImplementedError::new_err(reason)
@@ -2999,38 +2986,19 @@ impl PyDirState {
                 entry_debug,
             } => {
                 self.inner.changes_aborted = true;
-                let errors_mod = match py.import("bzrformats.errors") {
-                    Ok(m) => m,
-                    Err(e) => return e,
-                };
-                let cls = match errors_mod.getattr("InconsistentDelta") {
-                    Ok(c) => c,
-                    Err(e) => return e,
-                };
-                let path_bytes = PyBytes::new(py, &new_path);
-                let file_id_bytes = PyBytes::new(py, &file_id);
-                let reason = format!("mismatched entry file_id {}", entry_debug);
-                match cls.call1((path_bytes, file_id_bytes, reason)) {
-                    Ok(instance) => PyErr::from_value(instance),
-                    Err(e) => e,
-                }
+                InconsistentDelta::new_err((
+                    PyBytes::new(py, &new_path).unbind(),
+                    PyBytes::new(py, &file_id).unbind(),
+                    format!("mismatched entry file_id {}", entry_debug),
+                ))
             }
             bazaar::dirstate::BasisApplyError::NewPathWithoutEntry { new_path, file_id } => {
                 self.inner.changes_aborted = true;
-                let errors_mod = match py.import("bzrformats.errors") {
-                    Ok(m) => m,
-                    Err(e) => return e,
-                };
-                let cls = match errors_mod.getattr("InconsistentDelta") {
-                    Ok(c) => c,
-                    Err(e) => return e,
-                };
-                let path_bytes = PyBytes::new(py, &new_path);
-                let file_id_bytes = PyBytes::new(py, &file_id);
-                match cls.call1((path_bytes, file_id_bytes, "new_path with no entry")) {
-                    Ok(instance) => PyErr::from_value(instance),
-                    Err(e) => e,
-                }
+                InconsistentDelta::new_err((
+                    PyBytes::new(py, &new_path).unbind(),
+                    PyBytes::new(py, &file_id).unbind(),
+                    "new_path with no entry",
+                ))
             }
         }
     }

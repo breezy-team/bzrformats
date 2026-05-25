@@ -1355,8 +1355,7 @@ impl PyCombinedGraphIndex {
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let revision = py.import("bzrformats.revision")?;
-        let null_revision = revision.getattr("NULL_REVISION")?;
+        let null_revision = PyBytes::new(py, bazaar::NULL_REVISION).into_any();
         let search_keys = pyo3::types::PySet::empty(py)?;
         for k in keys.try_iter()? {
             search_keys.add(k?)?;

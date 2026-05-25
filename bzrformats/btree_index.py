@@ -26,11 +26,11 @@ from . import lru_cache
 from .lru_cache import FIFOCache
 
 _BTSIGNATURE = b"B+Tree Graph Index 2\n"
-_OPTION_ROW_LENGTHS = b"row_lengths="
 _LEAF_FLAG = b"type=leaf\n"
 _INTERNAL_FLAG = b"type=internal\n"
-_INTERNAL_OFFSET = b"offset="
 
+# Read by the Rust BTreeBuilder.write_nodes via py.import — tests
+# monkey-patch these via overrideAttr to force smaller trees.
 _RESERVED_HEADER_BYTES = 120
 _PAGE_SIZE = 4096
 
