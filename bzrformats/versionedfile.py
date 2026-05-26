@@ -155,21 +155,11 @@ call and caches the result. ``storage_kind`` is ``"file"``.
 """
 
 
-class AdapterFactory(ContentFactory):
-    """A content factory to adapt between key prefix's."""
-
-    def __init__(self, key, parents, adapted):
-        """Create an adapter factory instance."""
-        self.key = key
-        self.parents = parents
-        self._adapted = adapted
-
-    def __getattr__(self, attr):
-        """Return a member from the adapted object."""
-        if attr in ("key", "parents"):
-            return self.__dict__[attr]
-        else:
-            return getattr(self._adapted, attr)
+AdapterFactory = _versionedfile_rs.AdapterFactory
+"""See ContentFactory. Overrides ``key`` / ``parents`` while delegating
+``storage_kind`` / ``sha1`` / ``size`` / ``get_bytes_as`` to the wrapped
+factory passed as ``adapted``.
+"""
 
 
 def filter_absent(record_stream):

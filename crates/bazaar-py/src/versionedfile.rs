@@ -281,6 +281,179 @@ impl PyFileContentFactory {
     }
 }
 
+/// `ContentFactory` that overrides the underlying record's key (and
+/// parents) while delegating everything else - bytes, size, sha1,
+/// storage_kind - to a Python `ContentFactory` instance.
+///
+/// Mirrors `bzrformats.versionedfile.AdapterFactory`. The Python class
+/// used `__getattr__` to forward attribute access; here we make the
+/// forwarding explicit through the `ContentFactory` trait.
+struct AdapterFactoryInner {
+    key: Key,
+    parents: Option<Vec<Key>>,
+    adapted: Py<PyAny>,
+}
+
+impl AdapterFactoryInner {
+    fn call_adapted_bytes(&self, method: &str, kind: &str) -> Vec<u8> {
+        Python::attach(|py| -> PyResult<Vec<u8>> {
+            self.adapted
+                .bind(py)
+                .call_method1(method, (kind,))?
+                .extract()
+        })
+        .expect("AdapterFactory delegate call failed")
+    }
+
+    fn adapted_storage_kind(&self) -> String {
+        Python::attach(|py| -> PyResult<String> {
+            self.adapted.bind(py).getattr("storage_kind")?.extract()
+        })
+        .expect("AdapterFactory storage_kind read failed")
+    }
+
+    fn adapted_sha1(&self) -> Option<Vec<u8>> {
+        Python::attach(|py| -> PyResult<Option<Vec<u8>>> {
+            let val = self.adapted.bind(py).getattr("sha1")?;
+            if val.is_none() {
+                Ok(None)
+            } else {
+                Ok(Some(val.extract()?))
+            }
+        })
+        .expect("AdapterFactory sha1 read failed")
+    }
+
+    fn adapted_size(&self) -> Option<usize> {
+        Python::attach(|py| -> PyResult<Option<usize>> {
+            let val = self.adapted.bind(py).getattr("size")?;
+            if val.is_none() {
+                Ok(None)
+            } else {
+                Ok(Some(val.extract()?))
+            }
+        })
+        .expect("AdapterFactory size read failed")
+    }
+}
+
+impl bazaar::versionedfile::ContentFactory for AdapterFactoryInner {
+    fn sha1(&self) -> Option<Vec<u8>> {
+        self.adapted_sha1()
+    }
+
+    fn size(&self) -> Option<usize> {
+        self.adapted_size()
+    }
+
+    fn key(&self) -> Key {
+        self.key.clone()
+    }
+
+    fn parents(&self) -> Option<Vec<Key>> {
+        self.parents.clone()
+    }
+
+    fn to_fulltext<'a, 'b>(&'a self) -> std::borrow::Cow<'b, [u8]>
+    where
+        'a: 'b,
+    {
+        std::borrow::Cow::Owned(self.call_adapted_bytes("get_bytes_as", "fulltext"))
+    }
+
+    fn to_chunks<'a, 'b>(&'a self) -> Box<dyn Iterator<Item = std::borrow::Cow<'b, [u8]>> + 'b>
+    where
+        'a: 'b,
+    {
+        let chunks: Vec<Vec<u8>> = Python::attach(|py| -> PyResult<Vec<Vec<u8>>> {
+            self.adapted
+                .bind(py)
+                .call_method1("get_bytes_as", ("chunked",))?
+                .extract()
+        })
+        .expect("AdapterFactory get_bytes_as(chunked) failed");
+        Box::new(chunks.into_iter().map(std::borrow::Cow::Owned))
+    }
+
+    fn to_lines<'a, 'b>(&'a self) -> Box<dyn Iterator<Item = std::borrow::Cow<'b, [u8]>> + 'b>
+    where
+        'a: 'b,
+    {
+        let lines: Vec<Vec<u8>> = Python::attach(|py| -> PyResult<Vec<Vec<u8>>> {
+            self.adapted
+                .bind(py)
+                .call_method1("get_bytes_as", ("lines",))?
+                .extract()
+        })
+        .expect("AdapterFactory get_bytes_as(lines) failed");
+        Box::new(lines.into_iter().map(std::borrow::Cow::Owned))
+    }
+
+    fn into_fulltext(self) -> Vec<u8> {
+        self.call_adapted_bytes("get_bytes_as", "fulltext")
+    }
+
+    fn into_chunks(self) -> Box<dyn Iterator<Item = Vec<u8>>> {
+        let chunks: Vec<Vec<u8>> = Python::attach(|py| -> PyResult<Vec<Vec<u8>>> {
+            self.adapted
+                .bind(py)
+                .call_method1("get_bytes_as", ("chunked",))?
+                .extract()
+        })
+        .expect("AdapterFactory get_bytes_as(chunked) failed");
+        Box::new(chunks.into_iter())
+    }
+
+    fn storage_kind(&self) -> String {
+        self.adapted_storage_kind()
+    }
+
+    fn map_key(&mut self, f: &dyn Fn(Key) -> Key) {
+        self.key = f(self.key.clone());
+        self.parents = self.parents.take().map(|v| v.into_iter().map(f).collect());
+    }
+}
+
+#[pyclass(name = "AdapterFactory", extends = AbstractContentFactory, module = "bzrformats._bzr_rs.versionedfile")]
+struct PyAdapterFactory {
+    // Duplicate the adapted reference here so the `__getattr__` forwarder
+    // can reach it without downcasting through `AbstractContentFactory`'s
+    // boxed trait object. Cheap clone of the same Python reference.
+    adapted: Py<PyAny>,
+}
+
+#[pymethods]
+impl PyAdapterFactory {
+    #[new]
+    fn new(
+        py: Python<'_>,
+        key: Key,
+        parents: Option<Vec<Key>>,
+        adapted: Py<PyAny>,
+    ) -> PyResult<(Self, AbstractContentFactory)> {
+        let adapted_for_forward = adapted.clone_ref(py);
+        let inner = AdapterFactoryInner {
+            key,
+            parents,
+            adapted,
+        };
+        Ok((
+            PyAdapterFactory {
+                adapted: adapted_for_forward,
+            },
+            AbstractContentFactory(Box::new(inner)),
+        ))
+    }
+
+    /// Forward arbitrary attribute access to the adapted factory. Mirrors
+    /// the Python `__getattr__` that the original `AdapterFactory`
+    /// relied on (and that knit's adapter chain probes via `_raw_record`
+    /// and friends).
+    fn __getattr__<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+        self.adapted.bind(py).getattr(name)
+    }
+}
+
 #[pyfunction]
 pub fn record_to_fulltext_bytes<'py>(
     py: Python<'py>,
@@ -2155,6 +2328,7 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<FulltextContentFactory>()?;
     m.add_class::<ChunkedContentFactory>()?;
     m.add_class::<PyFileContentFactory>()?;
+    m.add_class::<PyAdapterFactory>()?;
     m.add_class::<AbsentContentFactory>()?;
     m.add_class::<KeyRefs>()?;
     m.add_class::<PyConstantMapper>()?;
