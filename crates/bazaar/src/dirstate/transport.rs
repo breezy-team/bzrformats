@@ -177,6 +177,17 @@ pub trait Transport {
     /// or write lock; returns `NotLocked` otherwise.
     fn read_all(&mut self) -> Result<Vec<u8>, TransportError>;
 
+    /// Length of the backing file, in bytes. Used by the bisect path
+    /// to know where the last record ends without pulling the whole
+    /// file into memory. Requires a read or write lock; returns
+    /// `NotLocked` otherwise. The default implementation reads the
+    /// whole file and reports its length; concrete implementations
+    /// should override with `fstat` or equivalent.
+    #[allow(clippy::len_without_is_empty)]
+    fn len(&mut self) -> Result<u64, TransportError> {
+        Ok(self.read_all()?.len() as u64)
+    }
+
     /// Read `len` bytes starting at `offset`. Used by the bisect path
     /// to avoid pulling the whole dirstate into memory just to probe a
     /// handful of locations. The default implementation reads the
@@ -199,6 +210,41 @@ pub trait Transport {
     /// lock; returns `NotLocked` if no lock is held, and a generic
     /// error if only a read lock is held.
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), TransportError>;
+
+    /// Temporarily upgrade a read lock to a write lock. On success the
+    /// transport's [`Transport::lock_state`] becomes
+    /// `Some(LockState::Write)`. On failure (another reader holds the
+    /// file) the read lock is preserved and the method returns
+    /// `Ok(false)`. Returns `NotLocked` if no lock is held, or
+    /// `AlreadyLocked` if a write lock is already held.
+    ///
+    /// The default implementation refuses the upgrade — backends that
+    /// can't atomically switch lock modes (e.g. in-memory tests, the
+    /// Python-file adapter) keep the read lock.
+    fn upgrade_to_write_lock(&mut self) -> Result<bool, TransportError> {
+        match self.lock_state() {
+            None => Err(TransportError::NotLocked),
+            Some(LockState::Write) => Err(TransportError::AlreadyLocked),
+            Some(LockState::Read) => Ok(false),
+        }
+    }
+
+    /// Inverse of [`Self::upgrade_to_write_lock`]. Downgrade a write
+    /// lock previously obtained via `upgrade_to_write_lock` back to a
+    /// read lock. Returns `NotLocked` if no lock is held, or a
+    /// generic error if the current lock is not a write lock.
+    ///
+    /// The default implementation is a no-op when the lock is already
+    /// a read lock and errors otherwise.
+    fn downgrade_to_read_lock(&mut self) -> Result<(), TransportError> {
+        match self.lock_state() {
+            None => Err(TransportError::NotLocked),
+            Some(LockState::Read) => Ok(()),
+            Some(LockState::Write) => Err(TransportError::Other(
+                "downgrade_to_read_lock not supported by this transport".into(),
+            )),
+        }
+    }
 
     /// Force the current contents to durable storage. Implementations
     /// that have no meaningful fsync (in-memory tests, mocked
