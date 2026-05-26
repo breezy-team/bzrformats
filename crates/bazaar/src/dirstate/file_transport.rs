@@ -13,7 +13,7 @@
 
 use super::transport::{DirEntryInfo, StatInfo, Transport, TransportError};
 use super::LockState;
-use crate::lock::{LockError, ReadLock, WriteLock};
+use crate::lock::{LockError, ReadLock, TemporaryWriteLockResult, WriteLock};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -112,6 +112,29 @@ impl Transport for FileTransport {
         Ok(buf)
     }
 
+    fn len(&mut self) -> Result<u64, TransportError> {
+        let file = self.current_file()?;
+        Ok(file.metadata().map_err(TransportError::from)?.len())
+    }
+
+    fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, TransportError> {
+        let file = self.current_file()?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; len];
+        let mut filled = 0;
+        // Loop because `read` may return fewer bytes than requested on
+        // a partial read; callers tolerate a short final read.
+        while filled < len {
+            let n = file.read(&mut buf[filled..])?;
+            if n == 0 {
+                buf.truncate(filled);
+                return Ok(buf);
+            }
+            filled += n;
+        }
+        Ok(buf)
+    }
+
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
         match &self.lock {
             Some(LockHandle::Write(_)) => {}
@@ -129,6 +152,41 @@ impl Transport for FileTransport {
         file.set_len(len)?;
         file.flush()?;
         Ok(())
+    }
+
+    fn upgrade_to_write_lock(&mut self) -> Result<bool, TransportError> {
+        match self.lock.take() {
+            None => Err(TransportError::NotLocked),
+            Some(LockHandle::Write(wl)) => {
+                self.lock = Some(LockHandle::Write(wl));
+                Err(TransportError::AlreadyLocked)
+            }
+            Some(LockHandle::Read(rl)) => match rl.temporary_write_lock().map_err(map_lock_err)? {
+                TemporaryWriteLockResult::Succeeded(wl) => {
+                    self.lock = Some(LockHandle::Write(wl));
+                    Ok(true)
+                }
+                TemporaryWriteLockResult::Failed(rl) => {
+                    self.lock = Some(LockHandle::Read(rl));
+                    Ok(false)
+                }
+            },
+        }
+    }
+
+    fn downgrade_to_read_lock(&mut self) -> Result<(), TransportError> {
+        match self.lock.take() {
+            None => Err(TransportError::NotLocked),
+            Some(LockHandle::Read(rl)) => {
+                self.lock = Some(LockHandle::Read(rl));
+                Ok(())
+            }
+            Some(LockHandle::Write(wl)) => {
+                let rl = wl.restore_read_lock().map_err(map_lock_err)?;
+                self.lock = Some(LockHandle::Read(rl));
+                Ok(())
+            }
+        }
     }
 
     fn fdatasync(&mut self) -> Result<(), TransportError> {
@@ -280,6 +338,89 @@ mod tests {
         write!(tmp, "x").unwrap();
         let mut t = FileTransport::new(tmp.path());
         assert!(matches!(t.read_all(), Err(TransportError::NotLocked)));
+    }
+
+    #[test]
+    fn read_at_returns_requested_window() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "0123456789abcdef").unwrap();
+        let mut t = FileTransport::new(tmp.path());
+        t.lock_read().unwrap();
+        assert_eq!(t.read_at(0, 4).unwrap(), b"0123");
+        assert_eq!(t.read_at(4, 4).unwrap(), b"4567");
+        assert_eq!(t.read_at(10, 6).unwrap(), b"abcdef");
+        t.unlock().unwrap();
+    }
+
+    #[test]
+    fn read_at_short_read_at_eof() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "0123").unwrap();
+        let mut t = FileTransport::new(tmp.path());
+        t.lock_read().unwrap();
+        // Requested window extends past EOF — short read.
+        assert_eq!(t.read_at(2, 100).unwrap(), b"23");
+        // Starting past EOF — empty.
+        assert_eq!(t.read_at(100, 4).unwrap(), b"");
+        t.unlock().unwrap();
+    }
+
+    #[test]
+    fn read_at_requires_lock() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "x").unwrap();
+        let mut t = FileTransport::new(tmp.path());
+        assert!(matches!(t.read_at(0, 1), Err(TransportError::NotLocked)));
+    }
+
+    #[test]
+    fn len_reports_file_size() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "0123456789").unwrap();
+        let mut t = FileTransport::new(tmp.path());
+        t.lock_read().unwrap();
+        assert_eq!(t.len().unwrap(), 10);
+        t.unlock().unwrap();
+    }
+
+    #[test]
+    fn upgrade_to_write_then_downgrade_roundtrip() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "before").unwrap();
+        let mut t = FileTransport::new(tmp.path());
+        t.lock_read().unwrap();
+        assert_eq!(t.lock_state(), Some(LockState::Read));
+
+        assert!(t.upgrade_to_write_lock().unwrap());
+        assert_eq!(t.lock_state(), Some(LockState::Write));
+        t.write_all(b"after").unwrap();
+
+        t.downgrade_to_read_lock().unwrap();
+        assert_eq!(t.lock_state(), Some(LockState::Read));
+        assert_eq!(t.read_all().unwrap(), b"after");
+        t.unlock().unwrap();
+    }
+
+    #[test]
+    fn upgrade_to_write_lock_when_not_locked_errors() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut t = FileTransport::new(tmp.path());
+        assert!(matches!(
+            t.upgrade_to_write_lock(),
+            Err(TransportError::NotLocked)
+        ));
+    }
+
+    #[test]
+    fn upgrade_to_write_lock_when_already_write_errors() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut t = FileTransport::new(tmp.path());
+        t.lock_write().unwrap();
+        assert!(matches!(
+            t.upgrade_to_write_lock(),
+            Err(TransportError::AlreadyLocked)
+        ));
+        t.unlock().unwrap();
     }
 
     #[test]

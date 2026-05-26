@@ -320,9 +320,9 @@ impl PyWriteLock {
 
 /// `LogicalLockResult` matching Python's two-arg constructor.
 #[pyclass(name = "LogicalLockResult", subclass)]
-struct PyLogicalLockResult {
-    unlock: Py<PyAny>,
-    token: Option<Py<PyAny>>,
+pub(crate) struct PyLogicalLockResult {
+    pub(crate) unlock: Py<PyAny>,
+    pub(crate) token: Option<Py<PyAny>>,
 }
 
 #[pymethods]

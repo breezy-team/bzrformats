@@ -86,46 +86,41 @@ pub(crate) fn dirblocks_to_py<'py>(
 /// :return: None
 /// :postcondition: The dirblocks will be loaded into the appropriate fields
 ///     in the DirState object.
+/// `DirState.IN_MEMORY_UNMODIFIED`. Inlined here so this helper
+/// does not need to round-trip into `bzrformats.dirstate` just to
+/// look up an integer module constant.
+const IN_MEMORY_UNMODIFIED: i32 = 1;
+
 #[pyfunction]
 pub fn _read_dirblocks(py: Python, state: &Bound<PyAny>) -> PyResult<()> {
-    let dirstate_mod = py.import("bzrformats.dirstate")?;
-    let dirstate_cls = dirstate_mod.getattr("DirState")?;
-
-    // Seek to end of header and read the rest
-    let state_file = state.getattr("_state_file")?;
-    let end_of_header = state.getattr("_end_of_header")?;
-    state_file.call_method1("seek", (end_of_header,))?;
-    let text_obj = state_file.call_method0("read")?;
-    let text: &[u8] = text_obj.extract()?;
+    // Read the full file via the transport, then slice off the
+    // header. `state` is the DirState pyclass itself (no Python
+    // wrapper).
+    let end_of_header: usize = state.getattr("_end_of_header")?.extract()?;
+    let all_obj = state.call_method0("_read_all")?;
+    let all: &[u8] = all_obj.extract()?;
+    let text: &[u8] = if end_of_header >= all.len() {
+        &[]
+    } else {
+        &all[end_of_header..]
+    };
 
     if text.is_empty() {
-        // No data to parse
-        state.setattr(
-            "_dirblock_state",
-            dirstate_cls.getattr("IN_MEMORY_UNMODIFIED")?,
-        )?;
+        state.setattr("_dirblock_state", IN_MEMORY_UNMODIFIED)?;
         return Ok(());
     }
 
     let num_present_parents: usize = state.call_method0("_num_present_parents")?.extract()?;
     let num_trees = num_present_parents + 1;
-    let num_entries: usize = state.getattr("_rs")?.getattr("num_entries")?.extract()?;
+    let num_entries: usize = state.getattr("num_entries")?.extract()?;
 
     let dirblocks =
         parse_dirblocks(text, num_trees, num_entries).map_err(|e| dirblocks_err_to_py(state, e))?;
 
     let py_dirblocks = dirblocks_to_py(py, &dirblocks)?;
     state.setattr("_dirblocks", py_dirblocks)?;
-    // `_split_root_dirblock_into_contents` still lives in Python; it is a
-    // pure reshuffle of `_dirblocks[0]` / `_dirblocks[1]` and is cheap to
-    // call across the FFI boundary. A later commit can delegate the split
-    // to `bazaar::dirstate::split_root_dirblock_into_contents` once the
-    // pure-Rust version is wired into the marshalling path.
     state.call_method0("_split_root_dirblock_into_contents")?;
-    state.setattr(
-        "_dirblock_state",
-        dirstate_cls.getattr("IN_MEMORY_UNMODIFIED")?,
-    )?;
+    state.setattr("_dirblock_state", IN_MEMORY_UNMODIFIED)?;
 
     Ok(())
 }

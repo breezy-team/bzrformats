@@ -16,6 +16,9 @@ pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
 pyo3::import_exception!(bzrformats.errors, InconsistentDelta);
 pyo3::import_exception!(bzrformats.errors, InvalidNormalization);
 pyo3::import_exception!(bzrformats.errors, BadFileKindError);
+pyo3::import_exception!(bzrformats.errors, LockContention);
+pyo3::import_exception!(bzrformats.errors, LockNotHeld);
+pyo3::import_exception!(bzrformats.errors, ObjectNotLocked);
 pyo3::import_exception!(bzrformats.inventory, DuplicateFileId);
 pyo3::import_exception!(bzrformats.inventory, InvalidEntryName);
 pyo3::import_exception!(bzrformats.dirstate, DirstateCorrupt);
@@ -99,6 +102,50 @@ impl bazaar::dirstate::Transport for PyFileTransport {
                 )
             })?;
             Ok(bytes.as_bytes().to_vec())
+        })
+    }
+
+    fn read_at(
+        &mut self,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, bazaar::dirstate::TransportError> {
+        if self.lock_state.is_none() {
+            return Err(bazaar::dirstate::TransportError::NotLocked);
+        }
+        Python::attach(|py| -> Result<Vec<u8>, bazaar::dirstate::TransportError> {
+            let f = self.file.bind(py);
+            f.call_method1("seek", (offset,))
+                .map_err(|e| Self::map_err(py, e))?;
+            let data = f
+                .call_method1("read", (len,))
+                .map_err(|e| Self::map_err(py, e))?;
+            let bytes = data.cast_into::<PyBytes>().map_err(|_| {
+                bazaar::dirstate::TransportError::Other(
+                    "file.read() did not return bytes".to_string(),
+                )
+            })?;
+            Ok(bytes.as_bytes().to_vec())
+        })
+    }
+
+    fn len(&mut self) -> Result<u64, bazaar::dirstate::TransportError> {
+        if self.lock_state.is_none() {
+            return Err(bazaar::dirstate::TransportError::NotLocked);
+        }
+        Python::attach(|py| -> Result<u64, bazaar::dirstate::TransportError> {
+            let os = py.import("os").map_err(|e| Self::map_err(py, e))?;
+            let f = self.file.bind(py);
+            let fileno = f.call_method0("fileno").map_err(|e| Self::map_err(py, e))?;
+            let st = os
+                .call_method1("fstat", (fileno,))
+                .map_err(|e| Self::map_err(py, e))?;
+            let size: u64 = st
+                .getattr("st_size")
+                .map_err(|e| Self::map_err(py, e))?
+                .extract()
+                .map_err(|e| Self::map_err(py, e))?;
+            Ok(size)
         })
     }
 
@@ -349,6 +396,47 @@ impl bazaar::dirstate::Transport for PyFileTransport {
 /// `bytes` object, raising `ValueError` on an empty slice or unknown
 /// byte.  Used by every pyo3 entry that accepts a minikind slice from
 /// Python.
+/// Helper: marshal a Python `InventoryEntry` into the 5-tuple shape
+/// `inv_entry_to_details` returns: `(minikind_byte, fingerprint,
+/// size, executable, packed_stat)`. Pulls the entry's fields through
+/// pyo3's `InventoryEntry` extractor and forwards to the pure-Rust
+/// `bazaar::dirstate::inv_entry_to_details`.
+fn inv_entry_to_details_tuple<'py>(
+    py: Python<'py>,
+    inv_entry: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let extracted = inv_entry.extract::<pyo3::PyRef<'_, crate::inventory::InventoryEntry>>()?;
+    let (minikind, fingerprint, size, executable, packed_stat) =
+        bazaar::dirstate::inv_entry_to_details(&extracted.0);
+    PyTuple::new(
+        py,
+        [
+            PyBytes::new(py, &[minikind.to_minikind()]).into_any(),
+            PyBytes::new(py, fingerprint.as_slice()).into_any(),
+            size.into_pyobject(py)?.into_any(),
+            pyo3::types::PyBool::new(py, executable)
+                .to_owned()
+                .into_any(),
+            PyBytes::new(py, packed_stat.as_slice()).into_any(),
+        ],
+    )
+}
+
+/// Map a kind name (`"file"`, `"directory"`, `"symlink"`,
+/// `"tree-reference"`, `"absent"`, `"relocated"`) to the corresponding
+/// dirstate `Kind`. Used when marshalling inventory entries.
+fn kind_to_minikind(kind: &str) -> PyResult<bazaar::dirstate::Kind> {
+    match kind {
+        "file" => Ok(bazaar::dirstate::Kind::File),
+        "directory" => Ok(bazaar::dirstate::Kind::Directory),
+        "symlink" => Ok(bazaar::dirstate::Kind::Symlink),
+        "tree-reference" => Ok(bazaar::dirstate::Kind::TreeReference),
+        "absent" => Ok(bazaar::dirstate::Kind::Absent),
+        "relocated" => Ok(bazaar::dirstate::Kind::Relocated),
+        other => Err(PyTypeError::new_err(format!("unknown kind: {other}"))),
+    }
+}
+
 fn decode_minikind(bytes: &[u8]) -> PyResult<bazaar::dirstate::Kind> {
     let byte = bytes
         .first()
@@ -411,29 +499,38 @@ fn bisect_err_to_py(state: &Bound<PyAny>, err: bazaar::dirstate::BisectError) ->
     }
 }
 
-/// Build a `read_range(offset, len)` closure that seeks + reads on a
-/// Python file-like object.  Used by the bisect entrypoints — the
-/// pure-Rust bisect only needs random byte access, not the full
-/// Transport contract.
-fn make_read_range(
-    state_file: &Bound<PyAny>,
-) -> impl FnMut(u64, usize) -> Result<Vec<u8>, bazaar::dirstate::BisectError> {
-    let file: Py<PyAny> = state_file.clone().unbind();
-    move |offset: u64, len: usize| -> Result<Vec<u8>, bazaar::dirstate::BisectError> {
-        Python::attach(|py| {
-            let f = file.bind(py);
-            f.call_method1("seek", (offset,))
-                .map_err(|e| bazaar::dirstate::BisectError::ReadError(e.to_string()))?;
-            let data = f
-                .call_method1("read", (len,))
-                .map_err(|e| bazaar::dirstate::BisectError::ReadError(e.to_string()))?;
-            let bytes = data.cast_into::<PyBytes>().map_err(|_| {
-                bazaar::dirstate::BisectError::ReadError(
-                    "state_file.read() did not return bytes".to_string(),
-                )
-            })?;
-            Ok(bytes.as_bytes().to_vec())
-        })
+/// Map a [`bazaar::dirstate::TransportError`] into the Python
+/// exception class the dirstate API used to raise. `LockContention`
+/// / `NotLocked` / `AlreadyLocked` become their named counterparts;
+/// the rest fall through to `BzrFormatsError` so callers can still
+/// catch.
+/// Read the dirstate header and dirblocks from the transport iff they
+/// have not already been loaded. Mirrors Python's
+/// `DirState._read_dirblocks_if_needed`. Takes the `Bound<PyDirState>`
+/// because the body-parsing step needs to call back into the pyo3
+/// helper that produces the Python-side `_dirblocks` aliasing
+/// representation.
+fn read_dirblocks_if_needed(py: Python<'_>, slf: &Bound<'_, PyDirState>) -> PyResult<()> {
+    PyDirState::_read_header_if_needed(slf.clone())?;
+    let needs_blocks = matches!(
+        slf.borrow().inner.dirblock_state,
+        bazaar::dirstate::MemoryState::NotInMemory
+    );
+    if !needs_blocks {
+        return Ok(());
+    }
+    crate::dirstate_helpers::_read_dirblocks(py, slf.as_any())
+}
+
+fn transport_err_to_py(err: bazaar::dirstate::TransportError) -> PyErr {
+    use bazaar::dirstate::TransportError;
+    match err {
+        TransportError::LockContention(p) => LockContention::new_err(p),
+        TransportError::NotLocked => LockNotHeld::new_err(()),
+        TransportError::AlreadyLocked => LockContention::new_err("already locked"),
+        TransportError::NotFound(p) => pyo3::exceptions::PyFileNotFoundError::new_err(p),
+        TransportError::Io { message, .. } => pyo3::exceptions::PyOSError::new_err(message),
+        TransportError::Other(msg) => BzrFormatsError::new_err(msg),
     }
 }
 
@@ -1113,6 +1210,8 @@ fn dirstate_change_to_pytuple<'py>(
     } else {
         PyBytes::new(py, &change.file_id).into_any().unbind()
     };
+    // `DirstateInventoryChange` carries nine slots (last is `copied`).
+    // Dirstate doesn't model copies, so always surface `False`.
     PyTuple::new(
         py,
         [
@@ -1127,6 +1226,10 @@ fn dirstate_change_to_pytuple<'py>(
             name_tuple.into_any().unbind(),
             kind_tuple.into_any().unbind(),
             exec_tuple.into_any().unbind(),
+            pyo3::types::PyBool::new(py, false)
+                .to_owned()
+                .into_any()
+                .unbind(),
         ],
     )
 }
@@ -1195,13 +1298,126 @@ fn memory_state_from_py(value: i64) -> PyResult<bazaar::dirstate::MemoryState> {
 /// `num_present_parents`). Dirblocks, parents, ghosts, id_index, the
 /// save path, and the various get_entry/iter variants come in later
 /// commits.
-#[pyclass(name = "DirStateRs")]
+#[pyclass(name = "DirState", subclass, dict)]
 struct PyDirState {
     inner: bazaar::dirstate::DirState,
+    /// Cached `IdIndex` pyclass instance held across calls. Lazily
+    /// created on the first `_get_id_index` call and refreshed in
+    /// place by `refresh_cached_id_index` after every mutation so
+    /// callers that hold the returned object see fresh state.
+    id_index: std::sync::Mutex<Option<Py<IdIndex>>>,
+    /// Transport representing the dirstate file on disk. Created at
+    /// construction time as a [`FileTransport`] pointing at the
+    /// dirstate path; its lifetime matches this `DirState`.
+    /// Lock acquisition/release happens *on* the transport via
+    /// `lock_read` / `lock_write` / `unlock`; the transport itself
+    /// is always present.
+    transport: std::sync::Mutex<Box<dyn bazaar::dirstate::Transport + Send>>,
+    /// Mini-bisect cache: index of the last entry returned by
+    /// [`_find_entry_index`]. On the next call the cache lets us check
+    /// `block[last + 1]` directly before falling back to a full
+    /// `bisect_left`. Mirrors Python's `_last_entry_index` field.
+    last_entry_index: std::sync::Mutex<Option<usize>>,
 }
 
 #[pymethods]
 impl PyDirState {
+    // Class-level constants. Mirror the `DirState.FOO` attributes the
+    // Python class used to carry — tests and external callers still
+    // reach for them as `DirState.NULLSTAT` etc.
+
+    #[classattr]
+    const BISECT_PAGE_SIZE: usize = 4096;
+
+    #[classattr]
+    const NOT_IN_MEMORY: i32 = 0;
+    #[classattr]
+    const IN_MEMORY_UNMODIFIED: i32 = 1;
+    #[classattr]
+    const IN_MEMORY_MODIFIED: i32 = 2;
+    #[classattr]
+    const IN_MEMORY_HASH_MODIFIED: i32 = 3;
+
+    #[classattr]
+    fn NULLSTAT(py: Python<'_>) -> Bound<'_, PyBytes> {
+        // 32 'x' bytes — sentinel pack_stat value that never matches
+        // a real base64-encoded stat.
+        PyBytes::new(py, &[b'x'; 32])
+    }
+
+    #[classattr]
+    fn NULL_PARENT_DETAILS(py: Python<'_>) -> PyResult<Bound<'_, PyTuple>> {
+        PyTuple::new(
+            py,
+            [
+                PyBytes::new(py, b"a").into_any(),
+                PyBytes::new(py, b"").into_any(),
+                0i64.into_pyobject(py)?.into_any(),
+                pyo3::types::PyBool::new(py, false).to_owned().into_any(),
+                PyBytes::new(py, b"").into_any(),
+            ],
+        )
+    }
+
+    #[classattr]
+    fn HEADER_FORMAT_2(py: Python<'_>) -> Bound<'_, PyBytes> {
+        PyBytes::new(py, b"#bazaar dirstate flat format 2\n")
+    }
+
+    #[classattr]
+    fn HEADER_FORMAT_3(py: Python<'_>) -> Bound<'_, PyBytes> {
+        PyBytes::new(py, b"#bazaar dirstate flat format 3\n")
+    }
+
+    /// Map from full kind name (str) to minikind byte.
+    #[classattr]
+    fn _kind_to_minikind(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("absent", PyBytes::new(py, b"a"))?;
+        d.set_item("file", PyBytes::new(py, b"f"))?;
+        d.set_item("directory", PyBytes::new(py, b"d"))?;
+        d.set_item("relocated", PyBytes::new(py, b"r"))?;
+        d.set_item("symlink", PyBytes::new(py, b"l"))?;
+        d.set_item("tree-reference", PyBytes::new(py, b"t"))?;
+        Ok(d)
+    }
+
+    /// Map from minikind byte to full kind name (str). Used by
+    /// breezy's workingtree_4 to translate dirstate entries.
+    #[classattr]
+    fn _minikind_to_kind(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item(PyBytes::new(py, b"a"), "absent")?;
+        d.set_item(PyBytes::new(py, b"f"), "file")?;
+        d.set_item(PyBytes::new(py, b"d"), "directory")?;
+        d.set_item(PyBytes::new(py, b"l"), "symlink")?;
+        d.set_item(PyBytes::new(py, b"r"), "relocated")?;
+        d.set_item(PyBytes::new(py, b"t"), "tree-reference")?;
+        Ok(d)
+    }
+
+    /// Map from `stat.S_IF*` constants to the corresponding minikind
+    /// byte.
+    #[classattr]
+    fn _stat_to_minikind(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+        let d = pyo3::types::PyDict::new(py);
+        let stat = py.import("stat")?;
+        d.set_item(stat.getattr("S_IFDIR")?, PyBytes::new(py, b"d"))?;
+        d.set_item(stat.getattr("S_IFREG")?, PyBytes::new(py, b"f"))?;
+        d.set_item(stat.getattr("S_IFLNK")?, PyBytes::new(py, b"l"))?;
+        Ok(d)
+    }
+
+    /// Boolean-to-byte mapping used when serialising the executable
+    /// flag.
+    #[classattr]
+    fn _to_yesno(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item(true, PyBytes::new(py, b"y"))?;
+        d.set_item(false, PyBytes::new(py, b"n"))?;
+        Ok(d)
+    }
+
     /// Construct an empty dirstate at `path`. Mirrors Python's
     /// `DirState.__init__` for the pure-state fields only — lock and
     /// file-object plumbing stays on the Python side until its
@@ -1227,6 +1443,8 @@ impl PyDirState {
             Some(obj) => sha1_provider_from_py(py, obj),
             None => Box::new(bazaar::dirstate::DefaultSHA1Provider::new()),
         };
+        let transport: Box<dyn bazaar::dirstate::Transport + Send> =
+            Box::new(bazaar::dirstate::FileTransport::new(path.clone()));
         Ok(Self {
             inner: bazaar::dirstate::DirState::new(
                 path,
@@ -1235,6 +1453,9 @@ impl PyDirState {
                 use_filesystem_for_exec,
                 fdatasync,
             ),
+            id_index: std::sync::Mutex::new(None),
+            transport: std::sync::Mutex::new(transport),
+            last_entry_index: std::sync::Mutex::new(None),
         })
     }
 
@@ -1242,7 +1463,7 @@ impl PyDirState {
     /// Python's `DirState._filename` attribute, which is the ``str``
     /// path returned by ``Transport.local_abspath`` (always str, on
     /// every platform).
-    #[getter]
+    #[getter(_filename)]
     fn filename<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyString>> {
         let s = self
             .inner
@@ -1253,35 +1474,35 @@ impl PyDirState {
     }
 
     /// Header state flag matching Python's `_header_state` attribute.
-    #[getter]
+    #[getter(_header_state)]
     fn header_state(&self) -> i64 {
         memory_state_to_py(self.inner.header_state)
     }
 
-    #[setter]
+    #[setter(_header_state)]
     fn set_header_state(&mut self, value: i64) -> PyResult<()> {
         self.inner.header_state = memory_state_from_py(value)?;
         Ok(())
     }
 
     /// Dirblock state flag matching Python's `_dirblock_state`.
-    #[getter]
+    #[getter(_dirblock_state)]
     fn dirblock_state(&self) -> i64 {
         memory_state_to_py(self.inner.dirblock_state)
     }
 
-    #[setter]
+    #[setter(_dirblock_state)]
     fn set_dirblock_state(&mut self, value: i64) -> PyResult<()> {
         self.inner.dirblock_state = memory_state_from_py(value)?;
         Ok(())
     }
 
-    #[getter]
+    #[getter(_changes_aborted)]
     fn changes_aborted(&self) -> bool {
         self.inner.changes_aborted
     }
 
-    #[setter]
+    #[setter(_changes_aborted)]
     fn set_changes_aborted(&mut self, value: bool) {
         self.inner.changes_aborted = value;
     }
@@ -1289,12 +1510,12 @@ impl PyDirState {
     /// Offset in the backing file where the header ends and the
     /// dirblock body begins. `None` before the header has been read.
     /// Matches Python's `_end_of_header` attribute.
-    #[getter]
+    #[getter(_end_of_header)]
     fn end_of_header(&self) -> Option<u64> {
         self.inner.end_of_header
     }
 
-    #[setter]
+    #[setter(_end_of_header)]
     fn set_end_of_header(&mut self, value: Option<u64>) {
         self.inner.end_of_header = value;
     }
@@ -1302,18 +1523,19 @@ impl PyDirState {
     /// Cutoff mtime/ctime used when deciding whether cached sha1s are
     /// trustworthy. `None` before `_sha_cutoff_time` runs. Matches
     /// Python's `_cutoff_time` attribute.
-    #[getter]
+    #[getter(_cutoff_time)]
     fn cutoff_time(&self) -> Option<i64> {
         self.inner.cutoff_time
     }
 
-    #[setter]
+    #[setter(_cutoff_time)]
     fn set_cutoff_time(&mut self, value: Option<i64>) {
         self.inner.cutoff_time = value;
     }
 
     /// Compute, cache, and return the SHA cutoff time (`now - 3`).
     /// Mirrors Python's `DirState._sha_cutoff_time`.
+    #[pyo3(name = "_sha_cutoff_time")]
     fn compute_sha_cutoff_time(&mut self) -> i64 {
         self.inner.compute_sha_cutoff_time()
     }
@@ -1332,48 +1554,49 @@ impl PyDirState {
         self.inner.num_entries = value;
     }
 
-    #[getter]
+    #[getter(_worth_saving_limit)]
     fn worth_saving_limit(&self) -> i64 {
         self.inner.worth_saving_limit
     }
 
-    #[setter]
+    #[setter(_worth_saving_limit)]
     fn set_worth_saving_limit(&mut self, value: i64) {
         self.inner.worth_saving_limit = value;
     }
 
-    #[getter]
+    #[getter(_fdatasync)]
     fn fdatasync(&self) -> bool {
         self.inner.fdatasync
     }
 
-    #[setter]
+    #[setter(_fdatasync)]
     fn set_fdatasync(&mut self, value: bool) {
         self.inner.fdatasync = value;
     }
 
-    #[getter]
+    #[getter(_use_filesystem_for_exec)]
     fn use_filesystem_for_exec(&self) -> bool {
         self.inner.use_filesystem_for_exec
     }
 
-    #[setter]
+    #[setter(_use_filesystem_for_exec)]
     fn set_use_filesystem_for_exec(&mut self, value: bool) {
         self.inner.use_filesystem_for_exec = value;
     }
 
-    #[getter]
+    #[getter(_bisect_page_size)]
     fn bisect_page_size(&self) -> usize {
         self.inner.bisect_page_size
     }
 
-    #[setter]
+    #[setter(_bisect_page_size)]
     fn set_bisect_page_size(&mut self, value: usize) {
         self.inner.bisect_page_size = value;
     }
 
     /// Number of parent entries present in each record row. Mirrors
     /// Python's `DirState._num_present_parents`.
+    #[pyo3(name = "_num_present_parents")]
     fn num_present_parents(&self) -> usize {
         self.inner.num_present_parents()
     }
@@ -1387,7 +1610,7 @@ impl PyDirState {
     /// [`Self::append_parent`] or [`Self::set_parent_at`] for in-place
     /// mutation, or assign the attribute to replace the list
     /// wholesale.
-    #[getter]
+    #[getter(_parents)]
     fn parents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let items: Vec<Bound<PyBytes>> = self
             .inner
@@ -1398,7 +1621,7 @@ impl PyDirState {
         PyList::new(py, items)
     }
 
-    #[setter]
+    #[setter(_parents)]
     fn set_parents(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
         self.inner.parents = collect_bytes_vec(value)?;
         Ok(())
@@ -1407,8 +1630,8 @@ impl PyDirState {
     /// Ghost parent revision ids: parents referenced by the tree but
     /// not present locally. Same aliasing semantics as
     /// [`Self::parents`] — the getter returns a copy.
-    #[getter]
-    fn ghosts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+    #[getter(_ghosts)]
+    fn _ghosts_attr<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let items: Vec<Bound<PyBytes>> = self
             .inner
             .ghosts
@@ -1418,8 +1641,8 @@ impl PyDirState {
         PyList::new(py, items)
     }
 
-    #[setter]
-    fn set_ghosts(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
+    #[setter(_ghosts)]
+    fn _ghosts_attr_setter(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
         self.inner.ghosts = collect_bytes_vec(value)?;
         Ok(())
     }
@@ -1446,12 +1669,12 @@ impl PyDirState {
     ///
     /// Writing through the setter clears the cached id_index, since
     /// the previous index is no longer consistent with the new data.
-    #[getter]
+    #[getter(_dirblocks)]
     fn dirblocks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         crate::dirstate_helpers::dirblocks_to_py(py, &self.inner.dirblocks)
     }
 
-    #[setter]
+    #[setter(_dirblocks)]
     fn set_dirblocks(&mut self, value: &Bound<PyAny>) -> PyResult<()> {
         let new_blocks = crate::dirstate_helpers::dirblocks_from_py(value)?;
         self.inner.dirblocks = new_blocks;
@@ -1475,26 +1698,9 @@ impl PyDirState {
 
     /// Whether the current in-memory state is worth persisting. Mirrors
     /// `DirState._worth_saving`.
+    #[pyo3(name = "_worth_saving")]
     fn worth_saving(&self) -> bool {
         self.inner.worth_saving()
-    }
-
-    /// Persist the in-memory state to the given Python file-like
-    /// object, assuming the caller already holds a write lock.
-    /// Mirrors the `try` block inside Python's `DirState.save`:
-    /// serialises get_lines, seeks to 0, writes, truncates, flushes,
-    /// optionally fdatasyncs, and marks the dirstate unmodified.
-    /// Returns `True` if the state was actually written, `False` if
-    /// an early-return gate (`changes_aborted` / not-worth-saving)
-    /// prevented it.
-    fn save_to_file(&mut self, state_file: &Bound<PyAny>) -> PyResult<bool> {
-        let mut transport = PyFileTransport::new(
-            state_file.clone().unbind(),
-            bazaar::dirstate::LockState::Write,
-        );
-        self.inner.save_to(&mut transport).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("dirstate save failed: {:?}", e))
-        })
     }
 
     /// Record the observed sha1 for the entry at `key` and return the
@@ -1502,24 +1708,45 @@ impl PyDirState {
     /// non-regular file, or uncacheable mtime/ctime).  Mirrors
     /// Python's `DirState._observed_sha1` including the write-back
     /// the Python side used to do with a second `get_entry` call.
-    #[pyo3(signature = (key, sha1, st_mode, st_size, st_mtime, st_ctime, st_dev, st_ino))]
-    fn observed_sha1<'py>(
+    ///
+    /// Accepts the full dirstate entry tuple `(key, tree_states)` and
+    /// the stat-like object; pulls the key, reads `st_mode`/`st_size`/
+    /// `st_mtime`/`st_ctime` (with `getattr(..., 'st_dev', 0)` and
+    /// `'st_ino'` fallbacks to support `breezy.filters.FilteredStat`-
+    /// shaped stand-ins), and on success mutates `entry[1][0]` in place
+    /// with the new tree-0 details. No-op when the entry is the
+    /// `(None, None)` unversioned-path sentinel.
+    #[pyo3(name = "_observed_sha1")]
+    fn observed_sha1(
         &mut self,
-        py: Python<'py>,
-        key: &Bound<PyTuple>,
+        py: Python<'_>,
+        entry: &Bound<PyAny>,
         sha1: &[u8],
-        st_mode: u32,
-        st_size: u64,
-        st_mtime: f64,
-        st_ctime: f64,
-        st_dev: u64,
-        st_ino: u64,
-    ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        stat_value: &Bound<PyAny>,
+    ) -> PyResult<()> {
+        let entry_tuple = entry.cast::<PyTuple>()?;
+        if entry_tuple.get_item(0)?.is_none() {
+            return Ok(());
+        }
+        let key = entry_tuple.get_item(0)?.cast_into::<PyTuple>()?;
         let entry_key = bazaar::dirstate::EntryKey {
             dirname: key.get_item(0)?.extract()?,
             basename: key.get_item(1)?.extract()?,
             file_id: key.get_item(2)?.extract()?,
         };
+        let st_mode: u32 = stat_value.getattr("st_mode")?.extract()?;
+        let st_size: u64 = stat_value.getattr("st_size")?.extract()?;
+        let st_mtime: f64 = stat_value.getattr("st_mtime")?.extract()?;
+        let st_ctime: f64 = stat_value.getattr("st_ctime")?.extract()?;
+        // FilteredStat doesn't carry st_dev/st_ino; fall back to 0.
+        let st_dev: u64 = stat_value
+            .getattr("st_dev")
+            .and_then(|v| v.extract())
+            .unwrap_or(0);
+        let st_ino: u64 = stat_value
+            .getattr("st_ino")
+            .and_then(|v| v.extract())
+            .unwrap_or(0);
         let updated = self
             .inner
             .observed_sha1(
@@ -1541,9 +1768,10 @@ impl PyDirState {
                 }
                 other => pyo3::exceptions::PyRuntimeError::new_err(other.to_string()),
             })?;
-        match updated {
-            None => Ok(None),
-            Some(td) => Ok(Some(PyTuple::new(
+        if let Some(td) = updated {
+            // Mutate entry[1][0] in place so the caller's reference
+            // reflects the new tree-0 details.
+            let new_tree0 = PyTuple::new(
                 py,
                 [
                     PyBytes::new(py, &[td.minikind.to_minikind()]).into_any(),
@@ -1554,8 +1782,11 @@ impl PyDirState {
                         .into_any(),
                     PyBytes::new(py, &td.packed_stat).into_any(),
                 ],
-            )?)),
+            )?;
+            let trees = entry_tuple.get_item(1)?;
+            trees.set_item(0, new_tree0)?;
         }
+        Ok(())
     }
 
     /// Refresh the tree-0 slot of the entry at `key` from the
@@ -1781,92 +2012,255 @@ impl PyDirState {
         Ok((change_tuple, changed))
     }
 
-    /// Read the dirstate header out of `state_file` and populate the
-    /// header state (parents, ghosts, num_entries, end_of_header).
-    /// Mirrors `DirState._read_header`: reads five newline-delimited
-    /// lines from the current file position and leaves the file
-    /// pointer immediately after the fifth newline — the position
-    /// where the first dirblock record begins.  The caller must hold
-    /// a read or write lock and must have positioned the file at the
-    /// start of the header.  `state` is forwarded into the
-    /// `DirstateCorrupt(state, msg)` exception so callers can inspect
-    /// which dirstate failed to parse.
-    fn read_header_from_file(
-        &mut self,
-        state: &Bound<PyAny>,
-        state_file: &Bound<PyAny>,
-    ) -> PyResult<()> {
-        let mut data: Vec<u8> = Vec::new();
-        for _ in 0..5 {
-            let line = state_file.call_method0("readline")?;
-            let bytes = line.cast_into::<PyBytes>()?;
-            data.extend_from_slice(bytes.as_bytes());
-        }
-        self.inner
-            .read_header(&data)
-            .map_err(|e| DirstateCorrupt::new_err((state.clone().unbind(), e.to_string())))
+    /// Forget all in-memory state. Mirrors `DirState._wipe_state`.
+    #[pyo3(name = "_wipe_state")]
+    fn wipe_state(&mut self, py: Python<'_>) {
+        self.inner.wipe_state();
+        self.refresh_cached_id_index(py);
     }
 
-    /// Bisect for rows at the given paths. Mirrors Python's
-    /// `DirState._bisect`. `paths` is an iterable of `bytes`; returns
-    /// a `dict` mapping path → list of entries (same tuple shape as
-    /// `DirStateRs.dirblocks` entries). Requires the header to have
-    /// been read and the caller to hold a read (or write) lock on
-    /// `state_file`.
-    fn bisect<'py>(
-        &self,
+    /// Acquire a read lock on the dirstate file via the Transport.
+    /// Mirrors Python's `DirState.lock_read`. Returns a
+    /// `LogicalLockResult` whose `unlock` callback releases the
+    /// lock.
+    fn lock_read(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        {
+            let me = slf.borrow();
+            let mut t = me.transport.lock().unwrap();
+            t.lock_read().map_err(transport_err_to_py)?;
+        }
+        slf.borrow_mut().inner.wipe_state();
+        slf.borrow_mut().refresh_cached_id_index(py);
+        let unlock = slf.getattr("unlock")?;
+        let result = pyo3::Py::new(
+            py,
+            crate::lock::PyLogicalLockResult {
+                unlock: unlock.unbind(),
+                token: None,
+            },
+        )?;
+        Ok(result.into_any())
+    }
+
+    /// Acquire a write lock on the dirstate file via the Transport.
+    /// Mirrors Python's `DirState.lock_write`.
+    fn lock_write(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        {
+            let me = slf.borrow();
+            let mut t = me.transport.lock().unwrap();
+            t.lock_write().map_err(transport_err_to_py)?;
+        }
+        slf.borrow_mut().inner.wipe_state();
+        slf.borrow_mut().refresh_cached_id_index(py);
+        let unlock = slf.getattr("unlock")?;
+        // Python's lock_write passes self._lock_token as the second
+        // arg of LogicalLockResult; we pass slf for the same role
+        // (callers historically use it as an opaque token).
+        let result = pyo3::Py::new(
+            py,
+            crate::lock::PyLogicalLockResult {
+                unlock: unlock.unbind(),
+                token: Some(slf.clone().into_any().unbind()),
+            },
+        )?;
+        Ok(result.into_any())
+    }
+
+    /// Release the held lock. Mirrors Python's `DirState.unlock`.
+    fn unlock(&self) -> PyResult<()> {
+        let mut t = self.transport.lock().unwrap();
+        t.unlock().map_err(transport_err_to_py)?;
+        Ok(())
+    }
+
+    /// Persist any pending changes through the held lock. Mirrors
+    /// Python's `DirState.save`: skips when `changes_aborted` or the
+    /// state is not worth saving, performs the read→write lock-upgrade
+    /// dance through the transport, calls the pure-Rust `save_to`, and
+    /// restores the read lock afterwards.
+    fn save(&mut self) -> PyResult<()> {
+        if self.inner.changes_aborted {
+            return Ok(());
+        }
+        if !self.inner.worth_saving() {
+            return Ok(());
+        }
+        let mut t = self.transport.lock().unwrap();
+        let upgraded = match t.lock_state() {
+            Some(bazaar::dirstate::LockState::Write) => false,
+            Some(bazaar::dirstate::LockState::Read) => {
+                if !t.upgrade_to_write_lock().map_err(transport_err_to_py)? {
+                    // Another reader prevented the upgrade; matches
+                    // Python's "grabbed_write_lock is False" return.
+                    return Ok(());
+                }
+                true
+            }
+            None => return Err(ObjectNotLocked::new_err(())),
+        };
+        let save_result = self.inner.save_to(&mut **t);
+        if upgraded {
+            t.downgrade_to_read_lock().map_err(transport_err_to_py)?;
+        }
+        save_result.map_err(transport_err_to_py)?;
+        Ok(())
+    }
+
+    /// Current lock mode held on the transport: `"r"`, `"w"`, or
+    /// `None`. Mirrors Python's `DirState._lock_state` attribute.
+    #[getter(_lock_state)]
+    fn lock_state(&self) -> Option<&'static str> {
+        match self.transport.lock().unwrap().lock_state() {
+            None => None,
+            Some(bazaar::dirstate::LockState::Read) => Some("r"),
+            Some(bazaar::dirstate::LockState::Write) => Some("w"),
+        }
+    }
+
+    /// Truthy iff the dirstate is currently locked. Kept as a
+    /// back-compat attribute so `if state._lock_token:` checks
+    /// continue to work; the actual OS lock lives on the transport.
+    #[getter(_lock_token)]
+    fn lock_token(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if slf
+            .borrow()
+            .transport
+            .lock()
+            .unwrap()
+            .lock_state()
+            .is_some()
+        {
+            Ok(slf.into_any().unbind())
+        } else {
+            Ok(py.None())
+        }
+    }
+
+    /// Raise `ObjectNotLocked` if no lock is held on the transport.
+    /// Mirrors Python's `DirState._requires_lock`.
+    fn _requires_lock(&self) -> PyResult<()> {
+        let t = self.transport.lock().unwrap();
+        if t.lock_state().is_none() {
+            return Err(ObjectNotLocked::new_err(()));
+        }
+        Ok(())
+    }
+
+    /// Read the dirstate header from the transport iff it has not
+    /// already been loaded. Mirrors Python's
+    /// `DirState._read_header_if_needed`.
+    fn _read_header_if_needed(slf: Bound<'_, Self>) -> PyResult<()> {
+        let (data, already_loaded) = {
+            let me = slf.borrow();
+            let mut t = me.transport.lock().unwrap();
+            if t.lock_state().is_none() {
+                return Err(ObjectNotLocked::new_err(()));
+            }
+            if !matches!(
+                me.inner.header_state,
+                bazaar::dirstate::MemoryState::NotInMemory
+            ) {
+                return Ok(());
+            }
+            (t.read_all().map_err(transport_err_to_py)?, false)
+        };
+        let _ = already_loaded;
+        let path = slf
+            .borrow()
+            .inner
+            .filename
+            .to_string_lossy()
+            .into_owned();
+        slf.borrow_mut().inner.read_header(&data).map_err(|e| {
+            DirstateCorrupt::new_err((path, e.to_string()))
+        })
+    }
+
+    /// Size of the dirstate file as seen through the transport.
+    /// Used by `_prepare_bisect` to bound the bisect search.
+    fn _state_file_size(&self) -> PyResult<u64> {
+        let mut t = self.transport.lock().unwrap();
+        t.len().map_err(transport_err_to_py)
+    }
+
+    /// Read the full dirstate file via the transport. Used by
+    /// `get_lines` when both the header and dirblocks are
+    /// `IN_MEMORY_UNMODIFIED` and the on-disk bytes are authoritative.
+    fn _read_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let mut t = self.transport.lock().unwrap();
+        let data = t.read_all().map_err(transport_err_to_py)?;
+        Ok(PyBytes::new(py, &data))
+    }
+
+    /// Transport-backed counterpart of `_bisect`. Mirrors Python's
+    /// `DirState._bisect`: prepares the header / file size on demand
+    /// and bisects through the on-disk dirstate without materialising
+    /// it in memory.
+    fn _bisect<'py>(
+        slf: Bound<'py, Self>,
         py: Python<'py>,
-        state: &Bound<PyAny>,
-        state_file: &Bound<PyAny>,
-        file_size: u64,
         paths: &Bound<PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let file_size = Self::prepare_bisect(slf.clone())?;
         let rust_paths = collect_bytes_vec(paths)?;
-        let read_range = make_read_range(state_file);
-        let found = self
-            .inner
-            .bisect(rust_paths, file_size, read_range)
-            .map_err(|e| bisect_err_to_py(state, e))?;
+        let found = {
+            let me = slf.borrow();
+            let mut t = me.transport.lock().unwrap();
+            let mut read_range =
+                |offset: u64, len: usize| -> Result<Vec<u8>, bazaar::dirstate::BisectError> {
+                    t.read_at(offset, len)
+                        .map_err(|e| bazaar::dirstate::BisectError::ReadError(e.to_string()))
+                };
+            me.inner
+                .bisect(rust_paths, file_size, &mut read_range)
+                .map_err(|e| bisect_err_to_py(slf.as_any(), e))?
+        };
         bisect_result_to_pydict(py, &found)
     }
 
-    /// Bisect for all entries whose dirname is in `dir_list`.
-    /// Mirrors Python's `DirState._bisect_dirblocks`.
-    fn bisect_dirblocks<'py>(
-        &self,
+    /// Transport-backed counterpart of `_bisect_dirblocks`.
+    fn _bisect_dirblocks<'py>(
+        slf: Bound<'py, Self>,
         py: Python<'py>,
-        state: &Bound<PyAny>,
-        state_file: &Bound<PyAny>,
-        file_size: u64,
         dir_list: &Bound<PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let file_size = Self::prepare_bisect(slf.clone())?;
         let rust_dirs = collect_bytes_vec(dir_list)?;
-        let read_range = make_read_range(state_file);
-        let found = self
-            .inner
-            .bisect_dirblocks(rust_dirs, file_size, read_range)
-            .map_err(|e| bisect_err_to_py(state, e))?;
+        let found = {
+            let me = slf.borrow();
+            let mut t = me.transport.lock().unwrap();
+            let mut read_range =
+                |offset: u64, len: usize| -> Result<Vec<u8>, bazaar::dirstate::BisectError> {
+                    t.read_at(offset, len)
+                        .map_err(|e| bazaar::dirstate::BisectError::ReadError(e.to_string()))
+                };
+            me.inner
+                .bisect_dirblocks(rust_dirs, file_size, &mut read_range)
+                .map_err(|e| bisect_err_to_py(slf.as_any(), e))?
+        };
         bisect_result_to_pydict(py, &found)
     }
 
-    /// Recursive bisect. Mirrors Python's `DirState._bisect_recursive`.
-    /// `paths` is an iterable of `bytes` paths; returns a `dict`
-    /// mapping `(dirname, basename, file_id)` to a list of
-    /// tree-data 5-tuples.
-    fn bisect_recursive<'py>(
-        &self,
+    /// Transport-backed counterpart of `_bisect_recursive`.
+    fn _bisect_recursive<'py>(
+        slf: Bound<'py, Self>,
         py: Python<'py>,
-        state: &Bound<PyAny>,
-        state_file: &Bound<PyAny>,
-        file_size: u64,
         paths: &Bound<PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let file_size = Self::prepare_bisect(slf.clone())?;
         let rust_paths = collect_bytes_vec(paths)?;
-        let read_range = make_read_range(state_file);
-        let found = self
-            .inner
-            .bisect_recursive(rust_paths, file_size, read_range)
-            .map_err(|e| bisect_err_to_py(state, e))?;
+        let found = {
+            let me = slf.borrow();
+            let mut t = me.transport.lock().unwrap();
+            let mut read_range =
+                |offset: u64, len: usize| -> Result<Vec<u8>, bazaar::dirstate::BisectError> {
+                    t.read_at(offset, len)
+                        .map_err(|e| bazaar::dirstate::BisectError::ReadError(e.to_string()))
+                };
+            me.inner
+                .bisect_recursive(rust_paths, file_size, &mut read_range)
+                .map_err(|e| bisect_err_to_py(slf.as_any(), e))?
+        };
         let out = PyDict::new(py);
         for ((dn, bn, fid), trees) in &found {
             let key = PyTuple::new(
@@ -1900,11 +2294,6 @@ impl PyDirState {
         Ok(out)
     }
 
-    /// Forget all in-memory state. Mirrors `DirState._wipe_state`.
-    fn wipe_state(&mut self) {
-        self.inner.wipe_state();
-    }
-
     /// Parse the 5-line dirstate header out of `data`. Mirrors
     /// Python's `DirState._read_header`: populates parents, ghosts,
     /// num_entries, end_of_header, and marks the header as in-memory
@@ -1921,9 +2310,19 @@ impl PyDirState {
 
     /// Discard any parent trees beyond the first, including any
     /// entries that are dead in both tree 0 and tree 1 after the
-    /// discard. Mirrors Python's `DirState._discard_merge_parents`.
-    fn discard_merge_parents(&mut self) {
-        self.inner.discard_merge_parents();
+    /// discard. Reads the header and dirblocks first if needed.
+    /// Mirrors Python's `DirState._discard_merge_parents`.
+    #[pyo3(name = "_discard_merge_parents")]
+    fn discard_merge_parents(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        Self::_read_header_if_needed(slf.clone())?;
+        if slf.borrow().inner.parents.is_empty() {
+            return Ok(());
+        }
+        read_dirblocks_if_needed(py, &slf)?;
+        let mut me = slf.borrow_mut();
+        me.inner.discard_merge_parents();
+        me.refresh_cached_id_index(py);
+        Ok(())
     }
 
     /// Split the root dirblock into two sentinel blocks: block 0 with
@@ -1931,6 +2330,7 @@ impl PyDirState {
     /// Python's `DirState._split_root_dirblock_into_contents`. Raises
     /// `ValueError` when the pre-split layout is not the expected
     /// "everything in block 0, block 1 empty" shape.
+    #[pyo3(name = "_split_root_dirblock_into_contents")]
     fn split_root_dirblock_into_contents(&mut self) -> PyResult<()> {
         self.inner
             .split_root_dirblock_into_contents()
@@ -1942,6 +2342,7 @@ impl PyDirState {
     /// returns `(block_index, present)`. Python's one-slot
     /// `_last_block_index` cache is dropped by this port — bisect in
     /// Rust is cheap enough that the extra branch isn't worth it.
+    #[pyo3(name = "_find_block_index_from_key")]
     fn find_block_index_from_key(&self, key: &Bound<PyTuple>) -> PyResult<(usize, bool)> {
         let entry_key = bazaar::dirstate::EntryKey {
             dirname: key.get_item(0)?.extract()?,
@@ -1984,8 +2385,12 @@ impl PyDirState {
     }
 
     /// Find the entry index within `block` for `key`. Mirrors Python's
-    /// `DirState._find_entry_index`. `block` is the
+    /// `DirState._find_entry_index`, including the one-slot
+    /// `_last_entry_index` mini-bisect cache: after a hit, the next
+    /// call probes `block[last + 1]` directly before falling back to a
+    /// full `bisect_left`. `block` is the
     /// `self._dirblocks[block_index][1]` list.
+    #[pyo3(name = "_find_entry_index")]
     fn find_entry_index(
         &self,
         key: &Bound<PyTuple>,
@@ -1996,38 +2401,59 @@ impl PyDirState {
             basename: key.get_item(1)?.extract()?,
             file_id: key.get_item(2)?.extract()?,
         };
-        // The caller's `block` is Python's view of
-        // self._dirblocks[i][1]; we need the Rust view, so convert
-        // the block entries on the fly. This is wasteful — once the
-        // dirblock aliasing migrates fully, callers will pass
-        // block_index and we can read from self.inner.dirblocks
-        // directly.
         let mut entries: Vec<bazaar::dirstate::Entry> = Vec::new();
         for item in block.try_iter()? {
             entries.push(crate::dirstate_helpers::entry_from_py(&item?)?);
         }
-        Ok(self.inner.find_entry_index(&entry_key, &entries))
+        // Mini-bisect cache: check the slot just after the previously
+        // returned index. A hit is when `key` is strictly greater than
+        // the prior slot (block[last]) and `<=` the candidate slot
+        // (block[last + 1]). On hit, return that index; on miss, fall
+        // through to a full bisect.
+        fn key_tuple(k: &bazaar::dirstate::EntryKey) -> (&[u8], &[u8], &[u8]) {
+            (&k.dirname, &k.basename, &k.file_id)
+        }
+        let len_block = entries.len();
+        let mut last_guard = self.last_entry_index.lock().unwrap();
+        if let Some(last) = *last_guard {
+            let probe = last + 1;
+            if probe < len_block
+                && key_tuple(&entries[last].key) < key_tuple(&entry_key)
+                && key_tuple(&entry_key) <= key_tuple(&entries[probe].key)
+            {
+                let present = entries[probe].key == entry_key;
+                *last_guard = Some(probe);
+                return Ok((probe, present));
+            }
+        }
+        let (idx, present) = self.inner.find_entry_index(&entry_key, &entries);
+        *last_guard = Some(idx);
+        Ok((idx, present))
     }
 
     /// Look up `(dirname, basename)` in `tree_index` and return the
     /// four-field result Python's `DirState._get_block_entry_index`
     /// produces: `(block_index, entry_index, dir_present,
     /// path_present)`.
+    #[pyo3(name = "_get_block_entry_index")]
     fn get_block_entry_index(
-        &self,
+        slf: Bound<'_, Self>,
+        py: Python<'_>,
         dirname: &[u8],
         basename: &[u8],
         tree_index: usize,
-    ) -> (usize, usize, bool, bool) {
-        let bei = self
+    ) -> PyResult<(usize, usize, bool, bool)> {
+        read_dirblocks_if_needed(py, &slf)?;
+        let me = slf.borrow();
+        let bei = me
             .inner
             .get_block_entry_index(dirname, basename, tree_index);
-        (
+        Ok((
             bei.block_index,
             bei.entry_index,
             bei.dir_present,
             bei.path_present,
-        )
+        ))
     }
 
     /// Ensure a dirblock for `dirname` exists. Mirrors Python's
@@ -2037,6 +2463,7 @@ impl PyDirState {
     /// creating an empty block if necessary. Raises `AssertionError`
     /// when the supplied dirname does not end with the parent entry's
     /// basename.
+    #[pyo3(name = "_ensure_block")]
     fn ensure_block(
         &mut self,
         parent_block_index: isize,
@@ -2065,18 +2492,53 @@ impl PyDirState {
             .map(|sha1| PyBytes::new(py, sha1))
     }
 
+    /// `DirState.sha1_from_stat`: pack the stat tuple and look up the
+    /// resulting key in the packed-stat index in one call. `path` is
+    /// kept as an ignored back-compat first argument since callers
+    /// originally went through the wrapper class's
+    /// `sha1_from_stat(path, stat_result)` signature.
+    #[pyo3(signature = (path, stat_result))]
+    fn sha1_from_stat<'py>(
+        &mut self,
+        py: Python<'py>,
+        path: &Bound<'py, PyAny>,
+        stat_result: &Bound<'py, PyAny>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let _ = path;
+        let size = stat_result.getattr("st_size")?.extract::<u64>()?;
+        let mtime = extract_fs_time(&stat_result.getattr("st_mtime")?)?;
+        let ctime = extract_fs_time(&stat_result.getattr("st_ctime")?)?;
+        let dev = stat_result.getattr("st_dev")?.extract::<u64>()?;
+        let ino = stat_result.getattr("st_ino")?.extract::<u64>()?;
+        let mode = stat_result.getattr("st_mode")?.extract::<u32>()?;
+        let packed = bazaar::dirstate::pack_stat(size, mtime, ctime, dev, ino, mode);
+        Ok(self
+            .inner
+            .get_or_build_packed_stat_index()
+            .get(packed.as_bytes())
+            .map(|sha1| PyBytes::new(py, sha1)))
+    }
+
     /// Mark the entry at `key` as absent for tree 0, returning True
     /// when the entry row was removed entirely (the "last reference"
-    /// case). Mirrors Python's `DirState._make_absent`.
-    fn make_absent(&mut self, key: &Bound<PyTuple>) -> PyResult<bool> {
+    /// case). Mirrors Python's `DirState._make_absent`. Input is the
+    /// full dirstate `entry` (a `(key, tree_states)` 2-tuple), matching
+    /// the shape Python's iter_entries / get_entry produces. Only the
+    /// key (`entry[0]`) is consulted.
+    #[pyo3(name = "_make_absent")]
+    fn make_absent(&mut self, py: Python<'_>, entry: &Bound<PyTuple>) -> PyResult<bool> {
+        let key = entry.get_item(0)?.cast_into::<PyTuple>()?;
         let entry_key = bazaar::dirstate::EntryKey {
             dirname: key.get_item(0)?.extract()?,
             basename: key.get_item(1)?.extract()?,
             file_id: key.get_item(2)?.extract()?,
         };
-        self.inner
+        let result = self
+            .inner
             .make_absent(&entry_key)
-            .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))
+            .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))?;
+        self.refresh_cached_id_index(py);
+        Ok(result)
     }
 
     /// Apply a sequence of "adds" to tree 1. Mirrors Python's
@@ -2092,7 +2554,8 @@ impl PyDirState {
     /// the inner state first, mirroring Python's `_raise_invalid`),
     /// `NotImplementedError` for the basis-relocation branch, and
     /// `AssertionError` for internal invariant violations.
-    fn update_basis_apply_adds(&mut self, adds: &Bound<PyAny>) -> PyResult<()> {
+    #[pyo3(name = "_update_basis_apply_adds")]
+    fn update_basis_apply_adds(&mut self, py: Python<'_>, adds: &Bound<PyAny>) -> PyResult<()> {
         let mut rust_adds: Vec<bazaar::dirstate::BasisAdd> = Vec::new();
         for item in adds.try_iter()? {
             let tup = item?.cast_into::<PyTuple>()?;
@@ -2136,8 +2599,11 @@ impl PyDirState {
         }
 
         match self.inner.update_basis_apply_adds(&mut rust_adds) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.raise_basis_apply_error(adds.py(), e)),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 
@@ -2145,7 +2611,7 @@ impl PyDirState {
     /// `tree_index`. Mirrors Python's `DirState._get_entry` —
     /// including the `(None, None)` sentinel returned on a miss.
     /// On hit, the return is the same entry-tuple shape as
-    /// `DirStateRs.dirblocks` entries.
+    /// `DirState.dirblocks` entries.
     ///
     /// `include_deleted` controls whether the file_id branch
     /// returns absent entries (`b'a'`) as-is or hides them.
@@ -2153,6 +2619,7 @@ impl PyDirState {
     /// Raises `BzrFormatsError` for the "unversioned entry?" and
     /// "mismatching tree_index/file_id/path" guards; the second one
     /// also sets `changes_aborted` to match Python's side effect.
+    #[pyo3(name = "_get_entry")]
     #[pyo3(signature = (
         tree_index,
         fileid_utf8 = None,
@@ -2160,13 +2627,16 @@ impl PyDirState {
         include_deleted = false,
     ))]
     fn get_entry<'py>(
-        &mut self,
+        slf: Bound<'py, Self>,
         py: Python<'py>,
         tree_index: usize,
         fileid_utf8: Option<&[u8]>,
         path_utf8: Option<&[u8]>,
         include_deleted: bool,
     ) -> PyResult<Py<PyAny>> {
+        read_dirblocks_if_needed(py, &slf)?;
+        let mut binding = slf.borrow_mut();
+        let self_ = &mut *binding;
         let none_pair = || -> PyResult<Py<PyAny>> {
             Ok(PyTuple::new(py, [py.None(), py.None()])?.unbind().into())
         };
@@ -2177,13 +2647,13 @@ impl PyDirState {
                 Some(i) => (&path[..i], &path[i + 1..]),
                 None => (b"".as_slice(), path),
             };
-            let bei = self
+            let bei = self_
                 .inner
                 .get_block_entry_index(dirname_raw, basename_raw, tree_index);
             if !bei.path_present {
                 return none_pair();
             }
-            let entry = &self.inner.dirblocks[bei.block_index].entries[bei.entry_index];
+            let entry = &self_.inner.dirblocks[bei.block_index].entries[bei.entry_index];
             let t_kind = entry.trees.get(tree_index).map(|t| t.minikind);
             if entry.key.file_id.is_empty()
                 || matches!(
@@ -2196,7 +2666,7 @@ impl PyDirState {
             }
             if let Some(fid) = fileid_utf8 {
                 if entry.key.file_id != fid {
-                    self.inner.changes_aborted = true;
+                    self_.inner.changes_aborted = true;
                     return Err(BzrFormatsError::new_err(
                         "integrity error ? : mismatching tree_index, file_id and path",
                     ));
@@ -2212,7 +2682,7 @@ impl PyDirState {
         };
 
         let file_id = bazaar::FileId::from(&fid.to_vec());
-        let candidates = self.inner.get_or_build_id_index().get(&file_id);
+        let candidates = self_.inner.get_or_build_id_index().get(&file_id);
 
         let mut next_path: Option<Vec<u8>> = None;
         for (dn, bn, _) in candidates {
@@ -2221,17 +2691,17 @@ impl PyDirState {
                 basename: bn.clone(),
                 file_id: fid.to_vec(),
             };
-            let (b_idx, b_present) = self.inner.find_block_index_from_key(&search_key);
+            let (b_idx, b_present) = self_.inner.find_block_index_from_key(&search_key);
             if !b_present {
                 continue;
             }
-            let (e_idx, e_present) = self
+            let (e_idx, e_present) = self_
                 .inner
-                .find_entry_index(&search_key, &self.inner.dirblocks[b_idx].entries);
+                .find_entry_index(&search_key, &self_.inner.dirblocks[b_idx].entries);
             if !e_present {
                 continue;
             }
-            let entry = &self.inner.dirblocks[b_idx].entries[e_idx];
+            let entry = &self_.inner.dirblocks[b_idx].entries[e_idx];
             let t_kind = entry.trees.get(tree_index).map(|t| t.minikind);
             match t_kind {
                 Some(k) if k.is_fdlt() => {
@@ -2258,7 +2728,15 @@ impl PyDirState {
         }
 
         if let Some(real_path) = next_path {
-            return self.get_entry(py, tree_index, Some(fid), Some(&real_path), include_deleted);
+            drop(binding);
+            return Self::get_entry(
+                slf,
+                py,
+                tree_index,
+                Some(fid),
+                Some(&real_path),
+                include_deleted,
+            );
         }
 
         none_pair()
@@ -2268,6 +2746,7 @@ impl PyDirState {
     /// exists in `tree_index`. Mirrors Python's
     /// `DirState._after_delta_check_parents`. Raises
     /// `InconsistentDelta` on the first bad parent.
+    #[pyo3(name = "_after_delta_check_parents")]
     fn after_delta_check_parents(
         &mut self,
         py: Python<'_>,
@@ -2297,6 +2776,7 @@ impl PyDirState {
     /// `DirState._check_delta_ids_absent`. Raises
     /// `InconsistentDelta` on conflict, via the shared
     /// `raise_basis_apply_error` helper.
+    #[pyo3(name = "_check_delta_ids_absent")]
     fn check_delta_ids_absent(
         &mut self,
         py: Python<'_>,
@@ -2374,7 +2854,10 @@ impl PyDirState {
             .inner
             .update_minimal(entry_key, tree0_details, path_utf8, fullscan)
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
@@ -2391,6 +2874,7 @@ impl PyDirState {
     /// `BzrFormatsError` for unknown kinds, and `AssertionError` for
     /// internal invariant violations.
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(name = "_add_raw")]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -2413,7 +2897,10 @@ impl PyDirState {
             packed_stat,
             fingerprint.unwrap_or(b""),
         ) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(e) => Err(add_error_to_py(py, e)),
         }
     }
@@ -2427,16 +2914,25 @@ impl PyDirState {
     /// `stat` is either `None` (substitutes NULLSTAT) or any object
     /// exposing `st_mode`/`st_size`/`st_mtime`/`st_ctime`/`st_dev`/
     /// `st_ino` — matching `os.stat_result`.
+    #[pyo3(name = "add")]
     #[pyo3(signature = (path, file_id, kind, stat, fingerprint))]
     fn add_path(
         &mut self,
         py: Python<'_>,
-        path: &str,
+        path: &Bound<'_, PyAny>,
         file_id: &[u8],
         kind: bazaar::osutils::Kind,
         stat: Option<&Bound<PyAny>>,
         fingerprint: Option<&[u8]>,
     ) -> PyResult<()> {
+        // Accept either `str` (the canonical shape) or `bytes` (a few
+        // legacy callers still pass utf-8 bytes for `path`).
+        let path_owned: String = if let Ok(b) = path.downcast::<PyBytes>() {
+            String::from_utf8(b.as_bytes().to_vec())
+                .map_err(|e| PyTypeError::new_err(format!("path is not valid utf-8: {e}")))?
+        } else {
+            path.extract::<String>()?
+        };
         let stat_info: Option<bazaar::dirstate::StatInfo> = match stat {
             None => None,
             Some(s) if s.is_none() => None,
@@ -2449,11 +2945,17 @@ impl PyDirState {
                 ino: s.getattr("st_ino")?.extract()?,
             }),
         };
-        match self
-            .inner
-            .add_path(path, file_id, kind, stat_info, fingerprint.unwrap_or(b""))
-        {
-            Ok(()) => Ok(()),
+        match self.inner.add_path(
+            &path_owned,
+            file_id,
+            kind,
+            stat_info,
+            fingerprint.unwrap_or(b""),
+        ) {
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(e) => Err(add_error_to_py(py, e)),
         }
     }
@@ -2462,9 +2964,19 @@ impl PyDirState {
     /// `DirState.set_path_id` for `path=b""` — any other path raises
     /// `NotImplementedError`. Returns silently when `new_id` already
     /// matches the current root id.
-    fn set_path_id(&mut self, path: &[u8], new_id: &[u8]) -> PyResult<()> {
-        match self.inner.set_path_id(path, new_id) {
-            Ok(()) => Ok(()),
+    fn set_path_id(
+        slf: Bound<'_, Self>,
+        py: Python<'_>,
+        path: &[u8],
+        new_id: &[u8],
+    ) -> PyResult<()> {
+        read_dirblocks_if_needed(py, &slf)?;
+        let mut me = slf.borrow_mut();
+        match me.inner.set_path_id(path, new_id) {
+            Ok(()) => {
+                me.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(bazaar::dirstate::SetPathIdError::NonRootPath) => Err(
                 pyo3::exceptions::PyNotImplementedError::new_err("set_path_id non-root path"),
             ),
@@ -2478,7 +2990,8 @@ impl PyDirState {
     /// `DirState._apply_removals`. Input is a Python iterable of
     /// `(file_id, path)` 2-tuples, matching the caller pattern
     /// `update_by_delta` uses: `removals.items()`.
-    fn apply_removals(&mut self, removals: &Bound<PyAny>) -> PyResult<()> {
+    #[pyo3(name = "_apply_removals")]
+    fn apply_removals(&mut self, py: Python<'_>, removals: &Bound<PyAny>) -> PyResult<()> {
         let mut rust_removals: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for item in removals.try_iter()? {
             let tup = item?.cast_into::<PyTuple>()?;
@@ -2492,8 +3005,11 @@ impl PyDirState {
             rust_removals.push((file_id, path));
         }
         match self.inner.apply_removals(&rust_removals) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.raise_basis_apply_error(removals.py(), e)),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 
@@ -2501,8 +3017,11 @@ impl PyDirState {
     /// invariants. On violation raises `AssertionError` with the
     /// same message Python would — mirroring
     /// `DirState._validate`.
-    fn validate(&self) -> PyResult<()> {
-        self.inner
+    #[pyo3(name = "_validate")]
+    fn validate(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        read_dirblocks_if_needed(py, &slf)?;
+        slf.borrow()
+            .inner
             .validate()
             .map_err(|e| pyo3::exceptions::PyAssertionError::new_err(e.to_string()))
     }
@@ -2513,37 +3032,53 @@ impl PyDirState {
     /// validates each row's `file_id` against its `new_entry`, and
     /// dispatches to the Rust applier.
     fn update_basis_by_delta(
-        &mut self,
+        slf: Bound<'_, Self>,
         py: Python<'_>,
-        delta: &crate::inventory::InventoryDelta,
+        delta: Bound<'_, crate::inventory::InventoryDelta>,
         new_revid: Vec<u8>,
     ) -> PyResult<()> {
-        match self
+        read_dirblocks_if_needed(py, &slf)?;
+        delta.borrow().check(py)?;
+        delta.borrow_mut().sort();
+        let delta_ref = delta.borrow();
+        let mut me = slf.borrow_mut();
+        match me
             .inner
-            .update_basis_by_delta_from_inventory_delta(&delta.0, new_revid)
+            .update_basis_by_delta_from_inventory_delta(&delta_ref.0, new_revid)
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                me.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(e) => {
-                self.inner.changes_aborted = true;
-                Err(self.raise_basis_apply_error(py, e))
+                me.inner.changes_aborted = true;
+                Err(me.raise_basis_apply_error(py, e))
             }
         }
     }
 
-    /// Apply a pre-flattened inventory delta to tree 0. Mirrors
-    /// Python's `DirState.update_by_delta`. Input is a Python
     /// Apply an inventory delta to tree 0.  Takes an `InventoryDelta`
     /// pyclass; Rust does the per-row flattening and dispatch.
     fn update_by_delta(
-        &mut self,
+        slf: Bound<'_, Self>,
         py: Python<'_>,
-        delta: &crate::inventory::InventoryDelta,
+        delta: Bound<'_, crate::inventory::InventoryDelta>,
     ) -> PyResult<()> {
-        match self.inner.update_by_delta_from_inventory_delta(&delta.0) {
-            Ok(()) => Ok(()),
+        read_dirblocks_if_needed(py, &slf)?;
+        delta.borrow().check(py)?;
+        delta.borrow_mut().sort();
+        let delta_ref = delta.borrow();
+        let mut me = slf.borrow_mut();
+        match me.inner.update_by_delta_from_inventory_delta(&delta_ref.0) {
+            Ok(()) => {
+                drop(delta_ref);
+                me.refresh_cached_id_index(py);
+                Ok(())
+            }
             Err(e) => {
-                self.inner.changes_aborted = true;
-                Err(self.raise_basis_apply_error(py, e))
+                drop(delta_ref);
+                me.inner.changes_aborted = true;
+                Err(me.raise_basis_apply_error(py, e))
             }
         }
     }
@@ -2552,7 +3087,8 @@ impl PyDirState {
     /// `DirState._apply_insertions`. Input is a Python iterable of
     /// `(key, minikind, executable, fingerprint, path_utf8)` 5-tuples
     /// matching the shape assembled by `update_by_delta`.
-    fn apply_insertions(&mut self, adds: &Bound<PyAny>) -> PyResult<()> {
+    #[pyo3(name = "_apply_insertions")]
+    fn apply_insertions(&mut self, py: Python<'_>, adds: &Bound<PyAny>) -> PyResult<()> {
         let mut rust_adds: Vec<(
             bazaar::dirstate::EntryKey,
             bazaar::dirstate::Kind,
@@ -2581,8 +3117,11 @@ impl PyDirState {
             rust_adds.push((key, minikind, executable, fingerprint, path_utf8));
         }
         match self.inner.apply_insertions(rust_adds) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.raise_basis_apply_error(adds.py(), e)),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 
@@ -2592,7 +3131,12 @@ impl PyDirState {
     /// 4-tuples; `new_details` is the same 5-tuple layout used by
     /// `update_basis_apply_adds`. Raises `InconsistentDelta` on a
     /// stale entry.
-    fn update_basis_apply_changes(&mut self, changes: &Bound<PyAny>) -> PyResult<()> {
+    #[pyo3(name = "_update_basis_apply_changes")]
+    fn update_basis_apply_changes(
+        &mut self,
+        py: Python<'_>,
+        changes: &Bound<PyAny>,
+    ) -> PyResult<()> {
         let mut rust_changes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, bazaar::dirstate::TreeData)> =
             Vec::new();
         for item in changes.try_iter()? {
@@ -2617,8 +3161,11 @@ impl PyDirState {
             rust_changes.push((old_path, new_path, file_id, new_details));
         }
         match self.inner.update_basis_apply_changes(&rust_changes) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.raise_basis_apply_error(changes.py(), e)),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 
@@ -2628,7 +3175,12 @@ impl PyDirState {
     /// real_delete)` 5-tuples — the 4th element is unused by the
     /// Python implementation (it carries `None` in the current
     /// caller) but we accept it to preserve the existing wire shape.
-    fn update_basis_apply_deletes(&mut self, deletes: &Bound<PyAny>) -> PyResult<()> {
+    #[pyo3(name = "_update_basis_apply_deletes")]
+    fn update_basis_apply_deletes(
+        &mut self,
+        py: Python<'_>,
+        deletes: &Bound<PyAny>,
+    ) -> PyResult<()> {
         let mut rust_deletes: Vec<(Vec<u8>, Option<Vec<u8>>, Vec<u8>, bool)> = Vec::new();
         for item in deletes.try_iter()? {
             let tup = item?.cast_into::<PyTuple>()?;
@@ -2652,91 +3204,110 @@ impl PyDirState {
             rust_deletes.push((old_path, new_path, file_id, real_delete));
         }
         match self.inner.update_basis_apply_deletes(&rust_deletes) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.raise_basis_apply_error(deletes.py(), e)),
+            Ok(()) => {
+                self.refresh_cached_id_index(py);
+                Ok(())
+            }
+            Err(e) => Err(self.raise_basis_apply_error(py, e)),
         }
     }
 
     /// Replace the current tree-0 state with entries from the given
-    /// inventory rows. Mirrors Python's
-    /// `DirState.set_state_from_inventory`. Input is an iterable of
-    /// `(path_utf8, file_id, minikind, fingerprint, executable)`
-    /// tuples in `iter_entries_by_dir` order.
+    /// inventory. Mirrors Python's `DirState.set_state_from_inventory`.
+    /// Walks `new_inv.iter_entries_by_dir()` to build the per-entry row
+    /// list and passes it through to the pure-Rust state builder.
     fn set_state_from_inventory(
-        &mut self,
+        slf: Bound<'_, Self>,
         py: Python<'_>,
-        new_entries: &Bound<PyAny>,
+        new_inv: &Bound<PyAny>,
     ) -> PyResult<()> {
+        read_dirblocks_if_needed(py, &slf)?;
         let mut rows: Vec<(Vec<u8>, Vec<u8>, bazaar::dirstate::Kind, Vec<u8>, bool)> = Vec::new();
-        for item in new_entries.try_iter()? {
-            let tup = item?.cast_into::<PyTuple>()?;
-            if tup.len() != 5 {
-                return Err(PyTypeError::new_err(
-                    "set_state_from_inventory entries must be 5-tuples",
-                ));
-            }
-            let path: Vec<u8> = tup.get_item(0)?.extract()?;
-            let file_id: Vec<u8> = tup.get_item(1)?.extract()?;
-            let minikind_bytes: Vec<u8> = tup.get_item(2)?.extract()?;
-            let minikind = decode_minikind(&minikind_bytes)?;
-            let fingerprint: Vec<u8> = tup.get_item(3)?.extract()?;
-            let executable: bool = tup.get_item(4)?.extract()?;
-            rows.push((path, file_id, minikind, fingerprint, executable));
+        let iter = new_inv.call_method0("iter_entries_by_dir")?;
+        for item in iter.try_iter()? {
+            let pair = item?.cast_into::<PyTuple>()?;
+            let path: String = pair.get_item(0)?.extract()?;
+            let inv_entry = pair.get_item(1)?;
+            let kind_str: String = inv_entry.getattr("kind")?.extract()?;
+            let minikind = kind_to_minikind(&kind_str)?;
+            let fingerprint: Vec<u8> = if matches!(minikind, bazaar::dirstate::Kind::TreeReference)
+            {
+                inv_entry
+                    .getattr("reference_revision")
+                    .ok()
+                    .and_then(|v| if v.is_none() { None } else { v.extract().ok() })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let executable: bool = inv_entry
+                .getattr("executable")
+                .ok()
+                .and_then(|v| v.extract().ok())
+                .unwrap_or(false);
+            let file_id: Vec<u8> = inv_entry.getattr("file_id")?.extract()?;
+            rows.push((
+                path.into_bytes(),
+                file_id,
+                minikind,
+                fingerprint,
+                executable,
+            ));
         }
-        match self.inner.set_state_from_inventory(rows) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.raise_basis_apply_error(py, e)),
+        let result = slf.borrow_mut().inner.set_state_from_inventory(rows);
+        match result {
+            Ok(()) => {
+                slf.borrow_mut().refresh_cached_id_index(py);
+                Ok(())
+            }
+            Err(e) => Err(slf.borrow_mut().raise_basis_apply_error(py, e)),
         }
     }
 
     /// Replace the parent trees. Mirrors Python's
     /// `DirState.set_parent_trees`. Input:
     ///
-    /// - `trees`: iterable of `bytes` revision ids (one per parent,
-    ///   including ghosts), in order.
+    /// - `trees`: iterable of `(revid_bytes, tree)` pairs, one per
+    ///   parent (including ghosts), in order. The tree must expose
+    ///   `iter_entries_by_dir()` returning `(path_str, inv_entry)`
+    ///   pairs, where each `inv_entry` has `file_id`, `kind`,
+    ///   `executable`, and (when applicable) `reference_revision`.
     /// - `ghosts`: iterable of `bytes` revision ids that are ghosts.
-    /// - `parent_tree_entries`: iterable of lists — one list per
-    ///   non-ghost parent tree, in the same order as non-ghost parents
-    ///   appear in `trees`. Each list is a sequence of
-    ///   `(path_utf8, file_id, details)` tuples where `details` is the
-    ///   5-tuple returned by `inv_entry_to_details`:
-    ///   `(minikind_byte, fingerprint, size, executable, tree_data)`.
-    ///
-    /// Each inner list must be pre-sorted in `iter_entries_by_dir`
-    /// order (i.e. root first, then children in lexicographic order).
     fn set_parent_trees(
-        &mut self,
+        slf: Bound<'_, Self>,
+        py: Python<'_>,
         trees: &Bound<PyAny>,
         ghosts: &Bound<PyAny>,
-        parent_tree_entries: &Bound<PyAny>,
     ) -> PyResult<()> {
-        let rust_trees = collect_bytes_vec(trees)?;
+        read_dirblocks_if_needed(py, &slf)?;
         let rust_ghosts = collect_bytes_vec(ghosts)?;
+        let ghosts_set: std::collections::HashSet<Vec<u8>> = rust_ghosts.iter().cloned().collect();
+        let mut rust_trees: Vec<Vec<u8>> = Vec::new();
         let mut rust_entries: Vec<Vec<(Vec<u8>, Vec<u8>, bazaar::dirstate::TreeData)>> = Vec::new();
-        for tree_iter in parent_tree_entries.try_iter()? {
-            let tree = tree_iter?;
+        for item in trees.try_iter()? {
+            let pair = item?.cast_into::<PyTuple>()?;
+            let revid: Vec<u8> = pair.get_item(0)?.extract()?;
+            let tree = pair.get_item(1)?;
+            rust_trees.push(revid.clone());
+            if ghosts_set.contains(&revid) {
+                continue;
+            }
             let mut tree_rows: Vec<(Vec<u8>, Vec<u8>, bazaar::dirstate::TreeData)> = Vec::new();
-            for row in tree.try_iter()? {
-                let tup = row?.cast_into::<PyTuple>()?;
-                if tup.len() != 3 {
-                    return Err(PyTypeError::new_err(
-                        "parent_tree_entries entries must be 3-tuples",
-                    ));
-                }
-                let path_utf8: Vec<u8> = tup.get_item(0)?.extract()?;
-                let file_id: Vec<u8> = tup.get_item(1)?.extract()?;
-                let details_tup = tup.get_item(2)?.cast_into::<PyTuple>()?;
-                if details_tup.len() != 5 {
-                    return Err(PyTypeError::new_err("details must be a 5-tuple"));
-                }
+            let iter = tree.call_method0("iter_entries_by_dir")?;
+            for row in iter.try_iter()? {
+                let row_pair = row?.cast_into::<PyTuple>()?;
+                let path_str: String = row_pair.get_item(0)?.extract()?;
+                let inv_entry = row_pair.get_item(1)?;
+                let details_tup = inv_entry_to_details_tuple(py, &inv_entry)?;
                 let minikind_bytes: Vec<u8> = details_tup.get_item(0)?.extract()?;
                 let minikind = decode_minikind(&minikind_bytes)?;
                 let fingerprint: Vec<u8> = details_tup.get_item(1)?.extract()?;
                 let size: u64 = details_tup.get_item(2)?.extract()?;
                 let executable: bool = details_tup.get_item(3)?.extract()?;
                 let packed_stat: Vec<u8> = details_tup.get_item(4)?.extract()?;
+                let file_id: Vec<u8> = inv_entry.getattr("file_id")?.extract()?;
                 tree_rows.push((
-                    path_utf8,
+                    path_str.into_bytes(),
                     file_id,
                     bazaar::dirstate::TreeData {
                         minikind,
@@ -2749,19 +3320,151 @@ impl PyDirState {
             }
             rust_entries.push(tree_rows);
         }
-        self.inner
-            .set_parent_trees(rust_trees, rust_ghosts, rust_entries)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
+        {
+            let mut me = slf.borrow_mut();
+            me.inner
+                .set_parent_trees(rust_trees, rust_ghosts, rust_entries)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))?;
+            me.refresh_cached_id_index(py);
+        }
+        Ok(())
+    }
+
+    /// Wipe the in-memory state and rebuild it from an in-memory
+    /// working inventory plus parent trees. Mirrors Python's
+    /// `DirState.set_state_from_scratch`.
+    fn set_state_from_scratch(
+        slf: Bound<'_, Self>,
+        py: Python<'_>,
+        working_inv: &Bound<PyAny>,
+        parent_trees: &Bound<PyAny>,
+        parent_ghosts: &Bound<PyAny>,
+    ) -> PyResult<()> {
+        slf.borrow()._requires_lock()?;
+        // Empty tree-0 + empty contents-of-root so set_state_from_inventory
+        // has something to zip against.
+        let empty_root = PyTuple::new(
+            py,
+            [
+                PyTuple::new(
+                    py,
+                    [
+                        PyBytes::new(py, b"").into_any(),
+                        PyBytes::new(py, b"").into_any(),
+                        PyBytes::new(py, bazaar::inventory::ROOT_ID).into_any(),
+                    ],
+                )?
+                .into_any(),
+                PyList::new(
+                    py,
+                    [PyTuple::new(
+                        py,
+                        [
+                            PyBytes::new(py, b"d").into_any(),
+                            PyBytes::new(py, b"").into_any(),
+                            0i64.into_pyobject(py)?.into_any(),
+                            pyo3::types::PyBool::new(py, false).to_owned().into_any(),
+                            Self::NULLSTAT(py).into_any(),
+                        ],
+                    )?],
+                )?
+                .into_any(),
+            ],
+        )?;
+        let blocks = PyList::new(
+            py,
+            [
+                PyTuple::new(
+                    py,
+                    [
+                        PyBytes::new(py, b"").into_any(),
+                        PyList::new(py, [empty_root])?.into_any(),
+                    ],
+                )?,
+                PyTuple::new(
+                    py,
+                    [
+                        PyBytes::new(py, b"").into_any(),
+                        PyList::empty(py).into_any(),
+                    ],
+                )?,
+            ],
+        )?;
+        let empty_parents = PyList::empty(py);
+        slf.borrow_mut()
+            .set_data(py, empty_parents.as_any(), blocks.as_any())?;
+        Self::set_state_from_inventory(slf.clone(), py, working_inv)?;
+        Self::set_parent_trees(slf, py, parent_trees, parent_ghosts)?;
+        Ok(())
+    }
+
+    /// Create a dirstate file at `path` from a bzr `Tree`. Locks
+    /// for writing and populates with the tree's parents and
+    /// inventory; mirrors Python's `DirState.from_tree`.
+    #[classmethod]
+    #[pyo3(signature = (tree, dir_state_filename, sha1_provider = None))]
+    fn from_tree(
+        cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        tree: &Bound<PyAny>,
+        dir_state_filename: &Bound<PyAny>,
+        sha1_provider: Option<&Bound<PyAny>>,
+    ) -> PyResult<Py<Self>> {
+        let result = Self::initialize(cls, py, dir_state_filename, sha1_provider)?;
+        let bound = result.bind(py);
+        let outcome = (|| -> PyResult<()> {
+            let _tree_lock = tree.call_method0("lock_read")?;
+            let parent_ids_obj = tree.call_method0("get_parent_ids")?;
+            let parent_ids: Vec<Vec<u8>> = collect_bytes_vec(&parent_ids_obj)?;
+            let branch = tree.getattr("branch")?;
+            let repository = branch.getattr("repository")?;
+            let parent_trees_list = PyList::empty(py);
+            let mut parent_tree_locks: Vec<Bound<PyAny>> = Vec::new();
+            for revid in &parent_ids {
+                let revid_obj = PyBytes::new(py, revid);
+                let pt = repository.call_method1("revision_tree", (revid_obj.clone(),))?;
+                let pt_lock = pt.call_method0("lock_read")?;
+                parent_tree_locks.push(pt_lock);
+                let pair = PyTuple::new(py, [revid_obj.into_any(), pt])?;
+                parent_trees_list.append(pair)?;
+            }
+            let empty_ghosts = PyList::empty(py);
+            Self::set_parent_trees(
+                bound.clone(),
+                py,
+                parent_trees_list.as_any(),
+                empty_ghosts.as_any(),
+            )?;
+            let root_inv = tree.getattr("root_inventory")?;
+            Self::set_state_from_inventory(bound.clone(), py, &root_inv)?;
+            for lock in parent_tree_locks.iter().rev() {
+                let _ = lock.call_method0("unlock");
+            }
+            let _ = _tree_lock.call_method0("unlock");
+            Ok(())
+        })();
+        if let Err(e) = outcome {
+            bound.borrow().unlock()?;
+            return Err(e);
+        }
+        Ok(result)
     }
 
     /// Replace the entire in-memory state with `parent_ids` and
     /// `dirblocks` (both in the Python tuple shape), marking both the
     /// header and the dirblock data fully modified. Mirrors Python's
     /// `DirState._set_data`. Invalidates the cached id_index.
-    fn set_data(&mut self, parent_ids: &Bound<PyAny>, dirblocks: &Bound<PyAny>) -> PyResult<()> {
+    #[pyo3(name = "_set_data")]
+    fn set_data(
+        &mut self,
+        py: Python<'_>,
+        parent_ids: &Bound<PyAny>,
+        dirblocks: &Bound<PyAny>,
+    ) -> PyResult<()> {
         let parents = collect_bytes_vec(parent_ids)?;
         let blocks = crate::dirstate_helpers::dirblocks_from_py(dirblocks)?;
         self.inner.set_data(parents, blocks);
+        self.refresh_cached_id_index(py);
         Ok(())
     }
 
@@ -2772,9 +3475,10 @@ impl PyDirState {
     /// end so the two empty-dirname sentinel blocks are present.
     ///
     /// The input is a Python iterable of entry tuples in the same
-    /// shape as `DirStateRs.dirblocks` entries. Raises `ValueError`
+    /// shape as `DirState.dirblocks` entries. Raises `ValueError`
     /// if the entry list is empty or does not start with the root
     /// row.
+    #[pyo3(name = "_entries_to_current_state")]
     fn entries_to_current_state(&mut self, new_entries: &Bound<PyAny>) -> PyResult<()> {
         let mut entries: Vec<bazaar::dirstate::Entry> = Vec::new();
         for item in new_entries.try_iter()? {
@@ -2786,28 +3490,36 @@ impl PyDirState {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
     }
 
-    /// Mark the dirstate as modified. `hash_changed_keys` is an
-    /// optional iterable of `(dirname, basename, file_id)` tuples
-    /// indicating hash-only changes; pass `None` for a full
-    /// modification. Mirrors `DirState._mark_modified`.
-    #[pyo3(signature = (hash_changed_keys = None, header_modified = false))]
+    /// Mark the dirstate as modified. `hash_changed_entries` is an
+    /// optional iterable of dirstate entries (each
+    /// `(key, [tree_states])`, where `key` is the
+    /// `(dirname, basename, file_id)` 3-tuple); pass `None` for a
+    /// full modification. Mirrors `DirState._mark_modified`.
+    #[pyo3(name = "_mark_modified")]
+    #[pyo3(signature = (hash_changed_entries = None, header_modified = false))]
     fn mark_modified(
         &mut self,
-        hash_changed_keys: Option<&Bound<PyAny>>,
+        hash_changed_entries: Option<&Bound<PyAny>>,
         header_modified: bool,
     ) -> PyResult<()> {
         let mut keys: Vec<bazaar::dirstate::EntryKey> = Vec::new();
-        if let Some(iter) = hash_changed_keys {
+        if let Some(iter) = hash_changed_entries {
             for item in iter.try_iter()? {
-                let tup = item?.cast_into::<PyTuple>()?;
-                if tup.len() != 3 {
+                let entry = item?.cast_into::<PyTuple>()?;
+                if entry.len() < 1 {
                     return Err(PyTypeError::new_err(
-                        "hash_changed_keys entries must be 3-tuples",
+                        "hash_changed_entries items must be (key, ...) tuples",
                     ));
                 }
-                let dirname: Vec<u8> = tup.get_item(0)?.extract()?;
-                let basename: Vec<u8> = tup.get_item(1)?.extract()?;
-                let file_id: Vec<u8> = tup.get_item(2)?.extract()?;
+                let key_tup = entry.get_item(0)?.cast_into::<PyTuple>()?;
+                if key_tup.len() != 3 {
+                    return Err(PyTypeError::new_err(
+                        "entry key must be a (dirname, basename, file_id) 3-tuple",
+                    ));
+                }
+                let dirname: Vec<u8> = key_tup.get_item(0)?.extract()?;
+                let basename: Vec<u8> = key_tup.get_item(1)?.extract()?;
+                let file_id: Vec<u8> = key_tup.get_item(2)?.extract()?;
                 keys.push(bazaar::dirstate::EntryKey {
                     dirname,
                     basename,
@@ -2821,17 +3533,94 @@ impl PyDirState {
 
     /// Mark the dirstate as unmodified. Mirrors
     /// `DirState._mark_unmodified`.
+    #[pyo3(name = "_mark_unmodified")]
     fn mark_unmodified(&mut self) {
         self.inner.mark_unmodified();
     }
 
+    /// Read-only view of the cached `IdIndex`: returns `None` if
+    /// nothing has been cached yet. The Python `DirState._id_index`
+    /// property mirrors this for back-compat with code that pokes at
+    /// the cached attribute directly.
+    #[getter(_id_index)]
+    fn get_cached_id_index(&self, py: Python<'_>) -> Option<Py<IdIndex>> {
+        self.id_index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.clone_ref(py))
+    }
+
+    /// Setter for `_id_index`. Only accepts `None` (which drops the
+    /// cache); anything else is a TypeError. Mirrors the Python
+    /// property setter that used to enforce the same invariant.
+    #[setter(_id_index)]
+    fn set_cached_id_index(&self, value: &Bound<PyAny>) -> PyResult<()> {
+        if !value.is_none() {
+            return Err(PyTypeError::new_err(
+                "_id_index can only be set to None; call _get_id_index() to populate.",
+            ));
+        }
+        *self.id_index.lock().unwrap() = None;
+        Ok(())
+    }
+
+    /// Return the cached `IdIndex`, creating and filling it on first
+    /// call. Subsequent mutation methods refresh the same object in
+    /// place so callers that hold the reference see fresh state.
+    /// Mirrors `DirState._get_id_index`.
+    #[pyo3(name = "_get_id_index")]
+    fn get_id_index(&mut self, py: Python<'_>) -> PyResult<Py<IdIndex>> {
+        if let Some(idx) = self.id_index.lock().unwrap().as_ref() {
+            return Ok(idx.clone_ref(py));
+        }
+        let fresh = Py::new(py, IdIndex(bazaar::dirstate::IdIndex::new()))?;
+        fresh.bind(py).borrow_mut().fill_from_state(self);
+        *self.id_index.lock().unwrap() = Some(fresh.clone_ref(py));
+        Ok(fresh)
+    }
+
+    /// Drop the cached `IdIndex` so the next `get_id_index` call
+    /// rebuilds from scratch. Mirrors `self._id_index = None` on the
+    /// Python side.
+    fn clear_cached_id_index(&self) {
+        *self.id_index.lock().unwrap() = None;
+    }
+
     /// Serialise the in-memory state to the byte chunks that make up
     /// the on-disk dirstate file. Mirrors Python's
-    /// `DirState.get_lines` slow path (the fast path that re-reads
-    /// unchanged bytes from disk belongs to the caller, since it
-    /// requires the Python `_state_file` handle).
-    fn get_lines<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let lines = self.inner.get_lines();
+    /// `DirState.get_lines`: when both header and dirblocks are
+    /// `IN_MEMORY_UNMODIFIED`, returns the on-disk bytes via the
+    /// transport; otherwise serialises the in-memory state.
+    fn get_lines<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        use bazaar::dirstate::MemoryState;
+        let unmodified = {
+            let me = slf.borrow();
+            matches!(me.inner.header_state, MemoryState::InMemoryUnmodified)
+                && matches!(me.inner.dirblock_state, MemoryState::InMemoryUnmodified)
+        };
+        if unmodified {
+            let data = {
+                let me = slf.borrow();
+                let mut t = me.transport.lock().unwrap();
+                t.read_all().map_err(transport_err_to_py)?
+            };
+            let out = PyList::empty(py);
+            let mut start = 0;
+            for (i, b) in data.iter().enumerate() {
+                if *b == b'\n' {
+                    out.append(PyBytes::new(py, &data[start..=i]))?;
+                    start = i + 1;
+                }
+            }
+            if start < data.len() {
+                out.append(PyBytes::new(py, &data[start..]))?;
+            }
+            return Ok(out);
+        }
+        read_dirblocks_if_needed(py, &slf)?;
+        let me = slf.borrow();
+        let lines = me.inner.get_lines();
         let items: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
         PyList::new(py, items)
     }
@@ -2839,7 +3628,8 @@ impl PyDirState {
     /// Return all dirstate entries whose key `(dirname, basename)`
     /// matches `path_utf8`, across every file id. Mirrors Python's
     /// `DirState._entries_for_path`. Returns a snapshot list of
-    /// entries in the `DirStateRs.dirblocks` tuple shape.
+    /// entries in the `DirState.dirblocks` tuple shape.
+    #[pyo3(name = "_entries_for_path")]
     fn entries_for_path<'py>(
         &self,
         py: Python<'py>,
@@ -2856,12 +3646,13 @@ impl PyDirState {
     /// Walk the subtree rooted at `path_utf8` and return every live
     /// entry in `tree_index`. Mirrors Python's
     /// `DirState._iter_child_entries`. Returns a list of Python
-    /// entries in the same tuple shape as `DirStateRs.dirblocks`.
+    /// entries in the same tuple shape as `DirState.dirblocks`.
     ///
     /// The result is a snapshot: mutating returned entry tuples does
     /// NOT write back to the Rust-owned dirblocks. Callers that need
     /// in-place mutation must go through the (not-yet-exposed) Rust
     /// mutation methods.
+    #[pyo3(name = "_iter_child_entries")]
     fn iter_child_entries<'py>(
         &mut self,
         py: Python<'py>,
@@ -2882,9 +3673,12 @@ impl PyDirState {
     /// marshalling once instead of once per dirblock access — call
     /// once and iterate the returned list, do not re-call inside a
     /// loop.
-    fn entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+    #[pyo3(name = "_iter_entries")]
+    fn entries<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        read_dirblocks_if_needed(py, &slf)?;
+        let me = slf.borrow();
         let out = PyList::empty(py);
-        for entry in self.inner.iter_entries() {
+        for entry in me.inner.iter_entries() {
             out.append(entry_to_py_tuple(py, entry)?)?;
         }
         Ok(out)
@@ -2942,9 +3736,260 @@ impl PyDirState {
             pstate,
         })
     }
+
+    fn __repr__(&self) -> String {
+        format!("DirState({:?})", self.inner.filename)
+    }
+
+    /// Back-compat alias: `state._rs` used to be the Rust-side wrapper
+    /// object held inside the Python `DirState`. Now the dirstate IS
+    /// the Rust object, so `_rs` is the dirstate itself. Kept for
+    /// callers that haven't been updated yet.
+    #[getter]
+    fn _rs(slf: Bound<'_, Self>) -> Py<Self> {
+        slf.unbind()
+    }
+
+    /// Return the parent tree revision ids (post-header read).
+    /// Mirrors Python's `DirState.get_parent_ids`.
+    fn get_parent_ids<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        Self::_read_header_if_needed(slf.clone())?;
+        let me = slf.borrow();
+        let items: Vec<Bound<PyBytes>> = me
+            .inner
+            .parents
+            .iter()
+            .map(|p| PyBytes::new(py, p))
+            .collect();
+        PyList::new(py, items)
+    }
+
+    /// Return ghost revision ids (post-header read).
+    /// Mirrors Python's `DirState.get_ghosts`.
+    #[pyo3(name = "get_ghosts")]
+    fn get_ghosts_method<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        Self::_read_header_if_needed(slf.clone())?;
+        let me = slf.borrow();
+        let items: Vec<Bound<PyBytes>> = me
+            .inner
+            .ghosts
+            .iter()
+            .map(|g| PyBytes::new(py, g))
+            .collect();
+        PyList::new(py, items)
+    }
+
+    /// Construct a NULL-delimited line for `entry`, the on-disk
+    /// representation used by `get_lines`. Static method.
+    #[staticmethod]
+    #[pyo3(name = "_entry_to_line")]
+    fn entry_to_line<'py>(
+        py: Python<'py>,
+        entry: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let rust_entry = crate::dirstate_helpers::entry_from_py(entry)?;
+        let bytes = bazaar::dirstate::entry_to_line(&rust_entry);
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Build a list of `NULL_PARENT_DETAILS` tuples, one per parent.
+    /// Mirrors Python's `DirState._empty_parent_info`.
+    #[pyo3(name = "_empty_parent_info")]
+    fn empty_parent_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let n = self.inner.num_present_parents();
+        let out = PyList::empty(py);
+        for _ in 0..n {
+            out.append(Self::NULL_PARENT_DETAILS(py)?)?;
+        }
+        Ok(out)
+    }
+
+    /// Build the `((path_utf8, basename, kind, file_id, size,
+    /// packed_stat, fingerprint), parents)` tuple Python's
+    /// `_make_deleted_row` returns. Classmethod.
+    #[classmethod]
+    #[pyo3(name = "_make_deleted_row")]
+    fn make_deleted_row<'py>(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'py>,
+        fileid_utf8: &[u8],
+        parents: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let row = PyTuple::new(
+            py,
+            [
+                PyBytes::new(py, b"/").into_any(),
+                PyBytes::new(py, b"RECYCLED.BIN").into_any(),
+                pyo3::types::PyString::new(py, "file").into_any(),
+                PyBytes::new(py, fileid_utf8).into_any(),
+                0i64.into_pyobject(py)?.into_any(),
+                Self::NULLSTAT(py).into_any(),
+                PyBytes::new(py, b"").into_any(),
+            ],
+        )?;
+        PyTuple::new(py, [row.into_any(), parents.clone()])
+    }
+
+    /// Read in the dirblocks if not already loaded. Mirrors Python's
+    /// `DirState._read_dirblocks_if_needed`.
+    #[pyo3(name = "_read_dirblocks_if_needed")]
+    fn read_dirblocks_if_needed_method(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        read_dirblocks_if_needed(py, &slf)
+    }
+
+    /// Alias for `_read_header_if_needed`. Mirrors Python's
+    /// `DirState._read_header`.
+    #[pyo3(name = "_read_header")]
+    fn read_header_alias(slf: Bound<'_, Self>) -> PyResult<()> {
+        Self::_read_header_if_needed(slf)
+    }
+
+    /// Common setup shared by the three `_bisect*` methods: requires a
+    /// lock, makes sure the header is loaded, asserts dirblocks are
+    /// not yet materialised in memory, and returns the file size that
+    /// the Rust bisector needs. Mirrors Python's
+    /// `DirState._prepare_bisect`.
+    #[pyo3(name = "_prepare_bisect")]
+    fn prepare_bisect(slf: Bound<'_, Self>) -> PyResult<u64> {
+        slf.borrow()._requires_lock()?;
+        Self::_read_header_if_needed(slf.clone())?;
+        let me = slf.borrow();
+        if !matches!(
+            me.inner.dirblock_state,
+            bazaar::dirstate::MemoryState::NotInMemory
+        ) {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(
+                "bad dirblock state",
+            ));
+        }
+        me._state_file_size()
+    }
+
+    /// Create a new dirstate on `path`. Equivalent to constructing,
+    /// taking a write lock, populating with the empty-tree dirblocks,
+    /// and saving. Mirrors Python's `DirState.initialize`.
+    #[classmethod]
+    #[pyo3(signature = (path, sha1_provider = None))]
+    fn initialize(
+        cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        path: &Bound<PyAny>,
+        sha1_provider: Option<&Bound<PyAny>>,
+    ) -> PyResult<Py<Self>> {
+        let result_bound = Self::on_file(cls, py, path, sha1_provider, 0, true, false)?;
+        let bound = result_bound.bind(py);
+        let _lock_result = Self::lock_write(bound.clone(), py)?;
+        let outcome = (|| -> PyResult<()> {
+            let empty_root = PyTuple::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            PyBytes::new(py, b"").into_any(),
+                            PyBytes::new(py, b"").into_any(),
+                            PyBytes::new(py, bazaar::inventory::ROOT_ID).into_any(),
+                        ],
+                    )?
+                    .into_any(),
+                    PyList::new(
+                        py,
+                        [PyTuple::new(
+                            py,
+                            [
+                                PyBytes::new(py, b"d").into_any(),
+                                PyBytes::new(py, b"").into_any(),
+                                0i64.into_pyobject(py)?.into_any(),
+                                pyo3::types::PyBool::new(py, false).to_owned().into_any(),
+                                Self::NULLSTAT(py).into_any(),
+                            ],
+                        )?],
+                    )?
+                    .into_any(),
+                ],
+            )?;
+            let blocks = PyList::new(
+                py,
+                [
+                    PyTuple::new(
+                        py,
+                        [
+                            PyBytes::new(py, b"").into_any(),
+                            PyList::new(py, [empty_root])?.into_any(),
+                        ],
+                    )?,
+                    PyTuple::new(
+                        py,
+                        [
+                            PyBytes::new(py, b"").into_any(),
+                            PyList::empty(py).into_any(),
+                        ],
+                    )?,
+                ],
+            )?;
+            let empty_parents = PyList::empty(py);
+            bound
+                .borrow_mut()
+                .set_data(py, empty_parents.as_any(), blocks.as_any())?;
+            bound.borrow_mut().save()?;
+            Ok(())
+        })();
+        if let Err(e) = outcome {
+            bound.borrow().unlock()?;
+            return Err(e);
+        }
+        Ok(result_bound)
+    }
+
+    /// Construct a DirState bound to the file at `path`, unlocked.
+    /// Mirrors Python's `DirState.on_file`.
+    #[classmethod]
+    #[pyo3(signature = (
+        path,
+        sha1_provider = None,
+        worth_saving_limit = 0,
+        use_filesystem_for_exec = true,
+        fdatasync = false,
+    ))]
+    fn on_file(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        path: &Bound<PyAny>,
+        sha1_provider: Option<&Bound<PyAny>>,
+        worth_saving_limit: i64,
+        use_filesystem_for_exec: bool,
+        fdatasync: bool,
+    ) -> PyResult<Py<Self>> {
+        let result = Self::new(
+            py,
+            path,
+            sha1_provider,
+            worth_saving_limit,
+            use_filesystem_for_exec,
+            fdatasync,
+        )?;
+        Py::new(py, result)
+    }
 }
 
 impl PyDirState {
+    /// If a Python caller has previously fetched the cached IdIndex
+    /// (via `_get_id_index`), refresh its contents in place so the
+    /// held reference reflects the latest dirblock state. Called by
+    /// every mutation method on PyDirState. No-op when nothing has
+    /// been cached.
+    fn refresh_cached_id_index(&mut self, py: Python<'_>) {
+        let cached = self
+            .id_index
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.clone_ref(py));
+        if let Some(idx) = cached {
+            idx.bind(py).borrow_mut().fill_from_state(self);
+        }
+    }
+
     /// Shared error conversion for the three update_basis_apply_*
     /// methods: `Invalid` becomes `bzrformats.errors.InconsistentDelta`
     /// and also sets `changes_aborted` on the inner state (mirroring
@@ -3096,9 +4141,24 @@ impl IterChanges {
         match result {
             Ok(Some(change)) => {
                 let tup = dirstate_change_to_pytuple(py, &change)?;
-                let ds_mod = py.import("bzrformats.dirstate")?;
-                let cls = ds_mod.getattr("DirstateInventoryChange")?;
-                Ok(Some(cls.call1(tup)?.unbind()))
+                // Construct the Rust-backed DirstateInventoryChange
+                // directly rather than round-tripping through
+                // bzrformats.dirstate to grab the class object.
+                let instance = pyo3::Py::new(
+                    py,
+                    DirstateInventoryChange {
+                        file_id: tup.get_item(0)?.unbind(),
+                        path: tup.get_item(1)?.unbind(),
+                        changed_content: tup.get_item(2)?.unbind(),
+                        versioned: tup.get_item(3)?.unbind(),
+                        parent_id: tup.get_item(4)?.unbind(),
+                        name: tup.get_item(5)?.unbind(),
+                        kind: tup.get_item(6)?.unbind(),
+                        executable: tup.get_item(7)?.unbind(),
+                        copied: tup.get_item(8)?.unbind(),
+                    },
+                )?;
+                Ok(Some(instance.into_any()))
             }
             Ok(None) => Ok(None),
             Err(bazaar::dirstate::ProcessEntryError::DirstateCorrupt(msg)) => {
@@ -3244,6 +4304,216 @@ impl IdIndex {
     }
 }
 
+/// Change record produced by [`IterChanges`]. Mirrors the
+/// Python-side `bzrformats.dirstate.DirstateInventoryChange` class:
+/// a 9-field data carrier with a handful of derived predicates used
+/// by callers that want to compare/transform tree changes without
+/// walking the underlying entry tuples themselves.
+#[pyclass(module = "bzrformats._bzr_rs.dirstate", subclass)]
+struct DirstateInventoryChange {
+    #[pyo3(get, set)]
+    file_id: Py<PyAny>,
+    #[pyo3(get, set)]
+    path: Py<PyAny>,
+    #[pyo3(get, set)]
+    changed_content: Py<PyAny>,
+    #[pyo3(get, set)]
+    versioned: Py<PyAny>,
+    #[pyo3(get, set)]
+    parent_id: Py<PyAny>,
+    #[pyo3(get, set)]
+    name: Py<PyAny>,
+    #[pyo3(get, set)]
+    kind: Py<PyAny>,
+    #[pyo3(get, set)]
+    executable: Py<PyAny>,
+    #[pyo3(get, set)]
+    copied: Py<PyAny>,
+}
+
+#[pymethods]
+impl DirstateInventoryChange {
+    #[new]
+    #[pyo3(signature = (
+        file_id,
+        path,
+        changed_content,
+        versioned,
+        parent_id,
+        name,
+        kind,
+        executable,
+        copied = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        file_id: Py<PyAny>,
+        path: Py<PyAny>,
+        changed_content: Py<PyAny>,
+        versioned: Py<PyAny>,
+        parent_id: Py<PyAny>,
+        name: Py<PyAny>,
+        kind: Py<PyAny>,
+        executable: Py<PyAny>,
+        copied: Option<Py<PyAny>>,
+    ) -> Self {
+        Self {
+            file_id,
+            path,
+            changed_content,
+            versioned,
+            parent_id,
+            name,
+            kind,
+            executable,
+            copied: copied.unwrap_or_else(|| {
+                pyo3::types::PyBool::new(py, false)
+                    .to_owned()
+                    .unbind()
+                    .into_any()
+            }),
+        }
+    }
+
+    /// True iff the file is versioned in both trees and the executable
+    /// bit changed. Used by callers that want to ignore non-meta-only
+    /// changes.
+    fn meta_modified(&self, py: Python<'_>) -> PyResult<bool> {
+        // Mirror Python: `self.versioned == (True, True) and
+        // self.executable[0] != self.executable[1]`.
+        let versioned = self.versioned.bind(py);
+        let both_versioned = versioned.eq(PyTuple::new(
+            py,
+            [
+                pyo3::types::PyBool::new(py, true).to_owned(),
+                pyo3::types::PyBool::new(py, true).to_owned(),
+            ],
+        )?)?;
+        if !both_versioned {
+            return Ok(false);
+        }
+        let exec = self.executable.bind(py);
+        let exec0 = exec.get_item(0)?;
+        let exec1 = exec.get_item(1)?;
+        Ok(!exec0.eq(exec1)?)
+    }
+
+    fn is_reparented(&self, py: Python<'_>) -> PyResult<bool> {
+        let parent_id = self.parent_id.bind(py);
+        let p0 = parent_id.get_item(0)?;
+        let p1 = parent_id.get_item(1)?;
+        Ok(!p0.eq(p1)?)
+    }
+
+    #[getter]
+    fn renamed(&self, py: Python<'_>) -> PyResult<bool> {
+        // not copied and None not in name and None not in parent_id
+        // and (name[0] != name[1] or parent_id[0] != parent_id[1])
+        let copied = self.copied.bind(py).is_truthy()?;
+        if copied {
+            return Ok(false);
+        }
+        let name = self.name.bind(py);
+        let parent_id = self.parent_id.bind(py);
+        if name.contains(py.None())? {
+            return Ok(false);
+        }
+        if parent_id.contains(py.None())? {
+            return Ok(false);
+        }
+        let names_differ = !name.get_item(0)?.eq(name.get_item(1)?)?;
+        let parents_differ = !parent_id.get_item(0)?.eq(parent_id.get_item(1)?)?;
+        Ok(names_differ || parents_differ)
+    }
+
+    /// Return a fresh DirstateInventoryChange with all "new" sides
+    /// of the (old, new) tuples set to None and `copied=False`.
+    fn discard_new<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, DirstateInventoryChange>> {
+        fn old_then_none<'py>(py: Python<'py>, tup: &Py<PyAny>) -> PyResult<Bound<'py, PyTuple>> {
+            let bound = tup.bind(py);
+            PyTuple::new(py, [bound.get_item(0)?, py.None().into_bound(py)])
+        }
+        let path = old_then_none(py, &self.path)?;
+        let versioned = old_then_none(py, &self.versioned)?;
+        let parent_id = old_then_none(py, &self.parent_id)?;
+        let name = old_then_none(py, &self.name)?;
+        let kind = old_then_none(py, &self.kind)?;
+        let executable = old_then_none(py, &self.executable)?;
+        Bound::new(
+            py,
+            DirstateInventoryChange {
+                file_id: self.file_id.clone_ref(py),
+                path: path.into_any().unbind(),
+                changed_content: self.changed_content.clone_ref(py),
+                versioned: versioned.into_any().unbind(),
+                parent_id: parent_id.into_any().unbind(),
+                name: name.into_any().unbind(),
+                kind: kind.into_any().unbind(),
+                executable: executable.into_any().unbind(),
+                copied: pyo3::types::PyBool::new(py, false)
+                    .to_owned()
+                    .unbind()
+                    .into_any(),
+            },
+        )
+    }
+
+    fn _as_tuple<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            [
+                self.file_id.bind(py).clone(),
+                self.path.bind(py).clone(),
+                self.changed_content.bind(py).clone(),
+                self.versioned.bind(py).clone(),
+                self.parent_id.bind(py).clone(),
+                self.name.bind(py).clone(),
+                self.kind.bind(py).clone(),
+                self.executable.bind(py).clone(),
+                self.copied.bind(py).clone(),
+            ],
+        )
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let tup = self._as_tuple(py)?;
+        let tup_repr = tup.repr()?;
+        Ok(format!("DirstateInventoryChange{}", tup_repr))
+    }
+
+    fn __getitem__<'py>(&self, py: Python<'py>, index: isize) -> PyResult<Bound<'py, PyAny>> {
+        let tup = self._as_tuple(py)?;
+        Ok(tup.get_item(if index < 0 {
+            (tup.len() as isize + index) as usize
+        } else {
+            index as usize
+        })?)
+    }
+
+    fn __eq__(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        other: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        if let Ok(other_ref) = other.downcast::<DirstateInventoryChange>() {
+            let a = slf._as_tuple(py)?;
+            let b = other_ref.borrow()._as_tuple(py)?;
+            return Ok(a.eq(b)?.into_pyobject(py)?.to_owned().into_any().unbind());
+        }
+        if other.downcast::<PyTuple>().is_ok() {
+            let a = slf._as_tuple(py)?;
+            return Ok(a
+                .eq(other)?
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind());
+        }
+        Ok(py.NotImplemented())
+    }
+}
+
 #[pyfunction]
 fn inv_entry_to_details<'a>(
     py: Python<'a>,
@@ -3291,6 +4561,7 @@ pub fn _dirstate_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<IdIndex>()?;
     m.add_class::<PyDirState>()?;
     m.add_class::<IterChanges>()?;
+    m.add_class::<DirstateInventoryChange>()?;
     m.add_wrapped(wrap_pyfunction!(inv_entry_to_details))?;
     m.add_wrapped(wrap_pyfunction!(get_output_lines))?;
 

@@ -901,7 +901,7 @@ impl InventoryDelta {
         !slf.0.is_empty()
     }
 
-    fn sort(&mut self) {
+    pub(crate) fn sort(&mut self) {
         self.0.sort();
     }
 
@@ -944,7 +944,7 @@ impl InventoryDelta {
         ))
     }
 
-    fn check(&self, py: Python) -> PyResult<()> {
+    pub(crate) fn check(&self, py: Python) -> PyResult<()> {
         self.0.check().map_err(|e| match e {
             InventoryDeltaInconsistency::NoPath => {
                 InconsistentDelta::new_err(("", "", "No path in entry"))
