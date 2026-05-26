@@ -32,8 +32,6 @@ fn crc32(bit: &[u8]) -> u32 {
 
 pub type SerialisedKey = Vec<u8>;
 
-pub type SearchKeyFn = fn(&Key) -> SerializedKey;
-
 /// Map the key tuple into a search string that just uses the key bytes.
 pub fn search_key_plain(key: &Key) -> SerializedKey {
     key.0.join(&b'\x00')
@@ -61,6 +59,60 @@ pub fn search_key_255(key: &Key) -> SerializedKey {
         .iter()
         .map(|b| if *b == 0x0A { b'_' } else { *b })
         .collect()
+}
+
+/// The set of search-key functions a CHKMap may be configured with.
+///
+/// Mirrors the entries registered in Python's `search_key_registry`. The
+/// registry is closed in practice — `breezy` and `bzrformats` only ever
+/// register these three variants — so we encode them as an enum instead
+/// of carrying a Python callable through the Rust layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchKeyFunc {
+    /// `b"plain"` — `b"\x00".join(key)`.
+    Plain,
+    /// `b"hash-16-way"` — 8-char uppercase hex of `crc32(part)` joined by NUL.
+    Hash16Way,
+    /// `b"hash-255-way"` — big-endian `crc32(part)` bytes joined by NUL,
+    /// with any `\n` byte rewritten to `_`.
+    Hash255Way,
+}
+
+impl SearchKeyFunc {
+    /// Resolve a registry name to a variant. Unknown names return the
+    /// raw bytes back so the caller can report the failing key.
+    pub fn from_name(name: &[u8]) -> Result<Self, Vec<u8>> {
+        match name {
+            b"plain" => Ok(SearchKeyFunc::Plain),
+            b"hash-16-way" => Ok(SearchKeyFunc::Hash16Way),
+            b"hash-255-way" => Ok(SearchKeyFunc::Hash255Way),
+            other => Err(other.to_vec()),
+        }
+    }
+
+    /// Wire name as it appears in serialised inventories.
+    pub fn name(&self) -> &'static [u8] {
+        match self {
+            SearchKeyFunc::Plain => b"plain",
+            SearchKeyFunc::Hash16Way => b"hash-16-way",
+            SearchKeyFunc::Hash255Way => b"hash-255-way",
+        }
+    }
+
+    /// Apply this variant's search-key transform to `key`.
+    pub fn apply(&self, key: &Key) -> SerializedKey {
+        match self {
+            SearchKeyFunc::Plain => search_key_plain(key),
+            SearchKeyFunc::Hash16Way => search_key_16(key),
+            SearchKeyFunc::Hash255Way => search_key_255(key),
+        }
+    }
+}
+
+impl Default for SearchKeyFunc {
+    fn default() -> Self {
+        SearchKeyFunc::Plain
+    }
 }
 
 pub fn bytes_to_text_key(data: &[u8]) -> Result<(&[u8], &[u8]), String> {
@@ -966,6 +1018,53 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         // maximum_size=100 (3 digits) → 50 + 1 + 1 + 3 = 55
         let got = internal_node_current_size(100, 1, 3, 50);
         assert_eq!(got, 55);
+    }
+
+    #[test]
+    fn search_key_func_from_name_resolves_known_variants() {
+        assert_eq!(
+            SearchKeyFunc::from_name(b"plain").unwrap(),
+            SearchKeyFunc::Plain
+        );
+        assert_eq!(
+            SearchKeyFunc::from_name(b"hash-16-way").unwrap(),
+            SearchKeyFunc::Hash16Way
+        );
+        assert_eq!(
+            SearchKeyFunc::from_name(b"hash-255-way").unwrap(),
+            SearchKeyFunc::Hash255Way
+        );
+    }
+
+    #[test]
+    fn search_key_func_from_name_returns_unknown_bytes() {
+        let err = SearchKeyFunc::from_name(b"unrecognised").unwrap_err();
+        assert_eq!(err, b"unrecognised".to_vec());
+    }
+
+    #[test]
+    fn search_key_func_name_roundtrips() {
+        for variant in [
+            SearchKeyFunc::Plain,
+            SearchKeyFunc::Hash16Way,
+            SearchKeyFunc::Hash255Way,
+        ] {
+            let parsed = SearchKeyFunc::from_name(variant.name()).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn search_key_func_apply_matches_free_functions() {
+        let k = key(&[b"foo", b"bar"]);
+        assert_eq!(SearchKeyFunc::Plain.apply(&k), search_key_plain(&k));
+        assert_eq!(SearchKeyFunc::Hash16Way.apply(&k), search_key_16(&k));
+        assert_eq!(SearchKeyFunc::Hash255Way.apply(&k), search_key_255(&k));
+    }
+
+    #[test]
+    fn search_key_func_default_is_plain() {
+        assert_eq!(SearchKeyFunc::default(), SearchKeyFunc::Plain);
     }
 
     #[test]

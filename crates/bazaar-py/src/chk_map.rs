@@ -2,6 +2,7 @@ use bazaar::chk_map::{
     are_search_keys_identical, deserialise_internal_node, deserialise_leaf_node,
     internal_node_current_size, leaf_node_current_size, leaf_node_key_value_len,
     serialise_internal_node, serialise_leaf_node, Error as ChkError, InternalNodeChild, Key,
+    SearchKeyFunc,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
@@ -251,6 +252,23 @@ fn py_internal_node_current_size(
     internal_node_current_size(maximum_size, key_width, length, raw_size)
 }
 
+/// Apply the named search-key transform to `key`. `name` selects one of
+/// the registered variants — `b"plain"`, `b"hash-16-way"`, or
+/// `b"hash-255-way"`. Returns a `KeyError` for unknown names to match
+/// the behaviour of Python's `search_key_registry.get`.
+#[pyfunction]
+#[pyo3(name = "_search_key_by_name")]
+fn py_search_key_by_name<'py>(
+    py: Python<'py>,
+    name: &[u8],
+    key: Vec<Vec<u8>>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let func = SearchKeyFunc::from_name(name).map_err(|raw| {
+        pyo3::exceptions::PyKeyError::new_err(format!("Unknown search key: {:?}", raw))
+    })?;
+    Ok(PyBytes::new(py, &func.apply(&Key::from(key))))
+}
+
 /// `LeafNode._are_search_keys_identical` — given the precomputed search
 /// keys for every entry in the node, return True iff they are all equal.
 /// An empty iterable returns True.
@@ -279,5 +297,6 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(py_leaf_node_current_size))?;
     m.add_wrapped(wrap_pyfunction!(py_internal_node_current_size))?;
     m.add_wrapped(wrap_pyfunction!(py_are_search_keys_identical))?;
+    m.add_wrapped(wrap_pyfunction!(py_search_key_by_name))?;
     Ok(m)
 }
