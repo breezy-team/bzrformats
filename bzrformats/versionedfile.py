@@ -31,9 +31,7 @@ from .errors import (
     BzrFormatsError,
     ObjectNotLocked,
     RevisionNotPresent,
-    VersionedFileInvalidChecksum,
 )
-
 from .registry import Registry
 from .textmerge import TextMerge
 from .transport import TransportNoSuchFile

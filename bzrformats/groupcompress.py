@@ -173,6 +173,7 @@ class GroupCompressVersionedFiles(
 
         return VersionedFileAnnotator(self)
 
+
 from ._bzr_rs import groupcompress
 from ._bzr_rs.groupcompress import GCBuildDetails as _GCBuildDetails  # noqa: F401
 from ._bzr_rs.groupcompress import _GCGraphIndex

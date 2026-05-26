@@ -42,7 +42,7 @@ import threading
 from collections.abc import Callable, Generator, Iterator
 from typing import Union
 
-from . import lru_cache, osutils
+from . import lru_cache
 from ._bzr_rs import chk_map as _chk_map_rs
 from .errors import NoSuchRevision
 from .registry import Registry
@@ -1459,8 +1459,7 @@ class InternalNode(Node):
                 if node._key is not None:
                     # Never altered
                     continue
-                for key in node.serialise(store):
-                    yield key
+                yield from node.serialise(store)
             else:
                 raise AssertionError(
                     f"InternalNode._items should only contain tuples or Nodes, not {node.__class__}"

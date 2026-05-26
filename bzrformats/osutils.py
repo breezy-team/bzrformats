@@ -426,9 +426,7 @@ def is_inside_any(dir_list, fname):
     """
     from ._bzr_rs import osutils as _osutils_rs
 
-    dir_list = [
-        (d.decode("utf-8") if isinstance(d, bytes) else d) for d in dir_list
-    ]
+    dir_list = [(d.decode("utf-8") if isinstance(d, bytes) else d) for d in dir_list]
     if isinstance(fname, bytes):
         fname = fname.decode("utf-8")
     return _osutils_rs.is_inside_any(dir_list, fname)
