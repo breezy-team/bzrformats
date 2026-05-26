@@ -158,18 +158,62 @@ impl std::fmt::Display for VersionId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Key {
     Fixed(Vec<Vec<u8>>),
     ContentAddressed(Vec<Vec<u8>>),
 }
 
 impl Key {
+    pub fn fixed(segments: Vec<Vec<u8>>) -> Self {
+        Key::Fixed(segments)
+    }
+
+    /// All segments of the key.
+    pub fn segments(&self) -> &[Vec<u8>] {
+        match self {
+            Key::Fixed(v) | Key::ContentAddressed(v) => v,
+        }
+    }
+
+    fn segments_mut(&mut self) -> &mut Vec<Vec<u8>> {
+        match self {
+            Key::Fixed(v) | Key::ContentAddressed(v) => v,
+        }
+    }
+
+    /// Last segment (the version id / suffix).
+    pub fn version_id(&self) -> &[u8] {
+        self.segments().last().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// All segments except the last (the "prefix" used for file-based routing).
+    pub fn prefix(&self) -> &[Vec<u8>] {
+        let segs = self.segments();
+        if segs.is_empty() {
+            &[]
+        } else {
+            &segs[..segs.len() - 1]
+        }
+    }
+
+    /// Build a new `Key::Fixed` from a prefix slice and a suffix segment.
+    pub fn from_prefix_and_suffix(prefix: &[Vec<u8>], suffix: Vec<u8>) -> Self {
+        let mut v = prefix.to_vec();
+        v.push(suffix);
+        Key::Fixed(v)
+    }
+
+    /// Replace the last segment (the version id) in place.
+    pub fn set_version_id(&mut self, id: Vec<u8>) {
+        let segs = self.segments_mut();
+        if let Some(last) = segs.last_mut() {
+            *last = id;
+        }
+    }
+
     pub fn add_prefix(&mut self, prefix: &[&[u8]]) {
-        let v = match self {
-            Key::Fixed(ref mut v) => v,
-            Key::ContentAddressed(ref mut v) => v,
-        };
+        let v = self.segments_mut();
         for p in prefix.iter().rev() {
             v.insert(0, p.to_vec());
         }
@@ -851,15 +895,287 @@ pub trait VersionedFile<CF: ContentFactory, I> {
 /// :ivar _immediate_fallback_vfs: For subclasses that support stacking,
 ///     this is a list of other VersionedFiles immediately underneath this
 ///     one.  They may in turn each have further fallbacks.
-pub trait VersionedFiles<CF: ContentFactory, I> {
-    fn check_not_reserved_id(id: &VersionId) -> bool;
+pub trait VersionedFiles: Send + Sync {
+    fn get_parent_map(
+        &self,
+        keys: &[Key],
+    ) -> Result<HashMap<Key, Vec<Key>>, crate::knit::KnitError>;
 
     fn get_record_stream(
         &self,
-        keys: &[&Key],
-        ordering: Ordering,
+        keys: &[Key],
+        ordering: &str,
         include_delta_closure: bool,
-    ) -> Box<dyn Iterator<Item = CF>>;
+    ) -> Result<
+        Box<dyn Iterator<Item = Result<Box<dyn ContentFactory>, crate::knit::KnitError>>>,
+        crate::knit::KnitError,
+    >;
+
+    fn get_sha1s(&self, keys: &[Key]) -> Result<HashMap<Key, Vec<u8>>, crate::knit::KnitError>;
+
+    fn keys(&self) -> Result<Vec<Key>, crate::knit::KnitError>;
+
+    fn add_lines(
+        &self,
+        key: &Key,
+        parents: Option<&[Key]>,
+        lines: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, usize), crate::knit::KnitError>;
+
+    fn insert_record_stream(
+        &self,
+        stream: Box<dyn Iterator<Item = Box<dyn ContentFactory>>>,
+    ) -> Result<(), crate::knit::KnitError>;
+
+    fn iter_lines_added_or_present_in_keys(
+        &self,
+        keys: &[Key],
+    ) -> Result<Vec<(Vec<u8>, Key)>, crate::knit::KnitError>;
+
+    fn annotate(&self, key: &Key) -> Result<Vec<(Key, Vec<u8>)>, crate::knit::KnitError>;
+
+    /// Keys of missing compression parents left behind by a prior
+    /// `insert_record_stream`.
+    ///
+    /// Mirrors `VersionedFiles.get_missing_compression_parent_keys`, which
+    /// is abstract on the Python base; stores that do not track this raise
+    /// `NotImplementedError`.
+    fn get_missing_compression_parent_keys(&self) -> Result<Vec<Key>, crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented(
+            "get_missing_compression_parent_keys",
+        ))
+    }
+
+    /// Drop whatever caches this store holds.
+    ///
+    /// Mirrors `VersionedFiles.clear_cache`, whose base implementation is a
+    /// no-op; stores with caches override this.
+    fn clear_cache(&self) {}
+
+    /// Check this store for integrity.
+    ///
+    /// Mirrors `VersionedFiles.check`, which is abstract on the Python base.
+    fn check(&self) -> Result<(), crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented("check"))
+    }
+
+    /// Resolve the full ancestry of `keys` as a `{key: parents}` map.
+    ///
+    /// Walks `get_parent_map` outward from `keys` until no unresolved
+    /// parents remain. Mirrors the loop in
+    /// `VersionedFiles.get_known_graph_ancestry`; the caller wraps the
+    /// result in a `KnownGraph`.
+    fn known_graph_ancestry_map(
+        &self,
+        keys: &[Key],
+    ) -> Result<HashMap<Key, Vec<Key>>, crate::knit::KnitError> {
+        let mut parent_map: HashMap<Key, Vec<Key>> = HashMap::new();
+        let mut pending: Vec<Key> = keys.to_vec();
+        while !pending.is_empty() {
+            let this = self.get_parent_map(&pending)?;
+            let mut next: Vec<Key> = Vec::new();
+            for parents in this.values() {
+                for p in parents {
+                    if !parent_map.contains_key(p) && !this.contains_key(p) {
+                        next.push(p.clone());
+                    }
+                }
+            }
+            for (k, v) in this {
+                parent_map.insert(k, v);
+            }
+            next.sort();
+            next.dedup();
+            pending = next;
+        }
+        Ok(parent_map)
+    }
+}
+
+/// Storage-less [`VersionedFiles`] backed by two caller-supplied callbacks.
+///
+/// Mirrors `bzrformats.versionedfile.VirtualVersionedFiles`: callers supply
+/// a parent-map lookup and a fulltext lookup over bare bytes keys, and this
+/// adapter exposes them through the tuple-keyed `VersionedFiles` trait.
+///
+/// `GP` returns the parent map for the requested bare keys; entries absent
+/// from the map are treated as missing. `GL` returns the fulltext lines for
+/// a single bare key, or `None` if absent.
+pub struct VirtualVersionedFiles<GP, GL>
+where
+    GP: Fn(&[Vec<u8>]) -> Result<HashMap<Vec<u8>, Vec<Vec<u8>>>, crate::knit::KnitError>
+        + Send
+        + Sync,
+    GL: Fn(&[u8]) -> Result<Option<Vec<Vec<u8>>>, crate::knit::KnitError> + Send + Sync,
+{
+    get_parent_map_cb: GP,
+    get_lines_cb: GL,
+}
+
+impl<GP, GL> VirtualVersionedFiles<GP, GL>
+where
+    GP: Fn(&[Vec<u8>]) -> Result<HashMap<Vec<u8>, Vec<Vec<u8>>>, crate::knit::KnitError>
+        + Send
+        + Sync,
+    GL: Fn(&[u8]) -> Result<Option<Vec<Vec<u8>>>, crate::knit::KnitError> + Send + Sync,
+{
+    pub fn new(get_parent_map_cb: GP, get_lines_cb: GL) -> Self {
+        Self {
+            get_parent_map_cb,
+            get_lines_cb,
+        }
+    }
+}
+
+fn key_to_single_bytes(key: &Key) -> Result<&[u8], crate::knit::KnitError> {
+    let segs = match key {
+        Key::Fixed(v) | Key::ContentAddressed(v) => v,
+    };
+    if segs.len() != 1 {
+        return Err(crate::knit::KnitError::Corrupt(format!(
+            "VirtualVersionedFiles expects single-segment keys, got {:?}",
+            key
+        )));
+    }
+    Ok(&segs[0])
+}
+
+impl<GP, GL> VersionedFiles for VirtualVersionedFiles<GP, GL>
+where
+    GP: Fn(&[Vec<u8>]) -> Result<HashMap<Vec<u8>, Vec<Vec<u8>>>, crate::knit::KnitError>
+        + Send
+        + Sync,
+    GL: Fn(&[u8]) -> Result<Option<Vec<Vec<u8>>>, crate::knit::KnitError> + Send + Sync,
+{
+    fn get_parent_map(
+        &self,
+        keys: &[Key],
+    ) -> Result<HashMap<Key, Vec<Key>>, crate::knit::KnitError> {
+        let mut bare: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+        for k in keys {
+            bare.push(key_to_single_bytes(k)?.to_vec());
+        }
+        let raw = (self.get_parent_map_cb)(&bare)?;
+        let mut out: HashMap<Key, Vec<Key>> = HashMap::with_capacity(raw.len());
+        for (k, parents) in raw {
+            let key = Key::Fixed(vec![k]);
+            let py_parents = parents
+                .into_iter()
+                .map(|p| Key::Fixed(vec![p]))
+                .collect::<Vec<_>>();
+            out.insert(key, py_parents);
+        }
+        Ok(out)
+    }
+
+    fn get_record_stream(
+        &self,
+        keys: &[Key],
+        _ordering: &str,
+        _include_delta_closure: bool,
+    ) -> Result<
+        Box<dyn Iterator<Item = Result<Box<dyn ContentFactory>, crate::knit::KnitError>>>,
+        crate::knit::KnitError,
+    > {
+        let mut records: Vec<Result<Box<dyn ContentFactory>, crate::knit::KnitError>> = Vec::new();
+        for key in keys {
+            let bare = key_to_single_bytes(key)?.to_vec();
+            match (self.get_lines_cb)(&bare) {
+                Ok(Some(lines)) => {
+                    let sha = crate::weave::sha_strings(&lines);
+                    let factory = ChunkedContentFactory::new(
+                        Some(sha),
+                        Key::Fixed(vec![bare]),
+                        None,
+                        lines,
+                    );
+                    records.push(Ok(Box::new(factory) as Box<dyn ContentFactory>));
+                }
+                Ok(None) => {
+                    let factory = AbsentContentFactory::new(Key::Fixed(vec![bare]));
+                    records.push(Ok(Box::new(factory) as Box<dyn ContentFactory>));
+                }
+                Err(e) => records.push(Err(e)),
+            }
+        }
+        Ok(Box::new(records.into_iter()))
+    }
+
+    fn get_sha1s(&self, keys: &[Key]) -> Result<HashMap<Key, Vec<u8>>, crate::knit::KnitError> {
+        let mut out = HashMap::new();
+        for key in keys {
+            let bare = key_to_single_bytes(key)?;
+            if let Some(lines) = (self.get_lines_cb)(bare)? {
+                out.insert(key.clone(), crate::weave::sha_strings(&lines));
+            }
+        }
+        Ok(out)
+    }
+
+    fn keys(&self) -> Result<Vec<Key>, crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.keys",
+        ))
+    }
+
+    fn add_lines(
+        &self,
+        _key: &Key,
+        _parents: Option<&[Key]>,
+        _lines: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, usize), crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.add_lines",
+        ))
+    }
+
+    fn insert_record_stream(
+        &self,
+        _stream: Box<dyn Iterator<Item = Box<dyn ContentFactory>>>,
+    ) -> Result<(), crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.insert_record_stream",
+        ))
+    }
+
+    fn iter_lines_added_or_present_in_keys(
+        &self,
+        keys: &[Key],
+    ) -> Result<Vec<(Vec<u8>, Key)>, crate::knit::KnitError> {
+        let mut out = Vec::new();
+        for key in keys {
+            let bare = key_to_single_bytes(key)?;
+            if let Some(lines) = (self.get_lines_cb)(bare)? {
+                for line in lines {
+                    out.push((line, key.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn annotate(&self, _key: &Key) -> Result<Vec<(Key, Vec<u8>)>, crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.annotate",
+        ))
+    }
+
+    fn check(&self) -> Result<(), crate::knit::KnitError> {
+        Ok(())
+    }
+}
+
+/// Whether every entry in `lines` is a single full line.
+///
+/// A full line carries a newline only as its final byte; an embedded `\n`
+/// anywhere before the last position means the caller passed text that was
+/// not split into lines. Mirrors `VersionedFiles._check_lines_are_lines`,
+/// which raises `ValueError` when this returns false.
+pub fn check_lines_are_lines(lines: &[Vec<u8>]) -> bool {
+    lines.iter().all(|line| {
+        let body = line.split_last().map_or(&[][..], |(_, rest)| rest);
+        !body.contains(&b'\n')
+    })
 }
 
 /// Encode a record's metadata + fulltext into the `fulltext\n<len><meta><body>`
@@ -1010,4 +1326,361 @@ pub fn fulltext_network_to_record(bytes: &[u8], line_end: usize) -> FulltextCont
     let fulltext = &bytes[line_end + 4 + meta_len..];
 
     FulltextContentFactory::new(None, key, parents, fulltext.to_vec())
+}
+
+/// One input to [`add_mpdiffs_build`] / [`add_mpdiffs_prepare`]: the key,
+/// its parents, the expected sha1 of the reconstructed text, and the diff.
+#[derive(Clone, Debug)]
+pub struct MpdiffRecord {
+    pub key: Key,
+    pub parents: Vec<Key>,
+    pub expected_sha1: Vec<u8>,
+    pub diff: crate::multiparent::MultiParent,
+}
+
+/// One dispatch row produced by [`add_mpdiffs_prepare`]: a reconstructed
+/// text ready to hand to `VersionedFiles.add_lines`, plus the
+/// `left_matching_blocks` hint to thread in (when there's exactly one
+/// parent) and the `expected_sha1` for the post-add check.
+#[derive(Clone, Debug)]
+pub struct PreparedAddLines {
+    pub key: Key,
+    pub parents: Vec<Key>,
+    pub lines: Vec<Vec<u8>>,
+    pub left_matching_blocks: Option<Vec<(usize, usize, usize)>>,
+    pub expected_sha1: Vec<u8>,
+}
+
+/// Phase 1 of `add_mpdiffs`: load the input records into a fresh in-memory
+/// multiparent versioned file and report which parent keys are still
+/// missing.
+///
+/// The caller is expected to fetch the missing parents' fulltexts (typically
+/// via `VersionedFiles.get_record_stream`) and seed them into the returned
+/// mpvf with `add_version(lines, key, [], None, false)` before calling
+/// [`add_mpdiffs_prepare`].
+pub fn add_mpdiffs_build(
+    records: &[MpdiffRecord],
+) -> (crate::multiparent::MultiMemoryVersionedFile<Key>, Vec<Key>) {
+    let mut mpvf = crate::multiparent::MultiMemoryVersionedFile::<Key>::default();
+    for r in records {
+        mpvf.add_diff(r.diff.clone(), r.key.clone(), r.parents.clone());
+    }
+    let mut needed: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    for r in records {
+        for p in &r.parents {
+            if !mpvf.has_version(p) {
+                needed.insert(p.clone());
+            }
+        }
+    }
+    (mpvf, needed.into_iter().collect())
+}
+
+/// Phase 2 of `add_mpdiffs`: reconstruct each input record's fulltext from
+/// the now-populated mpvf and pre-compute the `left_matching_blocks` hint
+/// for the single-parent case (matching Python's logic in
+/// `VersionedFiles.add_mpdiffs`).
+///
+/// Returns one [`PreparedAddLines`] per input record, in input order.
+pub fn add_mpdiffs_prepare(
+    mpvf: &mut crate::multiparent::MultiMemoryVersionedFile<Key>,
+    records: &[MpdiffRecord],
+) -> Result<Vec<PreparedAddLines>, crate::multiparent::ReconstructError> {
+    let keys: Vec<Key> = records.iter().map(|r| r.key.clone()).collect();
+    let reconstructed = mpvf.get_line_list(&keys)?;
+    Ok(records
+        .iter()
+        .zip(reconstructed.into_iter())
+        .map(|(r, lines)| {
+            let left_matching_blocks = if r.parents.len() == 1 {
+                let parent_len = mpvf
+                    .get_diff(&r.parents[0])
+                    .map(crate::multiparent::MultiParent::num_lines)
+                    .unwrap_or(0);
+                Some(r.diff.get_matching_blocks(0, parent_len))
+            } else {
+                None
+            };
+            PreparedAddLines {
+                key: r.key.clone(),
+                parents: r.parents.clone(),
+                lines,
+                left_matching_blocks,
+                expected_sha1: r.expected_sha1.clone(),
+            }
+        })
+        .collect())
+}
+
+/// Generate multi-parent diffs for `ordered_keys`, in input order.
+///
+/// Mirrors `bzrformats.versionedfile._MPDiffGenerator.compute_diffs`. The
+/// generator pulls every key's text (and its non-ghost parents' texts) out
+/// of `vf` via `get_record_stream`, then walks the stream in topological
+/// order, refcount-releasing parent cache entries as soon as no children
+/// still need them, and computes one [`crate::multiparent::MultiParent`]
+/// per ordered key.
+pub fn make_mpdiffs(
+    vf: &dyn VersionedFiles,
+    ordered_keys: &[Key],
+) -> Result<Vec<crate::multiparent::MultiParent>, crate::knit::KnitError> {
+    let parent_map = vf.get_parent_map(ordered_keys)?;
+
+    let mut missing_keys: Vec<Key> = Vec::new();
+    for k in ordered_keys {
+        if !parent_map.contains_key(k) {
+            missing_keys.push(k.clone());
+        }
+    }
+    if let Some(first) = missing_keys.into_iter().next() {
+        return Err(crate::knit::KnitError::RevisionNotPresent(
+            first.segments().to_vec(),
+        ));
+    }
+
+    // Refcounts and just_parents track which texts we still need to keep
+    // cached so we can pop them as soon as the last child has consumed
+    // them. just_parents is the set of parents that aren't themselves in
+    // ordered_keys (so we have to look them up to distinguish present from
+    // ghost).
+    let mut needed_keys: std::collections::HashSet<Key> = ordered_keys.iter().cloned().collect();
+    let mut refcounts: std::collections::HashMap<Key, usize> = std::collections::HashMap::new();
+    let mut just_parents: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    for parents in parent_map.values() {
+        if parents.is_empty() {
+            continue;
+        }
+        for p in parents {
+            just_parents.insert(p.clone());
+            needed_keys.insert(p.clone());
+            *refcounts.entry(p.clone()).or_insert(0) += 1;
+        }
+    }
+    // just_parents = parents that aren't already in parent_map.
+    just_parents.retain(|p| !parent_map.contains_key(p));
+
+    // Distinguish ghost parents (not present in storage) from real ones; we
+    // only need to fetch the real ones.
+    let just_parents_vec: Vec<Key> = just_parents.iter().cloned().collect();
+    let present_parents = vf.get_parent_map(&just_parents_vec)?;
+    let ghost_parents: std::collections::HashSet<Key> = just_parents
+        .iter()
+        .filter(|p| !present_parents.contains_key(*p))
+        .cloned()
+        .collect();
+    for g in &ghost_parents {
+        needed_keys.remove(g);
+    }
+
+    // Keep parent_map mutable so we can pop entries as we process them
+    // (mirrors Python's `self.parent_map.pop(key)`).
+    let mut parent_map = parent_map;
+    let mut chunks_cache: std::collections::HashMap<Key, Vec<Vec<u8>>> =
+        std::collections::HashMap::new();
+    let mut diffs: std::collections::HashMap<Key, crate::multiparent::MultiParent> =
+        std::collections::HashMap::new();
+
+    let needed_keys_vec: Vec<Key> = needed_keys.into_iter().collect();
+    let stream = vf.get_record_stream(&needed_keys_vec, "topological", true)?;
+    for rec in stream {
+        let rec = rec?;
+        if rec.storage_kind() == "absent" {
+            return Err(crate::knit::KnitError::RevisionNotPresent(
+                rec.key().segments().to_vec(),
+            ));
+        }
+        let key = rec.key();
+        let this_lines: Vec<Vec<u8>> = rec.to_lines().map(|c| c.into_owned()).collect();
+
+        let cache_this = refcounts.contains_key(&key);
+
+        if let Some(parents) = parent_map.remove(&key) {
+            // Collect parent line lists in original order, popping cache
+            // entries whose refcount drops to zero.
+            let mut parent_lines: Vec<Vec<Vec<u8>>> = Vec::with_capacity(parents.len());
+            for p in &parents {
+                if ghost_parents.contains(p) {
+                    continue;
+                }
+                let count = refcounts.get_mut(p).ok_or_else(|| {
+                    crate::knit::KnitError::Corrupt(format!(
+                        "make_mpdiffs: missing refcount for {:?}",
+                        p
+                    ))
+                })?;
+                if *count == 1 {
+                    refcounts.remove(p);
+                    let cached = chunks_cache.remove(p).ok_or_else(|| {
+                        crate::knit::KnitError::Corrupt(format!(
+                            "make_mpdiffs: missing cached chunks for {:?}",
+                            p
+                        ))
+                    })?;
+                    parent_lines.push(cached);
+                } else {
+                    *count -= 1;
+                    let cached = chunks_cache.get(p).cloned().ok_or_else(|| {
+                        crate::knit::KnitError::Corrupt(format!(
+                            "make_mpdiffs: missing cached chunks for {:?}",
+                            p
+                        ))
+                    })?;
+                    parent_lines.push(cached);
+                }
+            }
+            let parent_refs: Vec<&[Vec<u8>]> = parent_lines.iter().map(Vec::as_slice).collect();
+            let diff = crate::multiparent::MultiParent::from_lines(&this_lines, &parent_refs, None);
+            diffs.insert(key.clone(), diff);
+        }
+
+        if cache_this {
+            chunks_cache.insert(key, this_lines);
+        }
+    }
+
+    // Emit results in the original input order.
+    let mut out: Vec<crate::multiparent::MultiParent> = Vec::with_capacity(ordered_keys.len());
+    for k in ordered_keys {
+        match diffs.remove(k) {
+            Some(d) => out.push(d),
+            None => {
+                return Err(crate::knit::KnitError::Corrupt(format!(
+                    "make_mpdiffs: never produced a diff for {:?}",
+                    k
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_lines_are_lines_accepts_proper_lines() {
+        assert!(check_lines_are_lines(&[]));
+        assert!(check_lines_are_lines(&[b"a\n".to_vec(), b"b\n".to_vec()]));
+        // A final line without a trailing newline is still a single line.
+        assert!(check_lines_are_lines(&[
+            b"a\n".to_vec(),
+            b"no-eol".to_vec()
+        ]));
+        // A bare newline is one (empty) line.
+        assert!(check_lines_are_lines(&[b"\n".to_vec()]));
+        // An empty entry has no embedded newline.
+        assert!(check_lines_are_lines(&[b"".to_vec()]));
+    }
+
+    #[test]
+    fn check_lines_are_lines_rejects_embedded_newlines() {
+        // A newline before the last byte means the text was not split.
+        assert!(!check_lines_are_lines(&[b"a\nb\n".to_vec()]));
+        assert!(!check_lines_are_lines(&[
+            b"ok\n".to_vec(),
+            b"a\nb".to_vec()
+        ]));
+    }
+
+    fn k(s: &str) -> Key {
+        Key::Fixed(vec![s.as_bytes().to_vec()])
+    }
+
+    #[test]
+    fn add_mpdiffs_build_collects_only_missing_parents() {
+        use crate::multiparent::{Hunk, MultiParent};
+        let snap_a = MultiParent::with_hunks(vec![Hunk::NewText(vec![b"a\n".to_vec()])]);
+        let snap_b = MultiParent::with_hunks(vec![Hunk::NewText(vec![b"b\n".to_vec()])]);
+        let records = vec![
+            MpdiffRecord {
+                key: k("a"),
+                parents: vec![],
+                expected_sha1: vec![],
+                diff: snap_a,
+            },
+            MpdiffRecord {
+                key: k("b"),
+                parents: vec![k("a"), k("z")],
+                expected_sha1: vec![],
+                diff: snap_b,
+            },
+        ];
+        let (mpvf, needed) = add_mpdiffs_build(&records);
+        // 'a' is in the mpvf as a record; 'z' is not.
+        assert_eq!(needed, vec![k("z")]);
+        assert!(mpvf.has_version(&k("a")));
+        assert!(mpvf.has_version(&k("b")));
+    }
+
+    #[test]
+    fn add_mpdiffs_prepare_single_parent_emits_blocks() {
+        use crate::multiparent::{Hunk, MultiParent};
+        // 'a' is a fulltext; 'b' is a delta against 'a' that re-uses every
+        // line of the parent.
+        let snap_a =
+            MultiParent::with_hunks(vec![Hunk::NewText(vec![b"x\n".to_vec(), b"y\n".to_vec()])]);
+        let delta_b = MultiParent::with_hunks(vec![Hunk::ParentText {
+            parent: 0,
+            parent_pos: 0,
+            child_pos: 0,
+            num_lines: 2,
+        }]);
+        let records = vec![
+            MpdiffRecord {
+                key: k("a"),
+                parents: vec![],
+                expected_sha1: vec![],
+                diff: snap_a,
+            },
+            MpdiffRecord {
+                key: k("b"),
+                parents: vec![k("a")],
+                expected_sha1: vec![],
+                diff: delta_b,
+            },
+        ];
+        let (mut mpvf, needed) = add_mpdiffs_build(&records);
+        assert!(needed.is_empty());
+        let prepared = add_mpdiffs_prepare(&mut mpvf, &records).unwrap();
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].lines, vec![b"x\n".to_vec(), b"y\n".to_vec()]);
+        assert_eq!(prepared[0].left_matching_blocks, None);
+        assert_eq!(prepared[1].lines, vec![b"x\n".to_vec(), b"y\n".to_vec()]);
+        // One ParentText hunk plus the trailing sentinel from
+        // get_matching_blocks.
+        let blocks = prepared[1].left_matching_blocks.as_ref().unwrap();
+        assert_eq!(blocks, &vec![(0, 0, 2), (2, 2, 0)]);
+    }
+
+    #[test]
+    fn add_mpdiffs_prepare_multi_parent_no_blocks() {
+        use crate::multiparent::{Hunk, MultiParent};
+        let snap = || MultiParent::with_hunks(vec![Hunk::NewText(vec![b"x\n".to_vec()])]);
+        let records = vec![
+            MpdiffRecord {
+                key: k("p1"),
+                parents: vec![],
+                expected_sha1: vec![],
+                diff: snap(),
+            },
+            MpdiffRecord {
+                key: k("p2"),
+                parents: vec![],
+                expected_sha1: vec![],
+                diff: snap(),
+            },
+            MpdiffRecord {
+                key: k("c"),
+                parents: vec![k("p1"), k("p2")],
+                expected_sha1: vec![],
+                diff: snap(),
+            },
+        ];
+        let (mut mpvf, _) = add_mpdiffs_build(&records);
+        let prepared = add_mpdiffs_prepare(&mut mpvf, &records).unwrap();
+        // Multi-parent: no left_matching_blocks hint.
+        assert_eq!(prepared[2].left_matching_blocks, None);
+    }
 }

@@ -133,34 +133,6 @@ struct BTreeLeafParser {
 }
 
 impl BTreeLeafParser {
-    /// Extract a key of `key_length` segments starting from `pos` within `line`.
-    /// Returns the key tuple and the new position.
-    fn extract_key<'py>(
-        &self,
-        py: Python<'py>,
-        line: &[u8],
-        mut pos: usize,
-    ) -> PyResult<(Bound<'py, PyTuple>, usize)> {
-        let mut parts: Vec<Bound<'py, PyBytes>> = Vec::with_capacity(self.key_length);
-        for i in 0..self.key_length {
-            if let Some(nul_offset) = line[pos..].iter().position(|&b| b == 0) {
-                parts.push(PyBytes::new(py, &line[pos..pos + nul_offset]));
-                pos = pos + nul_offset + 1;
-            } else if i + 1 == self.key_length {
-                // Last segment: capture to end
-                parts.push(PyBytes::new(py, &line[pos..]));
-                pos = line.len();
-            } else {
-                return Err(PyAssertionError::new_err(format!(
-                    "invalid key, wanted segment from {:?}",
-                    &line[pos..]
-                )));
-            }
-        }
-        let key = PyTuple::new(py, parts.iter().map(|b| b.as_any()))?;
-        Ok((key, pos))
-    }
-
     /// Process a single line of leaf node data. Returns true if there is more to process.
     fn process_line<'py>(
         &self,
@@ -184,53 +156,35 @@ impl BTreeLeafParser {
             }
         }
 
-        let (key, pos) = self.extract_key(py, line, 0)?;
+        // Delegate the per-line splitting (key segments / refs / value)
+        // to the pure crate; this wrapper only marshals the resulting
+        // bytes into the Python tuple shape the parser exposes.
+        let (key_segments, value_bytes, ref_lists) =
+            bazaar::btree_index::parse_leaf_line(line, self.key_length, self.ref_list_length)
+                .map_err(|_| PyAssertionError::new_err("Failed to parse leaf line"))?;
 
-        // Find the last \0 to separate references from value
-        let rest = &line[pos..];
-        let last_nul = rest.iter().rposition(|&b| b == 0);
-        let last_nul = match last_nul {
-            Some(idx) => idx,
-            None => {
-                return Err(PyAssertionError::new_err("Failed to find the value area"));
-            }
-        };
-        let value = PyBytes::new(py, &rest[last_nul + 1..]);
-        let refs_area = &rest[..last_nul];
+        let key_parts: Vec<Bound<PyBytes>> =
+            key_segments.iter().map(|s| PyBytes::new(py, s)).collect();
+        let key = PyTuple::new(py, key_parts.iter().map(|b| b.as_any()))?;
+        let value = PyBytes::new(py, &value_bytes);
 
-        let node_value: Bound<PyTuple>;
-        if self.ref_list_length > 0 {
-            let mut ref_lists: Vec<Bound<PyTuple>> = Vec::with_capacity(self.ref_list_length);
-            let ref_sections: Vec<&[u8]> = refs_area.split(|&b| b == b'\t').collect();
-            for ref_section in ref_sections.iter().take(self.ref_list_length) {
-                let mut ref_list: Vec<Bound<PyTuple>> = Vec::new();
-                if !ref_section.is_empty() {
-                    for ref_bytes in ref_section.split(|&b| b == b'\r') {
-                        if ref_bytes.is_empty() {
-                            continue;
-                        }
-                        // Parse a reference key: segments separated by \0
-                        let ref_parts: Vec<Bound<PyBytes>> = ref_bytes
-                            .split(|&b| b == 0)
-                            .map(|s| PyBytes::new(py, s))
-                            .collect();
-                        let ref_key = PyTuple::new(py, ref_parts.iter().map(|b| b.as_any()))?;
-                        ref_list.push(ref_key);
-                    }
+        let node_value: Bound<PyTuple> = if self.ref_list_length > 0 {
+            let mut ref_list_tuples: Vec<Bound<PyTuple>> = Vec::with_capacity(ref_lists.len());
+            for ref_list in &ref_lists {
+                let mut refs: Vec<Bound<PyTuple>> = Vec::with_capacity(ref_list.len());
+                for ref_key in ref_list {
+                    let parts: Vec<Bound<PyBytes>> =
+                        ref_key.iter().map(|s| PyBytes::new(py, s)).collect();
+                    refs.push(PyTuple::new(py, parts.iter().map(|b| b.as_any()))?);
                 }
-                ref_lists.push(PyTuple::new(py, ref_list.iter().map(|t| t.as_any()))?);
+                ref_list_tuples.push(PyTuple::new(py, refs.iter().map(|t| t.as_any()))?);
             }
-            let ref_lists_tuple = PyTuple::new(py, ref_lists.iter().map(|t| t.as_any()))?;
-            node_value = PyTuple::new(py, &[value.as_any(), ref_lists_tuple.as_any()])?;
+            let ref_lists_tuple = PyTuple::new(py, ref_list_tuples.iter().map(|t| t.as_any()))?;
+            PyTuple::new(py, &[value.as_any(), ref_lists_tuple.as_any()])?
         } else {
-            if !refs_area.is_empty() {
-                return Err(PyAssertionError::new_err(
-                    "unexpected reference data present",
-                ));
-            }
             let empty = PyTuple::empty(py);
-            node_value = PyTuple::new(py, &[value.as_any(), empty.as_any()])?;
-        }
+            PyTuple::new(py, &[value.as_any(), empty.as_any()])?
+        };
 
         let entry = PyTuple::new(py, &[key.as_any(), node_value.as_any()])?;
         self.keys.bind(py).append(entry)?;
@@ -643,24 +597,19 @@ fn _flatten_node<'py>(
         )));
     }
 
-    // Build string_key from node[1] (key tuple joined by \0)
     let key_tuple = node.get_item(1)?;
     let key_tuple: &Bound<PyTuple> = key_tuple
         .cast()
         .map_err(|_| PyTypeError::new_err("Expected a tuple for key"))?;
-    let mut string_key_bytes: Vec<u8> = Vec::new();
+    let mut key: bazaar::btree_builder::Key = Vec::with_capacity(key_tuple.len());
     for i in 0..key_tuple.len() {
-        if i > 0 {
-            string_key_bytes.push(0);
-        }
         let item = key_tuple.get_item(i)?;
         let b: &Bound<PyBytes> = item
             .cast()
             .map_err(|_| PyTypeError::new_err("Expected bytes for key part"))?;
-        string_key_bytes.extend_from_slice(b.as_bytes());
+        key.push(b.as_bytes().to_vec());
     }
 
-    // Get value from node[2]
     let val_obj = node.get_item(2)?;
     let val_bytes: &Bound<PyBytes> = val_obj.cast().map_err(|_| {
         PyTypeError::new_err(format!(
@@ -668,34 +617,24 @@ fn _flatten_node<'py>(
             val_obj.get_type()
         ))
     })?;
-    let value = val_bytes.as_bytes();
+    let value = val_bytes.as_bytes().to_vec();
 
-    // Compute refs bytes
-    let mut refs_bytes: Vec<u8> = Vec::new();
+    let mut references: Vec<Vec<bazaar::btree_builder::Key>> = Vec::new();
     if reference_lists {
         let ref_lists_obj = node.get_item(3)?;
-        let ref_lists_seq: Vec<Bound<'py, PyAny>> =
-            ref_lists_obj.try_iter()?.collect::<PyResult<Vec<_>>>()?;
-        for (rl_idx, ref_list_obj) in ref_lists_seq.iter().enumerate() {
-            if rl_idx > 0 {
-                refs_bytes.push(b'\t');
-            }
-            let ref_list: Vec<Bound<'py, PyAny>> =
-                ref_list_obj.try_iter()?.collect::<PyResult<Vec<_>>>()?;
-            for (ref_idx, reference_obj) in ref_list.iter().enumerate() {
-                if ref_idx > 0 {
-                    refs_bytes.push(b'\r');
-                }
+        for ref_list_obj in ref_lists_obj.try_iter()? {
+            let ref_list_obj = ref_list_obj?;
+            let mut rl: Vec<bazaar::btree_builder::Key> = Vec::new();
+            for reference_obj in ref_list_obj.try_iter()? {
+                let reference_obj = reference_obj?;
                 let reference: &Bound<'py, PyTuple> = reference_obj.cast().map_err(|_| {
                     PyTypeError::new_err(format!(
                         "We expect references to be tuples not: {:?}",
                         reference_obj.get_type()
                     ))
                 })?;
+                let mut r: bazaar::btree_builder::Key = Vec::with_capacity(reference.len());
                 for k in 0..reference.len() {
-                    if k > 0 {
-                        refs_bytes.push(0);
-                    }
                     let ref_bit = reference.get_item(k)?;
                     let ref_bit_bytes: &Bound<'py, PyBytes> = ref_bit.cast().map_err(|_| {
                         PyTypeError::new_err(format!(
@@ -703,22 +642,16 @@ fn _flatten_node<'py>(
                             ref_bit.get_type()
                         ))
                     })?;
-                    refs_bytes.extend_from_slice(ref_bit_bytes.as_bytes());
+                    r.push(ref_bit_bytes.as_bytes().to_vec());
                 }
+                rl.push(r);
             }
+            references.push(rl);
         }
     }
 
-    // Build final line: string_key \0 refs \0 value \n
-    let mut line =
-        Vec::with_capacity(string_key_bytes.len() + 1 + refs_bytes.len() + 1 + value.len() + 1);
-    line.extend_from_slice(&string_key_bytes);
-    line.push(0);
-    line.extend_from_slice(&refs_bytes);
-    line.push(0);
-    line.extend_from_slice(value);
-    line.push(b'\n');
-
+    let (string_key_bytes, line) =
+        bazaar::btree_builder::flatten_node(&key, &value, &references, reference_lists);
     let string_key = PyBytes::new(py, &string_key_bytes);
     let line_bytes = PyBytes::new(py, &line);
     Ok((string_key, line_bytes))

@@ -161,6 +161,28 @@ pub fn parse_node_position(value: &[u8]) -> Result<NodePosition, NodePositionErr
     })
 }
 
+/// Format the four positions an `_GCGraphIndex` entry stores as its
+/// value field: `b"block_start block_length entry_start entry_end"`.
+///
+/// This is the writer side of the format that [`parse_node_position`]
+/// reads back; the field names here reflect the write-time semantics
+/// (a block offset + length + per-record byte range inside the block),
+/// while [`NodePosition`]'s field names (`stop`, `basis_end`,
+/// `delta_end`) reflect how `_node_to_position` historically named the
+/// same four positional integers on read.
+pub fn format_gc_node_value(
+    block_start: u64,
+    block_length: u64,
+    entry_start: u64,
+    entry_end: u64,
+) -> Vec<u8> {
+    format!(
+        "{} {} {} {}",
+        block_start, block_length, entry_start, entry_end
+    )
+    .into_bytes()
+}
+
 /// Per-record state held by [`LazyGroupContentManager`].
 ///
 /// Mirrors the Python `_LazyGroupCompressFactory` attributes that affect the
@@ -392,6 +414,19 @@ mod tests {
             parse_node_position(b"10 20 nope 40"),
             Err(NodePositionError::InvalidInteger)
         );
+    }
+
+    #[test]
+    fn format_gc_node_value_roundtrips_through_parse_node_position() {
+        let bytes = format_gc_node_value(100, 50, 7, 42);
+        assert_eq!(bytes, b"100 50 7 42");
+        let parsed = parse_node_position(&bytes).unwrap();
+        // The reader-side field names are start/stop/basis_end/delta_end;
+        // semantically they hold the four write-time integers in order.
+        assert_eq!(parsed.start, 100);
+        assert_eq!(parsed.stop, 50);
+        assert_eq!(parsed.basis_end, 7);
+        assert_eq!(parsed.delta_end, 42);
     }
 
     fn make_block_with_keys(

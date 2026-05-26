@@ -377,6 +377,230 @@ fn parse_decimal(bytes: &[u8], what: &str) -> Result<usize, Error> {
         .ok_or_else(|| Error::DeserializeError(format!("invalid {}: {:?}", what, bytes)))
 }
 
+/// Build the byte chunks that [`LeafNode.serialise`] would emit before
+/// adding them to a store. `items` must be presented in already-sorted
+/// order (Python sorts `self._items.items()` before walking).
+///
+/// `common_prefix` is the longest common serialised prefix among all
+/// items — pass `None` for an empty node. The output is split into one
+/// `Vec<u8>` per line so the caller can hand it straight to
+/// `store.add_lines(...)`.
+///
+/// Mirrors `LeafNode.serialise` minus the I/O side: the caller is still
+/// responsible for `store.add_lines` and for updating `self._key` /
+/// the in-memory cache from the resulting bytes.
+pub fn serialise_leaf_node(
+    maximum_size: usize,
+    key_width: usize,
+    items: &[(Vec<Vec<u8>>, Vec<u8>)],
+    common_prefix: Option<&[u8]>,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(5 + items.len() * 2);
+    out.push(b"chkleaf:\n".to_vec());
+    out.push(format!("{}\n", maximum_size).into_bytes());
+    out.push(format!("{}\n", key_width).into_bytes());
+    out.push(format!("{}\n", items.len()).into_bytes());
+    let prefix_bytes = match common_prefix {
+        None => {
+            if !items.is_empty() {
+                return Err(Error::DeserializeError(
+                    "common prefix is None but items is non-empty".into(),
+                ));
+            }
+            out.push(b"\n".to_vec());
+            return Ok(out);
+        }
+        Some(p) => {
+            let mut line = p.to_vec();
+            line.push(b'\n');
+            out.push(line);
+            p
+        }
+    };
+    let prefix_len = prefix_bytes.len();
+    for (key, value) in items {
+        // Python's `osutils.chunks_to_lines([value + b"\n"])` resplits the
+        // value bytes on newlines, ensuring every value line ends in '\n'
+        // except possibly the last (and the trailing b"\n" we appended
+        // guarantees the last one ends in '\n' too).
+        let mut padded = value.to_vec();
+        padded.push(b'\n');
+        let value_lines: Vec<Vec<u8>> = split_lines_inclusive(&padded);
+
+        let serialised_key = key.join(&b'\x00');
+        let mut header = serialised_key.clone();
+        header.push(b'\x00');
+        header.extend_from_slice(format!("{}\n", value_lines.len()).as_bytes());
+        if !header.starts_with(prefix_bytes) {
+            return Err(Error::DeserializeError(format!(
+                "serialised key {:?} does not start with common prefix {:?}",
+                header, prefix_bytes
+            )));
+        }
+        out.push(header[prefix_len..].to_vec());
+        out.extend(value_lines);
+    }
+    Ok(out)
+}
+
+/// One entry on an `InternalNode`'s serialised body: a prefix and the
+/// flat sha1 key of the child it points at. The Python serialiser sorts
+/// these by prefix before writing.
+#[derive(Debug, Clone)]
+pub struct InternalNodeChild {
+    pub prefix: Vec<u8>,
+    pub flat_key: Vec<u8>,
+}
+
+/// Build the byte chunks that [`InternalNode.serialise`] would emit
+/// before adding them to a store. `items` must be sorted by `prefix`
+/// (the Python loop does `sorted(self._items.items())`).
+///
+/// `length` is the InternalNode's `_len` — the total number of leaf
+/// entries reachable through this node, **not** `items.len()` (which is
+/// the direct fan-out count).
+///
+/// Mirrors `InternalNode.serialise` minus the I/O side and the
+/// recursive walk that flushes child nodes first.
+pub fn serialise_internal_node(
+    maximum_size: usize,
+    key_width: usize,
+    length: usize,
+    search_prefix: &[u8],
+    items: &[InternalNodeChild],
+) -> Result<Vec<Vec<u8>>, Error> {
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(5 + items.len());
+    out.push(b"chknode:\n".to_vec());
+    out.push(format!("{}\n", maximum_size).into_bytes());
+    out.push(format!("{}\n", key_width).into_bytes());
+    out.push(format!("{}\n", length).into_bytes());
+    let mut prefix_line = search_prefix.to_vec();
+    prefix_line.push(b'\n');
+    out.push(prefix_line);
+    let prefix_len = search_prefix.len();
+    for child in items {
+        let mut serialised = child.prefix.clone();
+        serialised.push(b'\x00');
+        serialised.extend_from_slice(&child.flat_key);
+        serialised.push(b'\n');
+        if !serialised.starts_with(search_prefix) {
+            return Err(Error::DeserializeError(format!(
+                "internal node entry {:?} does not start with prefix {:?}",
+                serialised, search_prefix
+            )));
+        }
+        out.push(serialised[prefix_len..].to_vec());
+    }
+    Ok(out)
+}
+
+/// Serialised byte cost of one `(key, value)` pair inside a leaf node.
+///
+/// Mirrors `LeafNode._key_value_len` exactly: the key tuple's NUL-joined
+/// bytes, the count of newlines in the value as a decimal string, the
+/// value bytes themselves, and three separator bytes. The hot path for
+/// every map/unmap is calling this to track `_raw_size`.
+pub fn leaf_node_key_value_len(key: &[Vec<u8>], value: &[u8]) -> usize {
+    let key_len: usize = if key.is_empty() {
+        0
+    } else {
+        key.iter().map(Vec::len).sum::<usize>() + (key.len() - 1)
+    };
+    let newline_count = value.iter().filter(|&&b| b == b'\n').count();
+    let newline_count_digits = if newline_count == 0 {
+        1
+    } else {
+        let mut n = newline_count;
+        let mut digits = 0;
+        while n > 0 {
+            n /= 10;
+            digits += 1;
+        }
+        digits
+    };
+    key_len + 1 + newline_count_digits + 1 + value.len() + 1
+}
+
+/// Serialised byte cost of a leaf node, including its header.
+///
+/// Mirrors `LeafNode._current_size`. `bytes_for_items` is the sum of
+/// per-entry serialised costs (i.e. the running `_raw_size`), with the
+/// common-prefix-collapse applied: subtract `prefix_len * length` so
+/// each entry doesn't pay for the prefix once stored once at the top
+/// of the leaf.
+pub fn leaf_node_current_size(
+    maximum_size: usize,
+    key_width: usize,
+    length: usize,
+    raw_size: usize,
+    common_serialised_prefix: Option<&[u8]>,
+) -> usize {
+    let (bytes_for_items, prefix_len) = match common_serialised_prefix {
+        None => (0, 0),
+        Some(prefix) => {
+            let prefix_len = prefix.len();
+            (raw_size - prefix_len * length, prefix_len)
+        }
+    };
+    // 9 = b"chkleaf:\n".len()
+    9 + decimal_digits(maximum_size)
+        + 1
+        + decimal_digits(key_width)
+        + 1
+        + decimal_digits(length)
+        + 1
+        + prefix_len
+        + 1
+        + bytes_for_items
+}
+
+/// Serialised byte cost of an internal node header.
+///
+/// Mirrors `InternalNode._current_size`. The body bytes are tracked
+/// separately in `_raw_size`; the header adds the four decimal-encoded
+/// integers (maximum_size, key_width, length).
+pub fn internal_node_current_size(
+    maximum_size: usize,
+    key_width: usize,
+    length: usize,
+    raw_size: usize,
+) -> usize {
+    raw_size + decimal_digits(length) + decimal_digits(key_width) + decimal_digits(maximum_size)
+}
+
+#[inline]
+fn decimal_digits(n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut n = n;
+    let mut digits = 0;
+    while n > 0 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// Split `data` into lines, keeping the trailing `\n` on each non-final
+/// line. Mirrors `osutils.chunks_to_lines([b"".join(chunks)])` for a
+/// single chunk input: every `\n` ends a line, and any unterminated
+/// tail becomes its own final line.
+fn split_lines_inclusive(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b == b'\n' {
+            out.push(data[start..=i].to_vec());
+            start = i + 1;
+        }
+    }
+    if start < data.len() {
+        out.push(data[start..].to_vec());
+    }
+    out
+}
+
 #[test]
 fn test_common_prefix_many() {
     assert_eq!(
@@ -643,5 +867,104 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
             deserialise_internal_node(data),
             Err(Error::DeserializeError(_))
         ));
+    }
+
+    #[test]
+    fn serialise_leaf_node_roundtrips_through_deserialise() {
+        let items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = vec![
+            (vec![b"a".to_vec()], b"v1".to_vec()),
+            (vec![b"alpha".to_vec()], b"v2\nv2line2".to_vec()),
+        ];
+        // Common prefix of the serialised key lines `a\x001\n` and
+        // `alpha\x002\n` is `a` (the first byte of "a" and "alpha").
+        let out = serialise_leaf_node(100, 1, &items, Some(b"a")).unwrap();
+        let blob: Vec<u8> = out.iter().flatten().copied().collect();
+        let parsed = deserialise_leaf_node(&blob).unwrap();
+        assert_eq!(parsed.maximum_size, 100);
+        assert_eq!(parsed.key_width, 1);
+        assert_eq!(parsed.length, 2);
+        assert_eq!(parsed.common_serialised_prefix, b"a");
+        assert_eq!(parsed.items.len(), 2);
+        assert_eq!(parsed.items[0].0, vec![b"a".to_vec()]);
+        assert_eq!(parsed.items[0].1, b"v1".to_vec());
+        assert_eq!(parsed.items[1].0, vec![b"alpha".to_vec()]);
+        assert_eq!(parsed.items[1].1, b"v2\nv2line2".to_vec());
+    }
+
+    #[test]
+    fn serialise_empty_leaf_node_has_blank_prefix() {
+        let out = serialise_leaf_node(100, 1, &[], None).unwrap();
+        let blob: Vec<u8> = out.iter().flatten().copied().collect();
+        assert_eq!(blob, b"chkleaf:\n100\n1\n0\n\n");
+    }
+
+    #[test]
+    fn leaf_node_key_value_len_matches_python_layout() {
+        // Single-segment key, value with one newline.
+        let key = vec![b"foo".to_vec()];
+        let value = b"hello\nworld";
+        // Layout: key\0count\nvalue\n
+        //         "foo" + "\0" + "1" + "\n" + "hello\nworld" + "\n"
+        //          3      1     1     1       11               1   = 18
+        // Note the function returns raw size (no trailing newline yet
+        // collapsed into the value); count `\n` chars in value = 1
+        let got = leaf_node_key_value_len(&key, value);
+        // 3 + 1 (NUL after key) + 1 (digit "1") + 1 (NUL) + 11 (value) + 1 (NUL)
+        assert_eq!(got, 3 + 1 + 1 + 1 + 11 + 1);
+    }
+
+    #[test]
+    fn leaf_node_key_value_len_multi_segment_key_joins_with_nul() {
+        let key = vec![b"a".to_vec(), b"bc".to_vec()];
+        let value = b"x";
+        // key joined: "a\0bc" = 4 bytes; value has 0 newlines so count="0" (1 digit).
+        let got = leaf_node_key_value_len(&key, value);
+        // 4 + 1 + 1 + 1 + 1 + 1
+        assert_eq!(got, 9);
+    }
+
+    #[test]
+    fn leaf_node_current_size_includes_header_and_drops_prefix() {
+        // length=2 items, common prefix "ab" (2 bytes), raw_size=20.
+        // bytes_for_items = 20 - 2*2 = 16.
+        // Header: "chkleaf:\n100\n1\n2\nab\n" = 9 + 3+1 + 1+1 + 1+1 + 2+1 = 20
+        // current = 20 + 16 = 36
+        let got = leaf_node_current_size(100, 1, 2, 20, Some(b"ab"));
+        assert_eq!(got, 36);
+    }
+
+    #[test]
+    fn leaf_node_current_size_empty_prefix() {
+        let got = leaf_node_current_size(15, 1, 0, 0, None);
+        // "chkleaf:\n15\n1\n0\n\n" = 9 + 2+1 + 1+1 + 1+1 + 0+1 = 17
+        assert_eq!(got, 17);
+    }
+
+    #[test]
+    fn internal_node_current_size_adds_header_digits() {
+        // raw_size=50, length=3 (1 digit), key_width=1 (1 digit),
+        // maximum_size=100 (3 digits) → 50 + 1 + 1 + 3 = 55
+        let got = internal_node_current_size(100, 1, 3, 50);
+        assert_eq!(got, 55);
+    }
+
+    #[test]
+    fn serialise_internal_node_roundtrips_through_deserialise() {
+        let items = vec![
+            InternalNodeChild {
+                prefix: b"prebar".to_vec(),
+                flat_key: b"sha1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_vec(),
+            },
+            InternalNodeChild {
+                prefix: b"prefoo".to_vec(),
+                flat_key: b"sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec(),
+            },
+        ];
+        // The fixture's `length=2` happens to match items.len() because
+        // those two children are themselves leaves; for deeper trees
+        // length is the total leaf count, which the caller passes in.
+        let out = serialise_internal_node(200, 1, 2, b"pre", &items).unwrap();
+        let blob: Vec<u8> = out.iter().flatten().copied().collect();
+        assert_eq!(blob, INTERNAL_FIXTURE);
     }
 }

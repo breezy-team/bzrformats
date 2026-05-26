@@ -71,25 +71,9 @@ def pumpfile(from_file, to_file, buffer_size=65536):
 
 def chunks_to_lines(chunks):
     """Convert chunks to lines."""
-    if not chunks:
-        return []
+    from ._bzr_rs import osutils as _osutils_rs
 
-    # Join all chunks
-    data = b"".join(chunks)
-
-    # Split into lines, keeping line endings
-    lines = []
-    start = 0
-    for i, byte in enumerate(data):
-        if byte == ord(b"\n"):
-            lines.append(data[start : i + 1])
-            start = i + 1
-
-    # Add remaining data if any
-    if start < len(data):
-        lines.append(data[start:])
-
-    return lines
+    return _osutils_rs.chunks_to_lines(chunks)
 
 
 def normalized_filename(filename):
@@ -174,11 +158,11 @@ def file_kind_from_stat_mode(mode):
 
 def contains_whitespace(s):
     """Return True if the string contains whitespace characters."""
-    # Check for common whitespace characters
+    from ._bzr_rs import osutils as _osutils_rs
+
     if isinstance(s, bytes):
-        return any(c in s for c in b" \t\n\r\v\f")
-    else:
-        return any(c in s for c in " \t\n\r\v\f")
+        s = s.decode("utf-8")
+    return _osutils_rs.contains_whitespace(s)
 
 
 def sha_strings(strings):
@@ -424,20 +408,13 @@ def is_inside(dir, fname):
     :param fname: File path to check (bytes or str)
     :return: True if fname is inside dir
     """
-    # Normalize to use bytes for comparison
-    if isinstance(dir, str):
-        dir = dir.encode("utf-8")
-    if isinstance(fname, str):
-        fname = fname.encode("utf-8")
+    from ._bzr_rs import osutils as _osutils_rs
 
-    if dir == fname:
-        return True
-
-    # Ensure trailing slash for proper comparison
-    if dir != b"":
-        dir = dir.rstrip(b"/") + b"/"
-
-    return fname.startswith(dir)
+    if isinstance(dir, bytes):
+        dir = dir.decode("utf-8")
+    if isinstance(fname, bytes):
+        fname = fname.decode("utf-8")
+    return _osutils_rs.is_inside(dir, fname)
 
 
 def is_inside_any(dir_list, fname):
@@ -447,7 +424,12 @@ def is_inside_any(dir_list, fname):
     :param fname: File path to check
     :return: True if fname is inside any directory in dir_list
     """
-    return any(is_inside(dir, fname) for dir in dir_list)
+    from ._bzr_rs import osutils as _osutils_rs
+
+    dir_list = [(d.decode("utf-8") if isinstance(d, bytes) else d) for d in dir_list]
+    if isinstance(fname, bytes):
+        fname = fname.decode("utf-8")
+    return _osutils_rs.is_inside_any(dir_list, fname)
 
 
 def parent_directories(filename):

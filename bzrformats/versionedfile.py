@@ -17,7 +17,6 @@
 """Versioned text file storage api."""
 
 import functools
-import itertools
 import os
 from copy import copy
 from io import BytesIO
@@ -32,11 +31,7 @@ from .errors import (
     BzrFormatsError,
     ObjectNotLocked,
     RevisionNotPresent,
-    VersionedFileInvalidChecksum,
 )
-
-# Import complex osutils functions that are too difficult to replace
-from .osutils import file_iterator
 from .registry import Registry
 from .textmerge import TextMerge
 from .transport import TransportNoSuchFile
@@ -149,87 +144,20 @@ class ContentFactory:
         return self
 
 
-class FileContentFactory(ContentFactory):
-    """File-based content factory."""
+FileContentFactory = _versionedfile_rs.FileContentFactory
+"""See ContentFactory. File-backed content factory.
 
-    def __init__(self, key, parents, fileobj, sha1=None, size=None):
-        """Initialize a FileContentFactory.
-
-        Args:
-            key: Unique identifier for this content.
-            parents: Parent keys for this content.
-            fileobj: File-like object containing the content data.
-            sha1: SHA1 hash of the content (optional).
-            size: Size of the content in bytes (optional).
-        """
-        self.key = key
-        self.parents = parents
-        self.file = fileobj
-        self.storage_kind = "file"
-        self.sha1 = sha1
-        self.size = size
-        self._needs_reset = False
-
-    def get_bytes_as(self, storage_kind):
-        """Get the content bytes in the specified storage format.
-
-        Args:
-            storage_kind: The desired storage format ('fulltext', 'chunked', 'lines').
-
-        Returns:
-            bytes or list: The content data in the requested format.
-
-        Raises:
-            UnavailableRepresentation: If the requested storage kind is not supported.
-        """
-        if self._needs_reset:
-            self.file.seek(0)
-        self._needs_reset = True
-        if storage_kind == "fulltext":
-            return self.file.read()
-        elif storage_kind == "chunked":
-            return list(file_iterator(self.file))
-        elif storage_kind == "lines":
-            return list(self.file.readlines())
-        raise UnavailableRepresentation(self.key, storage_kind, self.storage_kind)
-
-    def iter_bytes_as(self, storage_kind):
-        """Iterate over content bytes in the specified storage format.
-
-        Args:
-            storage_kind: The desired storage format ('chunked', 'lines').
-
-        Returns:
-            iterator: Iterator over the content data in the requested format.
-
-        Raises:
-            UnavailableRepresentation: If the requested storage kind is not supported.
-        """
-        if self._needs_reset:
-            self.file.seek(0)
-        self._needs_reset = True
-        if storage_kind == "chunked":
-            return osutils.file_iterator(self.file)
-        elif storage_kind == "lines":
-            return self.file
-        raise UnavailableRepresentation(self.key, storage_kind, self.storage_kind)
+`__init__(key, parents, fileobj, sha1=None, size=None)`: reads bytes from
+the supplied Python file-like on first ``get_bytes_as`` / ``iter_bytes_as``
+call and caches the result. ``storage_kind`` is ``"file"``.
+"""
 
 
-class AdapterFactory(ContentFactory):
-    """A content factory to adapt between key prefix's."""
-
-    def __init__(self, key, parents, adapted):
-        """Create an adapter factory instance."""
-        self.key = key
-        self.parents = parents
-        self._adapted = adapted
-
-    def __getattr__(self, attr):
-        """Return a member from the adapted object."""
-        if attr in ("key", "parents"):
-            return self.__dict__[attr]
-        else:
-            return getattr(self._adapted, attr)
+AdapterFactory = _versionedfile_rs.AdapterFactory
+"""See ContentFactory. Overrides ``key`` / ``parents`` while delegating
+``storage_kind`` / ``sha1`` / ``size`` / ``get_bytes_as`` to the wrapped
+factory passed as ``adapted``.
+"""
 
 
 def filter_absent(record_stream):
@@ -240,35 +168,31 @@ def filter_absent(record_stream):
 
 
 class _MPDiffGenerator:
-    """Pull out the functionality for generating mp_diffs."""
+    """Pull out the functionality for generating mp_diffs.
+
+    `compute_diffs` drives a pure-Rust fast path. The other methods exist
+    for callers that need step-by-step access to the intermediate state
+    (parent map, refcounts, ghost parents, chunk cache) - chiefly breezy's
+    whitebox tests.
+    """
 
     def __init__(self, vf, keys):
         self.vf = vf
-        # This is the order the keys were requested in
         self.ordered_keys = tuple(keys)
-        # keys + their parents, what we need to compute the diffs
         self.needed_keys = ()
-        # Map from key: mp_diff
         self.diffs = {}
-        # Map from key: parents_needed (may have ghosts)
         self.parent_map = {}
-        # Parents that aren't present
         self.ghost_parents = ()
-        # Map from parent_key => number of children for this text
         self.refcounts = {}
-        # Content chunks that are cached while we still need them
         self.chunks = {}
 
     def _find_needed_keys(self):
-        """Find the set of keys we need to request.
+        """Find the keys we need to request from the underlying vf.
 
-        This includes all the original keys passed in, and the non-ghost
-        parents of those keys.
-
-        :return: (needed_keys, refcounts)
-            needed_keys is the set of all texts we need to extract
-            refcounts is a dict of {key: num_children} letting us know when we
-                no longer need to cache a given parent text
+        Returns ``(needed_keys, refcounts)``. ``needed_keys`` is the set of
+        all texts we need to extract; ``refcounts`` is a dict
+        ``{key: num_children}`` so callers know when a cached parent text
+        can be released.
         """
         parent_map = self.vf.get_parent_map(set(self.ordered_keys))
         self.parent_map = parent_map
@@ -277,7 +201,6 @@ class _MPDiffGenerator:
         )
         if missing_keys:
             raise RevisionNotPresent(next(iter(missing_keys)), self.vf)
-        # Remove any parents that are actually ghosts from the needed set
         self.present_parents = set(self.vf.get_parent_map(just_parents))
         self.ghost_parents = just_parents.difference(self.present_parents)
         needed_keys.difference_update(self.ghost_parents)
@@ -286,28 +209,12 @@ class _MPDiffGenerator:
         return needed_keys, refcounts
 
     def _compute_diff(self, key, parent_lines, lines):
-        """Compute a single mp_diff, and store it in self._diffs."""
-        if len(parent_lines) > 0:
-            # XXX: _extract_blocks is not usefully defined anywhere...
-            #      It was meant to extract the left-parent diff without
-            #      having to recompute it for Knit content (pack-0.92,
-            #      etc). That seems to have regressed somewhere
-            left_parent_blocks = self.vf._extract_blocks(key, parent_lines[0], lines)
-        else:
-            left_parent_blocks = None
-        diff = multiparent.MultiParent.from_lines(
-            lines, parent_lines, left_parent_blocks
-        )
+        diff = multiparent.MultiParent.from_lines(lines, parent_lines, None)
         self.diffs[key] = diff
 
     def _process_one_record(self, key, this_chunks):
-        parent_keys = None
         if key in self.parent_map:
-            # This record should be ready to diff, since we requested
-            # content in 'topological' order
             parent_keys = self.parent_map.pop(key)
-            # If a VersionedFile claims 'no-graph' support, then it may return
-            # None for any parent request, so we replace it with an empty tuple
             if parent_keys is None:
                 parent_keys = ()
             parent_chunks_list = _versionedfile_rs.mpdiff_collect_parent_chunks(
@@ -315,25 +222,15 @@ class _MPDiffGenerator:
             )
             parent_lines = [osutils.chunks_to_lines(pc) for pc in parent_chunks_list]
             lines = osutils.chunks_to_lines(this_chunks)
-            # Since we needed the lines, we'll go ahead and cache them this way
             this_chunks = lines
             self._compute_diff(key, parent_lines, lines)
             del lines
-        # Is this content required for any more children?
         if key in self.refcounts:
             self.chunks[key] = this_chunks
 
-    def _extract_diffs(self):
-        needed_keys, _refcounts = self._find_needed_keys()
-        for record in self.vf.get_record_stream(needed_keys, "topological", True):
-            if record.storage_kind == "absent":
-                raise RevisionNotPresent(record.key, self.vf)
-            self._process_one_record(record.key, record.get_bytes_as("chunked"))
-
     def compute_diffs(self):
-        self._extract_diffs()
-        dpop = self.diffs.pop
-        return [dpop(k) for k in self.ordered_keys]
+        """Return one `MultiParent` per ordered key, in input order."""
+        return list(_versionedfile_rs.make_mpdiffs(self.vf, self.ordered_keys))
 
 
 class VersionedFile:
@@ -518,15 +415,11 @@ class VersionedFile:
 
     def _check_lines_not_unicode(self, lines):
         """Check that lines being added to a versioned file are not unicode."""
-        for line in lines:
-            if not isinstance(line, bytes):
-                raise TypeError("lines")
+        _versionedfile_rs.check_lines_not_unicode(lines)
 
     def _check_lines_are_lines(self, lines):
         """Check that the lines really are full lines without inline EOL."""
-        for line in lines:
-            if b"\n" in line[:-1]:
-                raise ValueError("lines contain newlines")
+        _versionedfile_rs.check_lines_are_lines(lines)
 
     def get_format_signature(self):
         """Get a text description of the data encoding in this file.
@@ -536,52 +429,14 @@ class VersionedFile:
         raise NotImplementedError(self.get_format_signature)
 
     def make_mpdiffs(self, version_ids):
-        """Create multiparent diffs for specified versions."""
-        # XXX: Can't use _MPDiffGenerator just yet. This is because version_ids
-        #      is a list of strings, not keys. And while self.get_record_stream
-        #      is supported, it takes *keys*, while self.get_parent_map() takes
-        #      strings... *sigh*
-        knit_versions = set()
-        knit_versions.update(version_ids)
-        parent_map = self.get_parent_map(version_ids)
-        for version_id in version_ids:
-            try:
-                knit_versions.update(parent_map[version_id])
-            except KeyError as e:
-                raise RevisionNotPresent(version_id, self) from e
-        # We need to filter out ghosts, because we can't diff against them.
-        knit_versions = set(self.get_parent_map(knit_versions))
-        lines = dict(
-            zip(
-                knit_versions, self._get_lf_split_line_list(knit_versions), strict=False
-            )
-        )
-        diffs = []
-        for version_id in version_ids:
-            target = lines[version_id]
-            try:
-                parents = [
-                    lines[p] for p in parent_map[version_id] if p in knit_versions
-                ]
-            except KeyError as e:
-                # I don't know how this could ever trigger.
-                # parent_map[version_id] was already triggered in the previous
-                # for loop, and lines[p] has the 'if p in knit_versions' check,
-                # so we again won't have a KeyError.
-                raise RevisionNotPresent(version_id, self) from e
-            if len(parents) > 0:
-                left_parent_blocks = self._extract_blocks(
-                    version_id, parents[0], target
-                )
-            else:
-                left_parent_blocks = None
-            diffs.append(
-                multiparent.MultiParent.from_lines(target, parents, left_parent_blocks)
-            )
-        return diffs
+        """Create multiparent diffs for specified versions.
 
-    def _extract_blocks(self, version_id, source, target):
-        return None
+        Drives the parent-map / ghost-filter / bulk-fetch / per-record
+        ``MultiParent.from_lines`` loop in Rust; the only Python callbacks
+        it invokes are ``self.get_parent_map`` (twice) and
+        ``self._get_lf_split_line_list`` (once, in bulk).
+        """
+        return list(_versionedfile_rs.make_mpdiffs_singular(self, list(version_ids)))
 
     def add_mpdiffs(self, records):
         """Add mpdiffs to this VersionedFile.
@@ -589,55 +444,12 @@ class VersionedFile:
         Records should be iterables of version, parents, expected_sha1,
         mpdiff. mpdiff should be a MultiParent instance.
         """
-        # Does this need to call self._check_write_ok()? (IanC 20070919)
-        vf_parents = {}
-        mpvf = multiparent.MultiMemoryVersionedFile()
-        versions = []
-        for version, parent_ids, _expected_sha1, mpdiff in records:
-            versions.append(version)
-            mpvf.add_diff(mpdiff, version, parent_ids)
-        needed_parents = set()
-        for _version, parent_ids, _expected_sha1, _mpdiff in records:
-            needed_parents.update(p for p in parent_ids if not mpvf.has_version(p))
-        present_parents = set(self.get_parent_map(needed_parents))
-        for parent_id, lines in zip(
-            present_parents, self._get_lf_split_line_list(present_parents), strict=False
-        ):
-            mpvf.add_version(lines, parent_id, [])
-        for (version, parent_ids, _expected_sha1, mpdiff), lines in zip(
-            records, mpvf.get_line_list(versions), strict=False
-        ):
-            if len(parent_ids) == 1:
-                left_matching_blocks = list(
-                    mpdiff.get_matching_blocks(
-                        0, mpvf.get_diff(parent_ids[0]).num_lines()
-                    )
-                )
-            else:
-                left_matching_blocks = None
-            try:
-                _, _, version_text = self.add_lines_with_ghosts(
-                    version,
-                    parent_ids,
-                    lines,
-                    vf_parents,
-                    left_matching_blocks=left_matching_blocks,
-                )
-            except NotImplementedError:
-                # The vf can't handle ghosts, so add lines normally, which will
-                # (reasonably) fail if there are ghosts in the data.
-                _, _, version_text = self.add_lines(
-                    version,
-                    parent_ids,
-                    lines,
-                    vf_parents,
-                    left_matching_blocks=left_matching_blocks,
-                )
-            vf_parents[version] = version_text
-        sha1s = self.get_sha1s(versions)
-        for version, _parent_ids, expected_sha1, _mpdiff in records:
-            if expected_sha1 != sha1s[version]:
-                raise VersionedFileInvalidChecksum(version)
+        # Drives the build-mpvf / fetch-parents / reconstruct / add_lines
+        # loop in Rust; the only Python callbacks it invokes are
+        # self.get_parent_map, self._get_lf_split_line_list,
+        # self.add_lines_with_ghosts (with fallback to self.add_lines), and
+        # self.get_sha1s for the post-hoc checksum verification.
+        _versionedfile_rs.add_mpdiffs_singular(self, list(records))
 
     def get_text(self, version_id):
         """Return version contents as a text string.
@@ -1008,7 +820,12 @@ class OrderingVersionedFilesDecorator(RecordingVersionedFilesDecorator):
 
 
 class KeyMapper:
-    """KeyMappers map between keys and underlying partitioned storage."""
+    """Abstract KeyMapper kept as a Python type for ``isinstance`` checks.
+
+    The concrete mappers (``ConstantMapper``, ``PrefixMapper``,
+    ``HashPrefixMapper``, ``HashEscapedPrefixMapper``) are pyclasses
+    backed by ``crates/bazaar/src/key_mapper.rs``.
+    """
 
     def map(self, key):
         """Map key to an underlying storage identifier.
@@ -1029,70 +846,10 @@ class KeyMapper:
         raise NotImplementedError(self.unmap)
 
 
-class ConstantMapper(KeyMapper):
-    """A key mapper that maps to a constant result."""
-
-    def __init__(self, result):
-        """Create a ConstantMapper which will return result for all maps."""
-        self._result = result
-
-    def map(self, key):
-        """See KeyMapper.map()."""
-        return self._result
-
-
-class URLEscapeMapper(KeyMapper):
-    """Base class for use with transport backed storage.
-
-    Subclasses are responsible for url-escaping their `map` output and
-    url-unescaping their `unmap` input; the actual transformations live in
-    the Rust `versionedfile` module.
-    """
-
-
-class PrefixMapper(URLEscapeMapper):
-    """A key mapper that extracts the first component of a key.
-
-    This mapper is for use with a transport based backend.
-    """
-
-    def map(self, key):
-        """See KeyMapper.map()."""
-        return _versionedfile_rs.prefix_map(key[0])
-
-    def unmap(self, partition_id):
-        """See KeyMapper.unmap()."""
-        return (_versionedfile_rs.prefix_unmap(partition_id),)
-
-
-class HashPrefixMapper(URLEscapeMapper):
-    """A key mapper that combines the first component of a key with a hash.
-
-    This mapper is for use with a transport based backend.
-    """
-
-    def map(self, key):
-        """See KeyMapper.map()."""
-        return _versionedfile_rs.hash_prefix_map(key[0])
-
-    def unmap(self, partition_id):
-        """See KeyMapper.unmap()."""
-        return (_versionedfile_rs.hash_prefix_unmap(partition_id),)
-
-
-class HashEscapedPrefixMapper(HashPrefixMapper):
-    """Combines the escaped first component of a key with a hash.
-
-    This mapper is for use with a transport based backend.
-    """
-
-    def map(self, key):
-        """See KeyMapper.map()."""
-        return _versionedfile_rs.hash_escaped_prefix_map(key[0])
-
-    def unmap(self, partition_id):
-        """See KeyMapper.unmap()."""
-        return (_versionedfile_rs.hash_escaped_prefix_unmap(partition_id),)
+ConstantMapper = _versionedfile_rs.ConstantMapper
+PrefixMapper = _versionedfile_rs.PrefixMapper
+HashPrefixMapper = _versionedfile_rs.HashPrefixMapper
+HashEscapedPrefixMapper = _versionedfile_rs.HashEscapedPrefixMapper
 
 
 def make_versioned_files_factory(versioned_file_factory, mapper):
@@ -1225,42 +982,10 @@ class VersionedFiles:
         Records should be iterables of version, parents, expected_sha1,
         mpdiff. mpdiff should be a MultiParent instance.
         """
-        vf_parents = {}
-        mpvf = multiparent.MultiMemoryVersionedFile()
-        versions = []
-        for version, parent_ids, _expected_sha1, mpdiff in records:
-            versions.append(version)
-            mpvf.add_diff(mpdiff, version, parent_ids)
-        needed_parents = set()
-        for _version, parent_ids, _expected_sha1, _mpdiff in records:
-            needed_parents.update(p for p in parent_ids if not mpvf.has_version(p))
-        # It seems likely that adding all the present parents as fulltexts can
-        # easily exhaust memory.
-        for record in self.get_record_stream(needed_parents, "unordered", True):
-            if record.storage_kind == "absent":
-                continue
-            mpvf.add_version(record.get_bytes_as("lines"), record.key, [])
-        for (key, parent_keys, expected_sha1, mpdiff), lines in zip(
-            records, mpvf.get_line_list(versions), strict=False
-        ):
-            if len(parent_keys) == 1:
-                left_matching_blocks = list(
-                    mpdiff.get_matching_blocks(
-                        0, mpvf.get_diff(parent_keys[0]).num_lines()
-                    )
-                )
-            else:
-                left_matching_blocks = None
-            version_sha1, _, version_text = self.add_lines(
-                key,
-                parent_keys,
-                lines,
-                vf_parents,
-                left_matching_blocks=left_matching_blocks,
-            )
-            if version_sha1 != expected_sha1:
-                raise VersionedFileInvalidChecksum(version)
-            vf_parents[key] = version_text
+        # Drives the build-mpvf / fetch-parents / reconstruct / add_lines
+        # loop in Rust; the only Python callbacks it invokes are
+        # self.get_record_stream and self.add_lines.
+        _versionedfile_rs.add_mpdiffs(self, records)
 
     def annotate(self, key):
         """Return a list of (version-key, line) tuples for the text of key.
@@ -1304,28 +1029,18 @@ class VersionedFiles:
 
     def _check_lines_not_unicode(self, lines):
         """Check that lines being added to a versioned file are not unicode."""
-        for line in lines:
-            if line.__class__ is not bytes:
-                raise TypeError("lines")
+        _versionedfile_rs.check_lines_not_unicode(lines)
 
     def _check_lines_are_lines(self, lines):
         """Check that the lines really are full lines without inline EOL."""
-        for line in lines:
-            if b"\n" in line[:-1]:
-                raise ValueError("lines contain newlines")
+        _versionedfile_rs.check_lines_are_lines(lines)
 
     def get_known_graph_ancestry(self, keys):
         """Get a KnownGraph instance with the ancestry of keys."""
-        # most basic implementation is a loop around get_parent_map
-        pending = set(keys)
-        parent_map = {}
-        while pending:
-            this_parent_map = self.get_parent_map(pending)
-            parent_map.update(this_parent_map)
-            pending = set(itertools.chain.from_iterable(this_parent_map.values()))
-            pending.difference_update(parent_map)
-        kg = _mod_known_graph.KnownGraph(parent_map)
-        return kg
+        # The get_parent_map walk runs in Rust; it only needs this object's
+        # get_parent_map, which it calls back into.
+        parent_map = _versionedfile_rs.known_graph_ancestry_map(self, list(keys))
+        return _mod_known_graph.KnownGraph(parent_map)
 
     def get_parent_map(self, keys):
         """Get a map of the parents of keys.
@@ -1426,9 +1141,6 @@ class VersionedFiles:
         return VersionedFileAnnotator(self)
 
     missing_keys = index._missing_keys_from_parent_map
-
-    def _extract_blocks(self, version_id, source, target):
-        return None
 
     def _transitive_fallbacks(self):
         """Return the whole stack of fallback versionedfiles.
@@ -1914,78 +1626,14 @@ class WeaveMerge(PlanWeaveMerge):
         PlanWeaveMerge.__init__(self, plan, a_marker, b_marker)
 
 
-class VirtualVersionedFiles(VersionedFiles):
-    """Dummy implementation for VersionedFiles that uses other functions for
-    obtaining fulltexts and parent maps.
+VirtualVersionedFiles = _versionedfile_rs.VirtualVersionedFiles
+"""See VersionedFiles. Storage-less implementation backed by two callbacks.
 
-    This is always on the bottom of the stack and uses string keys
-    (rather than tuples) internally.
-    """
-
-    def __init__(self, get_parent_map, get_lines):
-        """Create a VirtualVersionedFiles.
-
-        :param get_parent_map: Same signature as Repository.get_parent_map.
-        :param get_lines: Should return lines for specified key or None if
-                          not available.
-        """
-        super().__init__()
-        self._get_parent_map = get_parent_map
-        self._get_lines = get_lines
-
-    def check(self, progressbar=None):
-        """See VersionedFiles.check.
-
-        :note: Always returns True for VirtualVersionedFiles.
-        """
-        return True
-
-    def add_mpdiffs(self, records):
-        """See VersionedFiles.mpdiffs.
-
-        :note: Not implemented for VirtualVersionedFiles.
-        """
-        raise NotImplementedError(self.add_mpdiffs)
-
-    def get_parent_map(self, keys):
-        """See VersionedFiles.get_parent_map."""
-        parent_view = self._get_parent_map(k for (k,) in keys).items()
-        return {(k,): tuple((p,) for p in v) for k, v in parent_view}
-
-    def get_sha1s(self, keys):
-        """See VersionedFiles.get_sha1s."""
-        ret = {}
-        for (k,) in keys:
-            lines = self._get_lines(k)
-            if lines is not None:
-                if not isinstance(lines, list):
-                    raise AssertionError
-                ret[(k,)] = osutils.sha_strings(lines)
-        return ret
-
-    def get_record_stream(self, keys, ordering, include_delta_closure):
-        """See VersionedFiles.get_record_stream."""
-        for (k,) in list(keys):
-            lines = self._get_lines(k)
-            if lines is not None:
-                if not isinstance(lines, list):
-                    raise AssertionError
-                yield ChunkedContentFactory(
-                    (k,),
-                    None,
-                    sha1=osutils.sha_strings(lines),
-                    chunks=lines,
-                )
-            else:
-                yield AbsentContentFactory((k,))
-
-    def iter_lines_added_or_present_in_keys(self, keys, pb=None):
-        """See VersionedFile.iter_lines_added_or_present_in_versions()."""
-        for i, (key,) in enumerate(keys):
-            if pb is not None:
-                pb.update("Finding changed lines", i, len(keys))
-            for l in self._get_lines(key):
-                yield (l, key)
+`__init__(get_parent_map, get_lines)`: caller-supplied callables operating
+on bare bytes keys. Backed by the Rust pyclass; the Python wrapper used
+to live here and applied the same `(k,) <-> k` rewrapping the Rust
+pyclass now does internally.
+"""
 
 
 class NoDupeAddLinesDecorator:

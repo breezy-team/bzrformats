@@ -220,9 +220,7 @@ class TestVersionedFile(TestCase):
 
     def test_add_version(self):
         vf = self.make_vf()
-        self.assertEqual(REV_A, vf._lines[b"rev-a"])
-        vf.clear_cache()
-        self.assertEqual(vf._lines, {})
+        self.assertEqual(REV_A, vf.cache_version(b"rev-a"))
 
     def test_get_line_list(self):
         vf = self.make_vf()
@@ -233,33 +231,12 @@ class TestVersionedFile(TestCase):
     def test_reconstruct_empty(self):
         vf = multiparent.MultiMemoryVersionedFile()
         vf.add_version([], b"a", [])
-        self.assertEqual([], self.reconstruct_version(vf, b"a"))
-
-    @staticmethod
-    def reconstruct(vf, revision_id, start, end):
-        reconstructor = multiparent._Reconstructor(vf, vf._lines, vf._parents)
-        lines = []
-        reconstructor._reconstruct(lines, revision_id, start, end)
-        return lines
-
-    @staticmethod
-    def reconstruct_version(vf, revision_id):
-        reconstructor = multiparent._Reconstructor(vf, vf._lines, vf._parents)
-        lines = []
-        reconstructor.reconstruct_version(lines, revision_id)
-        return lines
+        self.assertEqual([], vf.cache_version(b"a"))
 
     def test_reconstructor(self):
         vf = self.make_vf()
-        self.assertEqual([b"a\n", b"b\n"], self.reconstruct(vf, b"rev-a", 0, 2))
-        self.assertEqual([b"c\n", b"d\n"], self.reconstruct(vf, b"rev-a", 2, 4))
-        self.assertEqual([b"e\n", b"f\n"], self.reconstruct(vf, b"rev-c", 2, 4))
-        self.assertEqual(
-            [b"a\n", b"b\n", b"e\n", b"f\n"], self.reconstruct(vf, b"rev-c", 0, 4)
-        )
-        self.assertEqual(
-            [b"a\n", b"b\n", b"e\n", b"f\n"], self.reconstruct_version(vf, b"rev-c")
-        )
+        self.assertEqual([b"a\n", b"b\n", b"c\n", b"d\n"], vf.cache_version(b"rev-a"))
+        self.assertEqual([b"a\n", b"b\n", b"e\n", b"f\n"], vf.cache_version(b"rev-c"))
 
     def test_get_build_ranking(self):
         vf = self.make_vf()

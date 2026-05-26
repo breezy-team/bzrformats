@@ -42,7 +42,7 @@ import threading
 from collections.abc import Callable, Generator, Iterator
 from typing import Union
 
-from . import lru_cache, osutils
+from . import lru_cache
 from ._bzr_rs import chk_map as _chk_map_rs
 from .errors import NoSuchRevision
 from .registry import Registry
@@ -258,19 +258,6 @@ class CHKMap:
     def _dump_tree(self, include_keys=False, encoding="utf-8"):
         """Return the tree in a string representation."""
         self._ensure_root()
-
-        def decode(x):
-            return x.decode(encoding)
-
-        res = self._dump_tree_node(
-            self._root_node,
-            prefix=b"",
-            indent="",
-            decode=decode,
-            include_keys=include_keys,
-        )
-        res.append("")  # Give a trailing '\n'
-        return "\n".join(res)
 
         def decode(x):
             return x.decode(encoding)
@@ -865,26 +852,12 @@ class LeafNode(Node):
         This differs from self._raw_size in that it includes the bytes used for
         the header.
         """
-        if self._common_serialised_prefix is None:
-            bytes_for_items = 0
-            prefix_len = 0
-        else:
-            # We will store a single string with the common prefix
-            # And then that common prefix will not be stored in any of the
-            # entry lines
-            prefix_len = len(self._common_serialised_prefix)
-            bytes_for_items = self._raw_size - (prefix_len * self._len)
-        return (
-            9  # 'chkleaf:\n' +
-            + len(str(self._maximum_size))
-            + 1
-            + len(str(self._key_width))
-            + 1
-            + len(str(self._len))
-            + 1
-            + prefix_len
-            + 1
-            + bytes_for_items
+        return _chk_map_rs._leaf_node_current_size(
+            self._maximum_size,
+            self._key_width,
+            self._len,
+            self._raw_size,
+            self._common_serialised_prefix,
         )
 
     @classmethod
@@ -930,16 +903,7 @@ class LeafNode(Node):
             yield from self._items.items()
 
     def _key_value_len(self, key, value):
-        # TODO: Should probably be done without actually joining the key, but
-        #       then that can be done via the C extension
-        return (
-            len(self._serialise_key(key))
-            + 1
-            + len(b"%d" % value.count(b"\n"))
-            + 1
-            + len(value)
-            + 1
-        )
+        return _chk_map_rs._leaf_node_key_value_len(key, value)
 
     def _search_key(self, key: Key) -> bytes:
         return self._search_key_func(key)
@@ -1056,30 +1020,13 @@ class LeafNode(Node):
         :param store: A VersionedFiles honouring the CHK extensions.
         :return: An iterable of the keys inserted by this operation.
         """
-        lines = [b"chkleaf:\n"]
-        lines.append(b"%d\n" % self._maximum_size)
-        lines.append(b"%d\n" % self._key_width)
-        lines.append(b"%d\n" % self._len)
-        if self._common_serialised_prefix is None:
-            lines.append(b"\n")
-            if len(self._items) != 0:
-                raise AssertionError(
-                    "If _common_serialised_prefix is None we should have no items"
-                )
-        else:
-            lines.append(b"%s\n" % (self._common_serialised_prefix,))
-            prefix_len = len(self._common_serialised_prefix)
-        for key, value in sorted(self._items.items()):
-            # Always add a final newline
-            value_lines = osutils.chunks_to_lines([value + b"\n"])
-            serialized = b"%s\x00%d\n" % (self._serialise_key(key), len(value_lines))
-            if not serialized.startswith(self._common_serialised_prefix):
-                raise AssertionError(
-                    f"We thought the common prefix was {self._common_serialised_prefix!r}"
-                    f" but entry {serialized!r} does not have it in common"
-                )
-            lines.append(serialized[prefix_len:])
-            lines.extend(value_lines)
+        sorted_items = sorted(self._items.items())
+        lines = _chk_map_rs._serialise_leaf_node(
+            self._maximum_size,
+            self._key_width,
+            sorted_items,
+            self._common_serialised_prefix,
+        )
         sha1, _, _ = store.add_lines((None,), (), lines)
         self._key = (b"sha1:" + sha1,)
         data = b"".join(lines)
@@ -1205,11 +1152,11 @@ class InternalNode(Node):
 
     def _current_size(self):
         """Answer the current serialised size of this node."""
-        return (
-            self._raw_size
-            + len(str(self._len))
-            + len(str(self._key_width))
-            + len(str(self._maximum_size))
+        return _chk_map_rs._internal_node_current_size(
+            self._maximum_size,
+            self._key_width,
+            self._len,
+            self._raw_size,
         )
 
     @classmethod
@@ -1512,28 +1459,24 @@ class InternalNode(Node):
                 if node._key is not None:
                     # Never altered
                     continue
-                for key in node.serialise(store):
-                    yield key
+                yield from node.serialise(store)
             else:
                 raise AssertionError(
                     f"InternalNode._items should only contain tuples or Nodes, not {node.__class__}"
                 )
-        lines = [b"chknode:\n"]
-        lines.append(b"%d\n" % self._maximum_size)
-        lines.append(b"%d\n" % self._key_width)
-        lines.append(b"%d\n" % self._len)
         if self._search_prefix is None:
             raise AssertionError("_search_prefix should not be None")
-        lines.append(b"%s\n" % (self._search_prefix,))
-        prefix_len = len(self._search_prefix)
-        for prefix, node in sorted(self._items.items()):
-            key = node[0] if isinstance(node, tuple) else node._key[0]
-            serialised = b"%s\x00%s\n" % (prefix, key)
-            if not serialised.startswith(self._search_prefix):
-                raise AssertionError(
-                    f"prefixes mismatch: {serialised} must start with {self._search_prefix}"
-                )
-            lines.append(serialised[prefix_len:])
+        sorted_items = [
+            (prefix, node[0] if isinstance(node, tuple) else node._key[0])
+            for prefix, node in sorted(self._items.items())
+        ]
+        lines = _chk_map_rs._serialise_internal_node(
+            self._maximum_size,
+            self._key_width,
+            self._len,
+            self._search_prefix,
+            sorted_items,
+        )
         sha1, _, _ = store.add_lines((None,), (), lines)
         self._key = (b"sha1:" + sha1,)
         _get_cache()[self._key] = b"".join(lines)

@@ -2674,15 +2674,10 @@ pub(crate) fn py_iter_entries_prefix<'py>(
         if key_rs.len() != key_length {
             continue;
         }
-        let any_match = parsed.iter().any(|(_, prefix)| {
-            prefix
-                .iter()
-                .zip(key_rs.iter())
-                .all(|(p_elem, k_elem)| match p_elem {
-                    Some(p) => p == k_elem,
-                    None => true,
-                })
-        });
+        let prefixes_only: Vec<&bazaar::index::KeyPrefix> = parsed.iter().map(|(_, p)| p).collect();
+        let any_match = prefixes_only
+            .iter()
+            .any(|p| bazaar::index::key_matches_prefix(p, &key_rs));
         if !any_match {
             continue;
         }

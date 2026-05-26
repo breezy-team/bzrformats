@@ -24,10 +24,13 @@
 //!   lines plus wire prefix construction).
 //! - [`sort`] — `sort_gc_optimal`, the topological groupcompress-ordering
 //!   routine used when streaming records to a target repository.
+//! - [`gcvf`] — the `GroupCompressVersionedFiles` orchestration: read-memo
+//!   types, block batching, and record-stream assembly.
 
 pub mod block;
 pub mod compressor;
 pub mod delta;
+pub mod gcvf;
 pub mod line_delta;
 pub mod manager;
 pub mod rabin_delta;

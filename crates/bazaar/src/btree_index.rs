@@ -189,7 +189,10 @@ pub fn parse_leaf_lines(
     Ok(out)
 }
 
-fn parse_leaf_line(
+/// Parse a single body line of a B+Tree leaf node (after the
+/// `type=leaf` header has already been consumed). Used by the
+/// streaming pyo3 parser that processes lines one at a time.
+pub fn parse_leaf_line(
     line: &[u8],
     key_length: usize,
     ref_list_length: usize,

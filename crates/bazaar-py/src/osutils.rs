@@ -18,6 +18,34 @@ fn rand_chars(num: usize) -> PyResult<String> {
 }
 
 #[pyfunction]
+fn contains_whitespace(s: &str) -> bool {
+    bazaar::osutils::contains_whitespace(s)
+}
+
+/// Join the input chunks and split the result into lines, keeping each
+/// line's trailing `\n`. Mirrors `osutils.chunks_to_lines`: a list of
+/// bytes chunks in, a list of bytes lines out, with the final line
+/// possibly missing its terminator. Delegates the actual splitting to
+/// `bazaar::osutils::split_lines`.
+#[pyfunction]
+fn chunks_to_lines<'py>(
+    py: Python<'py>,
+    chunks: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut joined: Vec<u8> = Vec::new();
+    for chunk in chunks.try_iter()? {
+        let chunk = chunk?;
+        let bytes = chunk.cast_into::<PyBytes>()?;
+        joined.extend_from_slice(bytes.as_bytes());
+    }
+    let out = PyList::empty(py);
+    for line in bazaar::osutils::split_lines(&joined) {
+        out.append(PyBytes::new(py, &line))?;
+    }
+    Ok(out)
+}
+
+#[pyfunction]
 fn is_inside(dir: &str, fname: &str) -> PyResult<bool> {
     let dir_path = Path::new(dir);
     let fname_path = Path::new(fname);
@@ -98,6 +126,8 @@ pub fn supports_symlinks(path: PathBuf) -> Option<bool> {
 pub fn _osutils_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(split_lines, m)?)?;
     m.add_function(wrap_pyfunction!(rand_chars, m)?)?;
+    m.add_function(wrap_pyfunction!(contains_whitespace, m)?)?;
+    m.add_function(wrap_pyfunction!(chunks_to_lines, m)?)?;
     m.add_function(wrap_pyfunction!(is_inside, m)?)?;
     m.add_function(wrap_pyfunction!(is_inside_any, m)?)?;
     m.add_function(wrap_pyfunction!(parent_directories, m)?)?;

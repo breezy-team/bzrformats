@@ -24,6 +24,7 @@ mod lock;
 mod multiparent;
 mod osutils;
 mod pack;
+mod plan_merge;
 mod smart;
 mod textmerge;
 mod transport;
@@ -32,6 +33,8 @@ mod versionedfile;
 mod weave;
 
 import_exception!(bzrformats.errors, ReservedId);
+import_exception!(breezy.bugtracker, InvalidLineInBugsProperty);
+import_exception!(breezy.bugtracker, InvalidBugStatus);
 
 /// Create a new file id suffix that is reasonably unique.
 ///
@@ -320,6 +323,23 @@ impl Revision {
 
     fn bug_urls(&self) -> Vec<String> {
         self.0.bug_urls()
+    }
+
+    /// Iterate over `(url, status)` tuples decoded from the ``bugs`` property.
+    ///
+    /// Mirrors `breezy.revision.Revision.iter_bugs`. Malformed lines raise
+    /// `breezy.bugtracker.InvalidLineInBugsProperty`; unknown status tokens
+    /// raise `breezy.bugtracker.InvalidBugStatus`.
+    fn iter_bugs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match self.0.iter_bugs() {
+            Ok(pairs) => Ok(pyo3::types::PyList::new(py, pairs)?.try_iter()?.into_any()),
+            Err(bazaar::revision::BugError::InvalidLine(line)) => {
+                Err(InvalidLineInBugsProperty::new_err(line))
+            }
+            Err(bazaar::revision::BugError::InvalidStatus(status)) => {
+                Err(InvalidBugStatus::new_err(status))
+            }
+        }
     }
 }
 
@@ -999,6 +1019,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let versionedfilem = versionedfile::_versionedfile_rs(py)?;
     m.add_submodule(&versionedfilem)?;
 
+    let plan_mergem = plan_merge::_plan_merge_rs(py)?;
+    m.add_submodule(&plan_mergem)?;
+
     let btree_serializerm = btree_serializer::_btree_serializer_rs(py)?;
     m.add_submodule(&btree_serializerm)?;
 
@@ -1044,6 +1067,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.index", module_name), &indexm)?;
     modules.set_item(format!("{}.btree_index", module_name), &btree_indexm)?;
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
+    modules.set_item(format!("{}.plan_merge", module_name), &plan_mergem)?;
     modules.set_item(
         format!("{}.btree_serializer", module_name),
         &btree_serializerm,

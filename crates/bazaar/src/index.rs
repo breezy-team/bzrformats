@@ -488,6 +488,28 @@ pub type IndexEntry = (IndexKey, Vec<u8>, RefLists);
 /// match any key element at that position.
 pub type KeyPrefix = Vec<Option<Vec<u8>>>;
 
+/// `true` when `key` matches `prefix` position-by-position: every
+/// `Some` slot in the prefix must equal the corresponding key element,
+/// and `None` slots match anything. `key` and `prefix` must have the
+/// same length.
+#[inline]
+pub fn key_matches_prefix(prefix: &KeyPrefix, key: &[Vec<u8>]) -> bool {
+    if prefix.len() != key.len() {
+        return false;
+    }
+    prefix.iter().zip(key.iter()).all(|(p, k)| match p {
+        Some(p) => p == k,
+        None => true,
+    })
+}
+
+/// `true` when `key` matches any prefix in `prefixes`. Matches the
+/// `iter_entries_prefix` semantics of [`GraphIndex`].
+#[inline]
+pub fn key_matches_any_prefix(prefixes: &[KeyPrefix], key: &[Vec<u8>]) -> bool {
+    prefixes.iter().any(|p| key_matches_prefix(p, key))
+}
+
 /// `true` when `b` is one of the bytes a key element must not contain:
 /// tab, LF, VT, FF, CR, NUL, or space.
 #[inline]
@@ -3448,5 +3470,36 @@ mod tests {
         assert_eq!(m.key_index(&Some(key(&[b"a"]))), 0);
         assert_eq!(m.key_index(&Some(key(&[b"b"]))), 1);
         assert_eq!(m.key_index(&Some(key(&[b"e"]))), 1);
+    }
+
+    #[test]
+    fn key_matches_prefix_exact_and_wildcard() {
+        let p: KeyPrefix = vec![Some(b"a".to_vec()), None, Some(b"c".to_vec())];
+        assert!(key_matches_prefix(&p, &key(&[b"a", b"foo", b"c"])));
+        assert!(key_matches_prefix(&p, &key(&[b"a", b"bar", b"c"])));
+        assert!(!key_matches_prefix(&p, &key(&[b"a", b"foo", b"d"])));
+        assert!(!key_matches_prefix(&p, &key(&[b"x", b"foo", b"c"])));
+    }
+
+    #[test]
+    fn key_matches_prefix_rejects_length_mismatch() {
+        let p: KeyPrefix = vec![Some(b"a".to_vec())];
+        assert!(!key_matches_prefix(&p, &key(&[b"a", b"b"])));
+        assert!(!key_matches_prefix(&p, &key(&[])));
+    }
+
+    #[test]
+    fn key_matches_any_prefix_unions() {
+        let p1: KeyPrefix = vec![Some(b"a".to_vec()), None];
+        let p2: KeyPrefix = vec![Some(b"b".to_vec()), None];
+        assert!(key_matches_any_prefix(
+            &[p1.clone(), p2.clone()],
+            &key(&[b"a", b"x"])
+        ));
+        assert!(key_matches_any_prefix(
+            &[p1.clone(), p2.clone()],
+            &key(&[b"b", b"y"])
+        ));
+        assert!(!key_matches_any_prefix(&[p1, p2], &key(&[b"c", b"z"])));
     }
 }

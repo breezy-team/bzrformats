@@ -20,7 +20,6 @@ import contextlib
 import os
 from io import BytesIO
 
-from . import errors
 from ._bzr_rs import multiparent as _multiparent_rs
 
 
@@ -69,26 +68,11 @@ class MultiParent:
     @staticmethod
     def from_lines(text, parents=(), left_blocks=None):
         """Produce a MultiParent from a list of lines and parents."""
-        if len(parents) > 0:
-            try:
-                import patiencediff
-            except ImportError as e:
-                raise ImportError(
-                    "patiencediff module is required for multiparent operations"
-                ) from e
-
-            def compare(parent):
-                matcher = patiencediff.PatienceSequenceMatcher(None, parent, text)
-                return list(matcher.get_matching_blocks())
-
-            if left_blocks is None:
-                left_blocks = compare(parents[0])
-            else:
-                left_blocks = list(left_blocks)
-            parent_blocks = [left_blocks] + [compare(p) for p in parents[1:]]
-        else:
-            parent_blocks = []
-        raw_hunks = _multiparent_rs.from_lines_with_blocks(list(text), parent_blocks)
+        raw_hunks = _multiparent_rs.from_lines(
+            list(text),
+            [list(p) for p in parents],
+            None if left_blocks is None else list(left_blocks),
+        )
         hunks = []
         for kind, payload in raw_hunks:
             if kind == b"n":
@@ -470,29 +454,8 @@ class BaseVersionedFile:
         return lines
 
 
-class MultiMemoryVersionedFile(BaseVersionedFile):
-    """Memory-backed pseudo-versionedfile."""
-
-    def __init__(self, snapshot_interval=25, max_snapshots=None):
-        """Initialize a MultiMemoryVersionedFile."""
-        BaseVersionedFile.__init__(self, snapshot_interval, max_snapshots)
-        self._diffs = {}
-
-    def add_diff(self, diff, version_id, parent_ids):
-        """Add a diff to the versioned file."""
-        self._diffs[version_id] = diff
-        self._parents[version_id] = parent_ids
-
-    def get_diff(self, version_id):
-        """Get the diff for a version."""
-        try:
-            return self._diffs[version_id]
-        except KeyError as e:
-            raise errors.RevisionNotPresent(version_id, self) from e
-
-    def destroy(self):
-        """Clear all diffs."""
-        self._diffs = {}
+MultiMemoryVersionedFile = _multiparent_rs.MultiMemoryVersionedFile
+"""Memory-backed pseudo-versionedfile. Backed by Rust."""
 
 
 class MultiVersionedFile(BaseVersionedFile):
