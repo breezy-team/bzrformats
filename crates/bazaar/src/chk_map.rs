@@ -582,6 +582,26 @@ fn decimal_digits(n: usize) -> usize {
     digits
 }
 
+/// Check whether every search key in `search_keys` is identical.
+///
+/// Mirrors `LeafNode._are_search_keys_identical`: this is the safety check
+/// that lets a LeafNode grow past `_maximum_size` when its keys all hash to
+/// the same search key (a collision under hash-based search funcs). An
+/// empty iterator returns `true` (no two keys disagree).
+pub fn are_search_keys_identical<I, S>(search_keys: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<[u8]>,
+{
+    let mut iter = search_keys.into_iter();
+    let first = match iter.next() {
+        Some(k) => k,
+        None => return true,
+    };
+    let first = first.as_ref();
+    iter.all(|k| k.as_ref() == first)
+}
+
 /// Split `data` into lines, keeping the trailing `\n` on each non-final
 /// line. Mirrors `osutils.chunks_to_lines([b"".join(chunks)])` for a
 /// single chunk input: every `\n` ends a line, and any unterminated
@@ -946,6 +966,36 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         // maximum_size=100 (3 digits) → 50 + 1 + 1 + 3 = 55
         let got = internal_node_current_size(100, 1, 3, 50);
         assert_eq!(got, 55);
+    }
+
+    #[test]
+    fn are_search_keys_identical_returns_true_for_empty() {
+        let empty: [&[u8]; 0] = [];
+        assert!(are_search_keys_identical(empty));
+    }
+
+    #[test]
+    fn are_search_keys_identical_returns_true_for_single() {
+        assert!(are_search_keys_identical([b"hash".as_slice()]));
+    }
+
+    #[test]
+    fn are_search_keys_identical_returns_true_when_all_match() {
+        assert!(are_search_keys_identical([
+            b"same".as_slice(),
+            b"same",
+            b"same"
+        ]));
+    }
+
+    #[test]
+    fn are_search_keys_identical_returns_false_when_one_differs() {
+        assert!(!are_search_keys_identical([
+            b"same".as_slice(),
+            b"same",
+            b"other"
+        ]));
+        assert!(!are_search_keys_identical([b"first".as_slice(), b"second"]));
     }
 
     #[test]

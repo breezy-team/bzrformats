@@ -1056,14 +1056,9 @@ class LeafNode(Node):
         keys to collide. If that happens enough, we may try overflow a
         LeafNode, but as all are collisions, we must not split.
         """
-        common_search_key = None
-        for key in self._items:
-            search_key = self._search_key(key)
-            if common_search_key is None:
-                common_search_key = search_key
-            elif search_key != common_search_key:
-                return False
-        return True
+        return _chk_map_rs._are_search_keys_identical(
+            self._search_key_func(key) for key in self._items
+        )
 
     def _compute_serialised_prefix(self):
         """Determine the common prefix for serialised keys in this node.

@@ -1,7 +1,7 @@
 use bazaar::chk_map::{
-    deserialise_internal_node, deserialise_leaf_node, internal_node_current_size,
-    leaf_node_current_size, leaf_node_key_value_len, serialise_internal_node, serialise_leaf_node,
-    Error as ChkError, InternalNodeChild, Key,
+    are_search_keys_identical, deserialise_internal_node, deserialise_leaf_node,
+    internal_node_current_size, leaf_node_current_size, leaf_node_key_value_len,
+    serialise_internal_node, serialise_leaf_node, Error as ChkError, InternalNodeChild, Key,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
@@ -251,6 +251,19 @@ fn py_internal_node_current_size(
     internal_node_current_size(maximum_size, key_width, length, raw_size)
 }
 
+/// `LeafNode._are_search_keys_identical` — given the precomputed search
+/// keys for every entry in the node, return True iff they are all equal.
+/// An empty iterable returns True.
+#[pyfunction]
+#[pyo3(name = "_are_search_keys_identical")]
+fn py_are_search_keys_identical(search_keys: Bound<'_, PyAny>) -> PyResult<bool> {
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for key in search_keys.try_iter()? {
+        keys.push(key?.cast_into::<PyBytes>()?.as_bytes().to_vec());
+    }
+    Ok(are_search_keys_identical(keys.iter()))
+}
+
 pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "chk_map")?;
     m.add_wrapped(wrap_pyfunction!(_search_key_16))?;
@@ -265,5 +278,6 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(py_leaf_node_key_value_len))?;
     m.add_wrapped(wrap_pyfunction!(py_leaf_node_current_size))?;
     m.add_wrapped(wrap_pyfunction!(py_internal_node_current_size))?;
+    m.add_wrapped(wrap_pyfunction!(py_are_search_keys_identical))?;
     Ok(m)
 }
