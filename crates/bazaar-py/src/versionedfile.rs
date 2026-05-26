@@ -394,6 +394,398 @@ impl PyHashEscapedPrefixMapper {
     }
 }
 
+/// `VersionedFiles` adapter that defers `get_parent_map` and `get_lines`
+/// to two Python callables. Mirrors
+/// `bzrformats.versionedfile.VirtualVersionedFiles`.
+///
+/// External callers see the tuple-keyed `VersionedFiles` API. Internally
+/// the callbacks operate on bare bytes keys; this binding handles the
+/// `(k,) <-> k` rewrapping at the boundary.
+///
+/// `add_lines`, `add_mpdiffs`, `insert_record_stream` and other write
+/// paths raise `NotImplementedError`, matching the Python implementation.
+#[pyclass(name = "VirtualVersionedFiles", module = "bzrformats._bzr_rs.versionedfile")]
+struct PyVirtualVersionedFiles {
+    get_parent_map_cb: Py<PyAny>,
+    get_lines_cb: Py<PyAny>,
+}
+
+impl bazaar::versionedfile::VersionedFiles for PyVirtualVersionedFiles {
+    fn get_parent_map(
+        &self,
+        keys: &[Key],
+    ) -> Result<std::collections::HashMap<Key, Vec<Key>>, bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            // The Python callback expects an iterable of bare bytes keys
+            // (the tuple wrapping is this adapter's concern, not the
+            // caller's).
+            let py_keys = PyList::empty(py);
+            for k in keys {
+                let bare = key_single_bytes(k)?;
+                py_keys
+                    .append(PyBytes::new(py, bare))
+                    .map_err(|e| vf_err_from_py(py, e))?;
+            }
+            let raw = self
+                .get_parent_map_cb
+                .bind(py)
+                .call1((py_keys,))
+                .map_err(|e| vf_err_from_py(py, e))?;
+            let dict = raw
+                .cast_into::<PyDict>()
+                .map_err(|e| vf_err_from_py(py, e.into()))?;
+            let mut out = std::collections::HashMap::new();
+            for (k, v) in dict.iter() {
+                let k_bytes: Vec<u8> = k.extract().map_err(|e| vf_err_from_py(py, e))?;
+                let parents = if v.is_none() {
+                    Vec::new()
+                } else {
+                    let mut ps = Vec::new();
+                    for p in v.try_iter().map_err(|e| vf_err_from_py(py, e))? {
+                        let p = p.map_err(|e| vf_err_from_py(py, e))?;
+                        let pb: Vec<u8> = p.extract().map_err(|e| vf_err_from_py(py, e))?;
+                        ps.push(Key::Fixed(vec![pb]));
+                    }
+                    ps
+                };
+                out.insert(Key::Fixed(vec![k_bytes]), parents);
+            }
+            Ok(out)
+        })
+    }
+
+    fn get_record_stream(
+        &self,
+        keys: &[Key],
+        _ordering: &str,
+        _include_delta_closure: bool,
+    ) -> Result<
+        Box<dyn Iterator<Item = Result<Box<dyn ContentFactory>, bazaar::knit::KnitError>>>,
+        bazaar::knit::KnitError,
+    > {
+        let mut records: Vec<Result<Box<dyn ContentFactory>, bazaar::knit::KnitError>> = Vec::new();
+        Python::attach(|py| -> Result<(), bazaar::knit::KnitError> {
+            for key in keys {
+                let bare = key_single_bytes(key)?;
+                let result = self
+                    .get_lines_cb
+                    .bind(py)
+                    .call1((PyBytes::new(py, bare),))
+                    .map_err(|e| vf_err_from_py(py, e))?;
+                if result.is_none() {
+                    let factory =
+                        bazaar::versionedfile::AbsentContentFactory::new(key.clone());
+                    records.push(Ok(Box::new(factory) as Box<dyn ContentFactory>));
+                } else {
+                    let mut lines = Vec::new();
+                    for line in result.try_iter().map_err(|e| vf_err_from_py(py, e))? {
+                        let line = line.map_err(|e| vf_err_from_py(py, e))?;
+                        let bytes: Vec<u8> =
+                            line.extract().map_err(|e| vf_err_from_py(py, e))?;
+                        lines.push(bytes);
+                    }
+                    let sha = bazaar::weave::sha_strings(&lines);
+                    let factory = bazaar::versionedfile::ChunkedContentFactory::new(
+                        Some(sha),
+                        key.clone(),
+                        None,
+                        lines,
+                    );
+                    records.push(Ok(Box::new(factory) as Box<dyn ContentFactory>));
+                }
+            }
+            Ok(())
+        })?;
+        Ok(Box::new(records.into_iter()))
+    }
+
+    fn get_sha1s(
+        &self,
+        keys: &[Key],
+    ) -> Result<std::collections::HashMap<Key, Vec<u8>>, bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let mut out = std::collections::HashMap::new();
+            for key in keys {
+                let bare = key_single_bytes(key)?;
+                let result = self
+                    .get_lines_cb
+                    .bind(py)
+                    .call1((PyBytes::new(py, bare),))
+                    .map_err(|e| vf_err_from_py(py, e))?;
+                if !result.is_none() {
+                    let mut lines: Vec<Vec<u8>> = Vec::new();
+                    for line in result.try_iter().map_err(|e| vf_err_from_py(py, e))? {
+                        let line = line.map_err(|e| vf_err_from_py(py, e))?;
+                        let bytes: Vec<u8> =
+                            line.extract().map_err(|e| vf_err_from_py(py, e))?;
+                        lines.push(bytes);
+                    }
+                    out.insert(key.clone(), bazaar::weave::sha_strings(&lines));
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn keys(&self) -> Result<Vec<Key>, bazaar::knit::KnitError> {
+        Err(bazaar::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.keys",
+        ))
+    }
+
+    fn add_lines(
+        &self,
+        _key: &Key,
+        _parents: Option<&[Key]>,
+        _lines: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, usize), bazaar::knit::KnitError> {
+        Err(bazaar::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.add_lines",
+        ))
+    }
+
+    fn insert_record_stream(
+        &self,
+        _stream: Box<dyn Iterator<Item = Box<dyn ContentFactory>>>,
+    ) -> Result<(), bazaar::knit::KnitError> {
+        Err(bazaar::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.insert_record_stream",
+        ))
+    }
+
+    fn iter_lines_added_or_present_in_keys(
+        &self,
+        keys: &[Key],
+    ) -> Result<Vec<(Vec<u8>, Key)>, bazaar::knit::KnitError> {
+        Python::attach(|py| {
+            let mut out = Vec::new();
+            for key in keys {
+                let bare = key_single_bytes(key)?;
+                let result = self
+                    .get_lines_cb
+                    .bind(py)
+                    .call1((PyBytes::new(py, bare),))
+                    .map_err(|e| vf_err_from_py(py, e))?;
+                if !result.is_none() {
+                    for line in result.try_iter().map_err(|e| vf_err_from_py(py, e))? {
+                        let line = line.map_err(|e| vf_err_from_py(py, e))?;
+                        let bytes: Vec<u8> =
+                            line.extract().map_err(|e| vf_err_from_py(py, e))?;
+                        out.push((bytes, key.clone()));
+                    }
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn annotate(&self, _key: &Key) -> Result<Vec<(Key, Vec<u8>)>, bazaar::knit::KnitError> {
+        Err(bazaar::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.annotate",
+        ))
+    }
+
+    fn check(&self) -> Result<(), bazaar::knit::KnitError> {
+        Ok(())
+    }
+}
+
+fn key_single_bytes(key: &Key) -> Result<&[u8], bazaar::knit::KnitError> {
+    let segs = match key {
+        Key::Fixed(v) | Key::ContentAddressed(v) => v,
+    };
+    if segs.len() != 1 {
+        return Err(bazaar::knit::KnitError::Corrupt(format!(
+            "VirtualVersionedFiles expects single-segment keys, got {:?}",
+            key
+        )));
+    }
+    Ok(&segs[0])
+}
+
+#[pymethods]
+impl PyVirtualVersionedFiles {
+    #[new]
+    fn new(get_parent_map: Py<PyAny>, get_lines: Py<PyAny>) -> Self {
+        Self {
+            get_parent_map_cb: get_parent_map,
+            get_lines_cb: get_lines,
+        }
+    }
+
+    #[pyo3(signature = (progressbar=None))]
+    fn check(&self, progressbar: Option<Py<PyAny>>) -> bool {
+        let _ = progressbar;
+        true
+    }
+
+    fn add_mpdiffs(&self, _records: Py<PyAny>) -> PyResult<()> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "VirtualVersionedFiles.add_mpdiffs",
+        ))
+    }
+
+    #[pyo3(signature = (
+        _key,
+        _parents,
+        _lines,
+        parent_texts=None,
+        left_matching_blocks=None,
+        nostore_sha=None,
+        random_id=false,
+        check_content=true,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_lines(
+        &self,
+        _key: Py<PyAny>,
+        _parents: Py<PyAny>,
+        _lines: Py<PyAny>,
+        parent_texts: Option<Py<PyAny>>,
+        left_matching_blocks: Option<Py<PyAny>>,
+        nostore_sha: Option<Py<PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<()> {
+        let _ = (parent_texts, left_matching_blocks, nostore_sha, random_id, check_content);
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "VirtualVersionedFiles.add_lines",
+        ))
+    }
+
+    fn insert_record_stream(&self, _stream: Py<PyAny>) -> PyResult<()> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "VirtualVersionedFiles.insert_record_stream",
+        ))
+    }
+
+    fn get_parent_map<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use bazaar::versionedfile::VersionedFiles;
+        let mut rust_keys: Vec<Key> = Vec::new();
+        for k in keys.try_iter()? {
+            rust_keys.push(k?.extract()?);
+        }
+        let raw = <Self as bazaar::versionedfile::VersionedFiles>::get_parent_map(self, &rust_keys)
+            .map_err(crate::knit::knit_err_to_py)?;
+        let result = PyDict::new(py);
+        for (k, parents) in raw {
+            let py_k = k.into_pyobject(py)?;
+            let py_parents_vec: Vec<Bound<'py, PyTuple>> = parents
+                .into_iter()
+                .map(|p| p.into_pyobject(py))
+                .collect::<Result<_, _>>()?;
+            let py_parents = PyTuple::new(py, py_parents_vec)?;
+            result.set_item(py_k, py_parents)?;
+        }
+        Ok(result)
+    }
+
+    fn get_sha1s<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use bazaar::versionedfile::VersionedFiles;
+        let mut rust_keys: Vec<Key> = Vec::new();
+        for k in keys.try_iter()? {
+            rust_keys.push(k?.extract()?);
+        }
+        let raw = <Self as bazaar::versionedfile::VersionedFiles>::get_sha1s(self, &rust_keys)
+            .map_err(crate::knit::knit_err_to_py)?;
+        let result = PyDict::new(py);
+        for (k, sha) in raw {
+            let py_k = k.into_pyobject(py)?;
+            result.set_item(py_k, PyBytes::new(py, &sha))?;
+        }
+        Ok(result)
+    }
+
+    fn get_record_stream<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+        _ordering: &str,
+        _include_delta_closure: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let out = PyList::empty(py);
+        for k in keys.try_iter()? {
+            let key: Key = k?.extract()?;
+            let bare = match &key {
+                Key::Fixed(v) | Key::ContentAddressed(v) => {
+                    if v.len() != 1 {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "VirtualVersionedFiles expects single-segment keys, got {:?}",
+                            key
+                        )));
+                    }
+                    v[0].clone()
+                }
+            };
+            let result = self
+                .get_lines_cb
+                .bind(py)
+                .call1((PyBytes::new(py, &bare),))?;
+            let wrapped = if result.is_none() {
+                let factory = bazaar::versionedfile::AbsentContentFactory::new(key);
+                let init = PyClassInitializer::from(AbstractContentFactory(Box::new(factory)))
+                    .add_subclass(AbsentContentFactory);
+                Bound::new(py, init)?.into_any()
+            } else {
+                let mut lines: Vec<Vec<u8>> = Vec::new();
+                for line in result.try_iter()? {
+                    let line = line?;
+                    let bytes: Vec<u8> = line.extract()?;
+                    lines.push(bytes);
+                }
+                let sha = bazaar::weave::sha_strings(&lines);
+                let factory = bazaar::versionedfile::ChunkedContentFactory::new(
+                    Some(sha),
+                    key,
+                    None,
+                    lines,
+                );
+                let init = PyClassInitializer::from(AbstractContentFactory(Box::new(factory)))
+                    .add_subclass(ChunkedContentFactory);
+                Bound::new(py, init)?.into_any()
+            };
+            out.append(wrapped)?;
+        }
+        Ok(out.into_any().call_method0("__iter__")?)
+    }
+
+    #[pyo3(signature = (keys, pb=None))]
+    fn iter_lines_added_or_present_in_keys<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+        pb: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use bazaar::versionedfile::VersionedFiles;
+        let _ = pb;
+        let mut rust_keys: Vec<Key> = Vec::new();
+        for k in keys.try_iter()? {
+            rust_keys.push(k?.extract()?);
+        }
+        let pairs = <Self as bazaar::versionedfile::VersionedFiles>::iter_lines_added_or_present_in_keys(
+            self, &rust_keys,
+        )
+        .map_err(crate::knit::knit_err_to_py)?;
+        let out = PyList::empty(py);
+        for (line, key) in pairs {
+            // Match Python: yield (line, bare_bytes_key).
+            let bare = key_single_bytes(&key).map_err(crate::knit::knit_err_to_py)?;
+            let py_line = PyBytes::new(py, &line);
+            let py_key = PyBytes::new(py, bare);
+            out.append(PyTuple::new(py, [py_line.into_any(), py_key.into_any()])?)?;
+        }
+        Ok(out.into_any().call_method0("__iter__")?)
+    }
+}
+
 #[pyfunction]
 fn network_bytes_to_kind_and_offset(network_bytes: &[u8]) -> (String, usize) {
     bazaar::versionedfile::network_bytes_to_kind_and_offset(network_bytes)
@@ -1627,6 +2019,7 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<PyPrefixMapper>()?;
     m.add_class::<PyHashPrefixMapper>()?;
     m.add_class::<PyHashEscapedPrefixMapper>()?;
+    m.add_class::<PyVirtualVersionedFiles>()?;
     m.add_function(wrap_pyfunction!(record_to_fulltext_bytes, &m)?)?;
     m.add_function(wrap_pyfunction!(fulltext_network_to_record, &m)?)?;
     m.add_function(wrap_pyfunction!(network_bytes_to_kind_and_offset, &m)?)?;

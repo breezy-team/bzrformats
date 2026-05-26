@@ -1697,78 +1697,14 @@ class WeaveMerge(PlanWeaveMerge):
         PlanWeaveMerge.__init__(self, plan, a_marker, b_marker)
 
 
-class VirtualVersionedFiles(VersionedFiles):
-    """Dummy implementation for VersionedFiles that uses other functions for
-    obtaining fulltexts and parent maps.
+VirtualVersionedFiles = _versionedfile_rs.VirtualVersionedFiles
+"""See VersionedFiles. Storage-less implementation backed by two callbacks.
 
-    This is always on the bottom of the stack and uses string keys
-    (rather than tuples) internally.
-    """
-
-    def __init__(self, get_parent_map, get_lines):
-        """Create a VirtualVersionedFiles.
-
-        :param get_parent_map: Same signature as Repository.get_parent_map.
-        :param get_lines: Should return lines for specified key or None if
-                          not available.
-        """
-        super().__init__()
-        self._get_parent_map = get_parent_map
-        self._get_lines = get_lines
-
-    def check(self, progressbar=None):
-        """See VersionedFiles.check.
-
-        :note: Always returns True for VirtualVersionedFiles.
-        """
-        return True
-
-    def add_mpdiffs(self, records):
-        """See VersionedFiles.mpdiffs.
-
-        :note: Not implemented for VirtualVersionedFiles.
-        """
-        raise NotImplementedError(self.add_mpdiffs)
-
-    def get_parent_map(self, keys):
-        """See VersionedFiles.get_parent_map."""
-        parent_view = self._get_parent_map(k for (k,) in keys).items()
-        return {(k,): tuple((p,) for p in v) for k, v in parent_view}
-
-    def get_sha1s(self, keys):
-        """See VersionedFiles.get_sha1s."""
-        ret = {}
-        for (k,) in keys:
-            lines = self._get_lines(k)
-            if lines is not None:
-                if not isinstance(lines, list):
-                    raise AssertionError
-                ret[(k,)] = osutils.sha_strings(lines)
-        return ret
-
-    def get_record_stream(self, keys, ordering, include_delta_closure):
-        """See VersionedFiles.get_record_stream."""
-        for (k,) in list(keys):
-            lines = self._get_lines(k)
-            if lines is not None:
-                if not isinstance(lines, list):
-                    raise AssertionError
-                yield ChunkedContentFactory(
-                    (k,),
-                    None,
-                    sha1=osutils.sha_strings(lines),
-                    chunks=lines,
-                )
-            else:
-                yield AbsentContentFactory((k,))
-
-    def iter_lines_added_or_present_in_keys(self, keys, pb=None):
-        """See VersionedFile.iter_lines_added_or_present_in_versions()."""
-        for i, (key,) in enumerate(keys):
-            if pb is not None:
-                pb.update("Finding changed lines", i, len(keys))
-            for l in self._get_lines(key):
-                yield (l, key)
+`__init__(get_parent_map, get_lines)`: caller-supplied callables operating
+on bare bytes keys. Backed by the Rust pyclass; the Python wrapper used
+to live here and applied the same `(k,) <-> k` rewrapping the Rust
+pyclass now does internally.
+"""
 
 
 class NoDupeAddLinesDecorator:

@@ -992,6 +992,179 @@ pub trait VersionedFiles: Send + Sync {
     }
 }
 
+/// Storage-less [`VersionedFiles`] backed by two caller-supplied callbacks.
+///
+/// Mirrors `bzrformats.versionedfile.VirtualVersionedFiles`: callers supply
+/// a parent-map lookup and a fulltext lookup over bare bytes keys, and this
+/// adapter exposes them through the tuple-keyed `VersionedFiles` trait.
+///
+/// `GP` returns the parent map for the requested bare keys; entries absent
+/// from the map are treated as missing. `GL` returns the fulltext lines for
+/// a single bare key, or `None` if absent.
+pub struct VirtualVersionedFiles<GP, GL>
+where
+    GP: Fn(&[Vec<u8>]) -> Result<HashMap<Vec<u8>, Vec<Vec<u8>>>, crate::knit::KnitError>
+        + Send
+        + Sync,
+    GL: Fn(&[u8]) -> Result<Option<Vec<Vec<u8>>>, crate::knit::KnitError> + Send + Sync,
+{
+    get_parent_map_cb: GP,
+    get_lines_cb: GL,
+}
+
+impl<GP, GL> VirtualVersionedFiles<GP, GL>
+where
+    GP: Fn(&[Vec<u8>]) -> Result<HashMap<Vec<u8>, Vec<Vec<u8>>>, crate::knit::KnitError>
+        + Send
+        + Sync,
+    GL: Fn(&[u8]) -> Result<Option<Vec<Vec<u8>>>, crate::knit::KnitError> + Send + Sync,
+{
+    pub fn new(get_parent_map_cb: GP, get_lines_cb: GL) -> Self {
+        Self {
+            get_parent_map_cb,
+            get_lines_cb,
+        }
+    }
+}
+
+fn key_to_single_bytes(key: &Key) -> Result<&[u8], crate::knit::KnitError> {
+    let segs = match key {
+        Key::Fixed(v) | Key::ContentAddressed(v) => v,
+    };
+    if segs.len() != 1 {
+        return Err(crate::knit::KnitError::Corrupt(format!(
+            "VirtualVersionedFiles expects single-segment keys, got {:?}",
+            key
+        )));
+    }
+    Ok(&segs[0])
+}
+
+impl<GP, GL> VersionedFiles for VirtualVersionedFiles<GP, GL>
+where
+    GP: Fn(&[Vec<u8>]) -> Result<HashMap<Vec<u8>, Vec<Vec<u8>>>, crate::knit::KnitError>
+        + Send
+        + Sync,
+    GL: Fn(&[u8]) -> Result<Option<Vec<Vec<u8>>>, crate::knit::KnitError> + Send + Sync,
+{
+    fn get_parent_map(
+        &self,
+        keys: &[Key],
+    ) -> Result<HashMap<Key, Vec<Key>>, crate::knit::KnitError> {
+        let mut bare: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+        for k in keys {
+            bare.push(key_to_single_bytes(k)?.to_vec());
+        }
+        let raw = (self.get_parent_map_cb)(&bare)?;
+        let mut out: HashMap<Key, Vec<Key>> = HashMap::with_capacity(raw.len());
+        for (k, parents) in raw {
+            let key = Key::Fixed(vec![k]);
+            let py_parents = parents
+                .into_iter()
+                .map(|p| Key::Fixed(vec![p]))
+                .collect::<Vec<_>>();
+            out.insert(key, py_parents);
+        }
+        Ok(out)
+    }
+
+    fn get_record_stream(
+        &self,
+        keys: &[Key],
+        _ordering: &str,
+        _include_delta_closure: bool,
+    ) -> Result<
+        Box<dyn Iterator<Item = Result<Box<dyn ContentFactory>, crate::knit::KnitError>>>,
+        crate::knit::KnitError,
+    > {
+        let mut records: Vec<Result<Box<dyn ContentFactory>, crate::knit::KnitError>> = Vec::new();
+        for key in keys {
+            let bare = key_to_single_bytes(key)?.to_vec();
+            match (self.get_lines_cb)(&bare) {
+                Ok(Some(lines)) => {
+                    let sha = crate::weave::sha_strings(&lines);
+                    let factory = ChunkedContentFactory::new(
+                        Some(sha),
+                        Key::Fixed(vec![bare]),
+                        None,
+                        lines,
+                    );
+                    records.push(Ok(Box::new(factory) as Box<dyn ContentFactory>));
+                }
+                Ok(None) => {
+                    let factory = AbsentContentFactory::new(Key::Fixed(vec![bare]));
+                    records.push(Ok(Box::new(factory) as Box<dyn ContentFactory>));
+                }
+                Err(e) => records.push(Err(e)),
+            }
+        }
+        Ok(Box::new(records.into_iter()))
+    }
+
+    fn get_sha1s(&self, keys: &[Key]) -> Result<HashMap<Key, Vec<u8>>, crate::knit::KnitError> {
+        let mut out = HashMap::new();
+        for key in keys {
+            let bare = key_to_single_bytes(key)?;
+            if let Some(lines) = (self.get_lines_cb)(bare)? {
+                out.insert(key.clone(), crate::weave::sha_strings(&lines));
+            }
+        }
+        Ok(out)
+    }
+
+    fn keys(&self) -> Result<Vec<Key>, crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.keys",
+        ))
+    }
+
+    fn add_lines(
+        &self,
+        _key: &Key,
+        _parents: Option<&[Key]>,
+        _lines: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, usize), crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.add_lines",
+        ))
+    }
+
+    fn insert_record_stream(
+        &self,
+        _stream: Box<dyn Iterator<Item = Box<dyn ContentFactory>>>,
+    ) -> Result<(), crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.insert_record_stream",
+        ))
+    }
+
+    fn iter_lines_added_or_present_in_keys(
+        &self,
+        keys: &[Key],
+    ) -> Result<Vec<(Vec<u8>, Key)>, crate::knit::KnitError> {
+        let mut out = Vec::new();
+        for key in keys {
+            let bare = key_to_single_bytes(key)?;
+            if let Some(lines) = (self.get_lines_cb)(bare)? {
+                for line in lines {
+                    out.push((line, key.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn annotate(&self, _key: &Key) -> Result<Vec<(Key, Vec<u8>)>, crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented(
+            "VirtualVersionedFiles.annotate",
+        ))
+    }
+
+    fn check(&self) -> Result<(), crate::knit::KnitError> {
+        Ok(())
+    }
+}
+
 /// Whether every entry in `lines` is a single full line.
 ///
 /// A full line carries a newline only as its final byte; an embedded `\n`
