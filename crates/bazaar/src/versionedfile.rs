@@ -1213,10 +1213,10 @@ pub fn add_mpdiffs_build(
 pub fn add_mpdiffs_prepare(
     mpvf: &mut crate::multiparent::MultiMemoryVersionedFile<Key>,
     records: &[MpdiffRecord],
-) -> Vec<PreparedAddLines> {
+) -> Result<Vec<PreparedAddLines>, crate::multiparent::ReconstructError> {
     let keys: Vec<Key> = records.iter().map(|r| r.key.clone()).collect();
-    let reconstructed = mpvf.get_line_list(&keys);
-    records
+    let reconstructed = mpvf.get_line_list(&keys)?;
+    Ok(records
         .iter()
         .zip(reconstructed.into_iter())
         .map(|(r, lines)| {
@@ -1237,7 +1237,7 @@ pub fn add_mpdiffs_prepare(
                 expected_sha1: r.expected_sha1.clone(),
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Generate multi-parent diffs for `ordered_keys`, in input order.
@@ -1470,7 +1470,7 @@ mod tests {
         ];
         let (mut mpvf, needed) = add_mpdiffs_build(&records);
         assert!(needed.is_empty());
-        let prepared = add_mpdiffs_prepare(&mut mpvf, &records);
+        let prepared = add_mpdiffs_prepare(&mut mpvf, &records).unwrap();
         assert_eq!(prepared.len(), 2);
         assert_eq!(prepared[0].lines, vec![b"x\n".to_vec(), b"y\n".to_vec()]);
         assert_eq!(prepared[0].left_matching_blocks, None);
@@ -1506,7 +1506,7 @@ mod tests {
             },
         ];
         let (mut mpvf, _) = add_mpdiffs_build(&records);
-        let prepared = add_mpdiffs_prepare(&mut mpvf, &records);
+        let prepared = add_mpdiffs_prepare(&mut mpvf, &records).unwrap();
         // Multi-parent: no left_matching_blocks hint.
         assert_eq!(prepared[2].left_matching_blocks, None);
     }

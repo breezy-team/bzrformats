@@ -1,4 +1,6 @@
-use bazaar::multiparent::{self, Hunk, MultiMemoryVersionedFile, MultiParent, ParseError};
+use bazaar::multiparent::{
+    self, Hunk, MultiMemoryVersionedFile, MultiParent, ParseError, ReconstructError,
+};
 use pyo3::exceptions::{PyAssertionError, PyKeyError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBytes, PyDict, PyList, PySet, PyTuple};
@@ -54,6 +56,31 @@ fn num_lines(hunks: Bound<PyList>) -> PyResult<usize> {
 #[pyfunction]
 fn is_snapshot(hunks: Bound<PyList>) -> PyResult<bool> {
     Ok(py_hunks_to_rust(&hunks)?.is_snapshot())
+}
+
+/// Convert a `ReconstructError` to a Python exception.
+///
+/// Both variants surface as `bzrformats.errors.RevisionNotPresent` because
+/// both mean "the version we were asked to reconstruct cannot be built
+/// from what's in this `MultiMemoryVersionedFile`". Callers in breezy
+/// (notably `bundle/serializer/v4.RevisionInstaller.install_revisions`)
+/// catch `RevisionNotPresent` to retry against a fallback branch; raising
+/// `IndexError` / `KeyError` here bypasses that recovery path.
+pub(crate) fn reconstruct_err(e: ReconstructError) -> PyErr {
+    Python::attach(|py| {
+        let errors = match PyModule::import(py, "bzrformats.errors") {
+            Ok(m) => m,
+            Err(import_err) => return import_err,
+        };
+        let cls = match errors.getattr("RevisionNotPresent") {
+            Ok(c) => c,
+            Err(attr_err) => return attr_err,
+        };
+        match cls.call1((e.to_string(), py.None())) {
+            Ok(exc) => PyErr::from_value(exc),
+            Err(call_err) => call_err,
+        }
+    })
 }
 
 fn parse_error_to_py(e: ParseError) -> PyErr {
@@ -401,8 +428,8 @@ impl PyMultiMemoryVersionedFile {
         let key = PyHashable::new(version_id)?;
         let parents = py_iter_to_hashable(&parent_ids)?;
         self.inner
-            .add_version(lines, key, parents, force_snapshot, single_parent);
-        Ok(())
+            .add_version(lines, key, parents, force_snapshot, single_parent)
+            .map_err(reconstruct_err)
     }
 
     fn get_line_list<'py>(
@@ -411,7 +438,7 @@ impl PyMultiMemoryVersionedFile {
         version_ids: Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyList>> {
         let keys = py_iter_to_hashable(&version_ids)?;
-        let lines_list = self.inner.get_line_list(&keys);
+        let lines_list = self.inner.get_line_list(&keys).map_err(reconstruct_err)?;
         let outer = PyList::empty(py);
         for lines in lines_list {
             let inner: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
@@ -426,7 +453,7 @@ impl PyMultiMemoryVersionedFile {
         version_id: Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyList>> {
         let key = PyHashable::new(version_id)?;
-        let lines = self.inner.cache_version(&key).clone();
+        let lines = self.inner.cache_version(&key).map_err(reconstruct_err)?.to_vec();
         let inner: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
         PyList::new(py, inner)
     }
@@ -447,8 +474,7 @@ impl PyMultiMemoryVersionedFile {
 
     fn make_snapshot(&mut self, version_id: Bound<'_, PyAny>) -> PyResult<()> {
         let key = PyHashable::new(version_id)?;
-        self.inner.make_snapshot(key);
-        Ok(())
+        self.inner.make_snapshot(key).map_err(reconstruct_err)
     }
 
     fn import_diffs(&mut self, other: &Self) {
@@ -472,7 +498,7 @@ impl PyMultiMemoryVersionedFile {
     }
 
     fn select_by_size<'py>(&mut self, py: Python<'py>, num: usize) -> PyResult<Bound<'py, PyList>> {
-        let picks = self.inner.select_by_size(num);
+        let picks = self.inner.select_by_size(num).map_err(reconstruct_err)?;
         let list = PyList::empty(py);
         for v in &picks {
             list.append(v.bind(py))?;
@@ -481,7 +507,7 @@ impl PyMultiMemoryVersionedFile {
     }
 
     fn get_size_ranking<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let ranking = self.inner.get_size_ranking();
+        let ranking = self.inner.get_size_ranking().map_err(reconstruct_err)?;
         let list = PyList::empty(py);
         for (score, v) in &ranking {
             let tup = PyTuple::new(

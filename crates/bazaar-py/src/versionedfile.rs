@@ -1196,11 +1196,12 @@ fn add_mpdiffs(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>) -> PyRe
             // `get_bytes_as("lines")` semantics: split the fulltext into
             // newline-terminated lines.
             let lines: Vec<Vec<u8>> = rec.to_lines().map(|l| l.into_owned()).collect();
-            mpvf.add_version(lines, rec.key(), vec![], None, false);
+            mpvf.add_version(lines, rec.key(), vec![], None, false)
+                .map_err(crate::multiparent::reconstruct_err)?;
         }
     }
 
-    let prepared = add_mpdiffs_prepare(&mut mpvf, &rs);
+    let prepared = add_mpdiffs_prepare(&mut mpvf, &rs).map_err(crate::multiparent::reconstruct_err)?;
 
     // Dispatch each prepared row through Python. `vf_parents` threads the
     // opaque `parent_texts` token returned by add_lines back into
@@ -1330,12 +1331,13 @@ fn add_mpdiffs_singular(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>
                 .call_method1("_get_lf_split_line_list", (present_py,))?;
             let lines_vec: Vec<Vec<Vec<u8>>> = lines_lists.extract()?;
             for (vid, lines) in present.iter().zip(lines_vec.into_iter()) {
-                mpvf.add_version(lines, wrap(vid.clone()), vec![], None, false);
+                mpvf.add_version(lines, wrap(vid.clone()), vec![], None, false)
+                    .map_err(crate::multiparent::reconstruct_err)?;
             }
         }
     }
 
-    let prepared = add_mpdiffs_prepare(&mut mpvf, &rs);
+    let prepared = add_mpdiffs_prepare(&mut mpvf, &rs).map_err(crate::multiparent::reconstruct_err)?;
 
     // Dispatch each prepared row through Python. Try add_lines_with_ghosts
     // first, fall back to add_lines on NotImplementedError so non-ghost-aware
