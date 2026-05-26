@@ -140,6 +140,147 @@ impl ChunkedContentFactory {
     }
 }
 
+/// `ContentFactory` backed by a Python file-like object.
+///
+/// Wraps `bzrformats.versionedfile.FileContentFactory`: the storage kind
+/// is `"file"`, and bytes are pulled out of the Python file on first
+/// access (cached in memory thereafter so repeat reads don't have to
+/// `seek(0)`). The original Python implementation re-read the file from
+/// the start on each call; caching matches that behaviour from the
+/// caller's perspective without holding a Python lock across reads.
+struct FileContentFactoryInner {
+    key: Key,
+    parents: Option<Vec<Key>>,
+    sha1: Option<Vec<u8>>,
+    size: Option<usize>,
+    file: Py<PyAny>,
+    cache: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl FileContentFactoryInner {
+    fn fulltext(&self) -> Vec<u8> {
+        // Read the full file once; subsequent calls hit the cache. Any
+        // Python error during the read is panicked because the trait
+        // signature is infallible; callers should only construct this
+        // factory from a file they trust.
+        let mut guard = self.cache.lock().unwrap();
+        if let Some(cached) = guard.as_ref() {
+            return cached.clone();
+        }
+        let bytes: Vec<u8> = Python::attach(|py| -> PyResult<Vec<u8>> {
+            let f = self.file.bind(py);
+            // Mirror Python's seek(0) on subsequent calls; the cache makes
+            // subsequent calls a no-op, so seek only matters if the caller
+            // mutates the underlying file between constructor and first
+            // read. Matching the original code path.
+            f.call_method1("seek", (0,))?;
+            let buf: Vec<u8> = f.call_method0("read")?.extract()?;
+            Ok(buf)
+        })
+        .expect("FileContentFactory.read failed");
+        *guard = Some(bytes.clone());
+        bytes
+    }
+}
+
+impl bazaar::versionedfile::ContentFactory for FileContentFactoryInner {
+    fn sha1(&self) -> Option<Vec<u8>> {
+        self.sha1.clone()
+    }
+
+    fn size(&self) -> Option<usize> {
+        self.size
+    }
+
+    fn key(&self) -> Key {
+        self.key.clone()
+    }
+
+    fn parents(&self) -> Option<Vec<Key>> {
+        self.parents.clone()
+    }
+
+    fn to_fulltext<'a, 'b>(&'a self) -> std::borrow::Cow<'b, [u8]>
+    where
+        'a: 'b,
+    {
+        std::borrow::Cow::Owned(self.fulltext())
+    }
+
+    fn to_chunks<'a, 'b>(&'a self) -> Box<dyn Iterator<Item = std::borrow::Cow<'b, [u8]>> + 'b>
+    where
+        'a: 'b,
+    {
+        let full = self.fulltext();
+        // 64KB chunks, matching `osutils.file_iterator`'s default.
+        const CHUNK: usize = 65536;
+        let chunks: Vec<Vec<u8>> = full.chunks(CHUNK).map(|c| c.to_vec()).collect();
+        Box::new(chunks.into_iter().map(std::borrow::Cow::Owned))
+    }
+
+    fn to_lines<'a, 'b>(&'a self) -> Box<dyn Iterator<Item = std::borrow::Cow<'b, [u8]>> + 'b>
+    where
+        'a: 'b,
+    {
+        let full = self.fulltext();
+        Box::new(
+            bazaar::osutils::chunks_to_lines(std::iter::once(Ok::<_, std::io::Error>(&full[..])))
+                .map(|l| std::borrow::Cow::Owned(l.unwrap().into_owned()))
+                .collect::<Vec<_>>()
+                .into_iter(),
+        )
+    }
+
+    fn into_fulltext(self) -> Vec<u8> {
+        self.fulltext()
+    }
+
+    fn into_chunks(self) -> Box<dyn Iterator<Item = Vec<u8>>> {
+        let full = self.fulltext();
+        const CHUNK: usize = 65536;
+        let chunks: Vec<Vec<u8>> = full.chunks(CHUNK).map(|c| c.to_vec()).collect();
+        Box::new(chunks.into_iter())
+    }
+
+    fn storage_kind(&self) -> String {
+        "file".into()
+    }
+
+    fn map_key(&mut self, f: &dyn Fn(Key) -> Key) {
+        self.key = f(self.key.clone());
+        self.parents = self.parents.take().map(|v| v.into_iter().map(f).collect());
+    }
+}
+
+#[pyclass(name = "FileContentFactory", extends = AbstractContentFactory, module = "bzrformats._bzr_rs.versionedfile")]
+struct PyFileContentFactory;
+
+#[pymethods]
+impl PyFileContentFactory {
+    #[new]
+    #[pyo3(signature = (key, parents, fileobj, sha1=None, size=None))]
+    fn new(
+        key: Key,
+        parents: Option<Vec<Key>>,
+        fileobj: Py<PyAny>,
+        sha1: Option<Vec<u8>>,
+        size: Option<usize>,
+    ) -> PyResult<(Self, AbstractContentFactory)> {
+        let inner = FileContentFactoryInner {
+            key,
+            parents,
+            sha1,
+            size,
+            file: fileobj,
+            cache: std::sync::Mutex::new(None),
+        };
+        Ok((
+            PyFileContentFactory,
+            AbstractContentFactory(Box::new(inner)),
+        ))
+    }
+}
+
 #[pyfunction]
 pub fn record_to_fulltext_bytes<'py>(
     py: Python<'py>,
@@ -2013,6 +2154,7 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<AbstractContentFactory>()?;
     m.add_class::<FulltextContentFactory>()?;
     m.add_class::<ChunkedContentFactory>()?;
+    m.add_class::<PyFileContentFactory>()?;
     m.add_class::<AbsentContentFactory>()?;
     m.add_class::<KeyRefs>()?;
     m.add_class::<PyConstantMapper>()?;

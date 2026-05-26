@@ -34,8 +34,6 @@ from .errors import (
     VersionedFileInvalidChecksum,
 )
 
-# Import complex osutils functions that are too difficult to replace
-from .osutils import file_iterator
 from .registry import Registry
 from .textmerge import TextMerge
 from .transport import TransportNoSuchFile
@@ -148,70 +146,13 @@ class ContentFactory:
         return self
 
 
-class FileContentFactory(ContentFactory):
-    """File-based content factory."""
+FileContentFactory = _versionedfile_rs.FileContentFactory
+"""See ContentFactory. File-backed content factory.
 
-    def __init__(self, key, parents, fileobj, sha1=None, size=None):
-        """Initialize a FileContentFactory.
-
-        Args:
-            key: Unique identifier for this content.
-            parents: Parent keys for this content.
-            fileobj: File-like object containing the content data.
-            sha1: SHA1 hash of the content (optional).
-            size: Size of the content in bytes (optional).
-        """
-        self.key = key
-        self.parents = parents
-        self.file = fileobj
-        self.storage_kind = "file"
-        self.sha1 = sha1
-        self.size = size
-        self._needs_reset = False
-
-    def get_bytes_as(self, storage_kind):
-        """Get the content bytes in the specified storage format.
-
-        Args:
-            storage_kind: The desired storage format ('fulltext', 'chunked', 'lines').
-
-        Returns:
-            bytes or list: The content data in the requested format.
-
-        Raises:
-            UnavailableRepresentation: If the requested storage kind is not supported.
-        """
-        if self._needs_reset:
-            self.file.seek(0)
-        self._needs_reset = True
-        if storage_kind == "fulltext":
-            return self.file.read()
-        elif storage_kind == "chunked":
-            return list(file_iterator(self.file))
-        elif storage_kind == "lines":
-            return list(self.file.readlines())
-        raise UnavailableRepresentation(self.key, storage_kind, self.storage_kind)
-
-    def iter_bytes_as(self, storage_kind):
-        """Iterate over content bytes in the specified storage format.
-
-        Args:
-            storage_kind: The desired storage format ('chunked', 'lines').
-
-        Returns:
-            iterator: Iterator over the content data in the requested format.
-
-        Raises:
-            UnavailableRepresentation: If the requested storage kind is not supported.
-        """
-        if self._needs_reset:
-            self.file.seek(0)
-        self._needs_reset = True
-        if storage_kind == "chunked":
-            return osutils.file_iterator(self.file)
-        elif storage_kind == "lines":
-            return self.file
-        raise UnavailableRepresentation(self.key, storage_kind, self.storage_kind)
+`__init__(key, parents, fileobj, sha1=None, size=None)`: reads bytes from
+the supplied Python file-like on first ``get_bytes_as`` / ``iter_bytes_as``
+call and caches the result. ``storage_kind`` is ``"file"``.
+"""
 
 
 class AdapterFactory(ContentFactory):
