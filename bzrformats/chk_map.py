@@ -802,8 +802,12 @@ class Node:
         self._maximum_size = new_size
 
 
-# Singleton indicating we have not computed _search_prefix yet
-_unknown = object()
+# Singleton indicating we have not computed _search_prefix yet. Re-exported
+# from the Rust extension so identity comparisons line up across the
+# boundary: when `_leaf_node_map_no_split` writes a Rust `SearchPrefix::
+# Unknown` back onto a Python LeafNode, the resulting attribute is the
+# same object Python code compares against here.
+_unknown = _chk_map_rs._unknown
 
 
 class LeafNode(Node):
@@ -916,37 +920,7 @@ class LeafNode(Node):
 
         :return: True if adding this node should cause us to split.
         """
-        self._items[key] = value
-        self._raw_size += self._key_value_len(key, value)
-        self._len += 1
-        serialised_key = self._serialise_key(key)
-        if self._common_serialised_prefix is None:
-            self._common_serialised_prefix = serialised_key
-        else:
-            self._common_serialised_prefix = common_prefix_pair(
-                self._common_serialised_prefix, serialised_key
-            )
-        search_key = self._search_key(key)
-        if self._search_prefix is _unknown:
-            self._compute_search_prefix()
-        if self._search_prefix is None:
-            self._search_prefix = search_key
-        else:
-            self._search_prefix = common_prefix_pair(self._search_prefix, search_key)
-        if (
-            self._len > 1
-            and self._maximum_size
-            and self._current_size() > self._maximum_size
-        ):
-            # Check to see if all of the search_keys for this node are
-            # identical. We allow the node to grow under that circumstance
-            # (we could track this as common state, but it is infrequent)
-            if (
-                search_key != self._search_prefix
-                or not self._are_search_keys_identical()
-            ):
-                return True
-        return False
+        return _chk_map_rs._leaf_node_map_no_split(self, key, value)
 
     def _split(self, store):
         """We have overflowed.
@@ -1073,16 +1047,10 @@ class LeafNode(Node):
     def unmap(self, store, key):
         """Unmap key from the node."""
         try:
-            self._raw_size -= self._key_value_len(key, self._items[key])
+            _chk_map_rs._leaf_node_unmap(self, key)
         except KeyError:
             logger.debug("key %s not found in %r", key, self._items)
             raise
-        self._len -= 1
-        del self._items[key]
-        self._key = None
-        # Recompute from scratch
-        self._compute_search_prefix()
-        self._compute_serialised_prefix()
         return self
 
 

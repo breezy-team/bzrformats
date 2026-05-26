@@ -63,11 +63,11 @@ pub fn search_key_255(key: &Key) -> SerializedKey {
 
 /// The set of search-key functions a CHKMap may be configured with.
 ///
-/// Mirrors the entries registered in Python's `search_key_registry`. The
-/// registry is closed in practice — `breezy` and `bzrformats` only ever
-/// register these three variants — so we encode them as an enum instead
-/// of carrying a Python callable through the Rust layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Plain` / `Hash16Way` / `Hash255Way` mirror the entries registered in
+/// Python's `search_key_registry` for production use. `Custom` carries a
+/// boxed closure for callers (most often test code) that register their
+/// own — the pyo3 layer adapts a Python callable into a `Custom` variant.
+#[derive(Clone)]
 pub enum SearchKeyFunc {
     /// `b"plain"` — `b"\x00".join(key)`.
     Plain,
@@ -76,11 +76,45 @@ pub enum SearchKeyFunc {
     /// `b"hash-255-way"` — big-endian `crc32(part)` bytes joined by NUL,
     /// with any `\n` byte rewritten to `_`.
     Hash255Way,
+    /// Any other callable, identified by a free-form name. The bytes
+    /// returned by `name()` for a `Custom` variant come straight from
+    /// the caller — they may not appear in `from_name`'s lookup table.
+    Custom {
+        name: Vec<u8>,
+        func: std::sync::Arc<dyn Fn(&Key) -> SerializedKey + Send + Sync>,
+    },
 }
 
+impl std::fmt::Debug for SearchKeyFunc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SearchKeyFunc::Plain => f.write_str("Plain"),
+            SearchKeyFunc::Hash16Way => f.write_str("Hash16Way"),
+            SearchKeyFunc::Hash255Way => f.write_str("Hash255Way"),
+            SearchKeyFunc::Custom { name, .. } => write!(f, "Custom({:?})", name),
+        }
+    }
+}
+
+impl PartialEq for SearchKeyFunc {
+    /// Built-in variants compare equal by tag; `Custom` variants are
+    /// only equal when their `Arc`s point at the same closure.
+    fn eq(&self, other: &Self) -> bool {
+        use SearchKeyFunc::*;
+        match (self, other) {
+            (Plain, Plain) | (Hash16Way, Hash16Way) | (Hash255Way, Hash255Way) => true,
+            (Custom { func: a, .. }, Custom { func: b, .. }) => std::sync::Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SearchKeyFunc {}
+
 impl SearchKeyFunc {
-    /// Resolve a registry name to a variant. Unknown names return the
-    /// raw bytes back so the caller can report the failing key.
+    /// Resolve a registry name to a built-in variant. Unknown names
+    /// return the raw bytes back; the caller may wrap them in a
+    /// `Custom` variant with a closure of its own.
     pub fn from_name(name: &[u8]) -> Result<Self, Vec<u8>> {
         match name {
             b"plain" => Ok(SearchKeyFunc::Plain),
@@ -91,11 +125,12 @@ impl SearchKeyFunc {
     }
 
     /// Wire name as it appears in serialised inventories.
-    pub fn name(&self) -> &'static [u8] {
+    pub fn name(&self) -> &[u8] {
         match self {
             SearchKeyFunc::Plain => b"plain",
             SearchKeyFunc::Hash16Way => b"hash-16-way",
             SearchKeyFunc::Hash255Way => b"hash-255-way",
+            SearchKeyFunc::Custom { name, .. } => name.as_slice(),
         }
     }
 
@@ -105,6 +140,7 @@ impl SearchKeyFunc {
             SearchKeyFunc::Plain => search_key_plain(key),
             SearchKeyFunc::Hash16Way => search_key_16(key),
             SearchKeyFunc::Hash255Way => search_key_255(key),
+            SearchKeyFunc::Custom { func, .. } => func(key),
         }
     }
 }
@@ -720,10 +756,7 @@ impl LeafNode {
         let (search_prefix, common_serialised_prefix) = if items_empty {
             (SearchPrefix::Computed(None), None)
         } else {
-            (
-                SearchPrefix::Unknown,
-                Some(parsed.common_serialised_prefix),
-            )
+            (SearchPrefix::Unknown, Some(parsed.common_serialised_prefix))
         };
         Self {
             key: None,
@@ -1268,7 +1301,10 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
             n.search_prefix,
             SearchPrefix::Computed(Some(b"foo".to_vec()))
         );
-        assert_eq!(n.raw_size, leaf_node_key_value_len(&[b"foo".to_vec()], b"bar"));
+        assert_eq!(
+            n.raw_size,
+            leaf_node_key_value_len(&[b"foo".to_vec()], b"bar")
+        );
     }
 
     #[test]
