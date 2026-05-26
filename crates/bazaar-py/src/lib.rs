@@ -33,6 +33,8 @@ mod versionedfile;
 mod weave;
 
 import_exception!(bzrformats.errors, ReservedId);
+import_exception!(breezy.bugtracker, InvalidLineInBugsProperty);
+import_exception!(breezy.bugtracker, InvalidBugStatus);
 
 /// Create a new file id suffix that is reasonably unique.
 ///
@@ -321,6 +323,23 @@ impl Revision {
 
     fn bug_urls(&self) -> Vec<String> {
         self.0.bug_urls()
+    }
+
+    /// Iterate over `(url, status)` tuples decoded from the ``bugs`` property.
+    ///
+    /// Mirrors `breezy.revision.Revision.iter_bugs`. Malformed lines raise
+    /// `breezy.bugtracker.InvalidLineInBugsProperty`; unknown status tokens
+    /// raise `breezy.bugtracker.InvalidBugStatus`.
+    fn iter_bugs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match self.0.iter_bugs() {
+            Ok(pairs) => Ok(pyo3::types::PyList::new(py, pairs)?.try_iter()?.into_any()),
+            Err(bazaar::revision::BugError::InvalidLine(line)) => {
+                Err(InvalidLineInBugsProperty::new_err(line))
+            }
+            Err(bazaar::revision::BugError::InvalidStatus(status)) => {
+                Err(InvalidBugStatus::new_err(status))
+            }
+        }
     }
 }
 
