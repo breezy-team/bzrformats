@@ -169,11 +169,9 @@ impl FileContentFactoryInner {
         }
         let bytes: Vec<u8> = Python::attach(|py| -> PyResult<Vec<u8>> {
             let f = self.file.bind(py);
-            // Mirror Python's seek(0) on subsequent calls; the cache makes
-            // subsequent calls a no-op, so seek only matters if the caller
-            // mutates the underlying file between constructor and first
-            // read. Matching the original code path.
-            f.call_method1("seek", (0,))?;
+            // The Python original only seeks on _subsequent_ calls; the cache
+            // above turns subsequent reads into no-ops, so we never need to
+            // seek. This matters for non-seekable file-likes (e.g. PyIterableFile).
             let buf: Vec<u8> = f.call_method0("read")?.extract()?;
             Ok(buf)
         })
