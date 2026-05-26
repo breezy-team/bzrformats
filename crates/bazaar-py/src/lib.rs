@@ -24,6 +24,7 @@ mod lock;
 mod multiparent;
 mod osutils;
 mod pack;
+mod plan_merge;
 mod smart;
 mod textmerge;
 mod transport;
@@ -999,6 +1000,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let versionedfilem = versionedfile::_versionedfile_rs(py)?;
     m.add_submodule(&versionedfilem)?;
 
+    let plan_mergem = plan_merge::_plan_merge_rs(py)?;
+    m.add_submodule(&plan_mergem)?;
+
     let btree_serializerm = btree_serializer::_btree_serializer_rs(py)?;
     m.add_submodule(&btree_serializerm)?;
 
@@ -1044,6 +1048,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.index", module_name), &indexm)?;
     modules.set_item(format!("{}.btree_index", module_name), &btree_indexm)?;
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
+    modules.set_item(format!("{}.plan_merge", module_name), &plan_mergem)?;
     modules.set_item(
         format!("{}.btree_serializer", module_name),
         &btree_serializerm,
