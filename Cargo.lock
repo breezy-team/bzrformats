@@ -68,6 +68,7 @@ dependencies = [
  "crc32fast",
  "fancy-regex",
  "flate2",
+ "indexmap",
  "inventory",
  "lazy-regex",
  "lazy_static",

@@ -634,6 +634,225 @@ fn decimal_digits(n: usize) -> usize {
     digits
 }
 
+/// State of a `LeafNode`'s `_search_prefix` field.
+///
+/// Python uses an `_unknown` sentinel object to mark "items were
+/// rebuilt without recomputing the prefix"; map / unmap then
+/// demand-compute it. `None` means the node is empty, so there is no
+/// prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchPrefix {
+    /// The node was rebuilt and the prefix has not been recomputed.
+    Unknown,
+    /// The prefix is known to be `Some(p)` for a non-empty leaf, or
+    /// `None` for an empty leaf.
+    Computed(Option<Vec<u8>>),
+}
+
+impl SearchPrefix {
+    /// Return the prefix bytes if computed, panicking on `Unknown`.
+    /// Mirrors call sites where Python would have already demanded a
+    /// recompute.
+    pub fn expect_computed(&self) -> Option<&[u8]> {
+        match self {
+            SearchPrefix::Unknown => panic!("search prefix is Unknown"),
+            SearchPrefix::Computed(p) => p.as_deref(),
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, SearchPrefix::Unknown)
+    }
+}
+
+/// In-memory state of a CHK leaf node.
+///
+/// Mirrors Python's `LeafNode` exactly, minus the store-touching
+/// methods (`serialise`, `map`/`_split` recursion). Held by the
+/// upcoming pyo3 `LeafNode` pyclass and used directly by pure-Rust
+/// callers.
+///
+/// Iteration order of `items` follows insertion order so it matches
+/// Python's `dict` semantics — tests and the `_split` algorithm both
+/// observe items in that order when they don't sort first.
+#[derive(Debug, Clone)]
+pub struct LeafNode {
+    /// `(b"sha1:...",)` once the node has been serialised to a store;
+    /// `None` while it is still mutable.
+    pub key: Option<Vec<u8>>,
+    pub maximum_size: usize,
+    pub key_width: usize,
+    pub raw_size: usize,
+    pub items: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>>,
+    pub search_prefix: SearchPrefix,
+    pub common_serialised_prefix: Option<Vec<u8>>,
+    pub search_key_func: SearchKeyFunc,
+}
+
+impl LeafNode {
+    /// Empty node with the given search-key transform.
+    pub fn new(search_key_func: SearchKeyFunc) -> Self {
+        Self {
+            key: None,
+            maximum_size: 0,
+            key_width: 1,
+            raw_size: 0,
+            items: indexmap::IndexMap::new(),
+            search_prefix: SearchPrefix::Computed(None),
+            common_serialised_prefix: None,
+            search_key_func,
+        }
+    }
+
+    /// Build a populated leaf from the output of [`deserialise_leaf_node`].
+    ///
+    /// Mirrors Python's `_deserialise_leaf_node` post-processing: the
+    /// items become a dict, `search_prefix` is `Unknown` (Python uses
+    /// `_unknown`) for non-empty nodes so the next mutator recomputes
+    /// it on demand, and `common_serialised_prefix` is taken straight
+    /// from the parsed prefix.
+    pub fn from_parsed(parsed: ParsedLeafNode, search_key_func: SearchKeyFunc) -> Self {
+        let items_empty = parsed.items.is_empty();
+        let mut items = indexmap::IndexMap::with_capacity(parsed.items.len());
+        for (k, v) in parsed.items {
+            items.insert(k, v);
+        }
+        let (search_prefix, common_serialised_prefix) = if items_empty {
+            (SearchPrefix::Computed(None), None)
+        } else {
+            (
+                SearchPrefix::Unknown,
+                Some(parsed.common_serialised_prefix),
+            )
+        };
+        Self {
+            key: None,
+            maximum_size: parsed.maximum_size,
+            key_width: parsed.key_width,
+            raw_size: parsed.raw_size,
+            items,
+            search_prefix,
+            common_serialised_prefix,
+            search_key_func,
+        }
+    }
+
+    /// Number of entries in this leaf.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Wrapper around [`leaf_node_current_size`] using `self`'s state.
+    pub fn current_size(&self) -> usize {
+        leaf_node_current_size(
+            self.maximum_size,
+            self.key_width,
+            self.len(),
+            self.raw_size,
+            self.common_serialised_prefix.as_deref(),
+        )
+    }
+
+    /// Recompute `search_prefix` from scratch by hashing every key
+    /// and reducing with [`common_prefix_many`]. Mirrors
+    /// `LeafNode._compute_search_prefix`.
+    pub fn compute_search_prefix(&mut self) -> Option<&[u8]> {
+        let keys: Vec<SerializedKey> = self
+            .items
+            .keys()
+            .map(|k| self.search_key_func.apply(&Key::from(k.clone())))
+            .collect();
+        let prefix = common_prefix_many(keys.iter().map(|k| k.as_slice())).map(|s| s.to_vec());
+        self.search_prefix = SearchPrefix::Computed(prefix);
+        match &self.search_prefix {
+            SearchPrefix::Computed(p) => p.as_deref(),
+            SearchPrefix::Unknown => unreachable!(),
+        }
+    }
+
+    /// Recompute `common_serialised_prefix` from scratch. Mirrors
+    /// `LeafNode._compute_serialised_prefix`.
+    pub fn compute_serialised_prefix(&mut self) -> Option<&[u8]> {
+        let keys: Vec<SerializedKey> = self
+            .items
+            .keys()
+            .map(|k| Key::from(k.clone()).serialize())
+            .collect();
+        let prefix = common_prefix_many(keys.iter().map(|k| k.as_slice())).map(|s| s.to_vec());
+        self.common_serialised_prefix = prefix;
+        self.common_serialised_prefix.as_deref()
+    }
+
+    /// `LeafNode._are_search_keys_identical`: all entries hash to the
+    /// same search key. Empty leaves return `true`.
+    pub fn are_search_keys_identical(&self) -> bool {
+        let keys = self
+            .items
+            .keys()
+            .map(|k| self.search_key_func.apply(&Key::from(k.clone())));
+        are_search_keys_identical(keys)
+    }
+
+    /// Insert `(key, value)` and update `raw_size`, `search_prefix`,
+    /// `common_serialised_prefix`. Returns `true` if the leaf has
+    /// overflowed `maximum_size` and the caller must split it.
+    ///
+    /// Mirrors `LeafNode._map_no_split`: the caller must have already
+    /// removed any prior entry for `key` from `raw_size` / `len`. If
+    /// `search_prefix` was `Unknown`, it is recomputed before applying
+    /// the new key.
+    pub fn map_no_split(&mut self, key: Vec<Vec<u8>>, value: Vec<u8>) -> bool {
+        self.raw_size += leaf_node_key_value_len(&key, &value);
+        let serialised_key = Key::from(key.clone()).serialize();
+        let search_key = self.search_key_func.apply(&Key::from(key.clone()));
+        self.items.insert(key, value);
+
+        self.common_serialised_prefix = Some(match self.common_serialised_prefix.take() {
+            None => serialised_key,
+            Some(prefix) => common_prefix_pair(&prefix, &serialised_key).to_vec(),
+        });
+
+        if self.search_prefix.is_unknown() {
+            self.compute_search_prefix();
+        }
+        let new_prefix = match &self.search_prefix {
+            SearchPrefix::Computed(None) => search_key.clone(),
+            SearchPrefix::Computed(Some(p)) => common_prefix_pair(p, &search_key).to_vec(),
+            SearchPrefix::Unknown => unreachable!("just recomputed above"),
+        };
+        self.search_prefix = SearchPrefix::Computed(Some(new_prefix.clone()));
+
+        if self.items.len() > 1
+            && self.maximum_size > 0
+            && self.current_size() > self.maximum_size
+            && (search_key != new_prefix || !self.are_search_keys_identical())
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Remove `key`, recomputing `search_prefix` and
+    /// `common_serialised_prefix` from scratch. Returns the removed
+    /// value, or `None` if `key` was not present (Python raises
+    /// `KeyError`; here the caller decides how to react).
+    ///
+    /// Mirrors `LeafNode.unmap` minus the store argument (the store is
+    /// unused on the leaf path).
+    pub fn unmap(&mut self, key: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let removed = self.items.shift_remove(key)?;
+        self.raw_size -= leaf_node_key_value_len(key, &removed);
+        self.key = None;
+        self.compute_search_prefix();
+        self.compute_serialised_prefix();
+        Some(removed)
+    }
+}
+
 /// Check whether every search key in `search_keys` is identical.
 ///
 /// Mirrors `LeafNode._are_search_keys_identical`: this is the safety check
@@ -1018,6 +1237,121 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         // maximum_size=100 (3 digits) → 50 + 1 + 1 + 3 = 55
         let got = internal_node_current_size(100, 1, 3, 50);
         assert_eq!(got, 55);
+    }
+
+    fn key_vec(parts: &[&[u8]]) -> Vec<Vec<u8>> {
+        parts.iter().map(|p| p.to_vec()).collect()
+    }
+
+    #[test]
+    fn leaf_node_new_starts_empty() {
+        let n = LeafNode::new(SearchKeyFunc::Plain);
+        assert_eq!(n.len(), 0);
+        assert!(n.is_empty());
+        assert_eq!(n.maximum_size, 0);
+        assert_eq!(n.key_width, 1);
+        assert_eq!(n.raw_size, 0);
+        assert!(matches!(n.search_prefix, SearchPrefix::Computed(None)));
+        assert!(n.common_serialised_prefix.is_none());
+        assert!(n.key.is_none());
+    }
+
+    #[test]
+    fn leaf_node_map_no_split_first_insert_sets_prefixes() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        let split = n.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        assert!(!split);
+        assert_eq!(n.len(), 1);
+        // With one entry, both prefixes equal the key bytes themselves.
+        assert_eq!(n.common_serialised_prefix.as_deref(), Some(&b"foo"[..]));
+        assert_eq!(
+            n.search_prefix,
+            SearchPrefix::Computed(Some(b"foo".to_vec()))
+        );
+        assert_eq!(n.raw_size, leaf_node_key_value_len(&[b"foo".to_vec()], b"bar"));
+    }
+
+    #[test]
+    fn leaf_node_map_no_split_shrinks_prefix_on_divergent_key() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"alpha"]), b"v1".to_vec());
+        n.map_no_split(key_vec(&[b"alphabet"]), b"v2".to_vec());
+        // Common prefix of "alpha" and "alphabet" is "alpha".
+        assert_eq!(n.common_serialised_prefix.as_deref(), Some(&b"alpha"[..]));
+        assert_eq!(
+            n.search_prefix,
+            SearchPrefix::Computed(Some(b"alpha".to_vec()))
+        );
+    }
+
+    #[test]
+    fn leaf_node_map_no_split_signals_split_when_oversize() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.maximum_size = 10;
+        let _ = n.map_no_split(key_vec(&[b"foo"]), b"v1".to_vec());
+        // Second entry pushes us over and the keys disagree, so we must split.
+        let split = n.map_no_split(key_vec(&[b"bar"]), b"v2".to_vec());
+        assert!(split);
+    }
+
+    #[test]
+    fn leaf_node_unmap_removes_entry_and_recomputes_prefixes() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"v1".to_vec());
+        n.map_no_split(key_vec(&[b"foobar"]), b"v2".to_vec());
+        assert_eq!(n.common_serialised_prefix.as_deref(), Some(&b"foo"[..]));
+        let removed = n.unmap(&key_vec(&[b"foobar"]));
+        assert_eq!(removed, Some(b"v2".to_vec()));
+        // After removing "foobar", the only key left is "foo" and the prefix
+        // becomes its full bytes.
+        assert_eq!(n.common_serialised_prefix.as_deref(), Some(&b"foo"[..]));
+        assert_eq!(n.len(), 1);
+        assert!(n.key.is_none());
+    }
+
+    #[test]
+    fn leaf_node_unmap_returns_none_for_missing_key() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"v1".to_vec());
+        assert_eq!(n.unmap(&key_vec(&[b"missing"])), None);
+        // Unchanged otherwise.
+        assert_eq!(n.len(), 1);
+    }
+
+    #[test]
+    fn leaf_node_compute_search_prefix_resolves_unknown_state() {
+        let blob: &[u8] = b"chkleaf:\n100\n1\n2\nalph\n2\x002\nv2\nv2line2\na\x001\nv1\n";
+        let parsed = deserialise_leaf_node(blob).unwrap();
+        let mut n = LeafNode::from_parsed(parsed, SearchKeyFunc::Plain);
+        assert!(n.search_prefix.is_unknown());
+        let prefix = n.compute_search_prefix().map(|s| s.to_vec());
+        // Under Plain, the search keys equal the serialised keys; for
+        // "alph2" and "alpha" the common prefix is "alph".
+        assert_eq!(prefix, Some(b"alph".to_vec()));
+        assert!(!n.search_prefix.is_unknown());
+    }
+
+    #[test]
+    fn leaf_node_from_parsed_marks_search_prefix_unknown() {
+        let blob: &[u8] = b"chkleaf:\n100\n1\n2\nalph\n2\x002\nv2\nv2line2\na\x001\nv1\n";
+        let parsed = deserialise_leaf_node(blob).unwrap();
+        let n = LeafNode::from_parsed(parsed, SearchKeyFunc::Plain);
+        assert_eq!(n.len(), 2);
+        assert!(n.search_prefix.is_unknown());
+        assert_eq!(n.common_serialised_prefix.as_deref(), Some(&b"alph"[..]));
+        // current_size reads off the raw_size; reproducing it just sanity
+        // checks the wiring against leaf_node_current_size.
+        assert!(n.current_size() > 0);
+    }
+
+    #[test]
+    fn leaf_node_from_parsed_empty_keeps_prefix_none() {
+        let blob: &[u8] = b"chkleaf:\n100\n1\n0\n\n";
+        let parsed = deserialise_leaf_node(blob).unwrap();
+        let n = LeafNode::from_parsed(parsed, SearchKeyFunc::Plain);
+        assert_eq!(n.len(), 0);
+        assert!(matches!(n.search_prefix, SearchPrefix::Computed(None)));
+        assert!(n.common_serialised_prefix.is_none());
     }
 
     #[test]
