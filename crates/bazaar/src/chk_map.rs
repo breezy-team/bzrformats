@@ -1156,6 +1156,18 @@ impl Node {
         }
     }
 
+    /// CHK references held by this node. Mirrors `Node.refs`:
+    /// leaves never reference other pages (returns `[]`); internal
+    /// nodes return their children's sha1 keys (delegates to
+    /// `InternalNode::refs`, which requires the node to have been
+    /// serialised).
+    pub fn refs(&self) -> Result<Vec<Vec<u8>>, Error> {
+        match self {
+            Node::Leaf(_) => Ok(Vec::new()),
+            Node::Internal(n) => n.refs(),
+        }
+    }
+
     /// Insert `(key, value)` into this subtree (pure in-memory path).
     ///
     /// For leaves, delegates to `LeafNode::map`. For internal nodes,
@@ -2480,6 +2492,245 @@ where
             .ok_or_else(|| Error::AssertionFailed("from_dict produced no keys".into()))?)
     }
 
+    /// Iterate the differences between this map and `basis`.
+    ///
+    /// Mirrors Python's `CHKMap.iter_changes`: yields
+    /// `(key, basis_value, self_value)` tuples for keys that differ
+    /// (one side may carry `None` for "absent here"). Identical
+    /// subtrees are skipped wholesale by sha1-key comparison.
+    pub fn iter_changes(
+        &mut self,
+        basis: &mut CHKMap<S>,
+    ) -> Result<Vec<(Vec<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)>, Error> {
+        let mut out: Vec<(Vec<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = Vec::new();
+        // Fast path: identical root keys means no changes.
+        if let (Some(a), Some(b)) = (self.key(), basis.key()) {
+            if a == b {
+                return Ok(out);
+            }
+        }
+        self.ensure_root()?;
+        basis.ensure_root()?;
+
+        // We work with three stores: self.store, basis.store, and
+        // the page caches per side. The iter_changes algorithm
+        // demand-loads via either side's store.
+        let mut self_pending: std::collections::BinaryHeap<std::cmp::Reverse<PendingItem>> =
+            std::collections::BinaryHeap::new();
+        let mut basis_pending: std::collections::BinaryHeap<std::cmp::Reverse<PendingItem>> =
+            std::collections::BinaryHeap::new();
+
+        // Seed the pending heaps from the roots. Mirrors
+        // `process_common_prefix_nodes(self_root, None, basis_root, None)`.
+        let self_root_ref = match &self.root {
+            NodeRef::Loaded(n) => n.clone(),
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        let basis_root_ref = match &basis.root {
+            NodeRef::Loaded(n) => n.clone(),
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        process_common_prefix_nodes(
+            &self_root_ref,
+            None,
+            &basis_root_ref,
+            None,
+            &mut self_pending,
+            &mut basis_pending,
+            self.search_key_func.clone(),
+        );
+
+        let excluded_keys: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
+
+        loop {
+            if self_pending.is_empty() && basis_pending.is_empty() {
+                break;
+            }
+            if self_pending.is_empty() {
+                // Drain basis side as deletes.
+                for std::cmp::Reverse(item) in basis_pending.drain() {
+                    if path_excluded(&item.path, &excluded_keys) {
+                        continue;
+                    }
+                    drain_pending_item(
+                        item,
+                        true,
+                        &mut basis.root,
+                        &*basis.store,
+                        &*basis.cache,
+                        basis.search_key_func.clone(),
+                        &mut out,
+                    )?;
+                }
+                break;
+            }
+            if basis_pending.is_empty() {
+                for std::cmp::Reverse(item) in self_pending.drain() {
+                    if path_excluded(&item.path, &excluded_keys) {
+                        continue;
+                    }
+                    drain_pending_item(
+                        item,
+                        false,
+                        &mut self.root,
+                        &*self.store,
+                        &*self.cache,
+                        self.search_key_func.clone(),
+                        &mut out,
+                    )?;
+                }
+                break;
+            }
+            let self_top = &self_pending.peek().unwrap().0;
+            let basis_top = &basis_pending.peek().unwrap().0;
+            match self_top.prefix.cmp(&basis_top.prefix) {
+                std::cmp::Ordering::Less => {
+                    let item = self_pending.pop().unwrap().0;
+                    if path_excluded(&item.path, &excluded_keys) {
+                        continue;
+                    }
+                    match item.payload {
+                        Payload::Value { key, value } => {
+                            out.push((key, None, Some(value)));
+                        }
+                        Payload::Subtree(child) => {
+                            let node = resolve_noderef(
+                                child,
+                                &*self.store,
+                                &*self.cache,
+                                self.search_key_func.clone(),
+                            )?;
+                            expand_node(node, item.path, self.search_key_func.clone(), &mut self_pending);
+                        }
+                    }
+                }
+                std::cmp::Ordering::Greater => {
+                    let item = basis_pending.pop().unwrap().0;
+                    if path_excluded(&item.path, &excluded_keys) {
+                        continue;
+                    }
+                    match item.payload {
+                        Payload::Value { key, value } => {
+                            out.push((key, Some(value), None));
+                        }
+                        Payload::Subtree(child) => {
+                            let node = resolve_noderef(
+                                child,
+                                &*basis.store,
+                                &*basis.cache,
+                                basis.search_key_func.clone(),
+                            )?;
+                            expand_node(node, item.path, basis.search_key_func.clone(), &mut basis_pending);
+                        }
+                    }
+                }
+                std::cmp::Ordering::Equal => {
+                    let self_is_value = matches!(self_top.payload, Payload::Value { .. });
+                    let basis_is_value = matches!(basis_top.payload, Payload::Value { .. });
+                    if self_is_value && basis_is_value {
+                        let self_item = self_pending.pop().unwrap().0;
+                        let basis_item = basis_pending.pop().unwrap().0;
+                        match (self_item.payload, basis_item.payload) {
+                            (
+                                Payload::Value { key: sk, value: sv },
+                                Payload::Value {
+                                    key: _bk,
+                                    value: bv,
+                                },
+                            ) => {
+                                if sv != bv {
+                                    out.push((sk, Some(bv), Some(sv)));
+                                }
+                            }
+                            _ => unreachable!("just checked Value/Value"),
+                        }
+                        continue;
+                    }
+                    // At least one is a subtree. Check sha1 identity
+                    // first — identical pointers skip entirely.
+                    let self_child_key = subtree_child_sha1(&self_top.payload);
+                    let basis_child_key = subtree_child_sha1(&basis_top.payload);
+                    if self_child_key.is_some() && self_child_key == basis_child_key {
+                        self_pending.pop();
+                        basis_pending.pop();
+                        continue;
+                    }
+                    if !self_is_value && !basis_is_value {
+                        // Both subtrees, same prefix — process in parallel.
+                        let self_item = self_pending.pop().unwrap().0;
+                        let basis_item = basis_pending.pop().unwrap().0;
+                        let self_child = match self_item.payload {
+                            Payload::Subtree(c) => c,
+                            _ => unreachable!(),
+                        };
+                        let basis_child = match basis_item.payload {
+                            Payload::Subtree(c) => c,
+                            _ => unreachable!(),
+                        };
+                        let self_node = resolve_noderef(
+                            self_child,
+                            &*self.store,
+                            &*self.cache,
+                            self.search_key_func.clone(),
+                        )?;
+                        let basis_node = resolve_noderef(
+                            basis_child,
+                            &*basis.store,
+                            &*basis.cache,
+                            basis.search_key_func.clone(),
+                        )?;
+                        process_common_prefix_nodes(
+                            &self_node,
+                            Some(item_path_extend(&self_item.path, &self_node)),
+                            &basis_node,
+                            Some(item_path_extend(&basis_item.path, &basis_node)),
+                            &mut self_pending,
+                            &mut basis_pending,
+                            self.search_key_func.clone(),
+                        );
+                        continue;
+                    }
+                    if !self_is_value {
+                        let item = self_pending.pop().unwrap().0;
+                        if path_excluded(&item.path, &excluded_keys) {
+                            continue;
+                        }
+                        let child = match item.payload {
+                            Payload::Subtree(c) => c,
+                            _ => unreachable!(),
+                        };
+                        let node = resolve_noderef(
+                            child,
+                            &*self.store,
+                            &*self.cache,
+                            self.search_key_func.clone(),
+                        )?;
+                        expand_node(node, item.path, self.search_key_func.clone(), &mut self_pending);
+                    }
+                    if !basis_is_value {
+                        let item = basis_pending.pop().unwrap().0;
+                        if path_excluded(&item.path, &excluded_keys) {
+                            continue;
+                        }
+                        let child = match item.payload {
+                            Payload::Subtree(c) => c,
+                            _ => unreachable!(),
+                        };
+                        let node = resolve_noderef(
+                            child,
+                            &*basis.store,
+                            &*basis.cache,
+                            basis.search_key_func.clone(),
+                        )?;
+                        expand_node(node, item.path, basis.search_key_func.clone(), &mut basis_pending);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Apply a sequence of `(old_key, new_key, new_value)` changes,
     /// returning the new root sha1 key.
     ///
@@ -2559,6 +2810,275 @@ where
             .last()
             .cloned()
             .ok_or_else(|| Error::AssertionFailed("save returned no keys".into()))?)
+    }
+}
+
+/// Heap-pending item for the `iter_changes` diff walk.
+///
+/// Items compare by `prefix` first (the search-key prefix for
+/// internal-node children, or the search_key of a leaf value);
+/// `payload` is the actual content waiting to be processed.
+/// `path` is a tail-shared chain of sha1 keys of every node we
+/// walked through to reach this item, used to bail when an entire
+/// subtree gets excluded.
+#[derive(Debug)]
+struct PendingItem {
+    prefix: Vec<u8>,
+    payload: Payload,
+    path: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+enum Payload {
+    /// An internal-node child reference waiting to be expanded.
+    Subtree(NodeRef),
+    /// A leaf entry that can be yielded directly.
+    Value { key: Vec<Vec<u8>>, value: Vec<u8> },
+}
+
+impl PartialEq for PendingItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefix == other.prefix
+    }
+}
+impl Eq for PendingItem {}
+impl PartialOrd for PendingItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PendingItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.prefix.cmp(&other.prefix)
+    }
+}
+
+/// True if any sha1 key on `path` is in `excluded_keys`.
+fn path_excluded(path: &[Vec<u8>], excluded_keys: &std::collections::HashSet<Vec<u8>>) -> bool {
+    path.iter().any(|k| excluded_keys.contains(k))
+}
+
+/// Convert a possibly-unloaded NodeRef into a loaded Node by
+/// consulting the page cache then the store.
+fn resolve_noderef<S>(
+    nref: NodeRef,
+    store: &S,
+    cache: &dyn PageCache,
+    search_key_func: SearchKeyFunc,
+) -> Result<Node, Error>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    match nref {
+        NodeRef::Loaded(n) => Ok(n),
+        NodeRef::Unloaded(sha1_key) => {
+            let bytes = read_node_bytes(store, cache, &sha1_key)?;
+            deserialise_node(&bytes, sha1_key, search_key_func)
+        }
+    }
+}
+
+/// Append this node's sha1 key (if any) to `parent_path` to form a
+/// fresh path used for items emitted from this node.
+fn item_path_extend(parent_path: &[Vec<u8>], node: &Node) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(parent_path.len() + 1);
+    out.extend_from_slice(parent_path);
+    if let Some(k) = node.key() {
+        out.push(k.to_vec());
+    }
+    out
+}
+
+/// Expand a single node: push its children (for InternalNode) or its
+/// entries (for LeafNode) onto the pending heap.
+fn expand_node(
+    node: Node,
+    parent_path: Vec<Vec<u8>>,
+    _search_key_func: SearchKeyFunc,
+    pending: &mut std::collections::BinaryHeap<std::cmp::Reverse<PendingItem>>,
+) {
+    let path = item_path_extend(&parent_path, &node);
+    match node {
+        Node::Leaf(leaf) => {
+            for (k, v) in leaf.items {
+                let search_key = leaf.search_key_func.apply(&Key::from(k.clone()));
+                pending.push(std::cmp::Reverse(PendingItem {
+                    prefix: search_key,
+                    payload: Payload::Value { key: k, value: v },
+                    path: path.clone(),
+                }));
+            }
+        }
+        Node::Internal(internal) => {
+            for (prefix, child) in internal.items {
+                pending.push(std::cmp::Reverse(PendingItem {
+                    prefix,
+                    payload: Payload::Subtree(child),
+                    path: path.clone(),
+                }));
+            }
+        }
+    }
+}
+
+/// Extract the sha1 key of a Subtree payload's NodeRef if known
+/// (either unloaded or a loaded node that's been serialised).
+fn subtree_child_sha1(payload: &Payload) -> Option<Vec<u8>> {
+    match payload {
+        Payload::Subtree(NodeRef::Unloaded(k)) => Some(k.clone()),
+        Payload::Subtree(NodeRef::Loaded(n)) => n.key().map(|s| s.to_vec()),
+        Payload::Value { .. } => None,
+    }
+}
+
+/// Seed the pending heaps with the contents of two nodes at the
+/// same logical position. If both are InternalNodes, only emit the
+/// symmetric difference (avoiding redundant traversal of identical
+/// children). If both are LeafNodes, similarly emit only the
+/// per-side differences. Otherwise, expand each side independently.
+fn process_common_prefix_nodes(
+    self_node: &Node,
+    self_parent_path: Option<Vec<Vec<u8>>>,
+    basis_node: &Node,
+    basis_parent_path: Option<Vec<Vec<u8>>>,
+    self_pending: &mut std::collections::BinaryHeap<std::cmp::Reverse<PendingItem>>,
+    basis_pending: &mut std::collections::BinaryHeap<std::cmp::Reverse<PendingItem>>,
+    search_key_func: SearchKeyFunc,
+) {
+    let self_path = self_parent_path
+        .unwrap_or_else(|| self_node.key().map(|s| vec![s.to_vec()]).unwrap_or_default());
+    let basis_path = basis_parent_path.unwrap_or_else(|| {
+        basis_node
+            .key()
+            .map(|s| vec![s.to_vec()])
+            .unwrap_or_default()
+    });
+    match (self_node, basis_node) {
+        (Node::Internal(s), Node::Internal(b)) => {
+            // Symmetric difference by (prefix, child_sha1).
+            let self_set: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> = s
+                .items
+                .iter()
+                .map(|(p, c)| (p.clone(), node_ref_sha1(c)))
+                .collect();
+            let basis_set: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> = b
+                .items
+                .iter()
+                .map(|(p, c)| (p.clone(), node_ref_sha1(c)))
+                .collect();
+            for (prefix, child) in s.items.iter() {
+                let s_sha1 = node_ref_sha1(child);
+                if basis_set.get(prefix) != Some(&s_sha1) {
+                    self_pending.push(std::cmp::Reverse(PendingItem {
+                        prefix: prefix.clone(),
+                        payload: Payload::Subtree(child.clone()),
+                        path: self_path.clone(),
+                    }));
+                }
+            }
+            for (prefix, child) in b.items.iter() {
+                let b_sha1 = node_ref_sha1(child);
+                if self_set.get(prefix) != Some(&b_sha1) {
+                    basis_pending.push(std::cmp::Reverse(PendingItem {
+                        prefix: prefix.clone(),
+                        payload: Payload::Subtree(child.clone()),
+                        path: basis_path.clone(),
+                    }));
+                }
+            }
+        }
+        (Node::Leaf(s), Node::Leaf(b)) => {
+            for (k, v) in s.items.iter() {
+                if b.items.get(k) != Some(v) {
+                    let prefix = search_key_func.apply(&Key::from(k.clone()));
+                    self_pending.push(std::cmp::Reverse(PendingItem {
+                        prefix,
+                        payload: Payload::Value {
+                            key: k.clone(),
+                            value: v.clone(),
+                        },
+                        path: self_path.clone(),
+                    }));
+                }
+            }
+            for (k, v) in b.items.iter() {
+                if s.items.get(k) != Some(v) {
+                    let prefix = search_key_func.apply(&Key::from(k.clone()));
+                    basis_pending.push(std::cmp::Reverse(PendingItem {
+                        prefix,
+                        payload: Payload::Value {
+                            key: k.clone(),
+                            value: v.clone(),
+                        },
+                        path: basis_path.clone(),
+                    }));
+                }
+            }
+        }
+        _ => {
+            // Mismatched shapes — expand each side independently.
+            expand_node(
+                self_node.clone(),
+                self_path.clone(),
+                search_key_func.clone(),
+                self_pending,
+            );
+            expand_node(
+                basis_node.clone(),
+                basis_path,
+                search_key_func,
+                basis_pending,
+            );
+        }
+    }
+}
+
+/// sha1 key of a NodeRef when known (unloaded always knows; loaded
+/// only when serialised).
+fn node_ref_sha1(nref: &NodeRef) -> Option<Vec<u8>> {
+    match nref {
+        NodeRef::Unloaded(k) => Some(k.clone()),
+        NodeRef::Loaded(n) => n.key().map(|s| s.to_vec()),
+    }
+}
+
+/// Drain a single pending item into the output as a one-sided
+/// change (the other side is exhausted). `is_basis` chooses which
+/// (value-or-None) slot the value lands in.
+fn drain_pending_item<S>(
+    item: PendingItem,
+    is_basis: bool,
+    other_root: &mut NodeRef,
+    store: &S,
+    cache: &dyn PageCache,
+    search_key_func: SearchKeyFunc,
+    out: &mut Vec<(Vec<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)>,
+) -> Result<(), Error>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    let _ = other_root;
+    match item.payload {
+        Payload::Value { key, value } => {
+            if is_basis {
+                out.push((key, Some(value), None));
+            } else {
+                out.push((key, None, Some(value)));
+            }
+            Ok(())
+        }
+        Payload::Subtree(child) => {
+            let mut node = resolve_noderef(child, store, cache, search_key_func)?;
+            let items = node.iteritems(store, cache, None)?;
+            for (k, v) in items {
+                if is_basis {
+                    out.push((k, Some(v), None));
+                } else {
+                    out.push((k, None, Some(v)));
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3194,6 +3714,68 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
             Err(crate::knit::KnitError::NotImplemented("annotate"))
         }
+    }
+
+    #[test]
+    fn chkmap_iter_changes_identical_returns_empty() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut a = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        a.map(key_vec(&[b"k"]), b"v".to_vec()).unwrap();
+        let root = a.save().unwrap();
+        let mut a2 = CHKMap::new(store.clone(), cache.clone(), Some(root), SearchKeyFunc::Plain);
+        let changes = a.iter_changes(&mut a2).unwrap();
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn chkmap_iter_changes_detects_add_remove_modify() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        // basis: {a:1, b:2}
+        let mut basis = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        basis.map(key_vec(&[b"a"]), b"1".to_vec()).unwrap();
+        basis.map(key_vec(&[b"b"]), b"2".to_vec()).unwrap();
+        // self: {a:1, c:3}
+        let mut me = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        me.map(key_vec(&[b"a"]), b"1".to_vec()).unwrap();
+        me.map(key_vec(&[b"c"]), b"3".to_vec()).unwrap();
+        let mut changes = me.iter_changes(&mut basis).unwrap();
+        changes.sort();
+        // 'b' was removed (basis has it, self doesn't), 'c' was added.
+        assert_eq!(
+            changes,
+            vec![
+                (key_vec(&[b"b"]), Some(b"2".to_vec()), None),
+                (key_vec(&[b"c"]), None, Some(b"3".to_vec())),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_iter_changes_detects_modification() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut basis = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        basis.map(key_vec(&[b"a"]), b"old".to_vec()).unwrap();
+        let mut me = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        me.map(key_vec(&[b"a"]), b"new".to_vec()).unwrap();
+        let changes = me.iter_changes(&mut basis).unwrap();
+        assert_eq!(
+            changes,
+            vec![(
+                key_vec(&[b"a"]),
+                Some(b"old".to_vec()),
+                Some(b"new".to_vec())
+            )]
+        );
+    }
+
+    #[test]
+    fn node_refs_leaf_returns_empty() {
+        let leaf = LeafNode::new(SearchKeyFunc::Plain);
+        let node = Node::Leaf(Box::new(leaf));
+        assert!(node.refs().unwrap().is_empty());
     }
 
     #[test]
