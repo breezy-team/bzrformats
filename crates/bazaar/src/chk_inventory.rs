@@ -343,6 +343,135 @@ mod tests {
         assert!(!inv.is_empty().unwrap());
     }
 
+    /// Inventory: root -> dir/ -> {dir/file.txt, dir/sub/, dir/sub/nested.txt}
+    /// + root/top.txt
+    fn build_test_inv_deeper() -> CHKInventory<FakeChkStore> {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let root = Entry::Root {
+            file_id: FileId::from(&b"root-id"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev1"[..])),
+        };
+        let top = Entry::File {
+            file_id: FileId::from(&b"top-id"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev1"[..])),
+            parent_id: FileId::from(&b"root-id"[..]),
+            name: "top.txt".to_string(),
+            text_sha1: Some(b"x".to_vec()),
+            text_size: Some(0),
+            text_id: None,
+            executable: false,
+        };
+        let dir = Entry::Directory {
+            file_id: FileId::from(&b"dir-id"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev1"[..])),
+            parent_id: FileId::from(&b"root-id"[..]),
+            name: "dir".to_string(),
+        };
+        let file_in_dir = Entry::File {
+            file_id: FileId::from(&b"f1"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev1"[..])),
+            parent_id: FileId::from(&b"dir-id"[..]),
+            name: "file.txt".to_string(),
+            text_sha1: Some(b"x".to_vec()),
+            text_size: Some(0),
+            text_id: None,
+            executable: false,
+        };
+        let sub = Entry::Directory {
+            file_id: FileId::from(&b"sub-id"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev1"[..])),
+            parent_id: FileId::from(&b"dir-id"[..]),
+            name: "sub".to_string(),
+        };
+        let nested = Entry::File {
+            file_id: FileId::from(&b"f2"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev1"[..])),
+            parent_id: FileId::from(&b"sub-id"[..]),
+            name: "nested.txt".to_string(),
+            text_sha1: Some(b"y".to_vec()),
+            text_size: Some(0),
+            text_id: None,
+            executable: false,
+        };
+        let mut id_map = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        let entries = [&root, &top, &dir, &file_in_dir, &sub, &nested];
+        for e in entries {
+            id_map
+                .map(
+                    vec![e.file_id().as_bytes().to_vec()],
+                    chk_inventory_entry_to_bytes(e),
+                )
+                .unwrap();
+        }
+        id_map.save().unwrap();
+        let mut pid_initial: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> =
+            indexmap::IndexMap::new();
+        for e in entries {
+            pid_initial.insert(parent_id_basename_key(e), e.file_id().as_bytes().to_vec());
+        }
+        let pid_root_key = CHKMap::from_dict(
+            store.clone(),
+            cache.clone(),
+            pid_initial,
+            0,
+            2,
+            SearchKeyFunc::Plain,
+        )
+        .unwrap();
+        let pid_map = CHKMap::new(
+            store.clone(),
+            cache.clone(),
+            Some(pid_root_key),
+            SearchKeyFunc::Plain,
+        );
+        let out = CHKInventory::new(store.clone(), cache.clone(), b"plain".to_vec());
+        CHKInventory {
+            root_id: Some(FileId::from(&b"root-id"[..])),
+            revision_id: Some(crate::RevisionId::from(&b"rev1"[..])),
+            id_to_entry: std::cell::RefCell::new(Some(id_map)),
+            parent_id_basename_to_file_id: std::cell::RefCell::new(Some(pid_map)),
+            ..out
+        }
+    }
+
+    #[test]
+    fn iter_entries_root_recursive_yields_full_tree() {
+        let inv = build_test_inv_deeper();
+        let entries = inv.iter_entries(None, true).unwrap();
+        let paths: Vec<&str> = entries.iter().map(|(p, _)| p.as_str()).collect();
+        // Root yielded first as "", then sorted depth-first.
+        assert_eq!(
+            paths,
+            vec![
+                "",
+                "dir",
+                "dir/file.txt",
+                "dir/sub",
+                "dir/sub/nested.txt",
+                "top.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn iter_entries_non_recursive_yields_direct_children_only() {
+        let inv = build_test_inv_deeper();
+        let entries = inv
+            .iter_entries(Some(&FileId::from(&b"dir-id"[..])), false)
+            .unwrap();
+        let names: Vec<&str> = entries.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(names, vec!["file.txt", "sub"]);
+    }
+
+    #[test]
+    fn entries_excludes_root() {
+        let inv = build_test_inv_deeper();
+        let entries = inv.entries().unwrap();
+        assert!(entries.iter().all(|(p, _)| !p.is_empty()));
+        assert_eq!(entries.len(), 5);
+    }
+
     #[test]
     fn id2path_returns_slash_separated_path() {
         let (inv, _store, _cache) = build_test_inv_with_child();
@@ -847,6 +976,76 @@ where
         let mut sorted: Vec<(String, Entry)> = children.into_iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(sorted.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Walk the inventory in lexicographic order from `from_dir`
+    /// (or the root if `None`), yielding `(path, entry)` pairs.
+    /// `recursive=false` only yields the direct children of
+    /// `from_dir`.
+    ///
+    /// Mirrors Python's `iter_entries`. When starting from the
+    /// root, the root entry itself is yielded with an empty path.
+    pub fn iter_entries(
+        &self,
+        from_dir: Option<&crate::FileId>,
+        recursive: bool,
+    ) -> Result<Vec<(String, Entry)>, Error> {
+        let mut out: Vec<(String, Entry)> = Vec::new();
+        let start_id = match from_dir {
+            Some(id) => id.clone(),
+            None => match &self.root_id {
+                None => return Ok(out),
+                Some(id) => {
+                    let root = self.get_entry(id)?;
+                    out.push((String::new(), root));
+                    id.clone()
+                }
+            },
+        };
+        let direct: Vec<Entry> = self.iter_sorted_children(&start_id)?;
+        if !recursive {
+            for ch in direct {
+                let name = ch.name().to_string();
+                out.push((name, ch));
+            }
+            return Ok(out);
+        }
+        // Iterative depth-first walk over the subtree.
+        // Stack frames: (path_so_far, queue_of_pending_children).
+        let mut stack: Vec<(String, std::collections::VecDeque<Entry>)> = Vec::new();
+        stack.push((String::new(), direct.into_iter().collect()));
+        while let Some((path, children)) = stack.last_mut() {
+            if let Some(ie) = children.pop_front() {
+                let child_path = format!("{}/{}", path, ie.name());
+                // Trim leading slash for the top-level children.
+                let yield_path = child_path.trim_start_matches('/').to_string();
+                let is_directory = matches!(ie, Entry::Directory { .. });
+                let file_id = ie.file_id().clone();
+                out.push((yield_path, ie));
+                if is_directory {
+                    let new_children: std::collections::VecDeque<Entry> =
+                        self.iter_sorted_children(&file_id)?.into_iter().collect();
+                    stack.push((child_path, new_children));
+                }
+            } else {
+                stack.pop();
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return `[(path, entry)]` for every entry except the root.
+    /// Mirrors Python's `entries`, which exists as a slightly-faster
+    /// alternative to `iter_entries`.
+    pub fn entries(&self) -> Result<Vec<(String, Entry)>, Error> {
+        let mut all = self.iter_entries(None, true)?;
+        // Drop the synthetic root entry yielded under "".
+        if let Some(first) = all.first() {
+            if first.0.is_empty() {
+                all.remove(0);
+            }
+        }
+        Ok(all)
     }
 
     /// Serialise the inventory header to lines (the part that
