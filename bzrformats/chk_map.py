@@ -39,7 +39,6 @@ Densely packed upper nodes.
 import abc
 import heapq
 import logging
-import threading
 from collections.abc import Callable, Generator, Iterator
 from typing import Union
 
@@ -53,42 +52,15 @@ logger = logging.getLogger("bzrformats.chk_map")
 common_prefix_many = _chk_map_rs.common_prefix_many
 common_prefix_pair = _chk_map_rs.common_prefix_pair
 
-# approx 4MB
-# If each line is 50 bytes, and you have 255 internal pages, with 255-way fan
-# out, it takes 3.1MB to cache the layer.
-_PAGE_CACHE_SIZE = 4 * 1024 * 1024
-
 Key = tuple[bytes, ...]
 SerialisedKey = bytes
 SearchKeyFunc = Callable[[Key], bytes]
 KeyFilter = list[Key]
 
-# Per thread caches for 2 reasons:
-# - in the server we may be serving very different content, so we get less
-#   cache thrashing.
-# - we avoid locking on every cache lookup.
-_thread_caches = threading.local()
-# The page cache.
-_thread_caches.page_cache = None
 
-
-def _get_cache():
-    """Get the per-thread page cache.
-
-    We need a function to do this because in a new thread the _thread_caches
-    threading.local object does not have the cache initialized yet.
-    """
-    page_cache = getattr(_thread_caches, "page_cache", None)
-    if page_cache is None:
-        # We are caching bytes so len(value) is perfectly accurate
-        page_cache = lru_cache.LRUSizeCache(_PAGE_CACHE_SIZE)
-        _thread_caches.page_cache = page_cache
-    return page_cache
-
-
-def clear_cache():
-    """Clear the CHK map page cache."""
-    _get_cache().clear()
+clear_cache = _chk_map_rs.clear_cache
+_page_cache_get = _chk_map_rs._page_cache_get
+_page_cache_set = _chk_map_rs._page_cache_set
 
 
 # If a ChildNode falls below this many bytes, we check for a remap
@@ -152,30 +124,6 @@ def _chkmap_apply_delta(self, delta):
     if has_deletes:
         self._check_remap()
     return self._save()
-
-
-def _chkmap_ensure_root(self):
-    """Ensure _root_node is an object, not a key tuple."""
-    if isinstance(self._root_node, tuple):
-        self._root_node = self._get_node(self._root_node)
-
-
-def _chkmap_get_node(self, node):
-    """Get a node, deserialising from store if it's a tuple key."""
-    if isinstance(node, tuple):
-        bytes = self._read_bytes(node)
-        return _deserialise(bytes, node, search_key_func=self._search_key_func)
-    return node
-
-
-def _chkmap_read_bytes(self, key):
-    try:
-        return _get_cache()[key]
-    except KeyError:
-        stream = self._store.get_record_stream([key], "unordered", True)
-        bytes = next(stream).get_bytes_as("fulltext")
-        _get_cache()[key] = bytes
-        return bytes
 
 
 def _chkmap_dump_tree(self, include_keys=False, encoding="utf-8"):
@@ -457,24 +405,6 @@ def _chkmap_iteritems(self, key_filter=None):
     return iter(self._root_node.iteritems(self._store, key_filter=key_filter))
 
 
-def _chkmap_key(self):
-    """Return the key for this map."""
-    if isinstance(self._root_node, tuple):
-        return self._root_node
-    if isinstance(self._root_node, Node):
-        if self._root_node is None:
-            raise AssertionError("No root node")
-        return self._root_node._key
-    raise AssertionError(
-        "Invalid root node type: {!r}".format(type(self._root_node))
-    )
-
-
-def _chkmap_len(self):
-    self._ensure_root()
-    return len(self._root_node)
-
-
 def _chkmap_map(self, key, value):
     """Map a key tuple to value."""
     key = tuple(key)
@@ -490,15 +420,6 @@ def _chkmap_map(self, key, value):
         self._root_node._key_width = node_details[0][1]._key_width
         for split, node in node_details:
             self._root_node.add_node(split, node)
-
-
-def _chkmap_node_key(self, node):
-    """Get the key for a node whether it's a tuple or node."""
-    if isinstance(node, tuple):
-        return node
-    if isinstance(node, Node):
-        return node._key
-    raise AssertionError("Invalid node type: {!r}".format(type(node)))
 
 
 def _chkmap_unmap(self, key, check_remap=True):
@@ -527,9 +448,6 @@ def _chkmap_save(self):
 
 # Bind orchestration methods onto the CHKMap pyclass at module load.
 CHKMap.apply_delta = _chkmap_apply_delta
-CHKMap._ensure_root = _chkmap_ensure_root
-CHKMap._get_node = _chkmap_get_node
-CHKMap._read_bytes = _chkmap_read_bytes
 CHKMap._dump_tree = _chkmap_dump_tree
 CHKMap._dump_tree_node = _chkmap_dump_tree_node
 CHKMap.from_dict = _chkmap_from_dict
@@ -537,10 +455,7 @@ CHKMap._create_via_map = _chkmap_create_via_map
 CHKMap._create_directly = _chkmap_create_directly
 CHKMap.iter_changes = _chkmap_iter_changes
 CHKMap.iteritems = _chkmap_iteritems
-CHKMap.key = _chkmap_key
-CHKMap.__len__ = _chkmap_len
 CHKMap.map = _chkmap_map
-CHKMap._node_key = _chkmap_node_key
 CHKMap.unmap = _chkmap_unmap
 CHKMap._check_remap = _chkmap_check_remap
 CHKMap._save = _chkmap_save
@@ -714,7 +629,7 @@ def _leaf_serialise(self, store):
     data = b"".join(lines)
     if len(data) != self._current_size():
         raise AssertionError("Invalid _current_size")
-    _get_cache()[self._key] = data
+    _page_cache_set(self._key, data)
     return [self._key]
 
 
@@ -820,18 +735,16 @@ def _internal_iter_nodes(self, store, key_filter=None, batch_size=None):
     if keys:
         found_keys = set()
         for key in keys:
-            try:
-                bytes = _get_cache()[key]
-            except KeyError:
+            bytes = _page_cache_get(key)
+            if bytes is None:
                 continue
-            else:
-                node = _deserialise(bytes, key, search_key_func=self._search_key_func)
-                prefix, node_key_filter = keys[key]
-                if not isinstance(node, Node):
-                    raise AssertionError("Invalid node type: {!r}".format(type(node)))
-                self._items[prefix] = node
-                found_keys.add(key)
-                yield node, node_key_filter
+            node = _deserialise(bytes, key, search_key_func=self._search_key_func)
+            prefix, node_key_filter = keys[key]
+            if not isinstance(node, Node):
+                raise AssertionError("Invalid node type: {!r}".format(type(node)))
+            self._items[prefix] = node
+            found_keys.add(key)
+            yield node, node_key_filter
         for key in found_keys:
             del keys[key]
     if keys:
@@ -850,7 +763,7 @@ def _internal_iter_nodes(self, store, key_filter=None, batch_size=None):
                 if not isinstance(node, Node):
                     raise AssertionError("Invalid node type: {!r}".format(type(node)))
                 self._items[prefix] = node
-                _get_cache()[record.key] = bytes
+                _page_cache_set(record.key, bytes)
             yield from node_and_filters
 
 
@@ -958,7 +871,7 @@ def _internal_serialise(self, store):
     )
     sha1, _, _ = store.add_lines((None,), (), lines)
     self._key = (b"sha1:" + sha1,)
-    _get_cache()[self._key] = b"".join(lines)
+    _page_cache_set(self._key, b"".join(lines))
     yield self._key
 
 

@@ -322,6 +322,57 @@ pub(crate) fn search_key_callable_for_name<'py>(py: Python<'py>, name: &[u8]) ->
 /// Resolve a Python `_search_key_func` callable to a `SearchKeyFunc`.
 ///
 /// Identifies built-in variants by their output on a one-element
+/// Process-wide CHK page cache. Python originally used a per-thread
+/// LRU keyed on the sha1 tuple; with the GIL there's at most one
+/// active CHK reader at a time, so a single shared cache is
+/// equivalent under the GIL and simpler to reason about.
+static PAGE_CACHE: std::sync::OnceLock<bazaar::chk_map::InMemoryPageCache> =
+    std::sync::OnceLock::new();
+
+fn page_cache() -> &'static bazaar::chk_map::InMemoryPageCache {
+    PAGE_CACHE.get_or_init(bazaar::chk_map::InMemoryPageCache::new)
+}
+
+/// Clear the process-wide CHK page cache. Mirrors Python's
+/// `chk_map.clear_cache`.
+#[pyfunction]
+fn clear_cache() {
+    use bazaar::chk_map::PageCache as _;
+    page_cache().clear();
+}
+
+/// Look up `key` (a sha1 tuple) in the page cache. Returns `None`
+/// on miss. Exposed so the few remaining Python orchestration
+/// methods (`_internal_iter_nodes`, `_leaf_serialise`) can keep
+/// hitting the same cache without going through a CHKMap instance.
+#[pyfunction]
+fn _page_cache_get<'py>(
+    py: Python<'py>,
+    key: Bound<'py, PyTuple>,
+) -> PyResult<Option<Bound<'py, PyBytes>>> {
+    use bazaar::chk_map::PageCache as _;
+    let sha1: Vec<u8> = key
+        .get_item(0)?
+        .cast_into::<PyBytes>()?
+        .as_bytes()
+        .to_vec();
+    Ok(page_cache().get(&sha1).map(|b| PyBytes::new(py, &b)))
+}
+
+/// Insert `value` into the page cache under `key`. Companion to
+/// `_page_cache_get`.
+#[pyfunction]
+fn _page_cache_set(key: Bound<'_, PyTuple>, value: &[u8]) -> PyResult<()> {
+    use bazaar::chk_map::PageCache as _;
+    let sha1: Vec<u8> = key
+        .get_item(0)?
+        .cast_into::<PyBytes>()?
+        .as_bytes()
+        .to_vec();
+    page_cache().insert(sha1, value.to_vec());
+    Ok(())
+}
+
 /// fingerprint key whose `plain` / `hash-16` / `hash-255` outputs are
 /// all distinct. Anything else becomes a [`SearchKeyFunc::Custom`]
 /// wrapping a closure that calls back into Python — tests register
@@ -1368,6 +1419,157 @@ impl CHKMap {
         }
         Ok(())
     }
+
+    /// Return this map's root key tuple. Mirrors Python's
+    /// `_chkmap_key`: if the root is a tuple (unloaded), return it;
+    /// otherwise pull `.key()` off the loaded node.
+    fn key<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let root = self.root_node.bind(py);
+        if let Ok(t) = root.clone().cast_into::<PyTuple>() {
+            return Ok(t.into_any());
+        }
+        root.call_method0("key")
+    }
+
+    /// Number of items in the CHK map. Mirrors Python's
+    /// `_chkmap_len`: ensure_root, then `len(self._root_node)`.
+    fn __len__(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<usize> {
+        Self::_ensure_root(slf.clone(), py)?;
+        let root = slf.borrow().root_node.bind(py).clone();
+        root.len()
+    }
+
+    /// Force the root to be a loaded Node, not a tuple key.
+    /// Mirrors Python's `_chkmap_ensure_root`.
+    fn _ensure_root(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        let needs_load = slf
+            .borrow()
+            .root_node
+            .bind(py)
+            .clone()
+            .cast_into::<PyTuple>()
+            .is_ok();
+        if !needs_load {
+            return Ok(());
+        }
+        let key_tuple = slf
+            .borrow()
+            .root_node
+            .bind(py)
+            .clone()
+            .cast_into::<PyTuple>()?;
+        let node = Self::_get_node_inner(&slf, py, key_tuple.into_any())?;
+        slf.borrow_mut().root_node = node.unbind();
+        Ok(())
+    }
+
+    /// Resolve a node argument: tuple keys are fetched from the
+    /// store and deserialised; loaded nodes pass through.
+    /// Mirrors Python's `_chkmap_get_node`.
+    fn _get_node<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        node: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::_get_node_inner(&slf, py, node)
+    }
+
+    /// Get the key for a node-or-tuple. Mirrors Python's
+    /// `_chkmap_node_key`.
+    fn _node_key<'py>(
+        &self,
+        py: Python<'py>,
+        node: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = py;
+        if node.clone().cast_into::<PyTuple>().is_ok() {
+            return Ok(node);
+        }
+        node.call_method0("key")
+    }
+
+    /// Fetch the raw bytes for a CHK key. Consults the
+    /// process-wide page cache before going to the store.
+    /// Mirrors Python's `_chkmap_read_bytes`.
+    fn _read_bytes<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'py, PyTuple>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        use bazaar::chk_map::PageCache as _;
+        // Cache lookup uses the flat sha1 bytes (the first tuple element).
+        let sha1: Vec<u8> = key
+            .get_item(0)?
+            .cast_into::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        if let Some(cached) = page_cache().get(&sha1) {
+            return Ok(PyBytes::new(py, &cached));
+        }
+        let keys = PyList::new(py, [key.clone()])?;
+        let stream = self.store.bind(py).call_method1(
+            "get_record_stream",
+            (keys, "unordered", true),
+        )?;
+        let iter = stream.try_iter()?;
+        let record = iter
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "no record returned for key {:?}",
+                    key
+                ))
+            })??;
+        let bytes_obj = record.call_method1("get_bytes_as", ("fulltext",))?;
+        let bytes_py = bytes_obj.cast_into::<PyBytes>()?;
+        let bytes_vec = bytes_py.as_bytes().to_vec();
+        page_cache().insert(sha1, bytes_vec);
+        Ok(bytes_py)
+    }
+}
+
+impl CHKMap {
+    /// Shared body of `_get_node` / `_ensure_root`: tuple keys load
+    /// the page bytes and dispatch to LeafNode or InternalNode
+    /// `deserialise`; anything else passes through.
+    fn _get_node_inner<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        node: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let Ok(key_tuple) = node.clone().cast_into::<PyTuple>() else {
+            return Ok(node);
+        };
+        let bytes = slf
+            .borrow()
+            ._read_bytes(py, key_tuple.clone())?;
+        let data = bytes.as_bytes();
+        let search_key_callable = slf
+            .borrow()
+            .search_key_callable
+            .as_ref()
+            .map(|c| c.bind(py).clone());
+        if data.starts_with(b"chkleaf:\n") {
+            let cls = py.get_type::<LeafNode>();
+            cls.call_method(
+                "deserialise",
+                (bytes, key_tuple, search_key_callable),
+                None,
+            )
+        } else if data.starts_with(b"chknode:\n") {
+            let cls = py.get_type::<InternalNode>();
+            cls.call_method(
+                "deserialise",
+                (bytes, key_tuple, search_key_callable),
+                None,
+            )
+        } else {
+            Err(pyo3::exceptions::PyAssertionError::new_err(
+                "Unknown node type.",
+            ))
+        }
+    }
 }
 
 pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
@@ -1387,6 +1589,9 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(py_internal_node_current_size))?;
     m.add_wrapped(wrap_pyfunction!(py_are_search_keys_identical))?;
     m.add_wrapped(wrap_pyfunction!(py_search_key_by_name))?;
+    m.add_wrapped(wrap_pyfunction!(clear_cache))?;
+    m.add_wrapped(wrap_pyfunction!(_page_cache_get))?;
+    m.add_wrapped(wrap_pyfunction!(_page_cache_set))?;
     // Stash the per-variant pyfunctions so pyclass `#[new]` and
     // cross-module helpers (`search_key_callable_for_name`) can hand
     // them back without going through Python's search-key registry.
