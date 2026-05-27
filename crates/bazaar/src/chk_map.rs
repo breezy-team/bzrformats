@@ -1188,6 +1188,72 @@ impl InternalNode {
     }
 }
 
+/// The CHK page cache: a sha1-keyed bytes store the deserialiser
+/// consults before fetching from the underlying store.
+///
+/// Decoupled into a trait so the pyo3 layer can back it with
+/// Python's per-thread `LRUSizeCache` (size-bounded) while pure-Rust
+/// callers get a simple count-bounded LRU. Mirrors the per-thread
+/// `_get_cache()` in `bzrformats/chk_map.py`.
+pub trait PageCache: Send + Sync {
+    /// Fetch the cached bytes for `sha1_key` (e.g. `b"sha1:abcd"`).
+    fn get(&self, sha1_key: &[u8]) -> Option<Vec<u8>>;
+    /// Cache `bytes` under `sha1_key`.
+    fn insert(&self, sha1_key: Vec<u8>, bytes: Vec<u8>);
+    /// Drop every cached entry.
+    fn clear(&self);
+}
+
+/// Default in-memory `PageCache`: a `Mutex<LruCache>` shared across
+/// CHKMap instances. Count-bounded (Python's `LRUSizeCache` is
+/// byte-bounded; we approximate with a fixed entry count).
+pub struct InMemoryPageCache {
+    inner: std::sync::Mutex<lru::LruCache<Vec<u8>, Vec<u8>>>,
+}
+
+impl InMemoryPageCache {
+    /// At ~4 KiB per CHK page, 1024 entries gives ~4 MiB of cache —
+    /// the same nominal budget Python's `LRUSizeCache(4 * 1024 * 1024)`
+    /// uses.
+    pub const DEFAULT_CAPACITY: usize = 1024;
+
+    pub fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(capacity)
+                    .expect("InMemoryPageCache capacity must be > 0"),
+            )),
+        }
+    }
+}
+
+impl Default for InMemoryPageCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PageCache for InMemoryPageCache {
+    fn get(&self, sha1_key: &[u8]) -> Option<Vec<u8>> {
+        let mut g = self.inner.lock().expect("page cache mutex poisoned");
+        g.get(sha1_key).cloned()
+    }
+
+    fn insert(&self, sha1_key: Vec<u8>, bytes: Vec<u8>) {
+        let mut g = self.inner.lock().expect("page cache mutex poisoned");
+        g.put(sha1_key, bytes);
+    }
+
+    fn clear(&self) {
+        let mut g = self.inner.lock().expect("page cache mutex poisoned");
+        g.clear();
+    }
+}
+
 /// Deserialise a CHK page from `data`, dispatching on the magic
 /// prefix. Returns a fully populated `Node` with `key` set to the
 /// supplied sha1 key.
@@ -1753,6 +1819,35 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
             Some(NodeRef::Unloaded(k)) => assert_eq!(k, b"sha1:aaaa"),
             other => panic!("expected Unloaded for prefoo, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn in_memory_page_cache_roundtrips() {
+        let c = InMemoryPageCache::new();
+        assert_eq!(c.get(b"sha1:absent"), None);
+        c.insert(b"sha1:x".to_vec(), b"page-bytes".to_vec());
+        assert_eq!(c.get(b"sha1:x").as_deref(), Some(&b"page-bytes"[..]));
+    }
+
+    #[test]
+    fn in_memory_page_cache_clear_drops_all_entries() {
+        let c = InMemoryPageCache::new();
+        c.insert(b"sha1:x".to_vec(), b"v1".to_vec());
+        c.insert(b"sha1:y".to_vec(), b"v2".to_vec());
+        c.clear();
+        assert_eq!(c.get(b"sha1:x"), None);
+        assert_eq!(c.get(b"sha1:y"), None);
+    }
+
+    #[test]
+    fn in_memory_page_cache_evicts_when_full() {
+        let c = InMemoryPageCache::with_capacity(2);
+        c.insert(b"k1".to_vec(), b"v1".to_vec());
+        c.insert(b"k2".to_vec(), b"v2".to_vec());
+        c.insert(b"k3".to_vec(), b"v3".to_vec()); // evicts k1
+        assert_eq!(c.get(b"k1"), None);
+        assert_eq!(c.get(b"k2").as_deref(), Some(&b"v2"[..]));
+        assert_eq!(c.get(b"k3").as_deref(), Some(&b"v3"[..]));
     }
 
     #[test]
