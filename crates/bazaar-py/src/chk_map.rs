@@ -898,6 +898,46 @@ impl LeafNode {
         Ok(py.None())
     }
 
+    /// `LeafNode.iteritems` — return matching `(key, value)` pairs.
+    /// `_store` is unused on the leaf path.
+    #[pyo3(signature = (_store, key_filter = None))]
+    fn iteritems<'py>(
+        &self,
+        py: Python<'py>,
+        _store: Bound<'_, PyAny>,
+        key_filter: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let filter_vec: Option<Vec<Vec<Vec<u8>>>> = match key_filter {
+            None => None,
+            Some(filter) => {
+                let mut out: Vec<Vec<Vec<u8>>> = Vec::new();
+                for key in filter.try_iter()? {
+                    let key = key?;
+                    let key_tuple = key.cast_into::<PyTuple>()?;
+                    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key_tuple.len());
+                    for part in key_tuple.iter() {
+                        parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
+                    }
+                    out.push(parts);
+                }
+                Some(out)
+            }
+        };
+        let pairs = self.inner.iteritems(filter_vec.as_deref());
+        let list = PyList::empty(py);
+        for (k, v) in pairs {
+            let parts: Vec<Bound<PyBytes>> =
+                k.iter().map(|p| PyBytes::new(py, p)).collect();
+            let key_tuple = PyTuple::new(py, parts)?;
+            let pair = PyTuple::new(
+                py,
+                [key_tuple.into_any(), PyBytes::new(py, &v).into_any()],
+            )?;
+            list.append(pair)?;
+        }
+        Ok(list)
+    }
+
     /// Deserialise the bytes of a serialised LeafNode. `search_key_func`
     /// is optional and defaults to plain.
     #[classmethod]
@@ -909,6 +949,8 @@ impl LeafNode {
         key: Bound<'_, PyTuple>,
         search_key_func: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        // Parse the data first so bad-data errors surface before any
+        // key-shape complaints.
         let parsed = deserialise_leaf_node(data).map_err(chk_err_to_py)?;
         let (func, callable) = match search_key_func {
             None => (SearchKeyFunc::Plain, None),

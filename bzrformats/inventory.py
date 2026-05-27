@@ -891,7 +891,10 @@ class CHKInventory:
 
     def get_entry(self, file_id):
         """Map a single file_id -> InventoryEntry."""
-        if file_id is None:
+        if file_id is None or not isinstance(file_id, bytes):
+            # Python's old dict-miss path silently treated non-bytes
+            # file_ids as missing; the Rust-backed CHKMap is stricter,
+            # so do the same conversion here.
             raise NoSuchId(self, file_id)
         result = self._fileid_to_entry_cache.get(file_id, None)
         if result is not None:

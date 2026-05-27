@@ -36,6 +36,7 @@ Densely packed upper nodes.
 
 """
 
+import abc
 import heapq
 import logging
 import threading
@@ -106,36 +107,15 @@ search_key_registry.register(b"plain", _search_key_plain)
 
 
 def _deserialise_leaf_node(data, key, search_key_func=None):
-    """Deserialise bytes, with key key, into a LeafNode.
+    """Deserialise bytes into a LeafNode pyclass instance.
 
-    :param bytes: The bytes of the node.
-    :param key: The key that the serialised node has.
+    Wraps a bare-bytes `key` into a 1-tuple — some callers/tests
+    pass a placeholder bytes value where the canonical form is
+    `(b"sha1:...",)`.
     """
-    result = LeafNode(search_key_func=search_key_func)
-    (
-        maximum_size,
-        width,
-        length,
-        prefix,
-        raw_items,
-        raw_size,
-    ) = _chk_map_rs._deserialise_leaf_node(data)
-    items = dict(raw_items)
-    result._items = items
-    result._len = length
-    result._maximum_size = maximum_size
-    result._key = key
-    result._key_width = width
-    result._raw_size = raw_size
-    if not items:
-        result._search_prefix = None
-        result._common_serialised_prefix = None
-    else:
-        result._search_prefix = _unknown
-        result._common_serialised_prefix = prefix
-    if len(data) != result._current_size():
-        raise AssertionError("_current_size computed incorrectly")
-    return result
+    if isinstance(key, bytes):
+        key = (key,)
+    return _chk_map_rs.LeafNode.deserialise(data, key, search_key_func)
 
 
 def _deserialise_internal_node(data, key, search_key_func=None):
@@ -635,7 +615,10 @@ class CHKMap:
             raise AssertionError("Cannot iterate over a map with a tuple root node")
         if key_filter is not None:
             key_filter = [tuple(key) for key in key_filter]
-        return self._root_node.iteritems(self._store, key_filter=key_filter)
+        # LeafNode.iteritems (pyclass) returns a list; wrap in iter so
+        # callers that next() the result still work. InternalNode is
+        # still a generator.
+        return iter(self._root_node.iteritems(self._store, key_filter=key_filter))
 
     def key(self) -> Key:
         """Return the key for this map."""
@@ -714,11 +697,15 @@ class CHKMap:
         return keys[-1]
 
 
-class Node:
+class Node(metaclass=abc.ABCMeta):
     """Base class defining the protocol for CHK Map nodes.
 
     :ivar _raw_size: The total size of the serialized key:value data, before
         adding the header bytes, and without prefix compression.
+
+    The Rust-backed pyclass LeafNode is registered as a virtual
+    subclass at the bottom of this module so `isinstance(_, Node)`
+    works uniformly across LeafNode and InternalNode.
     """
 
     __slots__ = (
@@ -810,248 +797,102 @@ class Node:
 _unknown = _chk_map_rs._unknown
 
 
-class LeafNode(Node):
-    """A node containing actual key:value pairs.
+LeafNode = _chk_map_rs.LeafNode
 
-    :ivar _items: A dict of key->value items. The key is in tuple form.
-    :ivar _size: The number of bytes that would be used by serializing all of
-        the key/value pairs.
+
+def _leaf_split(self, store):
+    """We have overflowed.
+
+    Split this node into multiple LeafNodes, return it up the stack so that
+    the next layer creates a new InternalNode and references the new nodes.
+
+    :return: (common_serialised_prefix, [(node_serialised_prefix, node)])
     """
-
-    __slots__ = ("_common_serialised_prefix",)
-
-    def __init__(self, search_key_func=None):
-        """Initialize a LeafNode.
-
-        Args:
-            search_key_func: Function to generate search keys from regular keys.
-        """
-        Node.__init__(self)
-        # All of the keys in this leaf node share this common prefix
-        self._common_serialised_prefix = None
-        if search_key_func is None:
-            self._search_key_func = _search_key_plain
+    if self._search_prefix is _unknown:
+        raise AssertionError("Search prefix must be known")
+    common_prefix = self._search_prefix
+    split_at = len(common_prefix) + 1
+    result = {}
+    for key, value in self._items.items():
+        search_key = self._search_key(key)
+        prefix = search_key[:split_at]
+        if len(prefix) < split_at:
+            prefix += b"\x00" * (split_at - len(prefix))
+        if prefix not in result:
+            node = LeafNode(search_key_func=self._search_key_func)
+            node.set_maximum_size(self._maximum_size)
+            node._key_width = self._key_width
+            result[prefix] = node
         else:
-            self._search_key_func = search_key_func
+            node = result[prefix]
+        sub_prefix, node_details = node.map(store, key, value)
+        if len(node_details) > 1:
+            if prefix != sub_prefix:
+                # This node has been split and is now found via a different path
+                result.pop(prefix)
+            new_node = InternalNode(sub_prefix, search_key_func=self._search_key_func)
+            new_node.set_maximum_size(self._maximum_size)
+            new_node._key_width = self._key_width
+            for split, node in node_details:
+                new_node.add_node(split, node)
+            result[prefix] = new_node
+    return common_prefix, list(result.items())
 
-    def __repr__(self):
-        """Return string representation of the leaf node."""
-        items_str = str(sorted(self._items))
-        if len(items_str) > 20:
-            items_str = items_str[:16] + "...]"
-        return "{}(key:{} len:{} size:{} max:{} prefix:{} keywidth:{} items:{})".format(
-            self.__class__.__name__,
-            self._key,
-            self._len,
-            self._raw_size,
-            self._maximum_size,
-            self._search_prefix,
-            self._key_width,
-            items_str,
-        )
 
-    def _current_size(self):
-        """Answer the current serialised size of this node.
-
-        This differs from self._raw_size in that it includes the bytes used for
-        the header.
-        """
-        return _chk_map_rs._leaf_node_current_size(
-            self._maximum_size,
-            self._key_width,
-            self._len,
-            self._raw_size,
-            self._common_serialised_prefix,
-        )
-
-    @classmethod
-    def deserialise(cls, bytes, key, search_key_func=None):
-        """Deserialise bytes, with key key, into a LeafNode.
-
-        :param bytes: The bytes of the node.
-        :param key: The key that the serialised node has.
-        """
-        return _deserialise_leaf_node(bytes, key, search_key_func=search_key_func)
-
-    def iteritems(self, store, key_filter=None):
-        """Iterate over items in the node.
-
-        :param key_filter: A filter to apply to the node. It should be a
-            list/set/dict or similar repeatedly iterable container.
-        """
-        if key_filter is not None:
-            # Adjust the filter - short elements go to a prefix filter. All
-            # other items are looked up directly.
-            # XXX: perhaps defaultdict? Profiling<rinse and repeat>
-            filters = {}
-            for key in key_filter:
-                if len(key) == self._key_width:
-                    # This filter is meant to match exactly one key, yield it
-                    # if we have it.
-                    try:
-                        yield key, self._items[key]
-                    except KeyError:
-                        # This key is not present in this map, continue
-                        pass
-                else:
-                    # Short items, we need to match based on a prefix
-                    filters.setdefault(len(key), set()).add(key)
-            if filters:
-                filters_itemview = filters.items()
-                for item in self._items.items():
-                    for length, length_filter in filters_itemview:
-                        if item[0][:length] in length_filter:
-                            yield item
-                            break
-        else:
-            yield from self._items.items()
-
-    def _key_value_len(self, key, value):
-        return _chk_map_rs._leaf_node_key_value_len(key, value)
-
-    def _search_key(self, key: Key) -> bytes:
-        return self._search_key_func(key)
-
-    def _map_no_split(self, key: Key, value):
-        """Map a key to a value.
-
-        This assumes either the key does not already exist, or you have already
-        removed its size and length from self.
-
-        :return: True if adding this node should cause us to split.
-        """
-        return _chk_map_rs._leaf_node_map_no_split(self, key, value)
-
-    def _split(self, store):
-        """We have overflowed.
-
-        Split this node into multiple LeafNodes, return it up the stack so that
-        the next layer creates a new InternalNode and references the new nodes.
-
-        :return: (common_serialised_prefix, [(node_serialised_prefix, node)])
-        """
+def _leaf_map(self, store, key, value):
+    """Map key to value, returning (prefix, [(node_prefix, node)])."""
+    if key in self._items:
+        self._raw_size -= self._key_value_len(key, self._items[key])
+    self._key = None
+    if self._map_no_split(key, value):
+        return self._split(store)
+    else:
         if self._search_prefix is _unknown:
-            raise AssertionError("Search prefix must be known")
-        common_prefix = self._search_prefix
-        split_at = len(common_prefix) + 1
-        result = {}
-        for key, value in self._items.items():
-            search_key = self._search_key(key)
-            prefix = search_key[:split_at]
-            # TODO: Generally only 1 key can be exactly the right length,
-            #       which means we can only have 1 key in the node pointed
-            #       at by the 'prefix\0' key. We might want to consider
-            #       folding it into the containing InternalNode rather than
-            #       having a fixed length-1 node.
-            #       Note this is probably not true for hash keys, as they
-            #       may get a '\00' node anywhere, but won't have keys of
-            #       different lengths.
-            if len(prefix) < split_at:
-                prefix += b"\x00" * (split_at - len(prefix))
-            if prefix not in result:
-                node = LeafNode(search_key_func=self._search_key_func)
-                node.set_maximum_size(self._maximum_size)
-                node._key_width = self._key_width
-                result[prefix] = node
-            else:
-                node = result[prefix]
-            sub_prefix, node_details = node.map(store, key, value)
-            if len(node_details) > 1:
-                if prefix != sub_prefix:
-                    # This node has been split and is now found via a different
-                    # path
-                    result.pop(prefix)
-                new_node = InternalNode(
-                    sub_prefix, search_key_func=self._search_key_func
-                )
-                new_node.set_maximum_size(self._maximum_size)
-                new_node._key_width = self._key_width
-                for split, node in node_details:
-                    new_node.add_node(split, node)
-                result[prefix] = new_node
-        return common_prefix, list(result.items())
+            raise AssertionError(f"{self._search_prefix!r} must be known")
+        return self._search_prefix, [(b"", self)]
 
-    def map(self, store, key: Key, value):
-        """Map key to value."""
-        if key in self._items:
-            self._raw_size -= self._key_value_len(key, self._items[key])
-            self._len -= 1
-        self._key = None
-        if self._map_no_split(key, value):
-            return self._split(store)
-        else:
-            if self._search_prefix is _unknown:
-                raise AssertionError(f"{self._search_prefix!r} must be known")
-            return self._search_prefix, [(b"", self)]
 
-    @staticmethod
-    def _serialise_key(key):
-        return b"\x00".join(key)
+def _leaf_serialise(self, store):
+    """Serialise the LeafNode to store, returning [sha1_key]."""
+    sorted_items = sorted(self._items.items())
+    lines = _chk_map_rs._serialise_leaf_node(
+        self._maximum_size,
+        self._key_width,
+        sorted_items,
+        self._common_serialised_prefix,
+    )
+    sha1, _, _ = store.add_lines((None,), (), lines)
+    self._key = (b"sha1:" + sha1,)
+    data = b"".join(lines)
+    if len(data) != self._current_size():
+        raise AssertionError("Invalid _current_size")
+    _get_cache()[self._key] = data
+    return [self._key]
 
-    def serialise(self, store):
-        """Serialise the LeafNode to store.
 
-        :param store: A VersionedFiles honouring the CHK extensions.
-        :return: An iterable of the keys inserted by this operation.
-        """
-        sorted_items = sorted(self._items.items())
-        lines = _chk_map_rs._serialise_leaf_node(
-            self._maximum_size,
-            self._key_width,
-            sorted_items,
-            self._common_serialised_prefix,
-        )
-        sha1, _, _ = store.add_lines((None,), (), lines)
-        self._key = (b"sha1:" + sha1,)
-        data = b"".join(lines)
-        if len(data) != self._current_size():
-            raise AssertionError("Invalid _current_size")
-        _get_cache()[self._key] = data
-        return [self._key]
+_leaf_pyclass_unmap = LeafNode.unmap
 
-    def refs(self):
-        """Return the references to other CHK's held by this node."""
-        return []
 
-    def _compute_search_prefix(self):
-        """Determine the common search prefix for all keys in this node.
+def _leaf_unmap(self, store, key):
+    """Pyclass unmap returns None; the Python API returns self for chaining."""
+    _leaf_pyclass_unmap(self, store, key)
+    return self
 
-        :return: A bytestring of the longest search key prefix that is
-            unique within this node.
-        """
-        search_keys = [self._search_key_func(key) for key in self._items]
-        self._search_prefix = common_prefix_many(search_keys)
-        return self._search_prefix
 
-    def _are_search_keys_identical(self):
-        """Check to see if the search keys for all entries are the same.
+# Methods that need a CHK store or sibling InternalNode construction stay
+# in Python and bind onto the pyclass at module load time. The pyclass
+# owns its state and the in-memory algorithms (_map_no_split, unmap,
+# _compute_*, _are_search_keys_identical, iteritems, etc.); these
+# helpers only orchestrate the Python objects on top.
+LeafNode.map = _leaf_map
+LeafNode._split = _leaf_split
+LeafNode.serialise = _leaf_serialise
+LeafNode.unmap = _leaf_unmap
 
-        When using a hash as the search_key it is possible for non-identical
-        keys to collide. If that happens enough, we may try overflow a
-        LeafNode, but as all are collisions, we must not split.
-        """
-        return _chk_map_rs._are_search_keys_identical(
-            self._search_key_func(key) for key in self._items
-        )
-
-    def _compute_serialised_prefix(self):
-        """Determine the common prefix for serialised keys in this node.
-
-        :return: A bytestring of the longest serialised key prefix that is
-            unique within this node.
-        """
-        serialised_keys = [self._serialise_key(key) for key in self._items]
-        self._common_serialised_prefix = common_prefix_many(serialised_keys)
-        return self._common_serialised_prefix
-
-    def unmap(self, store, key):
-        """Unmap key from the node."""
-        try:
-            _chk_map_rs._leaf_node_unmap(self, key)
-        except KeyError:
-            logger.debug("key %s not found in %r", key, self._items)
-            raise
-        return self
+# Register the Rust-backed pyclass with the Node ABC so existing
+# `isinstance(_, Node)` checks across this module match LeafNode
+# instances. InternalNode (still pure Python) inherits Node directly.
+Node.register(LeafNode)
 
 
 class InternalNode(Node):
