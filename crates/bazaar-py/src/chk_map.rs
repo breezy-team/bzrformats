@@ -2,7 +2,7 @@ use bazaar::chk_map::{
     are_search_keys_identical, deserialise_internal_node, deserialise_leaf_node,
     internal_node_current_size, leaf_node_current_size, leaf_node_key_value_len,
     serialise_internal_node, serialise_leaf_node, Error as ChkError, InternalNodeChild, Key,
-    LeafNode, SearchKeyFunc, SearchPrefix,
+    LeafNode as RsLeafNode, SearchKeyFunc, SearchPrefix,
 };
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -288,7 +288,7 @@ fn extract_leaf_node(
     py: Python<'_>,
     node: &Bound<'_, PyAny>,
     search_key_func: SearchKeyFunc,
-) -> PyResult<LeafNode> {
+) -> PyResult<RsLeafNode> {
     let items_attr = node.getattr("_items")?;
     let items_dict = items_attr.cast::<PyDict>()?;
     let mut items: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> =
@@ -338,7 +338,7 @@ fn extract_leaf_node(
         Some(first.cast_into::<PyBytes>()?.as_bytes().to_vec())
     };
 
-    Ok(LeafNode {
+    Ok(RsLeafNode {
         key,
         maximum_size,
         key_width,
@@ -354,7 +354,7 @@ fn extract_leaf_node(
 /// instance. Sets `_items`, `_len`, `_raw_size`, `_search_prefix` and
 /// `_common_serialised_prefix`; does not touch `_key` (the caller
 /// decides when to invalidate it).
-fn store_leaf_node(py: Python<'_>, node: &Bound<'_, PyAny>, leaf: &LeafNode) -> PyResult<()> {
+fn store_leaf_node(py: Python<'_>, node: &Bound<'_, PyAny>, leaf: &RsLeafNode) -> PyResult<()> {
     // Build a fresh dict to replace _items.
     let new_items = PyDict::new(py);
     for (k, v) in leaf.items.iter() {
@@ -525,6 +525,413 @@ fn py_are_search_keys_identical(search_keys: Bound<'_, PyAny>) -> PyResult<bool>
     Ok(are_search_keys_identical(keys.iter()))
 }
 
+/// CHK leaf node — actual key/value storage.
+///
+/// Owns its state in Rust via `bazaar::chk_map::LeafNode`. The Python
+/// `_search_key_func` attribute round-trips through whatever the caller
+/// passed at construction (or `None`, which resolves to the plain
+/// variant); internal algorithms always run against the resolved
+/// `SearchKeyFunc` enum.
+#[pyclass(module = "bzrformats._bzr_rs.chk_map", name = "LeafNode")]
+pub struct LeafNode {
+    inner: RsLeafNode,
+    /// Original Python callable as passed in; preserved so the
+    /// `_search_key_func` getter returns the same object the caller
+    /// sees. `None` means the caller asked for the default
+    /// (plain) variant — the getter then synthesises a callable.
+    search_key_callable: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl LeafNode {
+    #[new]
+    #[pyo3(signature = (search_key_func = None))]
+    fn new(py: Python<'_>, search_key_func: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
+        let (func, callable) = match search_key_func {
+            None => (SearchKeyFunc::Plain, None),
+            Some(cb) => {
+                let func = resolve_search_key_func_by_callable(py, &cb)?;
+                (func, Some(cb.unbind()))
+            }
+        };
+        Ok(Self {
+            inner: RsLeafNode::new(func),
+            search_key_callable: callable,
+        })
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn __repr__(&self) -> String {
+        // Mirror Python's LeafNode.__repr__: include key, len, size,
+        // max, prefix, key_width, and a truncated items debug.
+        let items_dbg = format!("{:?}", self.inner.items.keys().collect::<Vec<_>>());
+        let items_short = if items_dbg.len() > 20 {
+            format!("{}...]", &items_dbg[..16])
+        } else {
+            items_dbg
+        };
+        let key_dbg = match &self.inner.key {
+            Some(k) => format!("({:?},)", String::from_utf8_lossy(k)),
+            None => "None".to_string(),
+        };
+        let prefix_dbg = match &self.inner.search_prefix {
+            SearchPrefix::Unknown => "<unknown>".to_string(),
+            SearchPrefix::Computed(None) => "None".to_string(),
+            SearchPrefix::Computed(Some(p)) => format!("{:?}", p),
+        };
+        format!(
+            "LeafNode(key:{} len:{} size:{} max:{} prefix:{} keywidth:{} items:{})",
+            key_dbg,
+            self.inner.len(),
+            self.inner.raw_size,
+            self.inner.maximum_size,
+            prefix_dbg,
+            self.inner.key_width,
+            items_short
+        )
+    }
+
+    /// `(sha1_key,)` tuple once serialised, `None` while mutable.
+    fn key<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        match &self.inner.key {
+            None => Ok(None),
+            Some(k) => Ok(Some(PyTuple::new(py, [PyBytes::new(py, k)])?)),
+        }
+    }
+
+    fn set_maximum_size(&mut self, new_size: usize) {
+        self.inner.maximum_size = new_size;
+    }
+
+    #[getter]
+    fn maximum_size(&self) -> usize {
+        self.inner.maximum_size
+    }
+
+    /// Leaf nodes never reference other CHK pages — always `[]`.
+    fn refs<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
+        PyList::empty(py)
+    }
+
+    // ----- whitebox state accessors -----
+
+    #[getter]
+    fn _key<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        match &self.inner.key {
+            None => Ok(py.None()),
+            Some(k) => Ok(PyTuple::new(py, [PyBytes::new(py, k)])?.into_any().unbind()),
+        }
+    }
+
+    #[setter]
+    fn set__key(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.inner.key = None;
+        } else {
+            let tup = value.cast_into::<PyTuple>()?;
+            let first = tup.get_item(0)?;
+            self.inner.key = Some(first.cast_into::<PyBytes>()?.as_bytes().to_vec());
+            let _ = py;
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn _len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[setter]
+    fn set__len(&mut self, value: usize) -> PyResult<()> {
+        // `_len` mirrors `len(_items)`; the underlying IndexMap is
+        // already authoritative. Writes are only accepted when they
+        // match what the items dict actually contains, to catch
+        // callers that drift out of sync.
+        if value != self.inner.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "LeafNode._len must match len(_items): tried to set {} but items has {}",
+                value,
+                self.inner.len()
+            )));
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn _maximum_size(&self) -> usize {
+        self.inner.maximum_size
+    }
+
+    #[setter]
+    fn set__maximum_size(&mut self, value: usize) {
+        self.inner.maximum_size = value;
+    }
+
+    #[getter]
+    fn _key_width(&self) -> usize {
+        self.inner.key_width
+    }
+
+    #[setter]
+    fn set__key_width(&mut self, value: usize) {
+        self.inner.key_width = value;
+    }
+
+    #[getter]
+    fn _raw_size(&self) -> usize {
+        self.inner.raw_size
+    }
+
+    #[setter]
+    fn set__raw_size(&mut self, value: usize) {
+        self.inner.raw_size = value;
+    }
+
+    /// Materialise `_items` as a fresh `dict[tuple[bytes, ...], bytes]`
+    /// each access. Mutations to the returned dict do *not* propagate
+    /// back — callers that need to replace the contents assign a new
+    /// dict to `_items`.
+    #[getter]
+    fn _items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (k, v) in self.inner.items.iter() {
+            let parts: Vec<Bound<PyBytes>> = k.iter().map(|p| PyBytes::new(py, p)).collect();
+            let key_tuple = PyTuple::new(py, parts)?;
+            dict.set_item(key_tuple, PyBytes::new(py, v))?;
+        }
+        Ok(dict)
+    }
+
+    /// Bulk-replace `_items`. Used by `CHKMap._create_directly`.
+    #[setter]
+    fn set__items(&mut self, value: Bound<'_, PyDict>) -> PyResult<()> {
+        let mut items: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> =
+            indexmap::IndexMap::with_capacity(value.len());
+        for (k, v) in value.iter() {
+            let key_tuple = k.cast_into::<PyTuple>()?;
+            let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key_tuple.len());
+            for part in key_tuple.iter() {
+                parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
+            }
+            let value_bytes = v.cast_into::<PyBytes>()?.as_bytes().to_vec();
+            items.insert(parts, value_bytes);
+        }
+        self.inner.items = items;
+        Ok(())
+    }
+
+    /// Returns one of: `chk_map._unknown` (sentinel), `None` (empty
+    /// node), or `bytes` (computed prefix).
+    #[getter]
+    fn _search_prefix<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        match &self.inner.search_prefix {
+            SearchPrefix::Unknown => unknown_sentinel(py).clone_ref(py),
+            SearchPrefix::Computed(None) => py.None(),
+            SearchPrefix::Computed(Some(p)) => PyBytes::new(py, p).into_any().unbind(),
+        }
+    }
+
+    #[setter]
+    fn set__search_prefix(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is(unknown_sentinel(py)) {
+            self.inner.search_prefix = SearchPrefix::Unknown;
+        } else if value.is_none() {
+            self.inner.search_prefix = SearchPrefix::Computed(None);
+        } else {
+            self.inner.search_prefix =
+                SearchPrefix::Computed(Some(value.cast_into::<PyBytes>()?.as_bytes().to_vec()));
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn _common_serialised_prefix<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        match &self.inner.common_serialised_prefix {
+            None => py.None(),
+            Some(p) => PyBytes::new(py, p).into_any().unbind(),
+        }
+    }
+
+    #[setter]
+    fn set__common_serialised_prefix(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.inner.common_serialised_prefix = None;
+        } else {
+            self.inner.common_serialised_prefix =
+                Some(value.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        Ok(())
+    }
+
+    /// Returns the original callable passed at construction, or a
+    /// synthesised wrapper around the resolved variant. Identity is
+    /// preserved across reads only when the caller supplied a callable.
+    #[getter]
+    fn _search_key_func<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        if let Some(cb) = &self.search_key_callable {
+            return Ok(cb.clone_ref(py));
+        }
+        // Synthesise a lambda backed by `_search_key_by_name` with the
+        // resolved variant's name.
+        let name = self.inner.search_key_func.name().to_vec();
+        let name_bytes = PyBytes::new(py, &name);
+        let module = py.import("bzrformats._bzr_rs.chk_map")?;
+        let by_name = module.getattr("_search_key_by_name")?;
+        // Build a partial: `lambda key: _search_key_by_name(name, key)`.
+        let functools = py.import("functools")?;
+        let partial = functools.getattr("partial")?;
+        Ok(partial.call1((by_name, name_bytes))?.unbind())
+    }
+
+    #[setter]
+    fn set__search_key_func(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.inner.search_key_func = SearchKeyFunc::Plain;
+            self.search_key_callable = None;
+        } else {
+            self.inner.search_key_func = resolve_search_key_func_by_callable(py, &value)?;
+            self.search_key_callable = Some(value.unbind());
+        }
+        Ok(())
+    }
+
+    // ----- pure methods -----
+
+    fn _current_size(&self) -> usize {
+        self.inner.current_size()
+    }
+
+    fn _key_value_len(&self, key: &Bound<'_, PyTuple>, value: &[u8]) -> PyResult<usize> {
+        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key.len());
+        for part in key.iter() {
+            parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        Ok(leaf_node_key_value_len(&parts, value))
+    }
+
+    fn _search_key<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'_, PyTuple>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key.len());
+        for part in key.iter() {
+            parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        let bytes = self.inner.search_key_func.apply(&Key::from(parts));
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Static helper mirroring `LeafNode._serialise_key`. The Python
+    /// classmethod has no `self`, so this is exposed as a regular
+    /// pyo3 staticmethod.
+    #[staticmethod]
+    fn _serialise_key<'py>(
+        py: Python<'py>,
+        key: Bound<'_, PyTuple>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key.len());
+        for part in key.iter() {
+            parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        Ok(PyBytes::new(py, &Key::from(parts).serialize()))
+    }
+
+    fn _compute_search_prefix<'py>(&mut self, py: Python<'py>) -> Py<PyAny> {
+        let prefix = self.inner.compute_search_prefix().map(|s| s.to_vec());
+        match prefix {
+            None => py.None(),
+            Some(p) => PyBytes::new(py, &p).into_any().unbind(),
+        }
+    }
+
+    fn _compute_serialised_prefix<'py>(&mut self, py: Python<'py>) -> Py<PyAny> {
+        let prefix = self.inner.compute_serialised_prefix().map(|s| s.to_vec());
+        match prefix {
+            None => py.None(),
+            Some(p) => PyBytes::new(py, &p).into_any().unbind(),
+        }
+    }
+
+    fn _are_search_keys_identical(&self) -> bool {
+        self.inner.are_search_keys_identical()
+    }
+
+    /// Insert `(key, value)` and return whether the node has now
+    /// overflowed `maximum_size`. Mirrors `LeafNode._map_no_split`.
+    fn _map_no_split(&mut self, key: Bound<'_, PyTuple>, value: &[u8]) -> PyResult<bool> {
+        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key.len());
+        for part in key.iter() {
+            parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        Ok(self.inner.map_no_split(parts, value.to_vec()))
+    }
+
+    /// Remove `key`, recomputing both prefixes from scratch. Mirrors
+    /// `LeafNode.unmap`; `_store` is unused on the leaf path. Raises
+    /// `KeyError` when the key is not present.
+    #[pyo3(signature = (_store, key))]
+    fn unmap(
+        &mut self,
+        py: Python<'_>,
+        _store: Bound<'_, PyAny>,
+        key: Bound<'_, PyTuple>,
+    ) -> PyResult<Py<PyAny>> {
+        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key.len());
+        for part in key.iter() {
+            parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        if self.inner.unmap(&parts).is_none() {
+            return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                "{:?}",
+                parts
+            )));
+        }
+        // Python's unmap returns `self` to chain. Returning None from a
+        // pyo3 method would replace `self`; instead, return Python's
+        // None and let the Python wrapper hand back the LeafNode
+        // instance. (Adjusted in the final replacement commit.)
+        Ok(py.None())
+    }
+
+    /// Deserialise the bytes of a serialised LeafNode. `search_key_func`
+    /// is optional and defaults to plain.
+    #[classmethod]
+    #[pyo3(signature = (data, key, search_key_func = None))]
+    fn deserialise(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        data: &[u8],
+        key: Bound<'_, PyTuple>,
+        search_key_func: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let parsed = deserialise_leaf_node(data).map_err(chk_err_to_py)?;
+        let (func, callable) = match search_key_func {
+            None => (SearchKeyFunc::Plain, None),
+            Some(cb) => {
+                let resolved = resolve_search_key_func_by_callable(py, &cb)?;
+                (resolved, Some(cb.unbind()))
+            }
+        };
+        let mut leaf = RsLeafNode::from_parsed(parsed, func);
+        let first = key.get_item(0)?;
+        leaf.key = Some(first.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        // Sanity check matching the Python deserialise wrapper.
+        if data.len() != leaf.current_size() {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(
+                "_current_size computed incorrectly",
+            ));
+        }
+        Ok(Self {
+            inner: leaf,
+            search_key_callable: callable,
+        })
+    }
+}
+
 pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "chk_map")?;
     m.add_wrapped(wrap_pyfunction!(_search_key_16))?;
@@ -547,5 +954,6 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     // as `chk_map._unknown` and identity comparisons line up with what
     // the Rust mutators write back.
     m.add("_unknown", py_unknown_sentinel(py))?;
+    m.add_class::<LeafNode>()?;
     Ok(m)
 }
