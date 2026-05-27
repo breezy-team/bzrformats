@@ -436,6 +436,55 @@ mod tests {
     }
 
     #[test]
+    fn create_by_apply_delta_adds_a_file() {
+        let inv = build_test_inv_deeper();
+        // Apply a delta that adds one new file under the root.
+        let new_file = Entry::File {
+            file_id: FileId::from(&b"new-id"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev2"[..])),
+            parent_id: FileId::from(&b"root-id"[..]),
+            name: "added.txt".to_string(),
+            text_sha1: Some(b"x".to_vec()),
+            text_size: Some(0),
+            text_id: None,
+            executable: false,
+        };
+        let delta = crate::inventory_delta::InventoryDelta(vec![
+            crate::inventory_delta::InventoryDeltaEntry {
+                old_path: None,
+                new_path: Some("added.txt".to_string()),
+                file_id: FileId::from(&b"new-id"[..]),
+                new_entry: Some(new_file),
+            },
+        ]);
+        let new_inv = inv
+            .create_by_apply_delta(&delta, crate::RevisionId::from(&b"rev2"[..]), false)
+            .unwrap();
+        assert!(new_inv.has_id(&FileId::from(&b"new-id"[..])).unwrap());
+        // Original inventory is unchanged.
+        assert!(!inv.has_id(&FileId::from(&b"new-id"[..])).unwrap());
+        let new_path = new_inv.id2path(&FileId::from(&b"new-id"[..])).unwrap();
+        assert_eq!(new_path, "added.txt");
+    }
+
+    #[test]
+    fn create_by_apply_delta_deletes_a_file() {
+        let inv = build_test_inv_deeper();
+        let delta = crate::inventory_delta::InventoryDelta(vec![
+            crate::inventory_delta::InventoryDeltaEntry {
+                old_path: Some("top.txt".to_string()),
+                new_path: None,
+                file_id: FileId::from(&b"top-id"[..]),
+                new_entry: None,
+            },
+        ]);
+        let new_inv = inv
+            .create_by_apply_delta(&delta, crate::RevisionId::from(&b"rev2"[..]), false)
+            .unwrap();
+        assert!(!new_inv.has_id(&FileId::from(&b"top-id"[..])).unwrap());
+    }
+
+    #[test]
     fn from_inventory_round_trips_through_to_lines() {
         let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
         let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
@@ -1052,6 +1101,253 @@ where
         let mut sorted: Vec<(String, Entry)> = children.into_iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(sorted.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Apply `inventory_delta` to this inventory, returning a new
+    /// CHKInventory under `new_revision_id`. Mirrors Python's
+    /// `create_by_apply_delta` — the receiver is *not* modified.
+    ///
+    /// `propagate_caches` carries forward this inventory's
+    /// `path_to_fileid_cache` (minus deleted paths) into the new
+    /// inventory to amortise lookups when the caller will be doing
+    /// many id2path/path2id calls on the result.
+    pub fn create_by_apply_delta(
+        &self,
+        inventory_delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: crate::RevisionId,
+        propagate_caches: bool,
+    ) -> Result<Self, Error> {
+        inventory_delta.check().map_err(|e| {
+            Error::InvalidFormat(format!("inventory delta failed precheck: {:?}", e))
+        })?;
+        let search_key_func = self.search_key_func()?;
+        // Establish the new id_to_entry map sharing this inventory's
+        // current root (we'll apply_delta into it). Preserving the
+        // existing maximum_size requires ensure_root on the original
+        // then reading off the root_node.
+        let id_root_key = {
+            let mut id_to_entry = self.id_to_entry.borrow_mut();
+            let map = id_to_entry
+                .as_mut()
+                .ok_or_else(|| Error::InvalidFormat("id_to_entry not set".into()))?;
+            map.ensure_root()?;
+            map.key()
+                .ok_or_else(|| Error::InvalidFormat("id_to_entry has no key".into()))?
+        };
+        let mut result_id_map = crate::chk_map::CHKMap::new(
+            self.store.clone(),
+            self.cache.clone(),
+            Some(id_root_key),
+            search_key_func.clone(),
+        );
+        // Establish the new parent_id_basename_to_file_id map similarly.
+        let parent_root_key = {
+            let mut pid_map = self.parent_id_basename_to_file_id.borrow_mut();
+            match pid_map.as_mut() {
+                None => None,
+                Some(map) => {
+                    map.ensure_root()?;
+                    Some(
+                        map.key()
+                            .ok_or_else(|| {
+                                Error::InvalidFormat(
+                                    "parent_id_basename_to_file_id has no key".into(),
+                                )
+                            })?,
+                    )
+                }
+            }
+        };
+        let mut result_pid_map = parent_root_key.map(|k| {
+            crate::chk_map::CHKMap::new(
+                self.store.clone(),
+                self.cache.clone(),
+                Some(k),
+                search_key_func.clone(),
+            )
+        });
+        let mut new_root_id = self.root_id.clone();
+        let mut path_cache: std::collections::HashMap<String, crate::FileId> =
+            if propagate_caches {
+                self.path_to_fileid_cache.borrow().clone()
+            } else {
+                std::collections::HashMap::new()
+            };
+        let mut id_delta: Vec<(
+            Option<Vec<Vec<u8>>>,
+            Option<Vec<Vec<u8>>>,
+            Vec<u8>,
+        )> = Vec::new();
+        let mut parent_delta: indexmap::IndexMap<Vec<Vec<u8>>, (Option<Vec<Vec<u8>>>, Option<Vec<u8>>)> =
+            indexmap::IndexMap::new();
+        let mut parents: std::collections::HashSet<(String, Option<crate::FileId>)> =
+            std::collections::HashSet::new();
+        let mut deletes: std::collections::HashSet<crate::FileId> =
+            std::collections::HashSet::new();
+        let mut altered: std::collections::HashSet<crate::FileId> =
+            std::collections::HashSet::new();
+        for entry_d in inventory_delta.iter() {
+            // Adjust root_id if the new path is "".
+            if entry_d.new_path.as_deref() == Some("") {
+                new_root_id = Some(entry_d.file_id.clone());
+            }
+            let (new_key, new_value): (Option<Vec<Vec<u8>>>, Option<Vec<u8>>) =
+                match &entry_d.new_path {
+                    None => {
+                        if propagate_caches {
+                            if let Some(op) = &entry_d.old_path {
+                                path_cache.remove(op);
+                            }
+                        }
+                        deletes.insert(entry_d.file_id.clone());
+                        (None, None)
+                    }
+                    Some(new_path) => {
+                        let entry = entry_d.new_entry.as_ref().ok_or_else(|| {
+                            Error::InvalidFormat("delta entry with new_path missing new_entry".into())
+                        })?;
+                        let key = vec![entry_d.file_id.as_bytes().to_vec()];
+                        let value = chk_inventory_entry_to_bytes(entry);
+                        path_cache.insert(new_path.clone(), entry_d.file_id.clone());
+                        let split_at = new_path.rfind('/').unwrap_or(0);
+                        let parent_path = if split_at == 0 {
+                            String::new()
+                        } else {
+                            new_path[..split_at].to_string()
+                        };
+                        parents.insert((parent_path, entry.parent_id().cloned()));
+                        (Some(key), Some(value))
+                    }
+                };
+            let old_key: Option<Vec<Vec<u8>>> = if entry_d.old_path.is_some() {
+                let k = vec![entry_d.file_id.as_bytes().to_vec()];
+                // Sanity check: the existing path matches what the
+                // delta claims.
+                let observed = self.id2path(&entry_d.file_id)?;
+                if Some(&observed) != entry_d.old_path.as_ref() {
+                    return Err(Error::InvalidFormat(format!(
+                        "Entry {:?} was at wrong path {:?} (delta expected {:?})",
+                        entry_d.file_id, observed, entry_d.old_path
+                    )));
+                }
+                altered.insert(entry_d.file_id.clone());
+                Some(k)
+            } else {
+                None
+            };
+            id_delta.push((
+                old_key,
+                new_key,
+                new_value.unwrap_or_default(),
+            ));
+            if result_pid_map.is_some() {
+                let old_pkey = if entry_d.old_path.is_some() {
+                    let old_entry = self.get_entry(&entry_d.file_id)?;
+                    Some(parent_id_basename_key(&old_entry))
+                } else {
+                    None
+                };
+                let (new_pkey, new_pvalue): (Option<Vec<Vec<u8>>>, Option<Vec<u8>>) =
+                    match (&entry_d.new_path, &entry_d.new_entry) {
+                        (None, _) => (None, None),
+                        (Some(_), None) => (None, None),
+                        (Some(_), Some(entry)) => (
+                            Some(parent_id_basename_key(entry)),
+                            Some(entry_d.file_id.as_bytes().to_vec()),
+                        ),
+                    };
+                if old_pkey != new_pkey {
+                    if let Some(ok) = &old_pkey {
+                        let slot = parent_delta.entry(ok.clone()).or_insert((None, None));
+                        slot.0 = Some(ok.clone());
+                    }
+                    if let Some(nk) = &new_pkey {
+                        let slot = parent_delta.entry(nk.clone()).or_insert((None, None));
+                        slot.1 = new_pvalue;
+                    }
+                }
+            }
+        }
+        // Validate that deletes are complete (every child of a deleted
+        // directory was either deleted or moved).
+        for fid in &deletes {
+            let entry = self.get_entry(fid)?;
+            if !matches!(entry, Entry::Directory { .. }) {
+                continue;
+            }
+            for child in self.iter_sorted_children(fid)? {
+                if !altered.contains(child.file_id()) {
+                    return Err(Error::InvalidFormat(format!(
+                        "Child {:?} not deleted or reparented when parent {:?} deleted",
+                        child.file_id(),
+                        fid
+                    )));
+                }
+            }
+        }
+        result_id_map.apply_delta(id_delta)?;
+        if let Some(pid_map) = result_pid_map.as_mut() {
+            if !parent_delta.is_empty() {
+                let delta_list: Vec<(
+                    Option<Vec<Vec<u8>>>,
+                    Option<Vec<Vec<u8>>>,
+                    Vec<u8>,
+                )> = parent_delta
+                    .into_iter()
+                    .map(|(key, (old_key, value))| match value {
+                        Some(v) => (old_key, Some(key), v),
+                        None => (old_key, None, Vec::new()),
+                    })
+                    .collect();
+                pid_map.apply_delta(delta_list)?;
+            }
+        }
+        let result = Self {
+            search_key_name: self.search_key_name.clone(),
+            revision_id: Some(new_revision_id),
+            root_id: new_root_id,
+            id_to_entry: std::cell::RefCell::new(Some(result_id_map)),
+            parent_id_basename_to_file_id: std::cell::RefCell::new(result_pid_map),
+            fileid_to_entry_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fully_cached: std::cell::Cell::new(false),
+            path_to_fileid_cache: std::cell::RefCell::new(path_cache),
+            children_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            store: self.store.clone(),
+            cache: self.cache.clone(),
+        };
+        // Validate parent expectations.
+        let mut parents = parents;
+        parents.retain(|(p, id)| !(p.is_empty() && id.is_none()));
+        for (parent_path, parent_id) in &parents {
+            let parent_id = match parent_id {
+                None => continue,
+                Some(id) => id,
+            };
+            match result.get_entry(parent_id) {
+                Ok(entry) => {
+                    if !matches!(entry, Entry::Directory { .. } | Entry::Root { .. }) {
+                        return Err(Error::InvalidFormat(format!(
+                            "Parent {:?} is not a directory, but given children",
+                            parent_id
+                        )));
+                    }
+                }
+                Err(Error::NoSuchId(_)) => {
+                    return Err(Error::InvalidFormat(format!(
+                        "Parent {:?} is not present in resulting inventory.",
+                        parent_id
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
+            if result.path2id(parent_path)? != Some(parent_id.clone()) {
+                return Err(Error::InvalidFormat(format!(
+                    "Parent {:?} has wrong path {:?}",
+                    parent_id, parent_path
+                )));
+            }
+        }
+        Ok(result)
     }
 
     /// Bulk-create a CHKInventory by serialising every entry in
