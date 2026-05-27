@@ -3517,6 +3517,143 @@ where
     Ok(data)
 }
 
+/// Test-only fixtures shared across the `chk_map` and
+/// `chk_inventory` test modules. Behind `#[cfg(test)]` (and
+/// `pub(crate)`) so it's invisible at link time.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// Minimal in-memory `VersionedFiles` for round-tripping pages.
+    /// `add_lines` hashes content with sha1 and stores under the bare
+    /// hex; `get_record_stream` strips the `b"sha1:"` prefix from
+    /// query keys and returns the matching pages as
+    /// `FulltextContentFactory` records.
+    pub struct FakeChkStore {
+        pub(crate) pages: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>,
+    }
+
+    impl FakeChkStore {
+        pub fn new() -> Self {
+            Self {
+                pages: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl crate::versionedfile::VersionedFiles for FakeChkStore {
+        fn get_parent_map(
+            &self,
+            _keys: &[crate::versionedfile::Key],
+        ) -> Result<
+            std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
+            crate::knit::KnitError,
+        > {
+            Ok(std::collections::HashMap::new())
+        }
+
+        fn get_record_stream(
+            &self,
+            keys: &[crate::versionedfile::Key],
+            _ordering: &str,
+            _include_delta_closure: bool,
+        ) -> Result<
+            Box<
+                dyn Iterator<
+                    Item = Result<
+                        Box<dyn crate::versionedfile::ContentFactory>,
+                        crate::knit::KnitError,
+                    >,
+                >,
+            >,
+            crate::knit::KnitError,
+        > {
+            let pages = self.pages.lock().unwrap();
+            let mut records: Vec<
+                Result<Box<dyn crate::versionedfile::ContentFactory>, crate::knit::KnitError>,
+            > = Vec::with_capacity(keys.len());
+            for key in keys {
+                let full = key.segments().first().cloned().unwrap_or_default();
+                let bare: &[u8] = if full.starts_with(b"sha1:") {
+                    &full[5..]
+                } else {
+                    &full
+                };
+                if let Some(data) = pages.get(bare) {
+                    records.push(Ok(Box::new(
+                        crate::versionedfile::FulltextContentFactory::new(
+                            Some(bare.to_vec()),
+                            key.clone(),
+                            Some(vec![]),
+                            data.clone(),
+                        ),
+                    )
+                        as Box<dyn crate::versionedfile::ContentFactory>));
+                }
+            }
+            Ok(Box::new(records.into_iter()))
+        }
+
+        fn get_sha1s(
+            &self,
+            _keys: &[crate::versionedfile::Key],
+        ) -> Result<
+            std::collections::HashMap<crate::versionedfile::Key, Vec<u8>>,
+            crate::knit::KnitError,
+        > {
+            Ok(std::collections::HashMap::new())
+        }
+
+        fn keys(&self) -> Result<Vec<crate::versionedfile::Key>, crate::knit::KnitError> {
+            let p = self.pages.lock().unwrap();
+            Ok(p.keys()
+                .map(|k| crate::versionedfile::Key::Fixed(vec![k.clone()]))
+                .collect())
+        }
+
+        fn add_lines(
+            &self,
+            _key: &crate::versionedfile::Key,
+            _parents: Option<&[crate::versionedfile::Key]>,
+            lines: &[Vec<u8>],
+        ) -> Result<(Vec<u8>, usize), crate::knit::KnitError> {
+            use sha1::{Digest, Sha1};
+            let data: Vec<u8> = lines.iter().flatten().copied().collect();
+            let mut hasher = Sha1::new();
+            hasher.update(&data);
+            let digest = hasher.finalize();
+            let sha1_hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+            let sha1_bytes = sha1_hex.into_bytes();
+            let size = data.len();
+            self.pages.lock().unwrap().insert(sha1_bytes.clone(), data);
+            Ok((sha1_bytes, size))
+        }
+
+        fn insert_record_stream(
+            &self,
+            _stream: Box<dyn Iterator<Item = Box<dyn crate::versionedfile::ContentFactory>>>,
+        ) -> Result<(), crate::knit::KnitError> {
+            Err(crate::knit::KnitError::NotImplemented("insert_record_stream"))
+        }
+
+        fn iter_lines_added_or_present_in_keys(
+            &self,
+            _keys: &[crate::versionedfile::Key],
+        ) -> Result<Vec<(Vec<u8>, crate::versionedfile::Key)>, crate::knit::KnitError> {
+            Err(crate::knit::KnitError::NotImplemented(
+                "iter_lines_added_or_present_in_keys",
+            ))
+        }
+
+        fn annotate(
+            &self,
+            _key: &crate::versionedfile::Key,
+        ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
+            Err(crate::knit::KnitError::NotImplemented("annotate"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3989,137 +4126,7 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         }
     }
 
-    /// Minimal in-memory `VersionedFiles` for round-tripping a single
-    /// page through `serialise` / `deserialise`. Only `add_lines` and
-    /// `get_record_stream` (single-key fulltext) are implemented.
-    struct FakeChkStore {
-        pages: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>,
-    }
-
-    impl FakeChkStore {
-        fn new() -> Self {
-            Self {
-                pages: std::sync::Mutex::new(std::collections::HashMap::new()),
-            }
-        }
-    }
-
-    impl crate::versionedfile::VersionedFiles for FakeChkStore {
-        fn get_parent_map(
-            &self,
-            _keys: &[crate::versionedfile::Key],
-        ) -> Result<
-            std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
-            crate::knit::KnitError,
-        > {
-            Ok(std::collections::HashMap::new())
-        }
-
-        fn get_record_stream(
-            &self,
-            keys: &[crate::versionedfile::Key],
-            _ordering: &str,
-            _include_delta_closure: bool,
-        ) -> Result<
-            Box<
-                dyn Iterator<
-                    Item = Result<
-                        Box<dyn crate::versionedfile::ContentFactory>,
-                        crate::knit::KnitError,
-                    >,
-                >,
-            >,
-            crate::knit::KnitError,
-        > {
-            let pages = self.pages.lock().unwrap();
-            let mut records: Vec<
-                Result<Box<dyn crate::versionedfile::ContentFactory>, crate::knit::KnitError>,
-            > = Vec::with_capacity(keys.len());
-            for key in keys {
-                let full = key.segments().first().cloned().unwrap_or_default();
-                // Test fixture stores pages under the bare hex; the
-                // CHK code uses prefixed `b"sha1:...."` keys.
-                let bare: &[u8] = if full.starts_with(b"sha1:") {
-                    &full[5..]
-                } else {
-                    &full
-                };
-                if let Some(data) = pages.get(bare) {
-                    records.push(Ok(Box::new(
-                        crate::versionedfile::FulltextContentFactory::new(
-                            Some(bare.to_vec()),
-                            key.clone(),
-                            Some(vec![]),
-                            data.clone(),
-                        ),
-                    )
-                        as Box<dyn crate::versionedfile::ContentFactory>));
-                }
-            }
-            Ok(Box::new(records.into_iter()))
-        }
-
-        fn get_sha1s(
-            &self,
-            _keys: &[crate::versionedfile::Key],
-        ) -> Result<
-            std::collections::HashMap<crate::versionedfile::Key, Vec<u8>>,
-            crate::knit::KnitError,
-        > {
-            Ok(std::collections::HashMap::new())
-        }
-
-        fn keys(&self) -> Result<Vec<crate::versionedfile::Key>, crate::knit::KnitError> {
-            let p = self.pages.lock().unwrap();
-            Ok(p.keys()
-                .map(|k| crate::versionedfile::Key::Fixed(vec![k.clone()]))
-                .collect())
-        }
-
-        fn add_lines(
-            &self,
-            _key: &crate::versionedfile::Key,
-            _parents: Option<&[crate::versionedfile::Key]>,
-            lines: &[Vec<u8>],
-        ) -> Result<(Vec<u8>, usize), crate::knit::KnitError> {
-            use sha1::{Digest, Sha1};
-            let data: Vec<u8> = lines.iter().flatten().copied().collect();
-            let mut hasher = Sha1::new();
-            hasher.update(&data);
-            let digest = hasher.finalize();
-            let sha1_hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
-            let sha1_bytes = sha1_hex.into_bytes();
-            let size = data.len();
-            self.pages
-                .lock()
-                .unwrap()
-                .insert(sha1_bytes.clone(), data);
-            Ok((sha1_bytes, size))
-        }
-
-        fn insert_record_stream(
-            &self,
-            _stream: Box<dyn Iterator<Item = Box<dyn crate::versionedfile::ContentFactory>>>,
-        ) -> Result<(), crate::knit::KnitError> {
-            Err(crate::knit::KnitError::NotImplemented("insert_record_stream"))
-        }
-
-        fn iter_lines_added_or_present_in_keys(
-            &self,
-            _keys: &[crate::versionedfile::Key],
-        ) -> Result<Vec<(Vec<u8>, crate::versionedfile::Key)>, crate::knit::KnitError> {
-            Err(crate::knit::KnitError::NotImplemented(
-                "iter_lines_added_or_present_in_keys",
-            ))
-        }
-
-        fn annotate(
-            &self,
-            _key: &crate::versionedfile::Key,
-        ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
-            Err(crate::knit::KnitError::NotImplemented("annotate"))
-        }
-    }
+    use super::testing::FakeChkStore;
 
     #[test]
     fn iter_interesting_nodes_no_old_yields_all_new() {

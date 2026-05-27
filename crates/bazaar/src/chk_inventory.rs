@@ -186,7 +186,97 @@ pub fn chk_inventory_bytes_to_utf8_name_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chk_map::testing::FakeChkStore;
+    use crate::chk_map::{CHKMap, InMemoryPageCache, PageCache, SearchKeyFunc};
     use crate::FileId;
+
+    fn build_test_inv() -> (
+        CHKInventory<FakeChkStore>,
+        std::sync::Arc<FakeChkStore>,
+        std::sync::Arc<dyn PageCache>,
+    ) {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let inv = CHKInventory::new(store.clone(), cache.clone(), b"plain".to_vec());
+        // Populate id_to_entry with a single root entry.
+        let mut id_map = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        let root = Entry::Root {
+            file_id: FileId::from(&b"root-id"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev1"[..])),
+        };
+        id_map
+            .map(
+                vec![root.file_id().as_bytes().to_vec()],
+                chk_inventory_entry_to_bytes(&root),
+            )
+            .unwrap();
+        id_map.save().unwrap();
+        inv.id_to_entry.replace(Some(id_map));
+        let mut out = CHKInventory::new(store.clone(), cache.clone(), b"plain".to_vec());
+        out.root_id = Some(FileId::from(&b"root-id"[..]));
+        out.revision_id = Some(crate::RevisionId::from(&b"rev1"[..]));
+        out.id_to_entry.replace(inv.id_to_entry.take());
+        (out, store, cache)
+    }
+
+    #[test]
+    fn get_entry_returns_root() {
+        let (inv, _store, _cache) = build_test_inv();
+        let entry = inv.get_entry(&FileId::from(&b"root-id"[..])).unwrap();
+        match entry {
+            Entry::Root { file_id, .. } => {
+                assert_eq!(file_id.as_bytes(), b"root-id");
+            }
+            _ => panic!("expected Root"),
+        }
+    }
+
+    #[test]
+    fn get_entry_missing_returns_no_such_id() {
+        let (inv, _store, _cache) = build_test_inv();
+        let err = inv.get_entry(&FileId::from(&b"absent"[..])).unwrap_err();
+        match err {
+            Error::NoSuchId(id) => assert_eq!(id.as_bytes(), b"absent"),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn has_id_uses_chk_map() {
+        let (inv, _store, _cache) = build_test_inv();
+        assert!(inv.has_id(&FileId::from(&b"root-id"[..])).unwrap());
+        assert!(!inv.has_id(&FileId::from(&b"absent"[..])).unwrap());
+    }
+
+    #[test]
+    fn is_root_compares_against_root_id() {
+        let (inv, _store, _cache) = build_test_inv();
+        assert!(inv.is_root(&FileId::from(&b"root-id"[..])));
+        assert!(!inv.is_root(&FileId::from(&b"other"[..])));
+    }
+
+    #[test]
+    fn iter_all_ids_returns_seeded_id() {
+        let (inv, _store, _cache) = build_test_inv();
+        let ids = inv.iter_all_ids().unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].as_bytes(), b"root-id");
+    }
+
+    #[test]
+    fn iter_just_entries_returns_deserialised_entry() {
+        let (inv, _store, _cache) = build_test_inv();
+        let entries = inv.iter_just_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0], Entry::Root { .. }));
+    }
+
+    #[test]
+    fn len_matches_chk_map_count() {
+        let (inv, _store, _cache) = build_test_inv();
+        assert_eq!(inv.len().unwrap(), 1);
+        assert!(!inv.is_empty().unwrap());
+    }
 
     #[test]
     fn parent_id_basename_key_directory() {
@@ -324,6 +414,156 @@ where
         crate::chk_map::SearchKeyFunc::from_name(&self.search_key_name).map_err(|raw| {
             Error::InvalidFormat(format!("unknown search_key_name: {:?}", raw))
         })
+    }
+
+    /// Look up an inventory entry by file id, consulting the cache
+    /// first. Mirrors Python's `CHKInventory.get_entry`. Returns
+    /// `NoSuchId` when the entry isn't present.
+    pub fn get_entry(&self, file_id: &crate::FileId) -> Result<Entry, Error> {
+        if let Some(entry) = self.fileid_to_entry_cache.borrow().get(file_id) {
+            return Ok(entry.clone());
+        }
+        let key = vec![file_id.as_bytes().to_vec()];
+        let mut id_to_entry = self.id_to_entry.borrow_mut();
+        let map = id_to_entry
+            .as_mut()
+            .ok_or_else(|| Error::InvalidFormat("id_to_entry not set".into()))?;
+        let items = map.iteritems(Some(&[key]))?;
+        let value = items
+            .into_iter()
+            .next()
+            .map(|(_k, v)| v)
+            .ok_or_else(|| Error::NoSuchId(file_id.clone()))?;
+        let entry = chk_inventory_bytes_to_entry(&value);
+        self.fileid_to_entry_cache
+            .borrow_mut()
+            .insert(file_id.clone(), entry.clone());
+        Ok(entry)
+    }
+
+    /// Bulk lookup. Returns entries for whichever of `file_ids` are
+    /// present; missing ids are silently omitted. Mirrors Python's
+    /// `_getitems`. Order is undefined.
+    pub fn get_items(
+        &self,
+        file_ids: &[crate::FileId],
+    ) -> Result<Vec<Entry>, Error> {
+        let mut result: Vec<Entry> = Vec::new();
+        let mut remaining: Vec<Vec<Vec<u8>>> = Vec::new();
+        {
+            let cache = self.fileid_to_entry_cache.borrow();
+            for fid in file_ids {
+                match cache.get(fid) {
+                    Some(e) => result.push(e.clone()),
+                    None => remaining.push(vec![fid.as_bytes().to_vec()]),
+                }
+            }
+        }
+        if remaining.is_empty() {
+            return Ok(result);
+        }
+        let mut id_to_entry = self.id_to_entry.borrow_mut();
+        let map = id_to_entry
+            .as_mut()
+            .ok_or_else(|| Error::InvalidFormat("id_to_entry not set".into()))?;
+        for (_k, value) in map.iteritems(Some(&remaining))? {
+            let entry = chk_inventory_bytes_to_entry(&value);
+            self.fileid_to_entry_cache
+                .borrow_mut()
+                .insert(entry.file_id().clone(), entry.clone());
+            result.push(entry);
+        }
+        Ok(result)
+    }
+
+    /// True if `file_id` is present in the inventory. Mirrors
+    /// Python's `has_id`.
+    pub fn has_id(&self, file_id: &crate::FileId) -> Result<bool, Error> {
+        if self.fileid_to_entry_cache.borrow().contains_key(file_id) {
+            return Ok(true);
+        }
+        let key = vec![file_id.as_bytes().to_vec()];
+        let mut id_to_entry = self.id_to_entry.borrow_mut();
+        let map = id_to_entry
+            .as_mut()
+            .ok_or_else(|| Error::InvalidFormat("id_to_entry not set".into()))?;
+        Ok(!map.iteritems(Some(&[key]))?.is_empty())
+    }
+
+    /// True if `file_id` is the root id. Mirrors `is_root`.
+    pub fn is_root(&self, file_id: &crate::FileId) -> bool {
+        self.root_id.as_ref() == Some(file_id)
+    }
+
+    /// Yield every file id stored in the inventory. Mirrors
+    /// `iter_all_ids`.
+    pub fn iter_all_ids(&self) -> Result<Vec<crate::FileId>, Error> {
+        let mut id_to_entry = self.id_to_entry.borrow_mut();
+        let map = id_to_entry
+            .as_mut()
+            .ok_or_else(|| Error::InvalidFormat("id_to_entry not set".into()))?;
+        Ok(map
+            .iteritems(None)?
+            .into_iter()
+            .map(|(k, _)| crate::FileId::from(k.last().cloned().unwrap_or_default().as_slice()))
+            .collect())
+    }
+
+    /// Yield every entry in the inventory (order undefined). Mirrors
+    /// Python's `iter_just_entries`. Caches as it walks.
+    pub fn iter_just_entries(&self) -> Result<Vec<Entry>, Error> {
+        let mut out: Vec<Entry> = Vec::new();
+        let pairs = {
+            let mut id_to_entry = self.id_to_entry.borrow_mut();
+            let map = id_to_entry
+                .as_mut()
+                .ok_or_else(|| Error::InvalidFormat("id_to_entry not set".into()))?;
+            map.iteritems(None)?
+        };
+        for (key, value) in pairs {
+            let file_id =
+                crate::FileId::from(key.last().cloned().unwrap_or_default().as_slice());
+            if let Some(entry) = self.fileid_to_entry_cache.borrow().get(&file_id) {
+                out.push(entry.clone());
+                continue;
+            }
+            let entry = chk_inventory_bytes_to_entry(&value);
+            self.fileid_to_entry_cache
+                .borrow_mut()
+                .insert(file_id, entry.clone());
+            out.push(entry);
+        }
+        Ok(out)
+    }
+
+    /// Number of entries in the inventory. Mirrors `__len__`.
+    pub fn len(&self) -> Result<usize, Error> {
+        let mut id_to_entry = self.id_to_entry.borrow_mut();
+        let map = id_to_entry
+            .as_mut()
+            .ok_or_else(|| Error::InvalidFormat("id_to_entry not set".into()))?;
+        Ok(map.len()?)
+    }
+
+    /// True if the inventory holds no entries.
+    pub fn is_empty(&self) -> Result<bool, Error> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Yield the chain of entries from `file_id` up to the root, in
+    /// child-to-root order. Mirrors `_iter_file_id_parents`.
+    pub fn iter_file_id_parents(
+        &self,
+        file_id: &crate::FileId,
+    ) -> Result<Vec<Entry>, Error> {
+        let mut out = Vec::new();
+        let mut cur = Some(file_id.clone());
+        while let Some(id) = cur {
+            let entry = self.get_entry(&id)?;
+            cur = entry.parent_id().cloned();
+            out.push(entry);
+        }
+        Ok(out)
     }
 
     /// Serialise the inventory header to lines (the part that
