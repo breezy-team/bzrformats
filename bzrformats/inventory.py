@@ -118,24 +118,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
     access.
     """
 
-    def id2path(self, file_id):
-        """Return as a string the path to file_id.
-
-        >>> i = Inventory()
-        >>> e = i.add(InventoryDirectory(b'src-id', 'src', ROOT_ID))
-        >>> e = i.add(InventoryFile(b'foo-id', 'foo.c', parent_id=b'src-id'))
-        >>> print(i.id2path(b'foo-id'))
-        src/foo.c
-
-        :raises NoSuchId: If file_id is not present in the inventory.
-        """
-        # get all names, skipping root
-        return "/".join(
-            reversed(
-                [parent.name for parent in self._iter_file_id_parents(file_id)][:-1]
-            )
-        )
-
     def iter_entries(self, from_dir=None, recursive=True):
         """Return (path, entry) pairs, in order by name.
 
@@ -187,17 +169,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
             else:
                 # if we finished all children, pop it off the stack
                 stack.pop()
-
-    def iter_sorted_children(self, file_id):
-        """Iterate through children of a directory in sorted order.
-
-        Args:
-            file_id: The file ID of the directory.
-
-        Yields:
-            Child inventory entries sorted by name.
-        """
-        return (c for (_n, c) in sorted(self.get_children(file_id).items()))
 
     def iter_entries_by_dir(self, from_dir=None, specific_file_ids=None):
         """Iterate over the entries in a directory first order.
@@ -358,64 +329,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
                 # or raise an error?
                 return None
         return parent
-
-    def get_children(self, dir_id):
-        """Access the list of children of this directory.
-
-        With a parent_id_basename_to_file_id index, loads all the children,
-        without loads the entire index. Without is bad. A more sophisticated
-        proxy object might be nice, to allow partial loading of children as
-        well when specific names are accessed. (So path traversal can be
-        written in the obvious way but not examine siblings.).
-        """
-        children = self._children_cache.get(dir_id)
-        if children is not None:
-            return children
-        # No longer supported
-        if self.parent_id_basename_to_file_id is None:
-            raise AssertionError(
-                "Inventories without"
-                " parent_id_basename_to_file_id are no longer supported"
-            )
-        result = {}
-        # XXX: Todo - use proxy objects for the children rather than loading
-        # all when the attribute is referenced.
-        child_keys = set()
-        for (
-            _parent_id,
-            _name_utf8,
-        ), file_id in self.parent_id_basename_to_file_id.iteritems(
-            key_filter=[(dir_id,)]
-        ):
-            child_keys.add((file_id,))
-        cached = set()
-        for file_id_key in child_keys:
-            entry = self._fileid_to_entry_cache.get(file_id_key[0], None)
-            if entry is not None:
-                result[entry.name] = entry
-                cached.add(file_id_key)
-        child_keys.difference_update(cached)
-        # populate; todo: do by name
-        id_to_entry = self.id_to_entry
-        for file_id_key, bytes in id_to_entry.iteritems(child_keys):
-            entry = self._bytes_to_entry(bytes)
-            result[entry.name] = entry
-            self._fileid_to_entry_cache[file_id_key[0]] = entry
-        self._children_cache[dir_id] = result
-        return result
-
-    def get_child(self, dir_id, name):
-        """Get a specific child from a directory.
-
-        Args:
-            dir_id: The file ID of the directory.
-            name: The name of the child to retrieve.
-
-        Returns:
-            The child inventory entry or None if not found.
-        """
-        # TODO(jelmer): Implement a version that doesn't load all children.
-        return self.get_children(dir_id).get(name)
 
     def _expand_fileids_to_parents_and_children(self, file_ids):
         """Give a more wholistic view starting with the given file_ids.
@@ -990,52 +903,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
                 kind,
                 executable,
             )
-
-    def path2id(self, relpath):
-        """Return the file ID for a relative path.
-
-        Args:
-            relpath: Relative path as string or list of path components.
-
-        Returns:
-            The file ID for the path, or None if not found.
-        """
-        # TODO: perhaps support negative hits?
-        if isinstance(relpath, str):
-            names = osutils.splitpath(relpath)
-        else:
-            names = relpath
-            if relpath == []:
-                relpath = [""]
-            relpath = osutils.pathjoin(*relpath)
-        result = self._path_to_fileid_cache.get(relpath, None)
-        if result is not None:
-            return result
-        current_id = self.root_id
-        if current_id is None:
-            return None
-        parent_id_index = self.parent_id_basename_to_file_id
-        cur_path = None
-        for basename in names:
-            cur_path = basename if cur_path is None else cur_path + "/" + basename
-            basename_utf8 = basename.encode("utf8")
-            file_id = self._path_to_fileid_cache.get(cur_path, None)
-            if file_id is None:
-                key_filter = [(current_id, basename_utf8)]
-                items = parent_id_index.iteritems(key_filter)
-                for (parent_id, name_utf8), file_id in items:  # noqa: B007
-                    if parent_id != current_id or name_utf8 != basename_utf8:
-                        raise BzrFormatsError(
-                            "corrupt inventory lookup! {!r} {!r} {!r} {!r}".format(
-                                parent_id, current_id, name_utf8, basename_utf8
-                            )
-                        )
-                if file_id is None:
-                    return None
-                else:
-                    self._path_to_fileid_cache[cur_path] = file_id
-            current_id = file_id
-        return current_id
 
     def to_lines(self):
         """Serialise the inventory to lines."""

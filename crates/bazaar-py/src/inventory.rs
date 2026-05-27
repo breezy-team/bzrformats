@@ -2302,6 +2302,219 @@ impl CHKInventory {
         let id_bytes = PyBytes::new(py, root_id.as_bytes());
         self.get_entry(py, id_bytes.into_any())
     }
+
+    /// Return the slash-separated path to `file_id`. Mirrors
+    /// Python's `id2path`. Raises NoSuchId if absent.
+    fn id2path(&self, py: Python<'_>, file_id: Bound<'_, PyBytes>) -> PyResult<String> {
+        let parents = self._iter_file_id_parents(py, file_id)?;
+        // Walk parents (child-to-root order), drop the root, reverse,
+        // join with '/'.
+        let mut segments: Vec<String> = Vec::with_capacity(parents.len());
+        for p in parents.iter() {
+            let name = p.getattr("name")?.extract::<String>()?;
+            segments.push(name);
+        }
+        if !segments.is_empty() {
+            segments.pop(); // drop the root's name ("")
+        }
+        segments.reverse();
+        Ok(segments.join("/"))
+    }
+
+    /// Return the file_id at `relpath`, or `None` if not found.
+    /// Mirrors Python's `path2id`. `relpath` can be a slash-separated
+    /// string or a list of path components.
+    fn path2id<'py>(
+        &self,
+        py: Python<'py>,
+        relpath: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        // Normalise `relpath` to (names: Vec<String>, joined: String).
+        let (names, joined): (Vec<String>, String) =
+            if let Ok(s) = relpath.clone().cast_into::<PyString>() {
+                let s: String = s.extract()?;
+                let names: Vec<String> = if s.is_empty() {
+                    Vec::new()
+                } else {
+                    s.split('/').map(str::to_string).collect()
+                };
+                (names, s)
+            } else {
+                // list of basenames
+                let mut names = Vec::new();
+                for n in relpath.try_iter()? {
+                    names.push(n?.extract::<String>()?);
+                }
+                let joined = if names.is_empty() {
+                    String::new()
+                } else {
+                    names.join("/")
+                };
+                (names, joined)
+            };
+        // Cache lookup.
+        let cache = self.path_to_fileid_cache.bind(py);
+        let joined_bound = PyString::new(py, &joined);
+        if let Some(cached) = cache.get_item(&joined_bound)? {
+            return Ok(cached.unbind());
+        }
+        let mut current_id: Py<PyAny> = match &self.root_id {
+            None => return Ok(py.None()),
+            Some(id) => PyBytes::new(py, id.as_bytes()).into_any().unbind(),
+        };
+        let parent_id_index = self.parent_id_basename_to_file_id.as_ref().ok_or_else(|| {
+            BzrFormatsError::new_err("parent_id_basename_to_file_id not set")
+        })?;
+        let mut cur_path: Option<String> = None;
+        for basename in &names {
+            cur_path = Some(match cur_path {
+                None => basename.clone(),
+                Some(p) => format!("{}/{}", p, basename),
+            });
+            let cp = cur_path.as_ref().unwrap();
+            let cp_bound = PyString::new(py, cp);
+            if let Some(cached) = cache.get_item(&cp_bound)? {
+                current_id = cached.unbind();
+                continue;
+            }
+            let basename_utf8 = PyBytes::new(py, basename.as_bytes());
+            let key_tuple = PyTuple::new(
+                py,
+                [current_id.bind(py).clone(), basename_utf8.into_any()],
+            )?;
+            let key_filter = PyList::new(py, [key_tuple])?;
+            let items_iter = parent_id_index
+                .bind(py)
+                .call_method1("iteritems", (key_filter,))?;
+            let mut file_id: Option<Py<PyAny>> = None;
+            for pair in items_iter.try_iter()? {
+                let pair = pair?;
+                let tup = pair.cast_into::<PyTuple>()?;
+                let key = tup.get_item(0)?.cast_into::<PyTuple>()?;
+                let parent_id = key.get_item(0)?;
+                let name_utf8 = key.get_item(1)?;
+                if !parent_id.eq(current_id.bind(py))?
+                    || !name_utf8.eq(PyBytes::new(py, basename.as_bytes()))?
+                {
+                    return Err(BzrFormatsError::new_err(format!(
+                        "corrupt inventory lookup! {:?} {:?}",
+                        parent_id, name_utf8,
+                    )));
+                }
+                file_id = Some(tup.get_item(1)?.unbind());
+            }
+            let Some(fid) = file_id else {
+                return Ok(py.None());
+            };
+            cache.set_item(&cp_bound, fid.bind(py).clone())?;
+            current_id = fid;
+        }
+        Ok(current_id)
+    }
+
+    /// Children of `dir_id` as a `{name -> Entry}` Python dict.
+    /// Mirrors Python's `get_children`. Caches the result.
+    fn get_children<'py>(
+        &self,
+        py: Python<'py>,
+        dir_id: Bound<'py, PyBytes>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let children_cache = self.children_cache.bind(py);
+        if let Some(cached) = children_cache.get_item(&dir_id)? {
+            return cached
+                .cast_into::<PyDict>()
+                .map_err(|e| pyo3::PyErr::from(e));
+        }
+        let parent_idx = self.parent_id_basename_to_file_id.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyAssertionError::new_err(
+                "Inventories without parent_id_basename_to_file_id are no longer supported",
+            )
+        })?;
+        let result = PyDict::new(py);
+        // 1-element prefix filter yields just dir_id's children.
+        let prefix_tuple = PyTuple::new(py, [&dir_id])?;
+        let key_filter = PyList::new(py, [prefix_tuple])?;
+        let items_iter = parent_idx
+            .bind(py)
+            .call_method1("iteritems", (key_filter,))?;
+        let mut child_keys: Vec<Py<PyAny>> = Vec::new();
+        for pair in items_iter.try_iter()? {
+            let pair = pair?;
+            let tup = pair.cast_into::<PyTuple>()?;
+            let file_id = tup.get_item(1)?;
+            child_keys.push(file_id.unbind());
+        }
+        let cache = self.fileid_to_entry_cache.bind(py);
+        let mut remaining: Vec<Py<PyAny>> = Vec::new();
+        for fid in &child_keys {
+            if let Some(entry) = cache.get_item(fid.bind(py))? {
+                let name = entry.getattr("name")?;
+                result.set_item(name, entry)?;
+            } else {
+                remaining.push(fid.clone_ref(py));
+            }
+        }
+        if !remaining.is_empty() {
+            let id_to_entry = self.id_to_entry.as_ref().ok_or_else(|| {
+                BzrFormatsError::new_err("id_to_entry not set")
+            })?;
+            let file_keys = PyList::empty(py);
+            for fid in &remaining {
+                let tup = PyTuple::new(py, [fid.bind(py).clone()])?;
+                file_keys.append(tup)?;
+            }
+            let items_iter = id_to_entry
+                .bind(py)
+                .call_method1("iteritems", (file_keys,))?;
+            for pair in items_iter.try_iter()? {
+                let pair = pair?;
+                let tup = pair.cast_into::<PyTuple>()?;
+                let bytes_val = tup.get_item(1)?.cast_into::<PyBytes>()?;
+                let entry = self._bytes_to_entry(py, bytes_val)?;
+                let name = entry.getattr("name")?;
+                result.set_item(name, entry)?;
+            }
+        }
+        children_cache.set_item(&dir_id, &result)?;
+        Ok(result)
+    }
+
+    /// Look up one child of `dir_id` by name. Mirrors Python's
+    /// `get_child`. Returns None if not found.
+    fn get_child<'py>(
+        &self,
+        py: Python<'py>,
+        dir_id: Bound<'_, PyBytes>,
+        name: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let children = self.get_children(py, dir_id)?;
+        match children.get_item(&name)? {
+            Some(entry) => Ok(entry.unbind()),
+            None => Ok(py.None()),
+        }
+    }
+
+    /// Iterate children of `file_id` in lexicographic-name order.
+    /// Mirrors Python's `iter_sorted_children`. Returns a list rather
+    /// than a generator.
+    fn iter_sorted_children<'py>(
+        &self,
+        py: Python<'py>,
+        file_id: Bound<'_, PyBytes>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let children = self.get_children(py, file_id)?;
+        // Sort by key (name).
+        let mut pairs: Vec<(String, Py<PyAny>)> = Vec::new();
+        for (k, v) in children.iter() {
+            pairs.push((k.extract::<String>()?, v.unbind()));
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let out = PyList::empty(py);
+        for (_, v) in pairs {
+            out.append(v)?;
+        }
+        Ok(out)
+    }
 }
 
 pub fn _inventory_rs(py: Python) -> PyResult<Bound<PyModule>> {
