@@ -1807,6 +1807,190 @@ fn chk_inventory_bytes_to_utf8name_key<'py>(
     Ok((PyBytes::new(py, name), file_id, revision_id))
 }
 
+/// CHK-store-backed inventory.
+///
+/// State-only pyclass that mirrors Python's `CHKInventory` attributes:
+/// the two CHKMaps (id_to_entry, parent_id_basename_to_file_id), the
+/// configured search-key name, the revision and root ids, plus the
+/// in-memory caches. Orchestration methods (get_entry, has_id, id2path,
+/// path2id, get_children, get_child, iter_entries, etc.) are
+/// monkey-patched on from `bzrformats/inventory.py`.
+#[pyclass(module = "bzrformats._bzr_rs.inventory", name = "CHKInventory", subclass)]
+pub struct CHKInventory {
+    search_key_name: Vec<u8>,
+    root_id: Option<FileId>,
+    revision_id: Option<RevisionId>,
+    id_to_entry: Option<Py<PyAny>>,
+    parent_id_basename_to_file_id: Option<Py<PyAny>>,
+    fileid_to_entry_cache: Py<pyo3::types::PyDict>,
+    fully_cached: bool,
+    path_to_fileid_cache: Py<pyo3::types::PyDict>,
+    children_cache: Py<pyo3::types::PyDict>,
+}
+
+#[pymethods]
+impl CHKInventory {
+    #[new]
+    #[pyo3(signature = (search_key_name=None))]
+    fn new(py: Python<'_>, search_key_name: Option<&[u8]>) -> PyResult<Self> {
+        Ok(Self {
+            // Default to b"plain" when called with None — matches the
+            // Python CHKInventory(None) idiom used by test fixtures
+            // that don't need a particular search-key variant.
+            search_key_name: search_key_name.unwrap_or(b"plain").to_vec(),
+            root_id: None,
+            revision_id: None,
+            id_to_entry: None,
+            parent_id_basename_to_file_id: None,
+            fileid_to_entry_cache: pyo3::types::PyDict::new(py).unbind(),
+            fully_cached: false,
+            path_to_fileid_cache: pyo3::types::PyDict::new(py).unbind(),
+            children_cache: pyo3::types::PyDict::new(py).unbind(),
+        })
+    }
+
+    #[getter]
+    fn _search_key_name<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyBytes> {
+        pyo3::types::PyBytes::new(py, &self.search_key_name)
+    }
+
+    #[setter]
+    fn set__search_key_name(&mut self, value: &[u8]) {
+        self.search_key_name = value.to_vec();
+    }
+
+    #[getter]
+    fn root_id<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        match &self.root_id {
+            None => py.None(),
+            Some(id) => pyo3::types::PyBytes::new(py, id.as_bytes())
+                .into_any()
+                .unbind(),
+        }
+    }
+
+    #[setter]
+    fn set_root_id(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.root_id = None;
+        } else {
+            let bytes = value.cast_into::<pyo3::types::PyBytes>()?;
+            self.root_id = Some(FileId::from(bytes.as_bytes()));
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn revision_id<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        match &self.revision_id {
+            None => py.None(),
+            Some(id) => pyo3::types::PyBytes::new(py, id.as_bytes())
+                .into_any()
+                .unbind(),
+        }
+    }
+
+    #[setter]
+    fn set_revision_id(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.revision_id = None;
+        } else {
+            let bytes = value.cast_into::<pyo3::types::PyBytes>()?;
+            self.revision_id = Some(RevisionId::from(bytes.as_bytes()));
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn id_to_entry<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        match &self.id_to_entry {
+            None => py.None(),
+            Some(m) => m.clone_ref(py),
+        }
+    }
+
+    #[setter]
+    fn set_id_to_entry(&mut self, value: Bound<'_, PyAny>) {
+        if value.is_none() {
+            self.id_to_entry = None;
+        } else {
+            self.id_to_entry = Some(value.unbind());
+        }
+    }
+
+    #[getter]
+    fn parent_id_basename_to_file_id<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        match &self.parent_id_basename_to_file_id {
+            None => py.None(),
+            Some(m) => m.clone_ref(py),
+        }
+    }
+
+    #[setter]
+    fn set_parent_id_basename_to_file_id(&mut self, value: Bound<'_, PyAny>) {
+        if value.is_none() {
+            self.parent_id_basename_to_file_id = None;
+        } else {
+            self.parent_id_basename_to_file_id = Some(value.unbind());
+        }
+    }
+
+    #[getter]
+    fn _fileid_to_entry_cache<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Bound<'py, pyo3::types::PyDict> {
+        self.fileid_to_entry_cache.bind(py).clone()
+    }
+
+    #[setter]
+    fn set__fileid_to_entry_cache(
+        &mut self,
+        value: Bound<'_, pyo3::types::PyDict>,
+    ) {
+        self.fileid_to_entry_cache = value.unbind();
+    }
+
+    #[getter]
+    fn _fully_cached(&self) -> bool {
+        self.fully_cached
+    }
+
+    #[setter]
+    fn set__fully_cached(&mut self, value: bool) {
+        self.fully_cached = value;
+    }
+
+    #[getter]
+    fn _path_to_fileid_cache<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Bound<'py, pyo3::types::PyDict> {
+        self.path_to_fileid_cache.bind(py).clone()
+    }
+
+    #[setter]
+    fn set__path_to_fileid_cache(
+        &mut self,
+        value: Bound<'_, pyo3::types::PyDict>,
+    ) {
+        self.path_to_fileid_cache = value.unbind();
+    }
+
+    #[getter]
+    fn _children_cache<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Bound<'py, pyo3::types::PyDict> {
+        self.children_cache.bind(py).clone()
+    }
+
+    #[setter]
+    fn set__children_cache(&mut self, value: Bound<'_, pyo3::types::PyDict>) {
+        self.children_cache = value.unbind();
+    }
+}
+
 pub fn _inventory_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "inventory")?;
 
@@ -1833,6 +2017,7 @@ pub fn _inventory_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(chk_inventory_entry_to_bytes))?;
     m.add_wrapped(wrap_pyfunction!(chk_inventory_bytes_to_entry))?;
     m.add_wrapped(wrap_pyfunction!(chk_inventory_bytes_to_utf8name_key))?;
+    m.add_class::<CHKInventory>()?;
 
     Ok(m)
 }

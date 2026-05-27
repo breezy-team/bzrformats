@@ -92,7 +92,7 @@ class DuplicateFileId(BzrFormatsError):
         self.entry = entry
 
 
-class CHKInventory:
+class CHKInventory(_mod_inventory_rs.CHKInventory):
     """An inventory persisted in a CHK store.
 
     By design, a CHKInventory is immutable so many of the methods
@@ -111,6 +111,11 @@ class CHKInventory:
     No caching is performed: every method call or item access will perform
     requests to the storage layer. As such, keep references to objects you
     want to reuse.
+
+    State (search_key_name, root_id, revision_id, the two CHKMaps,
+    and the in-memory caches) lives on the Rust-backed pyo3 base class.
+    The orchestration methods below operate on that state via attribute
+    access.
     """
 
     def has_filename(self, filename):
@@ -374,19 +379,6 @@ class CHKInventory:
         root directory as depth 1.
         """
         raise NotImplementedError(self.get_idpath)
-
-    def __init__(self, search_key_name):
-        """Initialize CHKInventory with a search key name.
-
-        Args:
-            search_key_name: Name of the search key for CHK operations.
-        """
-        self._fileid_to_entry_cache = {}
-        self._fully_cached = False
-        self._path_to_fileid_cache = {}
-        self._search_key_name = search_key_name
-        self.root_id = None
-        self._children_cache = {}
 
     def __eq__(self, other):
         """Compare two sets by comparing their contents."""
