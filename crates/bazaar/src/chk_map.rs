@@ -939,6 +939,145 @@ impl LeafNode {
     }
 }
 
+/// In-memory CHK node — either a leaf with key/value entries or an
+/// internal node referencing other nodes. Mirrors the Python
+/// `Node` base class hierarchy (LeafNode | InternalNode).
+#[derive(Debug, Clone)]
+pub enum Node {
+    Leaf(Box<LeafNode>),
+    Internal(Box<InternalNode>),
+}
+
+impl Node {
+    /// `(b"sha1:...",)` key once the node has been serialised, else
+    /// `None`. Mirrors Python's `Node.key()`.
+    pub fn key(&self) -> Option<&[u8]> {
+        match self {
+            Node::Leaf(l) => l.key.as_deref(),
+            Node::Internal(n) => n.key.as_deref(),
+        }
+    }
+
+    /// Total number of leaf entries reachable through this node.
+    /// Mirrors Python's `Node.__len__`.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        match self {
+            Node::Leaf(l) => l.len(),
+            Node::Internal(n) => n.len,
+        }
+    }
+
+    /// Maximum byte size allowed for this node when serialised, or
+    /// `0` for unlimited.
+    pub fn maximum_size(&self) -> usize {
+        match self {
+            Node::Leaf(l) => l.maximum_size,
+            Node::Internal(n) => n.maximum_size,
+        }
+    }
+}
+
+/// Reference to a child of an `InternalNode`. The dict either holds a
+/// `(b"sha1:...",)` reference to an unloaded child page or, after
+/// `_iter_nodes` populates it from the store, the loaded child Node
+/// itself.
+#[derive(Debug, Clone)]
+pub enum NodeRef {
+    /// Unloaded reference — the `b"sha1:..."` key handed to the store
+    /// to fetch the child's bytes.
+    Unloaded(Vec<u8>),
+    /// In-memory child node.
+    Loaded(Node),
+}
+
+impl NodeRef {
+    /// Length contribution of this child for `InternalNode._len`.
+    pub fn len(&self) -> usize {
+        match self {
+            NodeRef::Unloaded(_) => {
+                // Mirrors Python's behaviour: a tuple has no `len(node)`
+                // semantic in `_len`, but Python only writes Unloaded
+                // references after the parent's `_len` was already set
+                // from the parsed body, so the per-ref length isn't
+                // queried for unloaded children.
+                0
+            }
+            NodeRef::Loaded(n) => n.len(),
+        }
+    }
+}
+
+/// In-memory state of a CHK internal node — a fan-out of byte-prefix
+/// to child (loaded Node or unloaded sha1 reference).
+///
+/// Iteration order over `items` follows insertion order to match
+/// Python's `dict` semantics; serialisation paths sort first.
+#[derive(Debug, Clone)]
+pub struct InternalNode {
+    pub key: Option<Vec<u8>>,
+    pub maximum_size: usize,
+    pub key_width: usize,
+    /// Total leaf entries reachable through this subtree.
+    pub len: usize,
+    /// Width in bytes of each prefix in `items`. `0` for an
+    /// empty internal node (Python's `_node_width` default).
+    pub node_width: usize,
+    /// Reserved for future prefix-compression accounting; the Python
+    /// `InternalNode` sets `_raw_size = None` since internal nodes
+    /// don't carry per-entry payload. We track an explicit `0` here
+    /// and recompute byte costs from the items list at serialise
+    /// time.
+    pub raw_size: usize,
+    pub items: indexmap::IndexMap<Vec<u8>, NodeRef>,
+    /// Search-key prefix common to every child of this node. Always
+    /// `Some` once initialised; `None` only on a default-constructed
+    /// empty node before `from_parsed` populates it.
+    pub search_prefix: Option<Vec<u8>>,
+    pub search_key_func: SearchKeyFunc,
+}
+
+impl InternalNode {
+    /// Empty internal node with the given search prefix and key
+    /// function. Mirrors Python's `InternalNode(prefix, search_key_func)`.
+    pub fn new(prefix: Vec<u8>, search_key_func: SearchKeyFunc) -> Self {
+        Self {
+            key: None,
+            maximum_size: 0,
+            key_width: 1,
+            len: 0,
+            node_width: 0,
+            raw_size: 0,
+            items: indexmap::IndexMap::new(),
+            search_prefix: Some(prefix),
+            search_key_func,
+        }
+    }
+
+    /// Build a populated internal node from the output of
+    /// [`deserialise_internal_node`]. All children start as
+    /// `NodeRef::Unloaded`; the caller demand-loads them via the
+    /// store as `_iter_nodes` runs.
+    pub fn from_parsed(parsed: ParsedInternalNode, search_key_func: SearchKeyFunc) -> Self {
+        let mut items: indexmap::IndexMap<Vec<u8>, NodeRef> =
+            indexmap::IndexMap::with_capacity(parsed.items.len());
+        for (prefix, flat_key) in parsed.items {
+            items.insert(prefix, NodeRef::Unloaded(flat_key));
+        }
+        Self {
+            key: None,
+            maximum_size: parsed.maximum_size,
+            key_width: parsed.key_width,
+            len: parsed.length,
+            node_width: parsed.node_width,
+            raw_size: 0,
+            items,
+            search_prefix: Some(parsed.search_prefix),
+            search_key_func,
+        }
+    }
+}
+
 /// Check whether every search key in `search_keys` is identical.
 ///
 /// Mirrors `LeafNode._are_search_keys_identical`: this is the safety check
@@ -1441,6 +1580,62 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         assert_eq!(n.len(), 0);
         assert!(matches!(n.search_prefix, SearchPrefix::Computed(None)));
         assert!(n.common_serialised_prefix.is_none());
+    }
+
+    #[test]
+    fn internal_node_new_starts_empty_with_prefix() {
+        let n = InternalNode::new(b"pre".to_vec(), SearchKeyFunc::Plain);
+        assert_eq!(n.len, 0);
+        assert_eq!(n.node_width, 0);
+        assert_eq!(n.maximum_size, 0);
+        assert_eq!(n.search_prefix.as_deref(), Some(&b"pre"[..]));
+        assert!(n.items.is_empty());
+        assert!(n.key.is_none());
+    }
+
+    #[test]
+    fn internal_node_from_parsed_marks_children_unloaded() {
+        let blob: &[u8] = b"chknode:\n200\n1\n2\npre\nbar\x00sha1:bbbb\nfoo\x00sha1:aaaa\n";
+        let parsed = deserialise_internal_node(blob).unwrap();
+        let n = InternalNode::from_parsed(parsed, SearchKeyFunc::Plain);
+        assert_eq!(n.len, 2);
+        assert_eq!(n.search_prefix.as_deref(), Some(&b"pre"[..]));
+        assert_eq!(n.maximum_size, 200);
+        assert_eq!(n.key_width, 1);
+        assert_eq!(n.items.len(), 2);
+        // Verify both are Unloaded with the right sha1 keys.
+        match n.items.get(&b"prebar".to_vec()) {
+            Some(NodeRef::Unloaded(k)) => assert_eq!(k, b"sha1:bbbb"),
+            other => panic!("expected Unloaded for prebar, got {:?}", other),
+        }
+        match n.items.get(&b"prefoo".to_vec()) {
+            Some(NodeRef::Unloaded(k)) => assert_eq!(k, b"sha1:aaaa"),
+            other => panic!("expected Unloaded for prefoo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn node_wraps_leaf_and_internal() {
+        let leaf = Node::Leaf(Box::new(LeafNode::new(SearchKeyFunc::Plain)));
+        let internal = Node::Internal(Box::new(InternalNode::new(
+            b"".to_vec(),
+            SearchKeyFunc::Plain,
+        )));
+        assert_eq!(leaf.len(), 0);
+        assert_eq!(internal.len(), 0);
+        assert_eq!(leaf.maximum_size(), 0);
+        assert_eq!(internal.maximum_size(), 0);
+        assert_eq!(leaf.key(), None);
+        assert_eq!(internal.key(), None);
+    }
+
+    #[test]
+    fn node_len_reflects_inner_state() {
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        leaf.map_no_split(key_vec(&[b"baz"]), b"qux".to_vec());
+        let node = Node::Leaf(Box::new(leaf));
+        assert_eq!(node.len(), 2);
     }
 
     #[test]
