@@ -3683,6 +3683,327 @@ impl CHKInventory {
         }
         Ok(out)
     }
+
+    /// Apply `inventory_delta` to `self`, producing a new
+    /// CHKInventory at `new_revision_id`. Mirrors Python's
+    /// `CHKInventory.create_by_apply_delta`.
+    #[pyo3(signature = (inventory_delta, new_revision_id, propagate_caches=false))]
+    fn create_by_apply_delta<'py>(
+        slf: Bound<'py, CHKInventory>,
+        py: Python<'py>,
+        inventory_delta: Bound<'py, PyAny>,
+        new_revision_id: Bound<'py, PyAny>,
+        propagate_caches: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Construct the result via cls(search_key_name) — same idea
+        // as from_inventory: preserve subclass identity.
+        let cls = slf.get_type();
+        let search_key_name_bytes =
+            PyBytes::new(py, &slf.borrow().search_key_name).into_any();
+        let result_obj = cls.call1((search_key_name_bytes,))?;
+        let result = result_obj.downcast::<CHKInventory>()?.clone();
+        if propagate_caches {
+            let pf = slf
+                .borrow()
+                .path_to_fileid_cache
+                .bind(py)
+                .call_method0("copy")?
+                .cast_into::<PyDict>()?;
+            result.borrow_mut().path_to_fileid_cache = pf.unbind();
+        }
+        let search_key_callable = crate::chk_map::search_key_callable_for_name(
+            py,
+            &slf.borrow().search_key_name,
+        );
+        // Snapshot id_to_entry: ensure root, capture maximum_size,
+        // build a fresh CHKMap pointing at the same root key.
+        let self_id_map = slf
+            .borrow()
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set"))?
+            .clone_ref(py);
+        self_id_map.bind(py).call_method0("_ensure_root")?;
+        let maximum_size: usize = self_id_map
+            .bind(py)
+            .getattr("_root_node")?
+            .getattr("maximum_size")?
+            .extract()?;
+        let chk_store = self_id_map.bind(py).getattr("_store")?;
+        let self_id_key = self_id_map.bind(py).call_method0("key")?;
+        let result_id_map = make_chkmap_pyinstance(
+            py,
+            &chk_store,
+            self_id_key,
+            search_key_callable.as_ref().map(|c| c.bind(py).clone()),
+        )?;
+        result_id_map.bind(py).call_method0("_ensure_root")?;
+        result_id_map
+            .bind(py)
+            .getattr("_root_node")?
+            .call_method1("set_maximum_size", (maximum_size,))?;
+        result.borrow_mut().id_to_entry = Some(result_id_map);
+
+        // parent_id_basename_to_file_id snapshot if present.
+        let mut have_pid = false;
+        if let Some(self_pid_map) = slf
+            .borrow()
+            .parent_id_basename_to_file_id
+            .as_ref()
+            .map(|p| p.clone_ref(py))
+        {
+            have_pid = true;
+            self_pid_map.bind(py).call_method0("_ensure_root")?;
+            let pid_store = self_pid_map.bind(py).getattr("_store")?;
+            let pid_key = self_pid_map.bind(py).call_method0("key")?;
+            let result_pid_map = make_chkmap_pyinstance(
+                py,
+                &pid_store,
+                pid_key,
+                search_key_callable.as_ref().map(|c| c.bind(py).clone()),
+            )?;
+            result_pid_map.bind(py).call_method0("_ensure_root")?;
+            let self_root_node = self_pid_map.bind(py).getattr("_root_node")?;
+            let result_root_node = result_pid_map.bind(py).getattr("_root_node")?;
+            let max_pid_size: usize = self_root_node.getattr("maximum_size")?.extract()?;
+            result_root_node.call_method1("set_maximum_size", (max_pid_size,))?;
+            let key_width: usize = self_root_node.getattr("_key_width")?.extract()?;
+            result_root_node.setattr("_key_width", key_width)?;
+            result.borrow_mut().parent_id_basename_to_file_id = Some(result_pid_map);
+        }
+
+        // Set revision_id and root_id.
+        result.setattr("revision_id", new_revision_id)?;
+        let self_root_id_obj: Py<PyAny> = match slf.borrow().root_id.as_ref() {
+            Some(rid) => PyBytes::new(py, rid.as_bytes()).into_any().unbind(),
+            None => py.None(),
+        };
+        result.setattr("root_id", &self_root_id_obj)?;
+        // Walk inventory_delta. Each item is (old_path, new_path,
+        // file_id, entry). Track parent_id_basename_delta as a dict
+        // (key -> [old_key, new_value]) so concurrent
+        // moves-on-the-same-key collapse to a single record.
+        inventory_delta.call_method0("check")?;
+        let parents = pyo3::types::PySet::empty(py)?;
+        let deletes = pyo3::types::PySet::empty(py)?;
+        let altered = pyo3::types::PySet::empty(py)?;
+        let parent_id_basename_delta = PyDict::new(py);
+        let id_to_entry_delta = PyList::empty(py);
+        // `osutils.split` is just os.path.split for str/bytes; inline as
+        // "split at last '/'" to avoid round-tripping through Python.
+        for change in inventory_delta.try_iter()? {
+            let change = change?;
+            let tup = change.cast_into::<PyTuple>()?;
+            let old_path = tup.get_item(0)?;
+            let new_path = tup.get_item(1)?;
+            let file_id = tup.get_item(2)?;
+            let entry = tup.get_item(3)?;
+            // Detect new root.
+            if !new_path.is_none() {
+                let np: String = new_path.extract()?;
+                if np.is_empty() {
+                    result.setattr("root_id", &file_id)?;
+                }
+            }
+            let (new_key, new_value): (Py<PyAny>, Py<PyAny>) = if new_path.is_none() {
+                if propagate_caches {
+                    let pf_cache = result.borrow().path_to_fileid_cache.clone_ref(py);
+                    let _ = pf_cache.bind(py).del_item(&old_path);
+                }
+                deletes.add(&file_id)?;
+                (py.None(), py.None())
+            } else {
+                let nk = PyTuple::new(py, [&file_id])?.into_any().unbind();
+                let entry_inner = entry.downcast::<InventoryEntry>()?.borrow();
+                let nv = chk_inventory_entry_to_bytes(py, &entry_inner)?
+                    .into_any()
+                    .unbind();
+                let pf_cache = result.borrow().path_to_fileid_cache.clone_ref(py);
+                pf_cache.bind(py).set_item(&new_path, &file_id)?;
+                let new_path_str: String = new_path.extract()?;
+                let parent_part_str: &str = match new_path_str.rfind('/') {
+                    Some(idx) => &new_path_str[..idx],
+                    None => "",
+                };
+                let parent_part = parent_part_str.into_pyobject(py)?.into_any();
+                let parent_id = entry.getattr("parent_id")?;
+                parents.add(PyTuple::new(py, [parent_part, parent_id])?)?;
+                (nk, nv)
+            };
+            let old_key: Py<PyAny> = if old_path.is_none() {
+                py.None()
+            } else {
+                let ok = PyTuple::new(py, [&file_id])?.into_any().unbind();
+                let id2path_self =
+                    slf.call_method1("id2path", (file_id.clone(),))?;
+                if !id2path_self.eq(&old_path)? {
+                    return Err(InconsistentDelta::new_err((
+                        old_path.unbind(),
+                        file_id.clone().unbind(),
+                        format!("Entry was at wrong other path {:?}.", id2path_self),
+                    )));
+                }
+                altered.add(&file_id)?;
+                ok
+            };
+            id_to_entry_delta.append(PyTuple::new(
+                py,
+                [
+                    old_key.bind(py).clone(),
+                    new_key.bind(py).clone(),
+                    new_value.bind(py).clone(),
+                ],
+            )?)?;
+            if have_pid {
+                // parent_id, basename changes
+                let old_pid_key: Py<PyAny> = if old_path.is_none() {
+                    py.None()
+                } else {
+                    let old_entry = slf.call_method1("get_entry", (file_id.clone(),))?;
+                    slf.call_method1("_parent_id_basename_key", (old_entry,))?
+                        .unbind()
+                };
+                let (new_pid_key, new_pid_value): (Py<PyAny>, Py<PyAny>) = if new_path.is_none() {
+                    (py.None(), py.None())
+                } else {
+                    let nk = slf
+                        .call_method1("_parent_id_basename_key", (entry.clone(),))?
+                        .unbind();
+                    (nk, file_id.clone().unbind())
+                };
+                if !old_pid_key.bind(py).eq(new_pid_key.bind(py))? {
+                    if !old_pid_key.is_none(py) {
+                        let entry_obj = parent_id_basename_delta
+                            .get_item(old_pid_key.bind(py))?
+                            .unwrap_or_else(|| {
+                                PyList::new(py, [py.None(), py.None()])
+                                    .unwrap()
+                                    .into_any()
+                            });
+                        entry_obj.set_item(0, old_pid_key.bind(py))?;
+                        parent_id_basename_delta
+                            .set_item(old_pid_key.bind(py), entry_obj)?;
+                    }
+                    if !new_pid_key.is_none(py) {
+                        let entry_obj = parent_id_basename_delta
+                            .get_item(new_pid_key.bind(py))?
+                            .unwrap_or_else(|| {
+                                PyList::new(py, [py.None(), py.None()])
+                                    .unwrap()
+                                    .into_any()
+                            });
+                        entry_obj.set_item(1, new_pid_value.bind(py))?;
+                        parent_id_basename_delta
+                            .set_item(new_pid_key.bind(py), entry_obj)?;
+                    }
+                }
+            }
+        }
+        // Validate that deletes are complete.
+        for file_id in deletes.iter() {
+            let entry = slf.call_method1("get_entry", (file_id.clone(),))?;
+            let kind: String = entry.getattr("kind")?.extract()?;
+            if kind != "directory" {
+                continue;
+            }
+            let entry_file_id = entry.getattr("file_id")?;
+            let children =
+                slf.call_method1("iter_sorted_children", (entry_file_id,))?;
+            for child in children.try_iter()? {
+                let child = child?;
+                let child_file_id = child.getattr("file_id")?;
+                if !altered.contains(&child_file_id)? {
+                    let child_path =
+                        slf.call_method1("id2path", (child_file_id.clone(),))?;
+                    return Err(InconsistentDelta::new_err((
+                        child_path.unbind(),
+                        child_file_id.unbind(),
+                        "Child not deleted or reparented when parent deleted.",
+                    )));
+                }
+            }
+        }
+        // Apply id_to_entry delta.
+        let result_id_map = result
+            .borrow()
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("result.id_to_entry not set"))?
+            .clone_ref(py);
+        result_id_map
+            .bind(py)
+            .call_method1("apply_delta", (id_to_entry_delta,))?;
+        if !parent_id_basename_delta.is_empty() {
+            let delta_list = PyList::empty(py);
+            for (key, value_pair) in parent_id_basename_delta.iter() {
+                let pair = value_pair.cast_into::<PyList>()?;
+                let old_key = pair.get_item(0)?;
+                let value = pair.get_item(1)?;
+                if !value.is_none() {
+                    delta_list.append(PyTuple::new(py, [old_key, key, value])?)?;
+                } else {
+                    delta_list.append(PyTuple::new(
+                        py,
+                        [old_key, py.None().into_bound(py), py.None().into_bound(py)],
+                    )?)?;
+                }
+            }
+            let result_pid_map = result
+                .borrow()
+                .parent_id_basename_to_file_id
+                .as_ref()
+                .ok_or_else(|| {
+                    BzrFormatsError::new_err("result.parent_id_basename_to_file_id not set")
+                })?
+                .clone_ref(py);
+            result_pid_map
+                .bind(py)
+                .call_method1("apply_delta", (delta_list,))?;
+        }
+        // Validate parent structure. Discard the synthetic
+        // root tuple ("", None) which represents the root's parent.
+        let empty_root_tup = PyTuple::new(
+            py,
+            ["".into_pyobject(py)?.into_any(), py.None().into_bound(py)],
+        )?;
+        parents.discard(&empty_root_tup)?;
+        for pair in parents.iter() {
+            let tup = pair.cast_into::<PyTuple>()?;
+            let parent_path = tup.get_item(0)?;
+            let parent = tup.get_item(1)?;
+            match result.call_method1("get_entry", (parent.clone(),)) {
+                Ok(entry) => {
+                    let kind: String = entry.getattr("kind")?.extract()?;
+                    if kind != "directory" {
+                        let parent_inv_path =
+                            result.call_method1("id2path", (parent.clone(),))?;
+                        return Err(InconsistentDelta::new_err((
+                            parent_inv_path.unbind(),
+                            parent.unbind(),
+                            "Not a directory, but given children",
+                        )));
+                    }
+                }
+                Err(e) if e.is_instance_of::<NoSuchId>(py) => {
+                    return Err(InconsistentDelta::new_err((
+                        "<unknown>".to_string(),
+                        parent.unbind(),
+                        "Parent is not present in resulting inventory.",
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
+            let resolved = result.call_method1("path2id", (parent_path.clone(),))?;
+            if !resolved.eq(&parent)? {
+                return Err(InconsistentDelta::new_err((
+                    parent_path.unbind(),
+                    parent.unbind(),
+                    format!("Parent has wrong path {:?}.", resolved),
+                )));
+            }
+        }
+        Ok(result_obj)
+    }
 }
 
 /// Construct a `_chk_map_rs.CHKMap` pyclass instance directly,
