@@ -2484,7 +2484,7 @@ impl CHKInventory {
     fn get_child<'py>(
         &self,
         py: Python<'py>,
-        dir_id: Bound<'_, PyBytes>,
+        dir_id: Bound<'py, PyBytes>,
         name: Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let children = self.get_children(py, dir_id)?;
@@ -2500,7 +2500,7 @@ impl CHKInventory {
     fn iter_sorted_children<'py>(
         &self,
         py: Python<'py>,
-        file_id: Bound<'_, PyBytes>,
+        file_id: Bound<'py, PyBytes>,
     ) -> PyResult<Bound<'py, PyList>> {
         let children = self.get_children(py, file_id)?;
         // Sort by key (name).
@@ -2514,6 +2514,413 @@ impl CHKInventory {
             out.append(v)?;
         }
         Ok(out)
+    }
+
+    /// Walk the inventory in lexicographic order. Mirrors Python's
+    /// `iter_entries(from_dir, recursive)`. Returns a list of
+    /// `(path, entry)` pairs.
+    #[pyo3(signature = (from_dir=None, recursive=true))]
+    fn iter_entries<'py>(
+        slf: pyo3::Bound<'py, CHKInventory>,
+        py: Python<'py>,
+        from_dir: Option<Bound<'py, PyAny>>,
+        recursive: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        let (start_file_id, _) = match from_dir {
+            None => {
+                if slf.borrow().root_id.is_none() {
+                    return Ok(out);
+                }
+                let root = slf.getattr("root")?;
+                let fid = root.getattr("file_id")?;
+                out.append(PyTuple::new(
+                    py,
+                    [PyString::new(py, "").into_any(), root.clone()],
+                )?)?;
+                (fid.unbind(), true)
+            }
+            Some(fd) => {
+                if let Ok(b) = fd.clone().cast_into::<PyBytes>() {
+                    (b.into_any().unbind(), false)
+                } else {
+                    let fid = fd.getattr("file_id")?;
+                    (fid.unbind(), false)
+                }
+            }
+        };
+        let start_bytes = start_file_id.bind(py).clone().cast_into::<PyBytes>()?;
+        let direct = slf.borrow().iter_sorted_children(py, start_bytes)?;
+        if !recursive {
+            for c in direct.iter() {
+                let name = c.getattr("name")?;
+                out.append(PyTuple::new(py, [name, c])?)?;
+            }
+            return Ok(out);
+        }
+        let mut stack: Vec<(String, std::collections::VecDeque<Py<PyAny>>)> = Vec::new();
+        let mut queue: std::collections::VecDeque<Py<PyAny>> =
+            std::collections::VecDeque::new();
+        for c in direct.iter() {
+            queue.push_back(c.unbind());
+        }
+        stack.push((String::new(), queue));
+        while let Some((path, children)) = stack.last_mut() {
+            if let Some(ie_py) = children.pop_front() {
+                let ie = ie_py.bind(py);
+                let name: String = ie.getattr("name")?.extract()?;
+                let new_path = format!("{}/{}", path, name);
+                let yield_path = new_path.trim_start_matches('/').to_string();
+                let kind: String = ie.getattr("kind")?.extract()?;
+                out.append(PyTuple::new(
+                    py,
+                    [PyString::new(py, &yield_path).into_any(), ie.clone()],
+                )?)?;
+                if kind == "directory" {
+                    let fid = ie.getattr("file_id")?.cast_into::<PyBytes>()?;
+                    let new_children = slf.borrow().iter_sorted_children(py, fid)?;
+                    let mut q: std::collections::VecDeque<Py<PyAny>> =
+                        std::collections::VecDeque::new();
+                    for c in new_children.iter() {
+                        q.push_back(c.unbind());
+                    }
+                    stack.push((new_path, q));
+                }
+            } else {
+                stack.pop();
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return `[(path, entry)]` for every entry except the root.
+    /// Mirrors Python's `entries`.
+    fn entries<'py>(
+        slf: pyo3::Bound<'py, CHKInventory>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let accum = PyList::empty(py);
+        if slf.borrow().root_id.is_none() {
+            return Ok(accum);
+        }
+        let root = slf.getattr("root")?;
+        // Iterative depth-first descent using osutils.pathjoin (which
+        // is what Python's `entries` uses) — but for the CHKInventory
+        // case paths are simple slash-joins, so just format here.
+        let mut stack: Vec<(String, Py<PyAny>)> = vec![(String::new(), root.unbind())];
+        while let Some((dir_path, dir_ie_py)) = stack.pop() {
+            let dir_ie = dir_ie_py.bind(py);
+            let fid = dir_ie.getattr("file_id")?.cast_into::<PyBytes>()?;
+            let children = slf.borrow().iter_sorted_children(py, fid)?;
+            // Push child directories in reverse so they pop in order.
+            let mut child_dirs: Vec<(String, Py<PyAny>)> = Vec::new();
+            for ie in children.iter() {
+                let name: String = ie.getattr("name")?.extract()?;
+                let child_path = if dir_path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", dir_path, name)
+                };
+                accum.append(PyTuple::new(
+                    py,
+                    [PyString::new(py, &child_path).into_any(), ie.clone()],
+                )?)?;
+                let kind: String = ie.getattr("kind")?.extract()?;
+                if kind == "directory" {
+                    child_dirs.push((child_path, ie.unbind()));
+                }
+            }
+            for cd in child_dirs.into_iter().rev() {
+                stack.push(cd);
+            }
+        }
+        Ok(accum)
+    }
+
+    /// Return the entry at `relpath` or None. Mirrors Python's
+    /// `get_entry_by_path`.
+    fn get_entry_by_path<'py>(
+        slf: pyo3::Bound<'py, CHKInventory>,
+        py: Python<'py>,
+        relpath: Bound<'py, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let names = split_relpath(py, relpath)?;
+        let parent = match slf.getattr("root") {
+            Ok(r) => r,
+            Err(e) if e.is_instance_of::<NoSuchId>(py) => return Ok(py.None()),
+            Err(e) => return Err(e),
+        };
+        if parent.is_none() {
+            return Ok(py.None());
+        }
+        let mut parent_py: Py<PyAny> = parent.unbind();
+        for f in &names {
+            let dir_id = parent_py
+                .bind(py)
+                .getattr("file_id")?
+                .cast_into::<PyBytes>()?;
+            let cie = slf.borrow().get_child(
+                py,
+                dir_id,
+                PyString::new(py, f).into_any(),
+            )?;
+            if cie.bind(py).is_none() {
+                return Ok(py.None());
+            }
+            parent_py = cie;
+        }
+        Ok(parent_py)
+    }
+
+    /// Like `get_entry_by_path` but stops at the first tree
+    /// reference. Returns `(entry, resolved, remaining)` or
+    /// `(None, None, None)`. Mirrors Python's
+    /// `get_entry_by_path_partial`.
+    fn get_entry_by_path_partial<'py>(
+        slf: pyo3::Bound<'py, CHKInventory>,
+        py: Python<'py>,
+        relpath: Bound<'py, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let names = split_relpath(py, relpath)?;
+        let parent = match slf.getattr("root") {
+            Ok(r) => r,
+            Err(e) if e.is_instance_of::<NoSuchId>(py) => {
+                let t = PyTuple::new(py, [py.None(), py.None(), py.None()])?;
+                return Ok(t.into_any().unbind());
+            }
+            Err(e) => return Err(e),
+        };
+        if parent.is_none() {
+            let t = PyTuple::new(py, [py.None(), py.None(), py.None()])?;
+            return Ok(t.into_any().unbind());
+        }
+        let mut parent_py: Py<PyAny> = parent.unbind();
+        for (i, f) in names.iter().enumerate() {
+            let dir_id = parent_py
+                .bind(py)
+                .getattr("file_id")?
+                .cast_into::<PyBytes>()?;
+            let cie = slf.borrow().get_child(
+                py,
+                dir_id,
+                PyString::new(py, f).into_any(),
+            )?;
+            if cie.bind(py).is_none() {
+                let t = PyTuple::new(py, [py.None(), py.None(), py.None()])?;
+                return Ok(t.into_any().unbind());
+            }
+            let kind: String = cie.bind(py).getattr("kind")?.extract()?;
+            if kind == "tree-reference" {
+                let resolved: Vec<&str> = names[..=i].iter().map(String::as_str).collect();
+                let remaining: Vec<&str> =
+                    names[i + 1..].iter().map(String::as_str).collect();
+                let resolved_list = PyList::new(py, resolved)?;
+                let remaining_list = PyList::new(py, remaining)?;
+                let t = PyTuple::new(
+                    py,
+                    [
+                        cie.bind(py).clone(),
+                        resolved_list.into_any(),
+                        remaining_list.into_any(),
+                    ],
+                )?;
+                return Ok(t.into_any().unbind());
+            }
+            parent_py = cie;
+        }
+        let resolved_list = PyList::new(
+            py,
+            names.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
+        let remaining_list = PyList::empty(py);
+        let t = PyTuple::new(
+            py,
+            [
+                parent_py.bind(py).clone(),
+                resolved_list.into_any(),
+                remaining_list.into_any(),
+            ],
+        )?;
+        Ok(t.into_any().unbind())
+    }
+
+    /// Walk the inventory in directory-first order. Mirrors Python's
+    /// `iter_entries_by_dir(from_dir, specific_file_ids)`.
+    #[pyo3(signature = (from_dir=None, specific_file_ids=None))]
+    fn iter_entries_by_dir<'py>(
+        slf: pyo3::Bound<'py, CHKInventory>,
+        py: Python<'py>,
+        from_dir: Option<Bound<'py, PyAny>>,
+        specific_file_ids: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        let specific_set: Option<std::collections::HashSet<Vec<u8>>> =
+            if let Some(s) = specific_file_ids.as_ref() {
+                let mut set = std::collections::HashSet::new();
+                for fid in s.try_iter()? {
+                    let fid = fid?;
+                    if let Ok(b) = fid.cast_into::<PyBytes>() {
+                        set.insert(b.as_bytes().to_vec());
+                    }
+                }
+                Some(set)
+            } else {
+                None
+            };
+        if from_dir.is_none() && specific_file_ids.is_none() {
+            slf.call_method0("_preload_cache")?;
+        }
+        let from_entry: Py<PyAny> = if let Some(fd) = from_dir.clone() {
+            if let Ok(b) = fd.clone().cast_into::<PyBytes>() {
+                slf.borrow().get_entry(py, b.into_any())?.unbind()
+            } else {
+                fd.unbind()
+            }
+        } else {
+            if let Some(set) = &specific_set {
+                if set.len() == 1 {
+                    let only = set.iter().next().unwrap().clone();
+                    let bytes = PyBytes::new(py, &only);
+                    match slf.call_method1("id2path", (&bytes,)) {
+                        Ok(path) => {
+                            match slf.borrow().get_entry(py, bytes.into_any()) {
+                                Ok(entry) => {
+                                    out.append(PyTuple::new(py, [path, entry])?)?;
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        Err(e) if e.is_instance_of::<NoSuchId>(py) => {}
+                        Err(e) => return Err(e),
+                    }
+                    return Ok(out);
+                }
+            }
+            if slf.borrow().root_id.is_none() {
+                return Ok(out);
+            }
+            let root = slf.getattr("root")?;
+            let root_fid: Vec<u8> = root
+                .getattr("file_id")?
+                .cast_into::<PyBytes>()?
+                .as_bytes()
+                .to_vec();
+            if specific_set
+                .as_ref()
+                .map_or(true, |s| s.contains(&root_fid))
+            {
+                out.append(PyTuple::new(
+                    py,
+                    [PyString::new(py, "").into_any(), root.clone()],
+                )?)?;
+            }
+            root.unbind()
+        };
+        let parents_filter: Option<std::collections::HashSet<Vec<u8>>> =
+            match &specific_set {
+                None => None,
+                Some(set) => {
+                    let mut ancestors: std::collections::HashSet<Vec<u8>> =
+                        std::collections::HashSet::new();
+                    for fid in set {
+                        let mut cur: Option<Vec<u8>> = Some(fid.clone());
+                        while let Some(id) = cur {
+                            let id_bytes = PyBytes::new(py, &id);
+                            let has_id: bool =
+                                slf.borrow().has_id(py, id_bytes.clone().into_any())?;
+                            if !has_id {
+                                break;
+                            }
+                            let entry =
+                                slf.borrow().get_entry(py, id_bytes.into_any())?;
+                            let parent_id = entry.getattr("parent_id")?;
+                            let parent_bytes: Option<Vec<u8>> = if parent_id.is_none() {
+                                None
+                            } else {
+                                Some(
+                                    parent_id
+                                        .cast_into::<PyBytes>()?
+                                        .as_bytes()
+                                        .to_vec(),
+                                )
+                            };
+                            if let Some(pid) = &parent_bytes {
+                                if ancestors.contains(pid) {
+                                    break;
+                                }
+                                ancestors.insert(pid.clone());
+                            }
+                            cur = parent_bytes;
+                        }
+                    }
+                    Some(ancestors)
+                }
+            };
+        let mut stack: Vec<(String, Py<PyAny>)> = vec![(String::new(), from_entry)];
+        while let Some((cur_relpath, cur_dir)) = stack.pop() {
+            let mut child_dirs: Vec<(String, Py<PyAny>)> = Vec::new();
+            let cur_fid = cur_dir
+                .bind(py)
+                .getattr("file_id")?
+                .cast_into::<PyBytes>()?;
+            let children = slf.borrow().iter_sorted_children(py, cur_fid)?;
+            for child in children.iter() {
+                let child_name: String = child.getattr("name")?.extract()?;
+                let child_relpath = format!("{}{}", cur_relpath, child_name);
+                let child_fid: Vec<u8> = child
+                    .getattr("file_id")?
+                    .cast_into::<PyBytes>()?
+                    .as_bytes()
+                    .to_vec();
+                if specific_set
+                    .as_ref()
+                    .map_or(true, |s| s.contains(&child_fid))
+                {
+                    out.append(PyTuple::new(
+                        py,
+                        [
+                            PyString::new(py, &child_relpath).into_any(),
+                            child.clone(),
+                        ],
+                    )?)?;
+                }
+                let kind: String = child.getattr("kind")?.extract()?;
+                if kind == "directory" {
+                    let recurse = match &parents_filter {
+                        None => true,
+                        Some(p) => p.contains(&child_fid),
+                    };
+                    if recurse {
+                        child_dirs
+                            .push((format!("{}/", child_relpath), child.unbind()));
+                    }
+                }
+            }
+            for cd in child_dirs.into_iter().rev() {
+                stack.push(cd);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Helper: split a relpath argument (string or list of components)
+/// into a `Vec<String>`. Empty string yields an empty vec.
+fn split_relpath(py: Python<'_>, relpath: Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    if let Ok(s) = relpath.clone().cast_into::<PyString>() {
+        let s: String = s.extract()?;
+        if s.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(s.split('/').map(str::to_string).collect())
+        }
+    } else {
+        let mut n = Vec::new();
+        for x in relpath.try_iter()? {
+            n.push(x?.extract::<String>()?);
+        }
+        let _ = py;
+        Ok(n)
     }
 }
 
