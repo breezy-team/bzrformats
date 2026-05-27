@@ -816,6 +816,440 @@ impl LeafNode {
     }
 }
 
+/// CHK internal node — fan-out to child nodes (LeafNode or
+/// InternalNode instances) or unloaded sha1 references.
+///
+/// Holds its scalar state directly; `_items` is a Python dict whose
+/// values are either `(b"sha1:...",)` tuples (unloaded) or
+/// LeafNode/InternalNode pyclass instances (loaded). The
+/// orchestration methods (`map`, `unmap`, `serialise`, `iteritems`)
+/// stay in Python — they need to construct sibling pyclass instances
+/// and walk the heterogeneous items dict.
+#[pyclass(module = "bzrformats._bzr_rs.chk_map", name = "InternalNode")]
+pub struct InternalNode {
+    key: Option<Vec<u8>>,
+    maximum_size: usize,
+    key_width: usize,
+    len: usize,
+    node_width: usize,
+    raw_size: usize,
+    search_prefix: Option<Vec<u8>>,
+    search_key_func: SearchKeyFunc,
+    /// Original Python callable as passed in. `None` means use the
+    /// default plain variant; the `_search_key_func` getter
+    /// synthesises a callable from `search_key_func.name()` in that
+    /// case.
+    search_key_callable: Option<Py<PyAny>>,
+    /// `prefix_bytes -> (b"sha1:...",) tuple OR LeafNode/InternalNode pyclass`.
+    /// Heterogeneous, mirroring Python's `InternalNode._items`.
+    items: Py<PyDict>,
+}
+
+#[pymethods]
+impl InternalNode {
+    #[new]
+    #[pyo3(signature = (prefix = None, search_key_func = None))]
+    fn new(
+        py: Python<'_>,
+        prefix: Option<&[u8]>,
+        search_key_func: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let (func, callable) = match search_key_func {
+            None => (SearchKeyFunc::Plain, None),
+            Some(cb) => {
+                let resolved = resolve_search_key_func_by_callable(py, &cb)?;
+                (resolved, Some(cb.unbind()))
+            }
+        };
+        Ok(Self {
+            key: None,
+            maximum_size: 0,
+            key_width: 1,
+            len: 0,
+            node_width: 0,
+            raw_size: 0,
+            search_prefix: Some(prefix.unwrap_or(b"").to_vec()),
+            search_key_func: func,
+            search_key_callable: callable,
+            items: PyDict::new(py).unbind(),
+        })
+    }
+
+    fn __len__(&self) -> usize {
+        self.len
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let items_dbg = {
+            let dict = self.items.bind(py);
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            for (k, _v) in dict.iter() {
+                if let Ok(b) = k.cast_into::<PyBytes>() {
+                    keys.push(b.as_bytes().to_vec());
+                }
+            }
+            keys.sort();
+            format!("{:?}", keys)
+        };
+        let items_short = if items_dbg.len() > 20 {
+            format!("{}...]", &items_dbg[..16])
+        } else {
+            items_dbg
+        };
+        let key_dbg = match &self.key {
+            Some(k) => format!("({:?},)", String::from_utf8_lossy(k)),
+            None => "None".to_string(),
+        };
+        let prefix_dbg = match &self.search_prefix {
+            None => "None".to_string(),
+            Some(p) => format!("{:?}", p),
+        };
+        format!(
+            "InternalNode(key:{} len:{} size:{} max:{} prefix:{} items:{})",
+            key_dbg,
+            self.len,
+            self.raw_size,
+            self.maximum_size,
+            prefix_dbg,
+            items_short,
+        )
+    }
+
+    fn key<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        match &self.key {
+            None => Ok(None),
+            Some(k) => Ok(Some(PyTuple::new(py, [PyBytes::new(py, k)])?)),
+        }
+    }
+
+    fn set_maximum_size(&mut self, new_size: usize) {
+        self.maximum_size = new_size;
+    }
+
+    #[getter]
+    fn maximum_size(&self) -> usize {
+        self.maximum_size
+    }
+
+    /// Add a child under `prefix`. Mirrors Python's `add_node`:
+    /// validates that `prefix` extends `_search_prefix` by exactly
+    /// one byte, updates `_len` and `_node_width`, clears `_key`.
+    fn add_node(
+        &mut self,
+        py: Python<'_>,
+        prefix: &[u8],
+        node: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let sp = self
+            .search_prefix
+            .as_deref()
+            .ok_or_else(|| pyo3::exceptions::PyAssertionError::new_err(
+                "_search_prefix should not be None",
+            ))?;
+        if !prefix.starts_with(sp) {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                "prefixes mismatch: {:?} must start with {:?}",
+                prefix, sp
+            )));
+        }
+        if prefix.len() != sp.len() + 1 {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                "prefix wrong length: len({:?}) is not {}",
+                prefix,
+                sp.len() + 1
+            )));
+        }
+        let child_len: usize = node.len()?;
+        self.len += child_len;
+        let dict = self.items.bind(py);
+        if dict.is_empty() {
+            self.node_width = prefix.len();
+        }
+        if self.node_width != sp.len() + 1 {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                "node width mismatch: {} is not {}",
+                self.node_width,
+                sp.len() + 1
+            )));
+        }
+        dict.set_item(PyBytes::new(py, prefix), node)?;
+        self.key = None;
+        Ok(())
+    }
+
+    fn _current_size(&self) -> usize {
+        internal_node_current_size(self.maximum_size, self.key_width, self.len, self.raw_size)
+    }
+
+    fn _search_key<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'_, PyTuple>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key.len());
+        for part in key.iter() {
+            parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        let base = self.search_key_func.apply(&Key::from(parts));
+        let bytes: Vec<u8> = if base.len() >= self.node_width {
+            base[..self.node_width].to_vec()
+        } else {
+            let mut padded = base;
+            padded.resize(self.node_width, 0);
+            padded
+        };
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn _search_prefix_filter<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'_, PyTuple>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key.len());
+        for part in key.iter() {
+            parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        let base = self.search_key_func.apply(&Key::from(parts));
+        let bytes: Vec<u8> = if base.len() >= self.node_width {
+            base[..self.node_width].to_vec()
+        } else {
+            base
+        };
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn _compute_search_prefix<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<Py<PyAny>> {
+        // common_prefix_many over the keys of self.items.
+        let dict = self.items.bind(py);
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for (k, _v) in dict.iter() {
+            keys.push(k.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        let prefix = bazaar::chk_map::common_prefix_many(keys.iter().map(|k| k.as_slice()))
+            .map(|s| s.to_vec());
+        self.search_prefix = prefix.clone();
+        match prefix {
+            None => Ok(py.None()),
+            Some(p) => Ok(PyBytes::new(py, &p).into_any().unbind()),
+        }
+    }
+
+    fn refs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        if self.key.is_none() {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(
+                "unserialised nodes have no refs",
+            ));
+        }
+        let out = PyList::empty(py);
+        let dict = self.items.bind(py);
+        for (_k, v) in dict.iter() {
+            // Tuple → use directly; Node → call .key()
+            if let Ok(t) = v.clone().cast_into::<PyTuple>() {
+                out.append(t)?;
+            } else {
+                let k = v.call_method0("key")?;
+                out.append(k)?;
+            }
+        }
+        Ok(out)
+    }
+
+    // ----- whitebox state accessors -----
+
+    #[getter]
+    fn _key<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        match &self.key {
+            None => Ok(py.None()),
+            Some(k) => Ok(PyTuple::new(py, [PyBytes::new(py, k)])?.into_any().unbind()),
+        }
+    }
+
+    #[setter]
+    fn set__key(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.key = None;
+        } else {
+            let tup = value.cast_into::<PyTuple>()?;
+            let first = tup.get_item(0)?;
+            self.key = Some(first.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn _len(&self) -> usize {
+        self.len
+    }
+
+    #[setter]
+    fn set__len(&mut self, value: usize) {
+        self.len = value;
+    }
+
+    #[getter]
+    fn _maximum_size(&self) -> usize {
+        self.maximum_size
+    }
+
+    #[setter]
+    fn set__maximum_size(&mut self, value: usize) {
+        self.maximum_size = value;
+    }
+
+    #[getter]
+    fn _key_width(&self) -> usize {
+        self.key_width
+    }
+
+    #[setter]
+    fn set__key_width(&mut self, value: usize) {
+        self.key_width = value;
+    }
+
+    #[getter]
+    fn _raw_size(&self) -> usize {
+        self.raw_size
+    }
+
+    #[setter]
+    fn set__raw_size(&mut self, value: usize) {
+        self.raw_size = value;
+    }
+
+    #[getter]
+    fn _node_width(&self) -> usize {
+        self.node_width
+    }
+
+    #[setter]
+    fn set__node_width(&mut self, value: usize) {
+        self.node_width = value;
+    }
+
+    /// Live reference to the `_items` dict — mutations from Python
+    /// propagate. Mirrors Python's `dict` semantics directly.
+    #[getter]
+    fn _items<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        self.items.bind(py).clone()
+    }
+
+    /// Replace `_items` with a fresh dict. Mirrors
+    /// `node._items = {...}`.
+    #[setter]
+    fn set__items(&mut self, py: Python<'_>, value: Bound<'_, PyDict>) -> PyResult<()> {
+        let new_dict = PyDict::new(py);
+        for (k, v) in value.iter() {
+            new_dict.set_item(k, v)?;
+        }
+        self.items = new_dict.unbind();
+        Ok(())
+    }
+
+    #[getter]
+    fn _search_prefix<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        match &self.search_prefix {
+            None => py.None(),
+            Some(p) => PyBytes::new(py, p).into_any().unbind(),
+        }
+    }
+
+    #[setter]
+    fn set__search_prefix(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.search_prefix = None;
+        } else {
+            self.search_prefix = Some(value.cast_into::<PyBytes>()?.as_bytes().to_vec());
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn _search_key_func<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        if let Some(cb) = &self.search_key_callable {
+            return Ok(cb.clone_ref(py));
+        }
+        let name = self.search_key_func.name().to_vec();
+        let name_bytes = PyBytes::new(py, &name);
+        let module = py.import("bzrformats._bzr_rs.chk_map")?;
+        let by_name = module.getattr("_search_key_by_name")?;
+        let functools = py.import("functools")?;
+        let partial = functools.getattr("partial")?;
+        Ok(partial.call1((by_name, name_bytes))?.unbind())
+    }
+
+    #[setter]
+    fn set__search_key_func(
+        &mut self,
+        py: Python<'_>,
+        value: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if value.is_none() {
+            self.search_key_func = SearchKeyFunc::Plain;
+            self.search_key_callable = None;
+        } else {
+            self.search_key_func = resolve_search_key_func_by_callable(py, &value)?;
+            self.search_key_callable = Some(value.unbind());
+        }
+        Ok(())
+    }
+
+    /// `InternalNode.deserialise`: build an internal node from a
+    /// serialised page, with every child starting as an unloaded
+    /// `(b"sha1:...",)` reference.
+    #[classmethod]
+    #[pyo3(signature = (data, key, search_key_func = None))]
+    fn deserialise(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        data: &[u8],
+        key: Bound<'_, PyAny>,
+        search_key_func: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let parsed = deserialise_internal_node(data).map_err(chk_err_to_py)?;
+        let (func, callable) = match search_key_func {
+            None => (SearchKeyFunc::Plain, None),
+            Some(cb) => {
+                let resolved = resolve_search_key_func_by_callable(py, &cb)?;
+                (resolved, Some(cb.unbind()))
+            }
+        };
+        let key_bytes = if let Ok(t) = key.clone().cast_into::<PyTuple>() {
+            t.get_item(0)?
+                .cast_into::<PyBytes>()?
+                .as_bytes()
+                .to_vec()
+        } else if let Ok(b) = key.cast_into::<PyBytes>() {
+            b.as_bytes().to_vec()
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "key must be a tuple or bytes",
+            ));
+        };
+        let items = PyDict::new(py);
+        for (prefix, flat_key) in parsed.items {
+            // Unloaded child: (b"sha1:...",) tuple.
+            let tuple = PyTuple::new(py, [PyBytes::new(py, &flat_key)])?;
+            items.set_item(PyBytes::new(py, &prefix), tuple)?;
+        }
+        Ok(Self {
+            key: Some(key_bytes),
+            maximum_size: parsed.maximum_size,
+            key_width: parsed.key_width,
+            len: parsed.length,
+            node_width: parsed.node_width,
+            raw_size: 0,
+            search_prefix: Some(parsed.search_prefix),
+            search_key_func: func,
+            search_key_callable: callable,
+            items: items.unbind(),
+        })
+    }
+}
+
 pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "chk_map")?;
     m.add_wrapped(wrap_pyfunction!(_search_key_16))?;
@@ -837,5 +1271,6 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     // the Rust mutators write back.
     m.add("_unknown", py_unknown_sentinel(py))?;
     m.add_class::<LeafNode>()?;
+    m.add_class::<InternalNode>()?;
     Ok(m)
 }
