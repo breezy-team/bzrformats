@@ -436,6 +436,40 @@ mod tests {
     }
 
     #[test]
+    fn get_entry_by_path_finds_nested_file() {
+        let inv = build_test_inv_deeper();
+        let entry = inv.get_entry_by_path("dir/sub/nested.txt").unwrap();
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().name(), "nested.txt");
+    }
+
+    #[test]
+    fn get_entry_by_path_missing_returns_none() {
+        let inv = build_test_inv_deeper();
+        let entry = inv.get_entry_by_path("dir/missing.txt").unwrap();
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn get_entry_by_path_root_returns_root() {
+        let inv = build_test_inv_deeper();
+        let entry = inv.get_entry_by_path("").unwrap();
+        assert!(matches!(entry, Some(Entry::Root { .. })));
+    }
+
+    #[test]
+    fn get_entry_by_path_partial_returns_full_path_when_no_tree_ref() {
+        let inv = build_test_inv_deeper();
+        let result = inv
+            .get_entry_by_path_partial("dir/sub/nested.txt")
+            .unwrap();
+        let (entry, resolved, remaining) = result.unwrap();
+        assert_eq!(entry.name(), "nested.txt");
+        assert_eq!(resolved, vec!["dir", "sub", "nested.txt"]);
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
     fn iter_entries_root_recursive_yields_full_tree() {
         let inv = build_test_inv_deeper();
         let entries = inv.iter_entries(None, true).unwrap();
@@ -976,6 +1010,69 @@ where
         let mut sorted: Vec<(String, Entry)> = children.into_iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(sorted.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Return the entry at `relpath`, or `None` if missing.
+    /// Mirrors Python's `get_entry_by_path`.
+    pub fn get_entry_by_path(&self, relpath: &str) -> Result<Option<Entry>, Error> {
+        let names: Vec<&str> = if relpath.is_empty() {
+            Vec::new()
+        } else {
+            relpath.split('/').collect()
+        };
+        let mut parent = match &self.root_id {
+            None => return Ok(None),
+            Some(id) => self.get_entry(id)?,
+        };
+        if names.is_empty() {
+            return Ok(Some(parent));
+        }
+        for name in names {
+            let parent_id = parent.file_id().clone();
+            let child = self.get_child(&parent_id, name)?;
+            match child {
+                None => return Ok(None),
+                Some(ie) => parent = ie,
+            }
+        }
+        Ok(Some(parent))
+    }
+
+    /// Like `get_entry_by_path`, but stops at the first tree
+    /// reference. Returns the (entry, resolved_elements,
+    /// remaining_elements) tuple. Mirrors Python's
+    /// `get_entry_by_path_partial`.
+    pub fn get_entry_by_path_partial<'a>(
+        &self,
+        relpath: &'a str,
+    ) -> Result<Option<(Entry, Vec<&'a str>, Vec<&'a str>)>, Error> {
+        let names: Vec<&str> = if relpath.is_empty() {
+            Vec::new()
+        } else {
+            relpath.split('/').collect()
+        };
+        let mut parent = match &self.root_id {
+            None => return Ok(None),
+            Some(id) => self.get_entry(id)?,
+        };
+        for (i, f) in names.iter().enumerate() {
+            let parent_id = parent.file_id().clone();
+            let child = self.get_child(&parent_id, f)?;
+            match child {
+                None => return Ok(None),
+                Some(ie) => {
+                    if matches!(ie, Entry::TreeReference { .. }) {
+                        return Ok(Some((
+                            ie,
+                            names[..=i].to_vec(),
+                            names[i + 1..].to_vec(),
+                        )));
+                    }
+                    parent = ie;
+                }
+            }
+        }
+        Ok(Some((parent, names.clone(), Vec::new())))
     }
 
     /// Walk the inventory in lexicographic order from `from_dir`
