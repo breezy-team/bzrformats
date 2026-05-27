@@ -791,9 +791,8 @@ class Node(metaclass=abc.ABCMeta):
 
 # Singleton indicating we have not computed _search_prefix yet. Re-exported
 # from the Rust extension so identity comparisons line up across the
-# boundary: when `_leaf_node_map_no_split` writes a Rust `SearchPrefix::
-# Unknown` back onto a Python LeafNode, the resulting attribute is the
-# same object Python code compares against here.
+# boundary: the LeafNode pyclass's `_search_prefix` getter returns this
+# exact object when the underlying Rust state is `SearchPrefix::Unknown`.
 _unknown = _chk_map_rs._unknown
 
 
