@@ -436,6 +436,61 @@ mod tests {
     }
 
     #[test]
+    fn iter_changes_reports_added_file() {
+        let basis = build_test_inv_deeper();
+        // Make a derived inventory adding "added.txt".
+        let new_file = Entry::File {
+            file_id: FileId::from(&b"new-id"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev2"[..])),
+            parent_id: FileId::from(&b"root-id"[..]),
+            name: "added.txt".to_string(),
+            text_sha1: Some(b"y".to_vec()),
+            text_size: Some(7),
+            text_id: None,
+            executable: false,
+        };
+        let delta = crate::inventory_delta::InventoryDelta(vec![
+            crate::inventory_delta::InventoryDeltaEntry {
+                old_path: None,
+                new_path: Some("added.txt".to_string()),
+                file_id: FileId::from(&b"new-id"[..]),
+                new_entry: Some(new_file),
+            },
+        ]);
+        let derived = basis
+            .create_by_apply_delta(&delta, crate::RevisionId::from(&b"rev2"[..]), false)
+            .unwrap();
+        let changes = derived.iter_changes(&basis).unwrap();
+        let added: Vec<&InventoryChange> = changes
+            .iter()
+            .filter(|c| c.file_id.as_bytes() == b"new-id")
+            .collect();
+        assert_eq!(added.len(), 1);
+        assert!(added[0].path_in_source.is_none());
+        assert_eq!(added[0].path_in_target.as_deref(), Some("added.txt"));
+        assert!(added[0].changed_content);
+        assert_eq!(added[0].versioned, (false, true));
+    }
+
+    #[test]
+    fn iter_changes_no_diff_returns_empty() {
+        let inv = build_test_inv_deeper();
+        // Save and reload to get an equivalent inventory under the
+        // same root key — avoiding the RefCell aliasing that would
+        // result from comparing an inventory against itself.
+        let lines = inv.to_lines().unwrap();
+        let reloaded = CHKInventory::deserialise(
+            inv.store.clone(),
+            inv.cache.clone(),
+            &lines,
+            inv.revision_id.as_ref().unwrap(),
+        )
+        .unwrap();
+        let changes = reloaded.iter_changes(&inv).unwrap();
+        assert!(changes.is_empty());
+    }
+
+    #[test]
     fn create_by_apply_delta_adds_a_file() {
         let inv = build_test_inv_deeper();
         // Apply a delta that adds one new file under the root.
@@ -679,6 +734,22 @@ mod tests {
         let key = parent_id_basename_key(&entry);
         assert_eq!(key, vec![b"".to_vec(), b"".to_vec()]);
     }
+}
+
+/// A single change reported by [`CHKInventory::iter_changes`].
+/// Mirrors Python's `tree.iter_changes` 8-tuple. Each `(basis, self)`
+/// pair has `basis` first matching Python's argument order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryChange {
+    pub file_id: crate::FileId,
+    pub path_in_source: Option<String>,
+    pub path_in_target: Option<String>,
+    pub changed_content: bool,
+    pub versioned: (bool, bool),
+    pub parent: (Option<crate::FileId>, Option<crate::FileId>),
+    pub name: (Option<String>, Option<String>),
+    pub kind: (Option<crate::osutils::Kind>, Option<crate::osutils::Kind>),
+    pub executable: (Option<bool>, Option<bool>),
 }
 
 /// Build the `(parent_id, basename_utf8)` key used by a
@@ -1101,6 +1172,125 @@ where
         let mut sorted: Vec<(String, Entry)> = children.into_iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(sorted.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Single record returned by [`iter_changes`].
+    ///
+    /// Mirrors Python's tree.iter_changes 8-tuple
+    /// `(file_id, (path_in_source, path_in_target), changed_content,
+    /// versioned, parent, name, kind, executable)`.
+    pub fn iter_changes(
+        &self,
+        basis: &Self,
+    ) -> Result<Vec<InventoryChange>, Error> {
+        let mut self_id_map = self.id_to_entry.borrow_mut();
+        let mut basis_id_map = basis.id_to_entry.borrow_mut();
+        let self_map = self_id_map.as_mut().ok_or_else(|| {
+            Error::InvalidFormat("self.id_to_entry not set".into())
+        })?;
+        let basis_map = basis_id_map.as_mut().ok_or_else(|| {
+            Error::InvalidFormat("basis.id_to_entry not set".into())
+        })?;
+        let changes = self_map.iter_changes(basis_map)?;
+        drop(self_id_map);
+        drop(basis_id_map);
+        let mut out: Vec<InventoryChange> = Vec::new();
+        for (key, basis_value, self_value) in changes {
+            let file_id =
+                crate::FileId::from(key.last().cloned().unwrap_or_default().as_slice());
+            let basis_entry = basis_value.as_deref().map(chk_inventory_bytes_to_entry);
+            let self_entry = self_value.as_deref().map(chk_inventory_bytes_to_entry);
+            let path_in_source = match basis_entry.as_ref() {
+                Some(_) => Some(basis.id2path(&file_id)?),
+                None => None,
+            };
+            let path_in_target = match self_entry.as_ref() {
+                Some(_) => Some(self.id2path(&file_id)?),
+                None => None,
+            };
+            let basis_parent = basis_entry.as_ref().and_then(|e| e.parent_id().cloned());
+            let basis_name = basis_entry.as_ref().map(|e| e.name().to_string());
+            let basis_executable = basis_entry.as_ref().and_then(|e| match e {
+                Entry::File { executable, .. } => Some(*executable),
+                _ => None,
+            });
+            let self_parent = self_entry.as_ref().and_then(|e| e.parent_id().cloned());
+            let self_name = self_entry.as_ref().map(|e| e.name().to_string());
+            let self_executable = self_entry.as_ref().and_then(|e| match e {
+                Entry::File { executable, .. } => Some(*executable),
+                _ => None,
+            });
+            let basis_kind = basis_entry.as_ref().map(|e| e.kind());
+            let self_kind = self_entry.as_ref().map(|e| e.kind());
+            let versioned = (basis_value.is_some(), self_value.is_some());
+            let mut changed_content = basis_kind != self_kind;
+            if !changed_content {
+                match (&basis_entry, &self_entry) {
+                    (
+                        Some(Entry::File {
+                            text_size: bs,
+                            text_sha1: bsha,
+                            ..
+                        }),
+                        Some(Entry::File {
+                            text_size: ss,
+                            text_sha1: ssha,
+                            ..
+                        }),
+                    ) => {
+                        if bs != ss || bsha != ssha {
+                            changed_content = true;
+                        }
+                    }
+                    (
+                        Some(Entry::Link {
+                            symlink_target: bt, ..
+                        }),
+                        Some(Entry::Link {
+                            symlink_target: st, ..
+                        }),
+                    ) => {
+                        if bt != st {
+                            changed_content = true;
+                        }
+                    }
+                    (
+                        Some(Entry::TreeReference {
+                            reference_revision: br,
+                            ..
+                        }),
+                        Some(Entry::TreeReference {
+                            reference_revision: sr,
+                            ..
+                        }),
+                    ) => {
+                        if br != sr {
+                            changed_content = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !changed_content
+                && basis_parent == self_parent
+                && basis_name == self_name
+                && basis_executable == self_executable
+            {
+                continue;
+            }
+            out.push(InventoryChange {
+                file_id,
+                path_in_source,
+                path_in_target,
+                changed_content,
+                versioned,
+                parent: (basis_parent, self_parent),
+                name: (basis_name, self_name),
+                kind: (basis_kind, self_kind),
+                executable: (basis_executable, self_executable),
+            });
+        }
+        Ok(out)
     }
 
     /// Apply `inventory_delta` to this inventory, returning a new
