@@ -1175,6 +1175,40 @@ impl Node {
         }
     }
 
+    /// Recursive remove that may demand-load child pages. Returns
+    /// the replacement node (possibly the same one, possibly a
+    /// collapsed leaf, possibly the single remaining child if the
+    /// internal node lost all but one child).
+    ///
+    /// Mirrors Python's polymorphic `unmap(store, key, check_remap)`.
+    /// Raises `KeyError`-equivalent (`AssertionFailed`) when the key
+    /// is not present.
+    pub fn unmap_with_store<S>(
+        self,
+        store: &S,
+        cache: &dyn PageCache,
+        key: &[Vec<u8>],
+        check_remap: bool,
+    ) -> Result<Node, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        match self {
+            Node::Leaf(mut leaf) => {
+                if leaf.unmap(key).is_none() {
+                    return Err(Error::AssertionFailed(format!(
+                        "key not found: {:?}",
+                        key
+                    )));
+                }
+                Ok(Node::Leaf(leaf))
+            }
+            Node::Internal(internal) => {
+                internal_unmap_with_store(*internal, store, cache, key, check_remap)
+            }
+        }
+    }
+
     /// Recursive insert that may demand-load child pages from the
     /// store. Mirrors Python's polymorphic dispatch:
     /// `LeafNode.map(store, key, value)` for leaves;
@@ -1963,6 +1997,102 @@ where
     }
 }
 
+/// Core of `InternalNode.unmap` — takes the node by value so it can
+/// optionally return a different replacement (single remaining
+/// child, collapsed leaf).
+fn internal_unmap_with_store<S>(
+    mut node: InternalNode,
+    store: &S,
+    cache: &dyn PageCache,
+    key: &[Vec<u8>],
+    check_remap: bool,
+) -> Result<Node, Error>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    if node.items.is_empty() {
+        return Err(Error::AssertionFailed(
+            "can't unmap in an empty InternalNode".into(),
+        ));
+    }
+    let key_obj = Key::from(key.to_vec());
+    let children = node.iter_nodes(store, cache, Some(&[key.to_vec()]), None)?;
+    let (child, _filter) = children.into_iter().next().ok_or_else(|| {
+        Error::AssertionFailed(format!("key not found in internal node: {:?}", key))
+    })?;
+    node.len -= 1;
+    let unmapped = child.unmap_with_store(store, cache, key, true)?;
+    node.key = None;
+    let search_key = node.search_key(&key_obj);
+    let was_internal_after = matches!(unmapped, Node::Internal(_));
+    if unmapped.len() == 0 {
+        // Drop the child entirely.
+        node.items.shift_remove(&search_key);
+    } else {
+        node.items
+            .insert(search_key, NodeRef::Loaded(unmapped));
+    }
+    if node.items.len() == 1 {
+        // Only one child left — collapse this internal node out of
+        // the chain entirely.
+        let only = node
+            .items
+            .into_iter()
+            .next()
+            .expect("just checked len == 1")
+            .1;
+        return Ok(match only {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(sha1_key) => {
+                // Need to load it from cache or store.
+                let bytes = match cache.get(&sha1_key) {
+                    Some(b) => b,
+                    None => {
+                        let stream = store
+                            .get_record_stream(
+                                &[crate::versionedfile::Key::Fixed(vec![sha1_key.clone()])],
+                                "unordered",
+                                true,
+                            )
+                            .map_err(|e| {
+                                Error::AssertionFailed(format!(
+                                    "get_record_stream: {:?}",
+                                    e
+                                ))
+                            })?;
+                        let record = stream
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                Error::AssertionFailed(
+                                    "store returned no record for collapse child".into(),
+                                )
+                            })?
+                            .map_err(|e| {
+                                Error::AssertionFailed(format!("record: {:?}", e))
+                            })?;
+                        let data = record.to_fulltext().into_owned();
+                        cache.insert(sha1_key.clone(), data.clone());
+                        data
+                    }
+                };
+                deserialise_node(&bytes, sha1_key, node.search_key_func.clone())?
+            }
+        });
+    }
+    if was_internal_after {
+        // The replaced child is itself an internal node; per the
+        // Python heuristic, we know there's no chance of further
+        // collapse at this level.
+        return Ok(Node::Internal(Box::new(node)));
+    }
+    if check_remap {
+        node.check_remap(store, cache)
+    } else {
+        Ok(Node::Internal(Box::new(node)))
+    }
+}
+
 /// Check whether every search key in `search_keys` is identical.
 ///
 /// Mirrors `LeafNode._are_search_keys_identical`: this is the safety check
@@ -2629,6 +2759,65 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
             Err(crate::knit::KnitError::NotImplemented("annotate"))
         }
+    }
+
+    #[test]
+    fn node_unmap_with_store_removes_from_leaf() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        leaf.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        let node = Node::Leaf(Box::new(leaf));
+        let new_node = node
+            .unmap_with_store(&store, &cache, &key_vec(&[b"a"]), true)
+            .unwrap();
+        assert_eq!(new_node.len(), 1);
+    }
+
+    #[test]
+    fn node_unmap_with_store_collapses_internal_to_only_child() {
+        // Build an internal with two leaves; remove one — internal
+        // should collapse to the remaining leaf.
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut leaf_b = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_b.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal
+            .add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        internal
+            .add_node(b"b".to_vec(), Node::Leaf(Box::new(leaf_b)))
+            .unwrap();
+        let node = Node::Internal(Box::new(internal));
+        let new_node = node
+            .unmap_with_store(&store, &cache, &key_vec(&[b"a"]), true)
+            .unwrap();
+        // After removing the "a" leaf, only "b" remains — the
+        // internal node collapses to the bare leaf.
+        match &new_node {
+            Node::Leaf(l) => {
+                assert_eq!(l.len(), 1);
+                assert!(l.items.contains_key(&key_vec(&[b"b"])));
+            }
+            Node::Internal(_) => panic!("expected collapse to leaf"),
+        }
+    }
+
+    #[test]
+    fn node_unmap_with_store_raises_for_missing_key() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let node = Node::Leaf(Box::new(leaf));
+        let err = node
+            .unmap_with_store(&store, &cache, &key_vec(&[b"absent"]), true)
+            .unwrap_err();
+        assert!(matches!(err, Error::AssertionFailed(_)));
     }
 
     #[test]
