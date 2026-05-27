@@ -616,6 +616,37 @@ mod tests {
     }
 
     #[test]
+    fn iter_entries_by_dir_yields_dirs_then_children() {
+        let inv = build_test_inv_deeper();
+        let entries = inv.iter_entries_by_dir(None, None).unwrap();
+        let paths: Vec<&str> = entries.iter().map(|(p, _)| p.as_str()).collect();
+        // Root yielded first, then each directory's children pop off
+        // the stack in order. Exact interleaving differs from
+        // iter_entries — assert the count and that key items appear.
+        assert!(paths.contains(&""));
+        assert!(paths.contains(&"top.txt"));
+        assert!(paths.contains(&"dir"));
+        assert!(paths.contains(&"dir/file.txt"));
+        assert!(paths.contains(&"dir/sub"));
+        assert!(paths.contains(&"dir/sub/nested.txt"));
+        assert_eq!(entries.len(), 6);
+    }
+
+    #[test]
+    fn iter_entries_by_dir_with_specific_file_ids() {
+        let inv = build_test_inv_deeper();
+        let entries = inv
+            .iter_entries_by_dir(
+                None,
+                Some(&[FileId::from(&b"f2"[..])]),
+            )
+            .unwrap();
+        // Single-id fast path: just that entry under its full path.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "dir/sub/nested.txt");
+    }
+
+    #[test]
     fn iter_entries_root_recursive_yields_full_tree() {
         let inv = build_test_inv_deeper();
         let entries = inv.iter_entries(None, true).unwrap();
@@ -1731,6 +1762,110 @@ where
                 }
             } else {
                 stack.pop();
+            }
+        }
+        Ok(out)
+    }
+
+    /// Walk the inventory in directory-first order (parent before
+    /// children, but no lexicographic guarantee across siblings).
+    /// Returns `(path, entry)` pairs. Optionally restricted to
+    /// `specific_file_ids` plus their ancestors.
+    ///
+    /// Mirrors Python's `iter_entries_by_dir`. The Python
+    /// `from_dir=None` shortcut for `len(specific_file_ids) == 1`
+    /// is preserved.
+    pub fn iter_entries_by_dir(
+        &self,
+        from_dir: Option<&crate::FileId>,
+        specific_file_ids: Option<&[crate::FileId]>,
+    ) -> Result<Vec<(String, Entry)>, Error> {
+        let mut out: Vec<(String, Entry)> = Vec::new();
+        let specific_set: Option<std::collections::HashSet<crate::FileId>> =
+            specific_file_ids.map(|ids| ids.iter().cloned().collect());
+
+        let start_entry = match from_dir {
+            Some(id) => self.get_entry(id)?,
+            None => match &self.root_id {
+                None => return Ok(out),
+                Some(root_id) => {
+                    if let Some(set) = &specific_set {
+                        if set.len() == 1 {
+                            let only = set.iter().next().unwrap().clone();
+                            // Fast path: id2path + get_entry for the
+                            // single requested id.
+                            if let Ok(path) = self.id2path(&only) {
+                                if let Ok(entry) = self.get_entry(&only) {
+                                    out.push((path, entry));
+                                }
+                            }
+                            return Ok(out);
+                        }
+                    }
+                    let root = self.get_entry(root_id)?;
+                    if specific_set.is_none()
+                        || specific_set.as_ref().unwrap().contains(root_id)
+                    {
+                        out.push((String::new(), root.clone()));
+                    }
+                    root
+                }
+            },
+        };
+
+        // Compute ancestors of the specific ids to limit recursion.
+        let parents_filter: Option<std::collections::HashSet<crate::FileId>> =
+            match &specific_set {
+                None => None,
+                Some(set) => {
+                    let mut ancestors: std::collections::HashSet<crate::FileId> =
+                        std::collections::HashSet::new();
+                    for fid in set {
+                        let mut cur = Some(fid.clone());
+                        while let Some(id) = cur {
+                            if !self.has_id(&id)? {
+                                break;
+                            }
+                            let entry = self.get_entry(&id)?;
+                            let parent_id = entry.parent_id().cloned();
+                            if let Some(pid) = &parent_id {
+                                if ancestors.contains(pid) {
+                                    break;
+                                }
+                                ancestors.insert(pid.clone());
+                            }
+                            cur = parent_id;
+                        }
+                    }
+                    Some(ancestors)
+                }
+            };
+
+        let mut stack: Vec<(String, Entry)> =
+            vec![(String::new(), start_entry)];
+        while let Some((cur_relpath, cur_dir)) = stack.pop() {
+            let mut child_dirs: Vec<(String, Entry)> = Vec::new();
+            for child_ie in self.iter_sorted_children(cur_dir.file_id())? {
+                let child_relpath = format!("{}{}", cur_relpath, child_ie.name());
+                if specific_set.is_none()
+                    || specific_set.as_ref().unwrap().contains(child_ie.file_id())
+                {
+                    out.push((child_relpath.clone(), child_ie.clone()));
+                }
+                if matches!(child_ie, Entry::Directory { .. }) {
+                    let recurse_into = match &parents_filter {
+                        None => true,
+                        Some(p) => p.contains(child_ie.file_id()),
+                    };
+                    if recurse_into {
+                        child_dirs.push((format!("{}/", child_relpath), child_ie));
+                    }
+                }
+            }
+            // Stack semantics: Python extends with reversed list so
+            // siblings are popped in original order. Mirror that.
+            for cd in child_dirs.into_iter().rev() {
+                stack.push(cd);
             }
         }
         Ok(out)
