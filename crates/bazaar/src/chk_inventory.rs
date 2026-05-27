@@ -436,6 +436,48 @@ mod tests {
     }
 
     #[test]
+    fn from_inventory_round_trips_through_to_lines() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let root = Entry::Root {
+            file_id: FileId::from(&b"root-id"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev1"[..])),
+        };
+        let file = Entry::File {
+            file_id: FileId::from(&b"file-id"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev1"[..])),
+            parent_id: FileId::from(&b"root-id"[..]),
+            name: "f.txt".to_string(),
+            text_sha1: Some(b"da39a3ee5e6b4b0d3255bfef95601890afd80709".to_vec()),
+            text_size: Some(0),
+            text_id: None,
+            executable: false,
+        };
+        let inv = CHKInventory::from_inventory(
+            store.clone(),
+            cache.clone(),
+            crate::RevisionId::from(&b"rev1"[..]),
+            FileId::from(&b"root-id"[..]),
+            &[root, file],
+            0,
+            b"plain".to_vec(),
+        )
+        .unwrap();
+        let lines = inv.to_lines().unwrap();
+        let expected_rev = crate::RevisionId::from(&b"rev1"[..]);
+        let restored = CHKInventory::deserialise(
+            store.clone(),
+            cache.clone(),
+            &lines,
+            &expected_rev,
+        )
+        .unwrap();
+        assert_eq!(restored.root_id.as_ref(), inv.root_id.as_ref());
+        let restored_items = restored.iter_all_ids().unwrap();
+        assert_eq!(restored_items.len(), 2);
+    }
+
+    #[test]
     fn get_entry_by_path_finds_nested_file() {
         let inv = build_test_inv_deeper();
         let entry = inv.get_entry_by_path("dir/sub/nested.txt").unwrap();
@@ -1010,6 +1052,83 @@ where
         let mut sorted: Vec<(String, Entry)> = children.into_iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(sorted.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Bulk-create a CHKInventory by serialising every entry in
+    /// `entries` into a fresh pair of CHKMaps under `store`. Mirrors
+    /// Python's `from_inventory` / `_populate_from_dicts`.
+    ///
+    /// `entries` should be an in-order traversal of an inventory (the
+    /// Python version iterates `inventory.iter_entries()`); the root
+    /// entry's file_id becomes `root_id`.
+    pub fn from_inventory(
+        store: std::sync::Arc<S>,
+        cache: std::sync::Arc<dyn crate::chk_map::PageCache>,
+        revision_id: crate::RevisionId,
+        root_id: crate::FileId,
+        entries: &[Entry],
+        maximum_size: usize,
+        search_key_name: Vec<u8>,
+    ) -> Result<Self, Error> {
+        let search_key_func = crate::chk_map::SearchKeyFunc::from_name(&search_key_name)
+            .map_err(|raw| {
+                Error::InvalidFormat(format!("unknown search_key_name: {:?}", raw))
+            })?;
+        let mut id_to_entry_dict: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> =
+            indexmap::IndexMap::new();
+        let mut parent_dict: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> =
+            indexmap::IndexMap::new();
+        for entry in entries {
+            id_to_entry_dict.insert(
+                vec![entry.file_id().as_bytes().to_vec()],
+                chk_inventory_entry_to_bytes(entry),
+            );
+            parent_dict.insert(
+                parent_id_basename_key(entry),
+                entry.file_id().as_bytes().to_vec(),
+            );
+        }
+        let id_root = crate::chk_map::CHKMap::from_dict(
+            store.clone(),
+            cache.clone(),
+            id_to_entry_dict,
+            maximum_size,
+            1,
+            search_key_func.clone(),
+        )?;
+        let parent_root = crate::chk_map::CHKMap::from_dict(
+            store.clone(),
+            cache.clone(),
+            parent_dict,
+            maximum_size,
+            2,
+            search_key_func.clone(),
+        )?;
+        let id_map = crate::chk_map::CHKMap::new(
+            store.clone(),
+            cache.clone(),
+            Some(id_root),
+            search_key_func.clone(),
+        );
+        let pid_map = crate::chk_map::CHKMap::new(
+            store.clone(),
+            cache.clone(),
+            Some(parent_root),
+            search_key_func,
+        );
+        Ok(Self {
+            search_key_name,
+            revision_id: Some(revision_id),
+            root_id: Some(root_id),
+            id_to_entry: std::cell::RefCell::new(Some(id_map)),
+            parent_id_basename_to_file_id: std::cell::RefCell::new(Some(pid_map)),
+            fileid_to_entry_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fully_cached: std::cell::Cell::new(false),
+            path_to_fileid_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            children_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            store,
+            cache,
+        })
     }
 
     /// Return the entry at `relpath`, or `None` if missing.
