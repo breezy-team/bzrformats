@@ -1030,6 +1030,33 @@ impl Node {
             Node::Internal(n) => n.maximum_size,
         }
     }
+
+    /// Iterate `(key, value)` pairs in this subtree matching
+    /// `key_filter`. Mirrors Python's polymorphic `iteritems`:
+    /// leaves yield directly; internal nodes recurse through
+    /// `iter_nodes`, demand-loading children as needed.
+    pub fn iteritems<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+        key_filter: Option<&[Vec<Vec<u8>>]>,
+    ) -> Result<Vec<(Vec<Vec<u8>>, Vec<u8>)>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        match self {
+            Node::Leaf(l) => Ok(l.iteritems(key_filter)),
+            Node::Internal(n) => {
+                let mut out: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::new();
+                let children = n.iter_nodes(store, cache, key_filter, None)?;
+                for (mut child, filter) in children {
+                    let sub_filter = filter.as_deref();
+                    out.extend(child.iteritems(store, cache, sub_filter)?);
+                }
+                Ok(out)
+            }
+        }
+    }
 }
 
 /// Reference to a child of an `InternalNode`. The dict either holds a
@@ -2212,6 +2239,65 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
             Err(crate::knit::KnitError::NotImplemented("annotate"))
         }
+    }
+
+    #[test]
+    fn node_iteritems_recurses_into_internal_children() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        // Two leaves each with one entry, serialised into the store.
+        let mut la = LeafNode::new(SearchKeyFunc::Plain);
+        la.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut lb = LeafNode::new(SearchKeyFunc::Plain);
+        lb.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        let key_a = la.serialise(&store, &cache).unwrap();
+        let key_b = lb.serialise(&store, &cache).unwrap();
+        // Parent internal node referencing both as unloaded.
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal.node_width = 1;
+        internal
+            .items
+            .insert(b"a".to_vec(), NodeRef::Unloaded(key_a));
+        internal
+            .items
+            .insert(b"b".to_vec(), NodeRef::Unloaded(key_b));
+        internal.len = 2;
+        let mut node = Node::Internal(Box::new(internal));
+        let mut items = node.iteritems(&store, &cache, None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"a"]), b"va".to_vec()),
+                (key_vec(&[b"b"]), b"vb".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn node_iteritems_with_filter_only_yields_matching_keys() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut la = LeafNode::new(SearchKeyFunc::Plain);
+        la.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut lb = LeafNode::new(SearchKeyFunc::Plain);
+        lb.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        let key_a = la.serialise(&store, &cache).unwrap();
+        let key_b = lb.serialise(&store, &cache).unwrap();
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal.node_width = 1;
+        internal
+            .items
+            .insert(b"a".to_vec(), NodeRef::Unloaded(key_a));
+        internal
+            .items
+            .insert(b"b".to_vec(), NodeRef::Unloaded(key_b));
+        internal.len = 2;
+        let mut node = Node::Internal(Box::new(internal));
+        let items = node
+            .iteritems(&store, &cache, Some(&[key_vec(&[b"a"])]))
+            .unwrap();
+        assert_eq!(items, vec![(key_vec(&[b"a"]), b"va".to_vec())]);
     }
 
     #[test]
