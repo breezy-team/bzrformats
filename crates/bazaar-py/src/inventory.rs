@@ -3177,6 +3177,134 @@ impl CHKInventory {
         )
     }
 
+    /// Given a starting set of file_ids, return the set of all
+    /// interesting file_ids plus a parent_id -> set-of-children
+    /// dict. For directories in `file_ids`, all children (recursively)
+    /// are included; ancestors of every input file_id are also
+    /// included (but their other children are not). Mirrors Python's
+    /// `_expand_fileids_to_parents_and_children`.
+    fn _expand_fileids_to_parents_and_children<'py>(
+        slf: Bound<'py, CHKInventory>,
+        py: Python<'py>,
+        file_ids: Bound<'py, PyAny>,
+    ) -> PyResult<(Bound<'py, pyo3::types::PySet>, Bound<'py, PyDict>)> {
+        // Collect file_ids into a Python set so we can do set
+        // operations against it efficiently.
+        let file_ids_set = pyo3::types::PySet::empty(py)?;
+        for fid in file_ids.try_iter()? {
+            file_ids_set.add(fid?)?;
+        }
+        let interesting = pyo3::types::PySet::empty(py)?;
+        let mut directories_to_expand: Vec<Py<PyAny>> = Vec::new();
+        let children_of_parent_id = PyDict::new(py);
+
+        // First pass — _getitems(file_ids) gives entries (some may be
+        // missing). Track directories to expand, and add each
+        // entry's parent to `interesting`.
+        let first_items = slf.call_method1("_getitems", (file_ids_set.clone(),))?;
+        for entry in first_items.try_iter()? {
+            let entry = entry?;
+            let kind: String = entry.getattr("kind")?.extract()?;
+            let file_id = entry.getattr("file_id")?;
+            let parent_id = entry.getattr("parent_id")?;
+            if kind == "directory" {
+                directories_to_expand.push(file_id.clone().unbind());
+            }
+            interesting.add(parent_id.clone())?;
+            match children_of_parent_id.get_item(&parent_id)? {
+                Some(s) => {
+                    s.cast_into::<pyo3::types::PySet>()?.add(file_id)?;
+                }
+                None => {
+                    let new_set = pyo3::types::PySet::empty(py)?;
+                    new_set.add(file_id)?;
+                    children_of_parent_id.set_item(parent_id, new_set)?;
+                }
+            }
+        }
+
+        // Now climb parents until we reach the root. `None` is the
+        // sentinel parent above the tree root — auto-filtered.
+        let mut remaining_parents =
+            interesting.call_method1("difference", (file_ids_set.clone(),))?;
+        interesting.add(py.None())?;
+        remaining_parents.call_method1("discard", (py.None(),))?;
+        while remaining_parents.is_truthy()? {
+            let next_parents = pyo3::types::PySet::empty(py)?;
+            let items = slf.call_method1("_getitems", (remaining_parents.clone(),))?;
+            for entry in items.try_iter()? {
+                let entry = entry?;
+                let file_id = entry.getattr("file_id")?;
+                let parent_id = entry.getattr("parent_id")?;
+                next_parents.add(parent_id.clone())?;
+                match children_of_parent_id.get_item(&parent_id)? {
+                    Some(s) => {
+                        s.cast_into::<pyo3::types::PySet>()?.add(file_id)?;
+                    }
+                    None => {
+                        let new_set = pyo3::types::PySet::empty(py)?;
+                        new_set.add(file_id)?;
+                        children_of_parent_id.set_item(parent_id, new_set)?;
+                    }
+                }
+            }
+            remaining_parents = next_parents.call_method1("difference", (interesting.clone(),))?;
+            interesting.call_method1("update", (remaining_parents.clone(),))?;
+        }
+        interesting.call_method1("update", (file_ids_set.clone(),))?;
+        interesting.call_method1("discard", (py.None(),))?;
+
+        // Now expand any directories in `directories_to_expand` by
+        // querying parent_id_basename_to_file_id.iteritems(keys).
+        while !directories_to_expand.is_empty() {
+            let keys = PyList::empty(py);
+            for f in &directories_to_expand {
+                keys.append(PyTuple::new(py, [f.bind(py)])?)?;
+            }
+            directories_to_expand.clear();
+            let pid_map = slf
+                .borrow()
+                .parent_id_basename_to_file_id
+                .as_ref()
+                .ok_or_else(|| {
+                    BzrFormatsError::new_err("parent_id_basename_to_file_id not set")
+                })?
+                .clone_ref(py);
+            let items = pid_map.bind(py).call_method1("iteritems", (keys,))?;
+            let next_file_ids = pyo3::types::PySet::empty(py)?;
+            for item in items.try_iter()? {
+                let item = item?;
+                let tup = item.cast_into::<PyTuple>()?;
+                let child_file_id = tup.get_item(1)?;
+                next_file_ids.add(child_file_id)?;
+            }
+            let next_file_ids =
+                next_file_ids.call_method1("difference", (interesting.clone(),))?;
+            interesting.call_method1("update", (next_file_ids.clone(),))?;
+            let items2 = slf.call_method1("_getitems", (next_file_ids,))?;
+            for entry in items2.try_iter()? {
+                let entry = entry?;
+                let kind: String = entry.getattr("kind")?.extract()?;
+                let file_id = entry.getattr("file_id")?;
+                let parent_id = entry.getattr("parent_id")?;
+                if kind == "directory" {
+                    directories_to_expand.push(file_id.clone().unbind());
+                }
+                match children_of_parent_id.get_item(&parent_id)? {
+                    Some(s) => {
+                        s.cast_into::<pyo3::types::PySet>()?.add(file_id)?;
+                    }
+                    None => {
+                        let new_set = pyo3::types::PySet::empty(py)?;
+                        new_set.add(file_id)?;
+                        children_of_parent_id.set_item(parent_id, new_set)?;
+                    }
+                }
+            }
+        }
+        Ok((interesting, children_of_parent_id))
+    }
+
     /// Populate the in-memory caches by walking the two CHKMaps.
     /// Mirrors Python's `_preload_cache`.
     ///
