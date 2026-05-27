@@ -1209,6 +1209,217 @@ impl InternalNode {
         self.search_prefix.as_deref()
     }
 
+    /// Yield child nodes that match `key_filter`, demand-loading
+    /// unloaded references via `cache` then `store`.
+    ///
+    /// Mirrors Python's `InternalNode._iter_nodes`: returns
+    /// `(child_node, optional_filter)` pairs. Already-loaded children
+    /// come first (in `self.items` order), then page-cache hits,
+    /// then freshly fetched batches from the store.
+    ///
+    /// When loading from the store, this method also flips the
+    /// matching `NodeRef::Unloaded` entries in `self.items` to
+    /// `NodeRef::Loaded`, so subsequent calls hit the in-memory
+    /// fast path.
+    ///
+    /// Note: returns owned `Node` clones rather than references —
+    /// the caller can recurse into them without lifetime
+    /// entanglement with `&mut self`.
+    pub fn iter_nodes<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+        key_filter: Option<&[Vec<Vec<u8>>]>,
+        batch_size: Option<usize>,
+    ) -> Result<Vec<(Node, Option<Vec<Vec<Vec<u8>>>>)>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let mut out: Vec<(Node, Option<Vec<Vec<Vec<u8>>>>)> = Vec::new();
+        // sha1_key -> (prefix, key_filter_for_that_child) for unloaded
+        // refs we need to demand-load. Uses an IndexMap so the batch
+        // ordering reflects `self.items` insertion order.
+        let mut to_load: indexmap::IndexMap<Vec<u8>, (Vec<u8>, Option<Vec<Vec<Vec<u8>>>>)> =
+            indexmap::IndexMap::new();
+
+        match key_filter {
+            None => {
+                // Yield every loaded child; queue every unloaded child
+                // with a `None` filter.
+                for (prefix, child) in self.items.iter() {
+                    match child {
+                        NodeRef::Loaded(node) => out.push((node.clone(), None)),
+                        NodeRef::Unloaded(sha1_key) => {
+                            to_load.insert(sha1_key.clone(), (prefix.clone(), None));
+                        }
+                    }
+                }
+            }
+            Some(filter) if filter.len() == 1 => {
+                // Single-key fast path: compute its full-width search
+                // prefix, do a dict lookup on items.
+                let only_key = Key::from(filter[0].clone());
+                let search_prefix = self.search_prefix_filter(&only_key);
+                if search_prefix.len() == self.node_width {
+                    match self.items.get(&search_prefix) {
+                        None => return Ok(out),
+                        Some(NodeRef::Loaded(node)) => {
+                            out.push((node.clone(), Some(vec![filter[0].clone()])));
+                            return Ok(out);
+                        }
+                        Some(NodeRef::Unloaded(sha1_key)) => {
+                            to_load.insert(
+                                sha1_key.clone(),
+                                (search_prefix, Some(vec![filter[0].clone()])),
+                            );
+                        }
+                    }
+                } else {
+                    // Fall through to the general filter path.
+                    self.iter_nodes_general_filter(filter, &mut out, &mut to_load);
+                }
+            }
+            Some(filter) => {
+                self.iter_nodes_general_filter(filter, &mut out, &mut to_load);
+            }
+        }
+
+        if to_load.is_empty() {
+            return Ok(out);
+        }
+
+        // Look in the page cache first.
+        let mut still_missing: indexmap::IndexMap<
+            Vec<u8>,
+            (Vec<u8>, Option<Vec<Vec<Vec<u8>>>>),
+        > = indexmap::IndexMap::new();
+        for (sha1_key, (prefix, filter)) in to_load.drain(..) {
+            if let Some(bytes) = cache.get(&sha1_key) {
+                let node = deserialise_node(&bytes, sha1_key.clone(), self.search_key_func.clone())?;
+                self.items
+                    .insert(prefix.clone(), NodeRef::Loaded(node.clone()));
+                out.push((node, filter));
+            } else {
+                still_missing.insert(sha1_key, (prefix, filter));
+            }
+        }
+        if still_missing.is_empty() {
+            return Ok(out);
+        }
+
+        // Demand-load remaining keys from the store, batched.
+        let batch_size = batch_size.unwrap_or(still_missing.len());
+        let key_order: Vec<Vec<u8>> = still_missing.keys().cloned().collect();
+        for batch_start in (0..key_order.len()).step_by(batch_size.max(1)) {
+            let batch_end = (batch_start + batch_size).min(key_order.len());
+            let batch_keys: Vec<crate::versionedfile::Key> = key_order[batch_start..batch_end]
+                .iter()
+                .map(|k| crate::versionedfile::Key::Fixed(vec![k.clone()]))
+                .collect();
+            let stream = store
+                .get_record_stream(&batch_keys, "unordered", true)
+                .map_err(|e| {
+                    Error::AssertionFailed(format!("get_record_stream failed: {:?}", e))
+                })?;
+            for record in stream {
+                let record = record
+                    .map_err(|e| Error::AssertionFailed(format!("record error: {:?}", e)))?;
+                let rec_key = record.key();
+                let sha1_key = rec_key
+                    .segments()
+                    .first()
+                    .ok_or_else(|| {
+                        Error::AssertionFailed("record key has no segments".into())
+                    })?
+                    .clone();
+                let bytes = record.to_fulltext().into_owned();
+                let (prefix, filter) = still_missing.shift_remove(&sha1_key).ok_or_else(|| {
+                    Error::AssertionFailed(format!(
+                        "store returned unexpected key {:?}",
+                        sha1_key
+                    ))
+                })?;
+                let node = deserialise_node(&bytes, sha1_key.clone(), self.search_key_func.clone())?;
+                cache.insert(sha1_key, bytes);
+                self.items
+                    .insert(prefix, NodeRef::Loaded(node.clone()));
+                out.push((node, filter));
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// General-case filter dispatch shared between the multi-key path
+    /// and the single-key-but-not-full-width fallback. Walks every
+    /// item in `self.items` against the length-keyed prefix filters.
+    fn iter_nodes_general_filter(
+        &self,
+        filter: &[Vec<Vec<u8>>],
+        out: &mut Vec<(Node, Option<Vec<Vec<Vec<u8>>>>)>,
+        to_load: &mut indexmap::IndexMap<Vec<u8>, (Vec<u8>, Option<Vec<Vec<Vec<u8>>>>)>,
+    ) {
+        // Group filter keys by search-prefix length.
+        let mut prefix_to_keys: indexmap::IndexMap<Vec<u8>, Vec<Vec<Vec<u8>>>> =
+            indexmap::IndexMap::new();
+        let mut length_filters: std::collections::HashMap<usize, indexmap::IndexSet<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for key in filter.iter() {
+            let search_prefix = self.search_prefix_filter(&Key::from(key.clone()));
+            length_filters
+                .entry(search_prefix.len())
+                .or_default()
+                .insert(search_prefix.clone());
+            prefix_to_keys
+                .entry(search_prefix)
+                .or_default()
+                .push(key.clone());
+        }
+
+        if length_filters.len() == 1
+            && length_filters.contains_key(&self.node_width)
+        {
+            // All filter keys map to full-width prefixes — do direct
+            // dict lookups in filter-prefix order.
+            let prefixes = &length_filters[&self.node_width];
+            for prefix in prefixes.iter() {
+                let Some(child) = self.items.get(prefix) else {
+                    continue;
+                };
+                let node_filter = prefix_to_keys.get(prefix).cloned();
+                match child {
+                    NodeRef::Loaded(node) => out.push((node.clone(), node_filter)),
+                    NodeRef::Unloaded(sha1_key) => {
+                        to_load.insert(sha1_key.clone(), (prefix.clone(), node_filter));
+                    }
+                }
+            }
+        } else {
+            // The slow path: walk every item, check each length filter.
+            for (prefix, child) in self.items.iter() {
+                let mut node_keys: Vec<Vec<Vec<u8>>> = Vec::new();
+                for (length, length_filter) in length_filters.iter() {
+                    if prefix.len() >= *length {
+                        let sub_prefix = &prefix[..*length];
+                        if length_filter.contains(sub_prefix) {
+                            if let Some(keys) = prefix_to_keys.get(sub_prefix) {
+                                node_keys.extend(keys.iter().cloned());
+                            }
+                        }
+                    }
+                }
+                if !node_keys.is_empty() {
+                    match child {
+                        NodeRef::Loaded(node) => out.push((node.clone(), Some(node_keys))),
+                        NodeRef::Unloaded(sha1_key) => {
+                            to_load.insert(sha1_key.clone(), (prefix.clone(), Some(node_keys)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Read-only references to the children. Mirrors `InternalNode.refs`:
     /// returns the sha1 key of each unloaded child plus the
     /// `.key()` of each loaded child. Returns an `AssertionFailed`
@@ -1899,7 +2110,7 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
 
         fn get_record_stream(
             &self,
-            _keys: &[crate::versionedfile::Key],
+            keys: &[crate::versionedfile::Key],
             _ordering: &str,
             _include_delta_closure: bool,
         ) -> Result<
@@ -1913,7 +2124,32 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
             >,
             crate::knit::KnitError,
         > {
-            Err(crate::knit::KnitError::NotImplemented("get_record_stream"))
+            let pages = self.pages.lock().unwrap();
+            let mut records: Vec<
+                Result<Box<dyn crate::versionedfile::ContentFactory>, crate::knit::KnitError>,
+            > = Vec::with_capacity(keys.len());
+            for key in keys {
+                let full = key.segments().first().cloned().unwrap_or_default();
+                // Test fixture stores pages under the bare hex; the
+                // CHK code uses prefixed `b"sha1:...."` keys.
+                let bare: &[u8] = if full.starts_with(b"sha1:") {
+                    &full[5..]
+                } else {
+                    &full
+                };
+                if let Some(data) = pages.get(bare) {
+                    records.push(Ok(Box::new(
+                        crate::versionedfile::FulltextContentFactory::new(
+                            Some(bare.to_vec()),
+                            key.clone(),
+                            Some(vec![]),
+                            data.clone(),
+                        ),
+                    )
+                        as Box<dyn crate::versionedfile::ContentFactory>));
+                }
+            }
+            Ok(Box::new(records.into_iter()))
         }
 
         fn get_sha1s(
@@ -1976,6 +2212,118 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
             Err(crate::knit::KnitError::NotImplemented("annotate"))
         }
+    }
+
+    #[test]
+    fn internal_node_iter_nodes_returns_loaded_children_in_order() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 1;
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut leaf_b = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_b.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        n.add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a))).unwrap();
+        n.add_node(b"b".to_vec(), Node::Leaf(Box::new(leaf_b))).unwrap();
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let yielded = n.iter_nodes(&store, &cache, None, None).unwrap();
+        assert_eq!(yielded.len(), 2);
+        // Filter is None for everything when no key_filter is given.
+        assert!(yielded.iter().all(|(_, f)| f.is_none()));
+        let lens: Vec<usize> = yielded.iter().map(|(n, _)| n.len()).collect();
+        assert_eq!(lens, vec![1, 1]);
+    }
+
+    #[test]
+    fn internal_node_iter_nodes_demand_loads_via_store() {
+        // Serialise a leaf into the store first.
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let child_key = leaf.serialise(&store, &cache).unwrap();
+
+        // Build an InternalNode pointing at the unloaded child.
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 1;
+        n.items
+            .insert(b"a".to_vec(), NodeRef::Unloaded(child_key.clone()));
+        n.len = 1;
+
+        // Drop the cache to force a store read.
+        cache.clear();
+
+        let yielded = n.iter_nodes(&store, &cache, None, None).unwrap();
+        assert_eq!(yielded.len(), 1);
+        assert_eq!(yielded[0].0.len(), 1);
+        // After loading, the items entry should be Loaded.
+        match n.items.get(&b"a".to_vec()) {
+            Some(NodeRef::Loaded(_)) => {}
+            other => panic!("expected Loaded after iter_nodes, got {:?}", other),
+        }
+        // The page cache should now hold the bytes.
+        assert!(cache.get(&child_key).is_some());
+    }
+
+    #[test]
+    fn internal_node_iter_nodes_single_key_filter_dict_lookup() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 1;
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut leaf_b = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_b.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        n.add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a))).unwrap();
+        n.add_node(b"b".to_vec(), Node::Leaf(Box::new(leaf_b))).unwrap();
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let filter = [key_vec(&[b"a"])];
+        let yielded = n.iter_nodes(&store, &cache, Some(&filter), None).unwrap();
+        assert_eq!(yielded.len(), 1);
+        assert_eq!(yielded[0].1.as_deref(), Some(&[key_vec(&[b"a"])][..]));
+    }
+
+    #[test]
+    fn internal_node_iter_nodes_single_key_miss_yields_nothing() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 1;
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        n.add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a))).unwrap();
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let filter = [key_vec(&[b"z"])];
+        let yielded = n.iter_nodes(&store, &cache, Some(&filter), None).unwrap();
+        assert!(yielded.is_empty());
+    }
+
+    #[test]
+    fn internal_node_iter_nodes_hits_cache_before_store() {
+        // First serialise leaf into store + cache.
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let child_key = leaf.serialise(&store, &cache).unwrap();
+
+        // Build an InternalNode pointing at the unloaded child.
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 1;
+        n.items
+            .insert(b"a".to_vec(), NodeRef::Unloaded(child_key.clone()));
+        n.len = 1;
+
+        // Now corrupt the store; if iter_nodes hits the store we'll
+        // get back garbage. The cache hit should bypass the store.
+        store
+            .pages
+            .lock()
+            .unwrap()
+            .insert(child_key[5..].to_vec(), b"corrupt".to_vec());
+
+        let yielded = n.iter_nodes(&store, &cache, None, None).unwrap();
+        assert_eq!(yielded.len(), 1);
+        assert_eq!(yielded[0].0.len(), 1);
     }
 
     #[test]
