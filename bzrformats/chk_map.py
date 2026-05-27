@@ -97,9 +97,10 @@ _INTERESTING_NEW_SIZE = 50
 _INTERESTING_SHRINKAGE_LIMIT = 20
 
 
-def _search_key_plain(key: Key) -> SerialisedKey:
-    """Map the key tuple into a search string that just uses the key bytes."""
-    return b"\x00".join(key)
+# Plain search-key transform comes from the Rust extension so the
+# pyclass `_search_key_func` getter and the registry hand back the
+# same callable object (identity comparisons in tests rely on this).
+_search_key_plain = _chk_map_rs._search_key_plain
 
 
 search_key_registry = Registry[bytes, Callable[[Key], SerialisedKey], None]()
@@ -125,559 +126,424 @@ def _deserialise_internal_node(data, key, search_key_func=None):
     return _chk_map_rs.InternalNode.deserialise(data, key, search_key_func)
 
 
-class CHKMap:
-    """A persistent map from string to string backed by a CHK store."""
+CHKMap = _chk_map_rs.CHKMap
 
-    __slots__ = ("_root_node", "_search_key_func", "_store")
-    _root_node: Union["Node", Key]
 
-    def __init__(
-        self,
-        store,
-        root_key: Key | None,
-        search_key_func: SearchKeyFunc | None = None,
-    ):
-        """Create a CHKMap object.
+def _chkmap_apply_delta(self, delta):
+    """Apply a delta to the map."""
+    has_deletes = False
+    new_items = {
+        tuple(key) for (old, key, value) in delta if key is not None and old is None
+    }
+    existing_new = list(self.iteritems(key_filter=new_items))
+    if existing_new:
+        from .errors import InconsistentDeltaDelta
 
-        :param store: The store the CHKMap is stored in.
-        :param root_key: The root key of the map. None to create an empty
-            CHKMap.
-        :param search_key_func: A function mapping a key => bytes. These bytes
-            are then used by the internal nodes to split up leaf nodes into
-            multiple pages.
-        """
-        self._store = store
-        if search_key_func is None:
-            search_key_func = _search_key_plain
-        self._search_key_func = search_key_func
-        if root_key is None:
-            self._root_node = LeafNode(search_key_func=search_key_func)
-        else:
-            self._root_node = self._node_key(root_key)
+        raise InconsistentDeltaDelta(
+            delta, f"New items are already in the map {existing_new!r}."
+        )
+    for old, new, _value in delta:
+        if old is not None and old != new:
+            self.unmap(old, check_remap=False)
+            has_deletes = True
+    for _old, new, value in delta:
+        if new is not None:
+            self.map(new, value)
+    if has_deletes:
+        self._check_remap()
+    return self._save()
 
-    def apply_delta(self, delta):
-        """Apply a delta to the map.
 
-        :param delta: An iterable of old_key, new_key, new_value tuples.
-            If new_key is not None, then new_key->new_value is inserted
-            into the map; if old_key is not None, then the old mapping
-            of old_key is removed.
-        """
-        has_deletes = False
-        # Check preconditions first.
-        new_items = {
-            tuple(key) for (old, key, value) in delta if key is not None and old is None
-        }
-        existing_new = list(self.iteritems(key_filter=new_items))
-        if existing_new:
-            from .errors import InconsistentDeltaDelta
+def _chkmap_ensure_root(self):
+    """Ensure _root_node is an object, not a key tuple."""
+    if isinstance(self._root_node, tuple):
+        self._root_node = self._get_node(self._root_node)
 
-            raise InconsistentDeltaDelta(
-                delta, f"New items are already in the map {existing_new!r}."
+
+def _chkmap_get_node(self, node):
+    """Get a node, deserialising from store if it's a tuple key."""
+    if isinstance(node, tuple):
+        bytes = self._read_bytes(node)
+        return _deserialise(bytes, node, search_key_func=self._search_key_func)
+    return node
+
+
+def _chkmap_read_bytes(self, key):
+    try:
+        return _get_cache()[key]
+    except KeyError:
+        stream = self._store.get_record_stream([key], "unordered", True)
+        bytes = next(stream).get_bytes_as("fulltext")
+        _get_cache()[key] = bytes
+        return bytes
+
+
+def _chkmap_dump_tree(self, include_keys=False, encoding="utf-8"):
+    self._ensure_root()
+
+    def decode(x):
+        return x.decode(encoding)
+
+    res = self._dump_tree_node(
+        self._root_node,
+        prefix=b"",
+        indent="",
+        decode=decode,
+        include_keys=include_keys,
+    )
+    res.append("")
+    return "\n".join(res)
+
+
+def _chkmap_dump_tree_node(self, node, prefix, indent, decode, include_keys=True):
+    result = []
+    if not include_keys:
+        key_str = ""
+    else:
+        node_key = node.key()
+        key_str = f" {decode(node_key[0])}" if node_key is not None else " None"
+    result.append(f"{indent}{decode(prefix)!r} {node.__class__.__name__}{key_str}")
+    if isinstance(node, InternalNode):
+        list(node._iter_nodes(self._store))
+        for prefix, sub in sorted(node._items.items()):
+            result.extend(
+                self._dump_tree_node(
+                    sub,
+                    prefix,
+                    indent + "  ",
+                    decode=decode,
+                    include_keys=include_keys,
+                )
             )
-        # Now apply changes.
-        for old, new, _value in delta:
-            if old is not None and old != new:
-                self.unmap(old, check_remap=False)
-                has_deletes = True
-        for _old, new, value in delta:
-            if new is not None:
-                self.map(new, value)
-        if has_deletes:
-            self._check_remap()
-        return self._save()
+    else:
+        for key, value in sorted(node._items.items()):
+            result.append(
+                f"      {tuple([decode(ke) for ke in key])!r} {decode(value)!r}"
+            )
+    return result
 
-    def _ensure_root(self) -> None:
-        """Ensure that the root node is an object not a key."""
-        if isinstance(self._root_node, tuple):
-            # Demand-load the root
-            self._root_node = self._get_node(self._root_node)
 
-    def _get_node(self, node: Union[Key, "Node"]) -> "Node":
-        """Get a node.
-
-        Note that this does not update the _items dict in objects containing a
-        reference to this node. As such it does not prevent subsequent IO being
-        performed.
-
-        :param node: A tuple key or node object.
-        :return: A node object.
-        """
-        if isinstance(node, tuple):
-            bytes = self._read_bytes(node)
-            return _deserialise(bytes, node, search_key_func=self._search_key_func)
-        else:
-            return node
-
-    def _read_bytes(self, key: Key) -> bytes:
-        try:
-            return _get_cache()[key]
-        except KeyError:
-            stream = self._store.get_record_stream([key], "unordered", True)
-            bytes = next(stream).get_bytes_as("fulltext")
-            _get_cache()[key] = bytes
-            return bytes
-
-    def _dump_tree(self, include_keys=False, encoding="utf-8"):
-        """Return the tree in a string representation."""
-        self._ensure_root()
-
-        def decode(x):
-            return x.decode(encoding)
-
-        res = self._dump_tree_node(
-            self._root_node,
-            prefix=b"",
-            indent="",
-            decode=decode,
-            include_keys=include_keys,
-        )
-        res.append("")  # Give a trailing '\n'
-        return "\n".join(res)
-
-    def _dump_tree_node(
-        self, node: "Node", prefix, indent, decode, include_keys: bool = True
-    ) -> list[str]:
-        """For this node and all children, generate a string representation."""
-        result = []
-        if not include_keys:
-            key_str = ""
-        else:
-            node_key = node.key()
-            key_str = f" {decode(node_key[0])}" if node_key is not None else " None"
-        result.append(f"{indent}{decode(prefix)!r} {node.__class__.__name__}{key_str}")
-        if isinstance(node, InternalNode):
-            # Trigger all child nodes to get loaded
-            list(node._iter_nodes(self._store))
-            for prefix, sub in sorted(node._items.items()):
-                result.extend(
-                    self._dump_tree_node(
-                        sub,
-                        prefix,
-                        indent + "  ",
-                        decode=decode,
-                        include_keys=include_keys,
-                    )
-                )
-        else:
-            for key, value in sorted(node._items.items()):
-                # Don't use prefix nor indent here to line up when used in
-                # tests in conjunction with assertEqualDiff
-                result.append(
-                    f"      {tuple([decode(ke) for ke in key])!r} {decode(value)!r}"
-                )
-        return result
-
-    @classmethod
-    def from_dict(
-        cls,
+@classmethod
+def _chkmap_from_dict(
+    cls, store, initial_value, maximum_size=0, key_width=1, search_key_func=None
+):
+    """Create a CHKMap in store with initial_value as the content."""
+    root_key = cls._create_directly(
         store,
         initial_value,
-        maximum_size: int = 0,
-        key_width: int = 1,
-        search_key_func: SearchKeyFunc | None = None,
-    ):
-        """Create a CHKMap in store with initial_value as the content.
+        maximum_size=maximum_size,
+        key_width=key_width,
+        search_key_func=search_key_func,
+    )
+    if not isinstance(root_key, tuple):
+        raise AssertionError(f"we got a {type(root_key)} instead of a tuple")
+    return root_key
 
-        :param store: The store to record initial_value in, a VersionedFiles
-            object with 1-tuple keys supporting CHK key generation.
-        :param initial_value: A dict to store in store. Its keys and values
-            must be bytestrings.
-        :param maximum_size: The maximum_size rule to apply to nodes. This
-            determines the size at which no new data is added to a single node.
-        :param key_width: The number of elements in each key_tuple being stored
-            in this map.
-        :param search_key_func: A function mapping a key => bytes. These bytes
-            are then used by the internal nodes to split up leaf nodes into
-            multiple pages.
-        :return: The root chk of the resulting CHKMap.
-        """
-        root_key = cls._create_directly(
-            store,
-            initial_value,
-            maximum_size=maximum_size,
-            key_width=key_width,
-            search_key_func=search_key_func,
-        )
-        if not isinstance(root_key, tuple):
-            raise AssertionError(f"we got a {type(root_key)} instead of a tuple")
-        return root_key
 
-    @classmethod
-    def _create_via_map(
-        cls,
-        store,
-        initial_value,
-        maximum_size: int = 0,
-        key_width: int = 1,
-        search_key_func: SearchKeyFunc | None = None,
-    ):
-        result = cls(store, None, search_key_func=search_key_func)
-        # root_key=None means _root_node is a LeafNode, not a tuple
-        if not isinstance(result._root_node, Node):
-            raise AssertionError("expected root node to be Node")
-        result._root_node.set_maximum_size(maximum_size)
-        result._root_node._key_width = key_width
-        delta = []
-        for key, value in initial_value.items():
-            delta.append((None, key, value))
-        root_key = result.apply_delta(delta)
-        return root_key
+@classmethod
+def _chkmap_create_via_map(
+    cls, store, initial_value, maximum_size=0, key_width=1, search_key_func=None
+):
+    result = cls(store, None, search_key_func=search_key_func)
+    if not isinstance(result._root_node, Node):
+        raise AssertionError("expected root node to be Node")
+    result._root_node.set_maximum_size(maximum_size)
+    result._root_node._key_width = key_width
+    delta = [(None, key, value) for key, value in initial_value.items()]
+    return result.apply_delta(delta)
 
-    @classmethod
-    def _create_directly(
-        cls,
-        store,
-        initial_value,
-        maximum_size: int = 0,
-        key_width: int = 1,
-        search_key_func: SearchKeyFunc | None = None,
+
+@classmethod
+def _chkmap_create_directly(
+    cls, store, initial_value, maximum_size=0, key_width=1, search_key_func=None
+):
+    leaf_node = LeafNode(search_key_func=search_key_func)
+    leaf_node.set_maximum_size(maximum_size)
+    leaf_node._key_width = key_width
+    leaf_node._items = {tuple(key): val for key, val in initial_value.items()}
+    leaf_node._raw_size = sum(
+        leaf_node._key_value_len(key, value)
+        for key, value in leaf_node._items.items()
+    )
+    leaf_node._len = len(leaf_node._items)
+    leaf_node._compute_search_prefix()
+    leaf_node._compute_serialised_prefix()
+    if (
+        leaf_node._len > 1
+        and maximum_size
+        and leaf_node._current_size() > maximum_size
     ):
-        leaf_node = LeafNode(search_key_func=search_key_func)
-        leaf_node.set_maximum_size(maximum_size)
-        leaf_node._key_width = key_width
-        leaf_node._items = {tuple(key): val for key, val in initial_value.items()}
-        leaf_node._raw_size = sum(
-            leaf_node._key_value_len(key, value)
-            for key, value in leaf_node._items.items()
-        )
-        leaf_node._len = len(leaf_node._items)
-        leaf_node._compute_search_prefix()
-        leaf_node._compute_serialised_prefix()
-        node: LeafNode | InternalNode
-        if (
-            leaf_node._len > 1
-            and maximum_size
-            and leaf_node._current_size() > maximum_size
+        prefix, node_details = leaf_node._split(store)
+        if len(node_details) == 1:
+            raise AssertionError("Failed to split using node._split")
+        internal_node = InternalNode(prefix, search_key_func=search_key_func)
+        internal_node.set_maximum_size(maximum_size)
+        internal_node._key_width = key_width
+        for split, subnode in node_details:
+            internal_node.add_node(split, subnode)
+        node = internal_node
+    else:
+        node = leaf_node
+    keys = list(node.serialise(store))
+    return keys[-1]
+
+
+def _chkmap_iter_changes(self, basis):
+    """Iterate over the changes between basis and self.
+
+    Yields (key, old_value, new_value). Old_value is None for keys
+    only in self; new_value is None for keys only in basis.
+    """
+    if self._node_key(self._root_node) == self._node_key(basis._root_node):
+        return
+    self._ensure_root()
+    basis._ensure_root()
+    excluded_keys = set()
+    self_node = self._root_node
+    basis_node = basis._root_node
+    self_pending = []
+    basis_pending = []
+
+    def process_node(node, path, a_map, pending):
+        node = a_map._get_node(node)
+        if isinstance(node, LeafNode):
+            path = (node._key, path)
+            for key, value in node._items.items():
+                search_key = node._search_key_func(key)
+                heapq.heappush(pending, (search_key, key, value, path))
+        else:
+            path = (node._key, path)
+            for prefix, child in node._items.items():
+                heapq.heappush(pending, (prefix, None, child, path))
+
+    def process_common_internal_nodes(self_node, basis_node):
+        self_items = set(self_node._items.items())
+        basis_items = set(basis_node._items.items())
+        path = (self_node._key, None)
+        for prefix, child in self_items - basis_items:
+            heapq.heappush(self_pending, (prefix, None, child, path))
+        path = (basis_node._key, None)
+        for prefix, child in basis_items - self_items:
+            heapq.heappush(basis_pending, (prefix, None, child, path))
+
+    def process_common_leaf_nodes(self_node, basis_node):
+        self_items = set(self_node._items.items())
+        basis_items = set(basis_node._items.items())
+        path = (self_node._key, None)
+        for key, value in self_items - basis_items:
+            prefix = self._search_key_func(key)
+            heapq.heappush(self_pending, (prefix, key, value, path))
+        path = (basis_node._key, None)
+        for key, value in basis_items - self_items:
+            prefix = basis._search_key_func(key)
+            heapq.heappush(basis_pending, (prefix, key, value, path))
+
+    def process_common_prefix_nodes(self_node, self_path, basis_node, basis_path):
+        self_node = self._get_node(self_node)
+        basis_node = basis._get_node(basis_node)
+        if isinstance(self_node, InternalNode) and isinstance(
+            basis_node, InternalNode
         ):
-            prefix, node_details = leaf_node._split(store)
-            if len(node_details) == 1:
-                raise AssertionError("Failed to split using node._split")
-            internal_node = InternalNode(prefix, search_key_func=search_key_func)
-            internal_node.set_maximum_size(maximum_size)
-            internal_node._key_width = key_width
-            for split, subnode in node_details:
-                internal_node.add_node(split, subnode)
-            node = internal_node
+            process_common_internal_nodes(self_node, basis_node)
+        elif isinstance(self_node, LeafNode) and isinstance(basis_node, LeafNode):
+            process_common_leaf_nodes(self_node, basis_node)
         else:
-            node = leaf_node
-        keys = list(node.serialise(store))
-        return keys[-1]
+            process_node(self_node, self_path, self, self_pending)
+            process_node(basis_node, basis_path, basis, basis_pending)
 
-    def iter_changes(self, basis):
-        """Iterate over the changes between basis and self.
+    process_common_prefix_nodes(self_node, None, basis_node, None)
+    excluded_keys = set()
 
-        :return: An iterator of tuples: (key, old_value, new_value). Old_value
-            is None for keys only in self; new_value is None for keys only in
-            basis.
-        """
-        # Overview:
-        # Read both trees in lexographic, highest-first order.
-        # Any identical nodes we skip
-        # Any unique prefixes we output immediately.
-        # values in a leaf node are treated as single-value nodes in the tree
-        # which allows them to be not-special-cased. We know to output them
-        # because their value is a string, not a key(tuple) or node.
-        #
-        # corner cases to beware of when considering this function:
-        # *) common references are at different heights.
-        #    consider two trees:
-        #    {'a': LeafNode={'aaa':'foo', 'aab':'bar'}, 'b': LeafNode={'b'}}
-        #    {'a': InternalNode={'aa':LeafNode={'aaa':'foo', 'aab':'bar'},
-        #                        'ab':LeafNode={'ab':'bar'}}
-        #     'b': LeafNode={'b'}}
-        #    the node with aaa/aab will only be encountered in the second tree
-        #    after reading the 'a' subtree, but it is encountered in the first
-        #    tree immediately. Variations on this may have read internal nodes
-        #    like this.  we want to cut the entire pending subtree when we
-        #    realise we have a common node.  For this we use a list of keys -
-        #    the path to a node - and check the entire path is clean as we
-        #    process each item.
-        if self._node_key(self._root_node) == self._node_key(basis._root_node):
+    def check_excluded(key_path):
+        while key_path is not None:
+            key, key_path = key_path
+            if key in excluded_keys:
+                return True
+        return False
+
+    while self_pending or basis_pending:
+        if not self_pending:
+            for _prefix, key, node, path in basis_pending:
+                if check_excluded(path):
+                    continue
+                node = basis._get_node(node)
+                if key is not None:
+                    yield (key, node, None)
+                else:
+                    for key, value in node.iteritems(basis._store):
+                        yield (key, value, None)
             return
-        self._ensure_root()
-        basis._ensure_root()
-        excluded_keys = set()
-        self_node = self._root_node
-        basis_node = basis._root_node
-        # A heap, each element is prefix, node(tuple/NodeObject/string),
-        # key_path (a list of tuples, tail-sharing down the tree.)
-        self_pending = []
-        basis_pending = []
-
-        def process_node(node, path, a_map, pending):
-            # take a node and expand it
-            node = a_map._get_node(node)
-            if isinstance(node, LeafNode):
-                path = (node._key, path)
-                for key, value in node._items.items():
-                    # For a LeafNode, the key is a serialized_key, rather than
-                    # a search_key, but the heap is using search_keys
-                    search_key = node._search_key_func(key)
-                    heapq.heappush(pending, (search_key, key, value, path))
+        elif not basis_pending:
+            for _prefix, key, node, path in self_pending:
+                if check_excluded(path):
+                    continue
+                node = self._get_node(node)
+                if key is not None:
+                    yield (key, None, node)
+                else:
+                    for key, value in node.iteritems(self._store):
+                        yield (key, None, value)
+            return
+        else:
+            if self_pending[0][0] < basis_pending[0][0]:
+                _prefix, key, node, path = heapq.heappop(self_pending)
+                if check_excluded(path):
+                    continue
+                if key is not None:
+                    yield (key, None, node)
+                else:
+                    process_node(node, path, self, self_pending)
+                    continue
+            elif self_pending[0][0] > basis_pending[0][0]:
+                _prefix, key, node, path = heapq.heappop(basis_pending)
+                if check_excluded(path):
+                    continue
+                if key is not None:
+                    yield (key, node, None)
+                else:
+                    process_node(node, path, basis, basis_pending)
+                    continue
             else:
-                # type(node) == InternalNode
-                path = (node._key, path)
-                for prefix, child in node._items.items():
-                    heapq.heappush(pending, (prefix, None, child, path))
-
-        def process_common_internal_nodes(self_node, basis_node):
-            self_items = set(self_node._items.items())
-            basis_items = set(basis_node._items.items())
-            path = (self_node._key, None)
-            for prefix, child in self_items - basis_items:
-                heapq.heappush(self_pending, (prefix, None, child, path))
-            path = (basis_node._key, None)
-            for prefix, child in basis_items - self_items:
-                heapq.heappush(basis_pending, (prefix, None, child, path))
-
-        def process_common_leaf_nodes(self_node, basis_node):
-            self_items = set(self_node._items.items())
-            basis_items = set(basis_node._items.items())
-            path = (self_node._key, None)
-            for key, value in self_items - basis_items:
-                prefix = self._search_key_func(key)
-                heapq.heappush(self_pending, (prefix, key, value, path))
-            path = (basis_node._key, None)
-            for key, value in basis_items - self_items:
-                prefix = basis._search_key_func(key)
-                heapq.heappush(basis_pending, (prefix, key, value, path))
-
-        def process_common_prefix_nodes(self_node, self_path, basis_node, basis_path):
-            # Would it be more efficient if we could request both at the same
-            # time?
-            self_node = self._get_node(self_node)
-            basis_node = basis._get_node(basis_node)
-            if isinstance(self_node, InternalNode) and isinstance(
-                basis_node, InternalNode
-            ):
-                # Matching internal nodes
-                process_common_internal_nodes(self_node, basis_node)
-            elif isinstance(self_node, LeafNode) and isinstance(basis_node, LeafNode):
-                process_common_leaf_nodes(self_node, basis_node)
-            else:
-                process_node(self_node, self_path, self, self_pending)
-                process_node(basis_node, basis_path, basis, basis_pending)
-
-        process_common_prefix_nodes(self_node, None, basis_node, None)
-        excluded_keys = set()
-
-        def check_excluded(key_path):
-            # Note that this is N^2, it depends on us trimming trees
-            # aggressively to not become slow.
-            # A better implementation would probably have a reverse map
-            # back to the children of a node, and jump straight to it when
-            # a common node is detected, the proceed to remove the already
-            # pending children. breezy.graph has a searcher module with a
-            # similar problem.
-            while key_path is not None:
-                key, key_path = key_path
-                if key in excluded_keys:
-                    return True
-            return False
-
-        loop_counter = 0
-        while self_pending or basis_pending:
-            loop_counter += 1
-            if not self_pending:
-                # self is exhausted: output remainder of basis
-                for _prefix, key, node, path in basis_pending:
-                    if check_excluded(path):
-                        continue
-                    node = basis._get_node(node)
-                    if key is not None:
-                        # a value
-                        yield (key, node, None)
-                    else:
-                        # subtree - fastpath the entire thing.
-                        for key, value in node.iteritems(basis._store):
-                            yield (key, value, None)
-                return
-            elif not basis_pending:
-                # basis is exhausted: output remainder of self.
-                for _prefix, key, node, path in self_pending:
-                    if check_excluded(path):
-                        continue
-                    node = self._get_node(node)
-                    if key is not None:
-                        # a value
-                        yield (key, None, node)
-                    else:
-                        # subtree - fastpath the entire thing.
-                        for key, value in node.iteritems(self._store):
-                            yield (key, None, value)
-                return
-            else:
-                # XXX: future optimisation - yield the smaller items
-                # immediately rather than pushing everything on/off the
-                # heaps. Applies to both internal nodes and leafnodes.
-                if self_pending[0][0] < basis_pending[0][0]:
-                    # expand self
+                if self_pending[0][1] is None:
+                    read_self = True
+                else:
+                    read_self = False
+                if basis_pending[0][1] is None:
+                    read_basis = True
+                else:
+                    read_basis = False
+                if not read_self and not read_basis:
+                    self_details = heapq.heappop(self_pending)
+                    basis_details = heapq.heappop(basis_pending)
+                    if self_details[2] != basis_details[2]:
+                        yield (self_details[1], basis_details[2], self_details[2])
+                    continue
+                if self._node_key(self_pending[0][2]) == self._node_key(
+                    basis_pending[0][2]
+                ):
+                    heapq.heappop(self_pending)
+                    heapq.heappop(basis_pending)
+                    continue
+                if read_self and read_basis:
+                    self_prefix, _, self_node, self_path = heapq.heappop(self_pending)
+                    basis_prefix, _, basis_node, basis_path = heapq.heappop(
+                        basis_pending
+                    )
+                    if self_prefix != basis_prefix:
+                        raise AssertionError(f"{self_prefix!r} != {basis_prefix!r}")
+                    process_common_prefix_nodes(
+                        self_node, self_path, basis_node, basis_path
+                    )
+                    continue
+                if read_self:
                     _prefix, key, node, path = heapq.heappop(self_pending)
                     if check_excluded(path):
                         continue
-                    if key is not None:
-                        # a value
-                        yield (key, None, node)
-                    else:
-                        process_node(node, path, self, self_pending)
-                        continue
-                elif self_pending[0][0] > basis_pending[0][0]:
-                    # expand basis
+                    process_node(node, path, self, self_pending)
+                if read_basis:
                     _prefix, key, node, path = heapq.heappop(basis_pending)
                     if check_excluded(path):
                         continue
-                    if key is not None:
-                        # a value
-                        yield (key, node, None)
-                    else:
-                        process_node(node, path, basis, basis_pending)
-                        continue
-                else:
-                    # common prefix: possibly expand both
-                    if self_pending[0][1] is None:
-                        # process next self
-                        read_self = True
-                    else:
-                        read_self = False
-                    if basis_pending[0][1] is None:
-                        # process next basis
-                        read_basis = True
-                    else:
-                        read_basis = False
-                    if not read_self and not read_basis:
-                        # compare a common value
-                        self_details = heapq.heappop(self_pending)
-                        basis_details = heapq.heappop(basis_pending)
-                        if self_details[2] != basis_details[2]:
-                            yield (self_details[1], basis_details[2], self_details[2])
-                        continue
-                    # At least one side wasn't a simple value
-                    if self._node_key(self_pending[0][2]) == self._node_key(
-                        basis_pending[0][2]
-                    ):
-                        # Identical pointers, skip (and don't bother adding to
-                        # excluded, it won't turn up again.
-                        heapq.heappop(self_pending)
-                        heapq.heappop(basis_pending)
-                        continue
-                    # Now we need to expand this node before we can continue
-                    if read_self and read_basis:
-                        # Both sides start with the same prefix, so process
-                        # them in parallel
-                        self_prefix, _, self_node, self_path = heapq.heappop(
-                            self_pending
-                        )
-                        basis_prefix, _, basis_node, basis_path = heapq.heappop(
-                            basis_pending
-                        )
-                        if self_prefix != basis_prefix:
-                            raise AssertionError(f"{self_prefix!r} != {basis_prefix!r}")
-                        process_common_prefix_nodes(
-                            self_node, self_path, basis_node, basis_path
-                        )
-                        continue
-                    if read_self:
-                        _prefix, key, node, path = heapq.heappop(self_pending)
-                        if check_excluded(path):
-                            continue
-                        process_node(node, path, self, self_pending)
-                    if read_basis:
-                        _prefix, key, node, path = heapq.heappop(basis_pending)
-                        if check_excluded(path):
-                            continue
-                        process_node(node, path, basis, basis_pending)
-        # print loop_counter
+                    process_node(node, path, basis, basis_pending)
 
-    def iteritems(
-        self, key_filter: KeyFilter | None = None
-    ) -> Iterator[tuple[Key, bytes]]:
-        """Iterate over the entire CHKMap's contents."""
-        self._ensure_root()
-        if isinstance(self._root_node, tuple):
-            raise AssertionError("Cannot iterate over a map with a tuple root node")
-        if key_filter is not None:
-            key_filter = [tuple(key) for key in key_filter]
-        # LeafNode.iteritems (pyclass) returns a list; wrap in iter so
-        # callers that next() the result still work. InternalNode is
-        # still a generator.
-        return iter(self._root_node.iteritems(self._store, key_filter=key_filter))
 
-    def key(self) -> Key:
-        """Return the key for this map."""
-        if isinstance(self._root_node, tuple):
-            return self._root_node
-        elif isinstance(self._root_node, Node):
-            if self._root_node is None:
-                raise AssertionError("No root node")
-            return self._root_node._key
-        else:
-            raise AssertionError(
-                "Invalid root node type: {!r}".format(type(self._root_node))
-            )
+def _chkmap_iteritems(self, key_filter=None):
+    """Iterate over the entire CHKMap's contents."""
+    self._ensure_root()
+    if isinstance(self._root_node, tuple):
+        raise AssertionError("Cannot iterate over a map with a tuple root node")
+    if key_filter is not None:
+        key_filter = [tuple(key) for key in key_filter]
+    return iter(self._root_node.iteritems(self._store, key_filter=key_filter))
 
-    def __len__(self) -> int:
-        """Return the number of items in the CHK map."""
-        self._ensure_root()
-        return len(self._root_node)
 
-    def map(self, key: Key, value) -> None:
-        """Map a key tuple to value.
+def _chkmap_key(self):
+    """Return the key for this map."""
+    if isinstance(self._root_node, tuple):
+        return self._root_node
+    if isinstance(self._root_node, Node):
+        if self._root_node is None:
+            raise AssertionError("No root node")
+        return self._root_node._key
+    raise AssertionError(
+        "Invalid root node type: {!r}".format(type(self._root_node))
+    )
 
-        :param key: A key to map.
-        :param value: The value to assign to key.
-        """
-        key = tuple(key)
-        # Need a root object.
-        self._ensure_root()
-        if isinstance(self._root_node, tuple):
-            raise AssertionError("Cannot map a key to a tuple root node")
-        prefix, node_details = self._root_node.map(self._store, key, value)
-        if len(node_details) == 1:
-            self._root_node = node_details[0][1]
-        else:
-            self._root_node = InternalNode(
-                prefix, search_key_func=self._search_key_func
-            )
-            self._root_node.set_maximum_size(node_details[0][1].maximum_size)
-            self._root_node._key_width = node_details[0][1]._key_width
-            for split, node in node_details:
-                self._root_node.add_node(split, node)
 
-    def _node_key(self, node):
-        """Get the key for a node whether it's a tuple or node."""
-        if isinstance(node, tuple):
-            return node
-        elif isinstance(node, Node):
-            return node._key
-        else:
-            raise AssertionError("Invalid node type: {!r}".format(type(node)))
+def _chkmap_len(self):
+    self._ensure_root()
+    return len(self._root_node)
 
-    def unmap(self, key, check_remap=True):
-        """Remove key from the map."""
-        self._ensure_root()
-        if isinstance(self._root_node, InternalNode):
-            unmapped = self._root_node.unmap(self._store, key, check_remap=check_remap)
-        else:
-            unmapped = self._root_node.unmap(self._store, key)
-        self._root_node = unmapped
 
-    def _check_remap(self) -> None:
-        """Check if nodes can be collapsed."""
-        self._ensure_root()
-        if isinstance(self._root_node, InternalNode):
-            self._root_node = self._root_node._check_remap(self._store)
+def _chkmap_map(self, key, value):
+    """Map a key tuple to value."""
+    key = tuple(key)
+    self._ensure_root()
+    if isinstance(self._root_node, tuple):
+        raise AssertionError("Cannot map a key to a tuple root node")
+    prefix, node_details = self._root_node.map(self._store, key, value)
+    if len(node_details) == 1:
+        self._root_node = node_details[0][1]
+    else:
+        self._root_node = InternalNode(prefix, search_key_func=self._search_key_func)
+        self._root_node.set_maximum_size(node_details[0][1].maximum_size)
+        self._root_node._key_width = node_details[0][1]._key_width
+        for split, node in node_details:
+            self._root_node.add_node(split, node)
 
-    def _save(self):
-        """Save the map completely.
 
-        :return: The key of the root node.
-        """
-        if isinstance(self._root_node, tuple):
-            # Already saved.
-            return self._root_node
-        keys = list(self._root_node.serialise(self._store))
-        return keys[-1]
+def _chkmap_node_key(self, node):
+    """Get the key for a node whether it's a tuple or node."""
+    if isinstance(node, tuple):
+        return node
+    if isinstance(node, Node):
+        return node._key
+    raise AssertionError("Invalid node type: {!r}".format(type(node)))
+
+
+def _chkmap_unmap(self, key, check_remap=True):
+    """Remove key from the map."""
+    self._ensure_root()
+    if isinstance(self._root_node, InternalNode):
+        unmapped = self._root_node.unmap(self._store, key, check_remap=check_remap)
+    else:
+        unmapped = self._root_node.unmap(self._store, key)
+    self._root_node = unmapped
+
+
+def _chkmap_check_remap(self):
+    self._ensure_root()
+    if isinstance(self._root_node, InternalNode):
+        self._root_node = self._root_node._check_remap(self._store)
+
+
+def _chkmap_save(self):
+    """Save the map completely; return the root key."""
+    if isinstance(self._root_node, tuple):
+        return self._root_node
+    keys = list(self._root_node.serialise(self._store))
+    return keys[-1]
+
+
+# Bind orchestration methods onto the CHKMap pyclass at module load.
+CHKMap.apply_delta = _chkmap_apply_delta
+CHKMap._ensure_root = _chkmap_ensure_root
+CHKMap._get_node = _chkmap_get_node
+CHKMap._read_bytes = _chkmap_read_bytes
+CHKMap._dump_tree = _chkmap_dump_tree
+CHKMap._dump_tree_node = _chkmap_dump_tree_node
+CHKMap.from_dict = _chkmap_from_dict
+CHKMap._create_via_map = _chkmap_create_via_map
+CHKMap._create_directly = _chkmap_create_directly
+CHKMap.iter_changes = _chkmap_iter_changes
+CHKMap.iteritems = _chkmap_iteritems
+CHKMap.key = _chkmap_key
+CHKMap.__len__ = _chkmap_len
+CHKMap.map = _chkmap_map
+CHKMap._node_key = _chkmap_node_key
+CHKMap.unmap = _chkmap_unmap
+CHKMap._check_remap = _chkmap_check_remap
+CHKMap._save = _chkmap_save
 
 
 class Node(metaclass=abc.ABCMeta):

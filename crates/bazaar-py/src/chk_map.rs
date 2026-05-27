@@ -18,6 +18,13 @@ fn chk_err_to_py(err: ChkError) -> PyErr {
 }
 
 #[pyfunction]
+fn _search_key_plain(py: Python, key: Vec<Vec<u8>>) -> Bound<PyBytes> {
+    let key: Key = key.into();
+    let ret = bazaar::chk_map::search_key_plain(&key);
+    PyBytes::new(py, &ret)
+}
+
+#[pyfunction]
 fn _search_key_16(py: Python, key: Vec<Vec<u8>>) -> Bound<PyBytes> {
     let key: Key = key.into();
     let ret = bazaar::chk_map::search_key_16(&key);
@@ -279,6 +286,18 @@ fn py_unknown_sentinel(py: Python<'_>) -> Py<PyAny> {
     unknown_sentinel(py).clone_ref(py)
 }
 
+/// Default `search_key_func` callable for LeafNode/InternalNode/CHKMap
+/// pyclasses. Filled in at module-init time with the
+/// `_search_key_plain` pyfunction so the pyclass `#[new]` can stash
+/// it on instances constructed with `search_key_func=None`.
+static DEFAULT_SEARCH_KEY_PLAIN: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn default_search_key_plain(py: Python<'_>) -> &Py<PyAny> {
+    DEFAULT_SEARCH_KEY_PLAIN.get(py).expect(
+        "DEFAULT_SEARCH_KEY_PLAIN not initialised; call _chk_map_rs(py) first",
+    )
+}
+
 /// Resolve a Python `_search_key_func` callable to a `SearchKeyFunc`.
 ///
 /// Identifies built-in variants by their output on a one-element
@@ -390,7 +409,10 @@ impl LeafNode {
     #[pyo3(signature = (search_key_func = None))]
     fn new(py: Python<'_>, search_key_func: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
         let (func, callable) = match search_key_func {
-            None => (SearchKeyFunc::Plain, None),
+            None => (
+                SearchKeyFunc::Plain,
+                Some(default_search_key_plain(py).clone_ref(py)),
+            ),
             Some(cb) => {
                 let func = resolve_search_key_func_by_callable(py, &cb)?;
                 (func, Some(cb.unbind()))
@@ -610,22 +632,17 @@ impl LeafNode {
 
     /// Returns the original callable passed at construction, or a
     /// synthesised wrapper around the resolved variant. Identity is
-    /// preserved across reads only when the caller supplied a callable.
+    /// Returns whatever callable was passed at construction, or
+    /// `None` if the default plain variant was used. Python wrappers
+    /// substitute their own default callable (the `_search_key_plain`
+    /// function in bzrformats.chk_map) before reading this when a
+    /// real callable is required.
     #[getter]
-    fn _search_key_func<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        if let Some(cb) = &self.search_key_callable {
-            return Ok(cb.clone_ref(py));
+    fn _search_key_func<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        match &self.search_key_callable {
+            Some(cb) => cb.clone_ref(py),
+            None => py.None(),
         }
-        // Synthesise a lambda backed by `_search_key_by_name` with the
-        // resolved variant's name.
-        let name = self.inner.search_key_func.name().to_vec();
-        let name_bytes = PyBytes::new(py, &name);
-        let module = py.import("bzrformats._bzr_rs.chk_map")?;
-        let by_name = module.getattr("_search_key_by_name")?;
-        // Build a partial: `lambda key: _search_key_by_name(name, key)`.
-        let functools = py.import("functools")?;
-        let partial = functools.getattr("partial")?;
-        Ok(partial.call1((by_name, name_bytes))?.unbind())
     }
 
     #[setter]
@@ -855,7 +872,10 @@ impl InternalNode {
         search_key_func: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let (func, callable) = match search_key_func {
-            None => (SearchKeyFunc::Plain, None),
+            None => (
+                SearchKeyFunc::Plain,
+                Some(default_search_key_plain(py).clone_ref(py)),
+            ),
             Some(cb) => {
                 let resolved = resolve_search_key_func_by_callable(py, &cb)?;
                 (resolved, Some(cb.unbind()))
@@ -1167,18 +1187,16 @@ impl InternalNode {
         Ok(())
     }
 
+    /// Returns the callable passed at construction, or `None` if the
+    /// default plain variant was used. Same convention as
+    /// `LeafNode._search_key_func` — Python wrappers substitute their
+    /// own default callable when None is returned.
     #[getter]
-    fn _search_key_func<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        if let Some(cb) = &self.search_key_callable {
-            return Ok(cb.clone_ref(py));
+    fn _search_key_func<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        match &self.search_key_callable {
+            Some(cb) => cb.clone_ref(py),
+            None => py.None(),
         }
-        let name = self.search_key_func.name().to_vec();
-        let name_bytes = PyBytes::new(py, &name);
-        let module = py.import("bzrformats._bzr_rs.chk_map")?;
-        let by_name = module.getattr("_search_key_by_name")?;
-        let functools = py.import("functools")?;
-        let partial = functools.getattr("partial")?;
-        Ok(partial.call1((by_name, name_bytes))?.unbind())
     }
 
     #[setter]
@@ -1250,8 +1268,121 @@ impl InternalNode {
     }
 }
 
+/// CHK persistent map — a string→string dict backed by a CHK store.
+///
+/// State holder over a Python VersionedFiles store, a root node
+/// (either a `(b"sha1:...",)` tuple or a LeafNode/InternalNode
+/// pyclass instance), and a search-key function. The full
+/// orchestration (map, unmap, iteritems, apply_delta, iter_changes,
+/// _save) is monkey-patched on from `bzrformats/chk_map.py` so it
+/// can drive the heterogeneous root via duck typing.
+#[pyclass(module = "bzrformats._bzr_rs.chk_map", name = "CHKMap")]
+pub struct CHKMap {
+    store: Py<PyAny>,
+    root_node: Py<PyAny>,
+    search_key_func: SearchKeyFunc,
+    search_key_callable: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl CHKMap {
+    #[new]
+    #[pyo3(signature = (store, root_key, search_key_func = None))]
+    fn new(
+        py: Python<'_>,
+        store: Bound<'_, PyAny>,
+        root_key: Bound<'_, PyAny>,
+        search_key_func: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let (func, callable) = match search_key_func {
+            None => (
+                SearchKeyFunc::Plain,
+                Some(default_search_key_plain(py).clone_ref(py)),
+            ),
+            Some(cb) => {
+                let resolved = resolve_search_key_func_by_callable(py, &cb)?;
+                (resolved, Some(cb.unbind()))
+            }
+        };
+        // root_key=None → start with an empty LeafNode (constructed
+        // directly via Py::new — no py.import needed since the
+        // pyclass is local).
+        // Otherwise, normalise: if we were handed an existing Node
+        // instance (LeafNode/InternalNode), extract its `.key()`
+        // (mirrors Python's `_node_key`). A tuple is stored as-is.
+        let root_node: Py<PyAny> = if root_key.is_none() {
+            let leaf = LeafNode {
+                inner: RsLeafNode::new(func.clone()),
+                search_key_callable: callable.as_ref().map(|cb| cb.clone_ref(py)),
+            };
+            Py::new(py, leaf)?.into_any()
+        } else if let Ok(_) = root_key.clone().cast_into::<PyTuple>() {
+            root_key.unbind()
+        } else {
+            // Node-like: pull off `.key()`.
+            let k = root_key.call_method0("key")?;
+            if k.is_none() {
+                root_key.unbind()
+            } else {
+                k.unbind()
+            }
+        };
+        Ok(Self {
+            store: store.unbind(),
+            root_node,
+            search_key_func: func,
+            search_key_callable: callable,
+        })
+    }
+
+    #[getter]
+    fn _store<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        self.store.clone_ref(py)
+    }
+
+    #[setter]
+    fn set__store(&mut self, value: Bound<'_, PyAny>) {
+        self.store = value.unbind();
+    }
+
+    #[getter]
+    fn _root_node<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        self.root_node.clone_ref(py)
+    }
+
+    #[setter]
+    fn set__root_node(&mut self, value: Bound<'_, PyAny>) {
+        self.root_node = value.unbind();
+    }
+
+    #[getter]
+    fn _search_key_func<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+        match &self.search_key_callable {
+            Some(cb) => cb.clone_ref(py),
+            None => py.None(),
+        }
+    }
+
+    #[setter]
+    fn set__search_key_func(
+        &mut self,
+        py: Python<'_>,
+        value: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if value.is_none() {
+            self.search_key_func = SearchKeyFunc::Plain;
+            self.search_key_callable = None;
+        } else {
+            self.search_key_func = resolve_search_key_func_by_callable(py, &value)?;
+            self.search_key_callable = Some(value.unbind());
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "chk_map")?;
+    m.add_wrapped(wrap_pyfunction!(_search_key_plain))?;
     m.add_wrapped(wrap_pyfunction!(_search_key_16))?;
     m.add_wrapped(wrap_pyfunction!(_search_key_255))?;
     m.add_wrapped(wrap_pyfunction!(_bytes_to_text_key))?;
@@ -1266,11 +1397,19 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(py_internal_node_current_size))?;
     m.add_wrapped(wrap_pyfunction!(py_are_search_keys_identical))?;
     m.add_wrapped(wrap_pyfunction!(py_search_key_by_name))?;
+    // Stash the `_search_key_plain` pyfunction as the default
+    // callable so pyclass `#[new]` methods can hand it back from
+    // `_search_key_func` when no callable was passed at construction.
+    let plain_fn = wrap_pyfunction!(_search_key_plain)(&m)?;
+    DEFAULT_SEARCH_KEY_PLAIN
+        .set(py, plain_fn.into_any().unbind())
+        .ok();
     // Expose the `_unknown` sentinel itself so Python can re-export it
     // as `chk_map._unknown` and identity comparisons line up with what
     // the Rust mutators write back.
     m.add("_unknown", py_unknown_sentinel(py))?;
     m.add_class::<LeafNode>()?;
     m.add_class::<InternalNode>()?;
+    m.add_class::<CHKMap>()?;
     Ok(m)
 }
