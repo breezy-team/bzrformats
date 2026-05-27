@@ -410,67 +410,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
                 )
         return result
 
-    def _preload_cache(self):
-        """Make sure all file-ids are in _fileid_to_entry_cache."""
-        if self._fully_cached:
-            return  # No need to do it again
-        # The optimal sort order is to use iteritems() directly
-        cache = self._fileid_to_entry_cache
-        for key, entry in self.id_to_entry.iteritems():
-            file_id = key[0]
-            if file_id not in cache:
-                ie = self._bytes_to_entry(entry)
-                cache[file_id] = ie
-            else:
-                ie = cache[file_id]
-        last_parent_id = last_parent_ie = None
-        pid_items = self.parent_id_basename_to_file_id.iteritems()
-        for key, child_file_id in pid_items:
-            if key == (b"", b""):  # This is the root
-                if child_file_id != self.root_id:
-                    raise ValueError(
-                        "Data inconsistency detected."
-                        ' We expected data with key ("","") to match'
-                        f" the root id, but {child_file_id} != {self.root_id}"
-                    )
-                continue
-            parent_id, basename = key
-            ie = cache[child_file_id]
-            if parent_id == last_parent_id:
-                if last_parent_ie is None:
-                    raise AssertionError("last_parent_ie should not be None")
-                parent_ie = last_parent_ie
-            else:
-                parent_ie = cache[parent_id]
-            if parent_ie.kind != "directory":
-                raise ValueError(
-                    "Data inconsistency detected."
-                    " An entry in the parent_id_basename_to_file_id map"
-                    f" has parent_id {{{parent_id}}} but the kind of that object"
-                    f' is {parent_ie.kind!r} not "directory"'
-                )
-            siblings = self._children_cache.setdefault(parent_ie.file_id, {})
-            basename = basename.decode("utf-8")
-            if basename in siblings:
-                existing_ie = siblings[basename]
-                if existing_ie != ie:
-                    raise ValueError(
-                        "Data inconsistency detected."
-                        f" Two entries with basename {basename!r} were found"
-                        f" in the parent entry {{{parent_id}}}"
-                    )
-            if basename != ie.name:
-                raise ValueError(
-                    "Data inconsistency detected."
-                    " In the parent_id_basename_to_file_id map, file_id"
-                    " {{{}}} is listed as having basename {!r}, but in the"
-                    " id_to_entry map it is {!r}".format(
-                        child_file_id, basename, ie.name
-                    )
-                )
-            siblings[basename] = ie
-        self._fully_cached = True
-
     def _make_delta(self, old):
         """Produce an InventoryDelta describing the changes from `old` to self.
 

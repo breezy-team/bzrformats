@@ -3177,6 +3177,152 @@ impl CHKInventory {
         )
     }
 
+    /// Populate the in-memory caches by walking the two CHKMaps.
+    /// Mirrors Python's `_preload_cache`.
+    ///
+    /// After this returns, every entry is materialised in
+    /// `_fileid_to_entry_cache`, and `_children_cache` is populated
+    /// for every directory.
+    fn _preload_cache<'py>(slf: Bound<'py, CHKInventory>, py: Python<'py>) -> PyResult<()> {
+        if slf.borrow().fully_cached {
+            return Ok(());
+        }
+        let id_map = slf
+            .borrow()
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set"))?
+            .clone_ref(py);
+        let pid_map_opt = slf
+            .borrow()
+            .parent_id_basename_to_file_id
+            .as_ref()
+            .map(|p| p.clone_ref(py));
+        let fileid_cache: Py<PyDict> = slf.borrow().fileid_to_entry_cache.clone_ref(py);
+        let children_cache: Py<PyDict> = slf.borrow().children_cache.clone_ref(py);
+        let root_id_obj: Py<PyAny> = match slf.borrow().root_id.as_ref() {
+            Some(rid) => PyBytes::new(py, rid.as_bytes()).into_any().unbind(),
+            None => py.None(),
+        };
+        // Walk id_to_entry, populating fileid_cache.
+        let id_iter = id_map.bind(py).call_method0("iteritems")?;
+        for item in id_iter.try_iter()? {
+            let item = item?;
+            let pair = item.cast_into::<PyTuple>()?;
+            let key = pair.get_item(0)?.cast_into::<PyTuple>()?;
+            let file_id = key.get_item(0)?;
+            let value = pair.get_item(1)?.cast_into::<PyBytes>()?;
+            let cache = fileid_cache.bind(py);
+            if !cache.contains(&file_id)? {
+                let ie = slf.borrow()._bytes_to_entry(py, value)?;
+                cache.set_item(file_id, ie)?;
+            }
+        }
+        // Walk parent_id_basename_to_file_id, populating children_cache.
+        if let Some(pid_map) = pid_map_opt {
+            let mut last_parent_id: Option<Py<PyAny>> = None;
+            let mut last_parent_ie: Option<Py<PyAny>> = None;
+            let pid_iter = pid_map.bind(py).call_method0("iteritems")?;
+            for item in pid_iter.try_iter()? {
+                let item = item?;
+                let pair = item.cast_into::<PyTuple>()?;
+                let key = pair.get_item(0)?.cast_into::<PyTuple>()?;
+                let child_file_id = pair.get_item(1)?;
+                let parent_id = key.get_item(0)?;
+                let basename_bytes = key.get_item(1)?.cast_into::<PyBytes>()?;
+                let empty = PyBytes::new(py, b"");
+                let parent_eq_empty = parent_id.as_any().eq(empty.as_any())?;
+                let basename_eq_empty = basename_bytes.as_any().eq(empty.as_any())?;
+                if parent_eq_empty && basename_eq_empty {
+                    // Root entry — sanity-check matches root_id, skip.
+                    if !child_file_id.eq(root_id_obj.bind(py))? {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "Data inconsistency detected. We expected data with key (\"\",\"\") to match the root id, but {:?} != {:?}",
+                            child_file_id, root_id_obj
+                        )));
+                    }
+                    continue;
+                }
+                let ie = fileid_cache
+                    .bind(py)
+                    .get_item(&child_file_id)?
+                    .ok_or_else(|| {
+                        BzrFormatsError::new_err(format!(
+                            "child_file_id {:?} not in fileid cache",
+                            child_file_id
+                        ))
+                    })?;
+                let parent_ie = match &last_parent_id {
+                    Some(lpid) if parent_id.eq(lpid.bind(py))? => last_parent_ie
+                        .as_ref()
+                        .ok_or_else(|| {
+                            pyo3::exceptions::PyAssertionError::new_err(
+                                "last_parent_ie should not be None",
+                            )
+                        })?
+                        .clone_ref(py)
+                        .into_bound(py),
+                    _ => {
+                        let pie =
+                            fileid_cache.bind(py).get_item(&parent_id)?.ok_or_else(|| {
+                                BzrFormatsError::new_err(format!(
+                                    "parent_id {:?} not in fileid cache",
+                                    parent_id
+                                ))
+                            })?;
+                        last_parent_id = Some(parent_id.clone().unbind());
+                        last_parent_ie = Some(pie.clone().unbind());
+                        pie
+                    }
+                };
+                let parent_kind: String = parent_ie.getattr("kind")?.extract()?;
+                if parent_kind != "directory" {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Data inconsistency detected. An entry in the parent_id_basename_to_file_id map has parent_id {{{:?}}} but the kind of that object is {:?} not \"directory\"",
+                        parent_id, parent_kind
+                    )));
+                }
+                let parent_file_id = parent_ie.getattr("file_id")?;
+                let siblings: Bound<'py, PyDict> =
+                    match children_cache.bind(py).get_item(&parent_file_id)? {
+                        Some(s) => s.cast_into::<PyDict>()?,
+                        None => {
+                            let d = PyDict::new(py);
+                            children_cache.bind(py).set_item(&parent_file_id, &d)?;
+                            d
+                        }
+                    };
+                let basename: String =
+                    String::from_utf8(basename_bytes.as_bytes().to_vec()).map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "invalid utf8 basename: {}",
+                            e
+                        ))
+                    })?;
+                if siblings.contains(&basename)? {
+                    if let Some(existing) = siblings.get_item(&basename)? {
+                        if !existing.eq(&ie)? {
+                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                                "Data inconsistency detected. Two entries with basename {:?} were found in the parent entry {{{:?}}}",
+                                basename, parent_id
+                            )));
+                        }
+                    }
+                }
+                let ie_name: String = ie.getattr("name")?.extract()?;
+                if basename != ie_name {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Data inconsistency detected. In the parent_id_basename_to_file_id map, file_id {{{:?}}} is listed as having basename {:?}, but in the id_to_entry map it is {:?}",
+                        child_file_id, basename, ie_name
+                    )));
+                }
+                siblings.set_item(basename, &ie)?;
+            }
+        }
+        slf.borrow_mut().fully_cached = true;
+        Ok(())
+    }
+
     /// Generate a `Tree.iter_changes`-style change list between
     /// `self` and `basis`. Mirrors Python's `CHKInventory.iter_changes`.
     ///
