@@ -2264,6 +2264,221 @@ fn test_common_prefix_many() {
     assert_eq!(common_prefix_many(vec![].into_iter()), None);
 }
 
+/// A persistent map from key-tuple to value-bytes backed by a CHK
+/// store.
+///
+/// Mirrors Python's `CHKMap`. The `store` is a `VersionedFiles`
+/// instance that holds the serialised page bytes; the `cache` is a
+/// `PageCache` (typically `InMemoryPageCache`) consulted before
+/// fetching from the store. The `root` is the root node — either an
+/// `Unloaded` sha1 reference (lazy-loaded on first access) or a
+/// `Loaded` in-memory `Node`.
+pub struct CHKMap<S>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    pub store: std::sync::Arc<S>,
+    pub cache: std::sync::Arc<dyn PageCache>,
+    pub search_key_func: SearchKeyFunc,
+    pub root: NodeRef,
+}
+
+impl<S> CHKMap<S>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    /// Create a new CHKMap.
+    ///
+    /// `root_key` is the sha1 of the existing root node, or `None`
+    /// to start with an empty in-memory LeafNode.
+    pub fn new(
+        store: std::sync::Arc<S>,
+        cache: std::sync::Arc<dyn PageCache>,
+        root_key: Option<Vec<u8>>,
+        search_key_func: SearchKeyFunc,
+    ) -> Self {
+        let root = match root_key {
+            None => NodeRef::Loaded(Node::Leaf(Box::new(LeafNode::new(
+                search_key_func.clone(),
+            )))),
+            Some(k) => NodeRef::Unloaded(k),
+        };
+        Self {
+            store,
+            cache,
+            search_key_func,
+            root,
+        }
+    }
+
+    /// Number of entries in this map. Demand-loads the root if
+    /// needed.
+    pub fn len(&mut self) -> Result<usize, Error> {
+        self.ensure_root()?;
+        Ok(match &self.root {
+            NodeRef::Loaded(n) => n.len(),
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        })
+    }
+
+    pub fn is_empty(&mut self) -> Result<bool, Error> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Return the sha1 key of the root node, or `None` if the root
+    /// is in memory and has not yet been serialised.
+    pub fn key(&self) -> Option<Vec<u8>> {
+        match &self.root {
+            NodeRef::Unloaded(k) => Some(k.clone()),
+            NodeRef::Loaded(n) => n.key().map(|s| s.to_vec()),
+        }
+    }
+
+    /// Ensure the root node is `Loaded`. If it was `Unloaded`, fetch
+    /// and deserialise it. Mirrors `CHKMap._ensure_root`.
+    pub fn ensure_root(&mut self) -> Result<(), Error> {
+        if let NodeRef::Unloaded(sha1_key) = &self.root {
+            let key = sha1_key.clone();
+            let bytes = read_node_bytes(&*self.store, &*self.cache, &key)?;
+            let node = deserialise_node(&bytes, key, self.search_key_func.clone())?;
+            self.root = NodeRef::Loaded(node);
+        }
+        Ok(())
+    }
+
+    /// Insert `(key, value)`. Mirrors Python's `CHKMap.map`.
+    pub fn map(&mut self, key: Vec<Vec<u8>>, value: Vec<u8>) -> Result<(), Error> {
+        self.ensure_root()?;
+        let root = match &mut self.root {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        let res = root.map_with_store(&*self.store, &*self.cache, key, value)?;
+        if let MapResult::Split {
+            common_serialised_prefix,
+            children,
+        } = res
+        {
+            // Build a new InternalNode wrapping the split children
+            // and use it as the new root.
+            let (mxs, kw) = match children.first() {
+                Some((_, n)) => (n.maximum_size(), match n {
+                    Node::Leaf(l) => l.key_width,
+                    Node::Internal(i) => i.key_width,
+                }),
+                None => (0, 1),
+            };
+            let mut new_root = InternalNode::new(
+                common_serialised_prefix,
+                self.search_key_func.clone(),
+            );
+            new_root.maximum_size = mxs;
+            new_root.key_width = kw;
+            for (prefix, child) in children {
+                new_root.add_node(prefix, child)?;
+            }
+            self.root = NodeRef::Loaded(Node::Internal(Box::new(new_root)));
+        }
+        Ok(())
+    }
+
+    /// Remove `key`. Mirrors Python's `CHKMap.unmap(key, check_remap)`.
+    pub fn unmap(&mut self, key: &[Vec<u8>], check_remap: bool) -> Result<(), Error> {
+        self.ensure_root()?;
+        // For LeafNode root, check_remap is ignored (LeafNode.unmap
+        // doesn't accept it); for InternalNode root, it threads through.
+        let placeholder = Node::Leaf(Box::new(LeafNode::new(self.search_key_func.clone())));
+        let old_root = std::mem::replace(&mut self.root, NodeRef::Loaded(placeholder));
+        let old_node = match old_root {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        let new_root = old_node.unmap_with_store(&*self.store, &*self.cache, key, check_remap)?;
+        self.root = NodeRef::Loaded(new_root);
+        Ok(())
+    }
+
+    /// Iterate `(key, value)` pairs in the map. Mirrors
+    /// `CHKMap.iteritems`.
+    pub fn iteritems(
+        &mut self,
+        key_filter: Option<&[Vec<Vec<u8>>]>,
+    ) -> Result<Vec<(Vec<Vec<u8>>, Vec<u8>)>, Error> {
+        self.ensure_root()?;
+        let root = match &mut self.root {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        root.iteritems(&*self.store, &*self.cache, key_filter)
+    }
+
+    /// Run a `check_remap` pass at the root. Mirrors Python's
+    /// `CHKMap._check_remap`.
+    pub fn check_remap(&mut self) -> Result<(), Error> {
+        self.ensure_root()?;
+        let placeholder = Node::Leaf(Box::new(LeafNode::new(self.search_key_func.clone())));
+        let old_root = std::mem::replace(&mut self.root, NodeRef::Loaded(placeholder));
+        let old_node = match old_root {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        let new_root = match old_node {
+            Node::Internal(b) => b.check_remap(&*self.store, &*self.cache)?,
+            other @ Node::Leaf(_) => other,
+        };
+        self.root = NodeRef::Loaded(new_root);
+        Ok(())
+    }
+
+    /// Serialise everything to the store and return the root sha1
+    /// key. Mirrors `CHKMap._save`.
+    pub fn save(&mut self) -> Result<Vec<u8>, Error> {
+        match &self.root {
+            NodeRef::Unloaded(k) => return Ok(k.clone()),
+            NodeRef::Loaded(_) => {}
+        }
+        let root = match &mut self.root {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(_) => unreachable!(),
+        };
+        let keys = root.serialise(&*self.store, &*self.cache)?;
+        Ok(keys
+            .last()
+            .cloned()
+            .ok_or_else(|| Error::AssertionFailed("save returned no keys".into()))?)
+    }
+}
+
+/// Fetch bytes for `sha1_key` from the page cache, falling back to
+/// the store. Mirrors Python's `CHKMap._read_bytes`.
+fn read_node_bytes<S>(
+    store: &S,
+    cache: &dyn PageCache,
+    sha1_key: &[u8],
+) -> Result<Vec<u8>, Error>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    if let Some(b) = cache.get(sha1_key) {
+        return Ok(b);
+    }
+    let stream = store
+        .get_record_stream(
+            &[crate::versionedfile::Key::Fixed(vec![sha1_key.to_vec()])],
+            "unordered",
+            true,
+        )
+        .map_err(|e| Error::AssertionFailed(format!("get_record_stream: {:?}", e)))?;
+    let record = stream
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::AssertionFailed("store returned no record".into()))?
+        .map_err(|e| Error::AssertionFailed(format!("record: {:?}", e)))?;
+    let data = record.to_fulltext().into_owned();
+    cache.insert(sha1_key.to_vec(), data.clone());
+    Ok(data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2866,6 +3081,92 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
             Err(crate::knit::KnitError::NotImplemented("annotate"))
         }
+    }
+
+    #[test]
+    fn chkmap_empty_starts_with_leaf_root() {
+        let store = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store, cache, None, SearchKeyFunc::Plain);
+        assert!(m.is_empty().unwrap());
+        assert!(m.key().is_none());
+    }
+
+    #[test]
+    fn chkmap_map_and_iteritems_roundtrip() {
+        let store = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store, cache, None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"foo"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"bar"]), b"v2".to_vec()).unwrap();
+        let mut items = m.iteritems(None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"bar"]), b"v2".to_vec()),
+                (key_vec(&[b"foo"]), b"v1".to_vec()),
+            ]
+        );
+        assert_eq!(m.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn chkmap_unmap_removes_entry() {
+        let store = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store, cache, None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"foo"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"bar"]), b"v2".to_vec()).unwrap();
+        m.unmap(&key_vec(&[b"foo"]), true).unwrap();
+        let items = m.iteritems(None).unwrap();
+        assert_eq!(items, vec![(key_vec(&[b"bar"]), b"v2".to_vec())]);
+    }
+
+    #[test]
+    fn chkmap_save_round_trips_through_demand_load() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m =
+            CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"foo"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"bar"]), b"v2".to_vec()).unwrap();
+        let root_key = m.save().unwrap();
+        assert!(root_key.starts_with(b"sha1:"));
+
+        // Reload from the stored root key.
+        let mut m2 =
+            CHKMap::new(store.clone(), cache.clone(), Some(root_key), SearchKeyFunc::Plain);
+        let mut items = m2.iteritems(None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"bar"]), b"v2".to_vec()),
+                (key_vec(&[b"foo"]), b"v1".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_map_split_promotes_root_to_internal() {
+        let store = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store, cache, None, SearchKeyFunc::Plain);
+        // Tight max_size forces a split on the second insert.
+        if let NodeRef::Loaded(Node::Leaf(l)) = &mut m.root {
+            l.maximum_size = 10;
+        }
+        m.map(key_vec(&[b"foo"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"bar"]), b"v2".to_vec()).unwrap();
+        // Root should now be an InternalNode.
+        match &m.root {
+            NodeRef::Loaded(Node::Internal(_)) => {}
+            other => panic!("expected Internal root after split, got {:?}", other),
+        }
+        let mut items = m.iteritems(None).unwrap();
+        items.sort();
+        assert_eq!(items.len(), 2);
     }
 
     #[test]
