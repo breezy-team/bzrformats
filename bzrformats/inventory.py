@@ -118,17 +118,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
     access.
     """
 
-    def has_filename(self, filename):
-        """Check if a filename exists in the inventory.
-
-        Args:
-            filename: Path to check for existence.
-
-        Returns:
-            True if the filename exists, False otherwise.
-        """
-        return bool(self.path2id(filename))
-
     def id2path(self, file_id):
         """Return as a string the path to file_id.
 
@@ -370,29 +359,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
                 return None
         return parent
 
-    def get_idpath(self, file_id):
-        """Return a list of file_ids for the path to an entry.
-
-        The list contains one element for each directory followed by
-        the id of the file itself.  So the length of the returned list
-        is equal to the depth of the file in the tree, counting the
-        root directory as depth 1.
-        """
-        raise NotImplementedError(self.get_idpath)
-
-    def __eq__(self, other):
-        """Compare two sets by comparing their contents."""
-        if not isinstance(other, CHKInventory):
-            return NotImplemented
-
-        this_key = self.id_to_entry.key()
-        other_key = other.id_to_entry.key()
-        this_pid_key = self.parent_id_basename_to_file_id.key()
-        other_pid_key = other.parent_id_basename_to_file_id.key()
-        if None in (this_key, this_pid_key, other_key, other_pid_key):
-            return False
-        return this_key == other_key and this_pid_key == other_pid_key
-
     def get_children(self, dir_id):
         """Access the list of children of this directory.
 
@@ -564,12 +530,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
             if file_id in parent_to_children:
                 remaining_children.extend(parent_to_children[file_id])
         return other
-
-    def _bytes_to_entry(self, bytes):
-        """Deserialise a serialised entry."""
-        result = _chk_inventory_bytes_to_entry(bytes)
-        self._fileid_to_entry_cache[result.file_id] = result
-        return result
 
     def create_by_apply_delta(
         self, inventory_delta, new_revision_id, propagate_caches=False
@@ -876,106 +836,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
             chk_store, root_key, search_key_func
         )
 
-    def _parent_id_basename_key(self, entry):
-        """Create a key for a entry in a parent_id_basename_to_file_id index."""
-        parent_id = entry.parent_id if entry.parent_id is not None else b""
-        return (parent_id, entry.name.encode("utf8"))
-
-    def get_entry(self, file_id):
-        """Map a single file_id -> InventoryEntry."""
-        if file_id is None or not isinstance(file_id, bytes):
-            # Python's old dict-miss path silently treated non-bytes
-            # file_ids as missing; the Rust-backed CHKMap is stricter,
-            # so do the same conversion here.
-            raise NoSuchId(self, file_id)
-        result = self._fileid_to_entry_cache.get(file_id, None)
-        if result is not None:
-            return result
-        try:
-            return self._bytes_to_entry(
-                next(self.id_to_entry.iteritems([(file_id,)]))[1]
-            )
-        except StopIteration as e:
-            # really we're passing an inventory, not a tree...
-            raise NoSuchId(self, file_id) from e
-
-    def _getitems(self, file_ids: Iterable[FileId]) -> list[InventoryEntry]:  # type: ignore
-        """Similar to get_entry, but lets you query for multiple.
-
-        The returned order is undefined. And currently if an item doesn't
-        exist, it isn't included in the output.
-        """
-        result: list[InventoryEntry] = []  # type: ignore
-        remaining: list[FileId] = []
-        for file_id in file_ids:
-            entry = self._fileid_to_entry_cache.get(file_id, None)
-            if entry is None:
-                remaining.append(file_id)
-            else:
-                result.append(entry)
-        file_keys = [(f,) for f in remaining]
-        for _file_key, value in self.id_to_entry.iteritems(file_keys):
-            entry = self._bytes_to_entry(value)
-            result.append(entry)
-            self._fileid_to_entry_cache[entry.file_id] = entry
-        return result
-
-    def has_id(self, file_id):
-        """Check if a file_id exists in the inventory.
-
-        Args:
-            file_id: The file ID to check.
-
-        Returns:
-            True if the file_id exists, False otherwise.
-        """
-        # Perhaps have an explicit 'contains' method on CHKMap ?
-        if self._fileid_to_entry_cache.get(file_id, None) is not None:
-            return True
-        return len(list(self.id_to_entry.iteritems([(file_id,)]))) == 1
-
-    def is_root(self, file_id):
-        """Check if a file_id is the root of the inventory.
-
-        Args:
-            file_id: The file ID to check.
-
-        Returns:
-            True if this is the root file ID, False otherwise.
-        """
-        return file_id == self.root_id
-
-    def _iter_file_id_parents(self, file_id):
-        """Yield the parents of file_id up to the root."""
-        while file_id is not None:
-            try:
-                ie = self.get_entry(file_id)
-            except KeyError as e:
-                raise NoSuchId(tree=self, file_id=file_id) from e
-            yield ie
-            file_id = ie.parent_id
-
-    def iter_all_ids(self):
-        """Iterate over all file-ids."""
-        for key, _ in self.id_to_entry.iteritems():
-            yield key[-1]
-
-    def iter_just_entries(self):
-        """Iterate over all entries.
-
-        Unlike iter_entries(), just the entries are returned (not (path, ie))
-        and the order of entries is undefined.
-
-        XXX: We may not want to merge this into bzr.dev.
-        """
-        for key, entry in self.id_to_entry.iteritems():
-            file_id = key[0]
-            ie = self._fileid_to_entry_cache.get(file_id, None)
-            if ie is None:
-                ie = self._bytes_to_entry(entry)
-                self._fileid_to_entry_cache[file_id] = ie
-            yield ie
-
     def _preload_cache(self):
         """Make sure all file-ids are in _fileid_to_entry_cache."""
         if self._fully_cached:
@@ -1131,10 +991,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
                 executable,
             )
 
-    def __len__(self) -> int:
-        """Return the number of entries in the inventory."""
-        return len(self.id_to_entry)
-
     def path2id(self, relpath):
         """Return the file ID for a relative path.
 
@@ -1204,11 +1060,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
                 )
             lines.append(b"id_to_entry: %s\n" % (self.id_to_entry.key()[0],))
         return lines
-
-    @property
-    def root(self):
-        """Get the root entry."""
-        return self.get_entry(self.root_id)
 
 
 entry_factory = {

@@ -11,7 +11,7 @@ use pyo3::exceptions::{
 };
 use pyo3::prelude::*;
 use pyo3::pyclass_init::PyClassInitializer;
-use pyo3::types::{PyBytes, PyDict, PyString};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use pyo3::wrap_pyfunction;
 use pyo3::{create_exception, import_exception};
 use std::collections::HashMap;
@@ -1988,6 +1988,319 @@ impl CHKInventory {
     #[setter]
     fn set__children_cache(&mut self, value: Bound<'_, pyo3::types::PyDict>) {
         self.children_cache = value.unbind();
+    }
+
+    // ----- methods ported from bzrformats.inventory.CHKInventory -----
+
+    /// Compare two CHKInventory instances by sha1 keys of their two
+    /// underlying CHKMaps. Mirrors Python's `__eq__`.
+    fn __eq__<'py>(
+        &self,
+        py: Python<'py>,
+        other: Bound<'py, PyAny>,
+    ) -> PyResult<bool> {
+        // Only equal to another CHKInventory.
+        let other_ref = match other.downcast::<CHKInventory>() {
+            Ok(o) => o,
+            Err(_) => return Ok(false),
+        };
+        let other_borrow = other_ref.borrow();
+        let (Some(self_id), Some(self_pid)) =
+            (&self.id_to_entry, &self.parent_id_basename_to_file_id)
+        else {
+            return Ok(false);
+        };
+        let (Some(other_id), Some(other_pid)) = (
+            &other_borrow.id_to_entry,
+            &other_borrow.parent_id_basename_to_file_id,
+        ) else {
+            return Ok(false);
+        };
+        let this_key = self_id.bind(py).call_method0("key")?;
+        let other_key = other_id.bind(py).call_method0("key")?;
+        let this_pid_key = self_pid.bind(py).call_method0("key")?;
+        let other_pid_key = other_pid.bind(py).call_method0("key")?;
+        if this_key.is_none()
+            || other_key.is_none()
+            || this_pid_key.is_none()
+            || other_pid_key.is_none()
+        {
+            return Ok(false);
+        }
+        Ok(this_key.eq(other_key)? && this_pid_key.eq(other_pid_key)?)
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        let map = self
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set"))?;
+        map.bind(py).len()
+    }
+
+    /// True iff `file_id` matches the inventory's `root_id`. Mirrors
+    /// Python's `is_root`. Accepts bytes or any equality-comparable
+    /// object; non-matches return False.
+    fn is_root(&self, py: Python<'_>, file_id: Bound<'_, PyAny>) -> PyResult<bool> {
+        let root_id = match &self.root_id {
+            None => return Ok(false),
+            Some(id) => id,
+        };
+        if let Ok(b) = file_id.cast_into::<PyBytes>() {
+            Ok(b.as_bytes() == root_id.as_bytes())
+        } else {
+            let _ = py;
+            Ok(false)
+        }
+    }
+
+    /// Check whether `file_id` exists in the inventory. Mirrors
+    /// Python's `has_id`. Consults the cache first.
+    fn has_id(&self, py: Python<'_>, file_id: Bound<'_, PyAny>) -> PyResult<bool> {
+        if self.fileid_to_entry_cache.bind(py).contains(&file_id)? {
+            return Ok(true);
+        }
+        // `file_id` must be bytes for the CHKMap lookup; non-bytes
+        // returns False (matches the LeafNode filter behaviour).
+        let Ok(bytes) = file_id.cast_into::<PyBytes>() else {
+            return Ok(false);
+        };
+        let map = self
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set"))?;
+        let key_tuple = PyTuple::new(py, [bytes])?;
+        let filter = PyList::new(py, [key_tuple])?;
+        let items_iter = map.bind(py).call_method1("iteritems", (filter,))?;
+        let items: Bound<'_, pyo3::types::PyList> = PyList::empty(py);
+        for item in items_iter.try_iter()? {
+            items.append(item?)?;
+        }
+        Ok(items.len() == 1)
+    }
+
+    /// True iff `filename` resolves to a file_id. Mirrors Python's
+    /// `has_filename`. Dispatches through `path2id` (still Python-
+    /// defined as of this commit; lifted in a later one).
+    fn has_filename(
+        slf: pyo3::Bound<'_, CHKInventory>,
+        filename: &str,
+    ) -> PyResult<bool> {
+        let result = slf.call_method1("path2id", (filename,))?;
+        Ok(!result.is_none())
+    }
+
+    /// Yield the parents of `file_id` up to the root. Mirrors
+    /// Python's `_iter_file_id_parents`. Returns a list rather than
+    /// a generator (no streaming benefit for the typical short chain
+    /// up to the root).
+    fn _iter_file_id_parents<'py>(
+        &self,
+        py: Python<'py>,
+        file_id: Bound<'_, PyBytes>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        let mut cur: Option<Py<PyAny>> = Some(file_id.into_any().unbind());
+        while let Some(id) = cur {
+            let id_bound = id.bind(py).clone();
+            if id_bound.is_none() {
+                break;
+            }
+            let entry = self.get_entry(py, id_bound)?;
+            cur = {
+                let parent = entry.getattr("parent_id")?;
+                if parent.is_none() {
+                    None
+                } else {
+                    Some(parent.unbind())
+                }
+            };
+            out.append(entry)?;
+        }
+        Ok(out)
+    }
+
+    /// Yield every file id stored in id_to_entry. Mirrors Python's
+    /// `iter_all_ids` (which is a generator); we return a list.
+    fn iter_all_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        let map = self
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set"))?;
+        let items_iter = map.bind(py).call_method0("iteritems")?;
+        for pair in items_iter.try_iter()? {
+            let pair = pair?;
+            let tup = pair.cast_into::<PyTuple>()?;
+            let key = tup.get_item(0)?;
+            // key[-1] in Python — the last element of the key tuple.
+            let key_tup = key.cast_into::<PyTuple>()?;
+            let last = key_tup.get_item(key_tup.len() - 1)?;
+            out.append(last)?;
+        }
+        Ok(out)
+    }
+
+    /// Yield every entry in the inventory. Mirrors Python's
+    /// `iter_just_entries`; populates the cache as it walks.
+    fn iter_just_entries<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        let map = self
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set"))?;
+        let cache = self.fileid_to_entry_cache.bind(py);
+        let items_iter = map.bind(py).call_method0("iteritems")?;
+        for pair in items_iter.try_iter()? {
+            let pair = pair?;
+            let tup = pair.cast_into::<PyTuple>()?;
+            let key = tup.get_item(0)?;
+            let value = tup.get_item(1)?;
+            let key_tup = key.cast_into::<PyTuple>()?;
+            let file_id = key_tup.get_item(0)?;
+            let entry = match cache.get_item(&file_id)? {
+                Some(e) => e,
+                None => {
+                    let bytes = value.cast_into::<PyBytes>()?;
+                    let e = chk_inventory_bytes_to_entry(py, bytes.as_bytes())?;
+                    cache.set_item(&file_id, &e)?;
+                    e
+                }
+            };
+            out.append(entry)?;
+        }
+        Ok(out)
+    }
+
+    /// Look up an inventory entry by file id. Mirrors Python's
+    /// `get_entry`. Raises NoSuchId for missing or non-bytes ids.
+    fn get_entry<'py>(
+        &self,
+        py: Python<'py>,
+        file_id: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if file_id.is_none() {
+            return Err(NoSuchId::new_err((py.None(), py.None())));
+        }
+        let Ok(bytes) = file_id.clone().cast_into::<PyBytes>() else {
+            return Err(NoSuchId::new_err((py.None(), file_id.unbind())));
+        };
+        if let Some(entry) = self.fileid_to_entry_cache.bind(py).get_item(&bytes)? {
+            return Ok(entry);
+        }
+        let map = self
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set"))?;
+        let key_tuple = PyTuple::new(py, [&bytes])?;
+        let filter = PyList::new(py, [key_tuple])?;
+        let items_iter = map.bind(py).call_method1("iteritems", (filter,))?;
+        let mut iter = items_iter.try_iter()?;
+        let first = match iter.next() {
+            None => return Err(NoSuchId::new_err((py.None(), bytes.unbind()))),
+            Some(r) => r?,
+        };
+        let pair = first.cast_into::<PyTuple>()?;
+        let value_bytes = pair.get_item(1)?.cast_into::<PyBytes>()?;
+        self._bytes_to_entry(py, value_bytes)
+    }
+
+    /// Multi-id variant of get_entry. Mirrors Python's `_getitems`:
+    /// silently omits missing ids; cache is filled for newly-loaded
+    /// entries. Return order is undefined.
+    fn _getitems<'py>(
+        &self,
+        py: Python<'py>,
+        file_ids: Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        let mut remaining: Vec<Py<PyAny>> = Vec::new();
+        let cache = self.fileid_to_entry_cache.bind(py);
+        for fid in file_ids.try_iter()? {
+            let fid = fid?;
+            if let Some(entry) = cache.get_item(&fid)? {
+                out.append(entry)?;
+            } else {
+                remaining.push(fid.unbind());
+            }
+        }
+        if remaining.is_empty() {
+            return Ok(out);
+        }
+        let file_keys = PyList::empty(py);
+        for r in &remaining {
+            let key_tuple = PyTuple::new(py, [r.bind(py).clone()])?;
+            file_keys.append(key_tuple)?;
+        }
+        let map = self
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set"))?;
+        let items_iter = map.bind(py).call_method1("iteritems", (file_keys,))?;
+        for pair in items_iter.try_iter()? {
+            let pair = pair?;
+            let tup = pair.cast_into::<PyTuple>()?;
+            let value = tup.get_item(1)?.cast_into::<PyBytes>()?;
+            let entry = self._bytes_to_entry(py, value)?;
+            out.append(entry)?;
+        }
+        Ok(out)
+    }
+
+    /// Deserialise a serialised entry, caching it under its file_id.
+    /// Mirrors Python's `_bytes_to_entry`.
+    fn _bytes_to_entry<'py>(
+        &self,
+        py: Python<'py>,
+        bytes: Bound<'_, PyBytes>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let entry = chk_inventory_bytes_to_entry(py, bytes.as_bytes())?;
+        let file_id = entry.getattr("file_id")?;
+        self.fileid_to_entry_cache
+            .bind(py)
+            .set_item(file_id, &entry)?;
+        Ok(entry)
+    }
+
+    /// Compute the `(parent_id, basename_utf8)` key used by the
+    /// parent_id_basename_to_file_id index. Mirrors Python's
+    /// `_parent_id_basename_key`.
+    fn _parent_id_basename_key<'py>(
+        &self,
+        py: Python<'py>,
+        entry: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let parent_id = entry.getattr("parent_id")?;
+        let parent_bytes: Bound<'py, PyBytes> = if parent_id.is_none() {
+            PyBytes::new(py, b"")
+        } else {
+            parent_id.cast_into::<PyBytes>()?
+        };
+        let name = entry.getattr("name")?;
+        let name_str: String = name.extract()?;
+        let name_bytes = PyBytes::new(py, name_str.as_bytes());
+        PyTuple::new(py, [parent_bytes, name_bytes])
+    }
+
+    /// Always raises NotImplementedError. Mirrors Python's
+    /// `get_idpath` placeholder.
+    fn get_idpath(&self, _file_id: Bound<'_, PyAny>) -> PyResult<()> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "get_idpath",
+        ))
+    }
+
+    /// Get the root entry. Mirrors Python's `root` property.
+    #[getter]
+    fn root<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let root_id = self.root_id.as_ref().ok_or_else(|| {
+            NoSuchId::new_err((py.None(), py.None()))
+        })?;
+        let id_bytes = PyBytes::new(py, root_id.as_bytes());
+        self.get_entry(py, id_bytes.into_any())
     }
 }
 
