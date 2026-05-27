@@ -1188,6 +1188,37 @@ impl InternalNode {
     }
 }
 
+/// Deserialise a CHK page from `data`, dispatching on the magic
+/// prefix. Returns a fully populated `Node` with `key` set to the
+/// supplied sha1 key.
+///
+/// Mirrors Python's `_deserialise(data, key, search_key_func)` plus
+/// the small post-processing wrappers that follow each parse.
+pub fn deserialise_node(
+    data: &[u8],
+    key: Vec<u8>,
+    search_key_func: SearchKeyFunc,
+) -> Result<Node, Error> {
+    if data.starts_with(b"chkleaf:\n") {
+        let parsed = deserialise_leaf_node(data)?;
+        let mut leaf = LeafNode::from_parsed(parsed, search_key_func);
+        if data.len() != leaf.current_size() {
+            return Err(Error::AssertionFailed(
+                "_current_size computed incorrectly".into(),
+            ));
+        }
+        leaf.key = Some(key);
+        Ok(Node::Leaf(Box::new(leaf)))
+    } else if data.starts_with(b"chknode:\n") {
+        let parsed = deserialise_internal_node(data)?;
+        let mut internal = InternalNode::from_parsed(parsed, search_key_func);
+        internal.key = Some(key);
+        Ok(Node::Internal(Box::new(internal)))
+    } else {
+        Err(Error::AssertionFailed("Unknown node type.".into()))
+    }
+}
+
 /// Check whether every search key in `search_keys` is identical.
 ///
 /// Mirrors `LeafNode._are_search_keys_identical`: this is the safety check
@@ -1722,6 +1753,41 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
             Some(NodeRef::Unloaded(k)) => assert_eq!(k, b"sha1:aaaa"),
             other => panic!("expected Unloaded for prefoo, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn deserialise_node_dispatches_to_leaf() {
+        let blob: &[u8] = b"chkleaf:\n100\n1\n2\nalph\n2\x002\nv2\nv2line2\na\x001\nv1\n";
+        let node =
+            deserialise_node(blob, b"sha1:abcd".to_vec(), SearchKeyFunc::Plain).unwrap();
+        match node {
+            Node::Leaf(leaf) => {
+                assert_eq!(leaf.key.as_deref(), Some(&b"sha1:abcd"[..]));
+                assert_eq!(leaf.len(), 2);
+            }
+            Node::Internal(_) => panic!("expected leaf"),
+        }
+    }
+
+    #[test]
+    fn deserialise_node_dispatches_to_internal() {
+        let blob: &[u8] = b"chknode:\n200\n1\n2\npre\nbar\x00sha1:bbbb\nfoo\x00sha1:aaaa\n";
+        let node =
+            deserialise_node(blob, b"sha1:root".to_vec(), SearchKeyFunc::Plain).unwrap();
+        match node {
+            Node::Internal(internal) => {
+                assert_eq!(internal.key.as_deref(), Some(&b"sha1:root"[..]));
+                assert_eq!(internal.len, 2);
+            }
+            Node::Leaf(_) => panic!("expected internal"),
+        }
+    }
+
+    #[test]
+    fn deserialise_node_rejects_unknown_magic() {
+        let blob: &[u8] = b"unknown:\n";
+        let err = deserialise_node(blob, b"sha1:x".to_vec(), SearchKeyFunc::Plain).unwrap_err();
+        assert!(matches!(err, Error::AssertionFailed(_)));
     }
 
     #[test]
