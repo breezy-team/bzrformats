@@ -2430,6 +2430,119 @@ where
         Ok(())
     }
 
+    /// Bulk-populate a fresh CHKMap from `initial_value` and serialise
+    /// it. Returns the root sha1 key. Mirrors Python's
+    /// `CHKMap.from_dict` / `_create_directly`.
+    pub fn from_dict(
+        store: std::sync::Arc<S>,
+        cache: std::sync::Arc<dyn PageCache>,
+        initial_value: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>>,
+        maximum_size: usize,
+        key_width: usize,
+        search_key_func: SearchKeyFunc,
+    ) -> Result<Vec<u8>, Error> {
+        let mut leaf = LeafNode::new(search_key_func.clone());
+        leaf.maximum_size = maximum_size;
+        leaf.key_width = key_width;
+        // Compute raw_size from the items.
+        leaf.raw_size = initial_value
+            .iter()
+            .map(|(k, v)| leaf_node_key_value_len(k, v))
+            .sum();
+        leaf.items = initial_value;
+        leaf.compute_search_prefix();
+        leaf.compute_serialised_prefix();
+        // Split if the bulk-populated leaf is oversize.
+        let mut node = if leaf.items.len() > 1
+            && maximum_size > 0
+            && leaf.current_size() > maximum_size
+        {
+            let (prefix, children) = leaf.split()?;
+            if children.len() == 1 {
+                return Err(Error::AssertionFailed(
+                    "Failed to split using node._split".into(),
+                ));
+            }
+            let mut internal = InternalNode::new(prefix, search_key_func);
+            internal.maximum_size = maximum_size;
+            internal.key_width = key_width;
+            for (split_prefix, child) in children {
+                internal.add_node(split_prefix, child)?;
+            }
+            Node::Internal(Box::new(internal))
+        } else {
+            Node::Leaf(Box::new(leaf))
+        };
+        let keys = node.serialise(&*store, &*cache)?;
+        Ok(keys
+            .last()
+            .cloned()
+            .ok_or_else(|| Error::AssertionFailed("from_dict produced no keys".into()))?)
+    }
+
+    /// Apply a sequence of `(old_key, new_key, new_value)` changes,
+    /// returning the new root sha1 key.
+    ///
+    /// Mirrors Python's `CHKMap.apply_delta`:
+    /// * pre-check that none of the new keys already exist (insert,
+    ///   not update) — raises InconsistentDeltaDelta otherwise;
+    /// * apply all deletes (`old != None and old != new`);
+    /// * apply all inserts (`new != None`);
+    /// * `check_remap` if any deletes happened;
+    /// * `save` and return the new root.
+    pub fn apply_delta(
+        &mut self,
+        delta: Vec<(Option<Vec<Vec<u8>>>, Option<Vec<Vec<u8>>>, Vec<u8>)>,
+    ) -> Result<Vec<u8>, Error> {
+        // Pre-check: every (None, Some(k), v) entry's k must not
+        // already be in the map.
+        let new_only: Vec<Vec<Vec<u8>>> = delta
+            .iter()
+            .filter_map(|(old, new, _v)| match (old, new) {
+                (None, Some(k)) => Some(k.clone()),
+                _ => None,
+            })
+            .collect();
+        if !new_only.is_empty() {
+            let existing = self.iteritems(Some(&new_only))?;
+            if !existing.is_empty() {
+                return Err(Error::InconsistentDeltaDelta(
+                    delta
+                        .iter()
+                        .map(|(o, n, v)| {
+                            (
+                                o.as_ref().map(|k| Key::from(k.clone())),
+                                n.as_ref().map(|k| Key::from(k.clone())),
+                                v.clone(),
+                            )
+                        })
+                        .collect(),
+                    format!("New items are already in the map {:?}.", existing),
+                ));
+            }
+        }
+        // Apply deletes.
+        let mut has_deletes = false;
+        for (old, new, _value) in &delta {
+            if let Some(old_k) = old {
+                if Some(old_k) != new.as_ref() {
+                    self.unmap(old_k, false)?;
+                    has_deletes = true;
+                }
+            }
+        }
+        // Apply inserts.
+        for (_old, new, value) in &delta {
+            if let Some(new_k) = new {
+                self.map(new_k.clone(), value.clone())?;
+            }
+        }
+        if has_deletes {
+            self.check_remap()?;
+        }
+        self.save()
+    }
+
     /// Serialise everything to the store and return the root sha1
     /// key. Mirrors `CHKMap._save`.
     pub fn save(&mut self) -> Result<Vec<u8>, Error> {
@@ -3081,6 +3194,66 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
             Err(crate::knit::KnitError::NotImplemented("annotate"))
         }
+    }
+
+    #[test]
+    fn chkmap_from_dict_returns_loadable_root_key() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut initial: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> = indexmap::IndexMap::new();
+        initial.insert(key_vec(&[b"a"]), b"v1".to_vec());
+        initial.insert(key_vec(&[b"b"]), b"v2".to_vec());
+        let root_key = CHKMap::from_dict(
+            store.clone(),
+            cache.clone(),
+            initial,
+            0,
+            1,
+            SearchKeyFunc::Plain,
+        )
+        .unwrap();
+        assert!(root_key.starts_with(b"sha1:"));
+        let mut m = CHKMap::new(store, cache, Some(root_key), SearchKeyFunc::Plain);
+        let items = m.iteritems(None).unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn chkmap_apply_delta_inserts_and_deletes() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"a"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"b"]), b"v2".to_vec()).unwrap();
+
+        // Delete b, add c.
+        let delta = vec![
+            (Some(key_vec(&[b"b"])), None, Vec::new()),
+            (None, Some(key_vec(&[b"c"])), b"v3".to_vec()),
+        ];
+        let new_root = m.apply_delta(delta).unwrap();
+        assert!(new_root.starts_with(b"sha1:"));
+        let mut items = m.iteritems(None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"a"]), b"v1".to_vec()),
+                (key_vec(&[b"c"]), b"v3".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_apply_delta_rejects_insert_collisions() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"a"]), b"v1".to_vec()).unwrap();
+        // Try to insert (None, Some("a"), v2) — "a" already exists.
+        let delta = vec![(None, Some(key_vec(&[b"a"])), b"v2".to_vec())];
+        let err = m.apply_delta(delta).unwrap_err();
+        assert!(matches!(err, Error::InconsistentDeltaDelta(_, _)));
     }
 
     #[test]
