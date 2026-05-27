@@ -939,6 +939,106 @@ impl LeafNode {
         Ok(full_key)
     }
 
+    /// Split this overflowing leaf into multiple child nodes.
+    ///
+    /// Mirrors Python's `LeafNode._split`: groups items by the
+    /// `(search_prefix + 1)`-byte search-key prefix into fresh sub-leaves.
+    /// If a sub-leaf overflows during its own `map`, the result is
+    /// promoted into an InternalNode wrapping the further splits.
+    ///
+    /// Consumes the items in `self`. After `_split` returns, the
+    /// caller should treat `self` as destroyed — Python returns new
+    /// nodes up the stack and the caller wraps them in an
+    /// InternalNode at the level above.
+    pub fn split(&mut self) -> Result<(Vec<u8>, Vec<(Vec<u8>, Node)>), Error> {
+        let common_prefix = match &self.search_prefix {
+            SearchPrefix::Unknown => {
+                return Err(Error::AssertionFailed("Search prefix must be known".into()))
+            }
+            SearchPrefix::Computed(None) => Vec::new(),
+            SearchPrefix::Computed(Some(p)) => p.clone(),
+        };
+        let split_at = common_prefix.len() + 1;
+        let mut result: indexmap::IndexMap<Vec<u8>, Node> = indexmap::IndexMap::new();
+        let items = std::mem::take(&mut self.items);
+        for (key, value) in items {
+            let search_key = self.search_key_func.apply(&Key::from(key.clone()));
+            let mut prefix: Vec<u8> = if search_key.len() >= split_at {
+                search_key[..split_at].to_vec()
+            } else {
+                search_key.clone()
+            };
+            if prefix.len() < split_at {
+                prefix.resize(split_at, 0);
+            }
+            // Take or create the per-prefix sub-node; mutate it via
+            // map, then store back.
+            let existing = result.shift_remove(&prefix);
+            let mut sub_node = match existing {
+                Some(Node::Leaf(b)) => Node::Leaf(b),
+                Some(Node::Internal(b)) => Node::Internal(b),
+                None => {
+                    let mut leaf = LeafNode::new(self.search_key_func.clone());
+                    leaf.maximum_size = self.maximum_size;
+                    leaf.key_width = self.key_width;
+                    Node::Leaf(Box::new(leaf))
+                }
+            };
+            let map_res = sub_node.map(key, value)?;
+            match map_res {
+                MapResult::InPlace { .. } => {
+                    result.insert(prefix, sub_node);
+                }
+                MapResult::Split {
+                    common_serialised_prefix: sub_prefix,
+                    children,
+                } => {
+                    let mut new_internal = InternalNode::new(
+                        sub_prefix.clone(),
+                        self.search_key_func.clone(),
+                    );
+                    new_internal.maximum_size = self.maximum_size;
+                    new_internal.key_width = self.key_width;
+                    for (split_prefix, child) in children {
+                        new_internal.add_node(split_prefix, child)?;
+                    }
+                    result.insert(prefix, Node::Internal(Box::new(new_internal)));
+                }
+            }
+        }
+        Ok((common_prefix, result.into_iter().collect()))
+    }
+
+    /// In-place insert. Mirrors Python's `LeafNode.map`: subtract
+    /// the old entry's cost if the key existed, then call
+    /// `map_no_split`. If it signals overflow, split.
+    pub fn map(&mut self, key: Vec<Vec<u8>>, value: Vec<u8>) -> Result<MapResult, Error> {
+        if let Some(old_value) = self.items.get(&key) {
+            self.raw_size -= leaf_node_key_value_len(&key, old_value);
+        }
+        self.key = None;
+        if self.map_no_split(key, value) {
+            let (common_prefix, children) = self.split()?;
+            Ok(MapResult::Split {
+                common_serialised_prefix: common_prefix,
+                children,
+            })
+        } else {
+            let prefix = match &self.search_prefix {
+                SearchPrefix::Unknown => {
+                    return Err(Error::AssertionFailed(
+                        "search_prefix must be known after map".into(),
+                    ));
+                }
+                SearchPrefix::Computed(None) => Vec::new(),
+                SearchPrefix::Computed(Some(p)) => p.clone(),
+            };
+            Ok(MapResult::InPlace {
+                search_prefix: prefix,
+            })
+        }
+    }
+
     /// Yield `(key, value)` pairs matching `key_filter`. When `None`,
     /// yields every entry in insertion order. Otherwise:
     ///
@@ -993,6 +1093,24 @@ impl LeafNode {
     }
 }
 
+/// Result of [`LeafNode::map`] / [`Node::map`] — either the node
+/// absorbed the new entry in place, or it split into multiple
+/// children that the caller must wrap in an InternalNode.
+#[derive(Debug, Clone)]
+pub enum MapResult {
+    /// No structural change. The caller's existing reference still
+    /// points at the up-to-date node. `search_prefix` is the search
+    /// prefix of the node post-map (matches Python's first return).
+    InPlace { search_prefix: Vec<u8> },
+    /// The node overflowed and split. The caller replaces it with
+    /// an InternalNode at `common_serialised_prefix` containing
+    /// each `(sub_prefix, child)` pair.
+    Split {
+        common_serialised_prefix: Vec<u8>,
+        children: Vec<(Vec<u8>, Node)>,
+    },
+}
+
 /// In-memory CHK node — either a leaf with key/value entries or an
 /// internal node referencing other nodes. Mirrors the Python
 /// `Node` base class hierarchy (LeafNode | InternalNode).
@@ -1028,6 +1146,26 @@ impl Node {
         match self {
             Node::Leaf(l) => l.maximum_size,
             Node::Internal(n) => n.maximum_size,
+        }
+    }
+
+    /// Insert `(key, value)` into this subtree, returning whether the
+    /// node was modified in place or split into multiple children.
+    ///
+    /// For leaves, delegates to `LeafNode::map`. For internal nodes,
+    /// only the in-memory recursion path is implemented here — the
+    /// store-touching demand-load logic is added separately by
+    /// `InternalNode::map_with_store` once the recursion needs it.
+    /// (Used by `LeafNode::split` when sub-leaves are themselves
+    /// in-memory.)
+    pub fn map(&mut self, key: Vec<Vec<u8>>, value: Vec<u8>) -> Result<MapResult, Error> {
+        match self {
+            Node::Leaf(l) => l.map(key, value),
+            Node::Internal(_) => Err(Error::AssertionFailed(
+                "Node::map on InternalNode requires a store — \
+                 use InternalNode::map_with_store"
+                    .into(),
+            )),
         }
     }
 
@@ -2238,6 +2376,55 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
             _key: &crate::versionedfile::Key,
         ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
             Err(crate::knit::KnitError::NotImplemented("annotate"))
+        }
+    }
+
+    #[test]
+    fn leaf_node_map_in_place_no_split() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        let r = n.map(key_vec(&[b"foo"]), b"bar".to_vec()).unwrap();
+        match r {
+            MapResult::InPlace { search_prefix } => {
+                assert_eq!(search_prefix, b"foo".to_vec());
+            }
+            MapResult::Split { .. } => panic!("did not expect split"),
+        }
+        assert_eq!(n.len(), 1);
+    }
+
+    #[test]
+    fn leaf_node_map_replacing_existing_key_does_not_grow_len() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map(key_vec(&[b"foo"]), b"bar".to_vec()).unwrap();
+        let r = n.map(key_vec(&[b"foo"]), b"BAZ".to_vec()).unwrap();
+        assert!(matches!(r, MapResult::InPlace { .. }));
+        assert_eq!(n.len(), 1);
+        assert_eq!(n.items.get(&key_vec(&[b"foo"])), Some(&b"BAZ".to_vec()));
+    }
+
+    #[test]
+    fn leaf_node_map_overflow_splits_into_internal_subtree() {
+        // Two divergent keys with a tight maximum_size force a split.
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.maximum_size = 10;
+        let r1 = n.map(key_vec(&[b"foo"]), b"v1".to_vec()).unwrap();
+        assert!(matches!(r1, MapResult::InPlace { .. }));
+        let r2 = n.map(key_vec(&[b"bar"]), b"v2".to_vec()).unwrap();
+        match r2 {
+            MapResult::Split {
+                common_serialised_prefix,
+                children,
+            } => {
+                // Search prefix of two divergent single-byte-prefix
+                // keys is empty.
+                assert!(common_serialised_prefix.is_empty());
+                // Two sub-children for the split.
+                assert_eq!(children.len(), 2);
+                let prefixes: Vec<&[u8]> = children.iter().map(|(p, _)| p.as_slice()).collect();
+                assert!(prefixes.contains(&&b"f"[..]));
+                assert!(prefixes.contains(&&b"b"[..]));
+            }
+            MapResult::InPlace { .. } => panic!("expected split"),
         }
     }
 
