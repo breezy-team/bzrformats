@@ -63,6 +63,35 @@ _page_cache_get = _chk_map_rs._page_cache_get
 _page_cache_set = _chk_map_rs._page_cache_set
 
 
+class _PageCacheProxy:
+    """Dict-like view onto the Rust-backed CHK page cache.
+
+    Returned by :func:`_get_cache` for compatibility with callers
+    (notably breezy's test suite) that historically reached into the
+    pure-Python ``LRUSizeCache`` instance directly.
+    """
+
+    def __getitem__(self, key):
+        value = _page_cache_get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key, value):
+        _page_cache_set(key, value)
+
+    def __contains__(self, key):
+        return _page_cache_get(key) is not None
+
+
+_page_cache_proxy = _PageCacheProxy()
+
+
+def _get_cache():
+    """Return a dict-like view onto the shared CHK page cache."""
+    return _page_cache_proxy
+
+
 # If a ChildNode falls below this many bytes, we check for a remap
 _INTERESTING_NEW_SIZE = 50
 # If a ChildNode shrinks by more than this amount, we check for a remap

@@ -2493,79 +2493,59 @@ impl CHKInventory {
     }
 
     /// Walk the inventory in lexicographic order. Mirrors Python's
-    /// `iter_entries(from_dir, recursive)`. Returns a list of
-    /// `(path, entry)` pairs.
+    /// `iter_entries(from_dir, recursive)`. Returns an iterator
+    /// yielding `(path, entry)` pairs.
     #[pyo3(signature = (from_dir=None, recursive=true))]
     fn iter_entries<'py>(
         slf: pyo3::Bound<'py, CHKInventory>,
         py: Python<'py>,
         from_dir: Option<Bound<'py, PyAny>>,
         recursive: bool,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let out = PyList::empty(py);
-        let (start_file_id, _) = match from_dir {
+    ) -> PyResult<Bound<'py, CHKIterEntriesIterator>> {
+        let mut first: Option<(String, Py<PyAny>)> = None;
+        let start_file_id: Py<PyAny> = match from_dir {
             None => {
                 if slf.borrow().root_id.is_none() {
-                    return Ok(out);
+                    // Empty iterator.
+                    return Bound::new(
+                        py,
+                        CHKIterEntriesIterator {
+                            inv: slf.unbind(),
+                            stack: Vec::new(),
+                            recursive,
+                            first: None,
+                        },
+                    );
                 }
                 let root = slf.getattr("root")?;
                 let fid = root.getattr("file_id")?;
-                out.append(PyTuple::new(
-                    py,
-                    [PyString::new(py, "").into_any(), root.clone()],
-                )?)?;
-                (fid.unbind(), true)
+                first = Some((String::new(), root.unbind()));
+                fid.unbind()
             }
             Some(fd) => {
                 if let Ok(b) = fd.clone().cast_into::<PyBytes>() {
-                    (b.into_any().unbind(), false)
+                    b.into_any().unbind()
                 } else {
-                    let fid = fd.getattr("file_id")?;
-                    (fid.unbind(), false)
+                    fd.getattr("file_id")?.unbind()
                 }
             }
         };
         let start_bytes = start_file_id.bind(py).clone().cast_into::<PyBytes>()?;
         let direct = slf.borrow().iter_sorted_children(py, start_bytes)?;
-        if !recursive {
-            for c in direct.iter() {
-                let name = c.getattr("name")?;
-                out.append(PyTuple::new(py, [name, c])?)?;
-            }
-            return Ok(out);
-        }
-        let mut stack: Vec<(String, std::collections::VecDeque<Py<PyAny>>)> = Vec::new();
         let mut queue: std::collections::VecDeque<Py<PyAny>> = std::collections::VecDeque::new();
         for c in direct.iter() {
             queue.push_back(c.unbind());
         }
-        stack.push((String::new(), queue));
-        while let Some((path, children)) = stack.last_mut() {
-            if let Some(ie_py) = children.pop_front() {
-                let ie = ie_py.bind(py);
-                let name: String = ie.getattr("name")?.extract()?;
-                let new_path = format!("{}/{}", path, name);
-                let yield_path = new_path.trim_start_matches('/').to_string();
-                let kind: String = ie.getattr("kind")?.extract()?;
-                out.append(PyTuple::new(
-                    py,
-                    [PyString::new(py, &yield_path).into_any(), ie.clone()],
-                )?)?;
-                if kind == "directory" {
-                    let fid = ie.getattr("file_id")?.cast_into::<PyBytes>()?;
-                    let new_children = slf.borrow().iter_sorted_children(py, fid)?;
-                    let mut q: std::collections::VecDeque<Py<PyAny>> =
-                        std::collections::VecDeque::new();
-                    for c in new_children.iter() {
-                        q.push_back(c.unbind());
-                    }
-                    stack.push((new_path, q));
-                }
-            } else {
-                stack.pop();
-            }
-        }
-        Ok(out)
+        let stack = vec![(String::new(), queue)];
+        Bound::new(
+            py,
+            CHKIterEntriesIterator {
+                inv: slf.unbind(),
+                stack,
+                recursive,
+                first,
+            },
+        )
     }
 
     /// Return `[(path, entry)]` for every entry except the root.
@@ -2712,15 +2692,15 @@ impl CHKInventory {
     }
 
     /// Walk the inventory in directory-first order. Mirrors Python's
-    /// `iter_entries_by_dir(from_dir, specific_file_ids)`.
+    /// `iter_entries_by_dir(from_dir, specific_file_ids)`. Returns an
+    /// iterator yielding `(path, entry)` pairs.
     #[pyo3(signature = (from_dir=None, specific_file_ids=None))]
     fn iter_entries_by_dir<'py>(
         slf: pyo3::Bound<'py, CHKInventory>,
         py: Python<'py>,
         from_dir: Option<Bound<'py, PyAny>>,
         specific_file_ids: Option<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let out = PyList::empty(py);
+    ) -> PyResult<Bound<'py, CHKIterEntriesByDirIterator>> {
         let specific_set: Option<std::collections::HashSet<Vec<u8>>> =
             if let Some(s) = specific_file_ids.as_ref() {
                 let mut set = std::collections::HashSet::new();
@@ -2737,32 +2717,53 @@ impl CHKInventory {
         if from_dir.is_none() && specific_file_ids.is_none() {
             slf.call_method0("_preload_cache")?;
         }
-        let from_entry: Py<PyAny> = if let Some(fd) = from_dir.clone() {
-            if let Ok(b) = fd.clone().cast_into::<PyBytes>() {
+        let mut buffer: std::collections::VecDeque<(String, Py<PyAny>)> =
+            std::collections::VecDeque::new();
+        let mut stack: Vec<(String, Py<PyAny>)> = Vec::new();
+        let from_entry: Option<Py<PyAny>> = if let Some(fd) = from_dir.clone() {
+            let e = if let Ok(b) = fd.clone().cast_into::<PyBytes>() {
                 slf.borrow().get_entry(py, b.into_any())?.unbind()
             } else {
                 fd.unbind()
-            }
+            };
+            Some(e)
         } else {
             if let Some(set) = &specific_set {
                 if set.len() == 1 {
                     let only = set.iter().next().unwrap().clone();
                     let bytes = PyBytes::new(py, &only);
                     match slf.call_method1("id2path", (&bytes,)) {
-                        Ok(path) => match slf.borrow().get_entry(py, bytes.into_any()) {
-                            Ok(entry) => {
-                                out.append(PyTuple::new(py, [path, entry])?)?;
+                        Ok(path) => {
+                            if let Ok(entry) = slf.borrow().get_entry(py, bytes.into_any()) {
+                                buffer.push_back((path.extract::<String>()?, entry.unbind()));
                             }
-                            Err(_) => {}
-                        },
+                        }
                         Err(e) if e.is_instance_of::<NoSuchId>(py) => {}
                         Err(e) => return Err(e),
                     }
-                    return Ok(out);
+                    return Bound::new(
+                        py,
+                        CHKIterEntriesByDirIterator {
+                            inv: slf.unbind(),
+                            buffer,
+                            stack,
+                            specific_set: None,
+                            parents_filter: None,
+                        },
+                    );
                 }
             }
             if slf.borrow().root_id.is_none() {
-                return Ok(out);
+                return Bound::new(
+                    py,
+                    CHKIterEntriesByDirIterator {
+                        inv: slf.unbind(),
+                        buffer,
+                        stack,
+                        specific_set: None,
+                        parents_filter: None,
+                    },
+                );
             }
             let root = slf.getattr("root")?;
             let root_fid: Vec<u8> = root
@@ -2774,12 +2775,9 @@ impl CHKInventory {
                 .as_ref()
                 .map_or(true, |s| s.contains(&root_fid))
             {
-                out.append(PyTuple::new(
-                    py,
-                    [PyString::new(py, "").into_any(), root.clone()],
-                )?)?;
+                buffer.push_back((String::new(), root.clone().unbind()));
             }
-            root.unbind()
+            Some(root.unbind())
         };
         let parents_filter: Option<std::collections::HashSet<Vec<u8>>> = match &specific_set {
             None => None,
@@ -2813,47 +2811,19 @@ impl CHKInventory {
                 Some(ancestors)
             }
         };
-        let mut stack: Vec<(String, Py<PyAny>)> = vec![(String::new(), from_entry)];
-        while let Some((cur_relpath, cur_dir)) = stack.pop() {
-            let mut child_dirs: Vec<(String, Py<PyAny>)> = Vec::new();
-            let cur_fid = cur_dir
-                .bind(py)
-                .getattr("file_id")?
-                .cast_into::<PyBytes>()?;
-            let children = slf.borrow().iter_sorted_children(py, cur_fid)?;
-            for child in children.iter() {
-                let child_name: String = child.getattr("name")?.extract()?;
-                let child_relpath = format!("{}{}", cur_relpath, child_name);
-                let child_fid: Vec<u8> = child
-                    .getattr("file_id")?
-                    .cast_into::<PyBytes>()?
-                    .as_bytes()
-                    .to_vec();
-                if specific_set
-                    .as_ref()
-                    .map_or(true, |s| s.contains(&child_fid))
-                {
-                    out.append(PyTuple::new(
-                        py,
-                        [PyString::new(py, &child_relpath).into_any(), child.clone()],
-                    )?)?;
-                }
-                let kind: String = child.getattr("kind")?.extract()?;
-                if kind == "directory" {
-                    let recurse = match &parents_filter {
-                        None => true,
-                        Some(p) => p.contains(&child_fid),
-                    };
-                    if recurse {
-                        child_dirs.push((format!("{}/", child_relpath), child.unbind()));
-                    }
-                }
-            }
-            for cd in child_dirs.into_iter().rev() {
-                stack.push(cd);
-            }
+        if let Some(entry) = from_entry {
+            stack.push((String::new(), entry));
         }
-        Ok(out)
+        Bound::new(
+            py,
+            CHKIterEntriesByDirIterator {
+                inv: slf.unbind(),
+                buffer,
+                stack,
+                specific_set,
+                parents_filter,
+            },
+        )
     }
 
     /// Serialise the inventory header to lines. Mirrors Python's
@@ -3202,8 +3172,7 @@ impl CHKInventory {
             None => py.None().into_bound(py),
         };
         let inv_dir_cls = py.get_type::<InventoryDirectory>();
-        let root_dir =
-            inv_dir_cls.call1((root_id_obj.clone(), "", py.None(), root_revision))?;
+        let root_dir = inv_dir_cls.call1((root_id_obj.clone(), "", py.None(), root_revision))?;
         other.call_method1("add", (root_dir,))?;
         let revision_id_obj = match slf.borrow().revision_id.as_ref() {
             Some(rev) => PyBytes::new(py, rev.as_bytes()).into_any(),
@@ -3225,10 +3194,7 @@ impl CHKInventory {
         while let Some(file_id_obj) = remaining.pop_front() {
             let file_id = file_id_obj.bind(py);
             let ie = cache.bind(py).get_item(file_id)?.ok_or_else(|| {
-                BzrFormatsError::new_err(format!(
-                    "file_id {:?} not in fileid cache",
-                    file_id
-                ))
+                BzrFormatsError::new_err(format!("file_id {:?} not in fileid cache", file_id))
             })?;
             let kind: String = ie.getattr("kind")?.extract()?;
             let ie_to_add = if kind == "directory" {
@@ -3335,9 +3301,7 @@ impl CHKInventory {
                 .borrow()
                 .parent_id_basename_to_file_id
                 .as_ref()
-                .ok_or_else(|| {
-                    BzrFormatsError::new_err("parent_id_basename_to_file_id not set")
-                })?
+                .ok_or_else(|| BzrFormatsError::new_err("parent_id_basename_to_file_id not set"))?
                 .clone_ref(py);
             let items = pid_map.bind(py).call_method1("iteritems", (keys,))?;
             let next_file_ids = pyo3::types::PySet::empty(py)?;
@@ -3347,8 +3311,7 @@ impl CHKInventory {
                 let child_file_id = tup.get_item(1)?;
                 next_file_ids.add(child_file_id)?;
             }
-            let next_file_ids =
-                next_file_ids.call_method1("difference", (interesting.clone(),))?;
+            let next_file_ids = next_file_ids.call_method1("difference", (interesting.clone(),))?;
             interesting.call_method1("update", (next_file_ids.clone(),))?;
             let items2 = slf.call_method1("_getitems", (next_file_ids,))?;
             for entry in items2.try_iter()? {
@@ -3460,13 +3423,12 @@ impl CHKInventory {
                         .clone_ref(py)
                         .into_bound(py),
                     _ => {
-                        let pie =
-                            fileid_cache.bind(py).get_item(&parent_id)?.ok_or_else(|| {
-                                BzrFormatsError::new_err(format!(
-                                    "parent_id {:?} not in fileid cache",
-                                    parent_id
-                                ))
-                            })?;
+                        let pie = fileid_cache.bind(py).get_item(&parent_id)?.ok_or_else(|| {
+                            BzrFormatsError::new_err(format!(
+                                "parent_id {:?} not in fileid cache",
+                                parent_id
+                            ))
+                        })?;
                         last_parent_id = Some(parent_id.clone().unbind());
                         last_parent_ie = Some(pie.clone().unbind());
                         pie
@@ -3489,8 +3451,8 @@ impl CHKInventory {
                             d
                         }
                     };
-                let basename: String =
-                    String::from_utf8(basename_bytes.as_bytes().to_vec()).map_err(|e| {
+                let basename: String = String::from_utf8(basename_bytes.as_bytes().to_vec())
+                    .map_err(|e| {
                         pyo3::exceptions::PyValueError::new_err(format!(
                             "invalid utf8 basename: {}",
                             e
@@ -3566,9 +3528,8 @@ impl CHKInventory {
                         .borrow()
                         ._bytes_to_entry(py, bytes)?
                         .into_pyobject(py)?;
-                    let path: Py<PyAny> = basis
-                        .call_method1("id2path", (file_id.clone(),))?
-                        .unbind();
+                    let path: Py<PyAny> =
+                        basis.call_method1("id2path", (file_id.clone(),))?.unbind();
                     let parent = entry.getattr("parent_id")?.unbind();
                     let name = entry.getattr("name")?.unbind();
                     let executable = entry.getattr("executable").ok().map_or(py.None(), |v| {
@@ -3585,13 +3546,8 @@ impl CHKInventory {
                     (py.None(), py.None(), py.None(), py.None(), py.None())
                 } else {
                     let bytes = self_value.cast_into::<PyBytes>()?;
-                    let entry = slf
-                        .borrow()
-                        ._bytes_to_entry(py, bytes)?
-                        .into_pyobject(py)?;
-                    let path: Py<PyAny> = slf
-                        .call_method1("id2path", (file_id.clone(),))?
-                        .unbind();
+                    let entry = slf.borrow()._bytes_to_entry(py, bytes)?.into_pyobject(py)?;
+                    let path: Py<PyAny> = slf.call_method1("id2path", (file_id.clone(),))?.unbind();
                     let parent = entry.getattr("parent_id")?.unbind();
                     let name = entry.getattr("name")?.unbind();
                     let executable = entry.getattr("executable").ok().map_or(py.None(), |v| {
@@ -3615,13 +3571,8 @@ impl CHKInventory {
                     self_entry.getattr(py, "kind")?
                 },
             );
-            let versioned = (
-                !basis_entry.is_none(py),
-                !self_entry.is_none(py),
-            );
-            let mut changed_content = !basis_kind
-                .bind(py)
-                .eq(self_kind.bind(py))?;
+            let versioned = (!basis_entry.is_none(py), !self_entry.is_none(py));
+            let mut changed_content = !basis_kind.bind(py).eq(self_kind.bind(py))?;
             if !changed_content && !basis_entry.is_none(py) && !self_entry.is_none(py) {
                 let kind_str: Option<String> = basis_kind.extract(py).ok();
                 match kind_str.as_deref() {
@@ -3630,9 +3581,7 @@ impl CHKInventory {
                         let ss = self_entry.getattr(py, "text_size")?;
                         let bsha = basis_entry.getattr(py, "text_sha1")?;
                         let ssha = self_entry.getattr(py, "text_sha1")?;
-                        if !bs.bind(py).eq(ss.bind(py))?
-                            || !bsha.bind(py).eq(ssha.bind(py))?
-                        {
+                        if !bs.bind(py).eq(ss.bind(py))? || !bsha.bind(py).eq(ssha.bind(py))? {
                             changed_content = true;
                         }
                     }
@@ -3664,14 +3613,17 @@ impl CHKInventory {
             let parent_tup = PyTuple::new(py, [basis_parent, self_parent])?;
             let name_tup = PyTuple::new(py, [basis_name, self_name])?;
             let kind_tup = PyTuple::new(py, [basis_kind, self_kind])?;
-            let executable_tup =
-                PyTuple::new(py, [basis_executable, self_executable])?;
+            let executable_tup = PyTuple::new(py, [basis_executable, self_executable])?;
             let row = PyTuple::new(
                 py,
                 [
                     file_id.unbind(),
                     paths_tup.into_any().unbind(),
-                    changed_content.into_pyobject(py)?.to_owned().into_any().unbind(),
+                    changed_content
+                        .into_pyobject(py)?
+                        .to_owned()
+                        .into_any()
+                        .unbind(),
                     versioned_tup.into_any().unbind(),
                     parent_tup.into_any().unbind(),
                     name_tup.into_any().unbind(),
@@ -3698,8 +3650,7 @@ impl CHKInventory {
         // Construct the result via cls(search_key_name) — same idea
         // as from_inventory: preserve subclass identity.
         let cls = slf.get_type();
-        let search_key_name_bytes =
-            PyBytes::new(py, &slf.borrow().search_key_name).into_any();
+        let search_key_name_bytes = PyBytes::new(py, &slf.borrow().search_key_name).into_any();
         let result_obj = cls.call1((search_key_name_bytes,))?;
         let result = result_obj.downcast::<CHKInventory>()?.clone();
         if propagate_caches {
@@ -3711,10 +3662,8 @@ impl CHKInventory {
                 .cast_into::<PyDict>()?;
             result.borrow_mut().path_to_fileid_cache = pf.unbind();
         }
-        let search_key_callable = crate::chk_map::search_key_callable_for_name(
-            py,
-            &slf.borrow().search_key_name,
-        );
+        let search_key_callable =
+            crate::chk_map::search_key_callable_for_name(py, &slf.borrow().search_key_name);
         // Snapshot id_to_entry: ensure root, capture maximum_size,
         // build a fresh CHKMap pointing at the same root key.
         let self_id_map = slf
@@ -3834,8 +3783,7 @@ impl CHKInventory {
                 py.None()
             } else {
                 let ok = PyTuple::new(py, [&file_id])?.into_any().unbind();
-                let id2path_self =
-                    slf.call_method1("id2path", (file_id.clone(),))?;
+                let id2path_self = slf.call_method1("id2path", (file_id.clone(),))?;
                 if !id2path_self.eq(&old_path)? {
                     return Err(InconsistentDelta::new_err((
                         old_path.unbind(),
@@ -3876,25 +3824,19 @@ impl CHKInventory {
                         let entry_obj = parent_id_basename_delta
                             .get_item(old_pid_key.bind(py))?
                             .unwrap_or_else(|| {
-                                PyList::new(py, [py.None(), py.None()])
-                                    .unwrap()
-                                    .into_any()
+                                PyList::new(py, [py.None(), py.None()]).unwrap().into_any()
                             });
                         entry_obj.set_item(0, old_pid_key.bind(py))?;
-                        parent_id_basename_delta
-                            .set_item(old_pid_key.bind(py), entry_obj)?;
+                        parent_id_basename_delta.set_item(old_pid_key.bind(py), entry_obj)?;
                     }
                     if !new_pid_key.is_none(py) {
                         let entry_obj = parent_id_basename_delta
                             .get_item(new_pid_key.bind(py))?
                             .unwrap_or_else(|| {
-                                PyList::new(py, [py.None(), py.None()])
-                                    .unwrap()
-                                    .into_any()
+                                PyList::new(py, [py.None(), py.None()]).unwrap().into_any()
                             });
                         entry_obj.set_item(1, new_pid_value.bind(py))?;
-                        parent_id_basename_delta
-                            .set_item(new_pid_key.bind(py), entry_obj)?;
+                        parent_id_basename_delta.set_item(new_pid_key.bind(py), entry_obj)?;
                     }
                 }
             }
@@ -3907,14 +3849,12 @@ impl CHKInventory {
                 continue;
             }
             let entry_file_id = entry.getattr("file_id")?;
-            let children =
-                slf.call_method1("iter_sorted_children", (entry_file_id,))?;
+            let children = slf.call_method1("iter_sorted_children", (entry_file_id,))?;
             for child in children.try_iter()? {
                 let child = child?;
                 let child_file_id = child.getattr("file_id")?;
                 if !altered.contains(&child_file_id)? {
-                    let child_path =
-                        slf.call_method1("id2path", (child_file_id.clone(),))?;
+                    let child_path = slf.call_method1("id2path", (child_file_id.clone(),))?;
                     return Err(InconsistentDelta::new_err((
                         child_path.unbind(),
                         child_file_id.unbind(),
@@ -3975,8 +3915,7 @@ impl CHKInventory {
                 Ok(entry) => {
                     let kind: String = entry.getattr("kind")?.extract()?;
                     if kind != "directory" {
-                        let parent_inv_path =
-                            result.call_method1("id2path", (parent.clone(),))?;
+                        let parent_inv_path = result.call_method1("id2path", (parent.clone(),))?;
                         return Err(InconsistentDelta::new_err((
                             parent_inv_path.unbind(),
                             parent.unbind(),
@@ -4024,6 +3963,124 @@ fn make_chkmap_pyinstance<'py>(
         None => PyTuple::new(py, [chk_store.clone(), root_key])?,
     };
     Ok(cls.call1(args)?.unbind())
+}
+
+/// Iterator returned by `CHKInventory.iter_entries`. Yields
+/// `(path, entry)` pairs in lexicographic order, descending into
+/// directories when `recursive` is true. The synthetic root entry is
+/// yielded first when iteration was started without a `from_dir`.
+#[pyclass]
+struct CHKIterEntriesIterator {
+    inv: Py<CHKInventory>,
+    stack: Vec<(String, std::collections::VecDeque<Py<PyAny>>)>,
+    recursive: bool,
+    first: Option<(String, Py<PyAny>)>,
+}
+
+#[pymethods]
+impl CHKIterEntriesIterator {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<(String, Bound<'py, PyAny>)>> {
+        if let Some((path, ie)) = self.first.take() {
+            return Ok(Some((path, ie.into_bound(py))));
+        }
+        loop {
+            let Some((path, children)) = self.stack.last_mut() else {
+                return Ok(None);
+            };
+            let Some(ie_py) = children.pop_front() else {
+                self.stack.pop();
+                continue;
+            };
+            let ie = ie_py.into_bound(py);
+            let name: String = ie.getattr("name")?.extract()?;
+            let new_path = format!("{}/{}", path, name);
+            let yield_path = new_path.trim_start_matches('/').to_string();
+            let kind: String = ie.getattr("kind")?.extract()?;
+            if self.recursive && kind == "directory" {
+                let fid = ie.getattr("file_id")?.cast_into::<PyBytes>()?;
+                let new_children = self.inv.bind(py).borrow().iter_sorted_children(py, fid)?;
+                let mut q: std::collections::VecDeque<Py<PyAny>> =
+                    std::collections::VecDeque::new();
+                for c in new_children.iter() {
+                    q.push_back(c.unbind());
+                }
+                self.stack.push((new_path, q));
+            }
+            return Ok(Some((yield_path, ie)));
+        }
+    }
+}
+
+/// Iterator returned by `CHKInventory.iter_entries_by_dir`. Walks
+/// the inventory directory-first, optionally restricted to
+/// `specific_file_ids` (and their ancestors).
+#[pyclass]
+struct CHKIterEntriesByDirIterator {
+    inv: Py<CHKInventory>,
+    buffer: std::collections::VecDeque<(String, Py<PyAny>)>,
+    stack: Vec<(String, Py<PyAny>)>,
+    specific_set: Option<std::collections::HashSet<Vec<u8>>>,
+    parents_filter: Option<std::collections::HashSet<Vec<u8>>>,
+}
+
+#[pymethods]
+impl CHKIterEntriesByDirIterator {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<(String, Bound<'py, PyAny>)>> {
+        loop {
+            if let Some((path, ie)) = self.buffer.pop_front() {
+                return Ok(Some((path, ie.into_bound(py))));
+            }
+            let Some((cur_relpath, cur_dir)) = self.stack.pop() else {
+                return Ok(None);
+            };
+            let cur_dir_bound = cur_dir.into_bound(py);
+            let cur_fid = cur_dir_bound.getattr("file_id")?.cast_into::<PyBytes>()?;
+            let children = self
+                .inv
+                .bind(py)
+                .borrow()
+                .iter_sorted_children(py, cur_fid)?;
+            let mut child_dirs: Vec<(String, Py<PyAny>)> = Vec::new();
+            for child in children.iter() {
+                let child_name: String = child.getattr("name")?.extract()?;
+                let child_relpath = format!("{}{}", cur_relpath, child_name);
+                let child_fid: Vec<u8> = child
+                    .getattr("file_id")?
+                    .cast_into::<PyBytes>()?
+                    .as_bytes()
+                    .to_vec();
+                if self
+                    .specific_set
+                    .as_ref()
+                    .map_or(true, |s| s.contains(&child_fid))
+                {
+                    self.buffer
+                        .push_back((child_relpath.clone(), child.clone().unbind()));
+                }
+                let kind: String = child.getattr("kind")?.extract()?;
+                if kind == "directory" {
+                    let recurse = match &self.parents_filter {
+                        None => true,
+                        Some(p) => p.contains(&child_fid),
+                    };
+                    if recurse {
+                        child_dirs.push((format!("{}/", child_relpath), child.unbind()));
+                    }
+                }
+            }
+            for cd in child_dirs.into_iter().rev() {
+                self.stack.push(cd);
+            }
+        }
+    }
 }
 
 impl CHKInventory {
@@ -4147,6 +4204,8 @@ pub fn _inventory_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(chk_inventory_bytes_to_entry))?;
     m.add_wrapped(wrap_pyfunction!(chk_inventory_bytes_to_utf8name_key))?;
     m.add_class::<CHKInventory>()?;
+    m.add_class::<CHKIterEntriesIterator>()?;
+    m.add_class::<CHKIterEntriesByDirIterator>()?;
 
     Ok(m)
 }
