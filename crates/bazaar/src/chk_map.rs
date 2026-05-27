@@ -884,6 +884,59 @@ impl LeafNode {
         self.compute_serialised_prefix();
         Some(removed)
     }
+
+    /// Yield `(key, value)` pairs matching `key_filter`. When `None`,
+    /// yields every entry in insertion order. Otherwise:
+    ///
+    /// * Filter keys of length `key_width` are looked up directly and
+    ///   yielded in filter order (matching Python's left-to-right
+    ///   iteration before falling through to the prefix-match pass).
+    /// * Shorter filter keys act as prefix filters across the items.
+    ///   Items are checked in insertion order; the first matching
+    ///   filter wins (matches Python's `break` after a yield).
+    ///
+    /// Mirrors `LeafNode.iteritems` exactly; the store argument is
+    /// unused on the leaf path and is omitted from this pure-Rust
+    /// signature.
+    pub fn iteritems(
+        &self,
+        key_filter: Option<&[Vec<Vec<u8>>]>,
+    ) -> Vec<(Vec<Vec<u8>>, Vec<u8>)> {
+        let mut out: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::new();
+        let filter = match key_filter {
+            None => {
+                for (k, v) in self.items.iter() {
+                    out.push((k.clone(), v.clone()));
+                }
+                return out;
+            }
+            Some(f) => f,
+        };
+        // Group short filters by length; iterate exact-width matches in
+        // filter order.
+        let mut short_filters: std::collections::HashMap<usize, Vec<&[Vec<u8>]>> =
+            std::collections::HashMap::new();
+        for key in filter.iter() {
+            if key.len() == self.key_width {
+                if let Some(v) = self.items.get(key) {
+                    out.push((key.clone(), v.clone()));
+                }
+            } else {
+                short_filters.entry(key.len()).or_default().push(key);
+            }
+        }
+        if !short_filters.is_empty() {
+            for (k, v) in self.items.iter() {
+                for (length, candidates) in short_filters.iter() {
+                    if k.len() >= *length && candidates.iter().any(|c| *c == &k[..*length]) {
+                        out.push((k.clone(), v.clone()));
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Check whether every search key in `search_keys` is identical.
@@ -1388,6 +1441,65 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         assert_eq!(n.len(), 0);
         assert!(matches!(n.search_prefix, SearchPrefix::Computed(None)));
         assert!(n.common_serialised_prefix.is_none());
+    }
+
+    #[test]
+    fn leaf_node_iteritems_returns_all_with_no_filter() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        n.map_no_split(key_vec(&[b"baz"]), b"qux".to_vec());
+        let items = n.iteritems(None);
+        assert_eq!(items.len(), 2);
+        let keys: Vec<&[Vec<u8>]> = items.iter().map(|(k, _)| k.as_slice()).collect();
+        assert!(keys.contains(&key_vec(&[b"foo"]).as_slice()));
+        assert!(keys.contains(&key_vec(&[b"baz"]).as_slice()));
+    }
+
+    #[test]
+    fn leaf_node_iteritems_exact_match_filter() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        n.map_no_split(key_vec(&[b"baz"]), b"qux".to_vec());
+        let items = n.iteritems(Some(&[key_vec(&[b"foo"])]));
+        assert_eq!(items, vec![(key_vec(&[b"foo"]), b"bar".to_vec())]);
+    }
+
+    #[test]
+    fn leaf_node_iteritems_exact_miss_yields_nothing() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        let items = n.iteritems(Some(&[key_vec(&[b"absent"])]));
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn leaf_node_iteritems_short_prefix_filter_matches_items() {
+        // key_width=2, filter is a 1-element prefix that matches the
+        // first element of one stored key.
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.key_width = 2;
+        n.map_no_split(key_vec(&[b"foo", b"sub1"]), b"v1".to_vec());
+        n.map_no_split(key_vec(&[b"bar", b"sub2"]), b"v2".to_vec());
+        let items = n.iteritems(Some(&[key_vec(&[b"foo"])]));
+        assert_eq!(items, vec![(key_vec(&[b"foo", b"sub1"]), b"v1".to_vec())]);
+    }
+
+    #[test]
+    fn leaf_node_iteritems_mixed_filter_lengths() {
+        // key_width=2, mix of exact (length 2) and prefix (length 1).
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.key_width = 2;
+        n.map_no_split(key_vec(&[b"foo", b"sub"]), b"v1".to_vec());
+        n.map_no_split(key_vec(&[b"bar", b"sub"]), b"v2".to_vec());
+        n.map_no_split(key_vec(&[b"baz", b"sub"]), b"v3".to_vec());
+        let items = n.iteritems(Some(&[
+            key_vec(&[b"foo", b"sub"]), // exact, yielded first
+            key_vec(&[b"bar"]),         // prefix
+        ]));
+        // Exact match first, then prefix match in items order.
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], (key_vec(&[b"foo", b"sub"]), b"v1".to_vec()));
+        assert_eq!(items[1], (key_vec(&[b"bar", b"sub"]), b"v2".to_vec()));
     }
 
     #[test]
