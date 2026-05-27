@@ -44,7 +44,6 @@ __all__ = [
 
 import contextlib
 from collections import deque
-from collections.abc import Iterable
 
 from . import osutils
 from ._bzr_rs import ROOT_ID
@@ -411,136 +410,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
                 )
         return result
 
-    @classmethod
-    def deserialise(klass, chk_store, lines, expected_revision_id):
-        """Deserialise a CHKInventory.
-
-        :param chk_store: A CHK capable VersionedFiles instance.
-        :param bytes: The serialised bytes.
-        :param expected_revision_id: The revision ID we think this inventory is
-            for.
-        :return: A CHKInventory
-        """
-        if not lines[-1].endswith(b"\n"):
-            raise ValueError("last line should have trailing eol\n")
-        if lines[0] != b"chkinventory:\n":
-            raise ValueError(f"not a serialised CHKInventory: {bytes!r}")
-        info = {}
-        allowed_keys = frozenset(
-            (
-                b"root_id",
-                b"revision_id",
-                b"parent_id_basename_to_file_id",
-                b"search_key_name",
-                b"id_to_entry",
-            )
-        )
-        for line in lines[1:]:
-            key, value = line.rstrip(b"\n").split(b": ", 1)
-            if key not in allowed_keys:
-                raise BzrFormatsError(f"Unknown key in inventory: {key!r}\n{bytes!r}")
-            if key in info:
-                raise BzrFormatsError(f"Duplicate key in inventory: {key!r}\n{bytes!r}")
-            info[key] = value
-        revision_id = info[b"revision_id"]
-        root_id = info[b"root_id"]
-        search_key_name = info.get(b"search_key_name", b"plain")
-        parent_id_basename_to_file_id = info.get(b"parent_id_basename_to_file_id")
-        if not parent_id_basename_to_file_id.startswith(b"sha1:"):
-            raise ValueError(
-                "parent_id_basename_to_file_id should be a sha1"
-                f" key not {parent_id_basename_to_file_id!r}"
-            )
-        id_to_entry = info[b"id_to_entry"]
-        if not id_to_entry.startswith(b"sha1:"):
-            raise ValueError(f"id_to_entry should be a sha1 key not {id_to_entry!r}")
-
-        result = CHKInventory(search_key_name)
-        result.revision_id = revision_id
-        result.root_id = root_id
-        from . import chk_map
-
-        search_key_func = chk_map.search_key_registry.get(result._search_key_name)
-        if parent_id_basename_to_file_id is not None:
-            result.parent_id_basename_to_file_id = chk_map.CHKMap(
-                chk_store,
-                (parent_id_basename_to_file_id,),
-                search_key_func=search_key_func,
-            )
-        else:
-            result.parent_id_basename_to_file_id = None
-
-        result.id_to_entry = chk_map.CHKMap(
-            chk_store,
-            (id_to_entry,),
-            search_key_func=search_key_func,
-        )
-        if (result.revision_id,) != expected_revision_id:
-            raise ValueError(
-                f"Mismatched revision id and expected: {result.revision_id!r}, {expected_revision_id!r}"
-            )
-        return result
-
-    @classmethod
-    def from_inventory(
-        klass, chk_store, inventory, maximum_size=0, search_key_name=b"plain"
-    ):
-        """Create a CHKInventory from an existing inventory.
-
-        The content of inventory is copied into the chk_store, and a
-        CHKInventory referencing that is returned.
-
-        :param chk_store: A CHK capable VersionedFiles instance.
-        :param inventory: The inventory to copy.
-        :param maximum_size: The CHKMap node size limit.
-        :param search_key_name: The identifier for the search key function
-        """
-        result = klass(search_key_name)
-        result.revision_id = inventory.revision_id
-        result.root_id = inventory.root.file_id
-
-        parent_id_basename_key = result._parent_id_basename_key
-        id_to_entry_dict = {}
-        parent_id_basename_dict = {}
-        for _path, entry in inventory.iter_entries():
-            key = (entry.file_id,)
-            id_to_entry_dict[key] = _chk_inventory_entry_to_bytes(entry)
-            p_id_key = parent_id_basename_key(entry)
-            parent_id_basename_dict[p_id_key] = entry.file_id
-
-        result._populate_from_dicts(
-            chk_store,
-            id_to_entry_dict,
-            parent_id_basename_dict,
-            maximum_size=maximum_size,
-        )
-        return result
-
-    def _populate_from_dicts(
-        self, chk_store, id_to_entry_dict, parent_id_basename_dict, maximum_size
-    ):
-        from . import chk_map
-
-        search_key_func = chk_map.search_key_registry.get(self._search_key_name)
-        root_key = chk_map.CHKMap.from_dict(
-            chk_store,
-            id_to_entry_dict,
-            maximum_size=maximum_size,
-            key_width=1,
-            search_key_func=search_key_func,
-        )
-        self.id_to_entry = chk_map.CHKMap(chk_store, root_key, search_key_func)
-        root_key = chk_map.CHKMap.from_dict(
-            chk_store,
-            parent_id_basename_dict,
-            maximum_size=maximum_size,
-            key_width=2,
-            search_key_func=search_key_func,
-        )
-        self.parent_id_basename_to_file_id = chk_map.CHKMap(
-            chk_store, root_key, search_key_func
-        )
-
     def _preload_cache(self):
         """Make sure all file-ids are in _fileid_to_entry_cache."""
         if self._fully_cached:
@@ -695,30 +564,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
                 kind,
                 executable,
             )
-
-    def to_lines(self):
-        """Serialise the inventory to lines."""
-        lines = [b"chkinventory:\n"]
-        if self._search_key_name != b"plain":
-            # custom ordering grouping things that don't change together
-            lines.append(b"search_key_name: %s\n" % (self._search_key_name))
-            lines.append(b"root_id: %s\n" % self.root_id)
-            lines.append(
-                b"parent_id_basename_to_file_id: %s\n"
-                % (self.parent_id_basename_to_file_id.key()[0],)
-            )
-            lines.append(b"revision_id: %s\n" % self.revision_id)
-            lines.append(b"id_to_entry: %s\n" % (self.id_to_entry.key()[0],))
-        else:
-            lines.append(b"revision_id: %s\n" % self.revision_id)
-            lines.append(b"root_id: %s\n" % self.root_id)
-            if self.parent_id_basename_to_file_id is not None:
-                lines.append(
-                    b"parent_id_basename_to_file_id: %s\n"
-                    % (self.parent_id_basename_to_file_id.key()[0],)
-                )
-            lines.append(b"id_to_entry: %s\n" % (self.id_to_entry.key()[0],))
-        return lines
 
 
 entry_factory = {

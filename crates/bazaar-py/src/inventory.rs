@@ -2950,12 +2950,12 @@ impl CHKInventory {
     /// expected_revision_id)`.
     #[classmethod]
     fn deserialise<'py>(
-        _cls: &Bound<'_, pyo3::types::PyType>,
+        cls: &Bound<'py, pyo3::types::PyType>,
         py: Python<'py>,
         chk_store: Bound<'_, PyAny>,
         lines: Bound<'_, PyAny>,
         expected_revision_id: Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, CHKInventory>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         // Collect lines into a Vec<Vec<u8>>.
         let mut line_vec: Vec<Vec<u8>> = Vec::new();
         for line in lines.try_iter()? {
@@ -3065,18 +3065,19 @@ impl CHKInventory {
         } else {
             None
         };
-        let inv = CHKInventory {
-            search_key_name,
-            root_id: Some(FileId::from(root_id.as_slice())),
-            revision_id: Some(RevisionId::from(revision_id.as_slice())),
-            id_to_entry: Some(id_chkmap),
-            parent_id_basename_to_file_id: pid_chkmap,
-            fileid_to_entry_cache: PyDict::new(py).unbind(),
-            fully_cached: false,
-            path_to_fileid_cache: PyDict::new(py).unbind(),
-            children_cache: PyDict::new(py).unbind(),
-        };
-        Bound::new(py, inv)
+        // Construct via cls(search_key_name) so subclasses get a
+        // subclass instance instead of a bare pyclass instance.
+        let args = PyTuple::new(py, [PyBytes::new(py, &search_key_name)])?;
+        let inv_obj = cls.call1(args)?;
+        {
+            let inv_cell = inv_obj.downcast::<CHKInventory>()?;
+            let mut inv = inv_cell.borrow_mut();
+            inv.root_id = Some(FileId::from(root_id.as_slice()));
+            inv.revision_id = Some(RevisionId::from(revision_id.as_slice()));
+            inv.id_to_entry = Some(id_chkmap);
+            inv.parent_id_basename_to_file_id = pid_chkmap;
+        }
+        Ok(inv_obj)
     }
 
     /// Bulk-create a CHKInventory from an existing inventory.
@@ -3085,13 +3086,13 @@ impl CHKInventory {
     #[classmethod]
     #[pyo3(signature = (chk_store, inventory, maximum_size=0, search_key_name=None))]
     fn from_inventory<'py>(
-        _cls: &Bound<'_, pyo3::types::PyType>,
+        cls: &Bound<'py, pyo3::types::PyType>,
         py: Python<'py>,
         chk_store: Bound<'py, PyAny>,
         inventory: Bound<'py, PyAny>,
         maximum_size: usize,
         search_key_name: Option<&[u8]>,
-    ) -> PyResult<Bound<'py, CHKInventory>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let search_key_name = search_key_name.unwrap_or(b"plain");
         // Build the two seed dicts by walking inventory.iter_entries().
         let id_to_entry_dict = PyDict::new(py);
@@ -3120,31 +3121,39 @@ impl CHKInventory {
             let p_id_key = PyTuple::new(py, [parent_bytes, name_bytes])?;
             pid_dict.set_item(p_id_key, &file_id)?;
         }
-        // Construct an empty inventory and populate its two maps.
+        // Construct an empty inventory via cls(search_key_name) so
+        // subclasses get a subclass instance.
         let root_id = inventory.getattr("root")?.getattr("file_id")?;
         let revision_id = inventory.getattr("revision_id")?;
-        let inv = CHKInventory {
-            search_key_name: search_key_name.to_vec(),
-            root_id: Some(FileId::from(root_id.cast_into::<PyBytes>()?.as_bytes())),
-            revision_id: Some(RevisionId::from(
-                revision_id.cast_into::<PyBytes>()?.as_bytes(),
-            )),
-            id_to_entry: None,
-            parent_id_basename_to_file_id: None,
-            fileid_to_entry_cache: PyDict::new(py).unbind(),
-            fully_cached: false,
-            path_to_fileid_cache: PyDict::new(py).unbind(),
-            children_cache: PyDict::new(py).unbind(),
-        };
-        let bound_inv = Bound::new(py, inv)?;
-        bound_inv.borrow_mut().populate_from_dicts(
-            py,
-            &chk_store,
-            id_to_entry_dict.into_any(),
-            pid_dict.into_any(),
-            maximum_size,
-        )?;
-        Ok(bound_inv)
+        let args = PyTuple::new(py, [PyBytes::new(py, search_key_name)])?;
+        let inv_obj = cls.call1(args)?;
+        {
+            let inv_cell = inv_obj.downcast::<CHKInventory>()?;
+            let mut inv = inv_cell.borrow_mut();
+            inv.root_id = if root_id.is_none() {
+                None
+            } else {
+                Some(FileId::from(root_id.cast_into::<PyBytes>()?.as_bytes()))
+            };
+            inv.revision_id = if revision_id.is_none() {
+                None
+            } else {
+                Some(RevisionId::from(
+                    revision_id.cast_into::<PyBytes>()?.as_bytes(),
+                ))
+            };
+        }
+        {
+            let inv_cell = inv_obj.downcast::<CHKInventory>()?;
+            inv_cell.borrow_mut().populate_from_dicts(
+                py,
+                &chk_store,
+                id_to_entry_dict.into_any(),
+                pid_dict.into_any(),
+                maximum_size,
+            )?;
+        }
+        Ok(inv_obj)
     }
 
     /// Populate `id_to_entry` and `parent_id_basename_to_file_id`
