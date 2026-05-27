@@ -32,6 +32,13 @@ fn crc32(bit: &[u8]) -> u32 {
 
 pub type SerialisedKey = Vec<u8>;
 
+/// If a ChildNode falls below this many bytes, we check for a remap.
+/// Mirrors Python's `_INTERESTING_NEW_SIZE`.
+pub const INTERESTING_NEW_SIZE: usize = 50;
+/// If a ChildNode shrinks by more than this amount, we check for a remap.
+/// Mirrors Python's `_INTERESTING_SHRINKAGE_LIMIT`.
+pub const INTERESTING_SHRINKAGE_LIMIT: usize = 20;
+
 /// Map the key tuple into a search string that just uses the key bytes.
 pub fn search_key_plain(key: &Key) -> SerializedKey {
     key.0.join(&b'\x00')
@@ -1149,23 +1156,67 @@ impl Node {
         }
     }
 
-    /// Insert `(key, value)` into this subtree, returning whether the
-    /// node was modified in place or split into multiple children.
+    /// Insert `(key, value)` into this subtree (pure in-memory path).
     ///
     /// For leaves, delegates to `LeafNode::map`. For internal nodes,
-    /// only the in-memory recursion path is implemented here — the
-    /// store-touching demand-load logic is added separately by
-    /// `InternalNode::map_with_store` once the recursion needs it.
-    /// (Used by `LeafNode::split` when sub-leaves are themselves
-    /// in-memory.)
+    /// returns AssertionFailed — the recursive InternalNode path
+    /// needs the store and lives at `Node::map_with_store`. This
+    /// signature exists so `LeafNode::split` (which only ever creates
+    /// fresh in-memory sub-leaves) can recurse via `Node::map`
+    /// without a store argument.
     pub fn map(&mut self, key: Vec<Vec<u8>>, value: Vec<u8>) -> Result<MapResult, Error> {
         match self {
             Node::Leaf(l) => l.map(key, value),
             Node::Internal(_) => Err(Error::AssertionFailed(
                 "Node::map on InternalNode requires a store — \
-                 use InternalNode::map_with_store"
+                 use Node::map_with_store"
                     .into(),
             )),
+        }
+    }
+
+    /// Recursive insert that may demand-load child pages from the
+    /// store. Mirrors Python's polymorphic dispatch:
+    /// `LeafNode.map(store, key, value)` for leaves;
+    /// `InternalNode.map(store, key, value)` for internal nodes
+    /// (which descends into the matching child, possibly creating a
+    /// new wrapping parent if the key falls outside the current
+    /// search prefix).
+    ///
+    /// May replace `*self` with a new node (e.g. an internal node
+    /// promoting itself into a larger parent, or a parent collapsing
+    /// back into a leaf after `_check_remap`).
+    pub fn map_with_store<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+        key: Vec<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<MapResult, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        match self {
+            Node::Leaf(l) => l.map(key, value),
+            Node::Internal(_) => {
+                // We need to potentially replace `*self`. Take the
+                // internal node out, run the algorithm against it,
+                // and put the result (possibly wrapped or collapsed)
+                // back into `*self`.
+                let placeholder = Node::Internal(Box::new(InternalNode::new(
+                    Vec::new(),
+                    SearchKeyFunc::Plain,
+                )));
+                let owned = std::mem::replace(self, placeholder);
+                let internal = match owned {
+                    Node::Internal(b) => b,
+                    Node::Leaf(_) => unreachable!("matched Internal above"),
+                };
+                let (new_self, result) =
+                    internal_map_with_store(*internal, store, cache, key, value)?;
+                *self = new_self;
+                Ok(result)
+            }
         }
     }
 
@@ -1372,6 +1423,49 @@ impl InternalNode {
             common_prefix_many(self.items.keys().map(|k| k.as_slice())).map(|s| s.to_vec());
         self.search_prefix = prefix;
         self.search_prefix.as_deref()
+    }
+
+    /// Check whether this node's children can collapse back into a
+    /// single LeafNode. Returns either `self` (wrapped as
+    /// `Node::Internal`) when collapse isn't possible, or a freshly-
+    /// built `Node::Leaf` holding everything from this subtree.
+    ///
+    /// Mirrors Python's `InternalNode._check_remap`: walks children
+    /// in batches of 16, adding their entries into a candidate
+    /// LeafNode; if any child is itself an InternalNode, abort
+    /// (cheaper than walking further); if any insertion would overflow
+    /// the candidate, abort.
+    ///
+    /// Consumes `self` to allow returning either variant.
+    pub fn check_remap<S>(
+        mut self,
+        store: &S,
+        cache: &dyn PageCache,
+    ) -> Result<Node, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let mut new_leaf = LeafNode::new(self.search_key_func.clone());
+        new_leaf.maximum_size = self.maximum_size;
+        new_leaf.key_width = self.key_width;
+        let children = self.iter_nodes(store, cache, None, Some(16))?;
+        for (node, _) in children {
+            if let Node::Internal(_) = node {
+                // Any internal child means collapse is impossible.
+                return Ok(Node::Internal(Box::new(self)));
+            }
+            let leaf = match node {
+                Node::Leaf(l) => l,
+                Node::Internal(_) => unreachable!(),
+            };
+            for (k, v) in leaf.items {
+                if new_leaf.map_no_split(k, v) {
+                    // Overflow during accumulation — abort.
+                    return Ok(Node::Internal(Box::new(self)));
+                }
+            }
+        }
+        Ok(Node::Leaf(Box::new(new_leaf)))
     }
 
     /// Yield child nodes that match `key_filter`, demand-loading
@@ -1708,6 +1802,164 @@ pub fn deserialise_node(
         Ok(Node::Internal(Box::new(internal)))
     } else {
         Err(Error::AssertionFailed("Unknown node type.".into()))
+    }
+}
+
+/// Core of `InternalNode.map` — takes the node by value so it can
+/// optionally wrap itself in a new parent.
+///
+/// Returns `(replacement_node, MapResult)` where:
+/// * `replacement_node` is what should occupy the original parent
+///   slot. Usually the (mutated) self; may be a new wrapping parent
+///   when the inserted key falls outside `self.search_prefix`.
+/// * `MapResult` describes whether the *replacement* needs further
+///   wrapping at the level above.
+fn internal_map_with_store<S>(
+    mut node: InternalNode,
+    store: &S,
+    cache: &dyn PageCache,
+    key: Vec<Vec<u8>>,
+    value: Vec<u8>,
+) -> Result<(Node, MapResult), Error>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    if node.items.is_empty() {
+        return Err(Error::AssertionFailed(
+            "can't map in an empty InternalNode".into(),
+        ));
+    }
+    let key_obj = Key::from(key.clone());
+    let search_key = node.search_key(&key_obj);
+    let search_prefix = node
+        .search_prefix
+        .clone()
+        .ok_or_else(|| Error::AssertionFailed("search_prefix is None".into()))?;
+    if node.node_width != search_prefix.len() + 1 {
+        return Err(Error::AssertionFailed(format!(
+            "node width mismatch: {} is not {}",
+            node.node_width,
+            search_prefix.len() + 1
+        )));
+    }
+    if !search_key.starts_with(&search_prefix) {
+        // Inserted key falls outside our search prefix: wrap self in
+        // a new parent that has the broader prefix and recurse.
+        let new_prefix = common_prefix_pair(&search_prefix, &search_key).to_vec();
+        let mut new_parent =
+            InternalNode::new(new_prefix.clone(), node.search_key_func.clone());
+        new_parent.maximum_size = node.maximum_size;
+        new_parent.key_width = node.key_width;
+        // The wrapping parent's only child (initially) is `node`, at
+        // its current search prefix extended by one byte.
+        let wrap_prefix = search_prefix[..new_prefix.len() + 1].to_vec();
+        new_parent.add_node(wrap_prefix, Node::Internal(Box::new(node)))?;
+        // Recurse into the new parent.
+        return internal_map_with_store(new_parent, store, cache, key, value);
+    }
+    // Find the matching child via iter_nodes (which demand-loads).
+    let mut children = node.iter_nodes(store, cache, Some(&[key.clone()]), None)?;
+    let (mut child_node, _filter) = if children.is_empty() {
+        // No matching child — create a fresh LeafNode under
+        // `search_key`. Mirrors `_new_child(search_key, LeafNode)`.
+        let mut leaf = LeafNode::new(node.search_key_func.clone());
+        leaf.maximum_size = node.maximum_size;
+        leaf.key_width = node.key_width;
+        let new_leaf = Node::Leaf(Box::new(leaf));
+        node.items
+            .insert(search_key.clone(), NodeRef::Loaded(new_leaf.clone()));
+        (new_leaf, None)
+    } else {
+        children.remove(0)
+    };
+    let old_len = child_node.len();
+    let old_size = match &child_node {
+        Node::Leaf(l) => Some(l.current_size()),
+        Node::Internal(_) => None,
+    };
+    let map_res = child_node.map_with_store(store, cache, key, value)?;
+    match map_res {
+        MapResult::InPlace { .. } => {
+            // Child absorbed in place. Update items, len, and run
+            // _check_remap if applicable.
+            let new_len = child_node.len();
+            node.len = node.len + new_len - old_len;
+            node.items
+                .insert(search_key.clone(), NodeRef::Loaded(child_node.clone()));
+            node.key = None;
+            // _check_remap heuristics.
+            let new_self = match &child_node {
+                Node::Leaf(child_leaf) => {
+                    if old_size.is_none() {
+                        // Child was previously an internal that
+                        // collapsed to a leaf — definitely remap.
+                        node.check_remap(store, cache)?
+                    } else {
+                        let new_size = child_leaf.current_size();
+                        let shrinkage = old_size.unwrap().saturating_sub(new_size);
+                        if (shrinkage > 0 && new_size < INTERESTING_NEW_SIZE)
+                            || shrinkage > INTERESTING_SHRINKAGE_LIMIT
+                        {
+                            node.check_remap(store, cache)?
+                        } else {
+                            Node::Internal(Box::new(node))
+                        }
+                    }
+                }
+                Node::Internal(_) => Node::Internal(Box::new(node)),
+            };
+            let prefix = match &new_self {
+                Node::Leaf(l) => match &l.search_prefix {
+                    SearchPrefix::Computed(Some(p)) => p.clone(),
+                    SearchPrefix::Computed(None) => Vec::new(),
+                    SearchPrefix::Unknown => {
+                        return Err(Error::AssertionFailed(
+                            "search_prefix unknown after map".into(),
+                        ))
+                    }
+                },
+                Node::Internal(n) => n
+                    .search_prefix
+                    .clone()
+                    .ok_or_else(|| Error::AssertionFailed("search_prefix is None".into()))?,
+            };
+            Ok((
+                new_self,
+                MapResult::InPlace {
+                    search_prefix: prefix,
+                },
+            ))
+        }
+        MapResult::Split {
+            common_serialised_prefix: child_prefix,
+            children: split_children,
+        } => {
+            // Child overflowed: build a new intermediate InternalNode
+            // at the split prefix and add all the split children.
+            let mut intermediate =
+                InternalNode::new(child_prefix.clone(), node.search_key_func.clone());
+            intermediate.maximum_size = node.maximum_size;
+            intermediate.key_width = node.key_width;
+            for (sp, ch) in split_children {
+                intermediate.add_node(sp, ch)?;
+            }
+            let new_child = Node::Internal(Box::new(intermediate));
+            let new_len = new_child.len();
+            node.items
+                .insert(search_key, NodeRef::Loaded(new_child));
+            node.len = node.len + new_len - old_len;
+            node.key = None;
+            let prefix = node
+                .search_prefix
+                .clone()
+                .unwrap_or_default();
+            Ok((
+                Node::Internal(Box::new(node)),
+                MapResult::InPlace {
+                    search_prefix: prefix,
+                },
+            ))
+        }
     }
 }
 
@@ -2377,6 +2629,70 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
             Err(crate::knit::KnitError::NotImplemented("annotate"))
         }
+    }
+
+    #[test]
+    fn node_map_with_store_descends_into_internal_child() {
+        // Build an InternalNode with two leaf children that have
+        // distinct first-byte search keys; insert a new entry that
+        // belongs in one of them.
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"alpha"]), b"va".to_vec());
+        let mut leaf_b = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_b.map_no_split(key_vec(&[b"beta"]), b"vb".to_vec());
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal
+            .add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        internal
+            .add_node(b"b".to_vec(), Node::Leaf(Box::new(leaf_b)))
+            .unwrap();
+        let mut node = Node::Internal(Box::new(internal));
+        let r = node
+            .map_with_store(&store, &cache, key_vec(&[b"apple"]), b"vap".to_vec())
+            .unwrap();
+        assert!(matches!(r, MapResult::InPlace { .. }));
+        // The leaf under "a" should now have two entries.
+        let mut all_items = node.iteritems(&store, &cache, None).unwrap();
+        all_items.sort();
+        assert_eq!(
+            all_items,
+            vec![
+                (key_vec(&[b"alpha"]), b"va".to_vec()),
+                (key_vec(&[b"apple"]), b"vap".to_vec()),
+                (key_vec(&[b"beta"]), b"vb".to_vec()),
+            ]
+        );
+        assert_eq!(node.len(), 3);
+    }
+
+    #[test]
+    fn node_map_with_store_creates_new_child_if_no_match() {
+        // Insert into a slot that doesn't have a child yet.
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal
+            .add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        let mut node = Node::Internal(Box::new(internal));
+        let r = node
+            .map_with_store(&store, &cache, key_vec(&[b"b"]), b"vb".to_vec())
+            .unwrap();
+        assert!(matches!(r, MapResult::InPlace { .. }));
+        let mut items = node.iteritems(&store, &cache, None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"a"]), b"va".to_vec()),
+                (key_vec(&[b"b"]), b"vb".to_vec()),
+            ]
+        );
     }
 
     #[test]
