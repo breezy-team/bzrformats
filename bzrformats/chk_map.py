@@ -395,57 +395,6 @@ def _chkmap_iter_changes(self, basis):
                     process_node(node, path, basis, basis_pending)
 
 
-def _chkmap_iteritems(self, key_filter=None):
-    """Iterate over the entire CHKMap's contents."""
-    self._ensure_root()
-    if isinstance(self._root_node, tuple):
-        raise AssertionError("Cannot iterate over a map with a tuple root node")
-    if key_filter is not None:
-        key_filter = [tuple(key) for key in key_filter]
-    return iter(self._root_node.iteritems(self._store, key_filter=key_filter))
-
-
-def _chkmap_map(self, key, value):
-    """Map a key tuple to value."""
-    key = tuple(key)
-    self._ensure_root()
-    if isinstance(self._root_node, tuple):
-        raise AssertionError("Cannot map a key to a tuple root node")
-    prefix, node_details = self._root_node.map(self._store, key, value)
-    if len(node_details) == 1:
-        self._root_node = node_details[0][1]
-    else:
-        self._root_node = InternalNode(prefix, search_key_func=self._search_key_func)
-        self._root_node.set_maximum_size(node_details[0][1].maximum_size)
-        self._root_node._key_width = node_details[0][1]._key_width
-        for split, node in node_details:
-            self._root_node.add_node(split, node)
-
-
-def _chkmap_unmap(self, key, check_remap=True):
-    """Remove key from the map."""
-    self._ensure_root()
-    if isinstance(self._root_node, InternalNode):
-        unmapped = self._root_node.unmap(self._store, key, check_remap=check_remap)
-    else:
-        unmapped = self._root_node.unmap(self._store, key)
-    self._root_node = unmapped
-
-
-def _chkmap_check_remap(self):
-    self._ensure_root()
-    if isinstance(self._root_node, InternalNode):
-        self._root_node = self._root_node._check_remap(self._store)
-
-
-def _chkmap_save(self):
-    """Save the map completely; return the root key."""
-    if isinstance(self._root_node, tuple):
-        return self._root_node
-    keys = list(self._root_node.serialise(self._store))
-    return keys[-1]
-
-
 # Bind orchestration methods onto the CHKMap pyclass at module load.
 CHKMap.apply_delta = _chkmap_apply_delta
 CHKMap._dump_tree = _chkmap_dump_tree
@@ -454,11 +403,6 @@ CHKMap.from_dict = _chkmap_from_dict
 CHKMap._create_via_map = _chkmap_create_via_map
 CHKMap._create_directly = _chkmap_create_directly
 CHKMap.iter_changes = _chkmap_iter_changes
-CHKMap.iteritems = _chkmap_iteritems
-CHKMap.map = _chkmap_map
-CHKMap.unmap = _chkmap_unmap
-CHKMap._check_remap = _chkmap_check_remap
-CHKMap._save = _chkmap_save
 
 
 class Node(metaclass=abc.ABCMeta):

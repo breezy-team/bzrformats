@@ -1488,6 +1488,175 @@ impl CHKMap {
         node.call_method0("key")
     }
 
+    /// Iterate over the entire CHKMap's contents, optionally
+    /// filtered by `key_filter`. Mirrors Python's `_chkmap_iteritems`.
+    #[pyo3(signature = (key_filter=None))]
+    fn iteritems<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        key_filter: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::_ensure_root(slf.clone(), py)?;
+        let root = slf.borrow().root_node.clone_ref(py);
+        let root_bound = root.bind(py);
+        if root_bound.clone().cast_into::<PyTuple>().is_ok() {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(
+                "Cannot iterate over a map with a tuple root node",
+            ));
+        }
+        // Normalise key_filter: each entry must be a tuple.
+        let normalised_filter = match key_filter {
+            None => None,
+            Some(kf) => {
+                let lst = PyList::empty(py);
+                for k in kf.try_iter()? {
+                    let k = k?;
+                    if k.clone().cast_into::<PyTuple>().is_ok() {
+                        lst.append(k)?;
+                    } else {
+                        // tuple(k)
+                        let t = pyo3::types::PyTuple::new(
+                            py,
+                            k.try_iter()?.collect::<PyResult<Vec<_>>>()?,
+                        )?;
+                        lst.append(t)?;
+                    }
+                }
+                Some(lst.into_any())
+            }
+        };
+        let store = slf.borrow().store.clone_ref(py);
+        let kwargs = PyDict::new(py);
+        if let Some(kf) = &normalised_filter {
+            kwargs.set_item("key_filter", kf)?;
+        }
+        let iter = root_bound.call_method(
+            "iteritems",
+            (store,),
+            Some(&kwargs),
+        )?;
+        Ok(iter.call_method0("__iter__")?)
+    }
+
+    /// Drop `key` from the map, possibly collapsing internal nodes.
+    /// Mirrors Python's `_chkmap_unmap`.
+    #[pyo3(signature = (key, check_remap=true))]
+    fn unmap<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+        check_remap: bool,
+    ) -> PyResult<()> {
+        Self::_ensure_root(slf.clone(), py)?;
+        let root = slf.borrow().root_node.clone_ref(py);
+        let store = slf.borrow().store.clone_ref(py);
+        let is_internal = root.bind(py).is_instance_of::<InternalNode>();
+        let unmapped = if is_internal {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("check_remap", check_remap)?;
+            root.bind(py)
+                .call_method("unmap", (store, key), Some(&kwargs))?
+        } else {
+            root.bind(py).call_method1("unmap", (store, key))?
+        };
+        slf.borrow_mut().root_node = unmapped.unbind();
+        Ok(())
+    }
+
+    /// Force an internal-node remap check. Mirrors Python's
+    /// `_chkmap_check_remap`.
+    fn _check_remap(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<()> {
+        Self::_ensure_root(slf.clone(), py)?;
+        let root = slf.borrow().root_node.clone_ref(py);
+        if root.bind(py).is_instance_of::<InternalNode>() {
+            let store = slf.borrow().store.clone_ref(py);
+            let new_root = root.bind(py).call_method1("_check_remap", (store,))?;
+            slf.borrow_mut().root_node = new_root.unbind();
+        }
+        Ok(())
+    }
+
+    /// Save the map completely; return the root key. Mirrors Python's
+    /// `_chkmap_save`.
+    fn _save<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let root = self.root_node.bind(py);
+        if root.clone().cast_into::<PyTuple>().is_ok() {
+            return Ok(root.clone());
+        }
+        let store = self.store.bind(py);
+        let keys: Vec<Bound<'py, PyAny>> = root
+            .call_method1("serialise", (store,))?
+            .try_iter()?
+            .collect::<PyResult<Vec<_>>>()?;
+        keys.into_iter().next_back().ok_or_else(|| {
+            pyo3::exceptions::PyAssertionError::new_err("serialise returned no keys")
+        })
+    }
+
+    /// Map `key` to `value`. May replace the root with a fresh
+    /// InternalNode if the map split. Mirrors Python's `_chkmap_map`.
+    fn map<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+        value: Bound<'py, PyAny>,
+    ) -> PyResult<()> {
+        // Coerce key to tuple.
+        let key_tuple = if key.clone().cast_into::<PyTuple>().is_ok() {
+            key
+        } else {
+            PyTuple::new(py, key.try_iter()?.collect::<PyResult<Vec<_>>>()?)?
+                .into_any()
+        };
+        Self::_ensure_root(slf.clone(), py)?;
+        let root = slf.borrow().root_node.clone_ref(py);
+        if root.bind(py).clone().cast_into::<PyTuple>().is_ok() {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(
+                "Cannot map a key to a tuple root node",
+            ));
+        }
+        let store = slf.borrow().store.clone_ref(py);
+        let result = root
+            .bind(py)
+            .call_method1("map", (store, key_tuple, value))?;
+        let result_tup = result.cast_into::<PyTuple>()?;
+        let prefix = result_tup.get_item(0)?;
+        let node_details = result_tup.get_item(1)?;
+        let node_details: Vec<Bound<'py, PyAny>> =
+            node_details.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+        if node_details.len() == 1 {
+            let pair = node_details[0].clone().cast_into::<PyTuple>()?;
+            slf.borrow_mut().root_node = pair.get_item(1)?.unbind();
+        } else {
+            // Build a new InternalNode covering all splits.
+            let internal_cls = py.get_type::<InternalNode>();
+            let search_key_callable = slf
+                .borrow()
+                .search_key_callable
+                .as_ref()
+                .map(|c| c.clone_ref(py));
+            let kwargs = PyDict::new(py);
+            if let Some(cb) = &search_key_callable {
+                kwargs.set_item("search_key_func", cb)?;
+            }
+            let new_root = internal_cls.call((prefix,), Some(&kwargs))?;
+            let first = node_details[0].clone().cast_into::<PyTuple>()?;
+            let first_node = first.get_item(1)?;
+            let first_max: usize = first_node.getattr("maximum_size")?.extract()?;
+            new_root.call_method1("set_maximum_size", (first_max,))?;
+            let first_kw: usize = first_node.getattr("_key_width")?.extract()?;
+            new_root.setattr("_key_width", first_kw)?;
+            for d in &node_details {
+                let pair = d.clone().cast_into::<PyTuple>()?;
+                let split = pair.get_item(0)?;
+                let node = pair.get_item(1)?;
+                new_root.call_method1("add_node", (split, node))?;
+            }
+            slf.borrow_mut().root_node = new_root.unbind();
+        }
+        Ok(())
+    }
+
     /// Fetch the raw bytes for a CHK key. Consults the
     /// process-wide page cache before going to the store.
     /// Mirrors Python's `_chkmap_read_bytes`.
