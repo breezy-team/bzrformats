@@ -293,9 +293,30 @@ fn py_unknown_sentinel(py: Python<'_>) -> Py<PyAny> {
 static DEFAULT_SEARCH_KEY_PLAIN: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 fn default_search_key_plain(py: Python<'_>) -> &Py<PyAny> {
-    DEFAULT_SEARCH_KEY_PLAIN.get(py).expect(
-        "DEFAULT_SEARCH_KEY_PLAIN not initialised; call _chk_map_rs(py) first",
-    )
+    DEFAULT_SEARCH_KEY_PLAIN
+        .get(py)
+        .expect("DEFAULT_SEARCH_KEY_PLAIN not initialised; call _chk_map_rs(py) first")
+}
+
+/// Lazily-initialised pyfunction callables for the three registered
+/// search-key variants. Populated by `_chk_map_rs(py)` at module load.
+static SEARCH_KEY_16_CALLABLE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static SEARCH_KEY_255_CALLABLE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// Resolve a `search_key_name` (b"plain" / b"hash-16-way" /
+/// b"hash-255-way") to the matching Python callable. Returns
+/// `None` for unknown names.
+///
+/// Available cross-module (e.g. from `inventory.rs`) so siblings
+/// don't need to `py.import("bzrformats._bzr_rs.chk_map")` to find
+/// the registered callable for a given search-key variant.
+pub(crate) fn search_key_callable_for_name<'py>(py: Python<'py>, name: &[u8]) -> Option<Py<PyAny>> {
+    match name {
+        b"plain" => Some(default_search_key_plain(py).clone_ref(py)),
+        b"hash-16-way" => SEARCH_KEY_16_CALLABLE.get(py).map(|c| c.clone_ref(py)),
+        b"hash-255-way" => SEARCH_KEY_255_CALLABLE.get(py).map(|c| c.clone_ref(py)),
+        _ => None,
+    }
 }
 
 /// Resolve a Python `_search_key_func` callable to a `SearchKeyFunc`.
@@ -784,13 +805,9 @@ impl LeafNode {
         let pairs = self.inner.iteritems(filter_vec.as_deref());
         let list = PyList::empty(py);
         for (k, v) in pairs {
-            let parts: Vec<Bound<PyBytes>> =
-                k.iter().map(|p| PyBytes::new(py, p)).collect();
+            let parts: Vec<Bound<PyBytes>> = k.iter().map(|p| PyBytes::new(py, p)).collect();
             let key_tuple = PyTuple::new(py, parts)?;
-            let pair = PyTuple::new(
-                py,
-                [key_tuple.into_any(), PyBytes::new(py, &v).into_any()],
-            )?;
+            let pair = PyTuple::new(py, [key_tuple.into_any(), PyBytes::new(py, &v).into_any()])?;
             list.append(pair)?;
         }
         Ok(list)
@@ -926,12 +943,7 @@ impl InternalNode {
         };
         format!(
             "InternalNode(key:{} len:{} size:{} max:{} prefix:{} items:{})",
-            key_dbg,
-            self.len,
-            self.raw_size,
-            self.maximum_size,
-            prefix_dbg,
-            items_short,
+            key_dbg, self.len, self.raw_size, self.maximum_size, prefix_dbg, items_short,
         )
     }
 
@@ -954,18 +966,10 @@ impl InternalNode {
     /// Add a child under `prefix`. Mirrors Python's `add_node`:
     /// validates that `prefix` extends `_search_prefix` by exactly
     /// one byte, updates `_len` and `_node_width`, clears `_key`.
-    fn add_node(
-        &mut self,
-        py: Python<'_>,
-        prefix: &[u8],
-        node: Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        let sp = self
-            .search_prefix
-            .as_deref()
-            .ok_or_else(|| pyo3::exceptions::PyAssertionError::new_err(
-                "_search_prefix should not be None",
-            ))?;
+    fn add_node(&mut self, py: Python<'_>, prefix: &[u8], node: Bound<'_, PyAny>) -> PyResult<()> {
+        let sp = self.search_prefix.as_deref().ok_or_else(|| {
+            pyo3::exceptions::PyAssertionError::new_err("_search_prefix should not be None")
+        })?;
         if !prefix.starts_with(sp) {
             return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
                 "prefixes mismatch: {:?} must start with {:?}",
@@ -1039,10 +1043,7 @@ impl InternalNode {
         Ok(PyBytes::new(py, &bytes))
     }
 
-    fn _compute_search_prefix<'py>(
-        &mut self,
-        py: Python<'py>,
-    ) -> PyResult<Py<PyAny>> {
+    fn _compute_search_prefix<'py>(&mut self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         // common_prefix_many over the keys of self.items.
         let dict = self.items.bind(py);
         let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -1200,11 +1201,7 @@ impl InternalNode {
     }
 
     #[setter]
-    fn set__search_key_func(
-        &mut self,
-        py: Python<'_>,
-        value: Bound<'_, PyAny>,
-    ) -> PyResult<()> {
+    fn set__search_key_func(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
         if value.is_none() {
             self.search_key_func = SearchKeyFunc::Plain;
             self.search_key_callable = None;
@@ -1236,10 +1233,7 @@ impl InternalNode {
             }
         };
         let key_bytes = if let Ok(t) = key.clone().cast_into::<PyTuple>() {
-            t.get_item(0)?
-                .cast_into::<PyBytes>()?
-                .as_bytes()
-                .to_vec()
+            t.get_item(0)?.cast_into::<PyBytes>()?.as_bytes().to_vec()
         } else if let Ok(b) = key.cast_into::<PyBytes>() {
             b.as_bytes().to_vec()
         } else {
@@ -1278,10 +1272,10 @@ impl InternalNode {
 /// can drive the heterogeneous root via duck typing.
 #[pyclass(module = "bzrformats._bzr_rs.chk_map", name = "CHKMap")]
 pub struct CHKMap {
-    store: Py<PyAny>,
-    root_node: Py<PyAny>,
-    search_key_func: SearchKeyFunc,
-    search_key_callable: Option<Py<PyAny>>,
+    pub(crate) store: Py<PyAny>,
+    pub(crate) root_node: Py<PyAny>,
+    pub(crate) search_key_func: SearchKeyFunc,
+    pub(crate) search_key_callable: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -1364,11 +1358,7 @@ impl CHKMap {
     }
 
     #[setter]
-    fn set__search_key_func(
-        &mut self,
-        py: Python<'_>,
-        value: Bound<'_, PyAny>,
-    ) -> PyResult<()> {
+    fn set__search_key_func(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
         if value.is_none() {
             self.search_key_func = SearchKeyFunc::Plain;
             self.search_key_callable = None;
@@ -1397,12 +1387,19 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(py_internal_node_current_size))?;
     m.add_wrapped(wrap_pyfunction!(py_are_search_keys_identical))?;
     m.add_wrapped(wrap_pyfunction!(py_search_key_by_name))?;
-    // Stash the `_search_key_plain` pyfunction as the default
-    // callable so pyclass `#[new]` methods can hand it back from
-    // `_search_key_func` when no callable was passed at construction.
-    let plain_fn = wrap_pyfunction!(_search_key_plain)(&m)?;
+    // Stash the per-variant pyfunctions so pyclass `#[new]` and
+    // cross-module helpers (`search_key_callable_for_name`) can hand
+    // them back without going through Python's search-key registry.
+    // Use `m.getattr` after add so we share the same Python object
+    // that callers see via the module — preserves callable identity.
     DEFAULT_SEARCH_KEY_PLAIN
-        .set(py, plain_fn.into_any().unbind())
+        .set(py, m.getattr("_search_key_plain")?.unbind())
+        .ok();
+    SEARCH_KEY_16_CALLABLE
+        .set(py, m.getattr("_search_key_16")?.unbind())
+        .ok();
+    SEARCH_KEY_255_CALLABLE
+        .set(py, m.getattr("_search_key_255")?.unbind())
         .ok();
     // Expose the `_unknown` sentinel itself so Python can re-export it
     // as `chk_map._unknown` and identity comparisons line up with what

@@ -1815,7 +1815,11 @@ fn chk_inventory_bytes_to_utf8name_key<'py>(
 /// in-memory caches. Orchestration methods (get_entry, has_id, id2path,
 /// path2id, get_children, get_child, iter_entries, etc.) are
 /// monkey-patched on from `bzrformats/inventory.py`.
-#[pyclass(module = "bzrformats._bzr_rs.inventory", name = "CHKInventory", subclass)]
+#[pyclass(
+    module = "bzrformats._bzr_rs.inventory",
+    name = "CHKInventory",
+    subclass
+)]
 pub struct CHKInventory {
     search_key_name: Vec<u8>,
     root_id: Option<FileId>,
@@ -1936,18 +1940,12 @@ impl CHKInventory {
     }
 
     #[getter]
-    fn _fileid_to_entry_cache<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> Bound<'py, pyo3::types::PyDict> {
+    fn _fileid_to_entry_cache<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyDict> {
         self.fileid_to_entry_cache.bind(py).clone()
     }
 
     #[setter]
-    fn set__fileid_to_entry_cache(
-        &mut self,
-        value: Bound<'_, pyo3::types::PyDict>,
-    ) {
+    fn set__fileid_to_entry_cache(&mut self, value: Bound<'_, pyo3::types::PyDict>) {
         self.fileid_to_entry_cache = value.unbind();
     }
 
@@ -1962,26 +1960,17 @@ impl CHKInventory {
     }
 
     #[getter]
-    fn _path_to_fileid_cache<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> Bound<'py, pyo3::types::PyDict> {
+    fn _path_to_fileid_cache<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyDict> {
         self.path_to_fileid_cache.bind(py).clone()
     }
 
     #[setter]
-    fn set__path_to_fileid_cache(
-        &mut self,
-        value: Bound<'_, pyo3::types::PyDict>,
-    ) {
+    fn set__path_to_fileid_cache(&mut self, value: Bound<'_, pyo3::types::PyDict>) {
         self.path_to_fileid_cache = value.unbind();
     }
 
     #[getter]
-    fn _children_cache<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> Bound<'py, pyo3::types::PyDict> {
+    fn _children_cache<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyDict> {
         self.children_cache.bind(py).clone()
     }
 
@@ -1994,11 +1983,7 @@ impl CHKInventory {
 
     /// Compare two CHKInventory instances by sha1 keys of their two
     /// underlying CHKMaps. Mirrors Python's `__eq__`.
-    fn __eq__<'py>(
-        &self,
-        py: Python<'py>,
-        other: Bound<'py, PyAny>,
-    ) -> PyResult<bool> {
+    fn __eq__<'py>(&self, py: Python<'py>, other: Bound<'py, PyAny>) -> PyResult<bool> {
         // Only equal to another CHKInventory.
         let other_ref = match other.downcast::<CHKInventory>() {
             Ok(o) => o,
@@ -2082,10 +2067,7 @@ impl CHKInventory {
     /// True iff `filename` resolves to a file_id. Mirrors Python's
     /// `has_filename`. Dispatches through `path2id` (still Python-
     /// defined as of this commit; lifted in a later one).
-    fn has_filename(
-        slf: pyo3::Bound<'_, CHKInventory>,
-        filename: &str,
-    ) -> PyResult<bool> {
+    fn has_filename(slf: pyo3::Bound<'_, CHKInventory>, filename: &str) -> PyResult<bool> {
         let result = slf.call_method1("path2id", (filename,))?;
         Ok(!result.is_none())
     }
@@ -2143,10 +2125,7 @@ impl CHKInventory {
 
     /// Yield every entry in the inventory. Mirrors Python's
     /// `iter_just_entries`; populates the cache as it walks.
-    fn iter_just_entries<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyList>> {
+    fn iter_just_entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let out = PyList::empty(py);
         let map = self
             .id_to_entry
@@ -2296,9 +2275,10 @@ impl CHKInventory {
     /// Get the root entry. Mirrors Python's `root` property.
     #[getter]
     fn root<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let root_id = self.root_id.as_ref().ok_or_else(|| {
-            NoSuchId::new_err((py.None(), py.None()))
-        })?;
+        let root_id = self
+            .root_id
+            .as_ref()
+            .ok_or_else(|| NoSuchId::new_err((py.None(), py.None())))?;
         let id_bytes = PyBytes::new(py, root_id.as_bytes());
         self.get_entry(py, id_bytes.into_any())
     }
@@ -2324,11 +2304,7 @@ impl CHKInventory {
     /// Return the file_id at `relpath`, or `None` if not found.
     /// Mirrors Python's `path2id`. `relpath` can be a slash-separated
     /// string or a list of path components.
-    fn path2id<'py>(
-        &self,
-        py: Python<'py>,
-        relpath: Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyAny>> {
+    fn path2id<'py>(&self, py: Python<'py>, relpath: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         // Normalise `relpath` to (names: Vec<String>, joined: String).
         let (names, joined): (Vec<String>, String) =
             if let Ok(s) = relpath.clone().cast_into::<PyString>() {
@@ -2362,9 +2338,10 @@ impl CHKInventory {
             None => return Ok(py.None()),
             Some(id) => PyBytes::new(py, id.as_bytes()).into_any().unbind(),
         };
-        let parent_id_index = self.parent_id_basename_to_file_id.as_ref().ok_or_else(|| {
-            BzrFormatsError::new_err("parent_id_basename_to_file_id not set")
-        })?;
+        let parent_id_index = self
+            .parent_id_basename_to_file_id
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("parent_id_basename_to_file_id not set"))?;
         let mut cur_path: Option<String> = None;
         for basename in &names {
             cur_path = Some(match cur_path {
@@ -2378,10 +2355,8 @@ impl CHKInventory {
                 continue;
             }
             let basename_utf8 = PyBytes::new(py, basename.as_bytes());
-            let key_tuple = PyTuple::new(
-                py,
-                [current_id.bind(py).clone(), basename_utf8.into_any()],
-            )?;
+            let key_tuple =
+                PyTuple::new(py, [current_id.bind(py).clone(), basename_utf8.into_any()])?;
             let key_filter = PyList::new(py, [key_tuple])?;
             let items_iter = parent_id_index
                 .bind(py)
@@ -2455,9 +2430,10 @@ impl CHKInventory {
             }
         }
         if !remaining.is_empty() {
-            let id_to_entry = self.id_to_entry.as_ref().ok_or_else(|| {
-                BzrFormatsError::new_err("id_to_entry not set")
-            })?;
+            let id_to_entry = self
+                .id_to_entry
+                .as_ref()
+                .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set"))?;
             let file_keys = PyList::empty(py);
             for fid in &remaining {
                 let tup = PyTuple::new(py, [fid.bind(py).clone()])?;
@@ -2559,8 +2535,7 @@ impl CHKInventory {
             return Ok(out);
         }
         let mut stack: Vec<(String, std::collections::VecDeque<Py<PyAny>>)> = Vec::new();
-        let mut queue: std::collections::VecDeque<Py<PyAny>> =
-            std::collections::VecDeque::new();
+        let mut queue: std::collections::VecDeque<Py<PyAny>> = std::collections::VecDeque::new();
         for c in direct.iter() {
             queue.push_back(c.unbind());
         }
@@ -2659,11 +2634,9 @@ impl CHKInventory {
                 .bind(py)
                 .getattr("file_id")?
                 .cast_into::<PyBytes>()?;
-            let cie = slf.borrow().get_child(
-                py,
-                dir_id,
-                PyString::new(py, f).into_any(),
-            )?;
+            let cie = slf
+                .borrow()
+                .get_child(py, dir_id, PyString::new(py, f).into_any())?;
             if cie.bind(py).is_none() {
                 return Ok(py.None());
             }
@@ -2700,11 +2673,9 @@ impl CHKInventory {
                 .bind(py)
                 .getattr("file_id")?
                 .cast_into::<PyBytes>()?;
-            let cie = slf.borrow().get_child(
-                py,
-                dir_id,
-                PyString::new(py, f).into_any(),
-            )?;
+            let cie = slf
+                .borrow()
+                .get_child(py, dir_id, PyString::new(py, f).into_any())?;
             if cie.bind(py).is_none() {
                 let t = PyTuple::new(py, [py.None(), py.None(), py.None()])?;
                 return Ok(t.into_any().unbind());
@@ -2712,8 +2683,7 @@ impl CHKInventory {
             let kind: String = cie.bind(py).getattr("kind")?.extract()?;
             if kind == "tree-reference" {
                 let resolved: Vec<&str> = names[..=i].iter().map(String::as_str).collect();
-                let remaining: Vec<&str> =
-                    names[i + 1..].iter().map(String::as_str).collect();
+                let remaining: Vec<&str> = names[i + 1..].iter().map(String::as_str).collect();
                 let resolved_list = PyList::new(py, resolved)?;
                 let remaining_list = PyList::new(py, remaining)?;
                 let t = PyTuple::new(
@@ -2728,10 +2698,7 @@ impl CHKInventory {
             }
             parent_py = cie;
         }
-        let resolved_list = PyList::new(
-            py,
-            names.iter().map(String::as_str).collect::<Vec<_>>(),
-        )?;
+        let resolved_list = PyList::new(py, names.iter().map(String::as_str).collect::<Vec<_>>())?;
         let remaining_list = PyList::empty(py);
         let t = PyTuple::new(
             py,
@@ -2782,14 +2749,12 @@ impl CHKInventory {
                     let only = set.iter().next().unwrap().clone();
                     let bytes = PyBytes::new(py, &only);
                     match slf.call_method1("id2path", (&bytes,)) {
-                        Ok(path) => {
-                            match slf.borrow().get_entry(py, bytes.into_any()) {
-                                Ok(entry) => {
-                                    out.append(PyTuple::new(py, [path, entry])?)?;
-                                }
-                                Err(_) => {}
+                        Ok(path) => match slf.borrow().get_entry(py, bytes.into_any()) {
+                            Ok(entry) => {
+                                out.append(PyTuple::new(py, [path, entry])?)?;
                             }
-                        }
+                            Err(_) => {}
+                        },
                         Err(e) if e.is_instance_of::<NoSuchId>(py) => {}
                         Err(e) => return Err(e),
                     }
@@ -2816,46 +2781,38 @@ impl CHKInventory {
             }
             root.unbind()
         };
-        let parents_filter: Option<std::collections::HashSet<Vec<u8>>> =
-            match &specific_set {
-                None => None,
-                Some(set) => {
-                    let mut ancestors: std::collections::HashSet<Vec<u8>> =
-                        std::collections::HashSet::new();
-                    for fid in set {
-                        let mut cur: Option<Vec<u8>> = Some(fid.clone());
-                        while let Some(id) = cur {
-                            let id_bytes = PyBytes::new(py, &id);
-                            let has_id: bool =
-                                slf.borrow().has_id(py, id_bytes.clone().into_any())?;
-                            if !has_id {
+        let parents_filter: Option<std::collections::HashSet<Vec<u8>>> = match &specific_set {
+            None => None,
+            Some(set) => {
+                let mut ancestors: std::collections::HashSet<Vec<u8>> =
+                    std::collections::HashSet::new();
+                for fid in set {
+                    let mut cur: Option<Vec<u8>> = Some(fid.clone());
+                    while let Some(id) = cur {
+                        let id_bytes = PyBytes::new(py, &id);
+                        let has_id: bool = slf.borrow().has_id(py, id_bytes.clone().into_any())?;
+                        if !has_id {
+                            break;
+                        }
+                        let entry = slf.borrow().get_entry(py, id_bytes.into_any())?;
+                        let parent_id = entry.getattr("parent_id")?;
+                        let parent_bytes: Option<Vec<u8>> = if parent_id.is_none() {
+                            None
+                        } else {
+                            Some(parent_id.cast_into::<PyBytes>()?.as_bytes().to_vec())
+                        };
+                        if let Some(pid) = &parent_bytes {
+                            if ancestors.contains(pid) {
                                 break;
                             }
-                            let entry =
-                                slf.borrow().get_entry(py, id_bytes.into_any())?;
-                            let parent_id = entry.getattr("parent_id")?;
-                            let parent_bytes: Option<Vec<u8>> = if parent_id.is_none() {
-                                None
-                            } else {
-                                Some(
-                                    parent_id
-                                        .cast_into::<PyBytes>()?
-                                        .as_bytes()
-                                        .to_vec(),
-                                )
-                            };
-                            if let Some(pid) = &parent_bytes {
-                                if ancestors.contains(pid) {
-                                    break;
-                                }
-                                ancestors.insert(pid.clone());
-                            }
-                            cur = parent_bytes;
+                            ancestors.insert(pid.clone());
                         }
+                        cur = parent_bytes;
                     }
-                    Some(ancestors)
                 }
-            };
+                Some(ancestors)
+            }
+        };
         let mut stack: Vec<(String, Py<PyAny>)> = vec![(String::new(), from_entry)];
         while let Some((cur_relpath, cur_dir)) = stack.pop() {
             let mut child_dirs: Vec<(String, Py<PyAny>)> = Vec::new();
@@ -2878,10 +2835,7 @@ impl CHKInventory {
                 {
                     out.append(PyTuple::new(
                         py,
-                        [
-                            PyString::new(py, &child_relpath).into_any(),
-                            child.clone(),
-                        ],
+                        [PyString::new(py, &child_relpath).into_any(), child.clone()],
                     )?)?;
                 }
                 let kind: String = child.getattr("kind")?.extract()?;
@@ -2891,8 +2845,7 @@ impl CHKInventory {
                         Some(p) => p.contains(&child_fid),
                     };
                     if recurse {
-                        child_dirs
-                            .push((format!("{}/", child_relpath), child.unbind()));
+                        child_dirs.push((format!("{}/", child_relpath), child.unbind()));
                     }
                 }
             }
@@ -2902,6 +2855,412 @@ impl CHKInventory {
         }
         Ok(out)
     }
+
+    /// Serialise the inventory header to lines. Mirrors Python's
+    /// `to_lines`. The body (the two CHK maps) lives separately in
+    /// the store and is referenced by sha1 key here.
+    fn to_lines<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let lines = PyList::empty(py);
+        lines.append(PyBytes::new(py, b"chkinventory:\n"))?;
+        let root_id_bytes = self
+            .root_id
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("root_id not set on CHKInventory"))?;
+        let revision_id_bytes = self
+            .revision_id
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("revision_id not set on CHKInventory"))?;
+        let id_to_entry = self
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set on CHKInventory"))?;
+        // Extract sha1 keys from the CHKMap.key() tuples.
+        let id_key_tuple = id_to_entry.bind(py).call_method0("key")?;
+        let id_key_bytes = id_key_tuple
+            .cast_into::<PyTuple>()?
+            .get_item(0)?
+            .cast_into::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        let pid_key_bytes: Option<Vec<u8>> = match &self.parent_id_basename_to_file_id {
+            None => None,
+            Some(pid) => {
+                let t = pid.bind(py).call_method0("key")?;
+                Some(
+                    t.cast_into::<PyTuple>()?
+                        .get_item(0)?
+                        .cast_into::<PyBytes>()?
+                        .as_bytes()
+                        .to_vec(),
+                )
+            }
+        };
+
+        if self.search_key_name != b"plain" {
+            // Custom ordering for non-plain serialisers.
+            let mut buf = b"search_key_name: ".to_vec();
+            buf.extend_from_slice(&self.search_key_name);
+            buf.push(b'\n');
+            lines.append(PyBytes::new(py, &buf))?;
+            let mut buf = b"root_id: ".to_vec();
+            buf.extend_from_slice(root_id_bytes.as_bytes());
+            buf.push(b'\n');
+            lines.append(PyBytes::new(py, &buf))?;
+            // parent_id_basename_to_file_id is mandatory for non-plain.
+            let pid = pid_key_bytes.as_deref().ok_or_else(|| {
+                BzrFormatsError::new_err("parent_id_basename_to_file_id not set on CHKInventory")
+            })?;
+            let mut buf = b"parent_id_basename_to_file_id: ".to_vec();
+            buf.extend_from_slice(pid);
+            buf.push(b'\n');
+            lines.append(PyBytes::new(py, &buf))?;
+            let mut buf = b"revision_id: ".to_vec();
+            buf.extend_from_slice(revision_id_bytes.as_bytes());
+            buf.push(b'\n');
+            lines.append(PyBytes::new(py, &buf))?;
+            let mut buf = b"id_to_entry: ".to_vec();
+            buf.extend_from_slice(&id_key_bytes);
+            buf.push(b'\n');
+            lines.append(PyBytes::new(py, &buf))?;
+        } else {
+            let mut buf = b"revision_id: ".to_vec();
+            buf.extend_from_slice(revision_id_bytes.as_bytes());
+            buf.push(b'\n');
+            lines.append(PyBytes::new(py, &buf))?;
+            let mut buf = b"root_id: ".to_vec();
+            buf.extend_from_slice(root_id_bytes.as_bytes());
+            buf.push(b'\n');
+            lines.append(PyBytes::new(py, &buf))?;
+            if let Some(pid) = &pid_key_bytes {
+                let mut buf = b"parent_id_basename_to_file_id: ".to_vec();
+                buf.extend_from_slice(pid);
+                buf.push(b'\n');
+                lines.append(PyBytes::new(py, &buf))?;
+            }
+            let mut buf = b"id_to_entry: ".to_vec();
+            buf.extend_from_slice(&id_key_bytes);
+            buf.push(b'\n');
+            lines.append(PyBytes::new(py, &buf))?;
+        }
+        Ok(lines)
+    }
+
+    /// Deserialise inventory header bytes into a fresh CHKInventory.
+    /// Mirrors Python's `CHKInventory.deserialise(chk_store, lines,
+    /// expected_revision_id)`.
+    #[classmethod]
+    fn deserialise<'py>(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'py>,
+        chk_store: Bound<'_, PyAny>,
+        lines: Bound<'_, PyAny>,
+        expected_revision_id: Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, CHKInventory>> {
+        // Collect lines into a Vec<Vec<u8>>.
+        let mut line_vec: Vec<Vec<u8>> = Vec::new();
+        for line in lines.try_iter()? {
+            let b = line?.cast_into::<PyBytes>()?;
+            line_vec.push(b.as_bytes().to_vec());
+        }
+        if line_vec.is_empty() || !line_vec[line_vec.len() - 1].ends_with(b"\n") {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "last line should have trailing eol",
+            ));
+        }
+        if line_vec[0] != b"chkinventory:\n" {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "not a serialised CHKInventory",
+            ));
+        }
+        let allowed: &[&[u8]] = &[
+            b"root_id",
+            b"revision_id",
+            b"parent_id_basename_to_file_id",
+            b"search_key_name",
+            b"id_to_entry",
+        ];
+        let mut info: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+            std::collections::HashMap::new();
+        for line in &line_vec[1..] {
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
+            let split_at = line.windows(2).position(|w| w == b": ").ok_or_else(|| {
+                BzrFormatsError::new_err(format!("Inventory line missing ': ': {:?}", line))
+            })?;
+            let key = line[..split_at].to_vec();
+            let value = line[split_at + 2..].to_vec();
+            if !allowed.iter().any(|a| *a == &key[..]) {
+                return Err(BzrFormatsError::new_err(format!(
+                    "Unknown key in inventory: {:?}",
+                    key
+                )));
+            }
+            if info.contains_key(&key) {
+                return Err(BzrFormatsError::new_err(format!(
+                    "Duplicate key in inventory: {:?}",
+                    key
+                )));
+            }
+            info.insert(key, value);
+        }
+        let revision_id = info
+            .remove(&b"revision_id"[..].to_vec())
+            .ok_or_else(|| BzrFormatsError::new_err("missing revision_id"))?;
+        let root_id = info
+            .remove(&b"root_id"[..].to_vec())
+            .ok_or_else(|| BzrFormatsError::new_err("missing root_id"))?;
+        let search_key_name = info
+            .remove(&b"search_key_name"[..].to_vec())
+            .unwrap_or_else(|| b"plain".to_vec());
+        let parent_id_basename_to_file_id =
+            info.remove(&b"parent_id_basename_to_file_id"[..].to_vec());
+        let id_to_entry = info
+            .remove(&b"id_to_entry"[..].to_vec())
+            .ok_or_else(|| BzrFormatsError::new_err("missing id_to_entry"))?;
+        if let Some(pk) = &parent_id_basename_to_file_id {
+            if !pk.starts_with(b"sha1:") {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "parent_id_basename_to_file_id should be a sha1 key not {:?}",
+                    pk
+                )));
+            }
+        }
+        if !id_to_entry.starts_with(b"sha1:") {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "id_to_entry should be a sha1 key not {:?}",
+                id_to_entry
+            )));
+        }
+        // Verify the expected revision id matches.
+        let expected_tup = expected_revision_id.cast_into::<PyTuple>()?;
+        let expected_bytes = expected_tup
+            .get_item(0)?
+            .cast_into::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        if revision_id != expected_bytes {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Mismatched revision id and expected: {:?}, {:?}",
+                revision_id, expected_bytes
+            )));
+        }
+        let search_key_callable =
+            crate::chk_map::search_key_callable_for_name(py, &search_key_name);
+        // Build the result. The CHKInventory's id_to_entry/pid maps
+        // are CHKMap pyclass instances wrapping the chk_store.
+        let id_root_tuple = PyTuple::new(py, [PyBytes::new(py, &id_to_entry)])?;
+        let id_chkmap = make_chkmap_pyinstance(
+            py,
+            &chk_store,
+            id_root_tuple.into_any(),
+            search_key_callable.as_ref().map(|c| c.bind(py).clone()),
+        )?;
+        let pid_chkmap = if let Some(pid_bytes) = parent_id_basename_to_file_id {
+            let pid_tuple = PyTuple::new(py, [PyBytes::new(py, &pid_bytes)])?;
+            Some(make_chkmap_pyinstance(
+                py,
+                &chk_store,
+                pid_tuple.into_any(),
+                search_key_callable.as_ref().map(|c| c.bind(py).clone()),
+            )?)
+        } else {
+            None
+        };
+        let inv = CHKInventory {
+            search_key_name,
+            root_id: Some(FileId::from(root_id.as_slice())),
+            revision_id: Some(RevisionId::from(revision_id.as_slice())),
+            id_to_entry: Some(id_chkmap),
+            parent_id_basename_to_file_id: pid_chkmap,
+            fileid_to_entry_cache: PyDict::new(py).unbind(),
+            fully_cached: false,
+            path_to_fileid_cache: PyDict::new(py).unbind(),
+            children_cache: PyDict::new(py).unbind(),
+        };
+        Bound::new(py, inv)
+    }
+
+    /// Bulk-create a CHKInventory from an existing inventory.
+    /// Mirrors Python's `CHKInventory.from_inventory(chk_store,
+    /// inventory, maximum_size=0, search_key_name=b"plain")`.
+    #[classmethod]
+    #[pyo3(signature = (chk_store, inventory, maximum_size=0, search_key_name=None))]
+    fn from_inventory<'py>(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'py>,
+        chk_store: Bound<'py, PyAny>,
+        inventory: Bound<'py, PyAny>,
+        maximum_size: usize,
+        search_key_name: Option<&[u8]>,
+    ) -> PyResult<Bound<'py, CHKInventory>> {
+        let search_key_name = search_key_name.unwrap_or(b"plain");
+        // Build the two seed dicts by walking inventory.iter_entries().
+        let id_to_entry_dict = PyDict::new(py);
+        let pid_dict = PyDict::new(py);
+        let iter = inventory.call_method0("iter_entries")?;
+        for pair in iter.try_iter()? {
+            let pair = pair?;
+            let tup = pair.cast_into::<PyTuple>()?;
+            let entry = tup.get_item(1)?;
+            let file_id = entry.getattr("file_id")?.cast_into::<PyBytes>()?;
+            let key_tuple = PyTuple::new(py, [&file_id])?;
+            // Serialise the entry to bytes.
+            let entry_inner = entry.downcast::<InventoryEntry>()?;
+            let entry_borrow = entry_inner.borrow();
+            let bytes_val = chk_inventory_entry_to_bytes(py, &entry_borrow)?;
+            id_to_entry_dict.set_item(key_tuple, &bytes_val)?;
+            // _parent_id_basename_key inline (we have static access).
+            let parent_id = entry.getattr("parent_id")?;
+            let parent_bytes: Bound<'py, PyBytes> = if parent_id.is_none() {
+                PyBytes::new(py, b"")
+            } else {
+                parent_id.cast_into::<PyBytes>()?
+            };
+            let name: String = entry.getattr("name")?.extract()?;
+            let name_bytes = PyBytes::new(py, name.as_bytes());
+            let p_id_key = PyTuple::new(py, [parent_bytes, name_bytes])?;
+            pid_dict.set_item(p_id_key, &file_id)?;
+        }
+        // Construct an empty inventory and populate its two maps.
+        let root_id = inventory.getattr("root")?.getattr("file_id")?;
+        let revision_id = inventory.getattr("revision_id")?;
+        let inv = CHKInventory {
+            search_key_name: search_key_name.to_vec(),
+            root_id: Some(FileId::from(root_id.cast_into::<PyBytes>()?.as_bytes())),
+            revision_id: Some(RevisionId::from(
+                revision_id.cast_into::<PyBytes>()?.as_bytes(),
+            )),
+            id_to_entry: None,
+            parent_id_basename_to_file_id: None,
+            fileid_to_entry_cache: PyDict::new(py).unbind(),
+            fully_cached: false,
+            path_to_fileid_cache: PyDict::new(py).unbind(),
+            children_cache: PyDict::new(py).unbind(),
+        };
+        let bound_inv = Bound::new(py, inv)?;
+        bound_inv.borrow_mut().populate_from_dicts(
+            py,
+            &chk_store,
+            id_to_entry_dict.into_any(),
+            pid_dict.into_any(),
+            maximum_size,
+        )?;
+        Ok(bound_inv)
+    }
+
+    /// Populate `id_to_entry` and `parent_id_basename_to_file_id`
+    /// from two seed dicts via `CHKMap.from_dict`. Mirrors Python's
+    /// `_populate_from_dicts`.
+    #[pyo3(signature = (chk_store, id_to_entry_dict, parent_id_basename_dict, maximum_size))]
+    fn _populate_from_dicts<'py>(
+        &mut self,
+        py: Python<'py>,
+        chk_store: Bound<'_, PyAny>,
+        id_to_entry_dict: Bound<'_, PyAny>,
+        parent_id_basename_dict: Bound<'_, PyAny>,
+        maximum_size: usize,
+    ) -> PyResult<()> {
+        self.populate_from_dicts(
+            py,
+            &chk_store,
+            id_to_entry_dict,
+            parent_id_basename_dict,
+            maximum_size,
+        )
+    }
+}
+
+/// Construct a `_chk_map_rs.CHKMap` pyclass instance directly,
+/// without going through the Python module attribute lookup.
+fn make_chkmap_pyinstance<'py>(
+    py: Python<'py>,
+    chk_store: &Bound<'_, PyAny>,
+    root_key: Bound<'_, PyAny>,
+    search_key_callable: Option<Bound<'_, PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    // The pyclass exposes a (#[new]) constructor we can call via
+    // type lookup; constructing the struct directly here would mean
+    // referencing private fields. Use the pyclass type bound to the
+    // already-loaded module via py.get_type::<CHKMap>().
+    let cls = py.get_type::<crate::chk_map::CHKMap>();
+    let args = match search_key_callable {
+        Some(cb) => PyTuple::new(py, [chk_store.clone(), root_key, cb])?,
+        None => PyTuple::new(py, [chk_store.clone(), root_key])?,
+    };
+    Ok(cls.call1(args)?.unbind())
+}
+
+impl CHKInventory {
+    /// Internal helper called by `from_inventory` and the public
+    /// `_populate_from_dicts` method.
+    fn populate_from_dicts<'py>(
+        &mut self,
+        py: Python<'py>,
+        chk_store: &Bound<'_, PyAny>,
+        id_to_entry_dict: Bound<'_, PyAny>,
+        parent_id_basename_dict: Bound<'_, PyAny>,
+        maximum_size: usize,
+    ) -> PyResult<()> {
+        let search_key_callable =
+            crate::chk_map::search_key_callable_for_name(py, &self.search_key_name);
+        // Get the CHKMap pyclass type and call its `from_dict`
+        // classmethod for each of the two seed dicts.
+        let chkmap_cls = py.get_type::<crate::chk_map::CHKMap>();
+        let id_root_key = call_chkmap_from_dict(
+            py,
+            &chkmap_cls,
+            chk_store,
+            &id_to_entry_dict,
+            maximum_size,
+            1,
+            search_key_callable.as_ref().map(|c| c.bind(py).clone()),
+        )?;
+        let id_chkmap = make_chkmap_pyinstance(
+            py,
+            chk_store,
+            id_root_key,
+            search_key_callable.as_ref().map(|c| c.bind(py).clone()),
+        )?;
+        self.id_to_entry = Some(id_chkmap);
+        let pid_root_key = call_chkmap_from_dict(
+            py,
+            &chkmap_cls,
+            chk_store,
+            &parent_id_basename_dict,
+            maximum_size,
+            2,
+            search_key_callable.as_ref().map(|c| c.bind(py).clone()),
+        )?;
+        let pid_chkmap = make_chkmap_pyinstance(
+            py,
+            chk_store,
+            pid_root_key,
+            search_key_callable.as_ref().map(|c| c.bind(py).clone()),
+        )?;
+        self.parent_id_basename_to_file_id = Some(pid_chkmap);
+        Ok(())
+    }
+}
+
+/// Call `CHKMap.from_dict(chk_store, items, maximum_size=N,
+/// key_width=K, search_key_func=cb)` and return the resulting root
+/// key tuple.
+fn call_chkmap_from_dict<'py>(
+    py: Python<'py>,
+    chkmap_cls: &Bound<'py, pyo3::types::PyType>,
+    chk_store: &Bound<'py, PyAny>,
+    items: &Bound<'py, PyAny>,
+    maximum_size: usize,
+    key_width: usize,
+    search_key_callable: Option<Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("maximum_size", maximum_size)?;
+    kwargs.set_item("key_width", key_width)?;
+    if let Some(cb) = search_key_callable {
+        kwargs.set_item("search_key_func", cb)?;
+    }
+    let args = PyTuple::new(py, [chk_store.clone(), items.clone()])?;
+    chkmap_cls.call_method("from_dict", args, Some(&kwargs))
 }
 
 /// Helper: split a relpath argument (string or list of components)
