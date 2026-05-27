@@ -225,6 +225,10 @@ pub type Value = Vec<u8>;
 pub enum Error {
     InconsistentDeltaDelta(Vec<(Option<Key>, Option<Key>, Value)>, String),
     DeserializeError(String),
+    /// A precondition or invariant was violated. Mirrors Python's
+    /// `AssertionError` paths in chk_map.py — usually a bug in the
+    /// caller, not a corrupt input.
+    AssertionFailed(String),
 }
 
 impl From<std::num::ParseIntError> for Error {
@@ -1076,6 +1080,112 @@ impl InternalNode {
             search_key_func,
         }
     }
+
+    /// Serialised byte cost of this node (header + body). Wraps
+    /// [`internal_node_current_size`].
+    pub fn current_size(&self) -> usize {
+        internal_node_current_size(self.maximum_size, self.key_width, self.len, self.raw_size)
+    }
+
+    /// Add a loaded child node under `prefix`. Mirrors Python's
+    /// `InternalNode.add_node`: validates that `prefix` extends
+    /// `search_prefix` by exactly one byte, updates `len` and
+    /// `node_width`, clears `key` (this node is now dirty).
+    pub fn add_node(&mut self, prefix: Vec<u8>, node: Node) -> Result<(), Error> {
+        let search_prefix = self.search_prefix.as_deref().ok_or_else(|| {
+            Error::AssertionFailed("InternalNode.add_node: search_prefix is None".into())
+        })?;
+        if !prefix.starts_with(search_prefix) {
+            return Err(Error::AssertionFailed(format!(
+                "prefixes mismatch: {:?} must start with {:?}",
+                prefix, search_prefix
+            )));
+        }
+        if prefix.len() != search_prefix.len() + 1 {
+            return Err(Error::AssertionFailed(format!(
+                "prefix wrong length: len({:?}) is not {}",
+                prefix,
+                search_prefix.len() + 1
+            )));
+        }
+        self.len += node.len();
+        if self.items.is_empty() {
+            self.node_width = prefix.len();
+        }
+        if self.node_width != search_prefix.len() + 1 {
+            return Err(Error::AssertionFailed(format!(
+                "node width mismatch: {} is not {}",
+                self.node_width,
+                search_prefix.len() + 1
+            )));
+        }
+        self.items.insert(prefix, NodeRef::Loaded(node));
+        self.key = None;
+        Ok(())
+    }
+
+    /// Pad or truncate `key`'s search-key bytes to fit `node_width`,
+    /// padding with NUL. Mirrors `InternalNode._search_key`.
+    pub fn search_key(&self, key: &Key) -> SerializedKey {
+        let base = self.search_key_func.apply(key);
+        if base.len() >= self.node_width {
+            base[..self.node_width].to_vec()
+        } else {
+            let mut padded = Vec::with_capacity(self.node_width);
+            padded.extend_from_slice(&base);
+            padded.resize(self.node_width, 0);
+            padded
+        }
+    }
+
+    /// Truncate `key`'s search-key bytes to `node_width` without
+    /// padding (used as a prefix when filtering iteritems). Mirrors
+    /// `InternalNode._search_prefix_filter`.
+    pub fn search_prefix_filter(&self, key: &Key) -> SerializedKey {
+        let base = self.search_key_func.apply(key);
+        if base.len() >= self.node_width {
+            base[..self.node_width].to_vec()
+        } else {
+            base
+        }
+    }
+
+    /// Recompute `search_prefix` as the longest common prefix of all
+    /// child prefixes. Mirrors `InternalNode._compute_search_prefix`.
+    pub fn compute_search_prefix(&mut self) -> Option<&[u8]> {
+        let prefix =
+            common_prefix_many(self.items.keys().map(|k| k.as_slice())).map(|s| s.to_vec());
+        self.search_prefix = prefix;
+        self.search_prefix.as_deref()
+    }
+
+    /// Read-only references to the children. Mirrors `InternalNode.refs`:
+    /// returns the sha1 key of each unloaded child plus the
+    /// `.key()` of each loaded child. Returns an `AssertionFailed`
+    /// error when `self.key` is unset — the Python equivalent
+    /// raises an `AssertionError`.
+    pub fn refs(&self) -> Result<Vec<Vec<u8>>, Error> {
+        if self.key.is_none() {
+            return Err(Error::AssertionFailed(
+                "unserialised nodes have no refs".into(),
+            ));
+        }
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(self.items.len());
+        for value in self.items.values() {
+            match value {
+                NodeRef::Unloaded(k) => out.push(k.clone()),
+                NodeRef::Loaded(n) => {
+                    let k = n.key().ok_or_else(|| {
+                        Error::AssertionFailed(
+                            "InternalNode.refs: loaded child has no key".into(),
+                        )
+                    })?;
+                    out.push(k.to_vec());
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Check whether every search key in `search_keys` is identical.
@@ -1612,6 +1722,106 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
             Some(NodeRef::Unloaded(k)) => assert_eq!(k, b"sha1:aaaa"),
             other => panic!("expected Unloaded for prefoo, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn internal_node_add_node_validates_prefix_length() {
+        let mut n = InternalNode::new(b"pre".to_vec(), SearchKeyFunc::Plain);
+        let leaf = Node::Leaf(Box::new(LeafNode::new(SearchKeyFunc::Plain)));
+        // Prefix too long.
+        let too_long = n.add_node(b"preXY".to_vec(), leaf.clone());
+        assert!(matches!(too_long, Err(Error::AssertionFailed(_))));
+        // Prefix not starting with search_prefix.
+        let mismatch = n.add_node(b"qrZ".to_vec(), leaf.clone());
+        assert!(matches!(mismatch, Err(Error::AssertionFailed(_))));
+        // Correct: search_prefix + 1 byte.
+        n.add_node(b"preX".to_vec(), leaf).unwrap();
+        assert_eq!(n.items.len(), 1);
+        assert_eq!(n.node_width, 4);
+    }
+
+    #[test]
+    fn internal_node_add_node_clears_key_and_grows_len() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.key = Some(b"sha1:old".to_vec());
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"k1"]), b"v1".to_vec());
+        leaf.map_no_split(key_vec(&[b"k2"]), b"v2".to_vec());
+        n.add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf))).unwrap();
+        assert_eq!(n.len, 2);
+        assert!(n.key.is_none());
+    }
+
+    #[test]
+    fn internal_node_search_key_pads_with_nul() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 5;
+        // Plain search key of `("k",)` is `b"k"`, length 1; pad to 5.
+        assert_eq!(n.search_key(&Key::from(vec![b"k".to_vec()])), b"k\0\0\0\0");
+    }
+
+    #[test]
+    fn internal_node_search_key_truncates_when_longer() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 3;
+        assert_eq!(
+            n.search_key(&Key::from(vec![b"longkey".to_vec()])),
+            b"lon"
+        );
+    }
+
+    #[test]
+    fn internal_node_search_prefix_filter_does_not_pad() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 5;
+        // Shorter key returns as-is (no padding).
+        assert_eq!(
+            n.search_prefix_filter(&Key::from(vec![b"k".to_vec()])),
+            b"k"
+        );
+        // Longer key gets truncated.
+        n.node_width = 3;
+        assert_eq!(
+            n.search_prefix_filter(&Key::from(vec![b"longkey".to_vec()])),
+            b"lon"
+        );
+    }
+
+    #[test]
+    fn internal_node_compute_search_prefix_from_children() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.items
+            .insert(b"abc".to_vec(), NodeRef::Unloaded(b"sha1:x".to_vec()));
+        n.items
+            .insert(b"abd".to_vec(), NodeRef::Unloaded(b"sha1:y".to_vec()));
+        n.items
+            .insert(b"abe".to_vec(), NodeRef::Unloaded(b"sha1:z".to_vec()));
+        let prefix = n.compute_search_prefix().map(<[u8]>::to_vec);
+        assert_eq!(prefix, Some(b"ab".to_vec()));
+        assert_eq!(n.search_prefix.as_deref(), Some(&b"ab"[..]));
+    }
+
+    #[test]
+    fn internal_node_refs_returns_child_keys() {
+        let mut n = InternalNode::new(b"p".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 2;
+        n.items
+            .insert(b"pa".to_vec(), NodeRef::Unloaded(b"sha1:a".to_vec()));
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.key = Some(b"sha1:b".to_vec());
+        n.items
+            .insert(b"pb".to_vec(), NodeRef::Loaded(Node::Leaf(Box::new(leaf))));
+        n.key = Some(b"sha1:self".to_vec());
+        let refs = n.refs().unwrap();
+        assert_eq!(refs.len(), 2);
+        assert!(refs.contains(&b"sha1:a".to_vec()));
+        assert!(refs.contains(&b"sha1:b".to_vec()));
+    }
+
+    #[test]
+    fn internal_node_refs_errors_when_unserialised() {
+        let n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        assert!(matches!(n.refs(), Err(Error::AssertionFailed(_))));
     }
 
     #[test]

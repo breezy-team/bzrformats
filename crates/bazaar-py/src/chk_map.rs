@@ -13,6 +13,7 @@ fn chk_err_to_py(err: ChkError) -> PyErr {
     match err {
         ChkError::DeserializeError(msg) => pyo3::exceptions::PyValueError::new_err(msg),
         ChkError::InconsistentDeltaDelta(_, msg) => pyo3::exceptions::PyValueError::new_err(msg),
+        ChkError::AssertionFailed(msg) => pyo3::exceptions::PyAssertionError::new_err(msg),
     }
 }
 
