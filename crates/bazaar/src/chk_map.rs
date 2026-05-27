@@ -1175,6 +1175,27 @@ impl Node {
         }
     }
 
+    /// Serialise this subtree to the store, returning every sha1 key
+    /// written (children first, then self). Mirrors Python's
+    /// `Node.serialise`. Skips children that are unloaded (their
+    /// sha1 key is already canonical) or already serialised (key set).
+    pub fn serialise<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+    ) -> Result<Vec<Vec<u8>>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        match self {
+            Node::Leaf(l) => {
+                let k = l.serialise(store, cache)?;
+                Ok(vec![k])
+            }
+            Node::Internal(n) => n.serialise(store, cache),
+        }
+    }
+
     /// Recursive remove that may demand-load child pages. Returns
     /// the replacement node (possibly the same one, possibly a
     /// collapsed leaf, possibly the single remaining child if the
@@ -1457,6 +1478,92 @@ impl InternalNode {
             common_prefix_many(self.items.keys().map(|k| k.as_slice())).map(|s| s.to_vec());
         self.search_prefix = prefix;
         self.search_prefix.as_deref()
+    }
+
+    /// Serialise this internal node (and any dirty descendants) to
+    /// the store. Returns every newly-written sha1 key in
+    /// children-first / self-last order. Mirrors
+    /// `InternalNode.serialise`.
+    pub fn serialise<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+    ) -> Result<Vec<Vec<u8>>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        // Walk children: serialise any loaded child whose `key` is
+        // unset. Unloaded children and already-serialised loaded
+        // children are skipped.
+        let prefixes: Vec<Vec<u8>> = self.items.keys().cloned().collect();
+        for prefix in &prefixes {
+            // Take, mutate, replace — avoids holding a `&mut`
+            // borrow on self.items across recursion.
+            let entry = self.items.shift_remove(prefix).unwrap();
+            let entry = match entry {
+                NodeRef::Unloaded(k) => NodeRef::Unloaded(k),
+                NodeRef::Loaded(mut node) => {
+                    if node.key().is_none() {
+                        let keys = node.serialise(store, cache)?;
+                        out.extend(keys);
+                    }
+                    NodeRef::Loaded(node)
+                }
+            };
+            self.items.insert(prefix.clone(), entry);
+        }
+        let search_prefix = self
+            .search_prefix
+            .clone()
+            .ok_or_else(|| Error::AssertionFailed("search_prefix is None".into()))?;
+        // Build sorted (prefix, flat_key) list — mirrors
+        // `sorted_items = [(prefix, node[0] or node._key[0]) for ...]`.
+        let mut sorted_items: Vec<InternalNodeChild> = self
+            .items
+            .iter()
+            .map(|(prefix, child)| {
+                let flat_key = match child {
+                    NodeRef::Unloaded(k) => k.clone(),
+                    NodeRef::Loaded(n) => n
+                        .key()
+                        .map(|s| s.to_vec())
+                        .ok_or_else(|| {
+                            Error::AssertionFailed(
+                                "loaded child has no key after serialise".into(),
+                            )
+                        })
+                        .unwrap_or_default(),
+                };
+                InternalNodeChild {
+                    prefix: prefix.clone(),
+                    flat_key,
+                }
+            })
+            .collect();
+        sorted_items.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+        let lines = serialise_internal_node(
+            self.maximum_size,
+            self.key_width,
+            self.len,
+            &search_prefix,
+            &sorted_items,
+        )?;
+        let (sha1, _size) = store
+            .add_lines(
+                &crate::versionedfile::Key::ContentAddressed(vec![]),
+                Some(&[]),
+                &lines,
+            )
+            .map_err(|e| Error::AssertionFailed(format!("add_lines failed: {:?}", e)))?;
+        let mut full_key = Vec::with_capacity(5 + sha1.len());
+        full_key.extend_from_slice(b"sha1:");
+        full_key.extend_from_slice(&sha1);
+        let data: Vec<u8> = lines.iter().flatten().copied().collect();
+        cache.insert(full_key.clone(), data);
+        self.key = Some(full_key.clone());
+        out.push(full_key);
+        Ok(out)
     }
 
     /// Check whether this node's children can collapse back into a
@@ -2759,6 +2866,52 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
             Err(crate::knit::KnitError::NotImplemented("annotate"))
         }
+    }
+
+    #[test]
+    fn internal_node_serialise_writes_children_then_self() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut leaf_b = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_b.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal
+            .add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        internal
+            .add_node(b"b".to_vec(), Node::Leaf(Box::new(leaf_b)))
+            .unwrap();
+        let written = internal.serialise(&store, &cache).unwrap();
+        // Two children + self = 3 keys.
+        assert_eq!(written.len(), 3);
+        // The self key matches what's stored on the InternalNode.
+        assert_eq!(
+            internal.key.as_deref(),
+            Some(written.last().unwrap().as_slice())
+        );
+        // All written keys should be present in the page cache.
+        for k in &written {
+            assert!(cache.get(k).is_some(), "missing {:?}", k);
+        }
+    }
+
+    #[test]
+    fn internal_node_serialise_skips_already_serialised_children() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let _child_key = leaf_a.serialise(&store, &cache).unwrap();
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal
+            .add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        let written = internal.serialise(&store, &cache).unwrap();
+        // Child already serialised, so only self is in the written list.
+        assert_eq!(written.len(), 1);
+        assert!(written[0].starts_with(b"sha1:"));
     }
 
     #[test]
