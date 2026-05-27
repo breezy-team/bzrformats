@@ -3176,6 +3176,170 @@ impl CHKInventory {
             maximum_size,
         )
     }
+
+    /// Generate a `Tree.iter_changes`-style change list between
+    /// `self` and `basis`. Mirrors Python's `CHKInventory.iter_changes`.
+    ///
+    /// Returns a list of 8-tuples:
+    ///   (file_id, (path_in_source, path_in_target),
+    ///    changed_content, versioned, parent, name, kind, executable)
+    fn iter_changes<'py>(
+        slf: Bound<'py, CHKInventory>,
+        py: Python<'py>,
+        basis: Bound<'py, CHKInventory>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        // Walk the CHKMap iter_changes generator on self.id_to_entry
+        // vs basis.id_to_entry. We borrow both pyclass instances
+        // immutably for attribute access.
+        let self_id_map = slf
+            .borrow()
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("self.id_to_entry not set"))?
+            .clone_ref(py);
+        let basis_id_map = basis
+            .borrow()
+            .id_to_entry
+            .as_ref()
+            .ok_or_else(|| BzrFormatsError::new_err("basis.id_to_entry not set"))?
+            .clone_ref(py);
+        let changes_iter = self_id_map
+            .bind(py)
+            .call_method1("iter_changes", (basis_id_map,))?;
+        let out = PyList::empty(py);
+        for change in changes_iter.try_iter()? {
+            let change = change?;
+            let tup = change.cast_into::<PyTuple>()?;
+            let key = tup.get_item(0)?;
+            let basis_value = tup.get_item(1)?;
+            let self_value = tup.get_item(2)?;
+            let file_id = key.cast_into::<PyTuple>()?.get_item(0)?;
+            let (basis_entry, path_in_source, basis_parent, basis_name, basis_executable) =
+                if basis_value.is_none() {
+                    (py.None(), py.None(), py.None(), py.None(), py.None())
+                } else {
+                    let bytes = basis_value.cast_into::<PyBytes>()?;
+                    let entry = basis
+                        .borrow()
+                        ._bytes_to_entry(py, bytes)?
+                        .into_pyobject(py)?;
+                    let path: Py<PyAny> = basis
+                        .call_method1("id2path", (file_id.clone(),))?
+                        .unbind();
+                    let parent = entry.getattr("parent_id")?.unbind();
+                    let name = entry.getattr("name")?.unbind();
+                    let executable = entry.getattr("executable").ok().map_or(py.None(), |v| {
+                        if v.is_none() {
+                            py.None()
+                        } else {
+                            v.unbind()
+                        }
+                    });
+                    (entry.unbind(), path, parent, name, executable)
+                };
+            let (self_entry, path_in_target, self_parent, self_name, self_executable) =
+                if self_value.is_none() {
+                    (py.None(), py.None(), py.None(), py.None(), py.None())
+                } else {
+                    let bytes = self_value.cast_into::<PyBytes>()?;
+                    let entry = slf
+                        .borrow()
+                        ._bytes_to_entry(py, bytes)?
+                        .into_pyobject(py)?;
+                    let path: Py<PyAny> = slf
+                        .call_method1("id2path", (file_id.clone(),))?
+                        .unbind();
+                    let parent = entry.getattr("parent_id")?.unbind();
+                    let name = entry.getattr("name")?.unbind();
+                    let executable = entry.getattr("executable").ok().map_or(py.None(), |v| {
+                        if v.is_none() {
+                            py.None()
+                        } else {
+                            v.unbind()
+                        }
+                    });
+                    (entry.unbind(), path, parent, name, executable)
+                };
+            let (basis_kind, self_kind) = (
+                if basis_entry.is_none(py) {
+                    py.None()
+                } else {
+                    basis_entry.getattr(py, "kind")?
+                },
+                if self_entry.is_none(py) {
+                    py.None()
+                } else {
+                    self_entry.getattr(py, "kind")?
+                },
+            );
+            let versioned = (
+                !basis_entry.is_none(py),
+                !self_entry.is_none(py),
+            );
+            let mut changed_content = !basis_kind
+                .bind(py)
+                .eq(self_kind.bind(py))?;
+            if !changed_content && !basis_entry.is_none(py) && !self_entry.is_none(py) {
+                let kind_str: Option<String> = basis_kind.extract(py).ok();
+                match kind_str.as_deref() {
+                    Some("file") => {
+                        let bs = basis_entry.getattr(py, "text_size")?;
+                        let ss = self_entry.getattr(py, "text_size")?;
+                        let bsha = basis_entry.getattr(py, "text_sha1")?;
+                        let ssha = self_entry.getattr(py, "text_sha1")?;
+                        if !bs.bind(py).eq(ss.bind(py))?
+                            || !bsha.bind(py).eq(ssha.bind(py))?
+                        {
+                            changed_content = true;
+                        }
+                    }
+                    Some("symlink") => {
+                        let bt = basis_entry.getattr(py, "symlink_target")?;
+                        let st = self_entry.getattr(py, "symlink_target")?;
+                        if !bt.bind(py).eq(st.bind(py))? {
+                            changed_content = true;
+                        }
+                    }
+                    Some("tree-reference") => {
+                        let br = basis_entry.getattr(py, "reference_revision")?;
+                        let sr = self_entry.getattr(py, "reference_revision")?;
+                        if !br.bind(py).eq(sr.bind(py))? {
+                            changed_content = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let parent_eq = basis_parent.bind(py).eq(self_parent.bind(py))?;
+            let name_eq = basis_name.bind(py).eq(self_name.bind(py))?;
+            let executable_eq = basis_executable.bind(py).eq(self_executable.bind(py))?;
+            if !changed_content && parent_eq && name_eq && executable_eq {
+                continue;
+            }
+            let paths_tup = PyTuple::new(py, [path_in_source, path_in_target])?;
+            let versioned_tup = (versioned.0, versioned.1).into_pyobject(py)?;
+            let parent_tup = PyTuple::new(py, [basis_parent, self_parent])?;
+            let name_tup = PyTuple::new(py, [basis_name, self_name])?;
+            let kind_tup = PyTuple::new(py, [basis_kind, self_kind])?;
+            let executable_tup =
+                PyTuple::new(py, [basis_executable, self_executable])?;
+            let row = PyTuple::new(
+                py,
+                [
+                    file_id.unbind(),
+                    paths_tup.into_any().unbind(),
+                    changed_content.into_pyobject(py)?.to_owned().into_any().unbind(),
+                    versioned_tup.into_any().unbind(),
+                    parent_tup.into_any().unbind(),
+                    name_tup.into_any().unbind(),
+                    kind_tup.into_any().unbind(),
+                    executable_tup.into_any().unbind(),
+                ],
+            )?;
+            out.append(row)?;
+        }
+        Ok(out)
+    }
 }
 
 /// Construct a `_chk_map_rs.CHKMap` pyclass instance directly,
