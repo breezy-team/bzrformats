@@ -889,6 +889,56 @@ impl LeafNode {
         Some(removed)
     }
 
+    /// Serialise to `store` and cache the resulting bytes in `cache`.
+    ///
+    /// Mirrors Python's `LeafNode.serialise`: sorts the items, builds
+    /// the line list, calls `store.add_lines((None,), (), lines)`,
+    /// stores the resulting sha1 key on `self.key`, and writes the
+    /// concatenated bytes into the page cache. Returns the resulting
+    /// sha1 key (without the `b"sha1:"` prefix stripped).
+    ///
+    /// The Python version returns a single-element list; native Rust
+    /// callers want the key value alone.
+    pub fn serialise<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+    ) -> Result<Vec<u8>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        // Python sorts items before serialising; mirror that exactly.
+        let mut sorted_items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = self
+            .items
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        sorted_items.sort();
+        let lines = serialise_leaf_node(
+            self.maximum_size,
+            self.key_width,
+            &sorted_items,
+            self.common_serialised_prefix.as_deref(),
+        )?;
+        let (sha1, _size) = store
+            .add_lines(
+                &crate::versionedfile::Key::ContentAddressed(vec![]),
+                Some(&[]),
+                &lines,
+            )
+            .map_err(|e| Error::AssertionFailed(format!("add_lines failed: {:?}", e)))?;
+        let mut full_key = Vec::with_capacity(5 + sha1.len());
+        full_key.extend_from_slice(b"sha1:");
+        full_key.extend_from_slice(&sha1);
+        let data: Vec<u8> = lines.iter().flatten().copied().collect();
+        if data.len() != self.current_size() {
+            return Err(Error::AssertionFailed("Invalid _current_size".into()));
+        }
+        cache.insert(full_key.clone(), data);
+        self.key = Some(full_key.clone());
+        Ok(full_key)
+    }
+
     /// Yield `(key, value)` pairs matching `key_filter`. When `None`,
     /// yields every entry in insertion order. Otherwise:
     ///
@@ -1818,6 +1868,139 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         match n.items.get(&b"prefoo".to_vec()) {
             Some(NodeRef::Unloaded(k)) => assert_eq!(k, b"sha1:aaaa"),
             other => panic!("expected Unloaded for prefoo, got {:?}", other),
+        }
+    }
+
+    /// Minimal in-memory `VersionedFiles` for round-tripping a single
+    /// page through `serialise` / `deserialise`. Only `add_lines` and
+    /// `get_record_stream` (single-key fulltext) are implemented.
+    struct FakeChkStore {
+        pages: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>,
+    }
+
+    impl FakeChkStore {
+        fn new() -> Self {
+            Self {
+                pages: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl crate::versionedfile::VersionedFiles for FakeChkStore {
+        fn get_parent_map(
+            &self,
+            _keys: &[crate::versionedfile::Key],
+        ) -> Result<
+            std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
+            crate::knit::KnitError,
+        > {
+            Ok(std::collections::HashMap::new())
+        }
+
+        fn get_record_stream(
+            &self,
+            _keys: &[crate::versionedfile::Key],
+            _ordering: &str,
+            _include_delta_closure: bool,
+        ) -> Result<
+            Box<
+                dyn Iterator<
+                    Item = Result<
+                        Box<dyn crate::versionedfile::ContentFactory>,
+                        crate::knit::KnitError,
+                    >,
+                >,
+            >,
+            crate::knit::KnitError,
+        > {
+            Err(crate::knit::KnitError::NotImplemented("get_record_stream"))
+        }
+
+        fn get_sha1s(
+            &self,
+            _keys: &[crate::versionedfile::Key],
+        ) -> Result<
+            std::collections::HashMap<crate::versionedfile::Key, Vec<u8>>,
+            crate::knit::KnitError,
+        > {
+            Ok(std::collections::HashMap::new())
+        }
+
+        fn keys(&self) -> Result<Vec<crate::versionedfile::Key>, crate::knit::KnitError> {
+            let p = self.pages.lock().unwrap();
+            Ok(p.keys()
+                .map(|k| crate::versionedfile::Key::Fixed(vec![k.clone()]))
+                .collect())
+        }
+
+        fn add_lines(
+            &self,
+            _key: &crate::versionedfile::Key,
+            _parents: Option<&[crate::versionedfile::Key]>,
+            lines: &[Vec<u8>],
+        ) -> Result<(Vec<u8>, usize), crate::knit::KnitError> {
+            use sha1::{Digest, Sha1};
+            let data: Vec<u8> = lines.iter().flatten().copied().collect();
+            let mut hasher = Sha1::new();
+            hasher.update(&data);
+            let digest = hasher.finalize();
+            let sha1_hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+            let sha1_bytes = sha1_hex.into_bytes();
+            let size = data.len();
+            self.pages
+                .lock()
+                .unwrap()
+                .insert(sha1_bytes.clone(), data);
+            Ok((sha1_bytes, size))
+        }
+
+        fn insert_record_stream(
+            &self,
+            _stream: Box<dyn Iterator<Item = Box<dyn crate::versionedfile::ContentFactory>>>,
+        ) -> Result<(), crate::knit::KnitError> {
+            Err(crate::knit::KnitError::NotImplemented("insert_record_stream"))
+        }
+
+        fn iter_lines_added_or_present_in_keys(
+            &self,
+            _keys: &[crate::versionedfile::Key],
+        ) -> Result<Vec<(Vec<u8>, crate::versionedfile::Key)>, crate::knit::KnitError> {
+            Err(crate::knit::KnitError::NotImplemented(
+                "iter_lines_added_or_present_in_keys",
+            ))
+        }
+
+        fn annotate(
+            &self,
+            _key: &crate::versionedfile::Key,
+        ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
+            Err(crate::knit::KnitError::NotImplemented("annotate"))
+        }
+    }
+
+    #[test]
+    fn leaf_node_serialise_caches_and_sets_key() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let sha1_key = n.serialise(&store, &cache).unwrap();
+        assert!(sha1_key.starts_with(b"sha1:"));
+        assert_eq!(n.key.as_deref(), Some(sha1_key.as_slice()));
+        // Page cache holds the serialised bytes.
+        let cached = cache.get(&sha1_key).expect("page cache miss");
+        assert!(cached.starts_with(b"chkleaf:\n"));
+        // Round-trip through deserialise.
+        let node = deserialise_node(&cached, sha1_key, SearchKeyFunc::Plain).unwrap();
+        match node {
+            Node::Leaf(leaf) => {
+                assert_eq!(leaf.len(), 1);
+                assert_eq!(
+                    leaf.items.get(&key_vec(&[b"foo"])),
+                    Some(&b"bar".to_vec())
+                );
+            }
+            Node::Internal(_) => panic!("expected leaf"),
         }
     }
 
