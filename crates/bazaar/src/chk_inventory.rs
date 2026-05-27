@@ -219,6 +219,71 @@ mod tests {
         (out, store, cache)
     }
 
+    /// Build an inventory with a root + one child file + the
+    /// parent_id_basename_to_file_id map populated. Used by path2id /
+    /// get_children tests.
+    fn build_test_inv_with_child() -> (
+        CHKInventory<FakeChkStore>,
+        std::sync::Arc<FakeChkStore>,
+        std::sync::Arc<dyn PageCache>,
+    ) {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let root = Entry::Root {
+            file_id: FileId::from(&b"root-id"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev1"[..])),
+        };
+        let child = Entry::File {
+            file_id: FileId::from(&b"file-id"[..]),
+            revision: Some(crate::RevisionId::from(&b"rev1"[..])),
+            parent_id: FileId::from(&b"root-id"[..]),
+            name: "hello.txt".to_string(),
+            text_sha1: Some(b"da39a3ee5e6b4b0d3255bfef95601890afd80709".to_vec()),
+            text_size: Some(0),
+            text_id: None,
+            executable: false,
+        };
+        let mut id_map = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        for e in [&root, &child] {
+            id_map
+                .map(
+                    vec![e.file_id().as_bytes().to_vec()],
+                    chk_inventory_entry_to_bytes(e),
+                )
+                .unwrap();
+        }
+        id_map.save().unwrap();
+        let mut pid_initial: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> =
+            indexmap::IndexMap::new();
+        for e in [&root, &child] {
+            pid_initial.insert(parent_id_basename_key(e), e.file_id().as_bytes().to_vec());
+        }
+        let pid_root_key = CHKMap::from_dict(
+            store.clone(),
+            cache.clone(),
+            pid_initial,
+            0,
+            2,
+            SearchKeyFunc::Plain,
+        )
+        .unwrap();
+        let pid_map = CHKMap::new(
+            store.clone(),
+            cache.clone(),
+            Some(pid_root_key),
+            SearchKeyFunc::Plain,
+        );
+        let out = CHKInventory::new(store.clone(), cache.clone(), b"plain".to_vec());
+        let out = CHKInventory {
+            root_id: Some(FileId::from(&b"root-id"[..])),
+            revision_id: Some(crate::RevisionId::from(&b"rev1"[..])),
+            id_to_entry: std::cell::RefCell::new(Some(id_map)),
+            parent_id_basename_to_file_id: std::cell::RefCell::new(Some(pid_map)),
+            ..out
+        };
+        (out, store, cache)
+    }
+
     #[test]
     fn get_entry_returns_root() {
         let (inv, _store, _cache) = build_test_inv();
@@ -276,6 +341,67 @@ mod tests {
         let (inv, _store, _cache) = build_test_inv();
         assert_eq!(inv.len().unwrap(), 1);
         assert!(!inv.is_empty().unwrap());
+    }
+
+    #[test]
+    fn id2path_returns_slash_separated_path() {
+        let (inv, _store, _cache) = build_test_inv_with_child();
+        let path = inv.id2path(&FileId::from(&b"file-id"[..])).unwrap();
+        assert_eq!(path, "hello.txt");
+        let root_path = inv.id2path(&FileId::from(&b"root-id"[..])).unwrap();
+        assert_eq!(root_path, "");
+    }
+
+    #[test]
+    fn path2id_resolves_existing_path() {
+        let (inv, _store, _cache) = build_test_inv_with_child();
+        let id = inv.path2id("hello.txt").unwrap();
+        assert_eq!(id.map(|f| f.as_bytes().to_vec()), Some(b"file-id".to_vec()));
+    }
+
+    #[test]
+    fn path2id_missing_returns_none() {
+        let (inv, _store, _cache) = build_test_inv_with_child();
+        let id = inv.path2id("no/such/path").unwrap();
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn has_filename_true_for_existing() {
+        let (inv, _store, _cache) = build_test_inv_with_child();
+        assert!(inv.has_filename("hello.txt").unwrap());
+        assert!(!inv.has_filename("missing.txt").unwrap());
+    }
+
+    #[test]
+    fn get_children_returns_root_child() {
+        let (inv, _store, _cache) = build_test_inv_with_child();
+        let kids = inv.get_children(&FileId::from(&b"root-id"[..])).unwrap();
+        assert_eq!(kids.len(), 1);
+        assert!(kids.contains_key("hello.txt"));
+    }
+
+    #[test]
+    fn get_child_by_name() {
+        let (inv, _store, _cache) = build_test_inv_with_child();
+        let child = inv
+            .get_child(&FileId::from(&b"root-id"[..]), "hello.txt")
+            .unwrap();
+        assert!(child.is_some());
+        let absent = inv
+            .get_child(&FileId::from(&b"root-id"[..]), "nope.txt")
+            .unwrap();
+        assert!(absent.is_none());
+    }
+
+    #[test]
+    fn iter_sorted_children_returns_sorted_names() {
+        let (inv, _store, _cache) = build_test_inv_with_child();
+        let kids = inv
+            .iter_sorted_children(&FileId::from(&b"root-id"[..]))
+            .unwrap();
+        let names: Vec<&str> = kids.iter().map(|e| e.name()).collect();
+        assert_eq!(names, vec!["hello.txt"]);
     }
 
     #[test]
@@ -564,6 +690,163 @@ where
             out.push(entry);
         }
         Ok(out)
+    }
+
+    /// Return the slash-separated path of `file_id` from the root.
+    /// Mirrors Python's `id2path`. The root's path is `""`.
+    pub fn id2path(&self, file_id: &crate::FileId) -> Result<String, Error> {
+        let mut parents = self.iter_file_id_parents(file_id)?;
+        // The last parent is the root; drop it (its name is "").
+        parents.pop();
+        parents.reverse();
+        let segments: Vec<String> = parents
+            .into_iter()
+            .map(|e| e.name().to_string())
+            .collect();
+        Ok(segments.join("/"))
+    }
+
+    /// Return the file_id corresponding to `relpath`, or `None` if no
+    /// such entry exists. Mirrors Python's `path2id`. `relpath` may
+    /// be either a slash-separated path or a vector of basenames.
+    pub fn path2id(&self, relpath: &str) -> Result<Option<crate::FileId>, Error> {
+        let names: Vec<&str> = if relpath.is_empty() {
+            Vec::new()
+        } else {
+            relpath.split('/').collect()
+        };
+        if let Some(cached) = self.path_to_fileid_cache.borrow().get(relpath) {
+            return Ok(Some(cached.clone()));
+        }
+        let mut current_id = match &self.root_id {
+            None => return Ok(None),
+            Some(id) => id.clone(),
+        };
+        let mut cur_path: Option<String> = None;
+        for basename in names {
+            cur_path = Some(match cur_path {
+                None => basename.to_string(),
+                Some(p) => format!("{}/{}", p, basename),
+            });
+            if let Some(cached) = self
+                .path_to_fileid_cache
+                .borrow()
+                .get(cur_path.as_ref().unwrap())
+            {
+                current_id = cached.clone();
+                continue;
+            }
+            let basename_utf8 = basename.as_bytes().to_vec();
+            let key = vec![current_id.as_bytes().to_vec(), basename_utf8.clone()];
+            let mut parent_map = self.parent_id_basename_to_file_id.borrow_mut();
+            let map = parent_map.as_mut().ok_or_else(|| {
+                Error::InvalidFormat(
+                    "parent_id_basename_to_file_id not set; can't path2id".into(),
+                )
+            })?;
+            let items = map.iteritems(Some(&[key]))?;
+            let Some((found_key, file_id_bytes)) = items.into_iter().next() else {
+                return Ok(None);
+            };
+            // Sanity check the returned key matches what we asked for.
+            if found_key.len() != 2
+                || found_key[0] != current_id.as_bytes()
+                || found_key[1] != basename_utf8
+            {
+                return Err(Error::InvalidFormat(format!(
+                    "corrupt inventory lookup! key={:?}",
+                    found_key
+                )));
+            }
+            let file_id = crate::FileId::from(file_id_bytes.as_slice());
+            self.path_to_fileid_cache
+                .borrow_mut()
+                .insert(cur_path.clone().unwrap(), file_id.clone());
+            current_id = file_id;
+        }
+        Ok(Some(current_id))
+    }
+
+    /// True if `filename` exists in the inventory.
+    pub fn has_filename(&self, filename: &str) -> Result<bool, Error> {
+        Ok(self.path2id(filename)?.is_some())
+    }
+
+    /// Return the children of `dir_id` as a `{name -> Entry}` map.
+    ///
+    /// Mirrors `get_children`: looks them up via the
+    /// `parent_id_basename_to_file_id` map (returning the file_ids),
+    /// then dereferences via `id_to_entry`. Caches the result.
+    pub fn get_children(
+        &self,
+        dir_id: &crate::FileId,
+    ) -> Result<std::collections::HashMap<String, Entry>, Error> {
+        if let Some(c) = self.children_cache.borrow().get(dir_id) {
+            return Ok(c.clone());
+        }
+        let mut parent_map = self.parent_id_basename_to_file_id.borrow_mut();
+        let map = parent_map.as_mut().ok_or_else(|| {
+            Error::InvalidFormat(
+                "Inventories without parent_id_basename_to_file_id are no longer supported"
+                    .into(),
+            )
+        })?;
+        // 1-element prefix filter looks up just this directory's children.
+        let prefix = vec![dir_id.as_bytes().to_vec()];
+        let pairs = map.iteritems(Some(&[prefix]))?;
+        drop(parent_map);
+        let mut child_keys: Vec<crate::FileId> = pairs
+            .into_iter()
+            .map(|(_k, v)| crate::FileId::from(v.as_slice()))
+            .collect();
+        let mut result: std::collections::HashMap<String, Entry> =
+            std::collections::HashMap::new();
+        // Drain from the cache first.
+        {
+            let cache = self.fileid_to_entry_cache.borrow();
+            child_keys.retain(|cid| {
+                if let Some(entry) = cache.get(cid) {
+                    result.insert(entry.name().to_string(), entry.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        // Look up the rest via id_to_entry.
+        if !child_keys.is_empty() {
+            let entries = self.get_items(&child_keys)?;
+            for entry in entries {
+                result.insert(entry.name().to_string(), entry);
+            }
+        }
+        self.children_cache
+            .borrow_mut()
+            .insert(dir_id.clone(), result.clone());
+        Ok(result)
+    }
+
+    /// Return a specific child of `dir_id` by name. Mirrors `get_child`.
+    pub fn get_child(
+        &self,
+        dir_id: &crate::FileId,
+        name: &str,
+    ) -> Result<Option<Entry>, Error> {
+        // TODO(jelmer): implement a version that doesn't load all children.
+        let children = self.get_children(dir_id)?;
+        Ok(children.get(name).cloned())
+    }
+
+    /// Return children of `dir_id` sorted by name. Mirrors
+    /// `iter_sorted_children`.
+    pub fn iter_sorted_children(
+        &self,
+        dir_id: &crate::FileId,
+    ) -> Result<Vec<Entry>, Error> {
+        let children = self.get_children(dir_id)?;
+        let mut sorted: Vec<(String, Entry)> = children.into_iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(sorted.into_iter().map(|(_, e)| e).collect())
     }
 
     /// Serialise the inventory header to lines (the part that
