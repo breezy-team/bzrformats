@@ -50,32 +50,7 @@ class CHKSerializer(_RsCHKInventorySerializer):
         return self._write_inventory_duck(inv, f, working=working)
 
     def _write_inventory_duck(self, inv, f, working):
-        from .xml_serializer import encode_and_escape, serialize_inventory_flat
-
-        output = []
-        append = output.append
-        if inv.revision_id is not None:
-            revid = b"".join(
-                [b' revision_id="', encode_and_escape(inv.revision_id), b'"']
-            )
-        else:
-            revid = b""
-        append(b'<inventory format="%s"%s>\n' % (self.format_num, revid))
-        append(
-            b'<directory file_id="%s" name="%s" revision="%s" />\n'
-            % (
-                encode_and_escape(inv.root.file_id),
-                encode_and_escape(inv.root.name),
-                encode_and_escape(inv.root.revision),
-            )
-        )
-        serialize_inventory_flat(
-            inv,
-            append,
-            root_id=None,
-            supported_kinds=self.supported_kinds,
-            working=working,
-        )
+        output = self.write_inventory_duck_to_lines(inv, working)
         if f is not None:
             f.writelines(output)
         return output

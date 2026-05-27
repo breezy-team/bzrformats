@@ -743,7 +743,30 @@ fn serialize_inventory_flat(
         // No root, no body to write
         return Ok(());
     }
-    for (_path, ie) in entries {
+    write_entries_to_xml(
+        entries.map(|(_, ie)| ie),
+        out,
+        root_id,
+        supported_kinds,
+        working,
+    )
+}
+
+/// Serialize the supplied non-root entries into the body of a flat XML
+/// inventory, terminated by `</inventory>\n`. The caller is responsible
+/// for writing the opening `<inventory ...>` element and any root
+/// `<directory />` line (the latter applies to v6/v7/v8/CHK formats).
+pub fn write_entries_to_xml<'a, I>(
+    entries: I,
+    out: &mut Vec<u8>,
+    root_id: Option<&[u8]>,
+    supported_kinds: &[&str],
+    working: bool,
+) -> Result<(), Error>
+where
+    I: IntoIterator<Item = &'a Entry>,
+{
+    for ie in entries {
         let kind = ie.kind();
         let kind_str = crate::osutils::Kind::as_str(&kind);
         if !supported_kinds.contains(&kind_str) {
