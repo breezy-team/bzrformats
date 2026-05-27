@@ -3177,6 +3177,75 @@ impl CHKInventory {
         )
     }
 
+    /// Return an Inventory view filtered against `specific_fileids`.
+    /// Children of directories and parents are included. Mirrors
+    /// Python's `CHKInventory.filter`.
+    fn filter<'py>(
+        slf: Bound<'py, CHKInventory>,
+        py: Python<'py>,
+        specific_fileids: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, Inventory>> {
+        let (interesting, parent_to_children) =
+            CHKInventory::_expand_fileids_to_parents_and_children(
+                slf.clone(),
+                py,
+                specific_fileids,
+            )?;
+        // Create the new (empty) Inventory; seed with the root.
+        let inv_cls = py.get_type::<Inventory>();
+        let inv_obj = inv_cls.call1((py.None(),))?;
+        let other = inv_obj.downcast::<Inventory>()?.clone();
+        let root_attr = slf.getattr("root")?;
+        let root_revision = root_attr.getattr("revision")?;
+        let root_id_obj = match slf.borrow().root_id.as_ref() {
+            Some(rid) => PyBytes::new(py, rid.as_bytes()).into_any(),
+            None => py.None().into_bound(py),
+        };
+        let inv_dir_cls = py.get_type::<InventoryDirectory>();
+        let root_dir =
+            inv_dir_cls.call1((root_id_obj.clone(), "", py.None(), root_revision))?;
+        other.call_method1("add", (root_dir,))?;
+        let revision_id_obj = match slf.borrow().revision_id.as_ref() {
+            Some(rev) => PyBytes::new(py, rev.as_bytes()).into_any(),
+            None => py.None().into_bound(py),
+        };
+        other.setattr("revision_id", revision_id_obj)?;
+        if interesting.is_empty() || parent_to_children.is_empty() {
+            return Ok(other);
+        }
+        let cache = slf.borrow().fileid_to_entry_cache.clone_ref(py);
+        // Seed deque with parent_to_children[root_id].
+        let mut remaining: std::collections::VecDeque<Py<PyAny>> =
+            std::collections::VecDeque::new();
+        if let Some(root_children) = parent_to_children.get_item(&root_id_obj)? {
+            for child in root_children.try_iter()? {
+                remaining.push_back(child?.unbind());
+            }
+        }
+        while let Some(file_id_obj) = remaining.pop_front() {
+            let file_id = file_id_obj.bind(py);
+            let ie = cache.bind(py).get_item(file_id)?.ok_or_else(|| {
+                BzrFormatsError::new_err(format!(
+                    "file_id {:?} not in fileid cache",
+                    file_id
+                ))
+            })?;
+            let kind: String = ie.getattr("kind")?.extract()?;
+            let ie_to_add = if kind == "directory" {
+                ie.call_method0("copy")?
+            } else {
+                ie
+            };
+            other.call_method1("add", (ie_to_add,))?;
+            if let Some(children) = parent_to_children.get_item(file_id)? {
+                for c in children.try_iter()? {
+                    remaining.push_back(c?.unbind());
+                }
+            }
+        }
+        Ok(other)
+    }
+
     /// Given a starting set of file_ids, return the set of all
     /// interesting file_ids plus a parent_id -> set-of-children
     /// dict. For directories in `file_ids`, all children (recursively)

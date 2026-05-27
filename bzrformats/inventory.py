@@ -121,47 +121,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
         """Simple thunk to bzrformats.inventory.make_entry."""
         return make_entry(kind, name, parent_id, file_id, revision, **kwargs)
 
-    def filter(self, specific_fileids):
-        """Get an inventory view filtered against a set of file-ids.
-
-        Children of directories and parents are included.
-
-        The result may or may not reference the underlying inventory
-        so it should be treated as immutable.
-        """
-        (
-            interesting,
-            parent_to_children,
-        ) = self._expand_fileids_to_parents_and_children(specific_fileids)
-        # There is some overlap here, but we assume that all interesting items
-        # are in the _fileid_to_entry_cache because we had to read them to
-        # determine if they were a dir we wanted to recurse, or just a file
-        # This should give us all the entries we'll want to add, so start
-        # adding
-        other = Inventory(root_id=None)
-        root = InventoryDirectory(self.root_id, "", None, self.root.revision)
-        other.add(root)
-        other.revision_id = self.revision_id
-        if not interesting or not parent_to_children:
-            # empty filter, or filtering entrys that don't exist
-            # (if even 1 existed, then we would have populated
-            # parent_to_children with at least the tree root.)
-            return other
-        cache = self._fileid_to_entry_cache
-        remaining_children = deque(parent_to_children[self.root_id])
-        while remaining_children:
-            file_id = remaining_children.popleft()
-            ie = cache[file_id]
-            if ie.kind == "directory":
-                ie = ie.copy()  # We create a copy to depopulate the .children attribute
-            # TODO: depending on the uses of 'other' we should probably alwyas
-            #       '.copy()' to prevent someone from mutating other and
-            #       invaliding our internal cache
-            other.add(ie)
-            if file_id in parent_to_children:
-                remaining_children.extend(parent_to_children[file_id])
-        return other
-
     def create_by_apply_delta(
         self, inventory_delta, new_revision_id, propagate_caches=False
     ):
