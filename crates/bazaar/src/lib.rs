@@ -26,6 +26,7 @@ pub mod lock;
 pub mod multiparent;
 pub mod osutils;
 pub mod pack;
+pub mod pack_repo;
 pub mod plan_merge;
 pub mod repository;
 pub mod revision;
