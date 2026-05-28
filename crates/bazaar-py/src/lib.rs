@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use pyo3_filelike::PyBinaryFile;
 use std::collections::HashMap;
+use std::io::Write;
 
 mod bisect_multi;
 mod btree_index;
@@ -825,6 +826,46 @@ impl CHKInventorySerializer {
         PyBytes::new(py, &self.search_key_name)
     }
 
+    /// Write an inventory, dispatching on its concrete type. The Rust
+    /// ``Inventory`` pyclass takes the native fast path; any other (duck-typed)
+    /// inventory such as the pure-Python ``CHKInventory`` is serialized by
+    /// reading its entries via attribute access.
+    #[pyo3(signature = (inv, f, working = false))]
+    fn write_inventory<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        inv: Py<PyAny>,
+        f: Py<PyAny>,
+        working: bool,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let lines = chk_write_inventory_line_bytes(&slf, inv.bind(py), working)?;
+        if !f.is_none(py) {
+            let mut file = PyBinaryFile::from(f);
+            for line in &lines {
+                file.write_all(line)?;
+            }
+        }
+        Ok(lines.into_iter().map(|l| PyBytes::new(py, &l)).collect())
+    }
+
+    fn write_inventory_to_lines<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        inv: Py<PyAny>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let lines = chk_write_inventory_line_bytes(&slf, inv.bind(py), false)?;
+        Ok(lines.into_iter().map(|l| PyBytes::new(py, &l)).collect())
+    }
+
+    fn write_inventory_to_chunks<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        inv: Py<PyAny>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let lines = chk_write_inventory_line_bytes(&slf, inv.bind(py), false)?;
+        Ok(lines.into_iter().map(|l| PyBytes::new(py, &l)).collect())
+    }
+
     /// Serialize a duck-typed inventory (e.g. ``CHKInventory``) to a list of
     /// byte lines. The Rust ``CHKSerializer`` only accepts the Rust
     /// ``Inventory`` pyclass, but ``CHKInventory`` lives in pure Python — this
@@ -837,69 +878,75 @@ impl CHKInventorySerializer {
         inv: Py<PyAny>,
         working: bool,
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
-        let inv = inv.bind(py);
-        let format_num = slf.as_super().0.format_num().to_vec();
-
-        let mut out = Vec::new();
-        out.extend_from_slice(b"<inventory format=\"");
-        out.extend_from_slice(&format_num);
-        out.push(b'"');
-        let revision_id_attr = inv.getattr("revision_id")?;
-        if !revision_id_attr.is_none() {
-            let revision_id: Vec<u8> = revision_id_attr.extract()?;
-            out.extend_from_slice(b" revision_id=\"");
-            out.extend_from_slice(
-                bazaar::xml_serializer::encode_and_escape_bytes(&revision_id).as_bytes(),
-            );
-            out.push(b'"');
-        }
-        out.extend_from_slice(b">\n");
-
-        let root = inv.getattr("root")?;
-        let root_file_id: Vec<u8> = root.getattr("file_id")?.extract()?;
-        let root_name: String = root.getattr("name")?.extract()?;
-        let root_revision: Vec<u8> = root.getattr("revision")?.extract()?;
-        out.extend_from_slice(b"<directory file_id=\"");
-        out.extend_from_slice(
-            bazaar::xml_serializer::encode_and_escape_bytes(&root_file_id).as_bytes(),
-        );
-        out.extend_from_slice(b"\" name=\"");
-        out.extend_from_slice(
-            bazaar::xml_serializer::encode_and_escape_string(&root_name).as_bytes(),
-        );
-        out.extend_from_slice(b"\" revision=\"");
-        out.extend_from_slice(
-            bazaar::xml_serializer::encode_and_escape_bytes(&root_revision).as_bytes(),
-        );
-        out.extend_from_slice(b"\" />\n");
-
-        let entries_iter = inv.call_method0("iter_entries")?.try_iter()?;
-        // Skip the root, which iter_entries yields first.
-        let mut entries: Vec<bazaar::inventory::Entry> = Vec::new();
-        let mut first = true;
-        for item in entries_iter {
-            let pair = item?;
-            if first {
-                first = false;
-                continue;
-            }
-            let ie = pair.get_item(1)?;
-            let entry = inventory_entry_from_py(&ie)?;
-            entries.push(entry);
-        }
-
-        bazaar::xml_serializer::write_entries_to_xml(
-            entries.iter(),
-            &mut out,
-            None,
-            &["file", "directory", "symlink", "tree-reference"],
-            working,
-        )
-        .map_err(inventory_serializer_err_to_py_err)?;
-
-        let lines = split_lines_keepends(&out);
+        let lines = chk_write_inventory_duck(&slf, inv.bind(py), working)?;
         Ok(lines.into_iter().map(|l| PyBytes::new(py, &l)).collect())
     }
+}
+
+/// Serialize an inventory to byte lines, dispatching on its concrete type. A
+/// Rust ``Inventory`` pyclass takes the native serializer; anything else is
+/// treated as a duck-typed inventory and read via attribute access.
+fn chk_write_inventory_line_bytes(
+    slf: &PyRef<'_, CHKInventorySerializer>,
+    inv: &Bound<'_, PyAny>,
+    working: bool,
+) -> PyResult<Vec<Vec<u8>>> {
+    if let Ok(native) = inv.extract::<PyRef<inventory::Inventory>>() {
+        return slf
+            .as_super()
+            .0
+            .write_inventory_to_lines(&native.0, working)
+            .map_err(inventory_serializer_err_to_py_err);
+    }
+    chk_write_inventory_duck(slf, inv, working)
+}
+
+/// Serialize a duck-typed inventory to byte lines using attribute access. The
+/// header parts (format, revision_id, root) are read here; the pure-Rust
+/// writer in the ``bazaar`` crate produces the byte stream.
+fn chk_write_inventory_duck(
+    slf: &PyRef<'_, CHKInventorySerializer>,
+    inv: &Bound<'_, PyAny>,
+    working: bool,
+) -> PyResult<Vec<Vec<u8>>> {
+    let format_num = slf.as_super().0.format_num().to_vec();
+
+    let revision_id_attr = inv.getattr("revision_id")?;
+    let revision_id: Option<Vec<u8>> = if revision_id_attr.is_none() {
+        None
+    } else {
+        Some(revision_id_attr.extract()?)
+    };
+
+    let root = inv.getattr("root")?;
+    let root_file_id: Vec<u8> = root.getattr("file_id")?.extract()?;
+    let root_name: String = root.getattr("name")?.extract()?;
+    let root_revision: Vec<u8> = root.getattr("revision")?.extract()?;
+
+    let entries_iter = inv.call_method0("iter_entries")?.try_iter()?;
+    // Skip the root, which iter_entries yields first.
+    let mut entries: Vec<bazaar::inventory::Entry> = Vec::new();
+    let mut first = true;
+    for item in entries_iter {
+        let pair = item?;
+        if first {
+            first = false;
+            continue;
+        }
+        let ie = pair.get_item(1)?;
+        entries.push(inventory_entry_from_py(&ie)?);
+    }
+
+    bazaar::xml_serializer::serialize_chk_inventory_parts(
+        &format_num,
+        revision_id.as_deref(),
+        &root_file_id,
+        &root_name,
+        &root_revision,
+        entries.iter(),
+        working,
+    )
+    .map_err(inventory_serializer_err_to_py_err)
 }
 
 /// Build a Rust ``Entry`` from a duck-typed Python inventory entry. The fast
@@ -1005,21 +1052,6 @@ fn inventory_entry_from_py(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::inventory
             other
         ))),
     }
-}
-
-fn split_lines_keepends(data: &[u8]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, &b) in data.iter().enumerate() {
-        if b == b'\n' {
-            out.push(data[start..=i].to_vec());
-            start = i + 1;
-        }
-    }
-    if start < data.len() {
-        out.push(data[start..].to_vec());
-    }
-    out
 }
 
 #[pyfunction(name = "is_null")]

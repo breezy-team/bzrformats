@@ -1141,6 +1141,54 @@ fn append_chk_root(
     Ok(())
 }
 
+/// Serialize a CHK inventory from its already-extracted header parts and an
+/// iterator of non-root entries. Produces the same byte stream as
+/// [`CHKSerializer::write_inventory_to_lines`], split into keepends lines.
+///
+/// This exists so callers that cannot hand over a [`MutableInventory`] (for
+/// example the pyo3 layer reading a duck-typed Python `CHKInventory` via
+/// attribute access) can still drive the full XML writer from Rust.
+pub fn serialize_chk_inventory_parts<'a, I>(
+    format_num: &[u8],
+    revision_id: Option<&[u8]>,
+    root_file_id: &[u8],
+    root_name: &str,
+    root_revision: &[u8],
+    entries: I,
+    working: bool,
+) -> Result<Vec<Vec<u8>>, Error>
+where
+    I: IntoIterator<Item = &'a Entry>,
+{
+    let mut out = Vec::new();
+    out.extend_from_slice(b"<inventory format=\"");
+    out.extend_from_slice(format_num);
+    out.push(b'"');
+    if let Some(revision_id) = revision_id {
+        out.extend_from_slice(b" revision_id=\"");
+        out.extend_from_slice(encode_and_escape_bytes(revision_id).as_bytes());
+        out.push(b'"');
+    }
+    out.extend_from_slice(b">\n");
+
+    out.extend_from_slice(b"<directory file_id=\"");
+    out.extend_from_slice(encode_and_escape_bytes(root_file_id).as_bytes());
+    out.extend_from_slice(b"\" name=\"");
+    out.extend_from_slice(encode_and_escape_string(root_name).as_bytes());
+    out.extend_from_slice(b"\" revision=\"");
+    out.extend_from_slice(encode_and_escape_bytes(root_revision).as_bytes());
+    out.extend_from_slice(b"\" />\n");
+
+    write_entries_to_xml(
+        entries,
+        &mut out,
+        None,
+        SUPPORTED_KINDS_WITH_TREE_REF,
+        working,
+    )?;
+    Ok(split_lines_keepends(&out))
+}
+
 impl InventorySerializer for CHKSerializer {
     fn format_num(&self) -> &[u8] {
         &self.format_num
