@@ -141,6 +141,31 @@ fn py_deserialise_internal_node<'py>(
     ))
 }
 
+/// Convert serialised node bytes into a `LeafNode` or `InternalNode`,
+/// dispatching on the body prefix. Mirrors the Python
+/// `chk_map._deserialise` helper used by repositorydetails code.
+#[pyfunction]
+#[pyo3(name = "_deserialise")]
+#[pyo3(signature = (data, key, search_key_func = None))]
+fn py_deserialise<'py>(
+    py: Python<'py>,
+    data: &[u8],
+    key: Bound<'py, PyTuple>,
+    search_key_func: Option<Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if data.starts_with(b"chkleaf:\n") {
+        py.get_type::<LeafNode>()
+            .call_method("deserialise", (data, key, search_key_func), None)
+    } else if data.starts_with(b"chknode:\n") {
+        py.get_type::<InternalNode>()
+            .call_method("deserialise", (data, key, search_key_func), None)
+    } else {
+        Err(pyo3::exceptions::PyAssertionError::new_err(
+            "Unknown node type.",
+        ))
+    }
+}
+
 /// Build the line list that `LeafNode.serialise` would hand to
 /// `store.add_lines(...)`. `items` is a list of `(key_tuple, value)`
 /// pairs in already-sorted order; `common_prefix` is `None` only for the
@@ -1751,6 +1776,7 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(common_prefix_many))?;
     m.add_wrapped(wrap_pyfunction!(py_deserialise_leaf_node))?;
     m.add_wrapped(wrap_pyfunction!(py_deserialise_internal_node))?;
+    m.add_wrapped(wrap_pyfunction!(py_deserialise))?;
     m.add_wrapped(wrap_pyfunction!(py_serialise_leaf_node))?;
     m.add_wrapped(wrap_pyfunction!(py_serialise_internal_node))?;
     m.add_wrapped(wrap_pyfunction!(py_leaf_node_key_value_len))?;
