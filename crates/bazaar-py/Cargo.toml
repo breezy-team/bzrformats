@@ -11,6 +11,8 @@ bazaar = { path = "../bazaar", features=["pyo3"] }
 patiencediff = { version = "0.2.1", default-features = false }
 pyo3 = { workspace = true, features = ["extension-module", "chrono"]}
 pyo3-filelike = { workspace = true }
+pyo3-log = { workspace = true }
+log = { workspace = true }
 chrono = { workspace = true }
 sha1 = "0.10"
 vcs-graph = "3.5.0"

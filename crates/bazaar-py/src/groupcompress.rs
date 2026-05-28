@@ -2837,16 +2837,11 @@ impl GCGraphIndex {
                         )));
                     } else {
                         // Log warning and skip.
-                        let logging = py.import("logging")?;
-                        let logger =
-                            logging.call_method1("getLogger", ("bzrformats.groupcompress",))?;
-                        logger.call_method1(
-                            "warning",
-                            (format!(
-                                "inconsistent details in skipped record: {}",
-                                details
-                            ),),
-                        )?;
+                        log::warn!(
+                            target: "bzrformats.groupcompress",
+                            "inconsistent details in skipped record: {}",
+                            details
+                        );
                     }
                 }
                 keys_map.del_item(key)?;
@@ -3455,9 +3450,7 @@ impl GroupCompressVersionedFiles {
 
     /// All keys present in this store or any fallback.
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PySet>> {
-        py.import("logging")?
-            .call_method1("getLogger", ("bzrformats.evil",))?
-            .call_method1("debug", ("keys scales with size of history",))?;
+        log::debug!(target: "bzrformats.evil", "keys scales with size of history");
         // The pure store walks its fallback list internally; we just
         // marshal the result into a Python set.
         let keys = self.pure.keys().map_err(crate::knit::knit_err_to_py)?;
@@ -3692,22 +3685,19 @@ impl GroupCompressVersionedFiles {
             let record = record?;
             let storage_kind: String = record.getattr("storage_kind")?.extract()?;
             if storage_kind == "absent" {
-                return Err(PyErr::from_value(
-                    revision_not_present.call1((record.getattr("key")?, slf))?,
-                ));
+                return Err(RevisionNotPresent::new_err((
+                    record.getattr("key")?.unbind(),
+                    slf.clone().unbind(),
+                )));
             }
             if random_id {
                 let key_repr = record.getattr("key")?.repr()?.to_string();
                 if !inserted_keys.insert(key_repr) {
-                    py.import("logging")?
-                        .call_method1("getLogger", ("bzrformats.groupcompress",))?
-                        .call_method1(
-                            "info",
-                            (
-                                "Insert claimed random_id=True, but then inserted %r two times",
-                                record.getattr("key")?,
-                            ),
-                        )?;
+                    log::info!(
+                        target: "bzrformats.groupcompress",
+                        "Insert claimed random_id=True, but then inserted {} two times",
+                        record.getattr("key")?.repr()?
+                    );
                     continue;
                 }
             }
