@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use pyo3_filelike::PyBinaryFile;
 use std::collections::HashMap;
+use std::io::Write;
 
 mod bisect_multi;
 mod btree_index;
@@ -823,6 +824,233 @@ impl CHKInventorySerializer {
     #[getter]
     fn search_key_name<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.search_key_name)
+    }
+
+    /// Write an inventory, dispatching on its concrete type. The Rust
+    /// ``Inventory`` pyclass takes the native fast path; any other (duck-typed)
+    /// inventory such as the pure-Python ``CHKInventory`` is serialized by
+    /// reading its entries via attribute access.
+    #[pyo3(signature = (inv, f, working = false))]
+    fn write_inventory<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        inv: Py<PyAny>,
+        f: Py<PyAny>,
+        working: bool,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let lines = chk_write_inventory_line_bytes(&slf, inv.bind(py), working)?;
+        if !f.is_none(py) {
+            let mut file = PyBinaryFile::from(f);
+            for line in &lines {
+                file.write_all(line)?;
+            }
+        }
+        Ok(lines.into_iter().map(|l| PyBytes::new(py, &l)).collect())
+    }
+
+    fn write_inventory_to_lines<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        inv: Py<PyAny>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let lines = chk_write_inventory_line_bytes(&slf, inv.bind(py), false)?;
+        Ok(lines.into_iter().map(|l| PyBytes::new(py, &l)).collect())
+    }
+
+    fn write_inventory_to_chunks<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        inv: Py<PyAny>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let lines = chk_write_inventory_line_bytes(&slf, inv.bind(py), false)?;
+        Ok(lines.into_iter().map(|l| PyBytes::new(py, &l)).collect())
+    }
+
+    /// Serialize a duck-typed inventory (e.g. ``CHKInventory``) to a list of
+    /// byte lines. The Rust ``CHKSerializer`` only accepts the Rust
+    /// ``Inventory`` pyclass, but ``CHKInventory`` lives in pure Python — this
+    /// shim extracts its entries (each one is a Rust-backed ``InventoryEntry``)
+    /// and dispatches to the same Rust XML writer.
+    #[pyo3(signature = (inv, working = false))]
+    fn write_inventory_duck_to_lines<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        inv: Py<PyAny>,
+        working: bool,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let lines = chk_write_inventory_duck(&slf, inv.bind(py), working)?;
+        Ok(lines.into_iter().map(|l| PyBytes::new(py, &l)).collect())
+    }
+}
+
+/// Serialize an inventory to byte lines, dispatching on its concrete type. A
+/// Rust ``Inventory`` pyclass takes the native serializer; anything else is
+/// treated as a duck-typed inventory and read via attribute access.
+fn chk_write_inventory_line_bytes(
+    slf: &PyRef<'_, CHKInventorySerializer>,
+    inv: &Bound<'_, PyAny>,
+    working: bool,
+) -> PyResult<Vec<Vec<u8>>> {
+    if let Ok(native) = inv.extract::<PyRef<inventory::Inventory>>() {
+        return slf
+            .as_super()
+            .0
+            .write_inventory_to_lines(&native.0, working)
+            .map_err(inventory_serializer_err_to_py_err);
+    }
+    chk_write_inventory_duck(slf, inv, working)
+}
+
+/// Serialize a duck-typed inventory to byte lines using attribute access. The
+/// header parts (format, revision_id, root) are read here; the pure-Rust
+/// writer in the ``bazaar`` crate produces the byte stream.
+fn chk_write_inventory_duck(
+    slf: &PyRef<'_, CHKInventorySerializer>,
+    inv: &Bound<'_, PyAny>,
+    working: bool,
+) -> PyResult<Vec<Vec<u8>>> {
+    let format_num = slf.as_super().0.format_num().to_vec();
+
+    let revision_id_attr = inv.getattr("revision_id")?;
+    let revision_id: Option<Vec<u8>> = if revision_id_attr.is_none() {
+        None
+    } else {
+        Some(revision_id_attr.extract()?)
+    };
+
+    let root = inv.getattr("root")?;
+    let root_file_id: Vec<u8> = root.getattr("file_id")?.extract()?;
+    let root_name: String = root.getattr("name")?.extract()?;
+    let root_revision: Vec<u8> = root.getattr("revision")?.extract()?;
+
+    let entries_iter = inv.call_method0("iter_entries")?.try_iter()?;
+    // Skip the root, which iter_entries yields first.
+    let mut entries: Vec<bazaar::inventory::Entry> = Vec::new();
+    let mut first = true;
+    for item in entries_iter {
+        let pair = item?;
+        if first {
+            first = false;
+            continue;
+        }
+        let ie = pair.get_item(1)?;
+        entries.push(inventory_entry_from_py(&ie)?);
+    }
+
+    bazaar::xml_serializer::serialize_chk_inventory_parts(
+        &format_num,
+        revision_id.as_deref(),
+        &root_file_id,
+        &root_name,
+        &root_revision,
+        entries.iter(),
+        working,
+    )
+    .map_err(inventory_serializer_err_to_py_err)
+}
+
+/// Build a Rust ``Entry`` from a duck-typed Python inventory entry. The fast
+/// path (which is what ``CHKInventory`` produces) extracts the underlying
+/// Rust ``Entry`` from an ``InventoryEntry`` pyclass directly; the fallback
+/// reads named attributes one at a time, so any object that quacks like an
+/// inventory entry also works.
+fn inventory_entry_from_py(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::inventory::Entry> {
+    if let Ok(ie) = obj.extract::<PyRef<inventory::InventoryEntry>>() {
+        return Ok(ie.0.clone());
+    }
+    let kind: String = obj.getattr("kind")?.extract()?;
+    let file_id: Vec<u8> = obj.getattr("file_id")?.extract()?;
+    let file_id = bazaar::FileId::from(file_id.as_slice());
+    let name: String = obj.getattr("name")?.extract()?;
+    let parent_id_attr = obj.getattr("parent_id")?;
+    let parent_id: Option<bazaar::FileId> = if parent_id_attr.is_none() {
+        None
+    } else {
+        let bytes: Vec<u8> = parent_id_attr.extract()?;
+        Some(bazaar::FileId::from(bytes.as_slice()))
+    };
+    let revision_attr = obj.getattr("revision")?;
+    let revision: Option<bazaar::RevisionId> = if revision_attr.is_none() {
+        None
+    } else {
+        let bytes: Vec<u8> = revision_attr.extract()?;
+        Some(bazaar::RevisionId::from(bytes.as_slice()))
+    };
+    match kind.as_str() {
+        "directory" => {
+            let parent_id = parent_id
+                .ok_or_else(|| PyValueError::new_err("directory entry missing parent_id"))?;
+            Ok(bazaar::inventory::Entry::directory(
+                file_id, name, parent_id, revision,
+            ))
+        }
+        "file" => {
+            let parent_id =
+                parent_id.ok_or_else(|| PyValueError::new_err("file entry missing parent_id"))?;
+            let text_sha1_attr = obj.getattr("text_sha1")?;
+            let text_sha1: Option<Vec<u8>> = if text_sha1_attr.is_none() {
+                None
+            } else {
+                Some(text_sha1_attr.extract()?)
+            };
+            let text_size_attr = obj.getattr("text_size")?;
+            let text_size: Option<u64> = if text_size_attr.is_none() {
+                None
+            } else {
+                Some(text_size_attr.extract()?)
+            };
+            let executable: bool = obj.getattr("executable")?.extract().unwrap_or(false);
+            Ok(bazaar::inventory::Entry::file(
+                file_id,
+                name,
+                parent_id,
+                revision,
+                text_sha1,
+                text_size,
+                Some(executable),
+                None,
+            ))
+        }
+        "symlink" => {
+            let parent_id = parent_id
+                .ok_or_else(|| PyValueError::new_err("symlink entry missing parent_id"))?;
+            let target_attr = obj.getattr("symlink_target")?;
+            let symlink_target: Option<String> = if target_attr.is_none() {
+                None
+            } else {
+                Some(target_attr.extract()?)
+            };
+            Ok(bazaar::inventory::Entry::link(
+                file_id,
+                name,
+                parent_id,
+                revision,
+                symlink_target,
+            ))
+        }
+        "tree-reference" => {
+            let parent_id = parent_id
+                .ok_or_else(|| PyValueError::new_err("tree-reference entry missing parent_id"))?;
+            let reference_revision_attr = obj.getattr("reference_revision")?;
+            let reference_revision: Option<bazaar::RevisionId> =
+                if reference_revision_attr.is_none() {
+                    None
+                } else {
+                    let bytes: Vec<u8> = reference_revision_attr.extract()?;
+                    Some(bazaar::RevisionId::from(bytes.as_slice()))
+                };
+            Ok(bazaar::inventory::Entry::tree_reference(
+                file_id,
+                name,
+                parent_id,
+                revision,
+                reference_revision,
+            ))
+        }
+        other => Err(PyValueError::new_err(format!(
+            "unsupported inventory entry kind: {}",
+            other
+        ))),
     }
 }
 

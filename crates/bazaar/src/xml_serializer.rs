@@ -743,7 +743,30 @@ fn serialize_inventory_flat(
         // No root, no body to write
         return Ok(());
     }
-    for (_path, ie) in entries {
+    write_entries_to_xml(
+        entries.map(|(_, ie)| ie),
+        out,
+        root_id,
+        supported_kinds,
+        working,
+    )
+}
+
+/// Serialize the supplied non-root entries into the body of a flat XML
+/// inventory, terminated by `</inventory>\n`. The caller is responsible
+/// for writing the opening `<inventory ...>` element and any root
+/// `<directory />` line (the latter applies to v6/v7/v8/CHK formats).
+pub fn write_entries_to_xml<'a, I>(
+    entries: I,
+    out: &mut Vec<u8>,
+    root_id: Option<&[u8]>,
+    supported_kinds: &[&str],
+    working: bool,
+) -> Result<(), Error>
+where
+    I: IntoIterator<Item = &'a Entry>,
+{
+    for ie in entries {
         let kind = ie.kind();
         let kind_str = crate::osutils::Kind::as_str(&kind);
         if !supported_kinds.contains(&kind_str) {
@@ -1116,6 +1139,54 @@ fn append_chk_root(
     out.extend_from_slice(encode_and_escape_bytes(root_revision.as_bytes()).as_bytes());
     out.extend_from_slice(b"\" />\n");
     Ok(())
+}
+
+/// Serialize a CHK inventory from its already-extracted header parts and an
+/// iterator of non-root entries. Produces the same byte stream as
+/// [`CHKSerializer::write_inventory_to_lines`], split into keepends lines.
+///
+/// This exists so callers that cannot hand over a [`MutableInventory`] (for
+/// example the pyo3 layer reading a duck-typed Python `CHKInventory` via
+/// attribute access) can still drive the full XML writer from Rust.
+pub fn serialize_chk_inventory_parts<'a, I>(
+    format_num: &[u8],
+    revision_id: Option<&[u8]>,
+    root_file_id: &[u8],
+    root_name: &str,
+    root_revision: &[u8],
+    entries: I,
+    working: bool,
+) -> Result<Vec<Vec<u8>>, Error>
+where
+    I: IntoIterator<Item = &'a Entry>,
+{
+    let mut out = Vec::new();
+    out.extend_from_slice(b"<inventory format=\"");
+    out.extend_from_slice(format_num);
+    out.push(b'"');
+    if let Some(revision_id) = revision_id {
+        out.extend_from_slice(b" revision_id=\"");
+        out.extend_from_slice(encode_and_escape_bytes(revision_id).as_bytes());
+        out.push(b'"');
+    }
+    out.extend_from_slice(b">\n");
+
+    out.extend_from_slice(b"<directory file_id=\"");
+    out.extend_from_slice(encode_and_escape_bytes(root_file_id).as_bytes());
+    out.extend_from_slice(b"\" name=\"");
+    out.extend_from_slice(encode_and_escape_string(root_name).as_bytes());
+    out.extend_from_slice(b"\" revision=\"");
+    out.extend_from_slice(encode_and_escape_bytes(root_revision).as_bytes());
+    out.extend_from_slice(b"\" />\n");
+
+    write_entries_to_xml(
+        entries,
+        &mut out,
+        None,
+        SUPPORTED_KINDS_WITH_TREE_REF,
+        working,
+    )?;
+    Ok(split_lines_keepends(&out))
 }
 
 impl InventorySerializer for CHKSerializer {
@@ -1867,6 +1938,289 @@ mod tests {
         match err {
             Error::EncodeError(msg) => assert!(msg.contains("root has no revision")),
             other => panic!("expected EncodeError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inventory_v5_unpack_entry_details() {
+        use crate::inventory::Inventory as _;
+        let s = XMLInventorySerializer5;
+        let inv = s
+            .read_inventory_from_lines(&[COMMITTED_INV_V5], None)
+            .unwrap();
+        assert_eq!(inv.len(), 4);
+        let bar_id = FileId::from(b"bar-20050824000535-6bc48cfad47ed134".as_slice());
+        let ie = inv.get_entry(&bar_id).expect("entry present");
+        assert_eq!(ie.kind(), crate::osutils::Kind::File);
+        assert_eq!(
+            ie.revision().map(|r| r.as_bytes()),
+            Some(b"mbp@foo-00".as_slice())
+        );
+        assert_eq!(ie.name(), "bar");
+        let parent = inv.get_entry(ie.parent_id().unwrap()).unwrap();
+        assert_eq!(parent.kind(), crate::osutils::Kind::Directory);
+    }
+
+    #[test]
+    fn inventory_v5_basis_revision_id_from_data() {
+        let basis: &[u8] = b"<inventory revision_id=\"mbp@sourcefrog.net-20050905063503-43948f59fa127d92\">\n<file file_id=\"bar-20050901064931-73b4b1138abc9cd2\"\n      name=\"bar\" parent_id=\"TREE_ROOT\"\n      revision=\"mbp@foo-123123\"/>\n<directory name=\"subdir\"\n           file_id=\"foo-20050801201819-4139aa4a272f4250\"\n           parent_id=\"TREE_ROOT\"\n           revision=\"mbp@foo-00\"/>\n<file file_id=\"bar-20050824000535-6bc48cfad47ed134\"\n      name=\"bar\" parent_id=\"foo-20050801201819-4139aa4a272f4250\"\n      revision=\"mbp@foo-00\"/>\n</inventory>\n";
+        let s = XMLInventorySerializer5;
+        let inv = s.read_inventory_from_lines(&[basis], None).unwrap();
+        assert_eq!(inv.len(), 4);
+        assert_eq!(
+            inv.revision_id.as_ref().map(|r| r.as_bytes()),
+            Some(b"mbp@sourcefrog.net-20050905063503-43948f59fa127d92".as_slice())
+        );
+    }
+
+    #[test]
+    fn inventory_v5_with_non_default_root_roundtrips() {
+        let expected: &[u8] = b"<inventory file_id=\"f&lt;\" format=\"5\" revision_id=\"mother!\">\n<file file_id=\"bar-20050901064931-73b4b1138abc9cd2\" name=\"bar\" parent_id=\"f&lt;\" revision=\"mbp@foo-123123\" text_sha1=\"A\" text_size=\"1\" />\n<directory file_id=\"foo-20050801201819-4139aa4a272f4250\" name=\"subdir\" parent_id=\"f&lt;\" revision=\"mbp@foo-00\" />\n<file executable=\"yes\" file_id=\"bar-20050824000535-6bc48cfad47ed134\" name=\"bar\" parent_id=\"foo-20050801201819-4139aa4a272f4250\" revision=\"mbp@foo-00\" text_sha1=\"B\" text_size=\"0\" />\n<symlink file_id=\"link-1\" name=\"link\" parent_id=\"foo-20050801201819-4139aa4a272f4250\" revision=\"mbp@foo-00\" symlink_target=\"a\" />\n</inventory>\n";
+        let s = XMLInventorySerializer5;
+        let inv = s.read_inventory_from_lines(&[expected], None).unwrap();
+        let out = s.write_inventory_to_string(&inv, false).unwrap();
+        assert_eq!(out, expected);
+        let inv2 = s.read_inventory_from_lines(&[&out], None).unwrap();
+        assert_eq!(inv, inv2);
+    }
+
+    fn v6_v7_sample_inventory() -> MutableInventory {
+        let mut inv = MutableInventory::new();
+        inv.revision_id = Some(RevisionId::from(b"rev_outer".as_slice()));
+        inv.add(Entry::root(
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+        ))
+        .unwrap();
+        inv.add(Entry::directory(
+            FileId::from(b"dir-id".as_slice()),
+            "dir".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+        ))
+        .unwrap();
+        inv.add(Entry::file(
+            FileId::from(b"file-id".as_slice()),
+            "file".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+            Some(b"A".to_vec()),
+            Some(1),
+            Some(false),
+            None,
+        ))
+        .unwrap();
+        inv.add(Entry::link(
+            FileId::from(b"link-id".as_slice()),
+            "link".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+            Some("a".to_string()),
+        ))
+        .unwrap();
+        inv
+    }
+
+    #[test]
+    fn inventory_v6_roundtrip_and_text() {
+        let expected: &[u8] = b"<inventory format=\"6\" revision_id=\"rev_outer\">\n<directory file_id=\"tree-root-321\" name=\"\" revision=\"rev_outer\" />\n<directory file_id=\"dir-id\" name=\"dir\" parent_id=\"tree-root-321\" revision=\"rev_outer\" />\n<file file_id=\"file-id\" name=\"file\" parent_id=\"tree-root-321\" revision=\"rev_outer\" text_sha1=\"A\" text_size=\"1\" />\n<symlink file_id=\"link-id\" name=\"link\" parent_id=\"tree-root-321\" revision=\"rev_outer\" symlink_target=\"a\" />\n</inventory>\n";
+        let s = XMLInventorySerializer6;
+        let inv = v6_v7_sample_inventory();
+        let out = s.write_inventory_to_string(&inv, false).unwrap();
+        assert_eq!(out, expected);
+        let inv2 = s.read_inventory_from_lines(&[&out], None).unwrap();
+        assert_eq!(inv, inv2);
+    }
+
+    #[test]
+    fn inventory_v7_roundtrip_and_text() {
+        let expected: &[u8] = b"<inventory format=\"7\" revision_id=\"rev_outer\">\n<directory file_id=\"tree-root-321\" name=\"\" revision=\"rev_outer\" />\n<directory file_id=\"dir-id\" name=\"dir\" parent_id=\"tree-root-321\" revision=\"rev_outer\" />\n<file file_id=\"file-id\" name=\"file\" parent_id=\"tree-root-321\" revision=\"rev_outer\" text_sha1=\"A\" text_size=\"1\" />\n<symlink file_id=\"link-id\" name=\"link\" parent_id=\"tree-root-321\" revision=\"rev_outer\" symlink_target=\"a\" />\n<tree-reference file_id=\"nested-id\" name=\"nested\" parent_id=\"tree-root-321\" revision=\"rev_outer\" reference_revision=\"rev_inner\" />\n</inventory>\n";
+        let s = XMLInventorySerializer7;
+        let mut inv = v6_v7_sample_inventory();
+        inv.add(Entry::tree_reference(
+            FileId::from(b"nested-id".as_slice()),
+            "nested".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev_outer".as_slice())),
+            Some(RevisionId::from(b"rev_inner".as_slice())),
+        ))
+        .unwrap();
+        let out = s.write_inventory_to_string(&inv, false).unwrap();
+        assert_eq!(out, expected);
+        let inv2 = s.read_inventory_from_lines(&[&out], None).unwrap();
+        assert_eq!(inv, inv2);
+    }
+
+    #[test]
+    fn inventory_wrong_format_rejected() {
+        // v7 serializer must reject v5-shaped data, and v6 must reject v7 data.
+        let s_v6 = XMLInventorySerializer6;
+        let s_v7 = XMLInventorySerializer7;
+        let v5: &[u8] = b"<inventory format=\"5\">\n</inventory>\n";
+        let err = s_v7.read_inventory_from_lines(&[v5], None).unwrap_err();
+        match err {
+            Error::UnexpectedInventoryFormat(_) => {}
+            other => panic!("expected UnexpectedInventoryFormat, got {:?}", other),
+        }
+        let v7: &[u8] = b"<inventory format=\"7\" revision_id=\"rev_outer\">\n<directory file_id=\"tree-root-321\" name=\"\" revision=\"rev_outer\" />\n</inventory>\n";
+        let err = s_v6.read_inventory_from_lines(&[v7], None).unwrap_err();
+        match err {
+            Error::UnexpectedInventoryFormat(_) => {}
+            other => panic!("expected UnexpectedInventoryFormat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tree_reference_only_supported_by_v7() {
+        use crate::inventory::Inventory as _;
+        let mut inv = MutableInventory::new();
+        inv.revision_id = Some(RevisionId::from(b"rev-outer".as_slice()));
+        inv.add(Entry::root(
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"root-rev".as_slice())),
+        ))
+        .unwrap();
+        inv.add(Entry::tree_reference(
+            FileId::from(b"nested-id".as_slice()),
+            "nested".to_string(),
+            FileId::from(b"tree-root-321".as_slice()),
+            Some(RevisionId::from(b"rev-outer".as_slice())),
+            Some(RevisionId::from(b"rev-inner".as_slice())),
+        ))
+        .unwrap();
+
+        for s in [
+            &XMLInventorySerializer5 as &dyn InventorySerializer,
+            &XMLInventorySerializer6,
+        ] {
+            let err = s.write_inventory_to_string(&inv, false).unwrap_err();
+            match err {
+                Error::UnsupportedInventoryKind(kind) => assert_eq!(kind, "tree-reference"),
+                other => panic!("expected UnsupportedInventoryKind, got {:?}", other),
+            }
+        }
+
+        let s_v7 = XMLInventorySerializer7;
+        let out = s_v7.write_inventory_to_string(&inv, false).unwrap();
+        let inv2 = s_v7.read_inventory_from_lines(&[&out], None).unwrap();
+        let nested = inv2
+            .get_entry(&FileId::from(b"nested-id".as_slice()))
+            .unwrap();
+        match nested {
+            Entry::TreeReference {
+                parent_id,
+                revision,
+                reference_revision,
+                ..
+            } => {
+                assert_eq!(parent_id.as_bytes(), b"tree-root-321");
+                assert_eq!(
+                    revision.as_ref().map(|r| r.as_bytes()),
+                    Some(b"rev-outer".as_slice())
+                );
+                assert_eq!(
+                    reference_revision.as_ref().map(|r| r.as_bytes()),
+                    Some(b"rev-inner".as_slice())
+                );
+            }
+            other => panic!("expected tree-reference, got {:?}", other),
+        }
+    }
+
+    const EXPECTED_REV_V8: &[u8] = b"<revision committer=\"Martin Pool &lt;mbp@sourcefrog.net&gt;\" format=\"8\" inventory_sha1=\"e79c31c1deb64c163cf660fdedd476dd579ffd41\" revision_id=\"mbp@sourcefrog.net-20050905080035-e0439293f8b6b9f9\" timestamp=\"1125907235.212\" timezone=\"36000\">\n<message>- start splitting code for xml (de)serialization away from objects\n  preparatory to supporting multiple formats by a single library\n</message>\n<parents>\n<revision_ref revision_id=\"mbp@sourcefrog.net-20050905063503-43948f59fa127d92\" />\n</parents>\n</revision>\n";
+
+    const EXPECTED_REV_V8_COMPLEX: &[u8] = b"<revision committer=\"Erik B&#229;gfors &lt;erik@foo.net&gt;\" format=\"8\" inventory_sha1=\"e79c31c1deb64c163cf660fdedd476dd579ffd41\" revision_id=\"erik@b&#229;gfors-02\" timestamp=\"1125907235.212\" timezone=\"36000\">\n<message>Include &#181;nicode characters\n</message>\n<parents>\n<revision_ref revision_id=\"erik@b&#229;gfors-01\" />\n<revision_ref revision_id=\"erik@bagfors-02\" />\n</parents>\n<properties><property name=\"bar\" />\n<property name=\"foo\">this has a\nnewline in it</property>\n</properties>\n</revision>\n";
+
+    #[test]
+    fn revision_v8_text_round_trips() {
+        let s = XMLRevisionSerializer8;
+        let rev = s.read_revision_from_string(EXPECTED_REV_V8).unwrap();
+        let out = s.write_revision_to_string(&rev).unwrap();
+        assert_eq!(out, EXPECTED_REV_V8);
+    }
+
+    #[test]
+    fn revision_v8_text_round_trips_with_properties() {
+        let s = XMLRevisionSerializer8;
+        let rev = s
+            .read_revision_from_string(EXPECTED_REV_V8_COMPLEX)
+            .unwrap();
+        let out = s.write_revision_to_string(&rev).unwrap();
+        assert_eq!(out, EXPECTED_REV_V8_COMPLEX);
+    }
+
+    #[test]
+    fn revision_and_inventory_ids_are_utf8() {
+        let revision_utf8_v5: &[u8] = b"<revision committer=\"Erik B&#229;gfors &lt;erik@foo.net&gt;\"\n    inventory_sha1=\"e79c31c1deb64c163cf660fdedd476dd579ffd41\"\n    revision_id=\"erik@b&#229;gfors-02\"\n    timestamp=\"1125907235.212\"\n    timezone=\"36000\">\n<message>Include &#181;nicode characters\n</message>\n<parents>\n<revision_ref revision_id=\"erik@b&#229;gfors-01\"/>\n</parents>\n</revision>\n";
+        let sr = XMLRevisionSerializer5;
+        let rev = sr.read_revision_from_string(revision_utf8_v5).unwrap();
+        assert_eq!(rev.revision_id.as_bytes(), b"erik@b\xc3\xa5gfors-02");
+        assert_eq!(
+            rev.parent_ids
+                .iter()
+                .map(|p| p.as_bytes())
+                .collect::<Vec<_>>(),
+            vec![b"erik@b\xc3\xa5gfors-01".as_slice()]
+        );
+        assert_eq!(rev.message, "Include \u{b5}nicode characters\n");
+
+        let inventory_utf8_v5: &[u8] = b"<inventory file_id=\"TRE&#233;_ROOT\" format=\"5\"\n                                   revision_id=\"erik@b&#229;gfors-02\">\n<file file_id=\"b&#229;r-01\"\n      name=\"b&#229;r\" parent_id=\"TRE&#233;_ROOT\"\n      revision=\"erik@b&#229;gfors-01\"/>\n<directory name=\"s&#181;bdir\"\n           file_id=\"s&#181;bdir-01\"\n           parent_id=\"TRE&#233;_ROOT\"\n           revision=\"erik@b&#229;gfors-01\"/>\n<file executable=\"yes\" file_id=\"b&#229;r-02\"\n      name=\"b&#229;r\" parent_id=\"s&#181;bdir-01\"\n      revision=\"erik@b&#229;gfors-02\"/>\n</inventory>\n";
+        let si = XMLInventorySerializer5;
+        let inv = si
+            .read_inventory_from_lines(&[inventory_utf8_v5], None)
+            .unwrap();
+        assert_eq!(
+            inv.revision_id.as_ref().map(|r| r.as_bytes()),
+            Some(b"erik@b\xc3\xa5gfors-02".as_slice())
+        );
+
+        let expected: Vec<(&str, &[u8], Option<&[u8]>, Option<&[u8]>)> = vec![
+            (
+                "",
+                b"TRE\xc3\xa9_ROOT",
+                None,
+                Some(b"erik@b\xc3\xa5gfors-02"),
+            ),
+            (
+                "b\u{e5}r",
+                b"b\xc3\xa5r-01",
+                Some(b"TRE\xc3\xa9_ROOT"),
+                Some(b"erik@b\xc3\xa5gfors-01"),
+            ),
+            (
+                "s\u{b5}bdir",
+                b"s\xc2\xb5bdir-01",
+                Some(b"TRE\xc3\xa9_ROOT"),
+                Some(b"erik@b\xc3\xa5gfors-01"),
+            ),
+            (
+                "s\u{b5}bdir/b\u{e5}r",
+                b"b\xc3\xa5r-02",
+                Some(b"s\xc2\xb5bdir-01"),
+                Some(b"erik@b\xc3\xa5gfors-02"),
+            ),
+        ];
+        let actual: Vec<_> = inv.iter_entries_by_dir(None, None).collect();
+        assert_eq!(actual.len(), expected.len());
+        for ((exp_path, exp_fid, exp_pid, exp_rev), (act_path, act_ie)) in
+            expected.iter().zip(actual.iter())
+        {
+            assert_eq!(act_path, exp_path);
+            assert_eq!(act_ie.file_id().as_bytes(), *exp_fid);
+            assert_eq!(act_ie.parent_id().map(|p| p.as_bytes()), *exp_pid);
+            assert_eq!(act_ie.revision().map(|r| r.as_bytes()), *exp_rev);
+        }
+    }
+
+    #[test]
+    fn inventory_v5_malformed_xml_errors() {
+        let s = XMLInventorySerializer5;
+        let err = s
+            .read_inventory_from_lines(&[b"<Notquitexml"], None)
+            .unwrap_err();
+        match err {
+            Error::UnexpectedInventoryFormat(_) | Error::DecodeError(_) => {}
+            other => panic!("expected a decode/format error, got {:?}", other),
         }
     }
 }

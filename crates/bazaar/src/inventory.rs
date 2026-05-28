@@ -876,22 +876,31 @@ impl MutableInventory {
 
         let mut stack: Vec<(String, &FileId)> = vec![];
 
-        let from_dir = if from_dir.is_none() {
+        // When iterating from the root (no explicit from_dir), the root entry
+        // itself is yielded first as ("", root), matching Python's
+        // iter_entries_by_dir. An explicitly supplied from_dir is not yielded.
+        let defaulted_to_root = from_dir.is_none();
+        let from_dir = if defaulted_to_root {
             self.root_id.as_ref()
         } else {
             from_dir
         };
-        let mut children = VecDeque::new();
+        let mut pending_root: Option<(String, &Entry)> = None;
         if let Some(from_dir) = from_dir {
             stack.push(("".to_string(), from_dir));
-            children.extend(
-                self.iter_sorted_children(from_dir)
-                    .unwrap()
-                    .map(|(p, ie)| (p.to_string(), ie)),
-            );
+            if defaulted_to_root
+                && (specific_file_ids.is_none() || specific_file_ids.unwrap().contains(from_dir))
+            {
+                pending_root = self.get_entry(from_dir).map(|ie| ("".to_string(), ie));
+            }
         }
 
+        let mut children: VecDeque<(String, &Entry)> = VecDeque::new();
+
         std::iter::from_fn(move || -> Option<(String, &'a Entry)> {
+            if let Some(root) = pending_root.take() {
+                return Some(root);
+            }
             loop {
                 if let Some(e) = children.pop_front() {
                     return Some(e);
@@ -1779,5 +1788,56 @@ mod tests {
         let children = inv.get_children(&dir_id).expect("children map present");
         assert_eq!(children.len(), 1);
         assert!(children.contains_key("file"));
+    }
+
+    #[test]
+    fn iter_entries_by_dir_yields_root_first_then_each_entry_once() {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        inv.add(Entry::file(
+            FileId::from(b"a-id".to_vec()),
+            "a".to_string(),
+            root_id(),
+            None,
+            Some(b"sha".to_vec()),
+            Some(1),
+            Some(false),
+            None,
+        ))
+        .unwrap();
+        inv.add(Entry::directory(
+            FileId::from(b"sub-id".to_vec()),
+            "sub".to_string(),
+            root_id(),
+            None,
+        ))
+        .unwrap();
+        inv.add(Entry::file(
+            FileId::from(b"b-id".to_vec()),
+            "b".to_string(),
+            FileId::from(b"sub-id".to_vec()),
+            None,
+            Some(b"sha".to_vec()),
+            Some(1),
+            Some(false),
+            None,
+        ))
+        .unwrap();
+
+        let actual: Vec<(String, Vec<u8>)> = inv
+            .iter_entries_by_dir(None, None)
+            .map(|(p, ie)| (p, ie.file_id().as_bytes().to_vec()))
+            .collect();
+        // Root first (as ""), then directory-first order, each entry exactly
+        // once. This mirrors Python's Inventory.iter_entries_by_dir.
+        assert_eq!(
+            actual,
+            vec![
+                ("".to_string(), b"TREE_ROOT".to_vec()),
+                ("a".to_string(), b"a-id".to_vec()),
+                ("sub".to_string(), b"sub-id".to_vec()),
+                ("sub/b".to_string(), b"b-id".to_vec()),
+            ]
+        );
     }
 }

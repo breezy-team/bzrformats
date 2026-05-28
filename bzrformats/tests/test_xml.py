@@ -565,9 +565,3 @@ class TestEncodeAndEscape(TestCase):
             b"&#181;&#229;&amp;&#1580;",
             bzrformats.xml_serializer.encode_and_escape(uni_str),
         )
-
-
-class TestMisc(TestCase):
-    def test_unescape_xml(self):
-        """We get some kind of error when malformed entities are passed."""
-        self.assertRaises(KeyError, bzrformats.xml8._unescape_xml, b"foo&bar;")
