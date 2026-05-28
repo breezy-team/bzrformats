@@ -453,7 +453,11 @@ impl PyMultiMemoryVersionedFile {
         version_id: Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyList>> {
         let key = PyHashable::new(version_id)?;
-        let lines = self.inner.cache_version(&key).map_err(reconstruct_err)?.to_vec();
+        let lines = self
+            .inner
+            .cache_version(&key)
+            .map_err(reconstruct_err)?
+            .to_vec();
         let inner: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
         PyList::new(py, inner)
     }

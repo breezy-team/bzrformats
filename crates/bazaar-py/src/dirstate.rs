@@ -2165,15 +2165,11 @@ impl PyDirState {
             (t.read_all().map_err(transport_err_to_py)?, false)
         };
         let _ = already_loaded;
-        let path = slf
-            .borrow()
+        let path = slf.borrow().inner.filename.to_string_lossy().into_owned();
+        slf.borrow_mut()
             .inner
-            .filename
-            .to_string_lossy()
-            .into_owned();
-        slf.borrow_mut().inner.read_header(&data).map_err(|e| {
-            DirstateCorrupt::new_err((path, e.to_string()))
-        })
+            .read_header(&data)
+            .map_err(|e| DirstateCorrupt::new_err((path, e.to_string())))
     }
 
     /// Size of the dirstate file as seen through the transport.
@@ -3767,7 +3763,10 @@ impl PyDirState {
     /// Return ghost revision ids (post-header read).
     /// Mirrors Python's `DirState.get_ghosts`.
     #[pyo3(name = "get_ghosts")]
-    fn get_ghosts_method<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+    fn get_ghosts_method<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyList>> {
         Self::_read_header_if_needed(slf.clone())?;
         let me = slf.borrow();
         let items: Vec<Bound<PyBytes>> = me

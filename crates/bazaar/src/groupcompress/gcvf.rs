@@ -972,7 +972,9 @@ where
         let mut out = Vec::new();
         for record in self.get_record_stream(keys, "unordered")? {
             if record.storage_kind() == "absent" {
-                return Err(crate::knit::KnitError::RevisionNotPresent(record.key().segments().to_vec()));
+                return Err(crate::knit::KnitError::RevisionNotPresent(
+                    record.key().segments().to_vec(),
+                ));
             }
             let key = record.key();
             let chunks: Vec<Vec<u8>> = record.to_chunks().map(|c| c.into_owned()).collect();
@@ -997,7 +999,9 @@ where
         let all_keys = self.keys()?;
         for record in self.get_record_stream(&all_keys, "unordered")? {
             if record.storage_kind() == "absent" {
-                return Err(crate::knit::KnitError::RevisionNotPresent(record.key().segments().to_vec()));
+                return Err(crate::knit::KnitError::RevisionNotPresent(
+                    record.key().segments().to_vec(),
+                ));
             }
             // Force decoding of the content.
             let _ = record.to_fulltext();

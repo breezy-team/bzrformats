@@ -231,7 +231,10 @@ mod tests {
         let rev = make(
             "",
             Some("A"),
-            &[("bugs", "http://example.com/1 fixed\nhttp://example.com/2 related")],
+            &[(
+                "bugs",
+                "http://example.com/1 fixed\nhttp://example.com/2 related",
+            )],
         );
         assert_eq!(
             rev.iter_bugs(),

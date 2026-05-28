@@ -270,8 +270,14 @@ impl<'vf> PlanLCAMerge<'vf> {
                     .remove(lca.as_slice())
                     .unwrap_or_default()
             };
-            cached_matching_blocks.insert((a_rev.clone(), lca.clone()), matching_blocks(&lines_a, &lca_lines));
-            cached_matching_blocks.insert((b_rev.clone(), lca.clone()), matching_blocks(&lines_b, &lca_lines));
+            cached_matching_blocks.insert(
+                (a_rev.clone(), lca.clone()),
+                matching_blocks(&lines_a, &lca_lines),
+            );
+            cached_matching_blocks.insert(
+                (b_rev.clone(), lca.clone()),
+                matching_blocks(&lines_b, &lca_lines),
+            );
         }
         Ok(Self {
             a_rev,
@@ -293,7 +299,10 @@ impl<'vf> PlanLCAMerge<'vf> {
         left: &[u8],
         right: &[u8],
     ) -> Result<Vec<MatchingBlock>, KnitError> {
-        if let Some(cached) = self.cached_matching_blocks.get(&(left.to_vec(), right.to_vec())) {
+        if let Some(cached) = self
+            .cached_matching_blocks
+            .get(&(left.to_vec(), right.to_vec()))
+        {
             return Ok(cached.clone());
         }
         let mut need: Vec<Vec<u8>> = Vec::new();
@@ -380,7 +389,10 @@ mod tests {
     #[test]
     fn unique_lines_empty_blocks() {
         let blocks = vec![(0, 0, 0)];
-        assert_eq!(unique_lines(&blocks), (Vec::<usize>::new(), Vec::<usize>::new()));
+        assert_eq!(
+            unique_lines(&blocks),
+            (Vec::<usize>::new(), Vec::<usize>::new())
+        );
     }
 
     #[test]
@@ -425,10 +437,13 @@ mod tests {
         // The 'new-b x' line is shared with old → dropped. The shared
         // 'unchanged y' line passes through. The fresh 'new-a z' line is
         // unique to new → preserved.
-        assert_eq!(out, vec![
-            (MergeTag::Unchanged, line(b"y\n")),
-            (MergeTag::NewA, line(b"z\n")),
-        ]);
+        assert_eq!(
+            out,
+            vec![
+                (MergeTag::Unchanged, line(b"y\n")),
+                (MergeTag::NewA, line(b"z\n")),
+            ]
+        );
     }
 
     #[test]

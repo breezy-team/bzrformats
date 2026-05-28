@@ -253,8 +253,7 @@ mod tests {
                 .unwrap();
         }
         id_map.save().unwrap();
-        let mut pid_initial: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> =
-            indexmap::IndexMap::new();
+        let mut pid_initial: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> = indexmap::IndexMap::new();
         for e in [&root, &child] {
             pid_initial.insert(parent_id_basename_key(e), e.file_id().as_bytes().to_vec());
         }
@@ -405,8 +404,7 @@ mod tests {
                 .unwrap();
         }
         id_map.save().unwrap();
-        let mut pid_initial: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> =
-            indexmap::IndexMap::new();
+        let mut pid_initial: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> = indexmap::IndexMap::new();
         for e in entries {
             pid_initial.insert(parent_id_basename_key(e), e.file_id().as_bytes().to_vec());
         }
@@ -569,13 +567,8 @@ mod tests {
         .unwrap();
         let lines = inv.to_lines().unwrap();
         let expected_rev = crate::RevisionId::from(&b"rev1"[..]);
-        let restored = CHKInventory::deserialise(
-            store.clone(),
-            cache.clone(),
-            &lines,
-            &expected_rev,
-        )
-        .unwrap();
+        let restored =
+            CHKInventory::deserialise(store.clone(), cache.clone(), &lines, &expected_rev).unwrap();
         assert_eq!(restored.root_id.as_ref(), inv.root_id.as_ref());
         let restored_items = restored.iter_all_ids().unwrap();
         assert_eq!(restored_items.len(), 2);
@@ -606,9 +599,7 @@ mod tests {
     #[test]
     fn get_entry_by_path_partial_returns_full_path_when_no_tree_ref() {
         let inv = build_test_inv_deeper();
-        let result = inv
-            .get_entry_by_path_partial("dir/sub/nested.txt")
-            .unwrap();
+        let result = inv.get_entry_by_path_partial("dir/sub/nested.txt").unwrap();
         let (entry, resolved, remaining) = result.unwrap();
         assert_eq!(entry.name(), "nested.txt");
         assert_eq!(resolved, vec!["dir", "sub", "nested.txt"]);
@@ -636,10 +627,7 @@ mod tests {
     fn iter_entries_by_dir_with_specific_file_ids() {
         let inv = build_test_inv_deeper();
         let entries = inv
-            .iter_entries_by_dir(
-                None,
-                Some(&[FileId::from(&b"f2"[..])]),
-            )
+            .iter_entries_by_dir(None, Some(&[FileId::from(&b"f2"[..])]))
             .unwrap();
         // Single-id fast path: just that entry under its full path.
         assert_eq!(entries.len(), 1);
@@ -855,10 +843,7 @@ where
     fully_cached: std::cell::Cell<bool>,
     path_to_fileid_cache: std::cell::RefCell<std::collections::HashMap<String, crate::FileId>>,
     children_cache: std::cell::RefCell<
-        std::collections::HashMap<
-            crate::FileId,
-            std::collections::HashMap<String, Entry>,
-        >,
+        std::collections::HashMap<crate::FileId, std::collections::HashMap<String, Entry>>,
     >,
     store: std::sync::Arc<S>,
     cache: std::sync::Arc<dyn crate::chk_map::PageCache>,
@@ -893,9 +878,8 @@ where
     /// Resolve the configured `search_key_name` to a `SearchKeyFunc`
     /// variant. Errors when the name is unknown.
     pub fn search_key_func(&self) -> Result<crate::chk_map::SearchKeyFunc, Error> {
-        crate::chk_map::SearchKeyFunc::from_name(&self.search_key_name).map_err(|raw| {
-            Error::InvalidFormat(format!("unknown search_key_name: {:?}", raw))
-        })
+        crate::chk_map::SearchKeyFunc::from_name(&self.search_key_name)
+            .map_err(|raw| Error::InvalidFormat(format!("unknown search_key_name: {:?}", raw)))
     }
 
     /// Look up an inventory entry by file id, consulting the cache
@@ -926,10 +910,7 @@ where
     /// Bulk lookup. Returns entries for whichever of `file_ids` are
     /// present; missing ids are silently omitted. Mirrors Python's
     /// `_getitems`. Order is undefined.
-    pub fn get_items(
-        &self,
-        file_ids: &[crate::FileId],
-    ) -> Result<Vec<Entry>, Error> {
+    pub fn get_items(&self, file_ids: &[crate::FileId]) -> Result<Vec<Entry>, Error> {
         let mut result: Vec<Entry> = Vec::new();
         let mut remaining: Vec<Vec<Vec<u8>>> = Vec::new();
         {
@@ -1003,8 +984,7 @@ where
             map.iteritems(None)?
         };
         for (key, value) in pairs {
-            let file_id =
-                crate::FileId::from(key.last().cloned().unwrap_or_default().as_slice());
+            let file_id = crate::FileId::from(key.last().cloned().unwrap_or_default().as_slice());
             if let Some(entry) = self.fileid_to_entry_cache.borrow().get(&file_id) {
                 out.push(entry.clone());
                 continue;
@@ -1034,10 +1014,7 @@ where
 
     /// Yield the chain of entries from `file_id` up to the root, in
     /// child-to-root order. Mirrors `_iter_file_id_parents`.
-    pub fn iter_file_id_parents(
-        &self,
-        file_id: &crate::FileId,
-    ) -> Result<Vec<Entry>, Error> {
+    pub fn iter_file_id_parents(&self, file_id: &crate::FileId) -> Result<Vec<Entry>, Error> {
         let mut out = Vec::new();
         let mut cur = Some(file_id.clone());
         while let Some(id) = cur {
@@ -1055,10 +1032,7 @@ where
         // The last parent is the root; drop it (its name is "").
         parents.pop();
         parents.reverse();
-        let segments: Vec<String> = parents
-            .into_iter()
-            .map(|e| e.name().to_string())
-            .collect();
+        let segments: Vec<String> = parents.into_iter().map(|e| e.name().to_string()).collect();
         Ok(segments.join("/"))
     }
 
@@ -1096,9 +1070,7 @@ where
             let key = vec![current_id.as_bytes().to_vec(), basename_utf8.clone()];
             let mut parent_map = self.parent_id_basename_to_file_id.borrow_mut();
             let map = parent_map.as_mut().ok_or_else(|| {
-                Error::InvalidFormat(
-                    "parent_id_basename_to_file_id not set; can't path2id".into(),
-                )
+                Error::InvalidFormat("parent_id_basename_to_file_id not set; can't path2id".into())
             })?;
             let items = map.iteritems(Some(&[key]))?;
             let Some((found_key, file_id_bytes)) = items.into_iter().next() else {
@@ -1143,8 +1115,7 @@ where
         let mut parent_map = self.parent_id_basename_to_file_id.borrow_mut();
         let map = parent_map.as_mut().ok_or_else(|| {
             Error::InvalidFormat(
-                "Inventories without parent_id_basename_to_file_id are no longer supported"
-                    .into(),
+                "Inventories without parent_id_basename_to_file_id are no longer supported".into(),
             )
         })?;
         // 1-element prefix filter looks up just this directory's children.
@@ -1155,8 +1126,7 @@ where
             .into_iter()
             .map(|(_k, v)| crate::FileId::from(v.as_slice()))
             .collect();
-        let mut result: std::collections::HashMap<String, Entry> =
-            std::collections::HashMap::new();
+        let mut result: std::collections::HashMap<String, Entry> = std::collections::HashMap::new();
         // Drain from the cache first.
         {
             let cache = self.fileid_to_entry_cache.borrow();
@@ -1183,11 +1153,7 @@ where
     }
 
     /// Return a specific child of `dir_id` by name. Mirrors `get_child`.
-    pub fn get_child(
-        &self,
-        dir_id: &crate::FileId,
-        name: &str,
-    ) -> Result<Option<Entry>, Error> {
+    pub fn get_child(&self, dir_id: &crate::FileId, name: &str) -> Result<Option<Entry>, Error> {
         // TODO(jelmer): implement a version that doesn't load all children.
         let children = self.get_children(dir_id)?;
         Ok(children.get(name).cloned())
@@ -1195,10 +1161,7 @@ where
 
     /// Return children of `dir_id` sorted by name. Mirrors
     /// `iter_sorted_children`.
-    pub fn iter_sorted_children(
-        &self,
-        dir_id: &crate::FileId,
-    ) -> Result<Vec<Entry>, Error> {
+    pub fn iter_sorted_children(&self, dir_id: &crate::FileId) -> Result<Vec<Entry>, Error> {
         let children = self.get_children(dir_id)?;
         let mut sorted: Vec<(String, Entry)> = children.into_iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1210,25 +1173,21 @@ where
     /// Mirrors Python's tree.iter_changes 8-tuple
     /// `(file_id, (path_in_source, path_in_target), changed_content,
     /// versioned, parent, name, kind, executable)`.
-    pub fn iter_changes(
-        &self,
-        basis: &Self,
-    ) -> Result<Vec<InventoryChange>, Error> {
+    pub fn iter_changes(&self, basis: &Self) -> Result<Vec<InventoryChange>, Error> {
         let mut self_id_map = self.id_to_entry.borrow_mut();
         let mut basis_id_map = basis.id_to_entry.borrow_mut();
-        let self_map = self_id_map.as_mut().ok_or_else(|| {
-            Error::InvalidFormat("self.id_to_entry not set".into())
-        })?;
-        let basis_map = basis_id_map.as_mut().ok_or_else(|| {
-            Error::InvalidFormat("basis.id_to_entry not set".into())
-        })?;
+        let self_map = self_id_map
+            .as_mut()
+            .ok_or_else(|| Error::InvalidFormat("self.id_to_entry not set".into()))?;
+        let basis_map = basis_id_map
+            .as_mut()
+            .ok_or_else(|| Error::InvalidFormat("basis.id_to_entry not set".into()))?;
         let changes = self_map.iter_changes(basis_map)?;
         drop(self_id_map);
         drop(basis_id_map);
         let mut out: Vec<InventoryChange> = Vec::new();
         for (key, basis_value, self_value) in changes {
-            let file_id =
-                crate::FileId::from(key.last().cloned().unwrap_or_default().as_slice());
+            let file_id = crate::FileId::from(key.last().cloned().unwrap_or_default().as_slice());
             let basis_entry = basis_value.as_deref().map(chk_inventory_bytes_to_entry);
             let self_entry = self_value.as_deref().map(chk_inventory_bytes_to_entry);
             let path_in_source = match basis_entry.as_ref() {
@@ -1368,14 +1327,9 @@ where
                 None => None,
                 Some(map) => {
                     map.ensure_root()?;
-                    Some(
-                        map.key()
-                            .ok_or_else(|| {
-                                Error::InvalidFormat(
-                                    "parent_id_basename_to_file_id has no key".into(),
-                                )
-                            })?,
-                    )
+                    Some(map.key().ok_or_else(|| {
+                        Error::InvalidFormat("parent_id_basename_to_file_id has no key".into())
+                    })?)
                 }
             }
         };
@@ -1388,19 +1342,16 @@ where
             )
         });
         let mut new_root_id = self.root_id.clone();
-        let mut path_cache: std::collections::HashMap<String, crate::FileId> =
-            if propagate_caches {
-                self.path_to_fileid_cache.borrow().clone()
-            } else {
-                std::collections::HashMap::new()
-            };
-        let mut id_delta: Vec<(
-            Option<Vec<Vec<u8>>>,
-            Option<Vec<Vec<u8>>>,
-            Vec<u8>,
-        )> = Vec::new();
-        let mut parent_delta: indexmap::IndexMap<Vec<Vec<u8>>, (Option<Vec<Vec<u8>>>, Option<Vec<u8>>)> =
-            indexmap::IndexMap::new();
+        let mut path_cache: std::collections::HashMap<String, crate::FileId> = if propagate_caches {
+            self.path_to_fileid_cache.borrow().clone()
+        } else {
+            std::collections::HashMap::new()
+        };
+        let mut id_delta: Vec<(Option<Vec<Vec<u8>>>, Option<Vec<Vec<u8>>>, Vec<u8>)> = Vec::new();
+        let mut parent_delta: indexmap::IndexMap<
+            Vec<Vec<u8>>,
+            (Option<Vec<Vec<u8>>>, Option<Vec<u8>>),
+        > = indexmap::IndexMap::new();
         let mut parents: std::collections::HashSet<(String, Option<crate::FileId>)> =
             std::collections::HashSet::new();
         let mut deletes: std::collections::HashSet<crate::FileId> =
@@ -1412,34 +1363,35 @@ where
             if entry_d.new_path.as_deref() == Some("") {
                 new_root_id = Some(entry_d.file_id.clone());
             }
-            let (new_key, new_value): (Option<Vec<Vec<u8>>>, Option<Vec<u8>>) =
-                match &entry_d.new_path {
-                    None => {
-                        if propagate_caches {
-                            if let Some(op) = &entry_d.old_path {
-                                path_cache.remove(op);
-                            }
+            let (new_key, new_value): (Option<Vec<Vec<u8>>>, Option<Vec<u8>>) = match &entry_d
+                .new_path
+            {
+                None => {
+                    if propagate_caches {
+                        if let Some(op) = &entry_d.old_path {
+                            path_cache.remove(op);
                         }
-                        deletes.insert(entry_d.file_id.clone());
-                        (None, None)
                     }
-                    Some(new_path) => {
-                        let entry = entry_d.new_entry.as_ref().ok_or_else(|| {
-                            Error::InvalidFormat("delta entry with new_path missing new_entry".into())
-                        })?;
-                        let key = vec![entry_d.file_id.as_bytes().to_vec()];
-                        let value = chk_inventory_entry_to_bytes(entry);
-                        path_cache.insert(new_path.clone(), entry_d.file_id.clone());
-                        let split_at = new_path.rfind('/').unwrap_or(0);
-                        let parent_path = if split_at == 0 {
-                            String::new()
-                        } else {
-                            new_path[..split_at].to_string()
-                        };
-                        parents.insert((parent_path, entry.parent_id().cloned()));
-                        (Some(key), Some(value))
-                    }
-                };
+                    deletes.insert(entry_d.file_id.clone());
+                    (None, None)
+                }
+                Some(new_path) => {
+                    let entry = entry_d.new_entry.as_ref().ok_or_else(|| {
+                        Error::InvalidFormat("delta entry with new_path missing new_entry".into())
+                    })?;
+                    let key = vec![entry_d.file_id.as_bytes().to_vec()];
+                    let value = chk_inventory_entry_to_bytes(entry);
+                    path_cache.insert(new_path.clone(), entry_d.file_id.clone());
+                    let split_at = new_path.rfind('/').unwrap_or(0);
+                    let parent_path = if split_at == 0 {
+                        String::new()
+                    } else {
+                        new_path[..split_at].to_string()
+                    };
+                    parents.insert((parent_path, entry.parent_id().cloned()));
+                    (Some(key), Some(value))
+                }
+            };
             let old_key: Option<Vec<Vec<u8>>> = if entry_d.old_path.is_some() {
                 let k = vec![entry_d.file_id.as_bytes().to_vec()];
                 // Sanity check: the existing path matches what the
@@ -1456,11 +1408,7 @@ where
             } else {
                 None
             };
-            id_delta.push((
-                old_key,
-                new_key,
-                new_value.unwrap_or_default(),
-            ));
+            id_delta.push((old_key, new_key, new_value.unwrap_or_default()));
             if result_pid_map.is_some() {
                 let old_pkey = if entry_d.old_path.is_some() {
                     let old_entry = self.get_entry(&entry_d.file_id)?;
@@ -1509,17 +1457,14 @@ where
         result_id_map.apply_delta(id_delta)?;
         if let Some(pid_map) = result_pid_map.as_mut() {
             if !parent_delta.is_empty() {
-                let delta_list: Vec<(
-                    Option<Vec<Vec<u8>>>,
-                    Option<Vec<Vec<u8>>>,
-                    Vec<u8>,
-                )> = parent_delta
-                    .into_iter()
-                    .map(|(key, (old_key, value))| match value {
-                        Some(v) => (old_key, Some(key), v),
-                        None => (old_key, None, Vec::new()),
-                    })
-                    .collect();
+                let delta_list: Vec<(Option<Vec<Vec<u8>>>, Option<Vec<Vec<u8>>>, Vec<u8>)> =
+                    parent_delta
+                        .into_iter()
+                        .map(|(key, (old_key, value))| match value {
+                            Some(v) => (old_key, Some(key), v),
+                            None => (old_key, None, Vec::new()),
+                        })
+                        .collect();
                 pid_map.apply_delta(delta_list)?;
             }
         }
@@ -1588,13 +1533,10 @@ where
         search_key_name: Vec<u8>,
     ) -> Result<Self, Error> {
         let search_key_func = crate::chk_map::SearchKeyFunc::from_name(&search_key_name)
-            .map_err(|raw| {
-                Error::InvalidFormat(format!("unknown search_key_name: {:?}", raw))
-            })?;
+            .map_err(|raw| Error::InvalidFormat(format!("unknown search_key_name: {:?}", raw)))?;
         let mut id_to_entry_dict: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> =
             indexmap::IndexMap::new();
-        let mut parent_dict: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> =
-            indexmap::IndexMap::new();
+        let mut parent_dict: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> = indexmap::IndexMap::new();
         for entry in entries {
             id_to_entry_dict.insert(
                 vec![entry.file_id().as_bytes().to_vec()],
@@ -1698,11 +1640,7 @@ where
                 None => return Ok(None),
                 Some(ie) => {
                     if matches!(ie, Entry::TreeReference { .. }) {
-                        return Ok(Some((
-                            ie,
-                            names[..=i].to_vec(),
-                            names[i + 1..].to_vec(),
-                        )));
+                        return Ok(Some((ie, names[..=i].to_vec(), names[i + 1..].to_vec())));
                     }
                     parent = ie;
                 }
@@ -1803,9 +1741,7 @@ where
                         }
                     }
                     let root = self.get_entry(root_id)?;
-                    if specific_set.is_none()
-                        || specific_set.as_ref().unwrap().contains(root_id)
-                    {
+                    if specific_set.is_none() || specific_set.as_ref().unwrap().contains(root_id) {
                         out.push((String::new(), root.clone()));
                     }
                     root
@@ -1814,35 +1750,33 @@ where
         };
 
         // Compute ancestors of the specific ids to limit recursion.
-        let parents_filter: Option<std::collections::HashSet<crate::FileId>> =
-            match &specific_set {
-                None => None,
-                Some(set) => {
-                    let mut ancestors: std::collections::HashSet<crate::FileId> =
-                        std::collections::HashSet::new();
-                    for fid in set {
-                        let mut cur = Some(fid.clone());
-                        while let Some(id) = cur {
-                            if !self.has_id(&id)? {
+        let parents_filter: Option<std::collections::HashSet<crate::FileId>> = match &specific_set {
+            None => None,
+            Some(set) => {
+                let mut ancestors: std::collections::HashSet<crate::FileId> =
+                    std::collections::HashSet::new();
+                for fid in set {
+                    let mut cur = Some(fid.clone());
+                    while let Some(id) = cur {
+                        if !self.has_id(&id)? {
+                            break;
+                        }
+                        let entry = self.get_entry(&id)?;
+                        let parent_id = entry.parent_id().cloned();
+                        if let Some(pid) = &parent_id {
+                            if ancestors.contains(pid) {
                                 break;
                             }
-                            let entry = self.get_entry(&id)?;
-                            let parent_id = entry.parent_id().cloned();
-                            if let Some(pid) = &parent_id {
-                                if ancestors.contains(pid) {
-                                    break;
-                                }
-                                ancestors.insert(pid.clone());
-                            }
-                            cur = parent_id;
+                            ancestors.insert(pid.clone());
                         }
+                        cur = parent_id;
                     }
-                    Some(ancestors)
                 }
-            };
+                Some(ancestors)
+            }
+        };
 
-        let mut stack: Vec<(String, Entry)> =
-            vec![(String::new(), start_entry)];
+        let mut stack: Vec<(String, Entry)> = vec![(String::new(), start_entry)];
         while let Some((cur_relpath, cur_dir)) = stack.pop() {
             let mut child_dirs: Vec<(String, Entry)> = Vec::new();
             for child_ie in self.iter_sorted_children(cur_dir.file_id())? {
@@ -1990,9 +1924,7 @@ where
             ));
         }
         if lines[0] != b"chkinventory:\n" {
-            return Err(Error::InvalidFormat(
-                "not a serialised CHKInventory".into(),
-            ));
+            return Err(Error::InvalidFormat("not a serialised CHKInventory".into()));
         }
         let allowed: &[&[u8]] = &[
             b"root_id",
@@ -2030,8 +1962,7 @@ where
         let search_key_name = info
             .remove(&b"search_key_name"[..].to_vec())
             .unwrap_or_else(|| b"plain".to_vec());
-        let parent_key = info
-            .remove(&b"parent_id_basename_to_file_id"[..].to_vec());
+        let parent_key = info.remove(&b"parent_id_basename_to_file_id"[..].to_vec());
         let id_to_entry_key = info
             .remove(&b"id_to_entry"[..].to_vec())
             .ok_or_else(|| Error::InvalidFormat("missing id_to_entry".into()))?;
@@ -2056,9 +1987,7 @@ where
             });
         }
         let search_key_func = crate::chk_map::SearchKeyFunc::from_name(&search_key_name)
-            .map_err(|raw| {
-                Error::InvalidFormat(format!("unknown search_key_name: {:?}", raw))
-            })?;
+            .map_err(|raw| Error::InvalidFormat(format!("unknown search_key_name: {:?}", raw)))?;
         let id_map = crate::chk_map::CHKMap::new(
             store.clone(),
             cache.clone(),

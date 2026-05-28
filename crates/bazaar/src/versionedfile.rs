@@ -1083,12 +1083,8 @@ where
             match (self.get_lines_cb)(&bare) {
                 Ok(Some(lines)) => {
                     let sha = crate::weave::sha_strings(&lines);
-                    let factory = ChunkedContentFactory::new(
-                        Some(sha),
-                        Key::Fixed(vec![bare]),
-                        None,
-                        lines,
-                    );
+                    let factory =
+                        ChunkedContentFactory::new(Some(sha), Key::Fixed(vec![bare]), None, lines);
                     records.push(Ok(Box::new(factory) as Box<dyn ContentFactory>));
                 }
                 Ok(None) => {
