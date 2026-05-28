@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use std::sync::{Arc, Mutex};
 
+import_exception!(bzrformats.errors, BzrFormatsError);
 import_exception!(bzrformats.pack, ContainerHasExcessDataError);
 import_exception!(bzrformats.pack, DuplicateRecordNameError);
 import_exception!(bzrformats.pack, InvalidRecordError);
@@ -755,6 +756,173 @@ impl BytesRecordReader {
     }
 }
 
+/// Rust-backed port of `bzrformats.pack.ReadVFile`.
+///
+/// Adapts a readv result iterator (yielding `(offset, data)` pairs) to the
+/// streaming `read`/`readline` interface `ContainerReader` expects. The
+/// hunk-stitching state lives in [`pack::ReadVFile`]; this wrapper pulls the
+/// next hunk from the Python iterator when the current one is exhausted.
+#[pyclass(module = "bzrformats._bzr_rs.pack")]
+struct ReadVFile {
+    inner: pack::ReadVFile,
+    readv_result: Py<PyAny>,
+}
+
+impl ReadVFile {
+    /// Pull the next hunk's data bytes from the readv iterator. Surfaces a
+    /// `StopIteration` from the iterator as a Python error, matching the
+    /// behaviour of the Python `next(self.readv_result)`.
+    fn next_hunk(py: Python<'_>, iter: &Py<PyAny>) -> PyResult<Vec<u8>> {
+        let item = iter.call_method0(py, "__next__")?;
+        let tuple = item.bind(py);
+        // (offset, data) — the offset is discarded, as in Python.
+        let data = tuple.get_item(1)?;
+        let bytes = data
+            .cast_into::<PyBytes>()
+            .map_err(|_| PyTypeError::new_err("readv result data must be bytes"))?;
+        Ok(bytes.as_bytes().to_vec())
+    }
+}
+
+#[pymethods]
+impl ReadVFile {
+    #[new]
+    fn new(py: Python<'_>, readv_result: Py<PyAny>) -> PyResult<Self> {
+        // readv can return a sequence or an iterator, but we require an
+        // iterator to know how much has been consumed.
+        let readv_result = readv_result.bind(py).try_iter()?.unbind().into_any();
+        Ok(Self {
+            inner: pack::ReadVFile::new(),
+            readv_result,
+        })
+    }
+
+    fn read<'py>(&mut self, py: Python<'py>, length: usize) -> PyResult<Bound<'py, PyBytes>> {
+        // Split the borrow so the closure captures only `readv_result`
+        // while `inner` is borrowed mutably.
+        let Self {
+            inner,
+            readv_result,
+        } = self;
+        let outcome = inner.read(length, || Self::next_hunk(py, readv_result))?;
+        match outcome {
+            Ok(bytes) => Ok(PyBytes::new(py, &bytes)),
+            Err(pack::ReadVError::ShortRead {
+                wanted,
+                got,
+                prefix,
+            }) => Err(BzrFormatsError::new_err((format!(
+                "wanted {} bytes but next hunk only contains {}: {:?}...",
+                wanted,
+                got,
+                PyBytes::new(py, &prefix)
+            ),))),
+            Err(other) => Err(PyValueError::new_err(format!("{:?}", other))),
+        }
+    }
+
+    fn readline<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let Self {
+            inner,
+            readv_result,
+        } = self;
+        let outcome = inner.readline(|| Self::next_hunk(py, readv_result))?;
+        match outcome {
+            Ok(bytes) => Ok(PyBytes::new(py, &bytes)),
+            Err(pack::ReadVError::ShortReadline(result)) => {
+                Err(BzrFormatsError::new_err((format!(
+                    "short readline in the readvfile hunk: {:?}",
+                    PyBytes::new(py, &result)
+                ),)))
+            }
+            Err(other) => Err(PyValueError::new_err(format!("{:?}", other))),
+        }
+    }
+}
+
+/// Rust-backed port of `bzrformats.pack.make_readv_reader`.
+///
+/// Builds the readv block list (the format header plus the requested
+/// records), calls `transport.readv(filename, blocks)`, and wraps the result
+/// in a [`ReadVFile`] fed to a [`ContainerReader`].
+#[pyfunction]
+fn make_readv_reader<'py>(
+    py: Python<'py>,
+    transport: Bound<'py, PyAny>,
+    filename: &str,
+    requested_records: Bound<'py, PyAny>,
+) -> PyResult<Py<ContainerReader>> {
+    // The first block always covers the format marker line.
+    let header_block = PyTuple::new(py, [0usize, pack::FORMAT_ONE.len() + 1])?;
+    let blocks = PyList::empty(py);
+    blocks.append(header_block)?;
+    for record in requested_records.try_iter()? {
+        blocks.append(record?)?;
+    }
+    let readv_result = transport.call_method1("readv", (filename, blocks))?;
+    let readvfile = Py::new(py, ReadVFile::new(py, readv_result.unbind())?)?;
+    let reader = ContainerReader::new(py, readvfile.into_any())?;
+    Py::new(py, reader)
+}
+
+/// Rust-backed port of `bzrformats.pack.iter_records_from_file`.
+///
+/// Drives a [`ContainerPushParser`] over a Python file-like, yielding records
+/// as they become available.
+#[pyclass(module = "bzrformats._bzr_rs.pack")]
+struct RecordsFromFileIter {
+    parser: pack::ContainerPushParser,
+    source: Py<PyAny>,
+    pending: std::collections::VecDeque<pack::Record>,
+    done: bool,
+}
+
+#[pymethods]
+impl RecordsFromFileIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        loop {
+            if let Some(record) = slf.pending.pop_front() {
+                return Ok(record_to_py(py, record)?.into_any().unbind());
+            }
+            if slf.done {
+                return Err(PyStopIteration::new_err(()));
+            }
+            // Feed the parser another chunk, then collect any records it
+            // produced. Mirrors the Python loop: read, accept, drain,
+            // stop once the parser reports it is finished.
+            let hint = slf.parser.read_size_hint();
+            let chunk = slf.source.call_method1(py, "read", (hint,))?;
+            let bytes = chunk.extract::<Bound<PyBytes>>(py)?.as_bytes().to_vec();
+            slf.parser.accept_bytes(&bytes).map_err(pack_err_to_py)?;
+            let records = slf.parser.read_pending_records(None);
+            slf.pending.extend(records);
+            if slf.parser.finished() {
+                slf.done = true;
+            }
+        }
+    }
+}
+
+#[pyfunction]
+fn iter_records_from_file(
+    py: Python<'_>,
+    source_file: Py<PyAny>,
+) -> PyResult<Py<RecordsFromFileIter>> {
+    Py::new(
+        py,
+        RecordsFromFileIter {
+            parser: pack::ContainerPushParser::new(),
+            source: source_file,
+            pending: std::collections::VecDeque::new(),
+            done: false,
+        },
+    )
+}
+
 pub fn _pack_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "pack")?;
     m.add_class::<ContainerSerialiser>()?;
@@ -764,8 +932,12 @@ pub fn _pack_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<RecordIter>()?;
     m.add_class::<BytesRecordObject>()?;
     m.add_class::<BytesRecordReader>()?;
+    m.add_class::<ReadVFile>()?;
+    m.add_class::<RecordsFromFileIter>()?;
     m.add_function(wrap_pyfunction!(py_check_name, &m)?)?;
     m.add_function(wrap_pyfunction!(py_check_name_encoding, &m)?)?;
+    m.add_function(wrap_pyfunction!(make_readv_reader, &m)?)?;
+    m.add_function(wrap_pyfunction!(iter_records_from_file, &m)?)?;
     m.add("FORMAT_ONE", PyBytes::new(py, pack::FORMAT_ONE))?;
     Ok(m)
 }

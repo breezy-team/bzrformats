@@ -1,9 +1,9 @@
 //! Bazaar container format 1 serialization.
 //!
 //! Port of the pure-logic core of `bzrformats/pack.py`, plus stream-oriented
-//! reader/writer types. Transport plumbing (`ReadVFile`,
-//! `make_readv_reader`) stays in Python — that's a thin adapter over the
-//! transport layer.
+//! reader/writer types and the [`ReadVFile`] hunk adapter. The transport call
+//! that feeds `make_readv_reader` its hunks stays in the binding layer, but
+//! the hunk-stitching logic lives here.
 
 /// Magic bytes written at the start of a format-1 container (without the
 /// trailing newline).
@@ -611,6 +611,116 @@ impl<R: std::io::BufRead> ContainerReader<R> {
     }
 }
 
+/// Outcome of a [`ReadVFile`] read that fell short of what the caller asked
+/// for. Mirrors the two `BzrFormatsError` cases the Python `ReadVFile`
+/// raises: a `read` that could not be satisfied, and a `readline` that ran
+/// off the end of a hunk without a trailing newline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadVError {
+    /// `read(length)` got fewer than `length` bytes from the current hunk.
+    ShortRead {
+        wanted: usize,
+        got: usize,
+        /// The first bytes that were available, for the error message.
+        prefix: Vec<u8>,
+    },
+    /// `readline()` reached the end of the current hunk without seeing a
+    /// trailing newline.
+    ShortReadline(Vec<u8>),
+}
+
+/// Adapt a sequence of readv `(offset, data)` hunks to a streaming
+/// `read`/`readline` interface, the way `ContainerReader` consumes its
+/// source.
+///
+/// This is the pure-logic core of `bzrformats.pack.ReadVFile`: it tracks the
+/// current hunk and a cursor into it. When the current hunk is exhausted, the
+/// caller supplies the next one via the closures passed to [`read`] and
+/// [`readline`] — the transport/iterator plumbing stays in the binding layer.
+///
+/// Neither `read` nor `readline` crosses a hunk boundary; that invariant
+/// matches the Python implementation, which relies on the caller having
+/// requested exactly the hunks it needs.
+///
+/// [`read`]: ReadVFile::read
+/// [`readline`]: ReadVFile::readline
+#[derive(Debug, Default)]
+pub struct ReadVFile {
+    /// The current hunk's bytes, or `None` before the first hunk is pulled.
+    current: Option<Vec<u8>>,
+    /// Cursor into `current`.
+    pos: usize,
+}
+
+impl ReadVFile {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ensure there's an unexhausted current hunk, pulling the next one via
+    /// `next_hunk` if necessary. `next_hunk` returns the data bytes of the
+    /// next readv result (the offset is discarded, as in Python).
+    fn ensure_hunk<E>(&mut self, next_hunk: impl FnOnce() -> Result<Vec<u8>, E>) -> Result<(), E> {
+        let need = match &self.current {
+            None => true,
+            Some(buf) => self.pos == buf.len(),
+        };
+        if need {
+            self.current = Some(next_hunk()?);
+            self.pos = 0;
+        }
+        Ok(())
+    }
+
+    /// Read exactly `length` bytes from the current hunk. If the current
+    /// hunk is exhausted, `next_hunk` is called to pull the next one. Errors
+    /// with [`ReadVError::ShortRead`] if the hunk cannot satisfy the request
+    /// (matching Python, which does not read across hunks).
+    pub fn read<E>(
+        &mut self,
+        length: usize,
+        next_hunk: impl FnOnce() -> Result<Vec<u8>, E>,
+    ) -> Result<Result<Vec<u8>, ReadVError>, E> {
+        self.ensure_hunk(next_hunk)?;
+        let buf = self.current.as_ref().expect("ensure_hunk sets current");
+        let available = buf.len() - self.pos;
+        if available < length {
+            let prefix: Vec<u8> = buf[self.pos..buf.len().min(self.pos + 20)].to_vec();
+            return Ok(Err(ReadVError::ShortRead {
+                wanted: length,
+                got: available,
+                prefix,
+            }));
+        }
+        let out = buf[self.pos..self.pos + length].to_vec();
+        self.pos += length;
+        Ok(Ok(out))
+    }
+
+    /// Read a `\n`-terminated line from the current hunk, including the
+    /// newline. Like Python's `readline`, this never crosses a hunk
+    /// boundary; if the hunk ends without a newline it errors with
+    /// [`ReadVError::ShortReadline`].
+    pub fn readline<E>(
+        &mut self,
+        next_hunk: impl FnOnce() -> Result<Vec<u8>, E>,
+    ) -> Result<Result<Vec<u8>, ReadVError>, E> {
+        self.ensure_hunk(next_hunk)?;
+        let buf = self.current.as_ref().expect("ensure_hunk sets current");
+        let rest = &buf[self.pos..];
+        let end = match rest.iter().position(|&b| b == b'\n') {
+            Some(idx) => self.pos + idx + 1,
+            None => buf.len(),
+        };
+        let out = buf[self.pos..end].to_vec();
+        self.pos = end;
+        if self.pos == buf.len() && out.last() != Some(&b'\n') {
+            return Ok(Err(ReadVError::ShortReadline(out)));
+        }
+        Ok(Ok(out))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1075,5 +1185,102 @@ mod tests {
             Err(other) => panic!("expected UnexpectedEof, got {:?}", other),
             Ok(_) => panic!("expected error"),
         }
+    }
+
+    /// Drive a [`ReadVFile`] from a fixed list of hunks. Panics if the file
+    /// asks for more hunks than provided (the tests never should).
+    struct HunkFeeder {
+        hunks: std::vec::IntoIter<Vec<u8>>,
+    }
+
+    impl HunkFeeder {
+        fn new(hunks: Vec<&[u8]>) -> Self {
+            Self {
+                hunks: hunks
+                    .into_iter()
+                    .map(|h| h.to_vec())
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            }
+        }
+
+        fn next(&mut self) -> Result<Vec<u8>, ()> {
+            self.hunks.next().ok_or(())
+        }
+    }
+
+    #[test]
+    fn readv_file_read_within_and_across_hunks() {
+        // Mirrors test_pack.TestReadvFile.test_read_bytes: hunks "0", "12",
+        // "4", "67" requested via readv, read 1,2,1,1,1 bytes.
+        let mut f = ReadVFile::new();
+        let mut feeder = HunkFeeder::new(vec![b"0", b"12", b"4", b"67"]);
+        let mut results = Vec::new();
+        for &n in &[1usize, 2, 1, 1, 1] {
+            let got = f.read(n, || feeder.next()).unwrap().unwrap();
+            results.push(got);
+        }
+        assert_eq!(
+            results,
+            vec![
+                b"0".to_vec(),
+                b"12".to_vec(),
+                b"4".to_vec(),
+                b"6".to_vec(),
+                b"7".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn readv_file_readline_per_hunk() {
+        // Mirrors test_readline: hunks "0\n", "2\n4\n"; three readlines.
+        let mut f = ReadVFile::new();
+        let mut feeder = HunkFeeder::new(vec![b"0\n", b"2\n4\n"]);
+        let mut results = Vec::new();
+        for _ in 0..3 {
+            results.push(f.readline(|| feeder.next()).unwrap().unwrap());
+        }
+        assert_eq!(
+            results,
+            vec![b"0\n".to_vec(), b"2\n".to_vec(), b"4\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn readv_file_mixed_read_and_readline() {
+        // Mirrors test_readline_and_read: single hunk "0\n2\n4\n"; read(1),
+        // readline(), read(4).
+        let mut f = ReadVFile::new();
+        let mut feeder = HunkFeeder::new(vec![b"0\n2\n4\n"]);
+        let a = f.read(1, || feeder.next()).unwrap().unwrap();
+        let b = f.readline(|| feeder.next()).unwrap().unwrap();
+        let c = f.read(4, || feeder.next()).unwrap().unwrap();
+        assert_eq!(a, b"0");
+        assert_eq!(b, b"\n");
+        assert_eq!(c, b"2\n4\n");
+    }
+
+    #[test]
+    fn readv_file_short_read_reports_prefix() {
+        let mut f = ReadVFile::new();
+        let mut feeder = HunkFeeder::new(vec![b"abc"]);
+        let err = f.read(5, || feeder.next()).unwrap().unwrap_err();
+        assert_eq!(
+            err,
+            ReadVError::ShortRead {
+                wanted: 5,
+                got: 3,
+                prefix: b"abc".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn readv_file_short_readline_without_newline() {
+        let mut f = ReadVFile::new();
+        let mut feeder = HunkFeeder::new(vec![b"noeol"]);
+        let err = f.readline(|| feeder.next()).unwrap().unwrap_err();
+        assert_eq!(err, ReadVError::ShortReadline(b"noeol".to_vec()));
     }
 }
