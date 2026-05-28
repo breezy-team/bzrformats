@@ -2111,10 +2111,12 @@ fn ensure_key_tuple<'py>(
     if let Ok(t) = obj.downcast::<PyTuple>() {
         return Ok(t.clone());
     }
-    let builtins = py.import("builtins")?;
-    let tuple_class = builtins.getattr("tuple")?;
-    let coerced = tuple_class.call1((obj.clone(),))?;
-    Ok(coerced.cast_into()?)
+    // Equivalent to Python's `tuple(obj)`: materialise the iterable. A
+    // non-iterable raises the same `TypeError` via `try_iter`.
+    let items = obj
+        .try_iter()?
+        .collect::<PyResult<Vec<Bound<'py, PyAny>>>>()?;
+    PyTuple::new(py, items)
 }
 
 /// Non-pyo3 helpers for [`BTreeBuilder`]. These are called from the

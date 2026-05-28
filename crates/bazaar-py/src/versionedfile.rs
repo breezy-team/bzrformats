@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
 
 #[pyclass(subclass)]
-struct AbstractContentFactory(Box<dyn ContentFactory + Send + Sync>);
+pub(crate) struct AbstractContentFactory(Box<dyn ContentFactory + Send + Sync>);
 
 pyo3::import_exception!(bzrformats.errors, UnavailableRepresentation);
 
@@ -122,7 +122,7 @@ impl FulltextContentFactory {
 }
 
 #[pyclass(extends=AbstractContentFactory)]
-struct ChunkedContentFactory;
+pub(crate) struct ChunkedContentFactory;
 
 #[pymethods]
 impl ChunkedContentFactory {
@@ -138,6 +138,21 @@ impl ChunkedContentFactory {
 
         Ok((ChunkedContentFactory, AbstractContentFactory(Box::new(of))))
     }
+}
+
+/// Build a `ChunkedContentFactory` pyclass instance directly, without
+/// importing `bzrformats._bzr_rs.versionedfile` back into the extension.
+pub(crate) fn new_chunked_content_factory(
+    py: Python<'_>,
+    key: Key,
+    parents: Option<Vec<Key>>,
+    sha1: Option<Vec<u8>>,
+    chunks: Vec<Vec<u8>>,
+) -> PyResult<Bound<'_, ChunkedContentFactory>> {
+    let of = bazaar::versionedfile::ChunkedContentFactory::new(sha1, key, parents, chunks);
+    let init = PyClassInitializer::from(AbstractContentFactory(Box::new(of)))
+        .add_subclass(ChunkedContentFactory);
+    Bound::new(py, init)
 }
 
 /// `ContentFactory` backed by a Python file-like object.
@@ -481,7 +496,7 @@ pub fn record_to_fulltext_bytes<'py>(
 }
 
 #[pyclass(extends=AbstractContentFactory)]
-struct AbsentContentFactory;
+pub(crate) struct AbsentContentFactory;
 
 #[pymethods]
 impl AbsentContentFactory {
@@ -491,6 +506,18 @@ impl AbsentContentFactory {
 
         Ok((AbsentContentFactory, AbstractContentFactory(Box::new(of))))
     }
+}
+
+/// Build an `AbsentContentFactory` pyclass instance directly, without
+/// importing `bzrformats._bzr_rs.versionedfile` back into the extension.
+pub(crate) fn new_absent_content_factory(
+    py: Python<'_>,
+    key: Key,
+) -> PyResult<Bound<'_, AbsentContentFactory>> {
+    let of = bazaar::versionedfile::AbsentContentFactory::new(key);
+    let init = PyClassInitializer::from(AbstractContentFactory(Box::new(of)))
+        .add_subclass(AbsentContentFactory);
+    Bound::new(py, init)
 }
 
 /// First-pass refcount/needed-key bookkeeping for `_MPDiffGenerator`.

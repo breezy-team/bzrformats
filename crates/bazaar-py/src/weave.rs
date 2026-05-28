@@ -15,6 +15,8 @@ import_exception!(bzrformats.weave, WeaveParentMismatch);
 import_exception!(bzrformats.weave, WeaveTextDiffers);
 import_exception!(bzrformats.errors, RevisionAlreadyPresent);
 import_exception!(bzrformats.errors, RevisionNotPresent);
+import_exception!(bzrformats.errors, OutSideTransaction);
+import_exception!(bzrformats.errors, ReadOnlyObjectDirtiedError);
 import_exception!(bzrformats.versionedfile, ExistingContent);
 import_exception!(bzrformats.versionedfile, UnavailableRepresentation);
 
@@ -686,17 +688,13 @@ impl PyWeave {
                 Some(s) => s.clone_ref(py),
             };
             if !current.bind(py).eq(stored.bind(py))? {
-                let exc = py
-                    .import("bzrformats.errors")?
-                    .getattr("OutSideTransaction")?;
-                return Err(PyErr::from_value(exc.call0()?));
+                return Err(OutSideTransaction::new_err(()));
             }
         }
         if slf.access_mode != "w" {
-            let exc = py
-                .import("bzrformats.errors")?
-                .getattr("ReadOnlyObjectDirtiedError")?;
-            return Err(PyErr::from_value(exc.call1((slf.into_pyobject(py)?,))?));
+            return Err(ReadOnlyObjectDirtiedError::new_err((slf
+                .into_pyobject(py)?
+                .unbind(),)));
         }
         Ok(())
     }
@@ -1374,10 +1372,6 @@ impl PyWeave {
         drop(weave_ref);
 
         // Build the result list: one factory per name.
-        let absent_cls = py
-            .import("bzrformats._bzr_rs.versionedfile")?
-            .getattr("AbsentContentFactory")?;
-
         let out = PyList::empty(py);
         for name in ordered_names {
             let weave_ref = slf.borrow(py);
@@ -1390,8 +1384,8 @@ impl PyWeave {
             } else {
                 drop(weave_ref);
                 let key = PyTuple::new(py, [PyBytes::new(py, &name)])?;
-                let absent = absent_cls.call1((key,))?;
-                out.append(absent)?;
+                let absent = crate::versionedfile::new_absent_content_factory(py, key.extract()?)?;
+                out.append(absent.into_any())?;
             }
         }
         // Wrap the eager list in an iterator object so callers can

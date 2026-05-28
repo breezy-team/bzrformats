@@ -3548,11 +3548,7 @@ impl PyKndxIndex {
     ) -> PyResult<()> {
         let _ = random_id;
         if missing_compression_parents.unwrap_or(false) {
-            let err_cls = py
-                .import("bzrformats.errors")?
-                .getattr("RevisionNotPresent")?;
-            let exc = err_cls.call1((py.None(), py.None()))?;
-            return Err(PyErr::from_value(exc.unbind().into_bound(py)));
+            return Err(RevisionNotPresent::new_err((py.None(), py.None())));
         }
         // Collect all records first so we can group them
         let mut all_recs: Vec<(
@@ -4192,7 +4188,6 @@ impl PyKnitGraphIndex {
 
     fn _sort_keys_by_io(
         &self,
-        py: Python<'_>,
         keys: Bound<'_, pyo3::types::PyList>,
         positions: Bound<'_, PyDict>,
     ) -> PyResult<()> {
@@ -4205,11 +4200,10 @@ impl PyKnitGraphIndex {
                 .ok_or_else(|| PyValueError::new_err("_sort_keys_by_io: key not in positions"))?;
             let index_memo = pos_entry.get_item(1)?;
             let file_ref = index_memo.get_item(0)?;
-            let file_id: usize = py
-                .import("builtins")?
-                .getattr("id")?
-                .call1((&file_ref,))?
-                .extract()?;
+            // Equivalent to CPython's `id()`: the object's address. Stable
+            // for the lifetime of `file_ref`, which is held in `keyed` until
+            // the sort below completes.
+            let file_id = file_ref.as_ptr() as usize;
             let pos: u64 = index_memo.get_item(1)?.extract()?;
             keyed.push((file_id, pos, k));
         }
@@ -4450,14 +4444,10 @@ impl PyKnitGraphIndex {
         let mut iter = entries.try_iter()?;
         match iter.next() {
             Some(entry) => Ok(entry?.cast_into::<PyTuple>()?.unbind()),
-            None => {
-                let exc_cls = py
-                    .import("bzrformats.errors")?
-                    .getattr("RevisionNotPresent")?;
-                Err(PyErr::from_value(
-                    exc_cls.call1((key, py.None()))?.unbind().into_bound(py),
-                ))
-            }
+            None => Err(RevisionNotPresent::new_err((
+                key.clone().unbind(),
+                py.None(),
+            ))),
         }
     }
 
@@ -5350,12 +5340,10 @@ impl KnitRecordStreamLazy {
             };
             match item {
                 StreamItem::Absent(key) => {
-                    let absent_cls = py
-                        .import("bzrformats._bzr_rs.versionedfile")?
-                        .getattr("AbsentContentFactory")?;
-                    return Ok(Some(
-                        absent_cls.call1((py_knit_key_to_py(py, &key)?,))?.unbind(),
-                    ));
+                    let py_key = py_knit_key_to_py(py, &key)?;
+                    let factory =
+                        crate::versionedfile::new_absent_content_factory(py, py_key.extract()?)?;
+                    return Ok(Some(factory.into_any().unbind()));
                 }
                 StreamItem::Fallback { src_idx, keys } => {
                     let vf = self.vf.bind(py).borrow();
@@ -6139,12 +6127,12 @@ impl PyKnitVersionedFiles {
 
             let global_map_arc = Arc::new(global_map_rust.clone());
 
-            let absent_cls = py
-                .import("bzrformats._bzr_rs.versionedfile")?
-                .getattr("AbsentContentFactory")?;
             let result_list = PyList::empty(py);
             for key in &absent_set {
-                result_list.append(absent_cls.call1((py_knit_key_to_py(py, key)?,))?)?;
+                let py_key = py_knit_key_to_py(py, key)?;
+                let factory =
+                    crate::versionedfile::new_absent_content_factory(py, py_key.extract()?)?;
+                result_list.append(factory.into_any())?;
             }
 
             let annotated = this.annotated;

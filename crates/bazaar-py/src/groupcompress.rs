@@ -10,6 +10,10 @@ use std::convert::TryInto;
 pyo3::import_exception!(bzrformats.errors, ObjectNotLocked);
 pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
 pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
+pyo3::import_exception!(bzrformats.errors, InvalidRevisionId);
+pyo3::import_exception!(bzrformats.groupcompress, DecompressCorruption);
+pyo3::import_exception!(bzrformats.pack_repo, RetryWithNewPacks);
+pyo3::import_exception!(bzrformats.versionedfile, UnavailableRepresentation);
 
 /// A [`FileRef`](bazaar::knit::FileRef) backed by a Python graph-index
 /// object.
@@ -2382,19 +2386,7 @@ impl LazyGroupCompressFactory {
             block
                 .inner
                 .extract(start, end)
-                .map_err(|e| {
-                    let msg = format!("zlib: {:?}", e);
-                    let dc = py
-                        .import("bzrformats.groupcompress")
-                        .and_then(|m| m.getattr("DecompressCorruption"))
-                        .ok();
-                    if let Some(cls) = dc {
-                        let exc = cls.call1((msg.clone(),)).unwrap();
-                        PyErr::from_value(exc)
-                    } else {
-                        PyValueError::new_err(msg)
-                    }
-                })?
+                .map_err(|e| DecompressCorruption::new_err(format!("zlib: {:?}", e)))?
                 .into_iter()
                 .map(|c| PyBytes::new(py, &c).unbind())
                 .collect::<Vec<_>>()
@@ -2427,11 +2419,11 @@ fn unavailable_representation(
             None => py.None(),
         }
     };
-    let cls = py
-        .import("bzrformats.versionedfile")?
-        .getattr("UnavailableRepresentation")?;
-    let exc = cls.call1((key, requested, own_kind))?;
-    Ok(PyErr::from_value(exc))
+    Ok(UnavailableRepresentation::new_err((
+        key,
+        requested.to_string(),
+        own_kind.to_string(),
+    )))
 }
 
 /// Rust-backed `_GCBuildDetails`.
@@ -3540,9 +3532,6 @@ impl GroupCompressVersionedFiles {
         ordering: Bound<'py, PyAny>,
         include_delta_closure: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let retry_cls = py
-            .import("bzrformats.pack_repo")?
-            .getattr("RetryWithNewPacks")?;
         // keys might be a generator; materialise it once.
         let orig_keys = PyList::empty(py);
         for k in keys.try_iter()? {
@@ -3589,7 +3578,7 @@ impl GroupCompressVersionedFiles {
                     }
                     return Ok(out.try_iter()?.into_any());
                 }
-                Err(e) if e.is_instance(py, &retry_cls) => {
+                Err(e) if e.is_instance_of::<RetryWithNewPacks>(py) => {
                     slf.borrow()
                         .access_obj
                         .bind(py)
@@ -3644,15 +3633,6 @@ impl GroupCompressVersionedFiles {
         let adapter_registry = py
             .import("bzrformats.versionedfile")?
             .getattr("adapter_registry")?;
-        let unavailable = py
-            .import("bzrformats.versionedfile")?
-            .getattr("UnavailableRepresentation")?;
-        let decompress_corruption = py
-            .import("bzrformats.groupcompress")?
-            .getattr("DecompressCorruption")?;
-        let revision_not_present = py
-            .import("bzrformats.errors")?
-            .getattr("RevisionNotPresent")?;
 
         // adapter cache: {adapter_key: adapter}
         let adapters = PyDict::new(py);
@@ -3779,7 +3759,7 @@ impl GroupCompressVersionedFiles {
             let chunks: Bound<'py, PyAny> = match record.call_method1("get_bytes_as", ("chunked",))
             {
                 Ok(c) => c,
-                Err(e) if e.is_instance(py, &unavailable) => {
+                Err(e) if e.is_instance_of::<UnavailableRepresentation>(py) => {
                     let adapter_key = PyTuple::new(
                         py,
                         [
@@ -3791,9 +3771,7 @@ impl GroupCompressVersionedFiles {
                     adapter.call_method1("get_bytes", (&record, "chunked"))?
                 }
                 Err(e) if e.is_instance_of::<PyValueError>(py) => {
-                    return Err(PyErr::from_value(
-                        decompress_corruption.call1((e.to_string(),))?,
-                    ));
+                    return Err(DecompressCorruption::new_err(e.to_string()));
                 }
                 Err(e) => return Err(e),
             };
@@ -3925,12 +3903,10 @@ impl GroupCompressVersionedFiles {
                 .iter()
                 .any(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
             {
-                return Err(PyErr::from_value(
-                    slf.py()
-                        .import("bzrformats.errors")?
-                        .getattr("InvalidRevisionId")?
-                        .call1((version_id, slf))?,
-                ));
+                return Err(InvalidRevisionId::new_err((
+                    version_id.unbind(),
+                    slf.clone().unbind(),
+                )));
             }
         }
         slf.call_method1("check_not_reserved_id", (version_id,))?;
@@ -3992,11 +3968,15 @@ impl GroupCompressVersionedFiles {
                 }
             }
         }
-        let sha1 = PyBytes::new(py, &bazaar::weave::sha_strings(&line_vec));
-        let chunked_cls = py
-            .import("bzrformats._bzr_rs.versionedfile")?
-            .getattr("ChunkedContentFactory")?;
-        let factory = chunked_cls.call1((&key, &parents, sha1, &lines))?;
+        let sha1 = bazaar::weave::sha_strings(&line_vec);
+        let factory = crate::versionedfile::new_chunked_content_factory(
+            py,
+            key.extract()?,
+            parents.extract()?,
+            Some(sha1),
+            line_vec.clone(),
+        )?
+        .into_any();
         Self::add_content(
             slf,
             py,
@@ -4049,8 +4029,7 @@ impl GroupCompressVersionedFiles {
         &self,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        py.import("builtins")?
-            .call_method1("frozenset", (PyList::empty(py),))
+        Ok(pyo3::types::PyFrozenSet::empty(py)?.into_any())
     }
 
     /// Check the store for integrity. Mirrors `check`.
@@ -4451,16 +4430,12 @@ impl GroupCompressVersionedFiles {
             Self::io_ordered_source_keys(slf, py, &locations, &unadded_keys, &source_result)?
         };
 
-        let absent_cls = py
-            .import("bzrformats._bzr_rs.versionedfile")?
-            .getattr("AbsentContentFactory")?;
         for k in missing.iter() {
-            out.append(absent_cls.call1((k,))?)?;
+            let factory =
+                crate::versionedfile::new_absent_content_factory(py, k.extract()?)?.into_any();
+            out.append(factory)?;
         }
 
-        let chunked_cls = py
-            .import("bzrformats._bzr_rs.versionedfile")?
-            .getattr("ChunkedContentFactory")?;
         let get_compressor_settings = slf.getattr("_get_compressor_settings")?;
         let batcher = py.get_type::<BatchingBlockFetcher>().call1((
             slf,
@@ -4484,12 +4459,20 @@ impl GroupCompressVersionedFiles {
                         }
                         let compressor = slf.getattr("_compressor")?;
                         let extracted = compressor.call_method1("extract", (&key,))?;
-                        let chunks = extracted.get_item(0)?;
-                        let sha1 = extracted.get_item(1)?;
+                        let chunks: Vec<Vec<u8>> = extracted.get_item(0)?.extract()?;
+                        let sha1: Option<Vec<u8>> = extracted.get_item(1)?.extract()?;
                         let parents = unadded_refs
                             .get_item(&key)?
                             .ok_or_else(|| PyKeyError::new_err("unadded ref vanished"))?;
-                        out.append(chunked_cls.call1((&key, parents, sha1, chunks))?)?;
+                        let factory = crate::versionedfile::new_chunked_content_factory(
+                            py,
+                            key.extract()?,
+                            parents.extract()?,
+                            sha1,
+                            chunks,
+                        )?
+                        .into_any();
+                        out.append(factory)?;
                         continue;
                     }
                     let total: u64 = batcher.call_method1("add_key", (&key,))?.extract()?;
