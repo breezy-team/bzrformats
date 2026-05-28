@@ -609,6 +609,159 @@ mod tests {
         out
     }
 
+    /// Port of the test suite's `make_nodes(count, key_elements,
+    /// reference_lists)` helper. Generates `count * key_elements` sample
+    /// nodes with the same deterministic key/value/reference layout.
+    fn make_nodes(
+        count: usize,
+        key_elements: usize,
+        reference_lists: usize,
+    ) -> Vec<(Key, Vec<u8>, Vec<Vec<Key>>)> {
+        let mut nodes = Vec::new();
+        for prefix_pos in 0..key_elements {
+            let prefix: Vec<Vec<u8>> = if key_elements > 1 {
+                vec![pos_to_key(prefix_pos, b"")]
+            } else {
+                vec![]
+            };
+            for pos in 0..count {
+                let mut key = prefix.clone();
+                key.push(pos_to_key(pos, b""));
+                let value = format!("value:{pos}").into_bytes();
+                let mut refs: Vec<Vec<Key>> = Vec::new();
+                for list_pos in 0..reference_lists {
+                    let mut list: Vec<Key> = Vec::new();
+                    for ref_pos in 0..(list_pos + pos % 2) {
+                        let mut r = prefix.clone();
+                        if pos % 2 == 1 {
+                            r.push(pos_to_key(pos - 1, b"ref"));
+                        } else {
+                            r.push(pos_to_key(ref_pos, b"ref"));
+                        }
+                        list.push(r);
+                    }
+                    refs.push(list);
+                }
+                nodes.push((key, value, refs));
+            }
+        }
+        nodes
+    }
+
+    fn build_with_nodes(
+        reference_lists: usize,
+        key_elements: usize,
+        nodes: &[(Key, Vec<u8>, Vec<Vec<Key>>)],
+    ) -> Vec<u8> {
+        let layout = Layout {
+            page_size: 4096,
+            reserved_header_bytes: 100,
+        };
+        let mut builder = BTreeBuilder::with_layout(reference_lists, key_elements, layout);
+        for (key, value, refs) in nodes {
+            builder
+                .add_node(key.clone(), value.clone(), refs.clone())
+                .unwrap();
+        }
+        builder.finish().unwrap()
+    }
+
+    fn decompress(data: &[u8]) -> Vec<u8> {
+        let mut decoder = ZlibDecoder::new(data);
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    fn sorted_keys(nodes: &[(Key, Vec<u8>, Vec<Vec<Key>>)]) -> Vec<Key> {
+        let mut keys: Vec<Key> = nodes.iter().map(|(k, _, _)| k.clone()).collect();
+        keys.sort();
+        keys
+    }
+
+    // Mirror of test_btree_index.test_root_leaf_2_2: a single-leaf index
+    // with two key elements and two reference lists. This is the byte-exact
+    // check that reference lists serialise correctly through write_nodes.
+    #[test]
+    fn root_leaf_2_2_byte_exact() {
+        let nodes = make_nodes(5, 2, 2);
+        let content = build_with_nodes(2, 2, &nodes);
+        assert_eq!(content.len(), 238);
+        assert_eq!(
+            &content[..74],
+            b"B+Tree Graph Index 2\nnode_ref_lists=2\nkey_elements=2\nlen=10\nrow_lengths=1\n"
+        );
+        let node_bytes = decompress(&content[74..]);
+        let expected = concat_expected(&[
+            b"type=leaf\n",
+            b"0000000000000000000000000000000000000000\x000000000000000000000000000000000000000000\x00\t0000000000000000000000000000000000000000\x00ref0000000000000000000000000000000000000000\x00value:0\n",
+            b"0000000000000000000000000000000000000000\x001111111111111111111111111111111111111111\x000000000000000000000000000000000000000000\x00ref0000000000000000000000000000000000000000\t0000000000000000000000000000000000000000\x00ref0000000000000000000000000000000000000000\r0000000000000000000000000000000000000000\x00ref0000000000000000000000000000000000000000\x00value:1\n",
+            b"0000000000000000000000000000000000000000\x002222222222222222222222222222222222222222\x00\t0000000000000000000000000000000000000000\x00ref0000000000000000000000000000000000000000\x00value:2\n",
+            b"0000000000000000000000000000000000000000\x003333333333333333333333333333333333333333\x000000000000000000000000000000000000000000\x00ref2222222222222222222222222222222222222222\t0000000000000000000000000000000000000000\x00ref2222222222222222222222222222222222222222\r0000000000000000000000000000000000000000\x00ref2222222222222222222222222222222222222222\x00value:3\n",
+            b"0000000000000000000000000000000000000000\x004444444444444444444444444444444444444444\x00\t0000000000000000000000000000000000000000\x00ref0000000000000000000000000000000000000000\x00value:4\n",
+            b"1111111111111111111111111111111111111111\x000000000000000000000000000000000000000000\x00\t1111111111111111111111111111111111111111\x00ref0000000000000000000000000000000000000000\x00value:0\n",
+            b"1111111111111111111111111111111111111111\x001111111111111111111111111111111111111111\x001111111111111111111111111111111111111111\x00ref0000000000000000000000000000000000000000\t1111111111111111111111111111111111111111\x00ref0000000000000000000000000000000000000000\r1111111111111111111111111111111111111111\x00ref0000000000000000000000000000000000000000\x00value:1\n",
+            b"1111111111111111111111111111111111111111\x002222222222222222222222222222222222222222\x00\t1111111111111111111111111111111111111111\x00ref0000000000000000000000000000000000000000\x00value:2\n",
+            b"1111111111111111111111111111111111111111\x003333333333333333333333333333333333333333\x001111111111111111111111111111111111111111\x00ref2222222222222222222222222222222222222222\t1111111111111111111111111111111111111111\x00ref2222222222222222222222222222222222222222\r1111111111111111111111111111111111111111\x00ref2222222222222222222222222222222222222222\x00value:3\n",
+            b"1111111111111111111111111111111111111111\x004444444444444444444444444444444444444444\x00\t1111111111111111111111111111111111111111\x00ref0000000000000000000000000000000000000000\x00value:4\n",
+        ]);
+        assert_eq!(node_bytes, expected);
+    }
+
+    // Mirror of test_btree_index.test_last_page_rounded_1_layer: 10 nodes
+    // fit on a single leaf page.
+    #[test]
+    fn last_page_rounded_1_layer() {
+        let nodes = make_nodes(10, 1, 0);
+        let content = build_with_nodes(0, 1, &nodes);
+        assert_eq!(
+            &content[..74],
+            b"B+Tree Graph Index 2\nnode_ref_lists=0\nkey_elements=1\nlen=10\nrow_lengths=1\n"
+        );
+        // The single leaf holds all 10 keys, in sorted order.
+        let leaf = decompress(&content[74..]);
+        let parsed = crate::btree_index::parse_leaf_lines(&leaf, 1, 0).expect("leaf parses");
+        let mut got: Vec<Key> = parsed.into_iter().map(|(k, _, _)| k).collect();
+        got.sort();
+        assert_eq!(got, sorted_keys(&nodes));
+    }
+
+    // Mirror of test_btree_index.test_last_page_not_rounded_2_layer and the
+    // leaf-split portion of test_2_leaves_1_0: 400 nodes split across two
+    // leaves under a single internal root, 231 keys landing on the first leaf.
+    #[test]
+    fn last_page_not_rounded_2_layer() {
+        let nodes = make_nodes(400, 1, 0);
+        let content = build_with_nodes(0, 1, &nodes);
+        assert_eq!(
+            &content[..77],
+            b"B+Tree Graph Index 2\nnode_ref_lists=0\nkey_elements=1\nlen=400\nrow_lengths=1,2\n"
+        );
+        let sorted = sorted_keys(&nodes);
+        // Root internal node points at the split key.
+        let root = decompress(&content[77..4096]);
+        let expected_root =
+            concat_expected(&[b"type=internal\noffset=0\n", &pos_to_key(307, b""), b"\n"]);
+        assert_eq!(root, expected_root);
+        // First leaf holds the first 231 keys, the second the remainder.
+        let leaf1 = decompress(&content[4096..8192]);
+        let mut keys1: Vec<Key> = crate::btree_index::parse_leaf_lines(&leaf1, 1, 0)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .collect();
+        keys1.sort();
+        assert_eq!(keys1, sorted[..231]);
+        let leaf2 = decompress(&content[8192..]);
+        let mut keys2: Vec<Key> = crate::btree_index::parse_leaf_lines(&leaf2, 1, 0)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .collect();
+        keys2.sort();
+        assert_eq!(keys2, sorted[231..]);
+    }
+
     #[test]
     fn flatten_node_without_references() {
         let key = vec![b"file-id".to_vec()];
