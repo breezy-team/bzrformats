@@ -118,15 +118,6 @@ class CHKInventory(_mod_inventory_rs.CHKInventory):
         """Simple thunk to bzrformats.inventory.make_entry."""
         return make_entry(kind, name, parent_id, file_id, revision, **kwargs)
 
-    def _make_delta(self, old):
-        """Produce an InventoryDelta describing the changes from `old` to self.
-
-        Accepts `CHKInventory` and `Inventory` for `old`; the module-level
-        `_make_delta(new, old)` dispatcher handles every pairing of the two
-        inventory shapes.
-        """
-        return _make_delta(self, old)
-
 
 entry_factory = {
     "directory": InventoryDirectory,
@@ -180,44 +171,9 @@ _chk_inventory_entry_to_bytes = _mod_inventory_rs.chk_inventory_entry_to_bytes
 
 
 def _make_delta(new, old):
-    """Make an inventory delta from two inventories."""
-    from .inventory_delta import InventoryDelta
-
-    if isinstance(old, CHKInventory) and isinstance(new, CHKInventory):
-        delta = []
-        for key, old_value, self_value in new.id_to_entry.iter_changes(old.id_to_entry):
-            file_id = key[0]
-            old_path = old.id2path(file_id) if old_value is not None else None
-            if self_value is not None:
-                entry = new._bytes_to_entry(self_value)
-                new._fileid_to_entry_cache[file_id] = entry
-                new_path = new.id2path(file_id)
-            else:
-                entry = None
-                new_path = None
-            delta.append((old_path, new_path, file_id, entry))
-        return InventoryDelta(delta)
-    elif isinstance(old, Inventory) and isinstance(new, Inventory):
-        return new._make_delta(old)
-    else:
-        old_ids = set(old.iter_all_ids())
-        new_ids = set(new.iter_all_ids())
-        adds = new_ids - old_ids
-        deletes = old_ids - new_ids
-        common = old_ids.intersection(new_ids)
-        delta = []
-        for file_id in deletes:
-            delta.append((old.id2path(file_id), None, file_id, None))
-        for file_id in adds:
-            delta.append((None, new.id2path(file_id), file_id, new.get_entry(file_id)))
-        for file_id in common:
-            if old.get_entry(file_id) != new.get_entry(file_id):
-                delta.append(
-                    (
-                        old.id2path(file_id),
-                        new.id2path(file_id),
-                        file_id,
-                        new.get_entry(file_id),
-                    )
-                )
-        return InventoryDelta(delta)
+    """Produce an :class:`InventoryDelta` describing the changes from `old`
+    to `new`. Either side may be an :class:`Inventory` or a
+    :class:`CHKInventory`; dispatch happens in the Rust-backed
+    ``_make_delta`` method on the new inventory.
+    """
+    return new._make_delta(old)

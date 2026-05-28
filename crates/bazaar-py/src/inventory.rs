@@ -1029,6 +1029,65 @@ fn inventory_err_to_py_err(e: Error, py: Python) -> PyErr {
     }
 }
 
+/// Build a delta between two inventories of any shape by walking
+/// `iter_all_ids()` on each side and comparing entries. Mirrors the
+/// fallback branch of Python's `bzrformats.inventory._make_delta`.
+///
+/// Both `new` and `old` may be any object exposing `iter_all_ids()`,
+/// `id2path(file_id)`, and `get_entry(file_id)` — i.e. an
+/// `Inventory` or `CHKInventory` pyclass.
+fn make_delta_via_attrs<'py>(
+    new: &Bound<'py, PyAny>,
+    old: &Bound<'py, PyAny>,
+) -> PyResult<bazaar::inventory_delta::InventoryDelta> {
+    let mut old_ids: std::collections::HashSet<FileId> = std::collections::HashSet::new();
+    for fid in old.call_method0("iter_all_ids")?.try_iter()? {
+        old_ids.insert(fid?.extract()?);
+    }
+    let mut new_ids: std::collections::HashSet<FileId> = std::collections::HashSet::new();
+    for fid in new.call_method0("iter_all_ids")?.try_iter()? {
+        new_ids.insert(fid?.extract()?);
+    }
+    let mut delta: Vec<InventoryDeltaEntry> = Vec::new();
+    for file_id in old_ids.difference(&new_ids) {
+        let old_path: String = old.call_method1("id2path", (file_id.clone(),))?.extract()?;
+        delta.push(InventoryDeltaEntry {
+            old_path: Some(old_path),
+            new_path: None,
+            file_id: file_id.clone(),
+            new_entry: None,
+        });
+    }
+    for file_id in new_ids.difference(&old_ids) {
+        let new_path: String = new.call_method1("id2path", (file_id.clone(),))?.extract()?;
+        let entry_obj = new.call_method1("get_entry", (file_id.clone(),))?;
+        let entry = entry_obj.extract::<PyRef<InventoryEntry>>()?.0.clone();
+        delta.push(InventoryDeltaEntry {
+            old_path: None,
+            new_path: Some(new_path),
+            file_id: file_id.clone(),
+            new_entry: Some(entry),
+        });
+    }
+    for file_id in old_ids.intersection(&new_ids) {
+        let old_entry_obj = old.call_method1("get_entry", (file_id.clone(),))?;
+        let new_entry_obj = new.call_method1("get_entry", (file_id.clone(),))?;
+        let old_entry = old_entry_obj.extract::<PyRef<InventoryEntry>>()?.0.clone();
+        let new_entry = new_entry_obj.extract::<PyRef<InventoryEntry>>()?.0.clone();
+        if old_entry != new_entry {
+            let old_path: String = old.call_method1("id2path", (file_id.clone(),))?.extract()?;
+            let new_path: String = new.call_method1("id2path", (file_id.clone(),))?.extract()?;
+            delta.push(InventoryDeltaEntry {
+                old_path: Some(old_path),
+                new_path: Some(new_path),
+                file_id: file_id.clone(),
+                new_entry: Some(new_entry),
+            });
+        }
+    }
+    Ok(bazaar::inventory_delta::InventoryDelta::from(delta))
+}
+
 #[pyclass]
 pub(crate) struct Inventory(pub(crate) bazaar::inventory::MutableInventory);
 
@@ -1318,19 +1377,17 @@ impl Inventory {
         slf: &Bound<'py, Self>,
         py: Python<'py>,
         old: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<Bound<'py, InventoryDelta>> {
         // Fast path: both inventories are the Rust-backed `Inventory`.
         if let Ok(old_inv) = old.extract::<PyRef<Inventory>>() {
             let this = slf.borrow();
             let inventory_delta = this.0.make_delta(&old_inv.0);
-            return Ok(Bound::new(py, InventoryDelta(inventory_delta))?.into_any());
+            return Bound::new(py, InventoryDelta(inventory_delta));
         }
-        // TODO: handle `CHKInventory` natively in Rust so we don't need the
-        // Python round-trip. For now, fall back to the Python-side dispatcher
-        // which knows how to produce a delta across mixed inventory types.
-        py.import("bzrformats.inventory")?
-            .getattr("_make_delta")?
-            .call1((slf, old))
+        // Mixed Inventory<->CHKInventory: fall back to the generic
+        // attribute-based diff.
+        let delta = make_delta_via_attrs(slf.as_any(), old)?;
+        Bound::new(py, InventoryDelta(delta))
     }
 
     fn remove_recursive_id<'a>(
@@ -2242,6 +2299,81 @@ impl CHKInventory {
             .bind(py)
             .set_item(file_id, &entry)?;
         Ok(entry)
+    }
+
+    /// Produce an `InventoryDelta` from `old` to `self`. When `old` is
+    /// another `CHKInventory`, the two `id_to_entry` CHKMaps are diffed
+    /// via `iter_changes`; otherwise the generic attribute-based diff is
+    /// used. Mirrors `bzrformats.inventory._make_delta`.
+    fn _make_delta<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        old: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, InventoryDelta>> {
+        if let Ok(old_chk) = old.cast::<CHKInventory>() {
+            let self_id_map = slf
+                .borrow()
+                .id_to_entry
+                .as_ref()
+                .ok_or_else(|| BzrFormatsError::new_err("self.id_to_entry not set"))?
+                .clone_ref(py);
+            let basis_id_map = old_chk
+                .borrow()
+                .id_to_entry
+                .as_ref()
+                .ok_or_else(|| BzrFormatsError::new_err("old.id_to_entry not set"))?
+                .clone_ref(py);
+            let changes_iter = self_id_map
+                .bind(py)
+                .call_method1("iter_changes", (basis_id_map,))?;
+            let mut delta: Vec<InventoryDeltaEntry> = Vec::new();
+            let cache = slf.borrow().fileid_to_entry_cache.bind(py).clone();
+            for change in changes_iter.try_iter()? {
+                let change = change?;
+                let tup = change.cast_into::<PyTuple>()?;
+                let key = tup.get_item(0)?;
+                let old_value = tup.get_item(1)?;
+                let self_value = tup.get_item(2)?;
+                let file_id_obj = key.cast_into::<PyTuple>()?.get_item(0)?;
+                let file_id_bytes = file_id_obj.cast_into::<PyBytes>()?;
+                let file_id = FileId::from(file_id_bytes.as_bytes());
+                let old_path = if old_value.is_none() {
+                    None
+                } else {
+                    Some(
+                        old.call_method1("id2path", (file_id_bytes.clone(),))?
+                            .extract::<String>()?,
+                    )
+                };
+                let (new_path, new_entry) = if self_value.is_none() {
+                    (None, None)
+                } else {
+                    let self_bytes = self_value.cast_into::<PyBytes>()?;
+                    let entry =
+                        bazaar::chk_inventory::chk_inventory_bytes_to_entry(self_bytes.as_bytes());
+                    // Repopulate the cache the same way Python's
+                    // `_bytes_to_entry` would have.
+                    let py_entry = entry_to_py(py, entry.clone())?;
+                    cache.set_item(file_id_bytes.clone(), py_entry)?;
+                    let np = slf
+                        .call_method1("id2path", (file_id_bytes,))?
+                        .extract::<String>()?;
+                    (Some(np), Some(entry))
+                };
+                delta.push(InventoryDeltaEntry {
+                    old_path,
+                    new_path,
+                    file_id,
+                    new_entry,
+                });
+            }
+            return Bound::new(
+                py,
+                InventoryDelta(bazaar::inventory_delta::InventoryDelta::from(delta)),
+            );
+        }
+        let delta = make_delta_via_attrs(slf.as_any(), old)?;
+        Bound::new(py, InventoryDelta(delta))
     }
 
     /// Compute the `(parent_id, basename_utf8)` key used by the
