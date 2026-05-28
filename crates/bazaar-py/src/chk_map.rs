@@ -2703,6 +2703,215 @@ impl CHKMap {
         page_cache().insert(sha1, bytes_vec);
         Ok(bytes_py)
     }
+
+    /// Apply a `(old_key, new_key, value)` delta and save, returning the
+    /// new root key. Mirrors the former Python `_chkmap_apply_delta`.
+    fn apply_delta<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        delta: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Collect the delta once; it may be a one-shot iterable.
+        let entries: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)> = {
+            let mut out = Vec::new();
+            for entry in delta.try_iter()? {
+                let tup = entry?.cast_into::<PyTuple>()?;
+                out.push((tup.get_item(0)?, tup.get_item(1)?, tup.get_item(2)?));
+            }
+            out
+        };
+        // New keys (added, not moved) must not already exist.
+        let new_items = pyo3::types::PySet::empty(py)?;
+        for (old, new, _value) in &entries {
+            if !new.is_none() && old.is_none() {
+                let key_tuple = if new.clone().cast_into::<PyTuple>().is_ok() {
+                    new.clone()
+                } else {
+                    PyTuple::new(py, new.try_iter()?.collect::<PyResult<Vec<_>>>()?)?.into_any()
+                };
+                new_items.add(key_tuple)?;
+            }
+        }
+        let existing_new: Vec<Bound<'py, PyAny>> =
+            Self::iteritems(slf.clone(), py, Some(new_items.into_any()))?
+                .try_iter()?
+                .collect::<PyResult<Vec<_>>>()?;
+        if !existing_new.is_empty() {
+            let exc = py
+                .import("bzrformats.errors")?
+                .getattr("InconsistentDeltaDelta")?;
+            let msg = format!(
+                "New items are already in the map {}",
+                PyList::new(py, &existing_new)?.repr()?
+            );
+            return Err(PyErr::from_value(exc.call1((&delta, msg))?));
+        }
+        let mut has_deletes = false;
+        for (old, new, _value) in &entries {
+            if !old.is_none() && !old.eq(new)? {
+                Self::unmap(slf.clone(), py, old.clone(), false)?;
+                has_deletes = true;
+            }
+        }
+        for (_old, new, value) in &entries {
+            if !new.is_none() {
+                Self::map(slf.clone(), py, new.clone(), value.clone())?;
+            }
+        }
+        if has_deletes {
+            Self::_check_remap(slf.clone(), py)?;
+        }
+        slf.borrow()._save(py)
+    }
+
+    /// Create a CHKMap in `store` from `initial_value`, returning the
+    /// root key. Mirrors the former Python `_chkmap_from_dict`.
+    #[classmethod]
+    #[pyo3(signature = (store, initial_value, maximum_size = 0, key_width = 1, search_key_func = None))]
+    fn from_dict<'py>(
+        cls: &Bound<'py, pyo3::types::PyType>,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+        initial_value: Bound<'py, PyAny>,
+        maximum_size: usize,
+        key_width: usize,
+        search_key_func: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let root_key = Self::_create_directly(
+            cls,
+            py,
+            store,
+            initial_value,
+            maximum_size,
+            key_width,
+            search_key_func,
+        )?;
+        if root_key.clone().cast_into::<PyTuple>().is_err() {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                "we got a {} instead of a tuple",
+                root_key.get_type().name()?
+            )));
+        }
+        Ok(root_key)
+    }
+
+    /// Build a CHKMap by applying every item as a delta. Slower than
+    /// `_create_directly` but exercises the map/split path; used by
+    /// tests. Mirrors the former Python `_chkmap_create_via_map`.
+    #[classmethod]
+    #[pyo3(signature = (store, initial_value, maximum_size = 0, key_width = 1, search_key_func = None))]
+    fn _create_via_map<'py>(
+        cls: &Bound<'py, pyo3::types::PyType>,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+        initial_value: Bound<'py, PyAny>,
+        maximum_size: usize,
+        key_width: usize,
+        search_key_func: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let kwargs = PyDict::new(py);
+        if let Some(skf) = &search_key_func {
+            kwargs.set_item("search_key_func", skf)?;
+        }
+        let result = cls.call((store, py.None()), Some(&kwargs))?;
+        let root = result.getattr("_root_node")?;
+        if !is_node(&root) {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(
+                "expected root node to be Node",
+            ));
+        }
+        root.call_method1("set_maximum_size", (maximum_size,))?;
+        root.setattr("_key_width", key_width)?;
+        let delta = PyList::empty(py);
+        for item in initial_value.call_method0("items")?.try_iter()? {
+            let pair = item?.cast_into::<PyTuple>()?;
+            let key = pair.get_item(0)?;
+            let value = pair.get_item(1)?;
+            delta.append(PyTuple::new(py, [py.None().into_bound(py), key, value])?)?;
+        }
+        result.call_method1("apply_delta", (delta,))
+    }
+
+    /// Build a CHKMap directly: pack everything into a leaf, split into an
+    /// InternalNode if it overflows, then serialise. Mirrors the former
+    /// Python `_chkmap_create_directly`.
+    #[classmethod]
+    #[pyo3(signature = (store, initial_value, maximum_size = 0, key_width = 1, search_key_func = None))]
+    fn _create_directly<'py>(
+        _cls: &Bound<'py, pyo3::types::PyType>,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+        initial_value: Bound<'py, PyAny>,
+        maximum_size: usize,
+        key_width: usize,
+        search_key_func: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let leaf = Bound::new(py, LeafNode::new(py, search_key_func.clone())?)?;
+        {
+            let mut l = leaf.borrow_mut();
+            l.inner.maximum_size = maximum_size;
+            l.inner.key_width = key_width;
+            let mut items: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> = indexmap::IndexMap::new();
+            let mut raw_size = 0usize;
+            for item in initial_value.call_method0("items")?.try_iter()? {
+                let pair = item?.cast_into::<PyTuple>()?;
+                let key_tuple = pair.get_item(0)?.cast_into::<PyTuple>()?;
+                let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key_tuple.len());
+                for p in key_tuple.iter() {
+                    parts.push(p.cast_into::<PyBytes>()?.as_bytes().to_vec());
+                }
+                let value = pair
+                    .get_item(1)?
+                    .cast_into::<PyBytes>()?
+                    .as_bytes()
+                    .to_vec();
+                raw_size += leaf_node_key_value_len(&parts, &value);
+                items.insert(parts, value);
+            }
+            l.inner.items = items;
+            l.inner.raw_size = raw_size;
+        }
+        leaf.borrow_mut().inner.compute_search_prefix();
+        leaf.borrow_mut().inner.compute_serialised_prefix();
+        let (len, current_size) = {
+            let l = leaf.borrow();
+            (l.inner.len(), l.inner.current_size())
+        };
+        let node: Bound<'py, PyAny> = if len > 1 && maximum_size != 0 && current_size > maximum_size
+        {
+            let mapped = LeafNode::_split(leaf.clone(), py, store.clone())?;
+            let (prefix_obj, node_details) = mapped;
+            let node_details = node_details;
+            if node_details.len() == 1 {
+                return Err(pyo3::exceptions::PyAssertionError::new_err(
+                    "Failed to split using node._split",
+                ));
+            }
+            let prefix = prefix_obj.bind(py).cast::<PyBytes>()?.as_bytes().to_vec();
+            let internal = Bound::new(
+                py,
+                InternalNode::new(py, Some(&prefix), search_key_func.clone())?,
+            )?;
+            internal.borrow_mut().maximum_size = maximum_size;
+            internal.borrow_mut().key_width = key_width;
+            for d in node_details.iter() {
+                let pair = d.cast_into::<PyTuple>()?;
+                let split = pair.get_item(0)?.cast_into::<PyBytes>()?;
+                let subnode = pair.get_item(1)?;
+                InternalNode::add_node(&mut internal.borrow_mut(), py, split.as_bytes(), subnode)?;
+            }
+            internal.into_any()
+        } else {
+            leaf.into_any()
+        };
+        let keys: Vec<Bound<'py, PyAny>> = node
+            .call_method1("serialise", (store,))?
+            .try_iter()?
+            .collect::<PyResult<Vec<_>>>()?;
+        keys.into_iter().next_back().ok_or_else(|| {
+            pyo3::exceptions::PyAssertionError::new_err("serialise returned no keys")
+        })
+    }
 }
 
 impl CHKMap {

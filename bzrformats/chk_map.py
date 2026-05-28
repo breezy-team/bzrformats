@@ -120,31 +120,6 @@ def _deserialise_internal_node(data, key, search_key_func=None):
 CHKMap = _chk_map_rs.CHKMap
 
 
-def _chkmap_apply_delta(self, delta):
-    """Apply a delta to the map."""
-    has_deletes = False
-    new_items = {
-        tuple(key) for (old, key, value) in delta if key is not None and old is None
-    }
-    existing_new = list(self.iteritems(key_filter=new_items))
-    if existing_new:
-        from .errors import InconsistentDeltaDelta
-
-        raise InconsistentDeltaDelta(
-            delta, f"New items are already in the map {existing_new!r}."
-        )
-    for old, new, _value in delta:
-        if old is not None and old != new:
-            self.unmap(old, check_remap=False)
-            has_deletes = True
-    for _old, new, value in delta:
-        if new is not None:
-            self.map(new, value)
-    if has_deletes:
-        self._check_remap()
-    return self._save()
-
-
 def _chkmap_dump_tree(self, include_keys=False, encoding="utf-8"):
     self._ensure_root()
 
@@ -188,71 +163,6 @@ def _chkmap_dump_tree_node(self, node, prefix, indent, decode, include_keys=True
                 f"      {tuple([decode(ke) for ke in key])!r} {decode(value)!r}"
             )
     return result
-
-
-@classmethod
-def _chkmap_from_dict(
-    cls, store, initial_value, maximum_size=0, key_width=1, search_key_func=None
-):
-    """Create a CHKMap in store with initial_value as the content."""
-    root_key = cls._create_directly(
-        store,
-        initial_value,
-        maximum_size=maximum_size,
-        key_width=key_width,
-        search_key_func=search_key_func,
-    )
-    if not isinstance(root_key, tuple):
-        raise AssertionError(f"we got a {type(root_key)} instead of a tuple")
-    return root_key
-
-
-@classmethod
-def _chkmap_create_via_map(
-    cls, store, initial_value, maximum_size=0, key_width=1, search_key_func=None
-):
-    result = cls(store, None, search_key_func=search_key_func)
-    if not isinstance(result._root_node, Node):
-        raise AssertionError("expected root node to be Node")
-    result._root_node.set_maximum_size(maximum_size)
-    result._root_node._key_width = key_width
-    delta = [(None, key, value) for key, value in initial_value.items()]
-    return result.apply_delta(delta)
-
-
-@classmethod
-def _chkmap_create_directly(
-    cls, store, initial_value, maximum_size=0, key_width=1, search_key_func=None
-):
-    leaf_node = LeafNode(search_key_func=search_key_func)
-    leaf_node.set_maximum_size(maximum_size)
-    leaf_node._key_width = key_width
-    leaf_node._items = {tuple(key): val for key, val in initial_value.items()}
-    leaf_node._raw_size = sum(
-        leaf_node._key_value_len(key, value)
-        for key, value in leaf_node._items.items()
-    )
-    leaf_node._len = len(leaf_node._items)
-    leaf_node._compute_search_prefix()
-    leaf_node._compute_serialised_prefix()
-    if (
-        leaf_node._len > 1
-        and maximum_size
-        and leaf_node._current_size() > maximum_size
-    ):
-        prefix, node_details = leaf_node._split(store)
-        if len(node_details) == 1:
-            raise AssertionError("Failed to split using node._split")
-        internal_node = InternalNode(prefix, search_key_func=search_key_func)
-        internal_node.set_maximum_size(maximum_size)
-        internal_node._key_width = key_width
-        for split, subnode in node_details:
-            internal_node.add_node(split, subnode)
-        node = internal_node
-    else:
-        node = leaf_node
-    keys = list(node.serialise(store))
-    return keys[-1]
 
 
 def _chkmap_iter_changes(self, basis):
@@ -415,12 +325,10 @@ def _chkmap_iter_changes(self, basis):
 
 
 # Bind orchestration methods onto the CHKMap pyclass at module load.
-CHKMap.apply_delta = _chkmap_apply_delta
+# apply_delta, from_dict, _create_via_map and _create_directly are native
+# pyclass methods; the tree dump and iter_changes stay in Python.
 CHKMap._dump_tree = _chkmap_dump_tree
 CHKMap._dump_tree_node = _chkmap_dump_tree_node
-CHKMap.from_dict = _chkmap_from_dict
-CHKMap._create_via_map = _chkmap_create_via_map
-CHKMap._create_directly = _chkmap_create_directly
 CHKMap.iter_changes = _chkmap_iter_changes
 
 
