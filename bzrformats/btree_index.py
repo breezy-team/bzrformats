@@ -26,32 +26,8 @@ _BTSIGNATURE = b"B+Tree Graph Index 2\n"
 _LEAF_FLAG = b"type=leaf\n"
 _INTERNAL_FLAG = b"type=internal\n"
 
-# Read by the Rust BTreeBuilder.write_nodes and BTreeGraphIndex via
-# py.import — tests monkey-patch these via overrideAttr to force smaller
-# trees.
-_RESERVED_HEADER_BYTES = 120
-_PAGE_SIZE = 4096
-
-# 4K per page: 4MB - 1000 entries
-_NODE_CACHE_SIZE = 1000
-
-
 logger = logging.getLogger(name="bzrformats.btree_index")
 evil_logger = logging.getLogger(name="bzrformats.evil")
-
-
-class _DummyTransport:
-    """Stand-in transport used when constructing in-memory backing
-    indices from BTreeBuilder's spill output.
-
-    BTreeGraphIndex requires a transport to read its underlying file,
-    but spilled backings are read directly from an open file handle
-    written to during the spill - the transport is never used. This
-    class just satisfies the recommended_page_size protocol.
-    """
-
-    def recommended_page_size(self):
-        return _PAGE_SIZE
 
 
 BTreeBuilder = _btree_index_rs.BTreeBuilder
