@@ -820,29 +820,216 @@ impl LeafNode {
 
     /// Remove `key`, recomputing both prefixes from scratch. Mirrors
     /// `LeafNode.unmap`; `_store` is unused on the leaf path. Raises
-    /// `KeyError` when the key is not present.
+    /// `KeyError` when the key is not present. Returns `self` so callers
+    /// can chain, matching the Python API.
     #[pyo3(signature = (_store, key))]
-    fn unmap(
-        &mut self,
-        py: Python<'_>,
+    fn unmap<'py>(
+        slf: Bound<'py, Self>,
         _store: Bound<'_, PyAny>,
         key: Bound<'_, PyTuple>,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> PyResult<Bound<'py, Self>> {
         let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key.len());
         for part in key.iter() {
             parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
         }
-        if self.inner.unmap(&parts).is_none() {
+        if slf.borrow_mut().inner.unmap(&parts).is_none() {
             return Err(pyo3::exceptions::PyKeyError::new_err(format!(
                 "{:?}",
                 parts
             )));
         }
-        // Python's unmap returns `self` to chain. Returning None from a
-        // pyo3 method would replace `self`; instead, return Python's
-        // None and let the Python wrapper hand back the LeafNode
-        // instance. (Adjusted in the final replacement commit.)
-        Ok(py.None())
+        Ok(slf)
+    }
+
+    /// Serialise this leaf into `store`, returning `[(b"sha1:...",)]`.
+    /// Mirrors `LeafNode.serialise` (the former Python `_leaf_serialise`).
+    fn serialise<'py>(
+        &mut self,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        use bazaar::chk_map::PageCache as _;
+        let mut sorted_items: Vec<(&Vec<Vec<u8>>, &Vec<u8>)> = self.inner.items.iter().collect();
+        sorted_items.sort_by(|a, b| a.0.cmp(b.0));
+        let rust_items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = sorted_items
+            .into_iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let out = serialise_leaf_node(
+            self.inner.maximum_size,
+            self.inner.key_width,
+            &rust_items,
+            self.inner.common_serialised_prefix.as_deref(),
+        )
+        .map_err(chk_err_to_py)?;
+        let lines = PyList::empty(py);
+        for line in &out {
+            lines.append(PyBytes::new(py, line))?;
+        }
+        let result = store.call_method1("add_lines", ((py.None(),), PyList::empty(py), &lines))?;
+        let sha1: Vec<u8> = result
+            .cast_into::<PyTuple>()?
+            .get_item(0)?
+            .cast_into::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        let mut key = b"sha1:".to_vec();
+        key.extend_from_slice(&sha1);
+        self.inner.key = Some(key.clone());
+        let data: Vec<u8> = out.iter().flatten().copied().collect();
+        if data.len() != self.inner.current_size() {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(
+                "Invalid _current_size",
+            ));
+        }
+        page_cache().insert(key.clone(), data);
+        let key_tuple = PyTuple::new(py, [PyBytes::new(py, &key)])?;
+        PyList::new(py, [key_tuple])
+    }
+
+    /// Map `key`->`value`, returning `(prefix, [(node_prefix, node)])`.
+    /// If the node overflows it splits. Mirrors `LeafNode.map`
+    /// (the former Python `_leaf_map`).
+    fn map<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+        key: Bound<'py, PyTuple>,
+        value: Vec<u8>,
+    ) -> PyResult<(Py<PyAny>, Bound<'py, PyList>)> {
+        let overflowed = {
+            let mut me = slf.borrow_mut();
+            let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key.len());
+            for part in key.iter() {
+                parts.push(part.cast_into::<PyBytes>()?.as_bytes().to_vec());
+            }
+            if let Some(existing) = me.inner.items.get(&parts) {
+                me.inner.raw_size -= leaf_node_key_value_len(&parts, existing);
+            }
+            me.inner.key = None;
+            me.inner.map_no_split(parts, value)
+        };
+        if overflowed {
+            return LeafNode::_split(slf, py, store);
+        }
+        let prefix = match &slf.borrow().inner.search_prefix {
+            SearchPrefix::Unknown => {
+                return Err(pyo3::exceptions::PyAssertionError::new_err(
+                    "search prefix must be known",
+                ));
+            }
+            SearchPrefix::Computed(None) => py.None(),
+            SearchPrefix::Computed(Some(p)) => PyBytes::new(py, p).into_any().unbind(),
+        };
+        let details = PyList::new(
+            py,
+            [PyTuple::new(
+                py,
+                [PyBytes::new(py, b"").into_any(), slf.into_any()],
+            )?],
+        )?;
+        Ok((prefix, details))
+    }
+
+    /// Split an overflowed leaf into multiple leaves, returning
+    /// `(common_prefix, [(node_prefix, node)])`. Mirrors `LeafNode._split`
+    /// (the former Python `_leaf_split`).
+    fn _split<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+    ) -> PyResult<(Py<PyAny>, Bound<'py, PyList>)> {
+        let (common_prefix, maximum_size, key_width, items, callable) = {
+            let me = slf.borrow();
+            let common_prefix = match &me.inner.search_prefix {
+                SearchPrefix::Unknown => {
+                    return Err(pyo3::exceptions::PyAssertionError::new_err(
+                        "Search prefix must be known",
+                    ));
+                }
+                SearchPrefix::Computed(None) => Vec::new(),
+                SearchPrefix::Computed(Some(p)) => p.clone(),
+            };
+            let items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = me
+                .inner
+                .items
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let callable = me.search_key_callable.as_ref().map(|c| c.bind(py).clone());
+            (
+                common_prefix,
+                me.inner.maximum_size,
+                me.inner.key_width,
+                items,
+                callable,
+            )
+        };
+        let split_at = common_prefix.len() + 1;
+        // `result` is an insertion-ordered dict, exactly like Python's;
+        // the final `(prefix, node)` list is just its items.
+        let result = PyDict::new(py);
+        for (key_parts, value) in items {
+            let search_key = slf
+                .borrow()
+                .inner
+                .search_key_func
+                .apply(&Key::from(key_parts.clone()));
+            let mut prefix: Vec<u8> = search_key.iter().take(split_at).copied().collect();
+            if prefix.len() < split_at {
+                prefix.resize(split_at, 0);
+            }
+            let prefix_py = PyBytes::new(py, &prefix);
+            let node: Bound<'py, PyAny> = if let Some(existing) = result.get_item(&prefix_py)? {
+                existing
+            } else {
+                let leaf = Bound::new(py, LeafNode::new(py, callable.clone())?)?;
+                leaf.borrow_mut().inner.maximum_size = maximum_size;
+                leaf.borrow_mut().inner.key_width = key_width;
+                result.set_item(&prefix_py, &leaf)?;
+                leaf.into_any()
+            };
+            let key_tuple = PyTuple::new(py, key_parts.iter().map(|p| PyBytes::new(py, p)))?;
+            // `node` may already be an InternalNode if an earlier item with
+            // this prefix overflowed and was promoted; dispatch via the
+            // Python `map` so the right implementation runs.
+            let mapped = node
+                .call_method1("map", (store.clone(), key_tuple, PyBytes::new(py, &value)))?
+                .cast_into::<PyTuple>()?;
+            let sub_prefix = mapped.get_item(0)?;
+            let node_details = mapped.get_item(1)?.cast_into::<PyList>()?;
+            if node_details.len() > 1 {
+                if !sub_prefix.eq(&prefix_py)? {
+                    // Re-pathed under a different prefix; drop the old slot.
+                    result.del_item(&prefix_py)?;
+                }
+                let sub_prefix_slice = sub_prefix.cast_into::<PyBytes>()?.as_bytes().to_vec();
+                let internal = Bound::new(
+                    py,
+                    InternalNode::new(py, Some(&sub_prefix_slice), callable.clone())?,
+                )?;
+                internal.borrow_mut().maximum_size = maximum_size;
+                internal.borrow_mut().key_width = key_width;
+                for detail in node_details.iter() {
+                    let detail = detail.cast_into::<PyTuple>()?;
+                    let split = detail.get_item(0)?.cast_into::<PyBytes>()?;
+                    let sub_node = detail.get_item(1)?;
+                    InternalNode::add_node(
+                        &mut internal.borrow_mut(),
+                        py,
+                        split.as_bytes(),
+                        sub_node,
+                    )?;
+                }
+                result.set_item(&prefix_py, &internal)?;
+            }
+        }
+        let details = PyList::empty(py);
+        for (prefix, node) in result.iter() {
+            details.append(PyTuple::new(py, [prefix, node])?)?;
+        }
+        let common = PyBytes::new(py, &common_prefix).into_any().unbind();
+        Ok((common, details))
     }
 
     /// `LeafNode.iteritems` — return matching `(key, value)` pairs.
