@@ -3937,6 +3937,39 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         parts.iter().map(|p| p.to_vec()).collect()
     }
 
+    /// Build and save a CHK map from `entries`, returning its root key.
+    /// Mirrors the Python `TestCaseWithExampleMaps.get_map_key` /
+    /// `_get_map` helper used by the iter_changes / iter_interesting tests.
+    fn build_map_key(
+        store: std::sync::Arc<FakeChkStore>,
+        cache: std::sync::Arc<dyn PageCache>,
+        entries: &[(&[&[u8]], &[u8])],
+        maximum_size: usize,
+    ) -> Vec<u8> {
+        let mut initial: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> = indexmap::IndexMap::new();
+        for (key, value) in entries {
+            initial.insert(key_vec(key), value.to_vec());
+        }
+        CHKMap::from_dict(store, cache, initial, maximum_size, 1, SearchKeyFunc::Plain).unwrap()
+    }
+
+    /// Collect every `(key, value)` item yielded by `iter_interesting_nodes`,
+    /// sorted. Mirrors the Python `assertIterInteresting` aggregation, which
+    /// only cares about the union of items regardless of page order.
+    fn collect_interesting_items(
+        store: &FakeChkStore,
+        cache: &dyn PageCache,
+        interesting: &[Vec<u8>],
+        old: &[Vec<u8>],
+    ) -> Vec<(Vec<Vec<u8>>, Vec<u8>)> {
+        let records =
+            iter_interesting_nodes(store, cache, interesting, old, SearchKeyFunc::Plain).unwrap();
+        let mut items: Vec<(Vec<Vec<u8>>, Vec<u8>)> =
+            records.into_iter().flat_map(|r| r.items).collect();
+        items.sort();
+        items
+    }
+
     #[test]
     fn leaf_node_new_starts_empty() {
         let n = LeafNode::new(SearchKeyFunc::Plain);
@@ -4134,6 +4167,257 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         // Old contains the same root, so nothing new should appear.
         let interesting_items: Vec<_> = records.iter().flat_map(|r| r.items.clone()).collect();
         assert!(interesting_items.is_empty());
+    }
+
+    // The following iter_interesting_nodes tests mirror Python's
+    // `TestIterInterestingNodes` (bzrformats/tests/test_chk_map.py),
+    // asserting the union of yielded items rather than page-walk order.
+
+    #[test]
+    fn iter_interesting_nodes_empty_to_one_key() {
+        // test_empty_to_one_keys: one interesting root, no old roots.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let target = build_map_key(store.clone(), cache.clone(), &[(&[b"a"], b"content")], 10);
+        let items = collect_interesting_items(&*store, &*cache, &[target], &[]);
+        assert_eq!(items, vec![(key_vec(&[b"a"]), b"content".to_vec())]);
+    }
+
+    #[test]
+    fn iter_interesting_nodes_none_to_one_key() {
+        // test_none_to_one_key: empty old map, one-key new map.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let basis = build_map_key(store.clone(), cache.clone(), &[], 10);
+        let target = build_map_key(store.clone(), cache.clone(), &[(&[b"a"], b"content")], 10);
+        let items = collect_interesting_items(&*store, &*cache, &[target], &[basis]);
+        assert_eq!(items, vec![(key_vec(&[b"a"]), b"content".to_vec())]);
+    }
+
+    #[test]
+    fn iter_interesting_nodes_one_to_none_key() {
+        // test_one_to_none_key: deleting the only key yields no items.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let basis = build_map_key(store.clone(), cache.clone(), &[(&[b"a"], b"content")], 10);
+        let target = build_map_key(store.clone(), cache.clone(), &[], 10);
+        let items = collect_interesting_items(&*store, &*cache, &[target], &[basis]);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn iter_interesting_nodes_common_pages() {
+        // test_common_pages: only the changed leaf's item is interesting.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let basis = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"a"], b"content"),
+                (&[b"b"], b"content"),
+                (&[b"c"], b"content"),
+            ],
+            10,
+        );
+        let target = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"a"], b"content"),
+                (&[b"b"], b"other content"),
+                (&[b"c"], b"content"),
+            ],
+            10,
+        );
+        let items = collect_interesting_items(&*store, &*cache, &[target], &[basis]);
+        assert_eq!(items, vec![(key_vec(&[b"b"]), b"other content".to_vec())]);
+    }
+
+    #[test]
+    fn iter_interesting_nodes_common_sub_page() {
+        // test_common_sub_page: a new key nested under a shared sub-page.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let basis = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"aaa"], b"common"), (&[b"c"], b"common")],
+            10,
+        );
+        let target = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"aaa"], b"common"),
+                (&[b"aab"], b"new"),
+                (&[b"c"], b"common"),
+            ],
+            10,
+        );
+        let items = collect_interesting_items(&*store, &*cache, &[target], &[basis]);
+        assert_eq!(items, vec![(key_vec(&[b"aab"]), b"new".to_vec())]);
+    }
+
+    #[test]
+    fn iter_interesting_nodes_common_leaf_multiple_targets() {
+        // test_common_leaf: the shared 'aaa' leaf occurs at three depths
+        // across three interesting roots but its item appears once.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let basis = build_map_key(store.clone(), cache.clone(), &[], 10);
+        let target1 = build_map_key(store.clone(), cache.clone(), &[(&[b"aaa"], b"common")], 10);
+        let target2 = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"aaa"], b"common"), (&[b"bbb"], b"new")],
+            10,
+        );
+        let target3 = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"aaa"], b"common"),
+                (&[b"aac"], b"other"),
+                (&[b"bbb"], b"new"),
+            ],
+            10,
+        );
+        let items =
+            collect_interesting_items(&*store, &*cache, &[target1, target2, target3], &[basis]);
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"aaa"]), b"common".to_vec()),
+                (key_vec(&[b"aac"]), b"other".to_vec()),
+                (key_vec(&[b"bbb"]), b"new".to_vec()),
+            ]
+        );
+    }
+
+    // The following iter_changes tests mirror Python's `TestMap`
+    // iter_changes scenarios (bzrformats/tests/test_chk_map.py).
+
+    /// Build a saved map and reopen it from its root key, so iter_changes
+    /// starts from an unloaded tuple root like the Python tests do.
+    fn reopen_map(
+        store: std::sync::Arc<FakeChkStore>,
+        cache: std::sync::Arc<dyn PageCache>,
+        entries: &[(&[&[u8]], &[u8])],
+        maximum_size: usize,
+    ) -> CHKMap<FakeChkStore> {
+        let root = build_map_key(store.clone(), cache.clone(), entries, maximum_size);
+        CHKMap::new(store, cache, Some(root), SearchKeyFunc::Plain)
+    }
+
+    #[test]
+    fn chkmap_iter_changes_empty_to_ab() {
+        // test_iter_changes_empty_ab: empty basis -> {a, b} target.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut basis = reopen_map(store.clone(), cache.clone(), &[], 10);
+        let mut target = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"a"], b"content here"), (&[b"b"], b"more content")],
+            10,
+        );
+        let mut changes = target.iter_changes(&mut basis).unwrap();
+        changes.sort();
+        assert_eq!(
+            changes,
+            vec![
+                (key_vec(&[b"a"]), None, Some(b"content here".to_vec())),
+                (key_vec(&[b"b"]), None, Some(b"more content".to_vec())),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_iter_changes_ab_to_empty() {
+        // test_iter_changes_ab_empty: {a, b} basis -> empty target.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut basis = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"a"], b"content here"), (&[b"b"], b"more content")],
+            10,
+        );
+        let mut target = reopen_map(store.clone(), cache.clone(), &[], 10);
+        let mut changes = target.iter_changes(&mut basis).unwrap();
+        changes.sort();
+        assert_eq!(
+            changes,
+            vec![
+                (key_vec(&[b"a"]), Some(b"content here".to_vec()), None),
+                (key_vec(&[b"b"]), Some(b"more content".to_vec()), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_iter_changes_mixed_node_length() {
+        // test_iter_changes_unchanged_keys_in_multi_key_leafs_ignored:
+        // unchanged keys inside multi-value leaf nodes are not reported,
+        // while altered/added/removed keys are.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut basis = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"aaa"], b"foo bar"),
+                (&[b"aab"], b"common altered a"),
+                (&[b"b"], b"foo bar b"),
+            ],
+            10,
+        );
+        let mut target = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"aaa"], b"foo bar"),
+                (&[b"aab"], b"common altered b"),
+                (&[b"at"], b"foo bar t"),
+            ],
+            10,
+        );
+        let mut changes = target.iter_changes(&mut basis).unwrap();
+        changes.sort();
+        assert_eq!(
+            changes,
+            vec![
+                (
+                    key_vec(&[b"aab"]),
+                    Some(b"common altered a".to_vec()),
+                    Some(b"common altered b".to_vec()),
+                ),
+                (key_vec(&[b"at"]), None, Some(b"foo bar t".to_vec())),
+                (key_vec(&[b"b"]), Some(b"foo bar b".to_vec()), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_iter_changes_ab_ab_is_empty() {
+        // test_iter_changes_ab_ab_is_empty: identical multi-key maps.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut basis = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"a"], b"content here"), (&[b"b"], b"more content")],
+            10,
+        );
+        let mut target = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"a"], b"content here"), (&[b"b"], b"more content")],
+            10,
+        );
+        let changes = target.iter_changes(&mut basis).unwrap();
+        assert!(changes.is_empty());
     }
 
     #[test]
