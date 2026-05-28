@@ -37,7 +37,6 @@ Densely packed upper nodes.
 """
 
 import abc
-import heapq
 from collections.abc import Callable, Generator, Iterator
 from typing import Union
 
@@ -165,171 +164,11 @@ def _chkmap_dump_tree_node(self, node, prefix, indent, decode, include_keys=True
     return result
 
 
-def _chkmap_iter_changes(self, basis):
-    """Iterate over the changes between basis and self.
-
-    Yields (key, old_value, new_value). Old_value is None for keys
-    only in self; new_value is None for keys only in basis.
-    """
-    if self._node_key(self._root_node) == self._node_key(basis._root_node):
-        return
-    self._ensure_root()
-    basis._ensure_root()
-    excluded_keys = set()
-    self_node = self._root_node
-    basis_node = basis._root_node
-    self_pending = []
-    basis_pending = []
-
-    def process_node(node, path, a_map, pending):
-        node = a_map._get_node(node)
-        if isinstance(node, LeafNode):
-            path = (node._key, path)
-            for key, value in node._items.items():
-                search_key = node._search_key_func(key)
-                heapq.heappush(pending, (search_key, key, value, path))
-        else:
-            path = (node._key, path)
-            for prefix, child in node._items.items():
-                heapq.heappush(pending, (prefix, None, child, path))
-
-    def process_common_internal_nodes(self_node, basis_node):
-        self_items = set(self_node._items.items())
-        basis_items = set(basis_node._items.items())
-        path = (self_node._key, None)
-        for prefix, child in self_items - basis_items:
-            heapq.heappush(self_pending, (prefix, None, child, path))
-        path = (basis_node._key, None)
-        for prefix, child in basis_items - self_items:
-            heapq.heappush(basis_pending, (prefix, None, child, path))
-
-    def process_common_leaf_nodes(self_node, basis_node):
-        self_items = set(self_node._items.items())
-        basis_items = set(basis_node._items.items())
-        path = (self_node._key, None)
-        for key, value in self_items - basis_items:
-            prefix = self._search_key_func(key)
-            heapq.heappush(self_pending, (prefix, key, value, path))
-        path = (basis_node._key, None)
-        for key, value in basis_items - self_items:
-            prefix = basis._search_key_func(key)
-            heapq.heappush(basis_pending, (prefix, key, value, path))
-
-    def process_common_prefix_nodes(self_node, self_path, basis_node, basis_path):
-        self_node = self._get_node(self_node)
-        basis_node = basis._get_node(basis_node)
-        if isinstance(self_node, InternalNode) and isinstance(
-            basis_node, InternalNode
-        ):
-            process_common_internal_nodes(self_node, basis_node)
-        elif isinstance(self_node, LeafNode) and isinstance(basis_node, LeafNode):
-            process_common_leaf_nodes(self_node, basis_node)
-        else:
-            process_node(self_node, self_path, self, self_pending)
-            process_node(basis_node, basis_path, basis, basis_pending)
-
-    process_common_prefix_nodes(self_node, None, basis_node, None)
-    excluded_keys = set()
-
-    def check_excluded(key_path):
-        while key_path is not None:
-            key, key_path = key_path
-            if key in excluded_keys:
-                return True
-        return False
-
-    while self_pending or basis_pending:
-        if not self_pending:
-            for _prefix, key, node, path in basis_pending:
-                if check_excluded(path):
-                    continue
-                node = basis._get_node(node)
-                if key is not None:
-                    yield (key, node, None)
-                else:
-                    for key, value in node.iteritems(basis._store):
-                        yield (key, value, None)
-            return
-        elif not basis_pending:
-            for _prefix, key, node, path in self_pending:
-                if check_excluded(path):
-                    continue
-                node = self._get_node(node)
-                if key is not None:
-                    yield (key, None, node)
-                else:
-                    for key, value in node.iteritems(self._store):
-                        yield (key, None, value)
-            return
-        else:
-            if self_pending[0][0] < basis_pending[0][0]:
-                _prefix, key, node, path = heapq.heappop(self_pending)
-                if check_excluded(path):
-                    continue
-                if key is not None:
-                    yield (key, None, node)
-                else:
-                    process_node(node, path, self, self_pending)
-                    continue
-            elif self_pending[0][0] > basis_pending[0][0]:
-                _prefix, key, node, path = heapq.heappop(basis_pending)
-                if check_excluded(path):
-                    continue
-                if key is not None:
-                    yield (key, node, None)
-                else:
-                    process_node(node, path, basis, basis_pending)
-                    continue
-            else:
-                if self_pending[0][1] is None:
-                    read_self = True
-                else:
-                    read_self = False
-                if basis_pending[0][1] is None:
-                    read_basis = True
-                else:
-                    read_basis = False
-                if not read_self and not read_basis:
-                    self_details = heapq.heappop(self_pending)
-                    basis_details = heapq.heappop(basis_pending)
-                    if self_details[2] != basis_details[2]:
-                        yield (self_details[1], basis_details[2], self_details[2])
-                    continue
-                if self._node_key(self_pending[0][2]) == self._node_key(
-                    basis_pending[0][2]
-                ):
-                    heapq.heappop(self_pending)
-                    heapq.heappop(basis_pending)
-                    continue
-                if read_self and read_basis:
-                    self_prefix, _, self_node, self_path = heapq.heappop(self_pending)
-                    basis_prefix, _, basis_node, basis_path = heapq.heappop(
-                        basis_pending
-                    )
-                    if self_prefix != basis_prefix:
-                        raise AssertionError(f"{self_prefix!r} != {basis_prefix!r}")
-                    process_common_prefix_nodes(
-                        self_node, self_path, basis_node, basis_path
-                    )
-                    continue
-                if read_self:
-                    _prefix, key, node, path = heapq.heappop(self_pending)
-                    if check_excluded(path):
-                        continue
-                    process_node(node, path, self, self_pending)
-                if read_basis:
-                    _prefix, key, node, path = heapq.heappop(basis_pending)
-                    if check_excluded(path):
-                        continue
-                    process_node(node, path, basis, basis_pending)
-
-
-# Bind orchestration methods onto the CHKMap pyclass at module load.
-# apply_delta, from_dict, _create_via_map and _create_directly are native
-# pyclass methods; the tree dump and iter_changes stay in Python.
+# Bind the tree-dump methods onto the CHKMap pyclass at module load.
+# Everything else (map, unmap, apply_delta, iter_changes, the
+# constructors, _save, iteritems) is native on the pyclass.
 CHKMap._dump_tree = _chkmap_dump_tree
 CHKMap._dump_tree_node = _chkmap_dump_tree_node
-CHKMap.iter_changes = _chkmap_iter_changes
 
 
 class Node(metaclass=abc.ABCMeta):

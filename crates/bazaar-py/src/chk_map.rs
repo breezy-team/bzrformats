@@ -358,6 +358,25 @@ fn page_cache() -> &'static bazaar::chk_map::InMemoryPageCache {
     PAGE_CACHE.get_or_init(bazaar::chk_map::InMemoryPageCache::new)
 }
 
+/// Zero-sized `PageCache` that forwards to the process-wide
+/// [`page_cache`]. Lets pure-crate code that wants an owned
+/// `Arc<dyn PageCache>` share the same cache the binding uses, so
+/// lazy-loading behaviour (and tests that assert pages are not
+/// re-fetched) stay consistent.
+struct GlobalPageCache;
+
+impl bazaar::chk_map::PageCache for GlobalPageCache {
+    fn get(&self, sha1_key: &[u8]) -> Option<Vec<u8>> {
+        page_cache().get(sha1_key)
+    }
+    fn insert(&self, sha1_key: Vec<u8>, bytes: Vec<u8>) {
+        page_cache().insert(sha1_key, bytes);
+    }
+    fn clear(&self) {
+        page_cache().clear();
+    }
+}
+
 /// Clear the process-wide CHK page cache. Mirrors Python's
 /// `chk_map.clear_cache`.
 #[pyfunction]
@@ -2764,6 +2783,36 @@ impl CHKMap {
         slf.borrow()._save(py)
     }
 
+    /// Yield `(key, old_value, new_value)` for every difference between
+    /// this map and `basis`. Delegates to the pure-crate diff algorithm,
+    /// which demand-loads pages through each side's store and skips
+    /// identical subtrees. Mirrors the former Python `_chkmap_iter_changes`.
+    fn iter_changes<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        basis: Bound<'py, Self>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        let mut self_map = slf.borrow().build_pure_map(py)?;
+        let mut basis_map = basis.borrow().build_pure_map(py)?;
+        let changes = self_map
+            .iter_changes(&mut basis_map)
+            .map_err(chk_err_to_py)?;
+        for (key, old, new) in changes {
+            let key_tuple = PyTuple::new(py, key.iter().map(|p| PyBytes::new(py, p.as_slice())))?;
+            let old_obj = match old {
+                Some(v) => PyBytes::new(py, &v).into_any(),
+                None => py.None().into_bound(py),
+            };
+            let new_obj = match new {
+                Some(v) => PyBytes::new(py, &v).into_any(),
+                None => py.None().into_bound(py),
+            };
+            out.append(PyTuple::new(py, [key_tuple.into_any(), old_obj, new_obj])?)?;
+        }
+        Ok(out)
+    }
+
     /// Create a CHKMap in `store` from `initial_value`, returning the
     /// root key. Mirrors the former Python `_chkmap_from_dict`.
     #[classmethod]
@@ -2915,6 +2964,44 @@ impl CHKMap {
 }
 
 impl CHKMap {
+    /// Build a pure-crate `CHKMap` over this map's Python store, seeded
+    /// from the current root key. Used to delegate `iter_changes` to the
+    /// pure diff algorithm. Reads the root key without forcing a load, so
+    /// the pyo3 root node is left untouched.
+    fn build_pure_map(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<bazaar::chk_map::CHKMap<crate::versionedfile::PyVersionedFiles>> {
+        let root = self.root_node.bind(py);
+        let root_key: Option<Vec<u8>> = if let Ok(t) = root.clone().cast_into::<PyTuple>() {
+            Some(t.get_item(0)?.cast_into::<PyBytes>()?.as_bytes().to_vec())
+        } else {
+            let k = root.call_method0("key")?;
+            if k.is_none() {
+                None
+            } else {
+                Some(
+                    k.cast_into::<PyTuple>()?
+                        .get_item(0)?
+                        .cast_into::<PyBytes>()?
+                        .as_bytes()
+                        .to_vec(),
+                )
+            }
+        };
+        let store = std::sync::Arc::new(crate::versionedfile::PyVersionedFiles::new(
+            self.store.clone_ref(py),
+        ));
+        let cache: std::sync::Arc<dyn bazaar::chk_map::PageCache> =
+            std::sync::Arc::new(GlobalPageCache);
+        Ok(bazaar::chk_map::CHKMap::new(
+            store,
+            cache,
+            root_key,
+            self.search_key_func.clone(),
+        ))
+    }
+
     /// Shared body of `_get_node` / `_ensure_root`: tuple keys load
     /// the page bytes and dispatch to LeafNode or InternalNode
     /// `deserialise`; anything else passes through.
