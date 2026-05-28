@@ -119,58 +119,6 @@ def _deserialise_internal_node(data, key, search_key_func=None):
 CHKMap = _chk_map_rs.CHKMap
 
 
-def _chkmap_dump_tree(self, include_keys=False, encoding="utf-8"):
-    self._ensure_root()
-
-    def decode(x):
-        return x.decode(encoding)
-
-    res = self._dump_tree_node(
-        self._root_node,
-        prefix=b"",
-        indent="",
-        decode=decode,
-        include_keys=include_keys,
-    )
-    res.append("")
-    return "\n".join(res)
-
-
-def _chkmap_dump_tree_node(self, node, prefix, indent, decode, include_keys=True):
-    result = []
-    if not include_keys:
-        key_str = ""
-    else:
-        node_key = node.key()
-        key_str = f" {decode(node_key[0])}" if node_key is not None else " None"
-    result.append(f"{indent}{decode(prefix)!r} {node.__class__.__name__}{key_str}")
-    if isinstance(node, InternalNode):
-        list(node._iter_nodes(self._store))
-        for prefix, sub in sorted(node._items.items()):
-            result.extend(
-                self._dump_tree_node(
-                    sub,
-                    prefix,
-                    indent + "  ",
-                    decode=decode,
-                    include_keys=include_keys,
-                )
-            )
-    else:
-        for key, value in sorted(node._items.items()):
-            result.append(
-                f"      {tuple([decode(ke) for ke in key])!r} {decode(value)!r}"
-            )
-    return result
-
-
-# Bind the tree-dump methods onto the CHKMap pyclass at module load.
-# Everything else (map, unmap, apply_delta, iter_changes, the
-# constructors, _save, iteritems) is native on the pyclass.
-CHKMap._dump_tree = _chkmap_dump_tree
-CHKMap._dump_tree_node = _chkmap_dump_tree_node
-
-
 class Node(metaclass=abc.ABCMeta):
     """Base class defining the protocol for CHK Map nodes.
 

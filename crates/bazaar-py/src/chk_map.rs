@@ -2143,6 +2143,110 @@ fn node_search_prefix<'py>(
     }
 }
 
+/// `bytes.decode(encoding)` via Python, returning the resulting `str`
+/// object (so the caller can take its `repr()` with Python's quoting).
+fn decode_bytes<'py>(py: Python<'py>, data: &[u8], encoding: &str) -> PyResult<Bound<'py, PyAny>> {
+    PyBytes::new(py, data).call_method1("decode", (encoding,))
+}
+
+/// Python `repr(obj)` as a Rust `String`.
+fn py_repr(obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    obj.repr()?.extract()
+}
+
+/// Recursively render `node` and its descendants into `lines`. Mirrors
+/// the former Python `_chkmap_dump_tree_node`: internal nodes are
+/// demand-loaded via `_iter_nodes` and their children walked in sorted
+/// prefix order; leaf items are listed in sorted key order.
+#[allow(clippy::too_many_arguments)]
+fn dump_tree_node<'py>(
+    py: Python<'py>,
+    store: &Bound<'py, PyAny>,
+    node: &Bound<'py, PyAny>,
+    prefix: &[u8],
+    indent: &str,
+    encoding: &str,
+    include_keys: bool,
+    lines: &mut Vec<String>,
+) -> PyResult<()> {
+    let key_str = if include_keys {
+        let node_key = node.call_method0("key")?;
+        if node_key.is_none() {
+            " None".to_string()
+        } else {
+            let first = node_key.cast_into::<PyTuple>()?.get_item(0)?;
+            let decoded = decode_bytes(py, first.cast_into::<PyBytes>()?.as_bytes(), encoding)?;
+            format!(" {}", decoded.extract::<String>()?)
+        }
+    } else {
+        String::new()
+    };
+    let class_name = node.get_type().name()?;
+    let prefix_repr = py_repr(&decode_bytes(py, prefix, encoding)?)?;
+    lines.push(format!("{indent}{prefix_repr} {class_name}{key_str}"));
+
+    if node.cast::<InternalNode>().is_ok() {
+        // Demand-load all children, then walk them in sorted prefix order.
+        let _ = InternalNode::_iter_nodes(
+            node.clone().cast_into::<InternalNode>()?,
+            py,
+            store.clone(),
+            None,
+            None,
+        )?
+        .try_iter()?
+        .collect::<PyResult<Vec<_>>>()?;
+        let items = node.getattr("_items")?.cast_into::<PyDict>()?;
+        let mut entries: Vec<(Vec<u8>, Bound<'py, PyAny>)> = Vec::new();
+        for (k, v) in items.iter() {
+            entries.push((k.cast_into::<PyBytes>()?.as_bytes().to_vec(), v));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let child_indent = format!("{indent}  ");
+        for (sub_prefix, sub) in entries {
+            dump_tree_node(
+                py,
+                store,
+                &sub,
+                &sub_prefix,
+                &child_indent,
+                encoding,
+                include_keys,
+                lines,
+            )?;
+        }
+    } else {
+        let items = node.getattr("_items")?.cast_into::<PyDict>()?;
+        let mut entries: Vec<(Vec<Vec<u8>>, Bound<'py, PyAny>)> = Vec::new();
+        for (k, v) in items.iter() {
+            let key_tuple = k.cast_into::<PyTuple>()?;
+            let mut parts: Vec<Vec<u8>> = Vec::with_capacity(key_tuple.len());
+            for p in key_tuple.iter() {
+                parts.push(p.cast_into::<PyBytes>()?.as_bytes().to_vec());
+            }
+            entries.push((parts, v));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (key_parts, value) in entries {
+            // Decode each key element, build a tuple, and take its repr.
+            let decoded_key = PyTuple::new(
+                py,
+                key_parts
+                    .iter()
+                    .map(|p| decode_bytes(py, p, encoding))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )?;
+            let value_repr = py_repr(&decode_bytes(
+                py,
+                value.cast_into::<PyBytes>()?.as_bytes(),
+                encoding,
+            )?)?;
+            lines.push(format!("      {} {}", py_repr(&decoded_key)?, value_repr));
+        }
+    }
+    Ok(())
+}
+
 /// Is `obj` a loaded CHK node (LeafNode or InternalNode pyclass)?
 fn is_node(obj: &Bound<'_, PyAny>) -> bool {
     obj.cast::<LeafNode>().is_ok() || obj.cast::<InternalNode>().is_ok()
@@ -2811,6 +2915,33 @@ impl CHKMap {
             out.append(PyTuple::new(py, [key_tuple.into_any(), old_obj, new_obj])?)?;
         }
         Ok(out)
+    }
+
+    /// Render the tree as an indented, human-readable string for
+    /// debugging. Mirrors the former Python `_chkmap_dump_tree`.
+    #[pyo3(signature = (include_keys = false, encoding = "utf-8"))]
+    fn _dump_tree(
+        slf: Bound<'_, Self>,
+        py: Python<'_>,
+        include_keys: bool,
+        encoding: &str,
+    ) -> PyResult<String> {
+        Self::_ensure_root(slf.clone(), py)?;
+        let root = slf.borrow().root_node.clone_ref(py);
+        let store = slf.borrow().store.clone_ref(py);
+        let mut lines: Vec<String> = Vec::new();
+        dump_tree_node(
+            py,
+            store.bind(py),
+            root.bind(py),
+            b"",
+            "",
+            encoding,
+            include_keys,
+            &mut lines,
+        )?;
+        lines.push(String::new());
+        Ok(lines.join("\n"))
     }
 
     /// Create a CHKMap in `store` from `initial_value`, returning the
