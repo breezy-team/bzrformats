@@ -50,6 +50,33 @@ impl PyFileTransport {
     fn map_err(py: Python<'_>, err: PyErr) -> bazaar::dirstate::TransportError {
         bazaar::dirstate::TransportError::Other(err.value(py).to_string())
     }
+
+    /// Run `f` against a `std::fs::File` borrowing the Python file's fd.
+    ///
+    /// The file descriptor is owned by the Python file object; the
+    /// borrowed `File` is wrapped in `ManuallyDrop` so it is never
+    /// closed when `f` returns. Used for fd-level operations (fstat,
+    /// fdatasync) that std exposes through `File`.
+    fn with_borrowed_file<T>(
+        &self,
+        f: impl FnOnce(&std::fs::File) -> Result<T, bazaar::dirstate::TransportError>,
+    ) -> Result<T, bazaar::dirstate::TransportError> {
+        Python::attach(|py| {
+            use std::os::fd::FromRawFd;
+            let fileno: std::os::fd::RawFd = self
+                .file
+                .bind(py)
+                .call_method0("fileno")
+                .map_err(|e| Self::map_err(py, e))?
+                .extract()
+                .map_err(|e| Self::map_err(py, e))?;
+            // SAFETY: `fileno` is a live fd owned by the Python file
+            // object for the duration of this call. `ManuallyDrop`
+            // prevents the borrowed `File` from closing it.
+            let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fileno) });
+            f(&file)
+        })
+    }
 }
 
 impl bazaar::dirstate::Transport for PyFileTransport {
@@ -133,20 +160,9 @@ impl bazaar::dirstate::Transport for PyFileTransport {
         if self.lock_state.is_none() {
             return Err(bazaar::dirstate::TransportError::NotLocked);
         }
-        Python::attach(|py| -> Result<u64, bazaar::dirstate::TransportError> {
-            let os = py.import("os").map_err(|e| Self::map_err(py, e))?;
-            let f = self.file.bind(py);
-            let fileno = f.call_method0("fileno").map_err(|e| Self::map_err(py, e))?;
-            let st = os
-                .call_method1("fstat", (fileno,))
-                .map_err(|e| Self::map_err(py, e))?;
-            let size: u64 = st
-                .getattr("st_size")
-                .map_err(|e| Self::map_err(py, e))?
-                .extract()
-                .map_err(|e| Self::map_err(py, e))?;
-            Ok(size)
-        })
+        // Python owns the fd; borrow it for an fstat via std::fs without
+        // taking ownership (the file must not be closed here).
+        self.with_borrowed_file(|file| Ok(file.metadata()?.len()))
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), bazaar::dirstate::TransportError> {
@@ -170,21 +186,11 @@ impl bazaar::dirstate::Transport for PyFileTransport {
     }
 
     fn fdatasync(&mut self) -> Result<(), bazaar::dirstate::TransportError> {
-        Python::attach(|py| -> Result<(), bazaar::dirstate::TransportError> {
-            let osutils_mod = py
-                .import("bzrformats.osutils")
-                .map_err(|e| Self::map_err(py, e))?;
-            let fdatasync_fn = osutils_mod
-                .getattr("fdatasync")
-                .map_err(|e| Self::map_err(py, e))?;
-            let fileno = self
-                .file
-                .bind(py)
-                .call_method0("fileno")
-                .map_err(|e| Self::map_err(py, e))?;
-            fdatasync_fn
-                .call1((fileno,))
-                .map_err(|e| Self::map_err(py, e))?;
+        // `File::sync_data` is `fdatasync(2)`; the platform falls back to
+        // `fsync` where `fdatasync` is unavailable, matching
+        // `bzrformats.osutils.fdatasync`.
+        self.with_borrowed_file(|file| {
+            file.sync_data()?;
             Ok(())
         })
     }
@@ -193,202 +199,31 @@ impl bazaar::dirstate::Transport for PyFileTransport {
         &self,
         abspath: &[u8],
     ) -> Result<bazaar::dirstate::StatInfo, bazaar::dirstate::TransportError> {
-        Python::attach(
-            |py| -> Result<bazaar::dirstate::StatInfo, bazaar::dirstate::TransportError> {
-                let os_mod = py.import("os").map_err(|e| Self::map_err(py, e))?;
-                let lstat_fn = os_mod.getattr("lstat").map_err(|e| Self::map_err(py, e))?;
-                let py_bytes = PyBytes::new(py, abspath);
-                let st = match lstat_fn.call1((py_bytes,)) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        if e.is_instance_of::<pyo3::exceptions::PyFileNotFoundError>(py) {
-                            return Err(bazaar::dirstate::TransportError::NotFound(
-                                String::from_utf8_lossy(abspath).into_owned(),
-                            ));
-                        }
-                        return Err(Self::map_err(py, e));
-                    }
-                };
-                let mode: u32 = st
-                    .getattr("st_mode")
-                    .and_then(|v| v.extract())
-                    .map_err(|e| Self::map_err(py, e))?;
-                let size: u64 = st
-                    .getattr("st_size")
-                    .and_then(|v| v.extract())
-                    .map_err(|e| Self::map_err(py, e))?;
-                let mtime_f: f64 = st
-                    .getattr("st_mtime")
-                    .and_then(|v| v.extract())
-                    .map_err(|e| Self::map_err(py, e))?;
-                let ctime_f: f64 = st
-                    .getattr("st_ctime")
-                    .and_then(|v| v.extract())
-                    .map_err(|e| Self::map_err(py, e))?;
-                let dev: u64 = st
-                    .getattr("st_dev")
-                    .and_then(|v| v.extract())
-                    .map_err(|e| Self::map_err(py, e))?;
-                let ino: u64 = st
-                    .getattr("st_ino")
-                    .and_then(|v| v.extract())
-                    .map_err(|e| Self::map_err(py, e))?;
-                Ok(bazaar::dirstate::StatInfo {
-                    mode,
-                    size,
-                    mtime: mtime_f as i64,
-                    ctime: ctime_f as i64,
-                    dev,
-                    ino,
-                })
-            },
-        )
+        // Path-based: stat the filesystem directly rather than calling
+        // back into Python's `os.lstat`.
+        bazaar::dirstate::lstat_path(abspath)
     }
 
     fn read_link(&self, abspath: &[u8]) -> Result<Vec<u8>, bazaar::dirstate::TransportError> {
-        Python::attach(|py| -> Result<Vec<u8>, bazaar::dirstate::TransportError> {
-            let os_mod = py.import("os").map_err(|e| Self::map_err(py, e))?;
-            let readlink_fn = os_mod
-                .getattr("readlink")
-                .map_err(|e| Self::map_err(py, e))?;
-            let py_bytes = PyBytes::new(py, abspath);
-            let target = match readlink_fn.call1((py_bytes,)) {
-                Ok(t) => t,
-                Err(e) => {
-                    if e.is_instance_of::<pyo3::exceptions::PyFileNotFoundError>(py) {
-                        return Err(bazaar::dirstate::TransportError::NotFound(
-                            String::from_utf8_lossy(abspath).into_owned(),
-                        ));
-                    }
-                    return Err(Self::map_err(py, e));
-                }
-            };
-            // os.readlink(bytes) returns bytes per the Python docs; if it
-            // ever returns str, that's the caller's bug to fix.
-            let bytes: Vec<u8> = target.extract().map_err(|e| Self::map_err(py, e))?;
-            Ok(bytes)
-        })
+        bazaar::dirstate::read_link_path(abspath)
     }
 
     fn list_dir(
         &self,
         abspath: &[u8],
     ) -> Result<Vec<bazaar::dirstate::DirEntryInfo>, bazaar::dirstate::TransportError> {
-        Python::attach(
-            |py| -> Result<Vec<bazaar::dirstate::DirEntryInfo>, bazaar::dirstate::TransportError> {
-                let os_mod = py.import("os").map_err(|e| Self::map_err(py, e))?;
-                let scandir_fn = os_mod
-                    .getattr("scandir")
-                    .map_err(|e| Self::map_err(py, e))?;
-                let abs_bytes = PyBytes::new(py, abspath);
-                let iter = match scandir_fn.call1((abs_bytes,)) {
-                    Ok(it) => it,
-                    Err(e) => {
-                        if e.is_instance_of::<pyo3::exceptions::PyFileNotFoundError>(py) {
-                            return Err(bazaar::dirstate::TransportError::NotFound(
-                                String::from_utf8_lossy(abspath).into_owned(),
-                            ));
-                        }
-                        return Err(Self::map_err(py, e));
-                    }
-                };
-                let mut out: Vec<bazaar::dirstate::DirEntryInfo> = Vec::new();
-                for item in iter.try_iter().map_err(|e| Self::map_err(py, e))? {
-                    let entry = item.map_err(|e| Self::map_err(py, e))?;
-                    // os.scandir(bytes) yields DirEntry whose name/path are
-                    // bytes; we always pass bytes above, so trust that.
-                    let name_bytes: Vec<u8> = entry
-                        .getattr("name")
-                        .and_then(|n| n.extract())
-                        .map_err(|e| Self::map_err(py, e))?;
-                    let abspath_child: Vec<u8> = entry
-                        .getattr("path")
-                        .and_then(|p| p.extract())
-                        .map_err(|e| Self::map_err(py, e))?;
-                    let kwargs = pyo3::types::PyDict::new(py);
-                    kwargs
-                        .set_item("follow_symlinks", false)
-                        .map_err(|e| Self::map_err(py, e))?;
-                    let stat_obj = entry
-                        .call_method("stat", (), Some(&kwargs))
-                        .map_err(|e| Self::map_err(py, e))?;
-                    let mode: u32 = stat_obj
-                        .getattr("st_mode")
-                        .and_then(|v| v.extract())
-                        .map_err(|e| Self::map_err(py, e))?;
-                    let size: u64 = stat_obj
-                        .getattr("st_size")
-                        .and_then(|v| v.extract())
-                        .map_err(|e| Self::map_err(py, e))?;
-                    let mtime_f: f64 = stat_obj
-                        .getattr("st_mtime")
-                        .and_then(|v| v.extract())
-                        .map_err(|e| Self::map_err(py, e))?;
-                    let ctime_f: f64 = stat_obj
-                        .getattr("st_ctime")
-                        .and_then(|v| v.extract())
-                        .map_err(|e| Self::map_err(py, e))?;
-                    let dev: u64 = stat_obj
-                        .getattr("st_dev")
-                        .and_then(|v| v.extract())
-                        .map_err(|e| Self::map_err(py, e))?;
-                    let ino: u64 = stat_obj
-                        .getattr("st_ino")
-                        .and_then(|v| v.extract())
-                        .map_err(|e| Self::map_err(py, e))?;
-                    let kind = kind_from_mode(mode);
-                    out.push(bazaar::dirstate::DirEntryInfo {
-                        basename: name_bytes,
-                        kind,
-                        stat: bazaar::dirstate::StatInfo {
-                            mode,
-                            size,
-                            mtime: mtime_f as i64,
-                            ctime: ctime_f as i64,
-                            dev,
-                            ino,
-                        },
-                        abspath: abspath_child,
-                    });
-                }
-                Ok(out)
-            },
-        )
+        bazaar::dirstate::list_dir_path(abspath)
     }
 
     fn is_tree_reference_dir(
         &self,
         abspath: &[u8],
     ) -> Result<bool, bazaar::dirstate::TransportError> {
-        // The "does this directory contain a nested tree" question is
-        // a breezy-side concept: only tree-reference-supporting
-        // formats answer True, and even then only when the directory
-        // carries its own `.bzr/`.  The pyo3 adapter dispatches via
-        // the bzrformats.osutils.isdir helper + a `.bzr` suffix —
-        // good enough to match breezy's
-        // `_directory_may_be_tree_reference` without pulling in a
-        // separate Python callback per call.
-        Python::attach(|py| -> Result<bool, bazaar::dirstate::TransportError> {
-            if abspath.is_empty() {
-                // Mirrors breezy's guard: the tree root is not a
-                // reference even when the repository supports
-                // tree references.
-                return Ok(false);
-            }
-            let osutils_mod = py
-                .import("bzrformats.osutils")
-                .map_err(|e| Self::map_err(py, e))?;
-            let isdir_fn = osutils_mod
-                .getattr("isdir")
-                .map_err(|e| Self::map_err(py, e))?;
-            let mut probe = abspath.to_vec();
-            probe.extend_from_slice(b"/.bzr");
-            let probe_bytes = PyBytes::new(py, &probe);
-            let result = isdir_fn
-                .call1((probe_bytes,))
-                .map_err(|e| Self::map_err(py, e))?;
-            result.extract::<bool>().map_err(|e| Self::map_err(py, e))
-        })
+        // A directory is a potential tree reference when it carries its
+        // own `.bzr/`. Mirrors breezy's
+        // `_directory_may_be_tree_reference`; the empty-path guard keeps
+        // the tree root from ever counting as a reference.
+        bazaar::dirstate::is_tree_reference_dir_path(abspath)
     }
 }
 
@@ -445,20 +280,6 @@ fn decode_minikind(bytes: &[u8]) -> PyResult<bazaar::dirstate::Kind> {
     bazaar::dirstate::Kind::from_minikind(byte).map_err(|b| {
         pyo3::exceptions::PyValueError::new_err(format!("invalid minikind byte {:?}", b))
     })
-}
-
-/// Map a POSIX `st_mode` to the dirstate kind.  Matches
-/// `bzrformats.osutils.file_kind_from_stat_mode`; block / char /
-/// socket / fifo kinds are reported as `None` (the walker ignores
-/// those rows).  Never returns `TreeReference` — that distinction
-/// comes from `is_tree_reference_dir`, not the stat mode.
-fn kind_from_mode(mode: u32) -> Option<bazaar::osutils::Kind> {
-    match mode & 0o170000 {
-        0o100000 => Some(bazaar::osutils::Kind::File),
-        0o040000 => Some(bazaar::osutils::Kind::Directory),
-        0o120000 => Some(bazaar::osutils::Kind::Symlink),
-        _ => None,
-    }
 }
 
 /// Spell out the kind name for an `st_mode`, matching breezy's
@@ -1400,11 +1221,16 @@ impl PyDirState {
     /// byte.
     #[classattr]
     fn _stat_to_minikind(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+        // The S_IF* file-type bits are fixed POSIX values (the same ones
+        // Python's `stat` module exposes), so use them directly rather
+        // than importing `stat`.
+        const S_IFDIR: u32 = 0o040000;
+        const S_IFREG: u32 = 0o100000;
+        const S_IFLNK: u32 = 0o120000;
         let d = pyo3::types::PyDict::new(py);
-        let stat = py.import("stat")?;
-        d.set_item(stat.getattr("S_IFDIR")?, PyBytes::new(py, b"d"))?;
-        d.set_item(stat.getattr("S_IFREG")?, PyBytes::new(py, b"f"))?;
-        d.set_item(stat.getattr("S_IFLNK")?, PyBytes::new(py, b"l"))?;
+        d.set_item(S_IFDIR, PyBytes::new(py, b"d"))?;
+        d.set_item(S_IFREG, PyBytes::new(py, b"f"))?;
+        d.set_item(S_IFLNK, PyBytes::new(py, b"l"))?;
         Ok(d)
     }
 

@@ -239,7 +239,10 @@ fn gather_result_for_consistency(pstate: &mut ProcessEntryState, change: &Dirsta
 }
 
 mod transport;
-pub use transport::{DirEntryInfo, StatInfo, Transport, TransportError};
+pub use transport::{
+    is_tree_reference_dir_path, list_dir_path, lstat_path, read_link_path, DirEntryInfo, StatInfo,
+    Transport, TransportError,
+};
 
 mod file_transport;
 pub use file_transport::FileTransport;

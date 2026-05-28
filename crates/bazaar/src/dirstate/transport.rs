@@ -119,6 +119,120 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
+/// Decode a utf8-bytes path (as dirstate stores them) into a [`PathBuf`].
+///
+/// On Unix the bytes are used verbatim via `OsStr`; on other platforms
+/// they are decoded as utf8.
+#[cfg(unix)]
+pub fn bytes_to_path(b: &[u8]) -> Result<std::path::PathBuf, TransportError> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b)))
+}
+
+#[cfg(not(unix))]
+pub fn bytes_to_path(b: &[u8]) -> Result<std::path::PathBuf, TransportError> {
+    String::from_utf8(b.to_vec())
+        .map(std::path::PathBuf::from)
+        .map_err(|e| TransportError::Other(e.to_string()))
+}
+
+/// Encode a [`Path`] back into the utf8-bytes form dirstate stores.
+#[cfg(unix)]
+pub fn path_to_bytes(p: &std::path::Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    p.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+pub fn path_to_bytes(p: &std::path::Path) -> Vec<u8> {
+    p.to_string_lossy().into_owned().into_bytes()
+}
+
+/// Build a [`StatInfo`] from filesystem metadata.
+pub fn stat_info_from_metadata(m: &std::fs::Metadata) -> Result<StatInfo, TransportError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(StatInfo {
+            mode: m.mode(),
+            size: m.size(),
+            mtime: m.mtime(),
+            ctime: m.ctime(),
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = m;
+        Err(TransportError::Other(
+            "lstat unsupported on this platform".to_string(),
+        ))
+    }
+}
+
+fn kind_from_stat(stat: &StatInfo) -> Option<crate::osutils::Kind> {
+    if stat.is_file() {
+        Some(crate::osutils::Kind::File)
+    } else if stat.is_dir() {
+        Some(crate::osutils::Kind::Directory)
+    } else if stat.is_symlink() {
+        Some(crate::osutils::Kind::Symlink)
+    } else {
+        None
+    }
+}
+
+/// `lstat(2)` on a dirstate path: stat without following symlinks.
+///
+/// Path-keyed and stateless, so both the real-filesystem and pyo3
+/// transports share this implementation.
+pub fn lstat_path(abspath: &[u8]) -> Result<StatInfo, TransportError> {
+    let path = bytes_to_path(abspath)?;
+    let metadata = std::fs::symlink_metadata(&path)?;
+    stat_info_from_metadata(&metadata)
+}
+
+/// `readlink(2)` on a dirstate path, returning the target as utf8 bytes.
+pub fn read_link_path(abspath: &[u8]) -> Result<Vec<u8>, TransportError> {
+    let path = bytes_to_path(abspath)?;
+    let target = std::fs::read_link(&path)?;
+    Ok(path_to_bytes(&target))
+}
+
+/// Whether `abspath` is a directory carrying its own `.bzr/`, i.e. a
+/// potential nested tree reference.
+pub fn is_tree_reference_dir_path(abspath: &[u8]) -> Result<bool, TransportError> {
+    if abspath.is_empty() {
+        return Ok(false);
+    }
+    let path = bytes_to_path(abspath)?;
+    Ok(path.join(".bzr").is_dir())
+}
+
+/// List a directory, returning one [`DirEntryInfo`] per child with its
+/// `lstat` info filled in.
+pub fn list_dir_path(abspath: &[u8]) -> Result<Vec<DirEntryInfo>, TransportError> {
+    let path = bytes_to_path(abspath)?;
+    let entries = std::fs::read_dir(&path)?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let basename = path_to_bytes(std::path::Path::new(&name));
+        let metadata = entry.metadata()?;
+        let stat = stat_info_from_metadata(&metadata)?;
+        let kind = kind_from_stat(&stat);
+        out.push(DirEntryInfo {
+            basename,
+            kind,
+            stat,
+            abspath: path_to_bytes(&entry.path()),
+        });
+    }
+    Ok(out)
+}
+
 /// Single-file backing store for a [`DirState`].
 ///
 /// Unlike `bazaar::transport::Transport` (the knit-side path-keyed
