@@ -37,10 +37,8 @@ Densely packed upper nodes.
 """
 
 import abc
-from collections.abc import Callable, Generator, Iterator
-from typing import Union
+from collections.abc import Callable
 
-from . import lru_cache
 from ._bzr_rs import chk_map as _chk_map_rs
 from .registry import Registry
 
