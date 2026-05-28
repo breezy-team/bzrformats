@@ -171,6 +171,7 @@ class Node(metaclass=abc.ABCMeta):
             items_str,
         )
 
+    @abc.abstractmethod
     def iteritems(self, store, key_filter=None):
         """Iterate over items in the node.
 
@@ -179,10 +180,12 @@ class Node(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError(self.iteritems)
 
+    @abc.abstractmethod
     def unmap(self, store, key):
         """Unmap key from the node."""
         raise NotImplementedError(self.unmap)
 
+    @abc.abstractmethod
     def map(self, store, key: Key, value):
         """Map key to value."""
         raise NotImplementedError(self.map)
