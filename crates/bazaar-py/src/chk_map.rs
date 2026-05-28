@@ -376,11 +376,7 @@ fn _page_cache_get<'py>(
     key: Bound<'py, PyTuple>,
 ) -> PyResult<Option<Bound<'py, PyBytes>>> {
     use bazaar::chk_map::PageCache as _;
-    let sha1: Vec<u8> = key
-        .get_item(0)?
-        .cast_into::<PyBytes>()?
-        .as_bytes()
-        .to_vec();
+    let sha1: Vec<u8> = key.get_item(0)?.cast_into::<PyBytes>()?.as_bytes().to_vec();
     Ok(page_cache().get(&sha1).map(|b| PyBytes::new(py, &b)))
 }
 
@@ -389,11 +385,7 @@ fn _page_cache_get<'py>(
 #[pyfunction]
 fn _page_cache_set(key: Bound<'_, PyTuple>, value: &[u8]) -> PyResult<()> {
     use bazaar::chk_map::PageCache as _;
-    let sha1: Vec<u8> = key
-        .get_item(0)?
-        .cast_into::<PyBytes>()?
-        .as_bytes()
-        .to_vec();
+    let sha1: Vec<u8> = key.get_item(0)?.cast_into::<PyBytes>()?.as_bytes().to_vec();
     page_cache().insert(sha1, value.to_vec());
     Ok(())
 }
@@ -1555,11 +1547,7 @@ impl CHKMap {
         if let Some(kf) = &normalised_filter {
             kwargs.set_item("key_filter", kf)?;
         }
-        let iter = root_bound.call_method(
-            "iteritems",
-            (store,),
-            Some(&kwargs),
-        )?;
+        let iter = root_bound.call_method("iteritems", (store,), Some(&kwargs))?;
         Ok(iter.call_method0("__iter__")?)
     }
 
@@ -1630,8 +1618,7 @@ impl CHKMap {
         let key_tuple = if key.clone().cast_into::<PyTuple>().is_ok() {
             key
         } else {
-            PyTuple::new(py, key.try_iter()?.collect::<PyResult<Vec<_>>>()?)?
-                .into_any()
+            PyTuple::new(py, key.try_iter()?.collect::<PyResult<Vec<_>>>()?)?.into_any()
         };
         Self::_ensure_root(slf.clone(), py)?;
         let root = slf.borrow().root_node.clone_ref(py);
@@ -1692,29 +1679,19 @@ impl CHKMap {
     ) -> PyResult<Bound<'py, PyBytes>> {
         use bazaar::chk_map::PageCache as _;
         // Cache lookup uses the flat sha1 bytes (the first tuple element).
-        let sha1: Vec<u8> = key
-            .get_item(0)?
-            .cast_into::<PyBytes>()?
-            .as_bytes()
-            .to_vec();
+        let sha1: Vec<u8> = key.get_item(0)?.cast_into::<PyBytes>()?.as_bytes().to_vec();
         if let Some(cached) = page_cache().get(&sha1) {
             return Ok(PyBytes::new(py, &cached));
         }
         let keys = PyList::new(py, [key.clone()])?;
-        let stream = self.store.bind(py).call_method1(
-            "get_record_stream",
-            (keys, "unordered", true),
-        )?;
+        let stream = self
+            .store
+            .bind(py)
+            .call_method1("get_record_stream", (keys, "unordered", true))?;
         let iter = stream.try_iter()?;
-        let record = iter
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(format!(
-                    "no record returned for key {:?}",
-                    key
-                ))
-            })??;
+        let record = iter.into_iter().next().ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!("no record returned for key {:?}", key))
+        })??;
         let bytes_obj = record.call_method1("get_bytes_as", ("fulltext",))?;
         let bytes_py = bytes_obj.cast_into::<PyBytes>()?;
         let bytes_vec = bytes_py.as_bytes().to_vec();
@@ -1735,9 +1712,7 @@ impl CHKMap {
         let Ok(key_tuple) = node.clone().cast_into::<PyTuple>() else {
             return Ok(node);
         };
-        let bytes = slf
-            .borrow()
-            ._read_bytes(py, key_tuple.clone())?;
+        let bytes = slf.borrow()._read_bytes(py, key_tuple.clone())?;
         let data = bytes.as_bytes();
         let search_key_callable = slf
             .borrow()
@@ -1746,24 +1721,539 @@ impl CHKMap {
             .map(|c| c.bind(py).clone());
         if data.starts_with(b"chkleaf:\n") {
             let cls = py.get_type::<LeafNode>();
-            cls.call_method(
-                "deserialise",
-                (bytes, key_tuple, search_key_callable),
-                None,
-            )
+            cls.call_method("deserialise", (bytes, key_tuple, search_key_callable), None)
         } else if data.starts_with(b"chknode:\n") {
             let cls = py.get_type::<InternalNode>();
-            cls.call_method(
-                "deserialise",
-                (bytes, key_tuple, search_key_callable),
-                None,
-            )
+            cls.call_method("deserialise", (bytes, key_tuple, search_key_callable), None)
         } else {
             Err(pyo3::exceptions::PyAssertionError::new_err(
                 "Unknown node type.",
             ))
         }
     }
+}
+
+/// Build a `bzrformats.errors.NoSuchRevision(store, key)` error, matching
+/// what the Python difference algorithm raises for an absent record.
+fn no_such_revision(
+    py: Python<'_>,
+    store: &Bound<'_, PyAny>,
+    key: &Bound<'_, PyAny>,
+) -> PyResult<PyErr> {
+    let cls = py.import("bzrformats.errors")?.getattr("NoSuchRevision")?;
+    let exc = cls.call1((store, key))?;
+    Ok(PyErr::from_value(exc))
+}
+
+/// A CHK page reference: the flat sha1 bytes that form the single
+/// element of a `(b"sha1:...",)` key tuple.
+type ChkRef = Vec<u8>;
+/// A flat (key, value) item from a leaf node: the key is the list of
+/// tuple elements, the value the stored bytes.
+type ChkItem = (Vec<Vec<u8>>, Vec<u8>);
+/// One `process()` result: an optional record (None for the items-only
+/// flush) paired with the items in/under that page.
+type DiffResult = (Option<Py<PyAny>>, Vec<ChkItem>);
+
+/// The parsed contents of one stored CHK page, as the difference
+/// algorithm needs them.
+struct ReadNode {
+    record: Py<PyAny>,
+    /// `(prefix, ref)` pairs for an internal node; empty for a leaf.
+    prefix_refs: Vec<(Vec<u8>, ChkRef)>,
+    /// `(key, value)` pairs for a leaf node; empty for an internal node.
+    items: Vec<ChkItem>,
+}
+
+/// Convert a flat sha1 ref into the `(ref,)` key tuple the store and
+/// records use.
+fn ref_to_key_tuple<'py>(py: Python<'py>, r: &[u8]) -> PyResult<Bound<'py, PyTuple>> {
+    PyTuple::new(py, [PyBytes::new(py, r)])
+}
+
+/// Iterate the stored pages and (key, value) pairs that are in any of
+/// the new maps and not in any of the old maps. Rust port of the
+/// Python `chk_map.CHKMapDifference`.
+#[pyclass(module = "bzrformats._bzr_rs.chk_map", name = "CHKMapDifference")]
+pub struct CHKMapDifference {
+    store: Py<PyAny>,
+    new_root_keys: Vec<ChkRef>,
+    old_root_keys: Vec<ChkRef>,
+    pb: Option<Py<PyAny>>,
+    search_key_func: Py<PyAny>,
+    all_old_chks: std::collections::HashSet<ChkRef>,
+    all_old_items: std::collections::HashSet<ChkItem>,
+    processed_new_refs: std::collections::HashSet<ChkRef>,
+    old_queue: Vec<ChkRef>,
+    new_queue: Vec<ChkRef>,
+    new_item_queue: Vec<ChkItem>,
+}
+
+impl CHKMapDifference {
+    /// Read the given keys from the store and parse each page into the
+    /// prefix-refs / items the algorithm consumes. Mirrors
+    /// `_read_nodes_from_store`.
+    fn read_nodes_from_store(&self, py: Python<'_>, keys: &[ChkRef]) -> PyResult<Vec<ReadNode>> {
+        let key_tuples = PyList::empty(py);
+        for k in keys {
+            key_tuples.append(ref_to_key_tuple(py, k)?)?;
+        }
+        let stream = self
+            .store
+            .bind(py)
+            .call_method1("get_record_stream", (key_tuples, "unordered", true))?;
+        let mut out = Vec::new();
+        for record in stream.try_iter()? {
+            let record = record?;
+            if let Some(pb) = &self.pb {
+                pb.bind(py).call_method0("tick")?;
+            }
+            let storage_kind: String = record.getattr("storage_kind")?.extract()?;
+            if storage_kind == "absent" {
+                let key = record.getattr("key")?;
+                return Err(no_such_revision(py, self.store.bind(py), &key)?);
+            }
+            let bytes_obj = record.call_method1("get_bytes_as", ("fulltext",))?;
+            let bytes_py = bytes_obj.cast_into::<PyBytes>()?;
+            let data = bytes_py.as_bytes();
+            let (prefix_refs, items) = if data.starts_with(b"chknode:\n") {
+                let parsed = deserialise_internal_node(data).map_err(chk_err_to_py)?;
+                (parsed.items, Vec::new())
+            } else if data.starts_with(b"chkleaf:\n") {
+                let parsed = deserialise_leaf_node(data).map_err(chk_err_to_py)?;
+                (Vec::new(), parsed.items)
+            } else {
+                return Err(pyo3::exceptions::PyAssertionError::new_err(
+                    "Unknown node type.",
+                ));
+            };
+            out.push(ReadNode {
+                record: record.unbind(),
+                prefix_refs,
+                items,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Compute the search key for a leaf item's key by calling the
+    /// Python `search_key_func`. Mirrors `self._search_key_func(item[0])`.
+    fn search_key_for_item(&self, py: Python<'_>, key: &[Vec<u8>]) -> PyResult<Vec<u8>> {
+        let key_tuple = PyTuple::new(py, key.iter().map(|p| PyBytes::new(py, p)))?;
+        let result = self.search_key_func.bind(py).call1((key_tuple,))?;
+        Ok(result.cast_into::<PyBytes>()?.as_bytes().to_vec())
+    }
+
+    /// `_read_old_roots`: walk the old roots, recording their items and
+    /// chk refs, and return the `(prefix, ref)` pairs still to enqueue.
+    fn read_old_roots(&mut self, py: Python<'_>) -> PyResult<Vec<(Vec<u8>, ChkRef)>> {
+        let mut old_chks_to_enqueue = Vec::new();
+        let nodes = self.read_nodes_from_store(py, &self.old_root_keys.clone())?;
+        for node in nodes {
+            let prefix_refs: Vec<(Vec<u8>, ChkRef)> = node
+                .prefix_refs
+                .into_iter()
+                .filter(|(_, r)| !self.all_old_chks.contains(r))
+                .collect();
+            for (_, r) in &prefix_refs {
+                self.all_old_chks.insert(r.clone());
+            }
+            for item in node.items {
+                self.all_old_items.insert(item);
+            }
+            old_chks_to_enqueue.extend(prefix_refs);
+        }
+        Ok(old_chks_to_enqueue)
+    }
+
+    /// `_enqueue_old`: queue old refs whose prefix is still in the
+    /// remaining interesting prefix set.
+    fn enqueue_old(
+        &mut self,
+        new_prefixes: &std::collections::HashSet<Vec<u8>>,
+        old_chks_to_enqueue: Vec<(Vec<u8>, ChkRef)>,
+    ) {
+        for (prefix, r) in old_chks_to_enqueue {
+            let mut interesting = false;
+            for i in (1..=prefix.len()).rev() {
+                if new_prefixes.contains(&prefix[..i]) {
+                    interesting = true;
+                    break;
+                }
+            }
+            if interesting {
+                self.old_queue.push(r);
+            }
+        }
+    }
+
+    /// `_read_all_roots`: bootstrap phase. Returns the new-root records
+    /// to be yielded (each paired with an empty item list by `process`).
+    fn read_all_roots(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        if self.old_root_keys.is_empty() {
+            self.new_queue = self.new_root_keys.clone();
+            return Ok(Vec::new());
+        }
+        let old_chks_to_enqueue = self.read_old_roots(py)?;
+        let new_keys: Vec<ChkRef> = self
+            .new_root_keys
+            .iter()
+            .filter(|k| !self.all_old_chks.contains(*k))
+            .cloned()
+            .collect();
+        let mut new_prefixes: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for k in &new_keys {
+            self.processed_new_refs.insert(k.clone());
+        }
+        let mut records = Vec::new();
+        let nodes = self.read_nodes_from_store(py, &new_keys)?;
+        for node in nodes {
+            let prefix_refs: Vec<(Vec<u8>, ChkRef)> = node
+                .prefix_refs
+                .into_iter()
+                .filter(|(_, r)| {
+                    !self.all_old_chks.contains(r) && !self.processed_new_refs.contains(r)
+                })
+                .collect();
+            let refs: Vec<ChkRef> = prefix_refs.iter().map(|(_, r)| r.clone()).collect();
+            for (p, _) in &prefix_refs {
+                new_prefixes.insert(p.clone());
+            }
+            self.new_queue.extend(refs.iter().cloned());
+            let new_items: Vec<ChkItem> = node
+                .items
+                .into_iter()
+                .filter(|item| !self.all_old_items.contains(item))
+                .collect();
+            for item in &new_items {
+                new_prefixes.insert(self.search_key_for_item(py, &item.0)?);
+            }
+            self.new_item_queue.extend(new_items);
+            for r in &refs {
+                self.processed_new_refs.insert(r.clone());
+            }
+            records.push(node.record);
+        }
+        // Expand new_prefixes to include all shorter prefixes.
+        let full: Vec<Vec<u8>> = new_prefixes.iter().cloned().collect();
+        for prefix in full {
+            for i in 1..prefix.len() {
+                new_prefixes.insert(prefix[..i].to_vec());
+            }
+        }
+        self.enqueue_old(&new_prefixes, old_chks_to_enqueue);
+        Ok(records)
+    }
+
+    /// `_process_next_old`: drain the old queue one pass, recording
+    /// items and discovering further old refs.
+    fn process_next_old(&mut self, py: Python<'_>) -> PyResult<()> {
+        let refs = std::mem::take(&mut self.old_queue);
+        let nodes = self.read_nodes_from_store(py, &refs)?;
+        for node in nodes {
+            for item in node.items {
+                self.all_old_items.insert(item);
+            }
+            let new_refs: Vec<ChkRef> = node
+                .prefix_refs
+                .into_iter()
+                .map(|(_, r)| r)
+                .filter(|r| !self.all_old_chks.contains(r))
+                .collect();
+            for r in &new_refs {
+                self.all_old_chks.insert(r.clone());
+            }
+            self.old_queue.extend(new_refs);
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl CHKMapDifference {
+    #[new]
+    #[pyo3(signature = (store, new_root_keys, old_root_keys, search_key_func, pb = None))]
+    fn new(
+        store: Bound<'_, PyAny>,
+        new_root_keys: Bound<'_, PyAny>,
+        old_root_keys: Bound<'_, PyAny>,
+        search_key_func: Bound<'_, PyAny>,
+        pb: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let new_root_keys = extract_chk_refs(&new_root_keys)?;
+        let old_root_keys = extract_chk_refs(&old_root_keys)?;
+        let all_old_chks: std::collections::HashSet<ChkRef> =
+            old_root_keys.iter().cloned().collect();
+        Ok(Self {
+            store: store.unbind(),
+            new_root_keys,
+            old_root_keys,
+            pb: pb.map(|p| p.unbind()),
+            search_key_func: search_key_func.unbind(),
+            all_old_chks,
+            all_old_items: std::collections::HashSet::new(),
+            processed_new_refs: std::collections::HashSet::new(),
+            old_queue: Vec::new(),
+            new_queue: Vec::new(),
+            new_item_queue: Vec::new(),
+        })
+    }
+
+    /// Yield `(record, items)` tuples for pages and key-value pairs that
+    /// are in the new maps but not the old maps.
+    fn process(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<CHKDifferenceIterator> {
+        // Bootstrap: read roots, capturing the records to yield first.
+        let root_records = slf.borrow_mut().read_all_roots(py)?;
+        Ok(CHKDifferenceIterator {
+            diff: slf.unbind(),
+            root_records: root_records.into(),
+            phase: DiffPhase::Roots,
+            flush_refs: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+        })
+    }
+
+    // ----- whitebox state accessors (mirror the Python attributes) -----
+
+    #[getter]
+    fn _all_old_chks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PySet>> {
+        let set = pyo3::types::PySet::empty(py)?;
+        for r in &self.all_old_chks {
+            set.add(ref_to_key_tuple(py, r)?)?;
+        }
+        Ok(set)
+    }
+
+    #[getter]
+    fn _old_queue<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        refs_to_key_list(py, &self.old_queue)
+    }
+
+    #[getter]
+    fn _new_queue<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        refs_to_key_list(py, &self.new_queue)
+    }
+
+    #[getter]
+    fn _new_item_queue<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for (key, value) in &self.new_item_queue {
+            let key_tuple = PyTuple::new(py, key.iter().map(|p| PyBytes::new(py, p)))?;
+            let pair = PyTuple::new(
+                py,
+                [key_tuple.into_any(), PyBytes::new(py, value).into_any()],
+            )?;
+            list.append(pair)?;
+        }
+        Ok(list)
+    }
+
+    /// Read the root pages, populating the queues, and return the new-root
+    /// records. Mirrors the Python generator `_read_all_roots`.
+    fn _read_all_roots<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let records = self.read_all_roots(py)?;
+        let list = PyList::empty(py);
+        for r in records {
+            list.append(r.into_bound(py))?;
+        }
+        Ok(list)
+    }
+
+    /// Process one pass of the old queue. Mirrors `_process_next_old`.
+    fn _process_next_old(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.process_next_old(py)
+    }
+}
+
+/// Render a list of refs as a Python list of `(ref,)` key tuples.
+fn refs_to_key_list<'py>(py: Python<'py>, refs: &[ChkRef]) -> PyResult<Bound<'py, PyList>> {
+    let list = PyList::empty(py);
+    for r in refs {
+        list.append(ref_to_key_tuple(py, r)?)?;
+    }
+    Ok(list)
+}
+
+/// Extract a sequence of `(b"sha1:...",)` key tuples into flat refs.
+fn extract_chk_refs(obj: &Bound<'_, PyAny>) -> PyResult<Vec<ChkRef>> {
+    let mut out = Vec::new();
+    for item in obj.try_iter()? {
+        let item = item?;
+        let tuple = item.cast_into::<PyTuple>()?;
+        let first = tuple.get_item(0)?;
+        out.push(first.cast_into::<PyBytes>()?.as_bytes().to_vec());
+    }
+    Ok(out)
+}
+
+#[derive(PartialEq)]
+enum DiffPhase {
+    /// Yielding new-root records as `(record, [])`.
+    Roots,
+    /// Draining the old queue, then emitting the buffered new items.
+    DrainOld,
+    /// Walking the new queue breadth-first, yielding `(record, items)`.
+    FlushNew,
+    Done,
+}
+
+/// Lazy iterator over `CHKMapDifference.process()` results.
+#[pyclass(module = "bzrformats._bzr_rs.chk_map")]
+pub struct CHKDifferenceIterator {
+    diff: Py<CHKMapDifference>,
+    root_records: std::collections::VecDeque<Py<PyAny>>,
+    phase: DiffPhase,
+    /// The frontier of refs for the current `_flush_new_queue` pass.
+    flush_refs: Vec<ChkRef>,
+    /// Results produced but not yet handed out, each `(record_or_none, items)`.
+    pending: std::collections::VecDeque<DiffResult>,
+}
+
+impl CHKDifferenceIterator {
+    /// Materialise a stored result into the Python `(record, items)`
+    /// tuple the caller expects: items become `[(key_tuple, value)]`.
+    fn build_result<'py>(
+        py: Python<'py>,
+        record: Option<Py<PyAny>>,
+        items: &[ChkItem],
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let py_items = PyList::empty(py);
+        for (key, value) in items {
+            let key_tuple = PyTuple::new(py, key.iter().map(|p| PyBytes::new(py, p)))?;
+            let pair = PyTuple::new(
+                py,
+                [key_tuple.into_any(), PyBytes::new(py, value).into_any()],
+            )?;
+            py_items.append(pair)?;
+        }
+        let rec = match record {
+            Some(r) => r.into_bound(py).into_any(),
+            None => py.None().into_bound(py),
+        };
+        PyTuple::new(py, [rec, py_items.into_any()])
+    }
+
+    /// Advance the state machine until a result is available or the
+    /// iteration is exhausted. Returns the next `(record_or_none, items)`.
+    fn advance(&mut self, py: Python<'_>) -> PyResult<Option<DiffResult>> {
+        loop {
+            if let Some(result) = self.pending.pop_front() {
+                return Ok(Some(result));
+            }
+            match self.phase {
+                DiffPhase::Roots => {
+                    if let Some(record) = self.root_records.pop_front() {
+                        return Ok(Some((Some(record), Vec::new())));
+                    }
+                    // Roots done: drain the old queue, then set up flush.
+                    let mut diff = self.diff.bind(py).borrow_mut();
+                    while !diff.old_queue.is_empty() {
+                        diff.process_next_old(py)?;
+                    }
+                    self.phase = DiffPhase::DrainOld;
+                }
+                DiffPhase::DrainOld => {
+                    // `_flush_new_queue` setup: emit buffered new items,
+                    // then seed the breadth-first frontier.
+                    let mut diff = self.diff.bind(py).borrow_mut();
+                    let new_queue = std::mem::take(&mut diff.new_queue);
+                    let new_items: Vec<ChkItem> = std::mem::take(&mut diff.new_item_queue)
+                        .into_iter()
+                        .filter(|item| !diff.all_old_items.contains(item))
+                        .collect();
+                    let mut refs: std::collections::HashSet<ChkRef> =
+                        new_queue.into_iter().collect();
+                    for r in &diff.all_old_chks {
+                        refs.remove(r);
+                    }
+                    for r in &refs {
+                        diff.processed_new_refs.insert(r.clone());
+                    }
+                    self.flush_refs = refs.into_iter().collect();
+                    self.phase = DiffPhase::FlushNew;
+                    if !new_items.is_empty() {
+                        return Ok(Some((None, new_items)));
+                    }
+                }
+                DiffPhase::FlushNew => {
+                    if self.flush_refs.is_empty() {
+                        self.phase = DiffPhase::Done;
+                        continue;
+                    }
+                    let refs = std::mem::take(&mut self.flush_refs);
+                    let mut diff = self.diff.bind(py).borrow_mut();
+                    let nodes = diff.read_nodes_from_store(py, &refs)?;
+                    let mut next_refs: std::collections::HashSet<ChkRef> =
+                        std::collections::HashSet::new();
+                    let all_old_items_empty = diff.all_old_items.is_empty();
+                    for node in nodes {
+                        let items: Vec<ChkItem> = if all_old_items_empty {
+                            node.items
+                        } else {
+                            node.items
+                                .into_iter()
+                                .filter(|item| !diff.all_old_items.contains(item))
+                                .collect()
+                        };
+                        for (_, r) in &node.prefix_refs {
+                            next_refs.insert(r.clone());
+                        }
+                        self.pending.push_back((Some(node.record), items));
+                    }
+                    for r in &diff.all_old_chks {
+                        next_refs.remove(r);
+                    }
+                    next_refs.retain(|r| !diff.processed_new_refs.contains(r));
+                    for r in &next_refs {
+                        diff.processed_new_refs.insert(r.clone());
+                    }
+                    self.flush_refs = next_refs.into_iter().collect();
+                }
+                DiffPhase::Done => return Ok(None),
+            }
+        }
+    }
+}
+
+#[pymethods]
+impl CHKDifferenceIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        match self.advance(py)? {
+            Some((record, items)) => Ok(Some(Self::build_result(py, record, &items)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Given root keys, find interesting nodes — those referenced by the
+/// interesting roots but not by the uninteresting roots. Returns an
+/// iterator of `(record, items)`. Rust port of the Python
+/// `chk_map.iter_interesting_nodes`.
+#[pyfunction]
+#[pyo3(signature = (store, interesting_root_keys, uninteresting_root_keys, pb = None))]
+fn iter_interesting_nodes(
+    py: Python<'_>,
+    store: Bound<'_, PyAny>,
+    interesting_root_keys: Bound<'_, PyAny>,
+    uninteresting_root_keys: Bound<'_, PyAny>,
+    pb: Option<Bound<'_, PyAny>>,
+) -> PyResult<CHKDifferenceIterator> {
+    let search_key_func = store.getattr("_search_key_func")?;
+    let diff = Bound::new(
+        py,
+        CHKMapDifference::new(
+            store.clone(),
+            interesting_root_keys,
+            uninteresting_root_keys,
+            search_key_func,
+            pb,
+        )?,
+    )?;
+    CHKMapDifference::process(diff, py)
 }
 
 pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
@@ -1777,6 +2267,7 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(py_deserialise_leaf_node))?;
     m.add_wrapped(wrap_pyfunction!(py_deserialise_internal_node))?;
     m.add_wrapped(wrap_pyfunction!(py_deserialise))?;
+    m.add_wrapped(wrap_pyfunction!(iter_interesting_nodes))?;
     m.add_wrapped(wrap_pyfunction!(py_serialise_leaf_node))?;
     m.add_wrapped(wrap_pyfunction!(py_serialise_internal_node))?;
     m.add_wrapped(wrap_pyfunction!(py_leaf_node_key_value_len))?;
@@ -1808,5 +2299,7 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<LeafNode>()?;
     m.add_class::<InternalNode>()?;
     m.add_class::<CHKMap>()?;
+    m.add_class::<CHKMapDifference>()?;
+    m.add_class::<CHKDifferenceIterator>()?;
     Ok(m)
 }
