@@ -47,6 +47,7 @@ impl std::ops::DerefMut for InventoryDelta {
     }
 }
 
+#[derive(Debug)]
 pub enum InventoryDeltaInconsistency {
     DuplicateFileId(String, FileId),
     DuplicateOldPath(String, FileId),

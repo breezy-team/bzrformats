@@ -72,7 +72,10 @@ pub enum ReconstructError {
 impl std::fmt::Display for ReconstructError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReconstructError::ParentIndexOutOfRange { parent_index, parent_count } => write!(
+            ReconstructError::ParentIndexOutOfRange {
+                parent_index,
+                parent_count,
+            } => write!(
                 f,
                 "parent index {} out of range (version has {} parents)",
                 parent_index, parent_count
@@ -206,7 +209,11 @@ impl MultiParent {
     /// Mirrors `MultiParent.get_matching_blocks` — used by
     /// `VersionedFiles.add_mpdiffs` to pass the single-parent matching
     /// blocks straight into `add_lines` as a delta-compression hint.
-    pub fn get_matching_blocks(&self, parent: usize, parent_len: usize) -> Vec<(usize, usize, usize)> {
+    pub fn get_matching_blocks(
+        &self,
+        parent: usize,
+        parent_len: usize,
+    ) -> Vec<(usize, usize, usize)> {
         let mut out: Vec<(usize, usize, usize)> = Vec::new();
         for hunk in &self.hunks {
             if let Hunk::ParentText {
@@ -659,8 +666,7 @@ where
                 &parent_ids[..]
             };
             let parent_lines = self.get_line_list_owned(parents_slice)?;
-            let parent_refs: Vec<&[Vec<u8>]> =
-                parent_lines.iter().map(Vec::as_slice).collect();
+            let parent_refs: Vec<&[Vec<u8>]> = parent_lines.iter().map(Vec::as_slice).collect();
             let d = MultiParent::from_lines(&lines, &parent_refs, None);
             if d.is_snapshot() {
                 self.snapshots.insert(version_id.clone());
@@ -847,11 +853,7 @@ where
     /// reconstructed lines. Mirrors `BaseVersionedFile.make_snapshot`.
     pub fn make_snapshot(&mut self, version_id: K) -> Result<(), ReconstructError> {
         let lines = self.cache_version(&version_id)?.to_vec();
-        let parents = self
-            .parents
-            .get(&version_id)
-            .cloned()
-            .unwrap_or_default();
+        let parents = self.parents.get(&version_id).cloned().unwrap_or_default();
         let snap = MultiParent::with_hunks(vec![Hunk::NewText(lines)]);
         self.add_diff(snap, version_id.clone(), parents);
         self.snapshots.insert(version_id);
@@ -937,8 +939,7 @@ where
                 }
                 if potential.len() > interval {
                     snapshots.insert(version_id.clone());
-                    build_ancestors
-                        .insert(version_id.clone(), std::collections::HashSet::new());
+                    build_ancestors.insert(version_id.clone(), std::collections::HashSet::new());
                 } else {
                     build_ancestors.insert(version_id.clone(), potential);
                 }
@@ -975,10 +976,7 @@ where
             }
             let avoid_set = could_avoid.get(v).cloned().unwrap_or_default();
             for avoid_id in avoid_set {
-                referenced_by
-                    .entry(avoid_id)
-                    .or_default()
-                    .insert(v.clone());
+                referenced_by.entry(avoid_id).or_default().insert(v.clone());
             }
         }
         let mut available: Vec<K> = self.insert_order.clone();
@@ -1479,7 +1477,8 @@ mod tests {
         // Add a single fulltext (no parents → snapshot), read it back.
         let mut mpvf: MultiMemoryVersionedFile<&'static str> = MultiMemoryVersionedFile::default();
         let text = lines(&[b"a\n", b"b\n"]);
-        mpvf.add_version(text.clone(), "v1", vec![], None, false).unwrap();
+        mpvf.add_version(text.clone(), "v1", vec![], None, false)
+            .unwrap();
         assert!(mpvf.has_version(&"v1"));
         mpvf.clear_cache();
         let got = mpvf.get_line_list(&["v1"]).unwrap();
@@ -1492,8 +1491,10 @@ mod tests {
         let mut mpvf: MultiMemoryVersionedFile<&'static str> = MultiMemoryVersionedFile::default();
         let v1 = lines(&[b"a\n", b"b\n", b"c\n"]);
         let v2 = lines(&[b"a\n", b"x\n", b"c\n"]);
-        mpvf.add_version(v1.clone(), "v1", vec![], None, false).unwrap();
-        mpvf.add_version(v2.clone(), "v2", vec!["v1"], None, false).unwrap();
+        mpvf.add_version(v1.clone(), "v1", vec![], None, false)
+            .unwrap();
+        mpvf.add_version(v2.clone(), "v2", vec!["v1"], None, false)
+            .unwrap();
         // Force reconstruction from chain only.
         mpvf.clear_cache();
         let got = mpvf.get_line_list(&["v2"]).unwrap();
@@ -1505,7 +1506,8 @@ mod tests {
         // Wire up the diff directly (the path add_mpdiffs uses) and verify
         // get_line_list walks the chain.
         let mut mpvf: MultiMemoryVersionedFile<&'static str> = MultiMemoryVersionedFile::default();
-        mpvf.add_version(lines(&[b"x\n", b"y\n"]), "base", vec![], None, false).unwrap();
+        mpvf.add_version(lines(&[b"x\n", b"y\n"]), "base", vec![], None, false)
+            .unwrap();
         // Manually craft a delta that replaces line 0 with "X".
         let diff = MultiParent::with_hunks(vec![
             Hunk::NewText(lines(&[b"X\n"])),
@@ -1539,7 +1541,8 @@ mod tests {
         let base = lines(&[b"a\n", b"b\n"]);
         let child = lines(&[b"X\n", b"b\n"]);
         mpvf.add_version(base, "base", vec![], None, false).unwrap();
-        mpvf.add_version(child.clone(), "child", vec!["base"], None, false).unwrap();
+        mpvf.add_version(child.clone(), "child", vec!["base"], None, false)
+            .unwrap();
         assert!(!mpvf.is_snapshot(&"child"));
         mpvf.make_snapshot("child").unwrap();
         assert!(mpvf.is_snapshot(&"child"));
@@ -1551,8 +1554,10 @@ mod tests {
     #[test]
     fn mpvf_import_diffs_copies_each_version() {
         let mut src: MultiMemoryVersionedFile<&'static str> = MultiMemoryVersionedFile::default();
-        src.add_version(lines(&[b"a\n"]), "v1", vec![], None, false).unwrap();
-        src.add_version(lines(&[b"b\n"]), "v2", vec!["v1"], None, false).unwrap();
+        src.add_version(lines(&[b"a\n"]), "v1", vec![], None, false)
+            .unwrap();
+        src.add_version(lines(&[b"b\n"]), "v2", vec!["v1"], None, false)
+            .unwrap();
         let mut dst: MultiMemoryVersionedFile<&'static str> = MultiMemoryVersionedFile::default();
         dst.import_diffs(&src);
         assert!(dst.has_version(&"v1"));
@@ -1567,10 +1572,14 @@ mod tests {
         // version (counting the root) should be selected.
         let mut mpvf: MultiMemoryVersionedFile<&'static str> =
             MultiMemoryVersionedFile::new(Some(2), None);
-        mpvf.add_version(lines(&[b"v1\n"]), "v1", vec![], None, false).unwrap();
-        mpvf.add_version(lines(&[b"v2\n"]), "v2", vec!["v1"], None, false).unwrap();
-        mpvf.add_version(lines(&[b"v3\n"]), "v3", vec!["v2"], None, false).unwrap();
-        mpvf.add_version(lines(&[b"v4\n"]), "v4", vec!["v3"], None, false).unwrap();
+        mpvf.add_version(lines(&[b"v1\n"]), "v1", vec![], None, false)
+            .unwrap();
+        mpvf.add_version(lines(&[b"v2\n"]), "v2", vec!["v1"], None, false)
+            .unwrap();
+        mpvf.add_version(lines(&[b"v3\n"]), "v3", vec!["v2"], None, false)
+            .unwrap();
+        mpvf.add_version(lines(&[b"v4\n"]), "v4", vec!["v3"], None, false)
+            .unwrap();
         let chosen = mpvf.select_snapshots();
         // v1 has no parents → always a snapshot. After two steps we
         // exceed the interval, so v4 (3 ancestors) is also selected.

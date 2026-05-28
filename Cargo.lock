@@ -68,6 +68,7 @@ dependencies = [
  "crc32fast",
  "fancy-regex",
  "flate2",
+ "indexmap",
  "inventory",
  "lazy-regex",
  "lazy_static",
@@ -95,6 +96,7 @@ version = "3.4.4"
 dependencies = [
  "bazaar",
  "chrono",
+ "indexmap",
  "patiencediff",
  "pyo3",
  "pyo3-filelike",

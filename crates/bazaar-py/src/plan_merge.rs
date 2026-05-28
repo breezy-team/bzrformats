@@ -97,8 +97,13 @@ impl PyPlanLCAMerge {
     fn plan_merge<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let out = PyList::empty(py);
         for (tag, line) in &self.plan {
-            let tup = PyTuple::new(py, [tag.as_str().into_pyobject(py)?.into_any(),
-                PyBytes::new(py, line).into_any()])?;
+            let tup = PyTuple::new(
+                py,
+                [
+                    tag.as_str().into_pyobject(py)?.into_any(),
+                    PyBytes::new(py, line).into_any(),
+                ],
+            )?;
             out.append(tup)?;
         }
         Ok(out.into_any().call_method0("__iter__")?)
@@ -146,10 +151,7 @@ fn build_key<'py>(
     prefix: &[Vec<u8>],
     suffix: &[u8],
 ) -> PyResult<Bound<'py, PyTuple>> {
-    let mut parts: Vec<Bound<'py, PyBytes>> = prefix
-        .iter()
-        .map(|p| PyBytes::new(py, p))
-        .collect();
+    let mut parts: Vec<Bound<'py, PyBytes>> = prefix.iter().map(|p| PyBytes::new(py, p)).collect();
     parts.push(PyBytes::new(py, suffix));
     PyTuple::new(py, parts)
 }
@@ -166,10 +168,13 @@ fn subtract_plans_py<'py>(
     let out = pm::subtract_plans(&old, &new);
     let result = PyList::empty(py);
     for (tag, line) in out {
-        let tup = PyTuple::new(py, [
-            tag.as_str().into_pyobject(py)?.into_any(),
-            PyBytes::new(py, &line).into_any(),
-        ])?;
+        let tup = PyTuple::new(
+            py,
+            [
+                tag.as_str().into_pyobject(py)?.into_any(),
+                PyBytes::new(py, &line).into_any(),
+            ],
+        )?;
         result.append(tup)?;
     }
     Ok(result)

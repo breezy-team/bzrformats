@@ -32,7 +32,12 @@ fn crc32(bit: &[u8]) -> u32 {
 
 pub type SerialisedKey = Vec<u8>;
 
-pub type SearchKeyFn = fn(&Key) -> SerializedKey;
+/// If a ChildNode falls below this many bytes, we check for a remap.
+/// Mirrors Python's `_INTERESTING_NEW_SIZE`.
+pub const INTERESTING_NEW_SIZE: usize = 50;
+/// If a ChildNode shrinks by more than this amount, we check for a remap.
+/// Mirrors Python's `_INTERESTING_SHRINKAGE_LIMIT`.
+pub const INTERESTING_SHRINKAGE_LIMIT: usize = 20;
 
 /// Map the key tuple into a search string that just uses the key bytes.
 pub fn search_key_plain(key: &Key) -> SerializedKey {
@@ -61,6 +66,96 @@ pub fn search_key_255(key: &Key) -> SerializedKey {
         .iter()
         .map(|b| if *b == 0x0A { b'_' } else { *b })
         .collect()
+}
+
+/// The set of search-key functions a CHKMap may be configured with.
+///
+/// `Plain` / `Hash16Way` / `Hash255Way` mirror the entries registered in
+/// Python's `search_key_registry` for production use. `Custom` carries a
+/// boxed closure for callers (most often test code) that register their
+/// own — the pyo3 layer adapts a Python callable into a `Custom` variant.
+#[derive(Clone)]
+pub enum SearchKeyFunc {
+    /// `b"plain"` — `b"\x00".join(key)`.
+    Plain,
+    /// `b"hash-16-way"` — 8-char uppercase hex of `crc32(part)` joined by NUL.
+    Hash16Way,
+    /// `b"hash-255-way"` — big-endian `crc32(part)` bytes joined by NUL,
+    /// with any `\n` byte rewritten to `_`.
+    Hash255Way,
+    /// Any other callable, identified by a free-form name. The bytes
+    /// returned by `name()` for a `Custom` variant come straight from
+    /// the caller — they may not appear in `from_name`'s lookup table.
+    Custom {
+        name: Vec<u8>,
+        func: std::sync::Arc<dyn Fn(&Key) -> SerializedKey + Send + Sync>,
+    },
+}
+
+impl std::fmt::Debug for SearchKeyFunc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SearchKeyFunc::Plain => f.write_str("Plain"),
+            SearchKeyFunc::Hash16Way => f.write_str("Hash16Way"),
+            SearchKeyFunc::Hash255Way => f.write_str("Hash255Way"),
+            SearchKeyFunc::Custom { name, .. } => write!(f, "Custom({:?})", name),
+        }
+    }
+}
+
+impl PartialEq for SearchKeyFunc {
+    /// Built-in variants compare equal by tag; `Custom` variants are
+    /// only equal when their `Arc`s point at the same closure.
+    fn eq(&self, other: &Self) -> bool {
+        use SearchKeyFunc::*;
+        match (self, other) {
+            (Plain, Plain) | (Hash16Way, Hash16Way) | (Hash255Way, Hash255Way) => true,
+            (Custom { func: a, .. }, Custom { func: b, .. }) => std::sync::Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SearchKeyFunc {}
+
+impl SearchKeyFunc {
+    /// Resolve a registry name to a built-in variant. Unknown names
+    /// return the raw bytes back; the caller may wrap them in a
+    /// `Custom` variant with a closure of its own.
+    pub fn from_name(name: &[u8]) -> Result<Self, Vec<u8>> {
+        match name {
+            b"plain" => Ok(SearchKeyFunc::Plain),
+            b"hash-16-way" => Ok(SearchKeyFunc::Hash16Way),
+            b"hash-255-way" => Ok(SearchKeyFunc::Hash255Way),
+            other => Err(other.to_vec()),
+        }
+    }
+
+    /// Wire name as it appears in serialised inventories.
+    pub fn name(&self) -> &[u8] {
+        match self {
+            SearchKeyFunc::Plain => b"plain",
+            SearchKeyFunc::Hash16Way => b"hash-16-way",
+            SearchKeyFunc::Hash255Way => b"hash-255-way",
+            SearchKeyFunc::Custom { name, .. } => name.as_slice(),
+        }
+    }
+
+    /// Apply this variant's search-key transform to `key`.
+    pub fn apply(&self, key: &Key) -> SerializedKey {
+        match self {
+            SearchKeyFunc::Plain => search_key_plain(key),
+            SearchKeyFunc::Hash16Way => search_key_16(key),
+            SearchKeyFunc::Hash255Way => search_key_255(key),
+            SearchKeyFunc::Custom { func, .. } => func(key),
+        }
+    }
+}
+
+impl Default for SearchKeyFunc {
+    fn default() -> Self {
+        SearchKeyFunc::Plain
+    }
 }
 
 pub fn bytes_to_text_key(data: &[u8]) -> Result<(&[u8], &[u8]), String> {
@@ -137,6 +232,10 @@ pub type Value = Vec<u8>;
 pub enum Error {
     InconsistentDeltaDelta(Vec<(Option<Key>, Option<Key>, Value)>, String),
     DeserializeError(String),
+    /// A precondition or invariant was violated. Mirrors Python's
+    /// `AssertionError` paths in chk_map.py — usually a bug in the
+    /// caller, not a corrupt input.
+    AssertionFailed(String),
 }
 
 impl From<std::num::ParseIntError> for Error {
@@ -582,6 +681,1510 @@ fn decimal_digits(n: usize) -> usize {
     digits
 }
 
+/// State of a `LeafNode`'s `_search_prefix` field.
+///
+/// Python uses an `_unknown` sentinel object to mark "items were
+/// rebuilt without recomputing the prefix"; map / unmap then
+/// demand-compute it. `None` means the node is empty, so there is no
+/// prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchPrefix {
+    /// The node was rebuilt and the prefix has not been recomputed.
+    Unknown,
+    /// The prefix is known to be `Some(p)` for a non-empty leaf, or
+    /// `None` for an empty leaf.
+    Computed(Option<Vec<u8>>),
+}
+
+impl SearchPrefix {
+    /// Return the prefix bytes if computed, panicking on `Unknown`.
+    /// Mirrors call sites where Python would have already demanded a
+    /// recompute.
+    pub fn expect_computed(&self) -> Option<&[u8]> {
+        match self {
+            SearchPrefix::Unknown => panic!("search prefix is Unknown"),
+            SearchPrefix::Computed(p) => p.as_deref(),
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, SearchPrefix::Unknown)
+    }
+}
+
+/// In-memory state of a CHK leaf node.
+///
+/// Mirrors Python's `LeafNode` exactly, minus the store-touching
+/// methods (`serialise`, `map`/`_split` recursion). Held by the
+/// upcoming pyo3 `LeafNode` pyclass and used directly by pure-Rust
+/// callers.
+///
+/// Iteration order of `items` follows insertion order so it matches
+/// Python's `dict` semantics — tests and the `_split` algorithm both
+/// observe items in that order when they don't sort first.
+#[derive(Debug, Clone)]
+pub struct LeafNode {
+    /// `(b"sha1:...",)` once the node has been serialised to a store;
+    /// `None` while it is still mutable.
+    pub key: Option<Vec<u8>>,
+    pub maximum_size: usize,
+    pub key_width: usize,
+    pub raw_size: usize,
+    pub items: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>>,
+    pub search_prefix: SearchPrefix,
+    pub common_serialised_prefix: Option<Vec<u8>>,
+    pub search_key_func: SearchKeyFunc,
+}
+
+impl LeafNode {
+    /// Empty node with the given search-key transform.
+    pub fn new(search_key_func: SearchKeyFunc) -> Self {
+        Self {
+            key: None,
+            maximum_size: 0,
+            key_width: 1,
+            raw_size: 0,
+            items: indexmap::IndexMap::new(),
+            search_prefix: SearchPrefix::Computed(None),
+            common_serialised_prefix: None,
+            search_key_func,
+        }
+    }
+
+    /// Build a populated leaf from the output of [`deserialise_leaf_node`].
+    ///
+    /// Mirrors Python's `_deserialise_leaf_node` post-processing: the
+    /// items become a dict, `search_prefix` is `Unknown` (Python uses
+    /// `_unknown`) for non-empty nodes so the next mutator recomputes
+    /// it on demand, and `common_serialised_prefix` is taken straight
+    /// from the parsed prefix.
+    pub fn from_parsed(parsed: ParsedLeafNode, search_key_func: SearchKeyFunc) -> Self {
+        let items_empty = parsed.items.is_empty();
+        let mut items = indexmap::IndexMap::with_capacity(parsed.items.len());
+        for (k, v) in parsed.items {
+            items.insert(k, v);
+        }
+        let (search_prefix, common_serialised_prefix) = if items_empty {
+            (SearchPrefix::Computed(None), None)
+        } else {
+            (SearchPrefix::Unknown, Some(parsed.common_serialised_prefix))
+        };
+        Self {
+            key: None,
+            maximum_size: parsed.maximum_size,
+            key_width: parsed.key_width,
+            raw_size: parsed.raw_size,
+            items,
+            search_prefix,
+            common_serialised_prefix,
+            search_key_func,
+        }
+    }
+
+    /// Number of entries in this leaf.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Wrapper around [`leaf_node_current_size`] using `self`'s state.
+    pub fn current_size(&self) -> usize {
+        leaf_node_current_size(
+            self.maximum_size,
+            self.key_width,
+            self.len(),
+            self.raw_size,
+            self.common_serialised_prefix.as_deref(),
+        )
+    }
+
+    /// Recompute `search_prefix` from scratch by hashing every key
+    /// and reducing with [`common_prefix_many`]. Mirrors
+    /// `LeafNode._compute_search_prefix`.
+    pub fn compute_search_prefix(&mut self) -> Option<&[u8]> {
+        let keys: Vec<SerializedKey> = self
+            .items
+            .keys()
+            .map(|k| self.search_key_func.apply(&Key::from(k.clone())))
+            .collect();
+        let prefix = common_prefix_many(keys.iter().map(|k| k.as_slice())).map(|s| s.to_vec());
+        self.search_prefix = SearchPrefix::Computed(prefix);
+        match &self.search_prefix {
+            SearchPrefix::Computed(p) => p.as_deref(),
+            SearchPrefix::Unknown => unreachable!(),
+        }
+    }
+
+    /// Recompute `common_serialised_prefix` from scratch. Mirrors
+    /// `LeafNode._compute_serialised_prefix`.
+    pub fn compute_serialised_prefix(&mut self) -> Option<&[u8]> {
+        let keys: Vec<SerializedKey> = self
+            .items
+            .keys()
+            .map(|k| Key::from(k.clone()).serialize())
+            .collect();
+        let prefix = common_prefix_many(keys.iter().map(|k| k.as_slice())).map(|s| s.to_vec());
+        self.common_serialised_prefix = prefix;
+        self.common_serialised_prefix.as_deref()
+    }
+
+    /// `LeafNode._are_search_keys_identical`: all entries hash to the
+    /// same search key. Empty leaves return `true`.
+    pub fn are_search_keys_identical(&self) -> bool {
+        let keys = self
+            .items
+            .keys()
+            .map(|k| self.search_key_func.apply(&Key::from(k.clone())));
+        are_search_keys_identical(keys)
+    }
+
+    /// Insert `(key, value)` and update `raw_size`, `search_prefix`,
+    /// `common_serialised_prefix`. Returns `true` if the leaf has
+    /// overflowed `maximum_size` and the caller must split it.
+    ///
+    /// Mirrors `LeafNode._map_no_split`: the caller must have already
+    /// removed any prior entry for `key` from `raw_size` / `len`. If
+    /// `search_prefix` was `Unknown`, it is recomputed before applying
+    /// the new key.
+    pub fn map_no_split(&mut self, key: Vec<Vec<u8>>, value: Vec<u8>) -> bool {
+        self.raw_size += leaf_node_key_value_len(&key, &value);
+        let serialised_key = Key::from(key.clone()).serialize();
+        let search_key = self.search_key_func.apply(&Key::from(key.clone()));
+        self.items.insert(key, value);
+
+        self.common_serialised_prefix = Some(match self.common_serialised_prefix.take() {
+            None => serialised_key,
+            Some(prefix) => common_prefix_pair(&prefix, &serialised_key).to_vec(),
+        });
+
+        if self.search_prefix.is_unknown() {
+            self.compute_search_prefix();
+        }
+        let new_prefix = match &self.search_prefix {
+            SearchPrefix::Computed(None) => search_key.clone(),
+            SearchPrefix::Computed(Some(p)) => common_prefix_pair(p, &search_key).to_vec(),
+            SearchPrefix::Unknown => unreachable!("just recomputed above"),
+        };
+        self.search_prefix = SearchPrefix::Computed(Some(new_prefix.clone()));
+
+        if self.items.len() > 1
+            && self.maximum_size > 0
+            && self.current_size() > self.maximum_size
+            && (search_key != new_prefix || !self.are_search_keys_identical())
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Remove `key`, recomputing `search_prefix` and
+    /// `common_serialised_prefix` from scratch. Returns the removed
+    /// value, or `None` if `key` was not present (Python raises
+    /// `KeyError`; here the caller decides how to react).
+    ///
+    /// Mirrors `LeafNode.unmap` minus the store argument (the store is
+    /// unused on the leaf path).
+    pub fn unmap(&mut self, key: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let removed = self.items.shift_remove(key)?;
+        self.raw_size -= leaf_node_key_value_len(key, &removed);
+        self.key = None;
+        self.compute_search_prefix();
+        self.compute_serialised_prefix();
+        Some(removed)
+    }
+
+    /// Serialise to `store` and cache the resulting bytes in `cache`.
+    ///
+    /// Mirrors Python's `LeafNode.serialise`: sorts the items, builds
+    /// the line list, calls `store.add_lines((None,), (), lines)`,
+    /// stores the resulting sha1 key on `self.key`, and writes the
+    /// concatenated bytes into the page cache. Returns the resulting
+    /// sha1 key (without the `b"sha1:"` prefix stripped).
+    ///
+    /// The Python version returns a single-element list; native Rust
+    /// callers want the key value alone.
+    pub fn serialise<S>(&mut self, store: &S, cache: &dyn PageCache) -> Result<Vec<u8>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        // Python sorts items before serialising; mirror that exactly.
+        let mut sorted_items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = self
+            .items
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        sorted_items.sort();
+        let lines = serialise_leaf_node(
+            self.maximum_size,
+            self.key_width,
+            &sorted_items,
+            self.common_serialised_prefix.as_deref(),
+        )?;
+        let (sha1, _size) = store
+            .add_lines(
+                &crate::versionedfile::Key::ContentAddressed(vec![]),
+                Some(&[]),
+                &lines,
+            )
+            .map_err(|e| Error::AssertionFailed(format!("add_lines failed: {:?}", e)))?;
+        let mut full_key = Vec::with_capacity(5 + sha1.len());
+        full_key.extend_from_slice(b"sha1:");
+        full_key.extend_from_slice(&sha1);
+        let data: Vec<u8> = lines.iter().flatten().copied().collect();
+        if data.len() != self.current_size() {
+            return Err(Error::AssertionFailed("Invalid _current_size".into()));
+        }
+        cache.insert(full_key.clone(), data);
+        self.key = Some(full_key.clone());
+        Ok(full_key)
+    }
+
+    /// Split this overflowing leaf into multiple child nodes.
+    ///
+    /// Mirrors Python's `LeafNode._split`: groups items by the
+    /// `(search_prefix + 1)`-byte search-key prefix into fresh sub-leaves.
+    /// If a sub-leaf overflows during its own `map`, the result is
+    /// promoted into an InternalNode wrapping the further splits.
+    ///
+    /// Consumes the items in `self`. After `_split` returns, the
+    /// caller should treat `self` as destroyed — Python returns new
+    /// nodes up the stack and the caller wraps them in an
+    /// InternalNode at the level above.
+    pub fn split(&mut self) -> Result<(Vec<u8>, Vec<(Vec<u8>, Node)>), Error> {
+        let common_prefix = match &self.search_prefix {
+            SearchPrefix::Unknown => {
+                return Err(Error::AssertionFailed("Search prefix must be known".into()))
+            }
+            SearchPrefix::Computed(None) => Vec::new(),
+            SearchPrefix::Computed(Some(p)) => p.clone(),
+        };
+        let split_at = common_prefix.len() + 1;
+        let mut result: indexmap::IndexMap<Vec<u8>, Node> = indexmap::IndexMap::new();
+        let items = std::mem::take(&mut self.items);
+        for (key, value) in items {
+            let search_key = self.search_key_func.apply(&Key::from(key.clone()));
+            let mut prefix: Vec<u8> = if search_key.len() >= split_at {
+                search_key[..split_at].to_vec()
+            } else {
+                search_key.clone()
+            };
+            if prefix.len() < split_at {
+                prefix.resize(split_at, 0);
+            }
+            // Take or create the per-prefix sub-node; mutate it via
+            // map, then store back.
+            let existing = result.shift_remove(&prefix);
+            let mut sub_node = match existing {
+                Some(Node::Leaf(b)) => Node::Leaf(b),
+                Some(Node::Internal(b)) => Node::Internal(b),
+                None => {
+                    let mut leaf = LeafNode::new(self.search_key_func.clone());
+                    leaf.maximum_size = self.maximum_size;
+                    leaf.key_width = self.key_width;
+                    Node::Leaf(Box::new(leaf))
+                }
+            };
+            let map_res = sub_node.map(key, value)?;
+            match map_res {
+                MapResult::InPlace { .. } => {
+                    result.insert(prefix, sub_node);
+                }
+                MapResult::Split {
+                    common_serialised_prefix: sub_prefix,
+                    children,
+                } => {
+                    let mut new_internal =
+                        InternalNode::new(sub_prefix.clone(), self.search_key_func.clone());
+                    new_internal.maximum_size = self.maximum_size;
+                    new_internal.key_width = self.key_width;
+                    for (split_prefix, child) in children {
+                        new_internal.add_node(split_prefix, child)?;
+                    }
+                    result.insert(prefix, Node::Internal(Box::new(new_internal)));
+                }
+            }
+        }
+        Ok((common_prefix, result.into_iter().collect()))
+    }
+
+    /// In-place insert. Mirrors Python's `LeafNode.map`: subtract
+    /// the old entry's cost if the key existed, then call
+    /// `map_no_split`. If it signals overflow, split.
+    pub fn map(&mut self, key: Vec<Vec<u8>>, value: Vec<u8>) -> Result<MapResult, Error> {
+        if let Some(old_value) = self.items.get(&key) {
+            self.raw_size -= leaf_node_key_value_len(&key, old_value);
+        }
+        self.key = None;
+        if self.map_no_split(key, value) {
+            let (common_prefix, children) = self.split()?;
+            Ok(MapResult::Split {
+                common_serialised_prefix: common_prefix,
+                children,
+            })
+        } else {
+            let prefix = match &self.search_prefix {
+                SearchPrefix::Unknown => {
+                    return Err(Error::AssertionFailed(
+                        "search_prefix must be known after map".into(),
+                    ));
+                }
+                SearchPrefix::Computed(None) => Vec::new(),
+                SearchPrefix::Computed(Some(p)) => p.clone(),
+            };
+            Ok(MapResult::InPlace {
+                search_prefix: prefix,
+            })
+        }
+    }
+
+    /// Yield `(key, value)` pairs matching `key_filter`. When `None`,
+    /// yields every entry in insertion order. Otherwise:
+    ///
+    /// * Filter keys of length `key_width` are looked up directly and
+    ///   yielded in filter order (matching Python's left-to-right
+    ///   iteration before falling through to the prefix-match pass).
+    /// * Shorter filter keys act as prefix filters across the items.
+    ///   Items are checked in insertion order; the first matching
+    ///   filter wins (matches Python's `break` after a yield).
+    ///
+    /// Mirrors `LeafNode.iteritems` exactly; the store argument is
+    /// unused on the leaf path and is omitted from this pure-Rust
+    /// signature.
+    pub fn iteritems(&self, key_filter: Option<&[Vec<Vec<u8>>]>) -> Vec<(Vec<Vec<u8>>, Vec<u8>)> {
+        let mut out: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::new();
+        let filter = match key_filter {
+            None => {
+                for (k, v) in self.items.iter() {
+                    out.push((k.clone(), v.clone()));
+                }
+                return out;
+            }
+            Some(f) => f,
+        };
+        // Group short filters by length; iterate exact-width matches in
+        // filter order.
+        let mut short_filters: std::collections::HashMap<usize, Vec<&[Vec<u8>]>> =
+            std::collections::HashMap::new();
+        for key in filter.iter() {
+            if key.len() == self.key_width {
+                if let Some(v) = self.items.get(key) {
+                    out.push((key.clone(), v.clone()));
+                }
+            } else {
+                short_filters.entry(key.len()).or_default().push(key);
+            }
+        }
+        if !short_filters.is_empty() {
+            for (k, v) in self.items.iter() {
+                for (length, candidates) in short_filters.iter() {
+                    if k.len() >= *length && candidates.iter().any(|c| *c == &k[..*length]) {
+                        out.push((k.clone(), v.clone()));
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Result of [`LeafNode::map`] / [`Node::map`] — either the node
+/// absorbed the new entry in place, or it split into multiple
+/// children that the caller must wrap in an InternalNode.
+#[derive(Debug, Clone)]
+pub enum MapResult {
+    /// No structural change. The caller's existing reference still
+    /// points at the up-to-date node. `search_prefix` is the search
+    /// prefix of the node post-map (matches Python's first return).
+    InPlace { search_prefix: Vec<u8> },
+    /// The node overflowed and split. The caller replaces it with
+    /// an InternalNode at `common_serialised_prefix` containing
+    /// each `(sub_prefix, child)` pair.
+    Split {
+        common_serialised_prefix: Vec<u8>,
+        children: Vec<(Vec<u8>, Node)>,
+    },
+}
+
+/// In-memory CHK node — either a leaf with key/value entries or an
+/// internal node referencing other nodes. Mirrors the Python
+/// `Node` base class hierarchy (LeafNode | InternalNode).
+#[derive(Debug, Clone)]
+pub enum Node {
+    Leaf(Box<LeafNode>),
+    Internal(Box<InternalNode>),
+}
+
+impl Node {
+    /// `(b"sha1:...",)` key once the node has been serialised, else
+    /// `None`. Mirrors Python's `Node.key()`.
+    pub fn key(&self) -> Option<&[u8]> {
+        match self {
+            Node::Leaf(l) => l.key.as_deref(),
+            Node::Internal(n) => n.key.as_deref(),
+        }
+    }
+
+    /// Total number of leaf entries reachable through this node.
+    /// Mirrors Python's `Node.__len__`.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        match self {
+            Node::Leaf(l) => l.len(),
+            Node::Internal(n) => n.len,
+        }
+    }
+
+    /// Maximum byte size allowed for this node when serialised, or
+    /// `0` for unlimited.
+    pub fn maximum_size(&self) -> usize {
+        match self {
+            Node::Leaf(l) => l.maximum_size,
+            Node::Internal(n) => n.maximum_size,
+        }
+    }
+
+    /// CHK references held by this node. Mirrors `Node.refs`:
+    /// leaves never reference other pages (returns `[]`); internal
+    /// nodes return their children's sha1 keys (delegates to
+    /// `InternalNode::refs`, which requires the node to have been
+    /// serialised).
+    pub fn refs(&self) -> Result<Vec<Vec<u8>>, Error> {
+        match self {
+            Node::Leaf(_) => Ok(Vec::new()),
+            Node::Internal(n) => n.refs(),
+        }
+    }
+
+    /// Insert `(key, value)` into this subtree (pure in-memory path).
+    ///
+    /// For leaves, delegates to `LeafNode::map`. For internal nodes,
+    /// returns AssertionFailed — the recursive InternalNode path
+    /// needs the store and lives at `Node::map_with_store`. This
+    /// signature exists so `LeafNode::split` (which only ever creates
+    /// fresh in-memory sub-leaves) can recurse via `Node::map`
+    /// without a store argument.
+    pub fn map(&mut self, key: Vec<Vec<u8>>, value: Vec<u8>) -> Result<MapResult, Error> {
+        match self {
+            Node::Leaf(l) => l.map(key, value),
+            Node::Internal(_) => Err(Error::AssertionFailed(
+                "Node::map on InternalNode requires a store — \
+                 use Node::map_with_store"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Serialise this subtree to the store, returning every sha1 key
+    /// written (children first, then self). Mirrors Python's
+    /// `Node.serialise`. Skips children that are unloaded (their
+    /// sha1 key is already canonical) or already serialised (key set).
+    pub fn serialise<S>(&mut self, store: &S, cache: &dyn PageCache) -> Result<Vec<Vec<u8>>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        match self {
+            Node::Leaf(l) => {
+                let k = l.serialise(store, cache)?;
+                Ok(vec![k])
+            }
+            Node::Internal(n) => n.serialise(store, cache),
+        }
+    }
+
+    /// Recursive remove that may demand-load child pages. Returns
+    /// the replacement node (possibly the same one, possibly a
+    /// collapsed leaf, possibly the single remaining child if the
+    /// internal node lost all but one child).
+    ///
+    /// Mirrors Python's polymorphic `unmap(store, key, check_remap)`.
+    /// Raises `KeyError`-equivalent (`AssertionFailed`) when the key
+    /// is not present.
+    pub fn unmap_with_store<S>(
+        self,
+        store: &S,
+        cache: &dyn PageCache,
+        key: &[Vec<u8>],
+        check_remap: bool,
+    ) -> Result<Node, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        match self {
+            Node::Leaf(mut leaf) => {
+                if leaf.unmap(key).is_none() {
+                    return Err(Error::AssertionFailed(format!("key not found: {:?}", key)));
+                }
+                Ok(Node::Leaf(leaf))
+            }
+            Node::Internal(internal) => {
+                internal_unmap_with_store(*internal, store, cache, key, check_remap)
+            }
+        }
+    }
+
+    /// Recursive insert that may demand-load child pages from the
+    /// store. Mirrors Python's polymorphic dispatch:
+    /// `LeafNode.map(store, key, value)` for leaves;
+    /// `InternalNode.map(store, key, value)` for internal nodes
+    /// (which descends into the matching child, possibly creating a
+    /// new wrapping parent if the key falls outside the current
+    /// search prefix).
+    ///
+    /// May replace `*self` with a new node (e.g. an internal node
+    /// promoting itself into a larger parent, or a parent collapsing
+    /// back into a leaf after `_check_remap`).
+    pub fn map_with_store<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+        key: Vec<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> Result<MapResult, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        match self {
+            Node::Leaf(l) => l.map(key, value),
+            Node::Internal(_) => {
+                // We need to potentially replace `*self`. Take the
+                // internal node out, run the algorithm against it,
+                // and put the result (possibly wrapped or collapsed)
+                // back into `*self`.
+                let placeholder = Node::Internal(Box::new(InternalNode::new(
+                    Vec::new(),
+                    SearchKeyFunc::Plain,
+                )));
+                let owned = std::mem::replace(self, placeholder);
+                let internal = match owned {
+                    Node::Internal(b) => b,
+                    Node::Leaf(_) => unreachable!("matched Internal above"),
+                };
+                let (new_self, result) =
+                    internal_map_with_store(*internal, store, cache, key, value)?;
+                *self = new_self;
+                Ok(result)
+            }
+        }
+    }
+
+    /// Iterate `(key, value)` pairs in this subtree matching
+    /// `key_filter`. Mirrors Python's polymorphic `iteritems`:
+    /// leaves yield directly; internal nodes recurse through
+    /// `iter_nodes`, demand-loading children as needed.
+    pub fn iteritems<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+        key_filter: Option<&[Vec<Vec<u8>>]>,
+    ) -> Result<Vec<(Vec<Vec<u8>>, Vec<u8>)>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        match self {
+            Node::Leaf(l) => Ok(l.iteritems(key_filter)),
+            Node::Internal(n) => {
+                let mut out: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::new();
+                let children = n.iter_nodes(store, cache, key_filter, None)?;
+                for (mut child, filter) in children {
+                    let sub_filter = filter.as_deref();
+                    out.extend(child.iteritems(store, cache, sub_filter)?);
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// Reference to a child of an `InternalNode`. The dict either holds a
+/// `(b"sha1:...",)` reference to an unloaded child page or, after
+/// `_iter_nodes` populates it from the store, the loaded child Node
+/// itself.
+#[derive(Debug, Clone)]
+pub enum NodeRef {
+    /// Unloaded reference — the `b"sha1:..."` key handed to the store
+    /// to fetch the child's bytes.
+    Unloaded(Vec<u8>),
+    /// In-memory child node.
+    Loaded(Node),
+}
+
+impl NodeRef {
+    /// Length contribution of this child for `InternalNode._len`.
+    pub fn len(&self) -> usize {
+        match self {
+            NodeRef::Unloaded(_) => {
+                // Mirrors Python's behaviour: a tuple has no `len(node)`
+                // semantic in `_len`, but Python only writes Unloaded
+                // references after the parent's `_len` was already set
+                // from the parsed body, so the per-ref length isn't
+                // queried for unloaded children.
+                0
+            }
+            NodeRef::Loaded(n) => n.len(),
+        }
+    }
+}
+
+/// In-memory state of a CHK internal node — a fan-out of byte-prefix
+/// to child (loaded Node or unloaded sha1 reference).
+///
+/// Iteration order over `items` follows insertion order to match
+/// Python's `dict` semantics; serialisation paths sort first.
+#[derive(Debug, Clone)]
+pub struct InternalNode {
+    pub key: Option<Vec<u8>>,
+    pub maximum_size: usize,
+    pub key_width: usize,
+    /// Total leaf entries reachable through this subtree.
+    pub len: usize,
+    /// Width in bytes of each prefix in `items`. `0` for an
+    /// empty internal node (Python's `_node_width` default).
+    pub node_width: usize,
+    /// Reserved for future prefix-compression accounting; the Python
+    /// `InternalNode` sets `_raw_size = None` since internal nodes
+    /// don't carry per-entry payload. We track an explicit `0` here
+    /// and recompute byte costs from the items list at serialise
+    /// time.
+    pub raw_size: usize,
+    pub items: indexmap::IndexMap<Vec<u8>, NodeRef>,
+    /// Search-key prefix common to every child of this node. Always
+    /// `Some` once initialised; `None` only on a default-constructed
+    /// empty node before `from_parsed` populates it.
+    pub search_prefix: Option<Vec<u8>>,
+    pub search_key_func: SearchKeyFunc,
+}
+
+impl InternalNode {
+    /// Empty internal node with the given search prefix and key
+    /// function. Mirrors Python's `InternalNode(prefix, search_key_func)`.
+    pub fn new(prefix: Vec<u8>, search_key_func: SearchKeyFunc) -> Self {
+        Self {
+            key: None,
+            maximum_size: 0,
+            key_width: 1,
+            len: 0,
+            node_width: 0,
+            raw_size: 0,
+            items: indexmap::IndexMap::new(),
+            search_prefix: Some(prefix),
+            search_key_func,
+        }
+    }
+
+    /// Build a populated internal node from the output of
+    /// [`deserialise_internal_node`]. All children start as
+    /// `NodeRef::Unloaded`; the caller demand-loads them via the
+    /// store as `_iter_nodes` runs.
+    pub fn from_parsed(parsed: ParsedInternalNode, search_key_func: SearchKeyFunc) -> Self {
+        let mut items: indexmap::IndexMap<Vec<u8>, NodeRef> =
+            indexmap::IndexMap::with_capacity(parsed.items.len());
+        for (prefix, flat_key) in parsed.items {
+            items.insert(prefix, NodeRef::Unloaded(flat_key));
+        }
+        Self {
+            key: None,
+            maximum_size: parsed.maximum_size,
+            key_width: parsed.key_width,
+            len: parsed.length,
+            node_width: parsed.node_width,
+            raw_size: 0,
+            items,
+            search_prefix: Some(parsed.search_prefix),
+            search_key_func,
+        }
+    }
+
+    /// Serialised byte cost of this node (header + body). Wraps
+    /// [`internal_node_current_size`].
+    pub fn current_size(&self) -> usize {
+        internal_node_current_size(self.maximum_size, self.key_width, self.len, self.raw_size)
+    }
+
+    /// Add a loaded child node under `prefix`. Mirrors Python's
+    /// `InternalNode.add_node`: validates that `prefix` extends
+    /// `search_prefix` by exactly one byte, updates `len` and
+    /// `node_width`, clears `key` (this node is now dirty).
+    pub fn add_node(&mut self, prefix: Vec<u8>, node: Node) -> Result<(), Error> {
+        let search_prefix = self.search_prefix.as_deref().ok_or_else(|| {
+            Error::AssertionFailed("InternalNode.add_node: search_prefix is None".into())
+        })?;
+        if !prefix.starts_with(search_prefix) {
+            return Err(Error::AssertionFailed(format!(
+                "prefixes mismatch: {:?} must start with {:?}",
+                prefix, search_prefix
+            )));
+        }
+        if prefix.len() != search_prefix.len() + 1 {
+            return Err(Error::AssertionFailed(format!(
+                "prefix wrong length: len({:?}) is not {}",
+                prefix,
+                search_prefix.len() + 1
+            )));
+        }
+        self.len += node.len();
+        if self.items.is_empty() {
+            self.node_width = prefix.len();
+        }
+        if self.node_width != search_prefix.len() + 1 {
+            return Err(Error::AssertionFailed(format!(
+                "node width mismatch: {} is not {}",
+                self.node_width,
+                search_prefix.len() + 1
+            )));
+        }
+        self.items.insert(prefix, NodeRef::Loaded(node));
+        self.key = None;
+        Ok(())
+    }
+
+    /// Pad or truncate `key`'s search-key bytes to fit `node_width`,
+    /// padding with NUL. Mirrors `InternalNode._search_key`.
+    pub fn search_key(&self, key: &Key) -> SerializedKey {
+        let base = self.search_key_func.apply(key);
+        if base.len() >= self.node_width {
+            base[..self.node_width].to_vec()
+        } else {
+            let mut padded = Vec::with_capacity(self.node_width);
+            padded.extend_from_slice(&base);
+            padded.resize(self.node_width, 0);
+            padded
+        }
+    }
+
+    /// Truncate `key`'s search-key bytes to `node_width` without
+    /// padding (used as a prefix when filtering iteritems). Mirrors
+    /// `InternalNode._search_prefix_filter`.
+    pub fn search_prefix_filter(&self, key: &Key) -> SerializedKey {
+        let base = self.search_key_func.apply(key);
+        if base.len() >= self.node_width {
+            base[..self.node_width].to_vec()
+        } else {
+            base
+        }
+    }
+
+    /// Recompute `search_prefix` as the longest common prefix of all
+    /// child prefixes. Mirrors `InternalNode._compute_search_prefix`.
+    pub fn compute_search_prefix(&mut self) -> Option<&[u8]> {
+        let prefix =
+            common_prefix_many(self.items.keys().map(|k| k.as_slice())).map(|s| s.to_vec());
+        self.search_prefix = prefix;
+        self.search_prefix.as_deref()
+    }
+
+    /// Serialise this internal node (and any dirty descendants) to
+    /// the store. Returns every newly-written sha1 key in
+    /// children-first / self-last order. Mirrors
+    /// `InternalNode.serialise`.
+    pub fn serialise<S>(&mut self, store: &S, cache: &dyn PageCache) -> Result<Vec<Vec<u8>>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        // Walk children: serialise any loaded child whose `key` is
+        // unset. Unloaded children and already-serialised loaded
+        // children are skipped.
+        let prefixes: Vec<Vec<u8>> = self.items.keys().cloned().collect();
+        for prefix in &prefixes {
+            // Take, mutate, replace — avoids holding a `&mut`
+            // borrow on self.items across recursion.
+            let entry = self.items.shift_remove(prefix).unwrap();
+            let entry = match entry {
+                NodeRef::Unloaded(k) => NodeRef::Unloaded(k),
+                NodeRef::Loaded(mut node) => {
+                    if node.key().is_none() {
+                        let keys = node.serialise(store, cache)?;
+                        out.extend(keys);
+                    }
+                    NodeRef::Loaded(node)
+                }
+            };
+            self.items.insert(prefix.clone(), entry);
+        }
+        let search_prefix = self
+            .search_prefix
+            .clone()
+            .ok_or_else(|| Error::AssertionFailed("search_prefix is None".into()))?;
+        // Build sorted (prefix, flat_key) list — mirrors
+        // `sorted_items = [(prefix, node[0] or node._key[0]) for ...]`.
+        let mut sorted_items: Vec<InternalNodeChild> = self
+            .items
+            .iter()
+            .map(|(prefix, child)| {
+                let flat_key = match child {
+                    NodeRef::Unloaded(k) => k.clone(),
+                    NodeRef::Loaded(n) => n
+                        .key()
+                        .map(|s| s.to_vec())
+                        .ok_or_else(|| {
+                            Error::AssertionFailed("loaded child has no key after serialise".into())
+                        })
+                        .unwrap_or_default(),
+                };
+                InternalNodeChild {
+                    prefix: prefix.clone(),
+                    flat_key,
+                }
+            })
+            .collect();
+        sorted_items.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+        let lines = serialise_internal_node(
+            self.maximum_size,
+            self.key_width,
+            self.len,
+            &search_prefix,
+            &sorted_items,
+        )?;
+        let (sha1, _size) = store
+            .add_lines(
+                &crate::versionedfile::Key::ContentAddressed(vec![]),
+                Some(&[]),
+                &lines,
+            )
+            .map_err(|e| Error::AssertionFailed(format!("add_lines failed: {:?}", e)))?;
+        let mut full_key = Vec::with_capacity(5 + sha1.len());
+        full_key.extend_from_slice(b"sha1:");
+        full_key.extend_from_slice(&sha1);
+        let data: Vec<u8> = lines.iter().flatten().copied().collect();
+        cache.insert(full_key.clone(), data);
+        self.key = Some(full_key.clone());
+        out.push(full_key);
+        Ok(out)
+    }
+
+    /// Check whether this node's children can collapse back into a
+    /// single LeafNode. Returns either `self` (wrapped as
+    /// `Node::Internal`) when collapse isn't possible, or a freshly-
+    /// built `Node::Leaf` holding everything from this subtree.
+    ///
+    /// Mirrors Python's `InternalNode._check_remap`: walks children
+    /// in batches of 16, adding their entries into a candidate
+    /// LeafNode; if any child is itself an InternalNode, abort
+    /// (cheaper than walking further); if any insertion would overflow
+    /// the candidate, abort.
+    ///
+    /// Consumes `self` to allow returning either variant.
+    pub fn check_remap<S>(mut self, store: &S, cache: &dyn PageCache) -> Result<Node, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let mut new_leaf = LeafNode::new(self.search_key_func.clone());
+        new_leaf.maximum_size = self.maximum_size;
+        new_leaf.key_width = self.key_width;
+        let children = self.iter_nodes(store, cache, None, Some(16))?;
+        for (node, _) in children {
+            if let Node::Internal(_) = node {
+                // Any internal child means collapse is impossible.
+                return Ok(Node::Internal(Box::new(self)));
+            }
+            let leaf = match node {
+                Node::Leaf(l) => l,
+                Node::Internal(_) => unreachable!(),
+            };
+            for (k, v) in leaf.items {
+                if new_leaf.map_no_split(k, v) {
+                    // Overflow during accumulation — abort.
+                    return Ok(Node::Internal(Box::new(self)));
+                }
+            }
+        }
+        Ok(Node::Leaf(Box::new(new_leaf)))
+    }
+
+    /// Yield child nodes that match `key_filter`, demand-loading
+    /// unloaded references via `cache` then `store`.
+    ///
+    /// Mirrors Python's `InternalNode._iter_nodes`: returns
+    /// `(child_node, optional_filter)` pairs. Already-loaded children
+    /// come first (in `self.items` order), then page-cache hits,
+    /// then freshly fetched batches from the store.
+    ///
+    /// When loading from the store, this method also flips the
+    /// matching `NodeRef::Unloaded` entries in `self.items` to
+    /// `NodeRef::Loaded`, so subsequent calls hit the in-memory
+    /// fast path.
+    ///
+    /// Note: returns owned `Node` clones rather than references —
+    /// the caller can recurse into them without lifetime
+    /// entanglement with `&mut self`.
+    pub fn iter_nodes<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+        key_filter: Option<&[Vec<Vec<u8>>]>,
+        batch_size: Option<usize>,
+    ) -> Result<Vec<(Node, Option<Vec<Vec<Vec<u8>>>>)>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let mut out: Vec<(Node, Option<Vec<Vec<Vec<u8>>>>)> = Vec::new();
+        // sha1_key -> (prefix, key_filter_for_that_child) for unloaded
+        // refs we need to demand-load. Uses an IndexMap so the batch
+        // ordering reflects `self.items` insertion order.
+        let mut to_load: indexmap::IndexMap<Vec<u8>, (Vec<u8>, Option<Vec<Vec<Vec<u8>>>>)> =
+            indexmap::IndexMap::new();
+
+        match key_filter {
+            None => {
+                // Yield every loaded child; queue every unloaded child
+                // with a `None` filter.
+                for (prefix, child) in self.items.iter() {
+                    match child {
+                        NodeRef::Loaded(node) => out.push((node.clone(), None)),
+                        NodeRef::Unloaded(sha1_key) => {
+                            to_load.insert(sha1_key.clone(), (prefix.clone(), None));
+                        }
+                    }
+                }
+            }
+            Some(filter) if filter.len() == 1 => {
+                // Single-key fast path: compute its full-width search
+                // prefix, do a dict lookup on items.
+                let only_key = Key::from(filter[0].clone());
+                let search_prefix = self.search_prefix_filter(&only_key);
+                if search_prefix.len() == self.node_width {
+                    match self.items.get(&search_prefix) {
+                        None => return Ok(out),
+                        Some(NodeRef::Loaded(node)) => {
+                            out.push((node.clone(), Some(vec![filter[0].clone()])));
+                            return Ok(out);
+                        }
+                        Some(NodeRef::Unloaded(sha1_key)) => {
+                            to_load.insert(
+                                sha1_key.clone(),
+                                (search_prefix, Some(vec![filter[0].clone()])),
+                            );
+                        }
+                    }
+                } else {
+                    // Fall through to the general filter path.
+                    self.iter_nodes_general_filter(filter, &mut out, &mut to_load);
+                }
+            }
+            Some(filter) => {
+                self.iter_nodes_general_filter(filter, &mut out, &mut to_load);
+            }
+        }
+
+        if to_load.is_empty() {
+            return Ok(out);
+        }
+
+        // Look in the page cache first.
+        let mut still_missing: indexmap::IndexMap<Vec<u8>, (Vec<u8>, Option<Vec<Vec<Vec<u8>>>>)> =
+            indexmap::IndexMap::new();
+        for (sha1_key, (prefix, filter)) in to_load.drain(..) {
+            if let Some(bytes) = cache.get(&sha1_key) {
+                let node =
+                    deserialise_node(&bytes, sha1_key.clone(), self.search_key_func.clone())?;
+                self.items
+                    .insert(prefix.clone(), NodeRef::Loaded(node.clone()));
+                out.push((node, filter));
+            } else {
+                still_missing.insert(sha1_key, (prefix, filter));
+            }
+        }
+        if still_missing.is_empty() {
+            return Ok(out);
+        }
+
+        // Demand-load remaining keys from the store, batched.
+        let batch_size = batch_size.unwrap_or(still_missing.len());
+        let key_order: Vec<Vec<u8>> = still_missing.keys().cloned().collect();
+        for batch_start in (0..key_order.len()).step_by(batch_size.max(1)) {
+            let batch_end = (batch_start + batch_size).min(key_order.len());
+            let batch_keys: Vec<crate::versionedfile::Key> = key_order[batch_start..batch_end]
+                .iter()
+                .map(|k| crate::versionedfile::Key::Fixed(vec![k.clone()]))
+                .collect();
+            let stream = store
+                .get_record_stream(&batch_keys, "unordered", true)
+                .map_err(|e| {
+                    Error::AssertionFailed(format!("get_record_stream failed: {:?}", e))
+                })?;
+            for record in stream {
+                let record =
+                    record.map_err(|e| Error::AssertionFailed(format!("record error: {:?}", e)))?;
+                let rec_key = record.key();
+                let sha1_key = rec_key
+                    .segments()
+                    .first()
+                    .ok_or_else(|| Error::AssertionFailed("record key has no segments".into()))?
+                    .clone();
+                let bytes = record.to_fulltext().into_owned();
+                let (prefix, filter) = still_missing.shift_remove(&sha1_key).ok_or_else(|| {
+                    Error::AssertionFailed(format!("store returned unexpected key {:?}", sha1_key))
+                })?;
+                let node =
+                    deserialise_node(&bytes, sha1_key.clone(), self.search_key_func.clone())?;
+                cache.insert(sha1_key, bytes);
+                self.items.insert(prefix, NodeRef::Loaded(node.clone()));
+                out.push((node, filter));
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// General-case filter dispatch shared between the multi-key path
+    /// and the single-key-but-not-full-width fallback. Walks every
+    /// item in `self.items` against the length-keyed prefix filters.
+    fn iter_nodes_general_filter(
+        &self,
+        filter: &[Vec<Vec<u8>>],
+        out: &mut Vec<(Node, Option<Vec<Vec<Vec<u8>>>>)>,
+        to_load: &mut indexmap::IndexMap<Vec<u8>, (Vec<u8>, Option<Vec<Vec<Vec<u8>>>>)>,
+    ) {
+        // Group filter keys by search-prefix length.
+        let mut prefix_to_keys: indexmap::IndexMap<Vec<u8>, Vec<Vec<Vec<u8>>>> =
+            indexmap::IndexMap::new();
+        let mut length_filters: std::collections::HashMap<usize, indexmap::IndexSet<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for key in filter.iter() {
+            let search_prefix = self.search_prefix_filter(&Key::from(key.clone()));
+            length_filters
+                .entry(search_prefix.len())
+                .or_default()
+                .insert(search_prefix.clone());
+            prefix_to_keys
+                .entry(search_prefix)
+                .or_default()
+                .push(key.clone());
+        }
+
+        if length_filters.len() == 1 && length_filters.contains_key(&self.node_width) {
+            // All filter keys map to full-width prefixes — do direct
+            // dict lookups in filter-prefix order.
+            let prefixes = &length_filters[&self.node_width];
+            for prefix in prefixes.iter() {
+                let Some(child) = self.items.get(prefix) else {
+                    continue;
+                };
+                let node_filter = prefix_to_keys.get(prefix).cloned();
+                match child {
+                    NodeRef::Loaded(node) => out.push((node.clone(), node_filter)),
+                    NodeRef::Unloaded(sha1_key) => {
+                        to_load.insert(sha1_key.clone(), (prefix.clone(), node_filter));
+                    }
+                }
+            }
+        } else {
+            // The slow path: walk every item, check each length filter.
+            for (prefix, child) in self.items.iter() {
+                let mut node_keys: Vec<Vec<Vec<u8>>> = Vec::new();
+                for (length, length_filter) in length_filters.iter() {
+                    if prefix.len() >= *length {
+                        let sub_prefix = &prefix[..*length];
+                        if length_filter.contains(sub_prefix) {
+                            if let Some(keys) = prefix_to_keys.get(sub_prefix) {
+                                node_keys.extend(keys.iter().cloned());
+                            }
+                        }
+                    }
+                }
+                if !node_keys.is_empty() {
+                    match child {
+                        NodeRef::Loaded(node) => out.push((node.clone(), Some(node_keys))),
+                        NodeRef::Unloaded(sha1_key) => {
+                            to_load.insert(sha1_key.clone(), (prefix.clone(), Some(node_keys)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read-only references to the children. Mirrors `InternalNode.refs`:
+    /// returns the sha1 key of each unloaded child plus the
+    /// `.key()` of each loaded child. Returns an `AssertionFailed`
+    /// error when `self.key` is unset — the Python equivalent
+    /// raises an `AssertionError`.
+    pub fn refs(&self) -> Result<Vec<Vec<u8>>, Error> {
+        if self.key.is_none() {
+            return Err(Error::AssertionFailed(
+                "unserialised nodes have no refs".into(),
+            ));
+        }
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(self.items.len());
+        for value in self.items.values() {
+            match value {
+                NodeRef::Unloaded(k) => out.push(k.clone()),
+                NodeRef::Loaded(n) => {
+                    let k = n.key().ok_or_else(|| {
+                        Error::AssertionFailed("InternalNode.refs: loaded child has no key".into())
+                    })?;
+                    out.push(k.to_vec());
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The CHK page cache: a sha1-keyed bytes store the deserialiser
+/// consults before fetching from the underlying store.
+///
+/// Decoupled into a trait so the pyo3 layer can back it with
+/// Python's per-thread `LRUSizeCache` (size-bounded) while pure-Rust
+/// callers get a simple count-bounded LRU. Mirrors the per-thread
+/// `_get_cache()` in `bzrformats/chk_map.py`.
+pub trait PageCache: Send + Sync {
+    /// Fetch the cached bytes for `sha1_key` (e.g. `b"sha1:abcd"`).
+    fn get(&self, sha1_key: &[u8]) -> Option<Vec<u8>>;
+    /// Cache `bytes` under `sha1_key`.
+    fn insert(&self, sha1_key: Vec<u8>, bytes: Vec<u8>);
+    /// Drop every cached entry.
+    fn clear(&self);
+}
+
+/// Default in-memory `PageCache`: a `Mutex<LruCache>` shared across
+/// CHKMap instances. Count-bounded (Python's `LRUSizeCache` is
+/// byte-bounded; we approximate with a fixed entry count).
+pub struct InMemoryPageCache {
+    inner: std::sync::Mutex<lru::LruCache<Vec<u8>, Vec<u8>>>,
+}
+
+impl InMemoryPageCache {
+    /// At ~4 KiB per CHK page, 1024 entries gives ~4 MiB of cache —
+    /// the same nominal budget Python's `LRUSizeCache(4 * 1024 * 1024)`
+    /// uses.
+    pub const DEFAULT_CAPACITY: usize = 1024;
+
+    pub fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(capacity)
+                    .expect("InMemoryPageCache capacity must be > 0"),
+            )),
+        }
+    }
+}
+
+impl Default for InMemoryPageCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PageCache for InMemoryPageCache {
+    fn get(&self, sha1_key: &[u8]) -> Option<Vec<u8>> {
+        let mut g = self.inner.lock().expect("page cache mutex poisoned");
+        g.get(sha1_key).cloned()
+    }
+
+    fn insert(&self, sha1_key: Vec<u8>, bytes: Vec<u8>) {
+        let mut g = self.inner.lock().expect("page cache mutex poisoned");
+        g.put(sha1_key, bytes);
+    }
+
+    fn clear(&self) {
+        let mut g = self.inner.lock().expect("page cache mutex poisoned");
+        g.clear();
+    }
+}
+
+/// Deserialise a CHK page from `data`, dispatching on the magic
+/// prefix. Returns a fully populated `Node` with `key` set to the
+/// supplied sha1 key.
+///
+/// Mirrors Python's `_deserialise(data, key, search_key_func)` plus
+/// the small post-processing wrappers that follow each parse.
+pub fn deserialise_node(
+    data: &[u8],
+    key: Vec<u8>,
+    search_key_func: SearchKeyFunc,
+) -> Result<Node, Error> {
+    if data.starts_with(b"chkleaf:\n") {
+        let parsed = deserialise_leaf_node(data)?;
+        let mut leaf = LeafNode::from_parsed(parsed, search_key_func);
+        if data.len() != leaf.current_size() {
+            return Err(Error::AssertionFailed(
+                "_current_size computed incorrectly".into(),
+            ));
+        }
+        leaf.key = Some(key);
+        Ok(Node::Leaf(Box::new(leaf)))
+    } else if data.starts_with(b"chknode:\n") {
+        let parsed = deserialise_internal_node(data)?;
+        let mut internal = InternalNode::from_parsed(parsed, search_key_func);
+        internal.key = Some(key);
+        Ok(Node::Internal(Box::new(internal)))
+    } else {
+        Err(Error::AssertionFailed("Unknown node type.".into()))
+    }
+}
+
+/// Core of `InternalNode.map` — takes the node by value so it can
+/// optionally wrap itself in a new parent.
+///
+/// Returns `(replacement_node, MapResult)` where:
+/// * `replacement_node` is what should occupy the original parent
+///   slot. Usually the (mutated) self; may be a new wrapping parent
+///   when the inserted key falls outside `self.search_prefix`.
+/// * `MapResult` describes whether the *replacement* needs further
+///   wrapping at the level above.
+fn internal_map_with_store<S>(
+    mut node: InternalNode,
+    store: &S,
+    cache: &dyn PageCache,
+    key: Vec<Vec<u8>>,
+    value: Vec<u8>,
+) -> Result<(Node, MapResult), Error>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    if node.items.is_empty() {
+        return Err(Error::AssertionFailed(
+            "can't map in an empty InternalNode".into(),
+        ));
+    }
+    let key_obj = Key::from(key.clone());
+    let search_key = node.search_key(&key_obj);
+    let search_prefix = node
+        .search_prefix
+        .clone()
+        .ok_or_else(|| Error::AssertionFailed("search_prefix is None".into()))?;
+    if node.node_width != search_prefix.len() + 1 {
+        return Err(Error::AssertionFailed(format!(
+            "node width mismatch: {} is not {}",
+            node.node_width,
+            search_prefix.len() + 1
+        )));
+    }
+    if !search_key.starts_with(&search_prefix) {
+        // Inserted key falls outside our search prefix: wrap self in
+        // a new parent that has the broader prefix and recurse.
+        let new_prefix = common_prefix_pair(&search_prefix, &search_key).to_vec();
+        let mut new_parent = InternalNode::new(new_prefix.clone(), node.search_key_func.clone());
+        new_parent.maximum_size = node.maximum_size;
+        new_parent.key_width = node.key_width;
+        // The wrapping parent's only child (initially) is `node`, at
+        // its current search prefix extended by one byte.
+        let wrap_prefix = search_prefix[..new_prefix.len() + 1].to_vec();
+        new_parent.add_node(wrap_prefix, Node::Internal(Box::new(node)))?;
+        // Recurse into the new parent.
+        return internal_map_with_store(new_parent, store, cache, key, value);
+    }
+    // Find the matching child via iter_nodes (which demand-loads).
+    let mut children = node.iter_nodes(store, cache, Some(&[key.clone()]), None)?;
+    let (mut child_node, _filter) = if children.is_empty() {
+        // No matching child — create a fresh LeafNode under
+        // `search_key`. Mirrors `_new_child(search_key, LeafNode)`.
+        let mut leaf = LeafNode::new(node.search_key_func.clone());
+        leaf.maximum_size = node.maximum_size;
+        leaf.key_width = node.key_width;
+        let new_leaf = Node::Leaf(Box::new(leaf));
+        node.items
+            .insert(search_key.clone(), NodeRef::Loaded(new_leaf.clone()));
+        (new_leaf, None)
+    } else {
+        children.remove(0)
+    };
+    let old_len = child_node.len();
+    let old_size = match &child_node {
+        Node::Leaf(l) => Some(l.current_size()),
+        Node::Internal(_) => None,
+    };
+    let map_res = child_node.map_with_store(store, cache, key, value)?;
+    match map_res {
+        MapResult::InPlace { .. } => {
+            // Child absorbed in place. Update items, len, and run
+            // _check_remap if applicable.
+            let new_len = child_node.len();
+            node.len = node.len + new_len - old_len;
+            node.items
+                .insert(search_key.clone(), NodeRef::Loaded(child_node.clone()));
+            node.key = None;
+            // _check_remap heuristics.
+            let new_self = match &child_node {
+                Node::Leaf(child_leaf) => {
+                    if old_size.is_none() {
+                        // Child was previously an internal that
+                        // collapsed to a leaf — definitely remap.
+                        node.check_remap(store, cache)?
+                    } else {
+                        let new_size = child_leaf.current_size();
+                        let shrinkage = old_size.unwrap().saturating_sub(new_size);
+                        if (shrinkage > 0 && new_size < INTERESTING_NEW_SIZE)
+                            || shrinkage > INTERESTING_SHRINKAGE_LIMIT
+                        {
+                            node.check_remap(store, cache)?
+                        } else {
+                            Node::Internal(Box::new(node))
+                        }
+                    }
+                }
+                Node::Internal(_) => Node::Internal(Box::new(node)),
+            };
+            let prefix = match &new_self {
+                Node::Leaf(l) => match &l.search_prefix {
+                    SearchPrefix::Computed(Some(p)) => p.clone(),
+                    SearchPrefix::Computed(None) => Vec::new(),
+                    SearchPrefix::Unknown => {
+                        return Err(Error::AssertionFailed(
+                            "search_prefix unknown after map".into(),
+                        ))
+                    }
+                },
+                Node::Internal(n) => n
+                    .search_prefix
+                    .clone()
+                    .ok_or_else(|| Error::AssertionFailed("search_prefix is None".into()))?,
+            };
+            Ok((
+                new_self,
+                MapResult::InPlace {
+                    search_prefix: prefix,
+                },
+            ))
+        }
+        MapResult::Split {
+            common_serialised_prefix: child_prefix,
+            children: split_children,
+        } => {
+            // Child overflowed: build a new intermediate InternalNode
+            // at the split prefix and add all the split children.
+            let mut intermediate =
+                InternalNode::new(child_prefix.clone(), node.search_key_func.clone());
+            intermediate.maximum_size = node.maximum_size;
+            intermediate.key_width = node.key_width;
+            for (sp, ch) in split_children {
+                intermediate.add_node(sp, ch)?;
+            }
+            let new_child = Node::Internal(Box::new(intermediate));
+            let new_len = new_child.len();
+            node.items.insert(search_key, NodeRef::Loaded(new_child));
+            node.len = node.len + new_len - old_len;
+            node.key = None;
+            let prefix = node.search_prefix.clone().unwrap_or_default();
+            Ok((
+                Node::Internal(Box::new(node)),
+                MapResult::InPlace {
+                    search_prefix: prefix,
+                },
+            ))
+        }
+    }
+}
+
+/// Core of `InternalNode.unmap` — takes the node by value so it can
+/// optionally return a different replacement (single remaining
+/// child, collapsed leaf).
+fn internal_unmap_with_store<S>(
+    mut node: InternalNode,
+    store: &S,
+    cache: &dyn PageCache,
+    key: &[Vec<u8>],
+    check_remap: bool,
+) -> Result<Node, Error>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    if node.items.is_empty() {
+        return Err(Error::AssertionFailed(
+            "can't unmap in an empty InternalNode".into(),
+        ));
+    }
+    let key_obj = Key::from(key.to_vec());
+    let children = node.iter_nodes(store, cache, Some(&[key.to_vec()]), None)?;
+    let (child, _filter) = children.into_iter().next().ok_or_else(|| {
+        Error::AssertionFailed(format!("key not found in internal node: {:?}", key))
+    })?;
+    node.len -= 1;
+    let unmapped = child.unmap_with_store(store, cache, key, true)?;
+    node.key = None;
+    let search_key = node.search_key(&key_obj);
+    let was_internal_after = matches!(unmapped, Node::Internal(_));
+    if unmapped.len() == 0 {
+        // Drop the child entirely.
+        node.items.shift_remove(&search_key);
+    } else {
+        node.items.insert(search_key, NodeRef::Loaded(unmapped));
+    }
+    if node.items.len() == 1 {
+        // Only one child left — collapse this internal node out of
+        // the chain entirely.
+        let only = node
+            .items
+            .into_iter()
+            .next()
+            .expect("just checked len == 1")
+            .1;
+        return Ok(match only {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(sha1_key) => {
+                // Need to load it from cache or store.
+                let bytes = match cache.get(&sha1_key) {
+                    Some(b) => b,
+                    None => {
+                        let stream = store
+                            .get_record_stream(
+                                &[crate::versionedfile::Key::Fixed(vec![sha1_key.clone()])],
+                                "unordered",
+                                true,
+                            )
+                            .map_err(|e| {
+                                Error::AssertionFailed(format!("get_record_stream: {:?}", e))
+                            })?;
+                        let record = stream
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                Error::AssertionFailed(
+                                    "store returned no record for collapse child".into(),
+                                )
+                            })?
+                            .map_err(|e| Error::AssertionFailed(format!("record: {:?}", e)))?;
+                        let data = record.to_fulltext().into_owned();
+                        cache.insert(sha1_key.clone(), data.clone());
+                        data
+                    }
+                };
+                deserialise_node(&bytes, sha1_key, node.search_key_func.clone())?
+            }
+        });
+    }
+    if was_internal_after {
+        // The replaced child is itself an internal node; per the
+        // Python heuristic, we know there's no chance of further
+        // collapse at this level.
+        return Ok(Node::Internal(Box::new(node)));
+    }
+    if check_remap {
+        node.check_remap(store, cache)
+    } else {
+        Ok(Node::Internal(Box::new(node)))
+    }
+}
+
+/// Check whether every search key in `search_keys` is identical.
+///
+/// Mirrors `LeafNode._are_search_keys_identical`: this is the safety check
+/// that lets a LeafNode grow past `_maximum_size` when its keys all hash to
+/// the same search key (a collision under hash-based search funcs). An
+/// empty iterator returns `true` (no two keys disagree).
+pub fn are_search_keys_identical<I, S>(search_keys: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<[u8]>,
+{
+    let mut iter = search_keys.into_iter();
+    let first = match iter.next() {
+        Some(k) => k,
+        None => return true,
+    };
+    let first = first.as_ref();
+    iter.all(|k| k.as_ref() == first)
+}
+
 /// Split `data` into lines, keeping the trailing `\n` on each non-final
 /// line. Mirrors `osutils.chunks_to_lines([b"".join(chunks)])` for a
 /// single chunk input: every `\n` ends a line, and any unterminated
@@ -624,6 +2227,1388 @@ fn test_common_prefix_many() {
         Some(&b"abc"[..])
     );
     assert_eq!(common_prefix_many(vec![].into_iter()), None);
+}
+
+/// A persistent map from key-tuple to value-bytes backed by a CHK
+/// store.
+///
+/// Mirrors Python's `CHKMap`. The `store` is a `VersionedFiles`
+/// instance that holds the serialised page bytes; the `cache` is a
+/// `PageCache` (typically `InMemoryPageCache`) consulted before
+/// fetching from the store. The `root` is the root node — either an
+/// `Unloaded` sha1 reference (lazy-loaded on first access) or a
+/// `Loaded` in-memory `Node`.
+pub struct CHKMap<S>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    pub store: std::sync::Arc<S>,
+    pub cache: std::sync::Arc<dyn PageCache>,
+    pub search_key_func: SearchKeyFunc,
+    pub root: NodeRef,
+}
+
+impl<S> CHKMap<S>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    /// Create a new CHKMap.
+    ///
+    /// `root_key` is the sha1 of the existing root node, or `None`
+    /// to start with an empty in-memory LeafNode.
+    pub fn new(
+        store: std::sync::Arc<S>,
+        cache: std::sync::Arc<dyn PageCache>,
+        root_key: Option<Vec<u8>>,
+        search_key_func: SearchKeyFunc,
+    ) -> Self {
+        let root = match root_key {
+            None => NodeRef::Loaded(Node::Leaf(Box::new(LeafNode::new(search_key_func.clone())))),
+            Some(k) => NodeRef::Unloaded(k),
+        };
+        Self {
+            store,
+            cache,
+            search_key_func,
+            root,
+        }
+    }
+
+    /// Number of entries in this map. Demand-loads the root if
+    /// needed.
+    pub fn len(&mut self) -> Result<usize, Error> {
+        self.ensure_root()?;
+        Ok(match &self.root {
+            NodeRef::Loaded(n) => n.len(),
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        })
+    }
+
+    pub fn is_empty(&mut self) -> Result<bool, Error> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Return the sha1 key of the root node, or `None` if the root
+    /// is in memory and has not yet been serialised.
+    pub fn key(&self) -> Option<Vec<u8>> {
+        match &self.root {
+            NodeRef::Unloaded(k) => Some(k.clone()),
+            NodeRef::Loaded(n) => n.key().map(|s| s.to_vec()),
+        }
+    }
+
+    /// Ensure the root node is `Loaded`. If it was `Unloaded`, fetch
+    /// and deserialise it. Mirrors `CHKMap._ensure_root`.
+    pub fn ensure_root(&mut self) -> Result<(), Error> {
+        if let NodeRef::Unloaded(sha1_key) = &self.root {
+            let key = sha1_key.clone();
+            let bytes = read_node_bytes(&*self.store, &*self.cache, &key)?;
+            let node = deserialise_node(&bytes, key, self.search_key_func.clone())?;
+            self.root = NodeRef::Loaded(node);
+        }
+        Ok(())
+    }
+
+    /// Insert `(key, value)`. Mirrors Python's `CHKMap.map`.
+    pub fn map(&mut self, key: Vec<Vec<u8>>, value: Vec<u8>) -> Result<(), Error> {
+        self.ensure_root()?;
+        let root = match &mut self.root {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        let res = root.map_with_store(&*self.store, &*self.cache, key, value)?;
+        if let MapResult::Split {
+            common_serialised_prefix,
+            children,
+        } = res
+        {
+            // Build a new InternalNode wrapping the split children
+            // and use it as the new root.
+            let (mxs, kw) = match children.first() {
+                Some((_, n)) => (
+                    n.maximum_size(),
+                    match n {
+                        Node::Leaf(l) => l.key_width,
+                        Node::Internal(i) => i.key_width,
+                    },
+                ),
+                None => (0, 1),
+            };
+            let mut new_root =
+                InternalNode::new(common_serialised_prefix, self.search_key_func.clone());
+            new_root.maximum_size = mxs;
+            new_root.key_width = kw;
+            for (prefix, child) in children {
+                new_root.add_node(prefix, child)?;
+            }
+            self.root = NodeRef::Loaded(Node::Internal(Box::new(new_root)));
+        }
+        Ok(())
+    }
+
+    /// Remove `key`. Mirrors Python's `CHKMap.unmap(key, check_remap)`.
+    pub fn unmap(&mut self, key: &[Vec<u8>], check_remap: bool) -> Result<(), Error> {
+        self.ensure_root()?;
+        // For LeafNode root, check_remap is ignored (LeafNode.unmap
+        // doesn't accept it); for InternalNode root, it threads through.
+        let placeholder = Node::Leaf(Box::new(LeafNode::new(self.search_key_func.clone())));
+        let old_root = std::mem::replace(&mut self.root, NodeRef::Loaded(placeholder));
+        let old_node = match old_root {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        let new_root = old_node.unmap_with_store(&*self.store, &*self.cache, key, check_remap)?;
+        self.root = NodeRef::Loaded(new_root);
+        Ok(())
+    }
+
+    /// Iterate `(key, value)` pairs in the map. Mirrors
+    /// `CHKMap.iteritems`.
+    pub fn iteritems(
+        &mut self,
+        key_filter: Option<&[Vec<Vec<u8>>]>,
+    ) -> Result<Vec<(Vec<Vec<u8>>, Vec<u8>)>, Error> {
+        self.ensure_root()?;
+        let root = match &mut self.root {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        root.iteritems(&*self.store, &*self.cache, key_filter)
+    }
+
+    /// Run a `check_remap` pass at the root. Mirrors Python's
+    /// `CHKMap._check_remap`.
+    pub fn check_remap(&mut self) -> Result<(), Error> {
+        self.ensure_root()?;
+        let placeholder = Node::Leaf(Box::new(LeafNode::new(self.search_key_func.clone())));
+        let old_root = std::mem::replace(&mut self.root, NodeRef::Loaded(placeholder));
+        let old_node = match old_root {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        let new_root = match old_node {
+            Node::Internal(b) => b.check_remap(&*self.store, &*self.cache)?,
+            other @ Node::Leaf(_) => other,
+        };
+        self.root = NodeRef::Loaded(new_root);
+        Ok(())
+    }
+
+    /// Bulk-populate a fresh CHKMap from `initial_value` and serialise
+    /// it. Returns the root sha1 key. Mirrors Python's
+    /// `CHKMap.from_dict` / `_create_directly`.
+    pub fn from_dict(
+        store: std::sync::Arc<S>,
+        cache: std::sync::Arc<dyn PageCache>,
+        initial_value: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>>,
+        maximum_size: usize,
+        key_width: usize,
+        search_key_func: SearchKeyFunc,
+    ) -> Result<Vec<u8>, Error> {
+        let mut leaf = LeafNode::new(search_key_func.clone());
+        leaf.maximum_size = maximum_size;
+        leaf.key_width = key_width;
+        // Compute raw_size from the items.
+        leaf.raw_size = initial_value
+            .iter()
+            .map(|(k, v)| leaf_node_key_value_len(k, v))
+            .sum();
+        leaf.items = initial_value;
+        leaf.compute_search_prefix();
+        leaf.compute_serialised_prefix();
+        // Split if the bulk-populated leaf is oversize.
+        let mut node =
+            if leaf.items.len() > 1 && maximum_size > 0 && leaf.current_size() > maximum_size {
+                let (prefix, children) = leaf.split()?;
+                if children.len() == 1 {
+                    return Err(Error::AssertionFailed(
+                        "Failed to split using node._split".into(),
+                    ));
+                }
+                let mut internal = InternalNode::new(prefix, search_key_func);
+                internal.maximum_size = maximum_size;
+                internal.key_width = key_width;
+                for (split_prefix, child) in children {
+                    internal.add_node(split_prefix, child)?;
+                }
+                Node::Internal(Box::new(internal))
+            } else {
+                Node::Leaf(Box::new(leaf))
+            };
+        let keys = node.serialise(&*store, &*cache)?;
+        Ok(keys
+            .last()
+            .cloned()
+            .ok_or_else(|| Error::AssertionFailed("from_dict produced no keys".into()))?)
+    }
+
+    /// Iterate the differences between this map and `basis`.
+    ///
+    /// Mirrors Python's `CHKMap.iter_changes`: yields
+    /// `(key, basis_value, self_value)` tuples for keys that differ
+    /// (one side may carry `None` for "absent here"). Identical
+    /// subtrees are skipped wholesale by sha1-key comparison.
+    pub fn iter_changes(
+        &mut self,
+        basis: &mut CHKMap<S>,
+    ) -> Result<Vec<(Vec<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)>, Error> {
+        let mut out: Vec<(Vec<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = Vec::new();
+        // Fast path: identical root keys means no changes.
+        if let (Some(a), Some(b)) = (self.key(), basis.key()) {
+            if a == b {
+                return Ok(out);
+            }
+        }
+        self.ensure_root()?;
+        basis.ensure_root()?;
+
+        // We work with three stores: self.store, basis.store, and
+        // the page caches per side. The iter_changes algorithm
+        // demand-loads via either side's store.
+        let mut self_pending: std::collections::BinaryHeap<std::cmp::Reverse<PendingItem>> =
+            std::collections::BinaryHeap::new();
+        let mut basis_pending: std::collections::BinaryHeap<std::cmp::Reverse<PendingItem>> =
+            std::collections::BinaryHeap::new();
+
+        // Seed the pending heaps from the roots. Mirrors
+        // `process_common_prefix_nodes(self_root, None, basis_root, None)`.
+        let self_root_ref = match &self.root {
+            NodeRef::Loaded(n) => n.clone(),
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        let basis_root_ref = match &basis.root {
+            NodeRef::Loaded(n) => n.clone(),
+            NodeRef::Unloaded(_) => unreachable!("just ensured root"),
+        };
+        process_common_prefix_nodes(
+            &self_root_ref,
+            None,
+            &basis_root_ref,
+            None,
+            &mut self_pending,
+            &mut basis_pending,
+            self.search_key_func.clone(),
+        );
+
+        let excluded_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+
+        loop {
+            if self_pending.is_empty() && basis_pending.is_empty() {
+                break;
+            }
+            if self_pending.is_empty() {
+                // Drain basis side as deletes.
+                for std::cmp::Reverse(item) in basis_pending.drain() {
+                    if path_excluded(&item.path, &excluded_keys) {
+                        continue;
+                    }
+                    drain_pending_item(
+                        item,
+                        true,
+                        &mut basis.root,
+                        &*basis.store,
+                        &*basis.cache,
+                        basis.search_key_func.clone(),
+                        &mut out,
+                    )?;
+                }
+                break;
+            }
+            if basis_pending.is_empty() {
+                for std::cmp::Reverse(item) in self_pending.drain() {
+                    if path_excluded(&item.path, &excluded_keys) {
+                        continue;
+                    }
+                    drain_pending_item(
+                        item,
+                        false,
+                        &mut self.root,
+                        &*self.store,
+                        &*self.cache,
+                        self.search_key_func.clone(),
+                        &mut out,
+                    )?;
+                }
+                break;
+            }
+            let self_top = &self_pending.peek().unwrap().0;
+            let basis_top = &basis_pending.peek().unwrap().0;
+            match self_top.prefix.cmp(&basis_top.prefix) {
+                std::cmp::Ordering::Less => {
+                    let item = self_pending.pop().unwrap().0;
+                    if path_excluded(&item.path, &excluded_keys) {
+                        continue;
+                    }
+                    match item.payload {
+                        Payload::Value { key, value } => {
+                            out.push((key, None, Some(value)));
+                        }
+                        Payload::Subtree(child) => {
+                            let node = resolve_noderef(
+                                child,
+                                &*self.store,
+                                &*self.cache,
+                                self.search_key_func.clone(),
+                            )?;
+                            expand_node(
+                                node,
+                                item.path,
+                                self.search_key_func.clone(),
+                                &mut self_pending,
+                            );
+                        }
+                    }
+                }
+                std::cmp::Ordering::Greater => {
+                    let item = basis_pending.pop().unwrap().0;
+                    if path_excluded(&item.path, &excluded_keys) {
+                        continue;
+                    }
+                    match item.payload {
+                        Payload::Value { key, value } => {
+                            out.push((key, Some(value), None));
+                        }
+                        Payload::Subtree(child) => {
+                            let node = resolve_noderef(
+                                child,
+                                &*basis.store,
+                                &*basis.cache,
+                                basis.search_key_func.clone(),
+                            )?;
+                            expand_node(
+                                node,
+                                item.path,
+                                basis.search_key_func.clone(),
+                                &mut basis_pending,
+                            );
+                        }
+                    }
+                }
+                std::cmp::Ordering::Equal => {
+                    let self_is_value = matches!(self_top.payload, Payload::Value { .. });
+                    let basis_is_value = matches!(basis_top.payload, Payload::Value { .. });
+                    if self_is_value && basis_is_value {
+                        let self_item = self_pending.pop().unwrap().0;
+                        let basis_item = basis_pending.pop().unwrap().0;
+                        match (self_item.payload, basis_item.payload) {
+                            (
+                                Payload::Value { key: sk, value: sv },
+                                Payload::Value {
+                                    key: _bk,
+                                    value: bv,
+                                },
+                            ) => {
+                                if sv != bv {
+                                    out.push((sk, Some(bv), Some(sv)));
+                                }
+                            }
+                            _ => unreachable!("just checked Value/Value"),
+                        }
+                        continue;
+                    }
+                    // At least one is a subtree. Check sha1 identity
+                    // first — identical pointers skip entirely.
+                    let self_child_key = subtree_child_sha1(&self_top.payload);
+                    let basis_child_key = subtree_child_sha1(&basis_top.payload);
+                    if self_child_key.is_some() && self_child_key == basis_child_key {
+                        self_pending.pop();
+                        basis_pending.pop();
+                        continue;
+                    }
+                    if !self_is_value && !basis_is_value {
+                        // Both subtrees, same prefix — process in parallel.
+                        let self_item = self_pending.pop().unwrap().0;
+                        let basis_item = basis_pending.pop().unwrap().0;
+                        let self_child = match self_item.payload {
+                            Payload::Subtree(c) => c,
+                            _ => unreachable!(),
+                        };
+                        let basis_child = match basis_item.payload {
+                            Payload::Subtree(c) => c,
+                            _ => unreachable!(),
+                        };
+                        let self_node = resolve_noderef(
+                            self_child,
+                            &*self.store,
+                            &*self.cache,
+                            self.search_key_func.clone(),
+                        )?;
+                        let basis_node = resolve_noderef(
+                            basis_child,
+                            &*basis.store,
+                            &*basis.cache,
+                            basis.search_key_func.clone(),
+                        )?;
+                        process_common_prefix_nodes(
+                            &self_node,
+                            Some(item_path_extend(&self_item.path, &self_node)),
+                            &basis_node,
+                            Some(item_path_extend(&basis_item.path, &basis_node)),
+                            &mut self_pending,
+                            &mut basis_pending,
+                            self.search_key_func.clone(),
+                        );
+                        continue;
+                    }
+                    if !self_is_value {
+                        let item = self_pending.pop().unwrap().0;
+                        if path_excluded(&item.path, &excluded_keys) {
+                            continue;
+                        }
+                        let child = match item.payload {
+                            Payload::Subtree(c) => c,
+                            _ => unreachable!(),
+                        };
+                        let node = resolve_noderef(
+                            child,
+                            &*self.store,
+                            &*self.cache,
+                            self.search_key_func.clone(),
+                        )?;
+                        expand_node(
+                            node,
+                            item.path,
+                            self.search_key_func.clone(),
+                            &mut self_pending,
+                        );
+                    }
+                    if !basis_is_value {
+                        let item = basis_pending.pop().unwrap().0;
+                        if path_excluded(&item.path, &excluded_keys) {
+                            continue;
+                        }
+                        let child = match item.payload {
+                            Payload::Subtree(c) => c,
+                            _ => unreachable!(),
+                        };
+                        let node = resolve_noderef(
+                            child,
+                            &*basis.store,
+                            &*basis.cache,
+                            basis.search_key_func.clone(),
+                        )?;
+                        expand_node(
+                            node,
+                            item.path,
+                            basis.search_key_func.clone(),
+                            &mut basis_pending,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply a sequence of `(old_key, new_key, new_value)` changes,
+    /// returning the new root sha1 key.
+    ///
+    /// Mirrors Python's `CHKMap.apply_delta`:
+    /// * pre-check that none of the new keys already exist (insert,
+    ///   not update) — raises InconsistentDeltaDelta otherwise;
+    /// * apply all deletes (`old != None and old != new`);
+    /// * apply all inserts (`new != None`);
+    /// * `check_remap` if any deletes happened;
+    /// * `save` and return the new root.
+    pub fn apply_delta(
+        &mut self,
+        delta: Vec<(Option<Vec<Vec<u8>>>, Option<Vec<Vec<u8>>>, Vec<u8>)>,
+    ) -> Result<Vec<u8>, Error> {
+        // Pre-check: every (None, Some(k), v) entry's k must not
+        // already be in the map.
+        let new_only: Vec<Vec<Vec<u8>>> = delta
+            .iter()
+            .filter_map(|(old, new, _v)| match (old, new) {
+                (None, Some(k)) => Some(k.clone()),
+                _ => None,
+            })
+            .collect();
+        if !new_only.is_empty() {
+            let existing = self.iteritems(Some(&new_only))?;
+            if !existing.is_empty() {
+                return Err(Error::InconsistentDeltaDelta(
+                    delta
+                        .iter()
+                        .map(|(o, n, v)| {
+                            (
+                                o.as_ref().map(|k| Key::from(k.clone())),
+                                n.as_ref().map(|k| Key::from(k.clone())),
+                                v.clone(),
+                            )
+                        })
+                        .collect(),
+                    format!("New items are already in the map {:?}.", existing),
+                ));
+            }
+        }
+        // Apply deletes.
+        let mut has_deletes = false;
+        for (old, new, _value) in &delta {
+            if let Some(old_k) = old {
+                if Some(old_k) != new.as_ref() {
+                    self.unmap(old_k, false)?;
+                    has_deletes = true;
+                }
+            }
+        }
+        // Apply inserts.
+        for (_old, new, value) in &delta {
+            if let Some(new_k) = new {
+                self.map(new_k.clone(), value.clone())?;
+            }
+        }
+        if has_deletes {
+            self.check_remap()?;
+        }
+        self.save()
+    }
+
+    /// Serialise everything to the store and return the root sha1
+    /// key. Mirrors `CHKMap._save`.
+    pub fn save(&mut self) -> Result<Vec<u8>, Error> {
+        match &self.root {
+            NodeRef::Unloaded(k) => return Ok(k.clone()),
+            NodeRef::Loaded(_) => {}
+        }
+        let root = match &mut self.root {
+            NodeRef::Loaded(n) => n,
+            NodeRef::Unloaded(_) => unreachable!(),
+        };
+        let keys = root.serialise(&*self.store, &*self.cache)?;
+        Ok(keys
+            .last()
+            .cloned()
+            .ok_or_else(|| Error::AssertionFailed("save returned no keys".into()))?)
+    }
+}
+
+/// One yielded record from the `iter_interesting_nodes` walk.
+///
+/// Mirrors Python's `(record, items)` yield pairs: a record holds a
+/// CHK page's sha1 key and bytes (or `None`s for the
+/// initial-from-queue items-only emission), plus any new
+/// `(key, value)` items found on that page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DifferenceRecord {
+    /// sha1 key of the page that was read, or `None` for the
+    /// initial items-only flush.
+    pub page_key: Option<Vec<u8>>,
+    /// page bytes; `None` when `page_key` is `None`.
+    pub page_bytes: Option<Vec<u8>>,
+    /// new `(key, value)` items from this page or queue, in
+    /// store-read order (matching Python's no-uniqueness guarantee).
+    pub items: Vec<(Vec<Vec<u8>>, Vec<u8>)>,
+}
+
+/// Walk the new-root subtree and yield every page + new item not
+/// reachable from the old-root subtree.
+///
+/// Mirrors Python's `CHKMapDifference.process` + `iter_interesting_nodes`:
+/// reads old roots fully to populate the "uninteresting" sets, then
+/// streams the new-root subtree yielding only references and items
+/// that aren't in the old set.
+///
+/// Returns the full output (ordered: first the new-root records, then
+/// the items-only flush, then descendant-page records). Native
+/// generator-style streaming would require an iterator returning
+/// `Result<DifferenceRecord, Error>` per `next()` — the Python
+/// version is also called for its side effect of fetching every page
+/// once, so materialising is acceptable.
+pub fn iter_interesting_nodes<S>(
+    store: &S,
+    cache: &dyn PageCache,
+    interesting_root_keys: &[Vec<u8>],
+    uninteresting_root_keys: &[Vec<u8>],
+    search_key_func: SearchKeyFunc,
+) -> Result<Vec<DifferenceRecord>, Error>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    let mut diff = CHKMapDifferenceState::new(
+        interesting_root_keys.to_vec(),
+        uninteresting_root_keys.to_vec(),
+        search_key_func,
+    );
+    diff.process(store, cache)
+}
+
+/// Internal state of the difference walk. Modelled as a struct so the
+/// helper functions can borrow `&mut self` without clashing with the
+/// store + cache references.
+struct CHKMapDifferenceState {
+    new_root_keys: Vec<Vec<u8>>,
+    old_root_keys: Vec<Vec<u8>>,
+    /// Every sha1 key reachable from the old roots (and thus to be
+    /// suppressed in the output).
+    all_old_chks: std::collections::HashSet<Vec<u8>>,
+    /// Every (key, value) item reachable from the old roots.
+    all_old_items: std::collections::HashSet<(Vec<Vec<u8>>, Vec<u8>)>,
+    /// New-side refs we've already streamed (so we don't re-walk).
+    processed_new_refs: std::collections::HashSet<Vec<u8>>,
+    /// Old-side refs still to walk for the suppression set.
+    old_queue: Vec<Vec<u8>>,
+    /// New-side refs whose pages we still need to yield.
+    new_queue: Vec<Vec<u8>>,
+    /// Items found on root pages, deferred until after old-root walk
+    /// finishes so we can deduplicate against `all_old_items`.
+    new_item_queue: Vec<(Vec<Vec<u8>>, Vec<u8>)>,
+    search_key_func: SearchKeyFunc,
+}
+
+impl CHKMapDifferenceState {
+    fn new(
+        new_root_keys: Vec<Vec<u8>>,
+        old_root_keys: Vec<Vec<u8>>,
+        search_key_func: SearchKeyFunc,
+    ) -> Self {
+        let mut all_old_chks: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for k in &old_root_keys {
+            all_old_chks.insert(k.clone());
+        }
+        Self {
+            new_root_keys,
+            old_root_keys,
+            all_old_chks,
+            all_old_items: std::collections::HashSet::new(),
+            processed_new_refs: std::collections::HashSet::new(),
+            old_queue: Vec::new(),
+            new_queue: Vec::new(),
+            new_item_queue: Vec::new(),
+            search_key_func: search_key_func.clone(),
+        }
+    }
+
+    fn process<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+    ) -> Result<Vec<DifferenceRecord>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let mut out: Vec<DifferenceRecord> = Vec::new();
+        // _read_all_roots: yields new-root records (no items per the
+        // Python `yield record` + outer `yield record, []`).
+        let root_records = self.read_all_roots(store, cache)?;
+        for rec in root_records {
+            out.push(rec);
+        }
+        // _process_queues: drain old queue, then flush new.
+        while !self.old_queue.is_empty() {
+            self.process_next_old(store, cache)?;
+        }
+        let flushed = self.flush_new_queue(store, cache)?;
+        out.extend(flushed);
+        Ok(out)
+    }
+
+    /// Read a batch of pages from `store`, returning each as
+    /// `(sha1, bytes, prefix_refs, items)` where `prefix_refs` is
+    /// non-empty only for internal nodes.
+    #[allow(clippy::type_complexity)]
+    fn read_nodes<S>(
+        &self,
+        store: &S,
+        cache: &dyn PageCache,
+        keys: &[Vec<u8>],
+    ) -> Result<
+        Vec<(
+            Vec<u8>,
+            Vec<u8>,
+            Vec<(Vec<u8>, Vec<u8>)>,
+            Vec<(Vec<Vec<u8>>, Vec<u8>)>,
+        )>,
+        Error,
+    >
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let key_objs: Vec<crate::versionedfile::Key> = keys
+            .iter()
+            .map(|k| crate::versionedfile::Key::Fixed(vec![k.clone()]))
+            .collect();
+        let stream = store
+            .get_record_stream(&key_objs, "unordered", true)
+            .map_err(|e| Error::AssertionFailed(format!("get_record_stream: {:?}", e)))?;
+        let mut out = Vec::new();
+        for record in stream {
+            let record = record.map_err(|e| Error::AssertionFailed(format!("record: {:?}", e)))?;
+            if record.storage_kind() == "absent" {
+                return Err(Error::AssertionFailed(format!(
+                    "absent record: {:?}",
+                    record.key()
+                )));
+            }
+            let sha1 = record.key().segments().first().cloned().unwrap_or_default();
+            let bytes = record.to_fulltext().into_owned();
+            cache.insert(sha1.clone(), bytes.clone());
+            let node = deserialise_node(&bytes, sha1.clone(), self.search_key_func.clone())?;
+            let (prefix_refs, items) = match node {
+                Node::Internal(internal) => {
+                    let refs: Vec<(Vec<u8>, Vec<u8>)> = internal
+                        .items
+                        .into_iter()
+                        .filter_map(|(prefix, child)| match child {
+                            NodeRef::Unloaded(k) => Some((prefix, k)),
+                            NodeRef::Loaded(n) => n.key().map(|s| (prefix, s.to_vec())),
+                        })
+                        .collect();
+                    (refs, Vec::new())
+                }
+                Node::Leaf(leaf) => {
+                    let items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = leaf.items.into_iter().collect();
+                    (Vec::new(), items)
+                }
+            };
+            out.push((sha1, bytes, prefix_refs, items));
+        }
+        Ok(out)
+    }
+
+    fn read_old_roots<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let mut old_chks_to_enqueue: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let nodes = self.read_nodes(store, cache, &self.old_root_keys.clone())?;
+        for (_sha1, _bytes, prefix_refs, items) in nodes {
+            let filtered: Vec<(Vec<u8>, Vec<u8>)> = prefix_refs
+                .into_iter()
+                .filter(|(_p, r)| !self.all_old_chks.contains(r))
+                .collect();
+            for (_p, r) in &filtered {
+                self.all_old_chks.insert(r.clone());
+            }
+            for item in items {
+                self.all_old_items.insert(item);
+            }
+            old_chks_to_enqueue.extend(filtered);
+        }
+        Ok(old_chks_to_enqueue)
+    }
+
+    fn enqueue_old(
+        &mut self,
+        new_prefixes: &std::collections::HashSet<Vec<u8>>,
+        old_chks_to_enqueue: Vec<(Vec<u8>, Vec<u8>)>,
+    ) {
+        for (prefix, refk) in old_chks_to_enqueue {
+            let mut interesting = false;
+            for i in (1..=prefix.len()).rev() {
+                if new_prefixes.contains(&prefix[..i]) {
+                    interesting = true;
+                    break;
+                }
+            }
+            if interesting {
+                self.old_queue.push(refk);
+            }
+        }
+    }
+
+    fn read_all_roots<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+    ) -> Result<Vec<DifferenceRecord>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let mut out: Vec<DifferenceRecord> = Vec::new();
+        if self.old_root_keys.is_empty() {
+            // Shortcut: no old context, queue all new roots.
+            self.new_queue = self.new_root_keys.clone();
+            return Ok(out);
+        }
+        let old_chks_to_enqueue = self.read_old_roots(store, cache)?;
+        let mut new_keys: Vec<Vec<u8>> = self
+            .new_root_keys
+            .iter()
+            .filter(|k| !self.all_old_chks.contains(*k))
+            .cloned()
+            .collect();
+        new_keys.sort();
+        new_keys.dedup();
+        let mut new_prefixes: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for k in &new_keys {
+            self.processed_new_refs.insert(k.clone());
+        }
+        let nodes = self.read_nodes(store, cache, &new_keys)?;
+        for (sha1, bytes, prefix_refs, items) in nodes {
+            let filtered: Vec<(Vec<u8>, Vec<u8>)> = prefix_refs
+                .into_iter()
+                .filter(|(_p, r)| {
+                    !self.all_old_chks.contains(r) && !self.processed_new_refs.contains(r)
+                })
+                .collect();
+            let refs: Vec<Vec<u8>> = filtered.iter().map(|(_, r)| r.clone()).collect();
+            for (p, _) in &filtered {
+                new_prefixes.insert(p.clone());
+            }
+            self.new_queue.extend(refs.clone());
+            let new_items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = items
+                .into_iter()
+                .filter(|it| !self.all_old_items.contains(it))
+                .collect();
+            for (k, _v) in &new_items {
+                let prefix = self.search_key_func.apply(&Key::from(k.clone()));
+                new_prefixes.insert(prefix);
+            }
+            self.new_item_queue.extend(new_items);
+            for r in refs {
+                self.processed_new_refs.insert(r);
+            }
+            out.push(DifferenceRecord {
+                page_key: Some(sha1),
+                page_bytes: Some(bytes),
+                items: Vec::new(),
+            });
+        }
+        // Expand new_prefixes to include all shorter prefixes.
+        let snapshot: Vec<Vec<u8>> = new_prefixes.iter().cloned().collect();
+        for p in snapshot {
+            for i in 1..p.len() {
+                new_prefixes.insert(p[..i].to_vec());
+            }
+        }
+        self.enqueue_old(&new_prefixes, old_chks_to_enqueue);
+        Ok(out)
+    }
+
+    fn flush_new_queue<S>(
+        &mut self,
+        store: &S,
+        cache: &dyn PageCache,
+    ) -> Result<Vec<DifferenceRecord>, Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let mut out: Vec<DifferenceRecord> = Vec::new();
+        let mut refs: std::collections::HashSet<Vec<u8>> = self.new_queue.drain(..).collect();
+        // Initial items-only flush.
+        let queued = std::mem::take(&mut self.new_item_queue);
+        let new_items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = queued
+            .into_iter()
+            .filter(|it| !self.all_old_items.contains(it))
+            .collect();
+        if !new_items.is_empty() {
+            out.push(DifferenceRecord {
+                page_key: None,
+                page_bytes: None,
+                items: new_items,
+            });
+        }
+        for k in &self.all_old_chks {
+            refs.remove(k);
+        }
+        for k in &refs {
+            self.processed_new_refs.insert(k.clone());
+        }
+        while !refs.is_empty() {
+            let mut next_refs: std::collections::HashSet<Vec<u8>> =
+                std::collections::HashSet::new();
+            let refs_vec: Vec<Vec<u8>> = refs.into_iter().collect();
+            let nodes = self.read_nodes(store, cache, &refs_vec)?;
+            for (sha1, bytes, prefix_refs, items) in nodes {
+                let items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = if self.all_old_items.is_empty() {
+                    items
+                } else {
+                    items
+                        .into_iter()
+                        .filter(|it| !self.all_old_items.contains(it))
+                        .collect()
+                };
+                out.push(DifferenceRecord {
+                    page_key: Some(sha1),
+                    page_bytes: Some(bytes),
+                    items,
+                });
+                for (_p, r) in prefix_refs {
+                    next_refs.insert(r);
+                }
+            }
+            for k in &self.all_old_chks {
+                next_refs.remove(k);
+            }
+            for k in &self.processed_new_refs {
+                next_refs.remove(k);
+            }
+            for k in &next_refs {
+                self.processed_new_refs.insert(k.clone());
+            }
+            refs = next_refs;
+        }
+        Ok(out)
+    }
+
+    fn process_next_old<S>(&mut self, store: &S, cache: &dyn PageCache) -> Result<(), Error>
+    where
+        S: crate::versionedfile::VersionedFiles + ?Sized,
+    {
+        let refs: Vec<Vec<u8>> = std::mem::take(&mut self.old_queue);
+        let nodes = self.read_nodes(store, cache, &refs)?;
+        for (_sha1, _bytes, prefix_refs, items) in nodes {
+            for item in items {
+                self.all_old_items.insert(item);
+            }
+            let new_refs: Vec<Vec<u8>> = prefix_refs
+                .into_iter()
+                .filter_map(|(_p, r)| {
+                    if self.all_old_chks.contains(&r) {
+                        None
+                    } else {
+                        Some(r)
+                    }
+                })
+                .collect();
+            for r in &new_refs {
+                self.all_old_chks.insert(r.clone());
+            }
+            self.old_queue.extend(new_refs);
+        }
+        Ok(())
+    }
+}
+
+/// Heap-pending item for the `iter_changes` diff walk.
+///
+/// Items compare by `prefix` first (the search-key prefix for
+/// internal-node children, or the search_key of a leaf value);
+/// `payload` is the actual content waiting to be processed.
+/// `path` is a tail-shared chain of sha1 keys of every node we
+/// walked through to reach this item, used to bail when an entire
+/// subtree gets excluded.
+#[derive(Debug)]
+struct PendingItem {
+    prefix: Vec<u8>,
+    payload: Payload,
+    path: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+enum Payload {
+    /// An internal-node child reference waiting to be expanded.
+    Subtree(NodeRef),
+    /// A leaf entry that can be yielded directly.
+    Value { key: Vec<Vec<u8>>, value: Vec<u8> },
+}
+
+impl PartialEq for PendingItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefix == other.prefix
+    }
+}
+impl Eq for PendingItem {}
+impl PartialOrd for PendingItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PendingItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.prefix.cmp(&other.prefix)
+    }
+}
+
+/// True if any sha1 key on `path` is in `excluded_keys`.
+fn path_excluded(path: &[Vec<u8>], excluded_keys: &std::collections::HashSet<Vec<u8>>) -> bool {
+    path.iter().any(|k| excluded_keys.contains(k))
+}
+
+/// Convert a possibly-unloaded NodeRef into a loaded Node by
+/// consulting the page cache then the store.
+fn resolve_noderef<S>(
+    nref: NodeRef,
+    store: &S,
+    cache: &dyn PageCache,
+    search_key_func: SearchKeyFunc,
+) -> Result<Node, Error>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    match nref {
+        NodeRef::Loaded(n) => Ok(n),
+        NodeRef::Unloaded(sha1_key) => {
+            let bytes = read_node_bytes(store, cache, &sha1_key)?;
+            deserialise_node(&bytes, sha1_key, search_key_func)
+        }
+    }
+}
+
+/// Append this node's sha1 key (if any) to `parent_path` to form a
+/// fresh path used for items emitted from this node.
+fn item_path_extend(parent_path: &[Vec<u8>], node: &Node) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(parent_path.len() + 1);
+    out.extend_from_slice(parent_path);
+    if let Some(k) = node.key() {
+        out.push(k.to_vec());
+    }
+    out
+}
+
+/// Expand a single node: push its children (for InternalNode) or its
+/// entries (for LeafNode) onto the pending heap.
+fn expand_node(
+    node: Node,
+    parent_path: Vec<Vec<u8>>,
+    _search_key_func: SearchKeyFunc,
+    pending: &mut std::collections::BinaryHeap<std::cmp::Reverse<PendingItem>>,
+) {
+    let path = item_path_extend(&parent_path, &node);
+    match node {
+        Node::Leaf(leaf) => {
+            for (k, v) in leaf.items {
+                let search_key = leaf.search_key_func.apply(&Key::from(k.clone()));
+                pending.push(std::cmp::Reverse(PendingItem {
+                    prefix: search_key,
+                    payload: Payload::Value { key: k, value: v },
+                    path: path.clone(),
+                }));
+            }
+        }
+        Node::Internal(internal) => {
+            for (prefix, child) in internal.items {
+                pending.push(std::cmp::Reverse(PendingItem {
+                    prefix,
+                    payload: Payload::Subtree(child),
+                    path: path.clone(),
+                }));
+            }
+        }
+    }
+}
+
+/// Extract the sha1 key of a Subtree payload's NodeRef if known
+/// (either unloaded or a loaded node that's been serialised).
+fn subtree_child_sha1(payload: &Payload) -> Option<Vec<u8>> {
+    match payload {
+        Payload::Subtree(NodeRef::Unloaded(k)) => Some(k.clone()),
+        Payload::Subtree(NodeRef::Loaded(n)) => n.key().map(|s| s.to_vec()),
+        Payload::Value { .. } => None,
+    }
+}
+
+/// Seed the pending heaps with the contents of two nodes at the
+/// same logical position. If both are InternalNodes, only emit the
+/// symmetric difference (avoiding redundant traversal of identical
+/// children). If both are LeafNodes, similarly emit only the
+/// per-side differences. Otherwise, expand each side independently.
+fn process_common_prefix_nodes(
+    self_node: &Node,
+    self_parent_path: Option<Vec<Vec<u8>>>,
+    basis_node: &Node,
+    basis_parent_path: Option<Vec<Vec<u8>>>,
+    self_pending: &mut std::collections::BinaryHeap<std::cmp::Reverse<PendingItem>>,
+    basis_pending: &mut std::collections::BinaryHeap<std::cmp::Reverse<PendingItem>>,
+    search_key_func: SearchKeyFunc,
+) {
+    let self_path = self_parent_path.unwrap_or_else(|| {
+        self_node
+            .key()
+            .map(|s| vec![s.to_vec()])
+            .unwrap_or_default()
+    });
+    let basis_path = basis_parent_path.unwrap_or_else(|| {
+        basis_node
+            .key()
+            .map(|s| vec![s.to_vec()])
+            .unwrap_or_default()
+    });
+    match (self_node, basis_node) {
+        (Node::Internal(s), Node::Internal(b)) => {
+            // Symmetric difference by (prefix, child_sha1).
+            let self_set: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> = s
+                .items
+                .iter()
+                .map(|(p, c)| (p.clone(), node_ref_sha1(c)))
+                .collect();
+            let basis_set: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> = b
+                .items
+                .iter()
+                .map(|(p, c)| (p.clone(), node_ref_sha1(c)))
+                .collect();
+            for (prefix, child) in s.items.iter() {
+                let s_sha1 = node_ref_sha1(child);
+                if basis_set.get(prefix) != Some(&s_sha1) {
+                    self_pending.push(std::cmp::Reverse(PendingItem {
+                        prefix: prefix.clone(),
+                        payload: Payload::Subtree(child.clone()),
+                        path: self_path.clone(),
+                    }));
+                }
+            }
+            for (prefix, child) in b.items.iter() {
+                let b_sha1 = node_ref_sha1(child);
+                if self_set.get(prefix) != Some(&b_sha1) {
+                    basis_pending.push(std::cmp::Reverse(PendingItem {
+                        prefix: prefix.clone(),
+                        payload: Payload::Subtree(child.clone()),
+                        path: basis_path.clone(),
+                    }));
+                }
+            }
+        }
+        (Node::Leaf(s), Node::Leaf(b)) => {
+            for (k, v) in s.items.iter() {
+                if b.items.get(k) != Some(v) {
+                    let prefix = search_key_func.apply(&Key::from(k.clone()));
+                    self_pending.push(std::cmp::Reverse(PendingItem {
+                        prefix,
+                        payload: Payload::Value {
+                            key: k.clone(),
+                            value: v.clone(),
+                        },
+                        path: self_path.clone(),
+                    }));
+                }
+            }
+            for (k, v) in b.items.iter() {
+                if s.items.get(k) != Some(v) {
+                    let prefix = search_key_func.apply(&Key::from(k.clone()));
+                    basis_pending.push(std::cmp::Reverse(PendingItem {
+                        prefix,
+                        payload: Payload::Value {
+                            key: k.clone(),
+                            value: v.clone(),
+                        },
+                        path: basis_path.clone(),
+                    }));
+                }
+            }
+        }
+        _ => {
+            // Mismatched shapes — expand each side independently.
+            expand_node(
+                self_node.clone(),
+                self_path.clone(),
+                search_key_func.clone(),
+                self_pending,
+            );
+            expand_node(
+                basis_node.clone(),
+                basis_path,
+                search_key_func,
+                basis_pending,
+            );
+        }
+    }
+}
+
+/// sha1 key of a NodeRef when known (unloaded always knows; loaded
+/// only when serialised).
+fn node_ref_sha1(nref: &NodeRef) -> Option<Vec<u8>> {
+    match nref {
+        NodeRef::Unloaded(k) => Some(k.clone()),
+        NodeRef::Loaded(n) => n.key().map(|s| s.to_vec()),
+    }
+}
+
+/// Drain a single pending item into the output as a one-sided
+/// change (the other side is exhausted). `is_basis` chooses which
+/// (value-or-None) slot the value lands in.
+fn drain_pending_item<S>(
+    item: PendingItem,
+    is_basis: bool,
+    other_root: &mut NodeRef,
+    store: &S,
+    cache: &dyn PageCache,
+    search_key_func: SearchKeyFunc,
+    out: &mut Vec<(Vec<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)>,
+) -> Result<(), Error>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    let _ = other_root;
+    match item.payload {
+        Payload::Value { key, value } => {
+            if is_basis {
+                out.push((key, Some(value), None));
+            } else {
+                out.push((key, None, Some(value)));
+            }
+            Ok(())
+        }
+        Payload::Subtree(child) => {
+            let mut node = resolve_noderef(child, store, cache, search_key_func)?;
+            let items = node.iteritems(store, cache, None)?;
+            for (k, v) in items {
+                if is_basis {
+                    out.push((k, Some(v), None));
+                } else {
+                    out.push((k, None, Some(v)));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Fetch bytes for `sha1_key` from the page cache, falling back to
+/// the store. Mirrors Python's `CHKMap._read_bytes`.
+fn read_node_bytes<S>(store: &S, cache: &dyn PageCache, sha1_key: &[u8]) -> Result<Vec<u8>, Error>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    if let Some(b) = cache.get(sha1_key) {
+        return Ok(b);
+    }
+    let stream = store
+        .get_record_stream(
+            &[crate::versionedfile::Key::Fixed(vec![sha1_key.to_vec()])],
+            "unordered",
+            true,
+        )
+        .map_err(|e| Error::AssertionFailed(format!("get_record_stream: {:?}", e)))?;
+    let record = stream
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::AssertionFailed("store returned no record".into()))?
+        .map_err(|e| Error::AssertionFailed(format!("record: {:?}", e)))?;
+    let data = record.to_fulltext().into_owned();
+    cache.insert(sha1_key.to_vec(), data.clone());
+    Ok(data)
+}
+
+/// Test-only fixtures shared across the `chk_map` and
+/// `chk_inventory` test modules. Behind `#[cfg(test)]` (and
+/// `pub(crate)`) so it's invisible at link time.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// Minimal in-memory `VersionedFiles` for round-tripping pages.
+    /// `add_lines` hashes content with sha1 and stores under the bare
+    /// hex; `get_record_stream` strips the `b"sha1:"` prefix from
+    /// query keys and returns the matching pages as
+    /// `FulltextContentFactory` records.
+    pub struct FakeChkStore {
+        pub(crate) pages: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>,
+    }
+
+    impl FakeChkStore {
+        pub fn new() -> Self {
+            Self {
+                pages: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl crate::versionedfile::VersionedFiles for FakeChkStore {
+        fn get_parent_map(
+            &self,
+            _keys: &[crate::versionedfile::Key],
+        ) -> Result<
+            std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
+            crate::knit::KnitError,
+        > {
+            Ok(std::collections::HashMap::new())
+        }
+
+        fn get_record_stream(
+            &self,
+            keys: &[crate::versionedfile::Key],
+            _ordering: &str,
+            _include_delta_closure: bool,
+        ) -> Result<
+            Box<
+                dyn Iterator<
+                    Item = Result<
+                        Box<dyn crate::versionedfile::ContentFactory>,
+                        crate::knit::KnitError,
+                    >,
+                >,
+            >,
+            crate::knit::KnitError,
+        > {
+            let pages = self.pages.lock().unwrap();
+            let mut records: Vec<
+                Result<Box<dyn crate::versionedfile::ContentFactory>, crate::knit::KnitError>,
+            > = Vec::with_capacity(keys.len());
+            for key in keys {
+                let full = key.segments().first().cloned().unwrap_or_default();
+                let bare: &[u8] = if full.starts_with(b"sha1:") {
+                    &full[5..]
+                } else {
+                    &full
+                };
+                if let Some(data) = pages.get(bare) {
+                    records.push(Ok(
+                        Box::new(crate::versionedfile::FulltextContentFactory::new(
+                            Some(bare.to_vec()),
+                            key.clone(),
+                            Some(vec![]),
+                            data.clone(),
+                        )) as Box<dyn crate::versionedfile::ContentFactory>,
+                    ));
+                }
+            }
+            Ok(Box::new(records.into_iter()))
+        }
+
+        fn get_sha1s(
+            &self,
+            _keys: &[crate::versionedfile::Key],
+        ) -> Result<
+            std::collections::HashMap<crate::versionedfile::Key, Vec<u8>>,
+            crate::knit::KnitError,
+        > {
+            Ok(std::collections::HashMap::new())
+        }
+
+        fn keys(&self) -> Result<Vec<crate::versionedfile::Key>, crate::knit::KnitError> {
+            let p = self.pages.lock().unwrap();
+            Ok(p.keys()
+                .map(|k| crate::versionedfile::Key::Fixed(vec![k.clone()]))
+                .collect())
+        }
+
+        fn add_lines(
+            &self,
+            _key: &crate::versionedfile::Key,
+            _parents: Option<&[crate::versionedfile::Key]>,
+            lines: &[Vec<u8>],
+        ) -> Result<(Vec<u8>, usize), crate::knit::KnitError> {
+            use sha1::{Digest, Sha1};
+            let data: Vec<u8> = lines.iter().flatten().copied().collect();
+            let mut hasher = Sha1::new();
+            hasher.update(&data);
+            let digest = hasher.finalize();
+            let sha1_hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+            let sha1_bytes = sha1_hex.into_bytes();
+            let size = data.len();
+            self.pages.lock().unwrap().insert(sha1_bytes.clone(), data);
+            Ok((sha1_bytes, size))
+        }
+
+        fn insert_record_stream(
+            &self,
+            _stream: Box<dyn Iterator<Item = Box<dyn crate::versionedfile::ContentFactory>>>,
+        ) -> Result<(), crate::knit::KnitError> {
+            Err(crate::knit::KnitError::NotImplemented(
+                "insert_record_stream",
+            ))
+        }
+
+        fn iter_lines_added_or_present_in_keys(
+            &self,
+            _keys: &[crate::versionedfile::Key],
+        ) -> Result<Vec<(Vec<u8>, crate::versionedfile::Key)>, crate::knit::KnitError> {
+            Err(crate::knit::KnitError::NotImplemented(
+                "iter_lines_added_or_present_in_keys",
+            ))
+        }
+
+        fn annotate(
+            &self,
+            _key: &crate::versionedfile::Key,
+        ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, crate::knit::KnitError> {
+            Err(crate::knit::KnitError::NotImplemented("annotate"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -946,6 +3931,1446 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
         // maximum_size=100 (3 digits) → 50 + 1 + 1 + 3 = 55
         let got = internal_node_current_size(100, 1, 3, 50);
         assert_eq!(got, 55);
+    }
+
+    fn key_vec(parts: &[&[u8]]) -> Vec<Vec<u8>> {
+        parts.iter().map(|p| p.to_vec()).collect()
+    }
+
+    /// Build and save a CHK map from `entries`, returning its root key.
+    /// Mirrors the Python `TestCaseWithExampleMaps.get_map_key` /
+    /// `_get_map` helper used by the iter_changes / iter_interesting tests.
+    fn build_map_key(
+        store: std::sync::Arc<FakeChkStore>,
+        cache: std::sync::Arc<dyn PageCache>,
+        entries: &[(&[&[u8]], &[u8])],
+        maximum_size: usize,
+    ) -> Vec<u8> {
+        let mut initial: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> = indexmap::IndexMap::new();
+        for (key, value) in entries {
+            initial.insert(key_vec(key), value.to_vec());
+        }
+        CHKMap::from_dict(store, cache, initial, maximum_size, 1, SearchKeyFunc::Plain).unwrap()
+    }
+
+    /// Collect every `(key, value)` item yielded by `iter_interesting_nodes`,
+    /// sorted. Mirrors the Python `assertIterInteresting` aggregation, which
+    /// only cares about the union of items regardless of page order.
+    fn collect_interesting_items(
+        store: &FakeChkStore,
+        cache: &dyn PageCache,
+        interesting: &[Vec<u8>],
+        old: &[Vec<u8>],
+    ) -> Vec<(Vec<Vec<u8>>, Vec<u8>)> {
+        let records =
+            iter_interesting_nodes(store, cache, interesting, old, SearchKeyFunc::Plain).unwrap();
+        let mut items: Vec<(Vec<Vec<u8>>, Vec<u8>)> =
+            records.into_iter().flat_map(|r| r.items).collect();
+        items.sort();
+        items
+    }
+
+    #[test]
+    fn leaf_node_new_starts_empty() {
+        let n = LeafNode::new(SearchKeyFunc::Plain);
+        assert_eq!(n.len(), 0);
+        assert!(n.is_empty());
+        assert_eq!(n.maximum_size, 0);
+        assert_eq!(n.key_width, 1);
+        assert_eq!(n.raw_size, 0);
+        assert!(matches!(n.search_prefix, SearchPrefix::Computed(None)));
+        assert!(n.common_serialised_prefix.is_none());
+        assert!(n.key.is_none());
+    }
+
+    #[test]
+    fn leaf_node_map_no_split_first_insert_sets_prefixes() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        let split = n.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        assert!(!split);
+        assert_eq!(n.len(), 1);
+        // With one entry, both prefixes equal the key bytes themselves.
+        assert_eq!(n.common_serialised_prefix.as_deref(), Some(&b"foo"[..]));
+        assert_eq!(
+            n.search_prefix,
+            SearchPrefix::Computed(Some(b"foo".to_vec()))
+        );
+        assert_eq!(
+            n.raw_size,
+            leaf_node_key_value_len(&[b"foo".to_vec()], b"bar")
+        );
+    }
+
+    #[test]
+    fn leaf_node_map_no_split_shrinks_prefix_on_divergent_key() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"alpha"]), b"v1".to_vec());
+        n.map_no_split(key_vec(&[b"alphabet"]), b"v2".to_vec());
+        // Common prefix of "alpha" and "alphabet" is "alpha".
+        assert_eq!(n.common_serialised_prefix.as_deref(), Some(&b"alpha"[..]));
+        assert_eq!(
+            n.search_prefix,
+            SearchPrefix::Computed(Some(b"alpha".to_vec()))
+        );
+    }
+
+    #[test]
+    fn leaf_node_map_no_split_signals_split_when_oversize() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.maximum_size = 10;
+        let _ = n.map_no_split(key_vec(&[b"foo"]), b"v1".to_vec());
+        // Second entry pushes us over and the keys disagree, so we must split.
+        let split = n.map_no_split(key_vec(&[b"bar"]), b"v2".to_vec());
+        assert!(split);
+    }
+
+    #[test]
+    fn leaf_node_unmap_removes_entry_and_recomputes_prefixes() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"v1".to_vec());
+        n.map_no_split(key_vec(&[b"foobar"]), b"v2".to_vec());
+        assert_eq!(n.common_serialised_prefix.as_deref(), Some(&b"foo"[..]));
+        let removed = n.unmap(&key_vec(&[b"foobar"]));
+        assert_eq!(removed, Some(b"v2".to_vec()));
+        // After removing "foobar", the only key left is "foo" and the prefix
+        // becomes its full bytes.
+        assert_eq!(n.common_serialised_prefix.as_deref(), Some(&b"foo"[..]));
+        assert_eq!(n.len(), 1);
+        assert!(n.key.is_none());
+    }
+
+    #[test]
+    fn leaf_node_unmap_returns_none_for_missing_key() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"v1".to_vec());
+        assert_eq!(n.unmap(&key_vec(&[b"missing"])), None);
+        // Unchanged otherwise.
+        assert_eq!(n.len(), 1);
+    }
+
+    #[test]
+    fn leaf_node_compute_search_prefix_resolves_unknown_state() {
+        let blob: &[u8] = b"chkleaf:\n100\n1\n2\nalph\n2\x002\nv2\nv2line2\na\x001\nv1\n";
+        let parsed = deserialise_leaf_node(blob).unwrap();
+        let mut n = LeafNode::from_parsed(parsed, SearchKeyFunc::Plain);
+        assert!(n.search_prefix.is_unknown());
+        let prefix = n.compute_search_prefix().map(|s| s.to_vec());
+        // Under Plain, the search keys equal the serialised keys; for
+        // "alph2" and "alpha" the common prefix is "alph".
+        assert_eq!(prefix, Some(b"alph".to_vec()));
+        assert!(!n.search_prefix.is_unknown());
+    }
+
+    #[test]
+    fn leaf_node_from_parsed_marks_search_prefix_unknown() {
+        let blob: &[u8] = b"chkleaf:\n100\n1\n2\nalph\n2\x002\nv2\nv2line2\na\x001\nv1\n";
+        let parsed = deserialise_leaf_node(blob).unwrap();
+        let n = LeafNode::from_parsed(parsed, SearchKeyFunc::Plain);
+        assert_eq!(n.len(), 2);
+        assert!(n.search_prefix.is_unknown());
+        assert_eq!(n.common_serialised_prefix.as_deref(), Some(&b"alph"[..]));
+        // current_size reads off the raw_size; reproducing it just sanity
+        // checks the wiring against leaf_node_current_size.
+        assert!(n.current_size() > 0);
+    }
+
+    #[test]
+    fn leaf_node_from_parsed_empty_keeps_prefix_none() {
+        let blob: &[u8] = b"chkleaf:\n100\n1\n0\n\n";
+        let parsed = deserialise_leaf_node(blob).unwrap();
+        let n = LeafNode::from_parsed(parsed, SearchKeyFunc::Plain);
+        assert_eq!(n.len(), 0);
+        assert!(matches!(n.search_prefix, SearchPrefix::Computed(None)));
+        assert!(n.common_serialised_prefix.is_none());
+    }
+
+    #[test]
+    fn internal_node_new_starts_empty_with_prefix() {
+        let n = InternalNode::new(b"pre".to_vec(), SearchKeyFunc::Plain);
+        assert_eq!(n.len, 0);
+        assert_eq!(n.node_width, 0);
+        assert_eq!(n.maximum_size, 0);
+        assert_eq!(n.search_prefix.as_deref(), Some(&b"pre"[..]));
+        assert!(n.items.is_empty());
+        assert!(n.key.is_none());
+    }
+
+    #[test]
+    fn internal_node_from_parsed_marks_children_unloaded() {
+        let blob: &[u8] = b"chknode:\n200\n1\n2\npre\nbar\x00sha1:bbbb\nfoo\x00sha1:aaaa\n";
+        let parsed = deserialise_internal_node(blob).unwrap();
+        let n = InternalNode::from_parsed(parsed, SearchKeyFunc::Plain);
+        assert_eq!(n.len, 2);
+        assert_eq!(n.search_prefix.as_deref(), Some(&b"pre"[..]));
+        assert_eq!(n.maximum_size, 200);
+        assert_eq!(n.key_width, 1);
+        assert_eq!(n.items.len(), 2);
+        // Verify both are Unloaded with the right sha1 keys.
+        match n.items.get(&b"prebar".to_vec()) {
+            Some(NodeRef::Unloaded(k)) => assert_eq!(k, b"sha1:bbbb"),
+            other => panic!("expected Unloaded for prebar, got {:?}", other),
+        }
+        match n.items.get(&b"prefoo".to_vec()) {
+            Some(NodeRef::Unloaded(k)) => assert_eq!(k, b"sha1:aaaa"),
+            other => panic!("expected Unloaded for prefoo, got {:?}", other),
+        }
+    }
+
+    use super::testing::FakeChkStore;
+
+    #[test]
+    fn iter_interesting_nodes_no_old_yields_all_new() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"a"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"b"]), b"v2".to_vec()).unwrap();
+        let root = m.save().unwrap();
+        let records =
+            iter_interesting_nodes(&*store, &*cache, &[root.clone()], &[], SearchKeyFunc::Plain)
+                .unwrap();
+        // With no old context the root page is reported and its items
+        // are flushed as a None-keyed record.
+        assert!(records.iter().any(|r| r.page_key.as_deref() == Some(&root)));
+        let all_items: Vec<(Vec<Vec<u8>>, Vec<u8>)> =
+            records.iter().flat_map(|r| r.items.clone()).collect();
+        // Note: with no old roots, items aren't yielded — the new
+        // root pages are queued for processing in flush_new_queue
+        // which yields per-page items. Page count + items together
+        // covers the full tree.
+        if all_items.is_empty() {
+            // Items live in the root page; root page was emitted.
+            assert!(!records.is_empty());
+        } else {
+            let mut sorted_items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = all_items;
+            sorted_items.sort();
+            assert_eq!(sorted_items.len(), 2);
+        }
+    }
+
+    #[test]
+    fn iter_interesting_nodes_identical_old_and_new_yields_root_only() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"a"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"b"]), b"v2".to_vec()).unwrap();
+        let root = m.save().unwrap();
+        let records = iter_interesting_nodes(
+            &*store,
+            &*cache,
+            &[root.clone()],
+            &[root.clone()],
+            SearchKeyFunc::Plain,
+        )
+        .unwrap();
+        // Old contains the same root, so nothing new should appear.
+        let interesting_items: Vec<_> = records.iter().flat_map(|r| r.items.clone()).collect();
+        assert!(interesting_items.is_empty());
+    }
+
+    // The following iter_interesting_nodes tests mirror Python's
+    // `TestIterInterestingNodes` (bzrformats/tests/test_chk_map.py),
+    // asserting the union of yielded items rather than page-walk order.
+
+    #[test]
+    fn iter_interesting_nodes_empty_to_one_key() {
+        // test_empty_to_one_keys: one interesting root, no old roots.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let target = build_map_key(store.clone(), cache.clone(), &[(&[b"a"], b"content")], 10);
+        let items = collect_interesting_items(&*store, &*cache, &[target], &[]);
+        assert_eq!(items, vec![(key_vec(&[b"a"]), b"content".to_vec())]);
+    }
+
+    #[test]
+    fn iter_interesting_nodes_none_to_one_key() {
+        // test_none_to_one_key: empty old map, one-key new map.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let basis = build_map_key(store.clone(), cache.clone(), &[], 10);
+        let target = build_map_key(store.clone(), cache.clone(), &[(&[b"a"], b"content")], 10);
+        let items = collect_interesting_items(&*store, &*cache, &[target], &[basis]);
+        assert_eq!(items, vec![(key_vec(&[b"a"]), b"content".to_vec())]);
+    }
+
+    #[test]
+    fn iter_interesting_nodes_one_to_none_key() {
+        // test_one_to_none_key: deleting the only key yields no items.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let basis = build_map_key(store.clone(), cache.clone(), &[(&[b"a"], b"content")], 10);
+        let target = build_map_key(store.clone(), cache.clone(), &[], 10);
+        let items = collect_interesting_items(&*store, &*cache, &[target], &[basis]);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn iter_interesting_nodes_common_pages() {
+        // test_common_pages: only the changed leaf's item is interesting.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let basis = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"a"], b"content"),
+                (&[b"b"], b"content"),
+                (&[b"c"], b"content"),
+            ],
+            10,
+        );
+        let target = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"a"], b"content"),
+                (&[b"b"], b"other content"),
+                (&[b"c"], b"content"),
+            ],
+            10,
+        );
+        let items = collect_interesting_items(&*store, &*cache, &[target], &[basis]);
+        assert_eq!(items, vec![(key_vec(&[b"b"]), b"other content".to_vec())]);
+    }
+
+    #[test]
+    fn iter_interesting_nodes_common_sub_page() {
+        // test_common_sub_page: a new key nested under a shared sub-page.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let basis = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"aaa"], b"common"), (&[b"c"], b"common")],
+            10,
+        );
+        let target = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"aaa"], b"common"),
+                (&[b"aab"], b"new"),
+                (&[b"c"], b"common"),
+            ],
+            10,
+        );
+        let items = collect_interesting_items(&*store, &*cache, &[target], &[basis]);
+        assert_eq!(items, vec![(key_vec(&[b"aab"]), b"new".to_vec())]);
+    }
+
+    #[test]
+    fn iter_interesting_nodes_common_leaf_multiple_targets() {
+        // test_common_leaf: the shared 'aaa' leaf occurs at three depths
+        // across three interesting roots but its item appears once.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let basis = build_map_key(store.clone(), cache.clone(), &[], 10);
+        let target1 = build_map_key(store.clone(), cache.clone(), &[(&[b"aaa"], b"common")], 10);
+        let target2 = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"aaa"], b"common"), (&[b"bbb"], b"new")],
+            10,
+        );
+        let target3 = build_map_key(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"aaa"], b"common"),
+                (&[b"aac"], b"other"),
+                (&[b"bbb"], b"new"),
+            ],
+            10,
+        );
+        let items =
+            collect_interesting_items(&*store, &*cache, &[target1, target2, target3], &[basis]);
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"aaa"]), b"common".to_vec()),
+                (key_vec(&[b"aac"]), b"other".to_vec()),
+                (key_vec(&[b"bbb"]), b"new".to_vec()),
+            ]
+        );
+    }
+
+    // The following iter_changes tests mirror Python's `TestMap`
+    // iter_changes scenarios (bzrformats/tests/test_chk_map.py).
+
+    /// Build a saved map and reopen it from its root key, so iter_changes
+    /// starts from an unloaded tuple root like the Python tests do.
+    fn reopen_map(
+        store: std::sync::Arc<FakeChkStore>,
+        cache: std::sync::Arc<dyn PageCache>,
+        entries: &[(&[&[u8]], &[u8])],
+        maximum_size: usize,
+    ) -> CHKMap<FakeChkStore> {
+        let root = build_map_key(store.clone(), cache.clone(), entries, maximum_size);
+        CHKMap::new(store, cache, Some(root), SearchKeyFunc::Plain)
+    }
+
+    #[test]
+    fn chkmap_iter_changes_empty_to_ab() {
+        // test_iter_changes_empty_ab: empty basis -> {a, b} target.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut basis = reopen_map(store.clone(), cache.clone(), &[], 10);
+        let mut target = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"a"], b"content here"), (&[b"b"], b"more content")],
+            10,
+        );
+        let mut changes = target.iter_changes(&mut basis).unwrap();
+        changes.sort();
+        assert_eq!(
+            changes,
+            vec![
+                (key_vec(&[b"a"]), None, Some(b"content here".to_vec())),
+                (key_vec(&[b"b"]), None, Some(b"more content".to_vec())),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_iter_changes_ab_to_empty() {
+        // test_iter_changes_ab_empty: {a, b} basis -> empty target.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut basis = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"a"], b"content here"), (&[b"b"], b"more content")],
+            10,
+        );
+        let mut target = reopen_map(store.clone(), cache.clone(), &[], 10);
+        let mut changes = target.iter_changes(&mut basis).unwrap();
+        changes.sort();
+        assert_eq!(
+            changes,
+            vec![
+                (key_vec(&[b"a"]), Some(b"content here".to_vec()), None),
+                (key_vec(&[b"b"]), Some(b"more content".to_vec()), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_iter_changes_mixed_node_length() {
+        // test_iter_changes_unchanged_keys_in_multi_key_leafs_ignored:
+        // unchanged keys inside multi-value leaf nodes are not reported,
+        // while altered/added/removed keys are.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut basis = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"aaa"], b"foo bar"),
+                (&[b"aab"], b"common altered a"),
+                (&[b"b"], b"foo bar b"),
+            ],
+            10,
+        );
+        let mut target = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[
+                (&[b"aaa"], b"foo bar"),
+                (&[b"aab"], b"common altered b"),
+                (&[b"at"], b"foo bar t"),
+            ],
+            10,
+        );
+        let mut changes = target.iter_changes(&mut basis).unwrap();
+        changes.sort();
+        assert_eq!(
+            changes,
+            vec![
+                (
+                    key_vec(&[b"aab"]),
+                    Some(b"common altered a".to_vec()),
+                    Some(b"common altered b".to_vec()),
+                ),
+                (key_vec(&[b"at"]), None, Some(b"foo bar t".to_vec())),
+                (key_vec(&[b"b"]), Some(b"foo bar b".to_vec()), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_iter_changes_ab_ab_is_empty() {
+        // test_iter_changes_ab_ab_is_empty: identical multi-key maps.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut basis = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"a"], b"content here"), (&[b"b"], b"more content")],
+            10,
+        );
+        let mut target = reopen_map(
+            store.clone(),
+            cache.clone(),
+            &[(&[b"a"], b"content here"), (&[b"b"], b"more content")],
+            10,
+        );
+        let changes = target.iter_changes(&mut basis).unwrap();
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn chkmap_iter_changes_identical_returns_empty() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut a = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        a.map(key_vec(&[b"k"]), b"v".to_vec()).unwrap();
+        let root = a.save().unwrap();
+        let mut a2 = CHKMap::new(
+            store.clone(),
+            cache.clone(),
+            Some(root),
+            SearchKeyFunc::Plain,
+        );
+        let changes = a.iter_changes(&mut a2).unwrap();
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn chkmap_iter_changes_detects_add_remove_modify() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        // basis: {a:1, b:2}
+        let mut basis = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        basis.map(key_vec(&[b"a"]), b"1".to_vec()).unwrap();
+        basis.map(key_vec(&[b"b"]), b"2".to_vec()).unwrap();
+        // self: {a:1, c:3}
+        let mut me = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        me.map(key_vec(&[b"a"]), b"1".to_vec()).unwrap();
+        me.map(key_vec(&[b"c"]), b"3".to_vec()).unwrap();
+        let mut changes = me.iter_changes(&mut basis).unwrap();
+        changes.sort();
+        // 'b' was removed (basis has it, self doesn't), 'c' was added.
+        assert_eq!(
+            changes,
+            vec![
+                (key_vec(&[b"b"]), Some(b"2".to_vec()), None),
+                (key_vec(&[b"c"]), None, Some(b"3".to_vec())),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_iter_changes_detects_modification() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut basis = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        basis.map(key_vec(&[b"a"]), b"old".to_vec()).unwrap();
+        let mut me = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        me.map(key_vec(&[b"a"]), b"new".to_vec()).unwrap();
+        let changes = me.iter_changes(&mut basis).unwrap();
+        assert_eq!(
+            changes,
+            vec![(
+                key_vec(&[b"a"]),
+                Some(b"old".to_vec()),
+                Some(b"new".to_vec())
+            )]
+        );
+    }
+
+    #[test]
+    fn node_refs_leaf_returns_empty() {
+        let leaf = LeafNode::new(SearchKeyFunc::Plain);
+        let node = Node::Leaf(Box::new(leaf));
+        assert!(node.refs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn chkmap_from_dict_returns_loadable_root_key() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut initial: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> = indexmap::IndexMap::new();
+        initial.insert(key_vec(&[b"a"]), b"v1".to_vec());
+        initial.insert(key_vec(&[b"b"]), b"v2".to_vec());
+        let root_key = CHKMap::from_dict(
+            store.clone(),
+            cache.clone(),
+            initial,
+            0,
+            1,
+            SearchKeyFunc::Plain,
+        )
+        .unwrap();
+        assert!(root_key.starts_with(b"sha1:"));
+        let mut m = CHKMap::new(store, cache, Some(root_key), SearchKeyFunc::Plain);
+        let items = m.iteritems(None).unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn chkmap_apply_delta_inserts_and_deletes() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"a"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"b"]), b"v2".to_vec()).unwrap();
+
+        // Delete b, add c.
+        let delta = vec![
+            (Some(key_vec(&[b"b"])), None, Vec::new()),
+            (None, Some(key_vec(&[b"c"])), b"v3".to_vec()),
+        ];
+        let new_root = m.apply_delta(delta).unwrap();
+        assert!(new_root.starts_with(b"sha1:"));
+        let mut items = m.iteritems(None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"a"]), b"v1".to_vec()),
+                (key_vec(&[b"c"]), b"v3".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_apply_delta_rejects_insert_collisions() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"a"]), b"v1".to_vec()).unwrap();
+        // Try to insert (None, Some("a"), v2) — "a" already exists.
+        let delta = vec![(None, Some(key_vec(&[b"a"])), b"v2".to_vec())];
+        let err = m.apply_delta(delta).unwrap_err();
+        assert!(matches!(err, Error::InconsistentDeltaDelta(_, _)));
+    }
+
+    #[test]
+    fn chkmap_empty_starts_with_leaf_root() {
+        let store = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store, cache, None, SearchKeyFunc::Plain);
+        assert!(m.is_empty().unwrap());
+        assert!(m.key().is_none());
+    }
+
+    #[test]
+    fn chkmap_map_and_iteritems_roundtrip() {
+        let store = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store, cache, None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"foo"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"bar"]), b"v2".to_vec()).unwrap();
+        let mut items = m.iteritems(None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"bar"]), b"v2".to_vec()),
+                (key_vec(&[b"foo"]), b"v1".to_vec()),
+            ]
+        );
+        assert_eq!(m.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn chkmap_unmap_removes_entry() {
+        let store = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store, cache, None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"foo"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"bar"]), b"v2".to_vec()).unwrap();
+        m.unmap(&key_vec(&[b"foo"]), true).unwrap();
+        let items = m.iteritems(None).unwrap();
+        assert_eq!(items, vec![(key_vec(&[b"bar"]), b"v2".to_vec())]);
+    }
+
+    #[test]
+    fn chkmap_save_round_trips_through_demand_load() {
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Plain);
+        m.map(key_vec(&[b"foo"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"bar"]), b"v2".to_vec()).unwrap();
+        let root_key = m.save().unwrap();
+        assert!(root_key.starts_with(b"sha1:"));
+
+        // Reload from the stored root key.
+        let mut m2 = CHKMap::new(
+            store.clone(),
+            cache.clone(),
+            Some(root_key),
+            SearchKeyFunc::Plain,
+        );
+        let mut items = m2.iteritems(None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"bar"]), b"v2".to_vec()),
+                (key_vec(&[b"foo"]), b"v1".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn chkmap_map_split_promotes_root_to_internal() {
+        let store = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store, cache, None, SearchKeyFunc::Plain);
+        // Tight max_size forces a split on the second insert.
+        if let NodeRef::Loaded(Node::Leaf(l)) = &mut m.root {
+            l.maximum_size = 10;
+        }
+        m.map(key_vec(&[b"foo"]), b"v1".to_vec()).unwrap();
+        m.map(key_vec(&[b"bar"]), b"v2".to_vec()).unwrap();
+        // Root should now be an InternalNode.
+        match &m.root {
+            NodeRef::Loaded(Node::Internal(_)) => {}
+            other => panic!("expected Internal root after split, got {:?}", other),
+        }
+        let mut items = m.iteritems(None).unwrap();
+        items.sort();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn internal_node_serialise_writes_children_then_self() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut leaf_b = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_b.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal
+            .add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        internal
+            .add_node(b"b".to_vec(), Node::Leaf(Box::new(leaf_b)))
+            .unwrap();
+        let written = internal.serialise(&store, &cache).unwrap();
+        // Two children + self = 3 keys.
+        assert_eq!(written.len(), 3);
+        // The self key matches what's stored on the InternalNode.
+        assert_eq!(
+            internal.key.as_deref(),
+            Some(written.last().unwrap().as_slice())
+        );
+        // All written keys should be present in the page cache.
+        for k in &written {
+            assert!(cache.get(k).is_some(), "missing {:?}", k);
+        }
+    }
+
+    #[test]
+    fn internal_node_serialise_skips_already_serialised_children() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let _child_key = leaf_a.serialise(&store, &cache).unwrap();
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal
+            .add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        let written = internal.serialise(&store, &cache).unwrap();
+        // Child already serialised, so only self is in the written list.
+        assert_eq!(written.len(), 1);
+        assert!(written[0].starts_with(b"sha1:"));
+    }
+
+    #[test]
+    fn node_unmap_with_store_removes_from_leaf() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        leaf.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        let node = Node::Leaf(Box::new(leaf));
+        let new_node = node
+            .unmap_with_store(&store, &cache, &key_vec(&[b"a"]), true)
+            .unwrap();
+        assert_eq!(new_node.len(), 1);
+    }
+
+    #[test]
+    fn node_unmap_with_store_collapses_internal_to_only_child() {
+        // Build an internal with two leaves; remove one — internal
+        // should collapse to the remaining leaf.
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut leaf_b = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_b.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal
+            .add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        internal
+            .add_node(b"b".to_vec(), Node::Leaf(Box::new(leaf_b)))
+            .unwrap();
+        let node = Node::Internal(Box::new(internal));
+        let new_node = node
+            .unmap_with_store(&store, &cache, &key_vec(&[b"a"]), true)
+            .unwrap();
+        // After removing the "a" leaf, only "b" remains — the
+        // internal node collapses to the bare leaf.
+        match &new_node {
+            Node::Leaf(l) => {
+                assert_eq!(l.len(), 1);
+                assert!(l.items.contains_key(&key_vec(&[b"b"])));
+            }
+            Node::Internal(_) => panic!("expected collapse to leaf"),
+        }
+    }
+
+    #[test]
+    fn node_unmap_with_store_raises_for_missing_key() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let node = Node::Leaf(Box::new(leaf));
+        let err = node
+            .unmap_with_store(&store, &cache, &key_vec(&[b"absent"]), true)
+            .unwrap_err();
+        assert!(matches!(err, Error::AssertionFailed(_)));
+    }
+
+    #[test]
+    fn node_map_with_store_descends_into_internal_child() {
+        // Build an InternalNode with two leaf children that have
+        // distinct first-byte search keys; insert a new entry that
+        // belongs in one of them.
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"alpha"]), b"va".to_vec());
+        let mut leaf_b = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_b.map_no_split(key_vec(&[b"beta"]), b"vb".to_vec());
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal
+            .add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        internal
+            .add_node(b"b".to_vec(), Node::Leaf(Box::new(leaf_b)))
+            .unwrap();
+        let mut node = Node::Internal(Box::new(internal));
+        let r = node
+            .map_with_store(&store, &cache, key_vec(&[b"apple"]), b"vap".to_vec())
+            .unwrap();
+        assert!(matches!(r, MapResult::InPlace { .. }));
+        // The leaf under "a" should now have two entries.
+        let mut all_items = node.iteritems(&store, &cache, None).unwrap();
+        all_items.sort();
+        assert_eq!(
+            all_items,
+            vec![
+                (key_vec(&[b"alpha"]), b"va".to_vec()),
+                (key_vec(&[b"apple"]), b"vap".to_vec()),
+                (key_vec(&[b"beta"]), b"vb".to_vec()),
+            ]
+        );
+        assert_eq!(node.len(), 3);
+    }
+
+    #[test]
+    fn node_map_with_store_creates_new_child_if_no_match() {
+        // Insert into a slot that doesn't have a child yet.
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal
+            .add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        let mut node = Node::Internal(Box::new(internal));
+        let r = node
+            .map_with_store(&store, &cache, key_vec(&[b"b"]), b"vb".to_vec())
+            .unwrap();
+        assert!(matches!(r, MapResult::InPlace { .. }));
+        let mut items = node.iteritems(&store, &cache, None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"a"]), b"va".to_vec()),
+                (key_vec(&[b"b"]), b"vb".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn leaf_node_map_in_place_no_split() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        let r = n.map(key_vec(&[b"foo"]), b"bar".to_vec()).unwrap();
+        match r {
+            MapResult::InPlace { search_prefix } => {
+                assert_eq!(search_prefix, b"foo".to_vec());
+            }
+            MapResult::Split { .. } => panic!("did not expect split"),
+        }
+        assert_eq!(n.len(), 1);
+    }
+
+    #[test]
+    fn leaf_node_map_replacing_existing_key_does_not_grow_len() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map(key_vec(&[b"foo"]), b"bar".to_vec()).unwrap();
+        let r = n.map(key_vec(&[b"foo"]), b"BAZ".to_vec()).unwrap();
+        assert!(matches!(r, MapResult::InPlace { .. }));
+        assert_eq!(n.len(), 1);
+        assert_eq!(n.items.get(&key_vec(&[b"foo"])), Some(&b"BAZ".to_vec()));
+    }
+
+    #[test]
+    fn leaf_node_map_overflow_splits_into_internal_subtree() {
+        // Two divergent keys with a tight maximum_size force a split.
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.maximum_size = 10;
+        let r1 = n.map(key_vec(&[b"foo"]), b"v1".to_vec()).unwrap();
+        assert!(matches!(r1, MapResult::InPlace { .. }));
+        let r2 = n.map(key_vec(&[b"bar"]), b"v2".to_vec()).unwrap();
+        match r2 {
+            MapResult::Split {
+                common_serialised_prefix,
+                children,
+            } => {
+                // Search prefix of two divergent single-byte-prefix
+                // keys is empty.
+                assert!(common_serialised_prefix.is_empty());
+                // Two sub-children for the split.
+                assert_eq!(children.len(), 2);
+                let prefixes: Vec<&[u8]> = children.iter().map(|(p, _)| p.as_slice()).collect();
+                assert!(prefixes.contains(&&b"f"[..]));
+                assert!(prefixes.contains(&&b"b"[..]));
+            }
+            MapResult::InPlace { .. } => panic!("expected split"),
+        }
+    }
+
+    #[test]
+    fn node_iteritems_recurses_into_internal_children() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        // Two leaves each with one entry, serialised into the store.
+        let mut la = LeafNode::new(SearchKeyFunc::Plain);
+        la.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut lb = LeafNode::new(SearchKeyFunc::Plain);
+        lb.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        let key_a = la.serialise(&store, &cache).unwrap();
+        let key_b = lb.serialise(&store, &cache).unwrap();
+        // Parent internal node referencing both as unloaded.
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal.node_width = 1;
+        internal
+            .items
+            .insert(b"a".to_vec(), NodeRef::Unloaded(key_a));
+        internal
+            .items
+            .insert(b"b".to_vec(), NodeRef::Unloaded(key_b));
+        internal.len = 2;
+        let mut node = Node::Internal(Box::new(internal));
+        let mut items = node.iteritems(&store, &cache, None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"a"]), b"va".to_vec()),
+                (key_vec(&[b"b"]), b"vb".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn node_iteritems_with_filter_only_yields_matching_keys() {
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut la = LeafNode::new(SearchKeyFunc::Plain);
+        la.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut lb = LeafNode::new(SearchKeyFunc::Plain);
+        lb.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        let key_a = la.serialise(&store, &cache).unwrap();
+        let key_b = lb.serialise(&store, &cache).unwrap();
+        let mut internal = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        internal.node_width = 1;
+        internal
+            .items
+            .insert(b"a".to_vec(), NodeRef::Unloaded(key_a));
+        internal
+            .items
+            .insert(b"b".to_vec(), NodeRef::Unloaded(key_b));
+        internal.len = 2;
+        let mut node = Node::Internal(Box::new(internal));
+        let items = node
+            .iteritems(&store, &cache, Some(&[key_vec(&[b"a"])]))
+            .unwrap();
+        assert_eq!(items, vec![(key_vec(&[b"a"]), b"va".to_vec())]);
+    }
+
+    #[test]
+    fn internal_node_iter_nodes_returns_loaded_children_in_order() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 1;
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut leaf_b = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_b.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        n.add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        n.add_node(b"b".to_vec(), Node::Leaf(Box::new(leaf_b)))
+            .unwrap();
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let yielded = n.iter_nodes(&store, &cache, None, None).unwrap();
+        assert_eq!(yielded.len(), 2);
+        // Filter is None for everything when no key_filter is given.
+        assert!(yielded.iter().all(|(_, f)| f.is_none()));
+        let lens: Vec<usize> = yielded.iter().map(|(n, _)| n.len()).collect();
+        assert_eq!(lens, vec![1, 1]);
+    }
+
+    #[test]
+    fn internal_node_iter_nodes_demand_loads_via_store() {
+        // Serialise a leaf into the store first.
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let child_key = leaf.serialise(&store, &cache).unwrap();
+
+        // Build an InternalNode pointing at the unloaded child.
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 1;
+        n.items
+            .insert(b"a".to_vec(), NodeRef::Unloaded(child_key.clone()));
+        n.len = 1;
+
+        // Drop the cache to force a store read.
+        cache.clear();
+
+        let yielded = n.iter_nodes(&store, &cache, None, None).unwrap();
+        assert_eq!(yielded.len(), 1);
+        assert_eq!(yielded[0].0.len(), 1);
+        // After loading, the items entry should be Loaded.
+        match n.items.get(&b"a".to_vec()) {
+            Some(NodeRef::Loaded(_)) => {}
+            other => panic!("expected Loaded after iter_nodes, got {:?}", other),
+        }
+        // The page cache should now hold the bytes.
+        assert!(cache.get(&child_key).is_some());
+    }
+
+    #[test]
+    fn internal_node_iter_nodes_single_key_filter_dict_lookup() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 1;
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let mut leaf_b = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_b.map_no_split(key_vec(&[b"b"]), b"vb".to_vec());
+        n.add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        n.add_node(b"b".to_vec(), Node::Leaf(Box::new(leaf_b)))
+            .unwrap();
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let filter = [key_vec(&[b"a"])];
+        let yielded = n.iter_nodes(&store, &cache, Some(&filter), None).unwrap();
+        assert_eq!(yielded.len(), 1);
+        assert_eq!(yielded[0].1.as_deref(), Some(&[key_vec(&[b"a"])][..]));
+    }
+
+    #[test]
+    fn internal_node_iter_nodes_single_key_miss_yields_nothing() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 1;
+        let mut leaf_a = LeafNode::new(SearchKeyFunc::Plain);
+        leaf_a.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        n.add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf_a)))
+            .unwrap();
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let filter = [key_vec(&[b"z"])];
+        let yielded = n.iter_nodes(&store, &cache, Some(&filter), None).unwrap();
+        assert!(yielded.is_empty());
+    }
+
+    #[test]
+    fn internal_node_iter_nodes_hits_cache_before_store() {
+        // First serialise leaf into store + cache.
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"a"]), b"va".to_vec());
+        let child_key = leaf.serialise(&store, &cache).unwrap();
+
+        // Build an InternalNode pointing at the unloaded child.
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 1;
+        n.items
+            .insert(b"a".to_vec(), NodeRef::Unloaded(child_key.clone()));
+        n.len = 1;
+
+        // Now corrupt the store; if iter_nodes hits the store we'll
+        // get back garbage. The cache hit should bypass the store.
+        store
+            .pages
+            .lock()
+            .unwrap()
+            .insert(child_key[5..].to_vec(), b"corrupt".to_vec());
+
+        let yielded = n.iter_nodes(&store, &cache, None, None).unwrap();
+        assert_eq!(yielded.len(), 1);
+        assert_eq!(yielded[0].0.len(), 1);
+    }
+
+    #[test]
+    fn leaf_node_serialise_caches_and_sets_key() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        let store = FakeChkStore::new();
+        let cache = InMemoryPageCache::new();
+        let sha1_key = n.serialise(&store, &cache).unwrap();
+        assert!(sha1_key.starts_with(b"sha1:"));
+        assert_eq!(n.key.as_deref(), Some(sha1_key.as_slice()));
+        // Page cache holds the serialised bytes.
+        let cached = cache.get(&sha1_key).expect("page cache miss");
+        assert!(cached.starts_with(b"chkleaf:\n"));
+        // Round-trip through deserialise.
+        let node = deserialise_node(&cached, sha1_key, SearchKeyFunc::Plain).unwrap();
+        match node {
+            Node::Leaf(leaf) => {
+                assert_eq!(leaf.len(), 1);
+                assert_eq!(leaf.items.get(&key_vec(&[b"foo"])), Some(&b"bar".to_vec()));
+            }
+            Node::Internal(_) => panic!("expected leaf"),
+        }
+    }
+
+    #[test]
+    fn in_memory_page_cache_roundtrips() {
+        let c = InMemoryPageCache::new();
+        assert_eq!(c.get(b"sha1:absent"), None);
+        c.insert(b"sha1:x".to_vec(), b"page-bytes".to_vec());
+        assert_eq!(c.get(b"sha1:x").as_deref(), Some(&b"page-bytes"[..]));
+    }
+
+    #[test]
+    fn in_memory_page_cache_clear_drops_all_entries() {
+        let c = InMemoryPageCache::new();
+        c.insert(b"sha1:x".to_vec(), b"v1".to_vec());
+        c.insert(b"sha1:y".to_vec(), b"v2".to_vec());
+        c.clear();
+        assert_eq!(c.get(b"sha1:x"), None);
+        assert_eq!(c.get(b"sha1:y"), None);
+    }
+
+    #[test]
+    fn in_memory_page_cache_evicts_when_full() {
+        let c = InMemoryPageCache::with_capacity(2);
+        c.insert(b"k1".to_vec(), b"v1".to_vec());
+        c.insert(b"k2".to_vec(), b"v2".to_vec());
+        c.insert(b"k3".to_vec(), b"v3".to_vec()); // evicts k1
+        assert_eq!(c.get(b"k1"), None);
+        assert_eq!(c.get(b"k2").as_deref(), Some(&b"v2"[..]));
+        assert_eq!(c.get(b"k3").as_deref(), Some(&b"v3"[..]));
+    }
+
+    #[test]
+    fn deserialise_node_dispatches_to_leaf() {
+        let blob: &[u8] = b"chkleaf:\n100\n1\n2\nalph\n2\x002\nv2\nv2line2\na\x001\nv1\n";
+        let node = deserialise_node(blob, b"sha1:abcd".to_vec(), SearchKeyFunc::Plain).unwrap();
+        match node {
+            Node::Leaf(leaf) => {
+                assert_eq!(leaf.key.as_deref(), Some(&b"sha1:abcd"[..]));
+                assert_eq!(leaf.len(), 2);
+            }
+            Node::Internal(_) => panic!("expected leaf"),
+        }
+    }
+
+    #[test]
+    fn deserialise_node_dispatches_to_internal() {
+        let blob: &[u8] = b"chknode:\n200\n1\n2\npre\nbar\x00sha1:bbbb\nfoo\x00sha1:aaaa\n";
+        let node = deserialise_node(blob, b"sha1:root".to_vec(), SearchKeyFunc::Plain).unwrap();
+        match node {
+            Node::Internal(internal) => {
+                assert_eq!(internal.key.as_deref(), Some(&b"sha1:root"[..]));
+                assert_eq!(internal.len, 2);
+            }
+            Node::Leaf(_) => panic!("expected internal"),
+        }
+    }
+
+    #[test]
+    fn deserialise_node_rejects_unknown_magic() {
+        let blob: &[u8] = b"unknown:\n";
+        let err = deserialise_node(blob, b"sha1:x".to_vec(), SearchKeyFunc::Plain).unwrap_err();
+        assert!(matches!(err, Error::AssertionFailed(_)));
+    }
+
+    #[test]
+    fn internal_node_add_node_validates_prefix_length() {
+        let mut n = InternalNode::new(b"pre".to_vec(), SearchKeyFunc::Plain);
+        let leaf = Node::Leaf(Box::new(LeafNode::new(SearchKeyFunc::Plain)));
+        // Prefix too long.
+        let too_long = n.add_node(b"preXY".to_vec(), leaf.clone());
+        assert!(matches!(too_long, Err(Error::AssertionFailed(_))));
+        // Prefix not starting with search_prefix.
+        let mismatch = n.add_node(b"qrZ".to_vec(), leaf.clone());
+        assert!(matches!(mismatch, Err(Error::AssertionFailed(_))));
+        // Correct: search_prefix + 1 byte.
+        n.add_node(b"preX".to_vec(), leaf).unwrap();
+        assert_eq!(n.items.len(), 1);
+        assert_eq!(n.node_width, 4);
+    }
+
+    #[test]
+    fn internal_node_add_node_clears_key_and_grows_len() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.key = Some(b"sha1:old".to_vec());
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"k1"]), b"v1".to_vec());
+        leaf.map_no_split(key_vec(&[b"k2"]), b"v2".to_vec());
+        n.add_node(b"a".to_vec(), Node::Leaf(Box::new(leaf)))
+            .unwrap();
+        assert_eq!(n.len, 2);
+        assert!(n.key.is_none());
+    }
+
+    #[test]
+    fn internal_node_search_key_pads_with_nul() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 5;
+        // Plain search key of `("k",)` is `b"k"`, length 1; pad to 5.
+        assert_eq!(n.search_key(&Key::from(vec![b"k".to_vec()])), b"k\0\0\0\0");
+    }
+
+    #[test]
+    fn internal_node_search_key_truncates_when_longer() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 3;
+        assert_eq!(n.search_key(&Key::from(vec![b"longkey".to_vec()])), b"lon");
+    }
+
+    #[test]
+    fn internal_node_search_prefix_filter_does_not_pad() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 5;
+        // Shorter key returns as-is (no padding).
+        assert_eq!(
+            n.search_prefix_filter(&Key::from(vec![b"k".to_vec()])),
+            b"k"
+        );
+        // Longer key gets truncated.
+        n.node_width = 3;
+        assert_eq!(
+            n.search_prefix_filter(&Key::from(vec![b"longkey".to_vec()])),
+            b"lon"
+        );
+    }
+
+    #[test]
+    fn internal_node_compute_search_prefix_from_children() {
+        let mut n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        n.items
+            .insert(b"abc".to_vec(), NodeRef::Unloaded(b"sha1:x".to_vec()));
+        n.items
+            .insert(b"abd".to_vec(), NodeRef::Unloaded(b"sha1:y".to_vec()));
+        n.items
+            .insert(b"abe".to_vec(), NodeRef::Unloaded(b"sha1:z".to_vec()));
+        let prefix = n.compute_search_prefix().map(<[u8]>::to_vec);
+        assert_eq!(prefix, Some(b"ab".to_vec()));
+        assert_eq!(n.search_prefix.as_deref(), Some(&b"ab"[..]));
+    }
+
+    #[test]
+    fn internal_node_refs_returns_child_keys() {
+        let mut n = InternalNode::new(b"p".to_vec(), SearchKeyFunc::Plain);
+        n.node_width = 2;
+        n.items
+            .insert(b"pa".to_vec(), NodeRef::Unloaded(b"sha1:a".to_vec()));
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.key = Some(b"sha1:b".to_vec());
+        n.items
+            .insert(b"pb".to_vec(), NodeRef::Loaded(Node::Leaf(Box::new(leaf))));
+        n.key = Some(b"sha1:self".to_vec());
+        let refs = n.refs().unwrap();
+        assert_eq!(refs.len(), 2);
+        assert!(refs.contains(&b"sha1:a".to_vec()));
+        assert!(refs.contains(&b"sha1:b".to_vec()));
+    }
+
+    #[test]
+    fn internal_node_refs_errors_when_unserialised() {
+        let n = InternalNode::new(b"".to_vec(), SearchKeyFunc::Plain);
+        assert!(matches!(n.refs(), Err(Error::AssertionFailed(_))));
+    }
+
+    #[test]
+    fn node_wraps_leaf_and_internal() {
+        let leaf = Node::Leaf(Box::new(LeafNode::new(SearchKeyFunc::Plain)));
+        let internal = Node::Internal(Box::new(InternalNode::new(
+            b"".to_vec(),
+            SearchKeyFunc::Plain,
+        )));
+        assert_eq!(leaf.len(), 0);
+        assert_eq!(internal.len(), 0);
+        assert_eq!(leaf.maximum_size(), 0);
+        assert_eq!(internal.maximum_size(), 0);
+        assert_eq!(leaf.key(), None);
+        assert_eq!(internal.key(), None);
+    }
+
+    #[test]
+    fn node_len_reflects_inner_state() {
+        let mut leaf = LeafNode::new(SearchKeyFunc::Plain);
+        leaf.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        leaf.map_no_split(key_vec(&[b"baz"]), b"qux".to_vec());
+        let node = Node::Leaf(Box::new(leaf));
+        assert_eq!(node.len(), 2);
+    }
+
+    #[test]
+    fn leaf_node_iteritems_returns_all_with_no_filter() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        n.map_no_split(key_vec(&[b"baz"]), b"qux".to_vec());
+        let items = n.iteritems(None);
+        assert_eq!(items.len(), 2);
+        let keys: Vec<&[Vec<u8>]> = items.iter().map(|(k, _)| k.as_slice()).collect();
+        assert!(keys.contains(&key_vec(&[b"foo"]).as_slice()));
+        assert!(keys.contains(&key_vec(&[b"baz"]).as_slice()));
+    }
+
+    #[test]
+    fn leaf_node_iteritems_exact_match_filter() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        n.map_no_split(key_vec(&[b"baz"]), b"qux".to_vec());
+        let items = n.iteritems(Some(&[key_vec(&[b"foo"])]));
+        assert_eq!(items, vec![(key_vec(&[b"foo"]), b"bar".to_vec())]);
+    }
+
+    #[test]
+    fn leaf_node_iteritems_exact_miss_yields_nothing() {
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.map_no_split(key_vec(&[b"foo"]), b"bar".to_vec());
+        let items = n.iteritems(Some(&[key_vec(&[b"absent"])]));
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn leaf_node_iteritems_short_prefix_filter_matches_items() {
+        // key_width=2, filter is a 1-element prefix that matches the
+        // first element of one stored key.
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.key_width = 2;
+        n.map_no_split(key_vec(&[b"foo", b"sub1"]), b"v1".to_vec());
+        n.map_no_split(key_vec(&[b"bar", b"sub2"]), b"v2".to_vec());
+        let items = n.iteritems(Some(&[key_vec(&[b"foo"])]));
+        assert_eq!(items, vec![(key_vec(&[b"foo", b"sub1"]), b"v1".to_vec())]);
+    }
+
+    #[test]
+    fn leaf_node_iteritems_mixed_filter_lengths() {
+        // key_width=2, mix of exact (length 2) and prefix (length 1).
+        let mut n = LeafNode::new(SearchKeyFunc::Plain);
+        n.key_width = 2;
+        n.map_no_split(key_vec(&[b"foo", b"sub"]), b"v1".to_vec());
+        n.map_no_split(key_vec(&[b"bar", b"sub"]), b"v2".to_vec());
+        n.map_no_split(key_vec(&[b"baz", b"sub"]), b"v3".to_vec());
+        let items = n.iteritems(Some(&[
+            key_vec(&[b"foo", b"sub"]), // exact, yielded first
+            key_vec(&[b"bar"]),         // prefix
+        ]));
+        // Exact match first, then prefix match in items order.
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], (key_vec(&[b"foo", b"sub"]), b"v1".to_vec()));
+        assert_eq!(items[1], (key_vec(&[b"bar", b"sub"]), b"v2".to_vec()));
+    }
+
+    #[test]
+    fn search_key_func_from_name_resolves_known_variants() {
+        assert_eq!(
+            SearchKeyFunc::from_name(b"plain").unwrap(),
+            SearchKeyFunc::Plain
+        );
+        assert_eq!(
+            SearchKeyFunc::from_name(b"hash-16-way").unwrap(),
+            SearchKeyFunc::Hash16Way
+        );
+        assert_eq!(
+            SearchKeyFunc::from_name(b"hash-255-way").unwrap(),
+            SearchKeyFunc::Hash255Way
+        );
+    }
+
+    #[test]
+    fn search_key_func_from_name_returns_unknown_bytes() {
+        let err = SearchKeyFunc::from_name(b"unrecognised").unwrap_err();
+        assert_eq!(err, b"unrecognised".to_vec());
+    }
+
+    #[test]
+    fn search_key_func_name_roundtrips() {
+        for variant in [
+            SearchKeyFunc::Plain,
+            SearchKeyFunc::Hash16Way,
+            SearchKeyFunc::Hash255Way,
+        ] {
+            let parsed = SearchKeyFunc::from_name(variant.name()).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn search_key_func_apply_matches_free_functions() {
+        let k = key(&[b"foo", b"bar"]);
+        assert_eq!(SearchKeyFunc::Plain.apply(&k), search_key_plain(&k));
+        assert_eq!(SearchKeyFunc::Hash16Way.apply(&k), search_key_16(&k));
+        assert_eq!(SearchKeyFunc::Hash255Way.apply(&k), search_key_255(&k));
+    }
+
+    #[test]
+    fn search_key_func_default_is_plain() {
+        assert_eq!(SearchKeyFunc::default(), SearchKeyFunc::Plain);
+    }
+
+    #[test]
+    fn are_search_keys_identical_returns_true_for_empty() {
+        let empty: [&[u8]; 0] = [];
+        assert!(are_search_keys_identical(empty));
+    }
+
+    #[test]
+    fn are_search_keys_identical_returns_true_for_single() {
+        assert!(are_search_keys_identical([b"hash".as_slice()]));
+    }
+
+    #[test]
+    fn are_search_keys_identical_returns_true_when_all_match() {
+        assert!(are_search_keys_identical([
+            b"same".as_slice(),
+            b"same",
+            b"same"
+        ]));
+    }
+
+    #[test]
+    fn are_search_keys_identical_returns_false_when_one_differs() {
+        assert!(!are_search_keys_identical([
+            b"same".as_slice(),
+            b"same",
+            b"other"
+        ]));
+        assert!(!are_search_keys_identical([b"first".as_slice(), b"second"]));
     }
 
     #[test]

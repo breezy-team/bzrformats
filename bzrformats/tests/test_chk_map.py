@@ -1337,12 +1337,12 @@ class TestMap(TestCaseWithStore):
         # Now clear the page cache, and only include 2 of the children in the
         # cache
         aab_key = chkmap._root_node._items[b"aab"]
-        aab_bytes = chk_map._get_cache()[aab_key]
+        aab_bytes = chk_map._page_cache_get(aab_key)
         aac_key = chkmap._root_node._items[b"aac"]
-        aac_bytes = chk_map._get_cache()[aac_key]
+        aac_bytes = chk_map._page_cache_get(aac_key)
         chk_map.clear_cache()
-        chk_map._get_cache()[aab_key] = aab_bytes
-        chk_map._get_cache()[aac_key] = aac_bytes
+        chk_map._page_cache_set(aab_key, aab_bytes)
+        chk_map._page_cache_set(aac_key, aac_bytes)
 
         # Unmapping the new node will check the nodes from the page cache
         # first, and not have to read in 'aaa'

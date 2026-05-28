@@ -716,7 +716,10 @@ impl PyHashEscapedPrefixMapper {
 ///
 /// `add_lines`, `add_mpdiffs`, `insert_record_stream` and other write
 /// paths raise `NotImplementedError`, matching the Python implementation.
-#[pyclass(name = "VirtualVersionedFiles", module = "bzrformats._bzr_rs.versionedfile")]
+#[pyclass(
+    name = "VirtualVersionedFiles",
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
 struct PyVirtualVersionedFiles {
     get_parent_map_cb: Py<PyAny>,
     get_lines_cb: Py<PyAny>,
@@ -785,15 +788,13 @@ impl bazaar::versionedfile::VersionedFiles for PyVirtualVersionedFiles {
                     .call1((PyBytes::new(py, bare),))
                     .map_err(|e| vf_err_from_py(py, e))?;
                 if result.is_none() {
-                    let factory =
-                        bazaar::versionedfile::AbsentContentFactory::new(key.clone());
+                    let factory = bazaar::versionedfile::AbsentContentFactory::new(key.clone());
                     records.push(Ok(Box::new(factory) as Box<dyn ContentFactory>));
                 } else {
                     let mut lines = Vec::new();
                     for line in result.try_iter().map_err(|e| vf_err_from_py(py, e))? {
                         let line = line.map_err(|e| vf_err_from_py(py, e))?;
-                        let bytes: Vec<u8> =
-                            line.extract().map_err(|e| vf_err_from_py(py, e))?;
+                        let bytes: Vec<u8> = line.extract().map_err(|e| vf_err_from_py(py, e))?;
                         lines.push(bytes);
                     }
                     let sha = bazaar::weave::sha_strings(&lines);
@@ -828,8 +829,7 @@ impl bazaar::versionedfile::VersionedFiles for PyVirtualVersionedFiles {
                     let mut lines: Vec<Vec<u8>> = Vec::new();
                     for line in result.try_iter().map_err(|e| vf_err_from_py(py, e))? {
                         let line = line.map_err(|e| vf_err_from_py(py, e))?;
-                        let bytes: Vec<u8> =
-                            line.extract().map_err(|e| vf_err_from_py(py, e))?;
+                        let bytes: Vec<u8> = line.extract().map_err(|e| vf_err_from_py(py, e))?;
                         lines.push(bytes);
                     }
                     out.insert(key.clone(), bazaar::weave::sha_strings(&lines));
@@ -881,8 +881,7 @@ impl bazaar::versionedfile::VersionedFiles for PyVirtualVersionedFiles {
                 if !result.is_none() {
                     for line in result.try_iter().map_err(|e| vf_err_from_py(py, e))? {
                         let line = line.map_err(|e| vf_err_from_py(py, e))?;
-                        let bytes: Vec<u8> =
-                            line.extract().map_err(|e| vf_err_from_py(py, e))?;
+                        let bytes: Vec<u8> = line.extract().map_err(|e| vf_err_from_py(py, e))?;
                         out.push((bytes, key.clone()));
                     }
                 }
@@ -959,7 +958,13 @@ impl PyVirtualVersionedFiles {
         random_id: bool,
         check_content: bool,
     ) -> PyResult<()> {
-        let _ = (parent_texts, left_matching_blocks, nostore_sha, random_id, check_content);
+        let _ = (
+            parent_texts,
+            left_matching_blocks,
+            nostore_sha,
+            random_id,
+            check_content,
+        );
         Err(pyo3::exceptions::PyNotImplementedError::new_err(
             "VirtualVersionedFiles.add_lines",
         ))
@@ -1054,12 +1059,8 @@ impl PyVirtualVersionedFiles {
                     lines.push(bytes);
                 }
                 let sha = bazaar::weave::sha_strings(&lines);
-                let factory = bazaar::versionedfile::ChunkedContentFactory::new(
-                    Some(sha),
-                    key,
-                    None,
-                    lines,
-                );
+                let factory =
+                    bazaar::versionedfile::ChunkedContentFactory::new(Some(sha), key, None, lines);
                 let init = PyClassInitializer::from(AbstractContentFactory(Box::new(factory)))
                     .add_subclass(ChunkedContentFactory);
                 Bound::new(py, init)?.into_any()
@@ -1082,10 +1083,11 @@ impl PyVirtualVersionedFiles {
         for k in keys.try_iter()? {
             rust_keys.push(k?.extract()?);
         }
-        let pairs = <Self as bazaar::versionedfile::VersionedFiles>::iter_lines_added_or_present_in_keys(
-            self, &rust_keys,
-        )
-        .map_err(crate::knit::knit_err_to_py)?;
+        let pairs =
+            <Self as bazaar::versionedfile::VersionedFiles>::iter_lines_added_or_present_in_keys(
+                self, &rust_keys,
+            )
+            .map_err(crate::knit::knit_err_to_py)?;
         let out = PyList::empty(py);
         for (line, key) in pairs {
             // Match Python: yield (line, bare_bytes_key).
@@ -1905,7 +1907,8 @@ fn add_mpdiffs(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>) -> PyRe
         }
     }
 
-    let prepared = add_mpdiffs_prepare(&mut mpvf, &rs).map_err(crate::multiparent::reconstruct_err)?;
+    let prepared =
+        add_mpdiffs_prepare(&mut mpvf, &rs).map_err(crate::multiparent::reconstruct_err)?;
 
     // Dispatch each prepared row through Python. `vf_parents` threads the
     // opaque `parent_texts` token returned by add_lines back into
@@ -2041,7 +2044,8 @@ fn add_mpdiffs_singular(py: Python<'_>, vf: Py<PyAny>, records: Bound<'_, PyAny>
         }
     }
 
-    let prepared = add_mpdiffs_prepare(&mut mpvf, &rs).map_err(crate::multiparent::reconstruct_err)?;
+    let prepared =
+        add_mpdiffs_prepare(&mut mpvf, &rs).map_err(crate::multiparent::reconstruct_err)?;
 
     // Dispatch each prepared row through Python. Try add_lines_with_ghosts
     // first, fall back to add_lines on NotImplementedError so non-ghost-aware
