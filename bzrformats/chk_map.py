@@ -38,15 +38,12 @@ Densely packed upper nodes.
 
 import abc
 import heapq
-import logging
 from collections.abc import Callable, Generator, Iterator
 from typing import Union
 
 from . import lru_cache
 from ._bzr_rs import chk_map as _chk_map_rs
 from .registry import Registry
-
-logger = logging.getLogger("bzrformats.chk_map")
 
 common_prefix_many = _chk_map_rs.common_prefix_many
 common_prefix_pair = _chk_map_rs.common_prefix_pair
@@ -89,12 +86,6 @@ _page_cache_proxy = _PageCacheProxy()
 def _get_cache():
     """Return a dict-like view onto the shared CHK page cache."""
     return _page_cache_proxy
-
-
-# If a ChildNode falls below this many bytes, we check for a remap
-_INTERESTING_NEW_SIZE = 50
-# If a ChildNode shrinks by more than this amount, we check for a remap
-_INTERESTING_SHRINKAGE_LIMIT = 20
 
 
 # Plain search-key transform comes from the Rust extension so the
@@ -535,294 +526,14 @@ _unknown = _chk_map_rs._unknown
 LeafNode = _chk_map_rs.LeafNode
 
 
-# Register the Rust-backed pyclass with the Node ABC so existing
-# `isinstance(_, Node)` checks across this module match LeafNode
-# instances. InternalNode (still pure Python) inherits Node directly.
+# Register the Rust-backed pyclasses with the Node ABC so existing
+# `isinstance(_, Node)` checks across this module match LeafNode and
+# InternalNode instances.
 Node.register(LeafNode)
 
 
 InternalNode = _chk_map_rs.InternalNode
 
-
-def _internal_iter_nodes(self, store, key_filter=None, batch_size=None):
-    """Iterate over child nodes matching key_filter, demand-loading."""
-    keys = {}
-    shortcut = False
-    if key_filter is None:
-        shortcut = True
-        for prefix, node in self._items.items():
-            if isinstance(node, tuple):
-                keys[node] = (prefix, None)
-            elif isinstance(node, Node):
-                yield node, None
-            else:
-                raise AssertionError("Invalid node type: {!r}".format(type(node)))
-    elif len(key_filter) == 1:
-        for key in key_filter:  # noqa: B007
-            break
-        search_prefix = self._search_prefix_filter(key)
-        if len(search_prefix) == self._node_width:
-            shortcut = True
-            try:
-                node = self._items[search_prefix]
-            except KeyError:
-                return
-            if isinstance(node, tuple):
-                keys[node] = (search_prefix, [key])
-            elif isinstance(node, Node):
-                yield node, [key]
-                return
-            else:
-                raise AssertionError("Invalid node type: {!r}".format(type(node)))
-    if not shortcut:
-        prefix_to_keys = {}
-        length_filters = {}
-        node_key_filter = None
-        if key_filter is None:
-            raise AssertionError("key_filter must not be None")
-        for key in key_filter:
-            search_prefix = self._search_prefix_filter(key)
-            length_filter = length_filters.setdefault(len(search_prefix), set())
-            length_filter.add(search_prefix)
-            prefix_to_keys.setdefault(search_prefix, []).append(key)
-
-        if self._node_width in length_filters and len(length_filters) == 1:
-            search_prefixes = length_filters[self._node_width]
-            for search_prefix in search_prefixes:
-                try:
-                    node = self._items[search_prefix]
-                except KeyError:
-                    continue
-                node_key_filter = prefix_to_keys[search_prefix]
-                if isinstance(node, tuple):
-                    keys[node] = (search_prefix, node_key_filter)
-                elif isinstance(node, Node):
-                    yield node, node_key_filter
-                else:
-                    raise AssertionError("Invalid node type: {!r}".format(type(node)))
-        else:
-            length_filters_itemview = length_filters.items()
-            for prefix, node in self._items.items():
-                node_key_filter = []
-                for length, length_filter in length_filters_itemview:
-                    sub_prefix = prefix[:length]
-                    if sub_prefix in length_filter:
-                        node_key_filter.extend(prefix_to_keys[sub_prefix])
-                if node_key_filter:
-                    if isinstance(node, tuple):
-                        keys[node] = (prefix, node_key_filter)
-                    elif isinstance(node, Node):
-                        yield node, node_key_filter
-                    else:
-                        raise AssertionError("Invalid node type: {!r}".format(type(node)))
-    if keys:
-        found_keys = set()
-        for key in keys:
-            bytes = _page_cache_get(key)
-            if bytes is None:
-                continue
-            node = _deserialise(bytes, key, search_key_func=self._search_key_func)
-            prefix, node_key_filter = keys[key]
-            if not isinstance(node, Node):
-                raise AssertionError("Invalid node type: {!r}".format(type(node)))
-            self._items[prefix] = node
-            found_keys.add(key)
-            yield node, node_key_filter
-        for key in found_keys:
-            del keys[key]
-    if keys:
-        if batch_size is None:
-            batch_size = len(keys)
-        key_order = list(keys)
-        for batch_start in range(0, len(key_order), batch_size):
-            batch = key_order[batch_start : batch_start + batch_size]
-            stream = store.get_record_stream(batch, "unordered", True)
-            node_and_filters = []
-            for record in stream:
-                bytes = record.get_bytes_as("fulltext")
-                node = _deserialise(bytes, record.key, search_key_func=self._search_key_func)
-                prefix, node_key_filter = keys[record.key]
-                node_and_filters.append((node, node_key_filter))
-                if not isinstance(node, Node):
-                    raise AssertionError("Invalid node type: {!r}".format(type(node)))
-                self._items[prefix] = node
-                _page_cache_set(record.key, bytes)
-            yield from node_and_filters
-
-
-def _internal_iteritems(self, store, key_filter=None):
-    """Iterate over items in this node and its children."""
-    for node, node_filter in self._iter_nodes(store, key_filter=key_filter):
-        yield from node.iteritems(store, key_filter=node_filter)
-
-
-def _internal_map(self, store, key, value):
-    """Map key to value, returning (prefix, [(node_prefix, node)])."""
-    if not len(self._items):
-        raise AssertionError("can't map in an empty InternalNode.")
-    search_key = self._search_key(key)
-    if self._node_width != len(self._search_prefix) + 1:
-        raise AssertionError(
-            "node width mismatch: %d is not %d"
-            % (self._node_width, len(self._search_prefix) + 1)
-        )
-    if not search_key.startswith(self._search_prefix):
-        new_prefix = common_prefix_pair(self._search_prefix, search_key)
-        new_parent = InternalNode(new_prefix, search_key_func=self._search_key_func)
-        new_parent.set_maximum_size(self._maximum_size)
-        new_parent._key_width = self._key_width
-        new_parent.add_node(self._search_prefix[: len(new_prefix) + 1], self)
-        return new_parent.map(store, key, value)
-    children = [node for node, _ in self._iter_nodes(store, key_filter=[key])]
-    if children:
-        child = children[0]
-    else:
-        child = _internal_new_child(self, search_key, LeafNode)
-    old_len = len(child)
-    old_size = child._current_size() if isinstance(child, LeafNode) else None
-    prefix, node_details = child.map(store, key, value)
-    if len(node_details) == 1:
-        child = node_details[0][1]
-        self._len = self._len - old_len + len(child)
-        self._items[search_key] = child
-        self._key = None
-        new_node = self
-        if isinstance(child, LeafNode):
-            if old_size is None:
-                logger.debug("checking remap as InternalNode -> LeafNode")
-                new_node = _internal_check_remap(self, store)
-            else:
-                new_size = child._current_size()
-                shrinkage = old_size - new_size
-                if (
-                    shrinkage > 0 and new_size < _INTERESTING_NEW_SIZE
-                ) or shrinkage > _INTERESTING_SHRINKAGE_LIMIT:
-                    logger.debug(
-                        "checking remap as size shrunk by %d to be %d",
-                        shrinkage,
-                        new_size,
-                    )
-                    new_node = _internal_check_remap(self, store)
-        if new_node._search_prefix is None:
-            raise AssertionError("_search_prefix should not be None")
-        return new_node._search_prefix, [(b"", new_node)]
-    child = _internal_new_child(self, search_key, InternalNode)
-    child._search_prefix = prefix
-    for split, node in node_details:
-        child.add_node(split, node)
-    self._len = self._len - old_len + len(child)
-    self._key = None
-    return self._search_prefix, [(b"", self)]
-
-
-def _internal_new_child(self, search_key, klass):
-    """Create a new child node of type klass."""
-    child = klass()
-    child.set_maximum_size(self._maximum_size)
-    child._key_width = self._key_width
-    child._search_key_func = self._search_key_func
-    self._items[search_key] = child
-    return child
-
-
-def _internal_serialise(self, store):
-    """Serialise the node (and dirty children) to store, yielding sha1 keys."""
-    for node in self._items.values():
-        if isinstance(node, tuple):
-            continue
-        elif isinstance(node, Node):
-            if node._key is not None:
-                continue
-            for key in node.serialise(store):
-                yield key
-        else:
-            raise AssertionError(
-                f"InternalNode._items should only contain tuples or Nodes, not {node.__class__}"
-            )
-    if self._search_prefix is None:
-        raise AssertionError("_search_prefix should not be None")
-    sorted_items = [
-        (prefix, node[0] if isinstance(node, tuple) else node._key[0])
-        for prefix, node in sorted(self._items.items())
-    ]
-    lines = _chk_map_rs._serialise_internal_node(
-        self._maximum_size,
-        self._key_width,
-        self._len,
-        self._search_prefix,
-        sorted_items,
-    )
-    sha1, _, _ = store.add_lines((None,), (), lines)
-    self._key = (b"sha1:" + sha1,)
-    _page_cache_set(self._key, b"".join(lines))
-    yield self._key
-
-
-def _internal_split(self, offset):
-    """Split this node into smaller nodes starting at offset.
-
-    Yields (prefix, node) tuples — only meaningful when offset >= node_width,
-    in which case it recurses into the children. Mostly unused in
-    practice but kept for API parity.
-    """
-    if offset >= self._node_width:
-        for node in self._items.values():
-            yield from node._split(offset)
-
-
-def _internal_unmap(self, store, key, check_remap=True):
-    """Remove key from this subtree, returning the replacement node."""
-    if not len(self._items):
-        raise AssertionError("can't unmap in an empty InternalNode.")
-    children = [node for node, _ in self._iter_nodes(store, key_filter=[key])]
-    if children:
-        child = children[0]
-    else:
-        raise KeyError(key)
-    self._len -= 1
-    unmapped = child.unmap(store, key)
-    if unmapped is None:
-        raise AssertionError("unmap returned None, but we expected a node")
-    self._key = None
-    search_key = self._search_key(key)
-    if len(unmapped) == 0:
-        del self._items[search_key]
-        unmapped = None
-    else:
-        self._items[search_key] = unmapped
-    if len(self._items) == 1:
-        return list(self._items.values())[0]
-    if isinstance(unmapped, InternalNode):
-        return self
-    if check_remap:
-        return _internal_check_remap(self, store)
-    else:
-        return self
-
-
-def _internal_check_remap(self, store):
-    """Check if all keys in this subtree fit in a single LeafNode."""
-    new_leaf = LeafNode(search_key_func=self._search_key_func)
-    new_leaf.set_maximum_size(self._maximum_size)
-    new_leaf._key_width = self._key_width
-    for node, _ in self._iter_nodes(store, batch_size=16):
-        if isinstance(node, InternalNode):
-            return self
-        for key, value in node._items.items():
-            if new_leaf._map_no_split(key, value):
-                return self
-    logger.debug("remap generated a new LeafNode")
-    return new_leaf
-
-
-# Bind store-touching methods onto the pyclass.
-InternalNode._iter_nodes = _internal_iter_nodes
-InternalNode.iteritems = _internal_iteritems
-InternalNode.map = _internal_map
-InternalNode.serialise = _internal_serialise
-InternalNode._split = _internal_split
-InternalNode.unmap = _internal_unmap
-InternalNode._check_remap = _internal_check_remap
 
 # Virtual subclass for isinstance(_, Node) checks.
 Node.register(InternalNode)

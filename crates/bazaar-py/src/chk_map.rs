@@ -1515,6 +1515,824 @@ impl InternalNode {
             items: items.unbind(),
         })
     }
+
+    /// Iterate over child nodes matching `key_filter`, demand-loading
+    /// unloaded children from the page cache and store. Returns a lazy
+    /// iterator of `(node, node_key_filter)` pairs; loading replaces the
+    /// `(b"sha1:...",)` tuple in `_items` with the deserialised node.
+    /// Laziness matters: `_check_remap` stops early and must not page in
+    /// children it never reaches. Mirrors `_internal_iter_nodes`.
+    #[pyo3(signature = (store, key_filter = None, batch_size = None))]
+    fn _iter_nodes<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+        key_filter: Option<Bound<'py, PyAny>>,
+        batch_size: Option<usize>,
+    ) -> PyResult<Bound<'py, InternalNodeIterator>> {
+        // Eager filtering pass: classify each child as already-resolved
+        // (into `result`) or pending load (into `to_load`/`key_order`).
+        // Loading is deferred to the iterator so early consumers (e.g.
+        // `_check_remap`) don't page in children they never reach.
+        let result = PyList::empty(py);
+        let to_load = PyDict::new(py);
+        let mut key_order: Vec<Py<PyAny>> = Vec::new();
+        {
+            let me = slf.borrow();
+            let items = me.items.bind(py);
+            let filter_len = match &key_filter {
+                None => None,
+                Some(kf) => Some(kf.len()?),
+            };
+            let mut shortcut = false;
+            if key_filter.is_none() {
+                shortcut = true;
+                for (prefix, node) in items.iter() {
+                    if node.clone().cast::<PyTuple>().is_ok() {
+                        record_to_load(
+                            &to_load,
+                            &mut key_order,
+                            &node,
+                            &prefix,
+                            py.None().bind(py),
+                        )?;
+                    } else if is_node(&node) {
+                        result.append(PyTuple::new(py, [node, py.None().into_bound(py)])?)?;
+                    } else {
+                        return Err(invalid_node_type(&node));
+                    }
+                }
+            } else if filter_len == Some(1) {
+                let kf = key_filter.as_ref().unwrap();
+                let key = kf.try_iter()?.next().unwrap()?;
+                let key_tuple = key.clone().cast_into::<PyTuple>()?;
+                let search_prefix = me._search_prefix_filter(py, key_tuple)?;
+                if search_prefix.as_bytes().len() == me.node_width {
+                    shortcut = true;
+                    if let Some(node) = items.get_item(&search_prefix)? {
+                        let filter_list = PyList::new(py, [key.clone()])?;
+                        if node.clone().cast::<PyTuple>().is_ok() {
+                            record_to_load(
+                                &to_load,
+                                &mut key_order,
+                                &node,
+                                &search_prefix,
+                                filter_list.as_any(),
+                            )?;
+                        } else if is_node(&node) {
+                            result.append(PyTuple::new(py, [node, filter_list.into_any()])?)?;
+                        } else {
+                            return Err(invalid_node_type(&node));
+                        }
+                    }
+                }
+            }
+
+            if !shortcut {
+                let kf = key_filter.as_ref().ok_or_else(|| {
+                    pyo3::exceptions::PyAssertionError::new_err("key_filter must not be None")
+                })?;
+                let prefix_to_keys = PyDict::new(py);
+                let mut length_filters: std::collections::HashMap<
+                    usize,
+                    std::collections::HashSet<Vec<u8>>,
+                > = std::collections::HashMap::new();
+                for key in kf.try_iter()? {
+                    let key = key?;
+                    let key_tuple = key.clone().cast_into::<PyTuple>()?;
+                    let search_prefix = me._search_prefix_filter(py, key_tuple)?;
+                    let sp_bytes = search_prefix.as_bytes().to_vec();
+                    length_filters
+                        .entry(sp_bytes.len())
+                        .or_default()
+                        .insert(sp_bytes.clone());
+                    match prefix_to_keys.get_item(&search_prefix)? {
+                        Some(lst) => lst.cast_into::<PyList>()?.append(key)?,
+                        None => {
+                            prefix_to_keys.set_item(&search_prefix, PyList::new(py, [key])?)?;
+                        }
+                    }
+                }
+
+                if length_filters.contains_key(&me.node_width) && length_filters.len() == 1 {
+                    let search_prefixes = &length_filters[&me.node_width];
+                    for sp in search_prefixes {
+                        let sp_py = PyBytes::new(py, sp);
+                        let Some(node) = items.get_item(&sp_py)? else {
+                            continue;
+                        };
+                        let node_key_filter = prefix_to_keys
+                            .get_item(&sp_py)?
+                            .unwrap()
+                            .cast_into::<PyList>()?;
+                        if node.clone().cast::<PyTuple>().is_ok() {
+                            record_to_load(
+                                &to_load,
+                                &mut key_order,
+                                &node,
+                                &sp_py,
+                                node_key_filter.as_any(),
+                            )?;
+                        } else if is_node(&node) {
+                            result.append(PyTuple::new(py, [node, node_key_filter.into_any()])?)?;
+                        } else {
+                            return Err(invalid_node_type(&node));
+                        }
+                    }
+                } else {
+                    for (prefix, node) in items.iter() {
+                        let prefix_bytes =
+                            prefix.clone().cast_into::<PyBytes>()?.as_bytes().to_vec();
+                        let node_key_filter = PyList::empty(py);
+                        for (length, length_filter) in &length_filters {
+                            if prefix_bytes.len() >= *length {
+                                let sub_prefix = &prefix_bytes[..*length];
+                                if length_filter.contains(sub_prefix) {
+                                    let sub_py = PyBytes::new(py, sub_prefix);
+                                    let keys = prefix_to_keys
+                                        .get_item(&sub_py)?
+                                        .unwrap()
+                                        .cast_into::<PyList>()?;
+                                    for k in keys.iter() {
+                                        node_key_filter.append(k)?;
+                                    }
+                                }
+                            }
+                        }
+                        if !node_key_filter.is_empty() {
+                            if node.clone().cast::<PyTuple>().is_ok() {
+                                record_to_load(
+                                    &to_load,
+                                    &mut key_order,
+                                    &node,
+                                    &prefix,
+                                    node_key_filter.as_any(),
+                                )?;
+                            } else if is_node(&node) {
+                                result.append(PyTuple::new(
+                                    py,
+                                    [node, node_key_filter.into_any()],
+                                )?)?;
+                            } else {
+                                return Err(invalid_node_type(&node));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        InternalNodeIterator::new_from(py, &slf, store, result, to_load, key_order, batch_size)
+    }
+
+    /// Iterate over `(key, value)` items in this node and its children,
+    /// demand-loading as needed. Mirrors `_internal_iteritems`.
+    #[pyo3(signature = (store, key_filter = None))]
+    fn iteritems<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+        key_filter: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        let nodes = InternalNode::_iter_nodes(slf, py, store.clone(), key_filter, None)?;
+        for pair in nodes.try_iter()? {
+            let pair = pair?.cast_into::<PyTuple>()?;
+            let node = pair.get_item(0)?;
+            let node_filter = pair.get_item(1)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("key_filter", node_filter)?;
+            let items = node.call_method("iteritems", (store.clone(),), Some(&kwargs))?;
+            for item in items.try_iter()? {
+                out.append(item?)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Serialise this node and any dirty children to `store`, returning
+    /// the list of sha1 keys written. Mirrors `_internal_serialise`.
+    fn serialise<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        use bazaar::chk_map::PageCache as _;
+        let yielded = PyList::empty(py);
+        // Serialise dirty children first.
+        let children: Vec<Bound<'py, PyAny>> = {
+            let me = slf.borrow();
+            let dict = me.items.bind(py);
+            dict.values().iter().collect()
+        };
+        for node in children {
+            if node.clone().cast::<PyTuple>().is_ok() {
+                continue;
+            }
+            if !is_node(&node) {
+                return Err(pyo3::exceptions::PyAssertionError::new_err(
+                    "InternalNode._items should only contain tuples or Nodes",
+                ));
+            }
+            // Already-serialised children (with a key) are skipped.
+            if !node.getattr("_key")?.is_none() {
+                continue;
+            }
+            for key in node
+                .call_method1("serialise", (store.clone(),))?
+                .try_iter()?
+            {
+                yielded.append(key?)?;
+            }
+        }
+        let (maximum_size, key_width, len, search_prefix, sorted_items) = {
+            let me = slf.borrow();
+            let search_prefix = me.search_prefix.clone().ok_or_else(|| {
+                pyo3::exceptions::PyAssertionError::new_err("_search_prefix should not be None")
+            })?;
+            let dict = me.items.bind(py);
+            let mut entries: Vec<(Vec<u8>, Bound<'py, PyAny>)> = Vec::new();
+            for (k, v) in dict.iter() {
+                entries.push((k.cast_into::<PyBytes>()?.as_bytes().to_vec(), v));
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let sorted_items = PyList::empty(py);
+            for (prefix, node) in entries {
+                let flat_key: Bound<'py, PyBytes> = if let Ok(t) = node.clone().cast::<PyTuple>() {
+                    t.get_item(0)?.cast_into::<PyBytes>()?
+                } else {
+                    node.getattr("_key")?
+                        .cast_into::<PyTuple>()?
+                        .get_item(0)?
+                        .cast_into::<PyBytes>()?
+                };
+                sorted_items.append(PyTuple::new(
+                    py,
+                    [PyBytes::new(py, &prefix).into_any(), flat_key.into_any()],
+                )?)?;
+            }
+            (
+                me.maximum_size,
+                me.key_width,
+                me.len,
+                search_prefix,
+                sorted_items,
+            )
+        };
+        let lines = py_serialise_internal_node(
+            py,
+            maximum_size,
+            key_width,
+            len,
+            &search_prefix,
+            sorted_items.into_any(),
+        )?;
+        let result = store.call_method1("add_lines", ((py.None(),), PyList::empty(py), &lines))?;
+        let sha1: Vec<u8> = result
+            .cast_into::<PyTuple>()?
+            .get_item(0)?
+            .cast_into::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        let mut key = b"sha1:".to_vec();
+        key.extend_from_slice(&sha1);
+        slf.borrow_mut().key = Some(key.clone());
+        let mut data: Vec<u8> = Vec::new();
+        for line in lines.iter() {
+            data.extend_from_slice(line.cast_into::<PyBytes>()?.as_bytes());
+        }
+        page_cache().insert(key.clone(), data);
+        let key_tuple = PyTuple::new(py, [PyBytes::new(py, &key)])?;
+        yielded.append(key_tuple)?;
+        Ok(yielded)
+    }
+
+    /// Split into smaller nodes starting at `offset`; only meaningful
+    /// when `offset >= node_width`. Mirrors `_internal_split`.
+    fn _split<'py>(&self, py: Python<'py>, offset: usize) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        if offset >= self.node_width {
+            let dict = self.items.bind(py);
+            for node in dict.values().iter() {
+                for item in node.call_method1("_split", (offset,))?.try_iter()? {
+                    out.append(item?)?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Check whether the whole subtree now fits in a single LeafNode;
+    /// if so return that new leaf, else return `self`. Mirrors
+    /// `_internal_check_remap`.
+    fn _check_remap<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (callable, maximum_size, key_width) = {
+            let me = slf.borrow();
+            (
+                me.search_key_callable.as_ref().map(|c| c.bind(py).clone()),
+                me.maximum_size,
+                me.key_width,
+            )
+        };
+        let new_leaf = Bound::new(py, LeafNode::new(py, callable)?)?;
+        new_leaf.borrow_mut().inner.maximum_size = maximum_size;
+        new_leaf.borrow_mut().inner.key_width = key_width;
+        let nodes = InternalNode::_iter_nodes(slf.clone(), py, store, None, Some(16))?;
+        for pair in nodes.try_iter()? {
+            let pair = pair?.cast_into::<PyTuple>()?;
+            let node = pair.get_item(0)?;
+            if node.clone().cast::<InternalNode>().is_ok() {
+                return Ok(slf.into_any());
+            }
+            let leaf = node.cast_into::<LeafNode>()?;
+            let items: Vec<(Vec<Vec<u8>>, Vec<u8>)> = leaf
+                .borrow()
+                .inner
+                .items
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (k, v) in items {
+                if new_leaf.borrow_mut().inner.map_no_split(k, v) {
+                    return Ok(slf.into_any());
+                }
+            }
+        }
+        Ok(new_leaf.into_any())
+    }
+
+    /// Map `key`->`value` into the subtree, returning
+    /// `(prefix, [(node_prefix, node)])`. Mirrors `_internal_map`.
+    fn map<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+        key: Bound<'py, PyTuple>,
+        value: Vec<u8>,
+    ) -> PyResult<(Py<PyAny>, Bound<'py, PyList>)> {
+        {
+            let me = slf.borrow();
+            if me.items.bind(py).is_empty() {
+                return Err(pyo3::exceptions::PyAssertionError::new_err(
+                    "can't map in an empty InternalNode.",
+                ));
+            }
+        }
+        let search_key = slf.borrow()._search_key(py, key.clone())?;
+        let search_prefix = slf.borrow().search_prefix.clone().unwrap_or_default();
+        let node_width = slf.borrow().node_width;
+        if node_width != search_prefix.len() + 1 {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                "node width mismatch: {} is not {}",
+                node_width,
+                search_prefix.len() + 1
+            )));
+        }
+        if !search_key.as_bytes().starts_with(&search_prefix) {
+            // The key falls outside this node; build a new common parent.
+            let new_prefix =
+                bazaar::chk_map::common_prefix_pair(&search_prefix, search_key.as_bytes()).to_vec();
+            let callable = slf
+                .borrow()
+                .search_key_callable
+                .as_ref()
+                .map(|c| c.bind(py).clone());
+            let new_parent = Bound::new(py, InternalNode::new(py, Some(&new_prefix), callable)?)?;
+            new_parent.borrow_mut().maximum_size = slf.borrow().maximum_size;
+            new_parent.borrow_mut().key_width = slf.borrow().key_width;
+            let self_prefix = search_prefix[..new_prefix.len() + 1].to_vec();
+            InternalNode::add_node(
+                &mut new_parent.borrow_mut(),
+                py,
+                &self_prefix,
+                slf.clone().into_any(),
+            )?;
+            return InternalNode::map(new_parent, py, store, key, value);
+        }
+        // Find or create the child for this search key.
+        let filter = PyList::new(py, [key.clone()])?;
+        let nodes = InternalNode::_iter_nodes(
+            slf.clone(),
+            py,
+            store.clone(),
+            Some(filter.into_any()),
+            None,
+        )?;
+        let first = nodes.try_iter()?.next();
+        let child: Bound<'py, PyAny> = match first {
+            Some(pair) => pair?.cast_into::<PyTuple>()?.get_item(0)?,
+            None => internal_new_child(&slf, py, search_key.as_bytes(), false)?,
+        };
+        let old_len: usize = child.len()?;
+        let old_size: Option<usize> = match child.cast::<LeafNode>() {
+            Ok(leaf) => Some(leaf.borrow()._current_size()),
+            Err(_) => None,
+        };
+        let mapped = child
+            .call_method1(
+                "map",
+                (store.clone(), key.clone(), PyBytes::new(py, &value)),
+            )?
+            .cast_into::<PyTuple>()?;
+        let prefix = mapped.get_item(0)?;
+        let node_details = mapped.get_item(1)?.cast_into::<PyList>()?;
+        if node_details.len() == 1 {
+            let child = node_details
+                .get_item(0)?
+                .cast_into::<PyTuple>()?
+                .get_item(1)?;
+            let new_child_len: usize = child.len()?;
+            {
+                let mut me = slf.borrow_mut();
+                me.len = me.len - old_len + new_child_len;
+                me.items.bind(py).set_item(&search_key, &child)?;
+                me.key = None;
+            }
+            let mut new_node: Bound<'py, PyAny> = slf.clone().into_any();
+            if let Ok(leaf) = child.cast::<LeafNode>() {
+                let do_remap = match old_size {
+                    None => true,
+                    Some(old) => {
+                        let new_size = leaf.borrow()._current_size();
+                        let shrinkage = old as isize - new_size as isize;
+                        (shrinkage > 0 && new_size < bazaar::chk_map::INTERESTING_NEW_SIZE)
+                            || shrinkage > bazaar::chk_map::INTERESTING_SHRINKAGE_LIMIT as isize
+                    }
+                };
+                if do_remap {
+                    new_node = InternalNode::_check_remap(slf.clone(), py, store.clone())?;
+                }
+            }
+            let new_prefix = node_search_prefix(&new_node, py)?;
+            if new_prefix.is_none() {
+                return Err(pyo3::exceptions::PyAssertionError::new_err(
+                    "_search_prefix should not be None",
+                ));
+            }
+            let details = PyList::new(
+                py,
+                [PyTuple::new(
+                    py,
+                    [PyBytes::new(py, b"").into_any(), new_node],
+                )?],
+            )?;
+            return Ok((new_prefix.unwrap().into_any().unbind(), details));
+        }
+        // Child split: wrap the pieces in a fresh InternalNode child.
+        let child = internal_new_child(&slf, py, search_key.as_bytes(), true)?;
+        let child = child.cast_into::<InternalNode>()?;
+        child.setattr("_search_prefix", &prefix)?;
+        for detail in node_details.iter() {
+            let detail = detail.cast_into::<PyTuple>()?;
+            let split = detail.get_item(0)?.cast_into::<PyBytes>()?;
+            let node = detail.get_item(1)?;
+            InternalNode::add_node(&mut child.borrow_mut(), py, split.as_bytes(), node)?;
+        }
+        let new_child_len: usize = child.borrow().len;
+        {
+            let mut me = slf.borrow_mut();
+            me.len = me.len - old_len + new_child_len;
+            me.key = None;
+        }
+        let self_prefix = slf.borrow().search_prefix.clone().unwrap_or_default();
+        let details = PyList::new(
+            py,
+            [PyTuple::new(
+                py,
+                [PyBytes::new(py, b"").into_any(), slf.into_any()],
+            )?],
+        )?;
+        Ok((PyBytes::new(py, &self_prefix).into_any().unbind(), details))
+    }
+
+    /// Remove `key` from the subtree, returning the (possibly collapsed)
+    /// replacement node. Mirrors `_internal_unmap`.
+    #[pyo3(signature = (store, key, check_remap = true))]
+    fn unmap<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        store: Bound<'py, PyAny>,
+        key: Bound<'py, PyTuple>,
+        check_remap: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if slf.borrow().items.bind(py).is_empty() {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(
+                "can't unmap in an empty InternalNode.",
+            ));
+        }
+        let filter = PyList::new(py, [key.clone()])?;
+        let nodes = InternalNode::_iter_nodes(
+            slf.clone(),
+            py,
+            store.clone(),
+            Some(filter.into_any()),
+            None,
+        )?;
+        let first = nodes.try_iter()?.next();
+        let child = match first {
+            Some(pair) => pair?.cast_into::<PyTuple>()?.get_item(0)?,
+            None => return Err(pyo3::exceptions::PyKeyError::new_err(format!("{:?}", key))),
+        };
+        slf.borrow_mut().len -= 1;
+        let unmapped = child.call_method1("unmap", (store.clone(), key.clone()))?;
+        slf.borrow_mut().key = None;
+        let search_key = slf.borrow()._search_key(py, key)?;
+        let unmapped_len: usize = unmapped.len()?;
+        let mut unmapped_is_none = false;
+        if unmapped_len == 0 {
+            slf.borrow().items.bind(py).del_item(&search_key)?;
+            unmapped_is_none = true;
+        } else {
+            slf.borrow()
+                .items
+                .bind(py)
+                .set_item(&search_key, &unmapped)?;
+        }
+        if slf.borrow().items.bind(py).len() == 1 {
+            let only = slf.borrow().items.bind(py).values().get_item(0)?;
+            return Ok(only);
+        }
+        if !unmapped_is_none && unmapped.cast::<InternalNode>().is_ok() {
+            return Ok(slf.into_any());
+        }
+        if check_remap {
+            InternalNode::_check_remap(slf, py, store)
+        } else {
+            Ok(slf.into_any())
+        }
+    }
+}
+
+/// Create a new child node of `klass` under `search_key`, inheriting
+/// max-size/key-width/search-key-func. `internal` picks InternalNode,
+/// else LeafNode. Mirrors `_internal_new_child`.
+fn internal_new_child<'py>(
+    parent: &Bound<'py, InternalNode>,
+    py: Python<'py>,
+    search_key: &[u8],
+    internal: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let (callable, maximum_size, key_width) = {
+        let me = parent.borrow();
+        (
+            me.search_key_callable.as_ref().map(|c| c.bind(py).clone()),
+            me.maximum_size,
+            me.key_width,
+        )
+    };
+    let child: Bound<'py, PyAny> = if internal {
+        let node = Bound::new(py, InternalNode::new(py, None, callable)?)?;
+        node.borrow_mut().maximum_size = maximum_size;
+        node.borrow_mut().key_width = key_width;
+        node.into_any()
+    } else {
+        let node = Bound::new(py, LeafNode::new(py, callable)?)?;
+        node.borrow_mut().inner.maximum_size = maximum_size;
+        node.borrow_mut().inner.key_width = key_width;
+        node.into_any()
+    };
+    parent
+        .borrow()
+        .items
+        .bind(py)
+        .set_item(PyBytes::new(py, search_key), &child)?;
+    Ok(child)
+}
+
+/// Read a node's `_search_prefix`, returning `None` for the Python
+/// `None` sentinel (an empty internal node) and `Some(bytes)` otherwise.
+fn node_search_prefix<'py>(
+    node: &Bound<'py, PyAny>,
+    py: Python<'py>,
+) -> PyResult<Option<Bound<'py, PyBytes>>> {
+    let sp = node.getattr("_search_prefix")?;
+    if sp.is_none() {
+        Ok(None)
+    } else if sp.is(unknown_sentinel(py)) {
+        // A leaf with an unknown prefix: compute it.
+        let computed = node.call_method0("_compute_search_prefix")?;
+        if computed.is_none() {
+            Ok(None)
+        } else {
+            Ok(Some(computed.cast_into::<PyBytes>()?))
+        }
+    } else {
+        Ok(Some(sp.cast_into::<PyBytes>()?))
+    }
+}
+
+/// Is `obj` a loaded CHK node (LeafNode or InternalNode pyclass)?
+fn is_node(obj: &Bound<'_, PyAny>) -> bool {
+    obj.cast::<LeafNode>().is_ok() || obj.cast::<InternalNode>().is_ok()
+}
+
+/// Build the "invalid node type" assertion error matching Python.
+fn invalid_node_type(obj: &Bound<'_, PyAny>) -> PyErr {
+    pyo3::exceptions::PyAssertionError::new_err(format!(
+        "Invalid node type: {}",
+        obj.get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+    ))
+}
+
+/// Queue an unloaded child for loading: `to_load[ref_tuple] = (prefix, filter)`,
+/// preserving first-seen order in `key_order`.
+fn record_to_load<'py>(
+    to_load: &Bound<'py, PyDict>,
+    key_order: &mut Vec<Py<PyAny>>,
+    ref_tuple: &Bound<'py, PyAny>,
+    prefix: &Bound<'py, PyAny>,
+    filter: &Bound<'py, PyAny>,
+) -> PyResult<()> {
+    if !to_load.contains(ref_tuple)? {
+        key_order.push(ref_tuple.clone().unbind());
+    }
+    let entry = PyTuple::new(ref_tuple.py(), [prefix.clone(), filter.clone()])?;
+    to_load.set_item(ref_tuple, entry)?;
+    Ok(())
+}
+
+/// Lazy iterator over `InternalNode._iter_nodes`. Yields already-resolved
+/// `(node, filter)` pairs first, then demand-loads pending children from
+/// the page cache and finally the store, replacing the `(sha1,)` tuple in
+/// the parent's `_items` as each child loads.
+#[pyclass(module = "bzrformats._bzr_rs.chk_map")]
+pub struct InternalNodeIterator {
+    parent: Py<InternalNode>,
+    /// `(node, filter)` pairs already resolved during filtering.
+    resolved: std::collections::VecDeque<Py<PyAny>>,
+    /// `ref_tuple -> (prefix, filter)` for pending loads.
+    to_load: Py<PyDict>,
+    /// Pending ref tuples in first-seen order, still to try the cache.
+    cache_queue: std::collections::VecDeque<Py<PyAny>>,
+    /// Refs that missed the page cache, awaiting a store read.
+    store_queue: Vec<Py<PyAny>>,
+    /// Records buffered from the current store batch.
+    store_buffer: std::collections::VecDeque<Py<PyAny>>,
+    /// The store to demand-load pages from.
+    store_handle: Py<PyAny>,
+    batch_size: Option<usize>,
+    callable: Option<Py<PyAny>>,
+}
+
+impl InternalNodeIterator {
+    #[allow(clippy::too_many_arguments)]
+    fn new_from<'py>(
+        py: Python<'py>,
+        parent: &Bound<'py, InternalNode>,
+        store: Bound<'py, PyAny>,
+        resolved: Bound<'py, PyList>,
+        to_load: Bound<'py, PyDict>,
+        key_order: Vec<Py<PyAny>>,
+        batch_size: Option<usize>,
+    ) -> PyResult<Bound<'py, InternalNodeIterator>> {
+        let callable = parent
+            .borrow()
+            .search_key_callable
+            .as_ref()
+            .map(|c| c.clone_ref(py));
+        let resolved_q: std::collections::VecDeque<Py<PyAny>> =
+            resolved.iter().map(|p| p.unbind()).collect();
+        Bound::new(
+            py,
+            InternalNodeIterator {
+                parent: parent.clone().unbind(),
+                resolved: resolved_q,
+                to_load: to_load.unbind(),
+                cache_queue: key_order.into_iter().collect(),
+                store_queue: Vec::new(),
+                store_buffer: std::collections::VecDeque::new(),
+                store_handle: store.unbind(),
+                batch_size,
+                callable,
+            },
+        )
+    }
+
+    /// Resolve a loaded child: look up its `(prefix, filter)`, store the
+    /// node back into the parent's `_items`, and return `(node, filter)`.
+    fn resolve_loaded<'py>(
+        &self,
+        py: Python<'py>,
+        ref_key: &Bound<'py, PyAny>,
+        node: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        if !is_node(&node) {
+            return Err(invalid_node_type(&node));
+        }
+        let entry = self
+            .to_load
+            .bind(py)
+            .get_item(ref_key)?
+            .unwrap()
+            .cast_into::<PyTuple>()?;
+        let prefix = entry.get_item(0)?;
+        let node_key_filter = entry.get_item(1)?;
+        self.parent
+            .bind(py)
+            .borrow()
+            .items
+            .bind(py)
+            .set_item(&prefix, &node)?;
+        PyTuple::new(py, [node, node_key_filter])
+    }
+}
+
+#[pymethods]
+impl InternalNodeIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        use bazaar::chk_map::PageCache as _;
+        if let Some(pair) = self.resolved.pop_front() {
+            return Ok(Some(pair.into_bound(py).cast_into::<PyTuple>()?));
+        }
+        // Drain the page-cache queue; misses move to the store queue.
+        while let Some(ref_key) = self.cache_queue.pop_front() {
+            let ref_b = ref_key.bind(py);
+            let sha1: Vec<u8> = ref_b
+                .clone()
+                .cast_into::<PyTuple>()?
+                .get_item(0)?
+                .cast_into::<PyBytes>()?
+                .as_bytes()
+                .to_vec();
+            match page_cache().get(&sha1) {
+                Some(bytes) => {
+                    let ref_tuple = ref_b.clone().cast_into::<PyTuple>()?;
+                    let node = py_deserialise(py, &bytes, ref_tuple, self.callable_bound(py))?;
+                    return Ok(Some(self.resolve_loaded(py, ref_b, node)?));
+                }
+                None => self.store_queue.push(ref_key.clone_ref(py)),
+            }
+        }
+        // Serve already-resolved pairs from the current store batch.
+        if let Some(pair) = self.store_buffer.pop_front() {
+            return Ok(Some(pair.into_bound(py).cast_into::<PyTuple>()?));
+        }
+        // Fetch the next store batch. Like Python, set `_items` for every
+        // record in the batch up front (even if the consumer stops early),
+        // then buffer the resolved pairs for yielding.
+        if !self.store_queue.is_empty() {
+            let batch_size = self.batch_size.unwrap_or(self.store_queue.len());
+            let take = batch_size.min(self.store_queue.len());
+            let this_batch: Vec<Py<PyAny>> = self.store_queue.drain(..take).collect();
+            let batch = PyList::empty(py);
+            for k in &this_batch {
+                batch.append(k.bind(py))?;
+            }
+            let store_obj = self.store_handle.bind(py).clone();
+            let stream = store_obj.call_method1("get_record_stream", (batch, "unordered", true))?;
+            for record in stream.try_iter()? {
+                let pair = self.consume_record(py, record?)?;
+                self.store_buffer.push_back(pair.unbind().into_any());
+            }
+            if let Some(pair) = self.store_buffer.pop_front() {
+                return Ok(Some(pair.into_bound(py).cast_into::<PyTuple>()?));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl InternalNodeIterator {
+    fn callable_bound<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyAny>> {
+        self.callable.as_ref().map(|c| c.bind(py).clone())
+    }
+
+    /// Deserialise a store record, cache its bytes, and resolve it into
+    /// the `(node, filter)` pair.
+    fn consume_record<'py>(
+        &self,
+        py: Python<'py>,
+        record: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        use bazaar::chk_map::PageCache as _;
+        let bytes_obj = record.call_method1("get_bytes_as", ("fulltext",))?;
+        let bytes_py = bytes_obj.cast_into::<PyBytes>()?;
+        let rec_key = record.getattr("key")?;
+        let rec_key_tuple = rec_key.clone().cast_into::<PyTuple>()?;
+        let sha1: Vec<u8> = rec_key_tuple
+            .get_item(0)?
+            .cast_into::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        let node = py_deserialise(
+            py,
+            bytes_py.as_bytes(),
+            rec_key_tuple,
+            self.callable_bound(py),
+        )?;
+        page_cache().insert(sha1, bytes_py.as_bytes().to_vec());
+        self.resolve_loaded(py, &rec_key, node)
+    }
 }
 
 /// CHK persistent map — a string→string dict backed by a CHK store.
@@ -2488,5 +3306,6 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<CHKMap>()?;
     m.add_class::<CHKMapDifference>()?;
     m.add_class::<CHKDifferenceIterator>()?;
+    m.add_class::<InternalNodeIterator>()?;
     Ok(m)
 }
