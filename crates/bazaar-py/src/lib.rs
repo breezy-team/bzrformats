@@ -24,6 +24,7 @@ mod lock;
 mod multiparent;
 mod osutils;
 mod pack;
+mod pack_repo;
 mod plan_merge;
 mod smart;
 mod textmerge;
@@ -1010,6 +1011,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let packm = pack::_pack_rs(py)?;
     m.add_submodule(&packm)?;
 
+    let pack_repom = pack_repo::_pack_repo_rs(py)?;
+    m.add_submodule(&pack_repom)?;
+
     let indexm = index::_index_rs(py)?;
     m.add_submodule(&indexm)?;
 
@@ -1064,6 +1068,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.multiparent", module_name), &multiparentm)?;
     modules.set_item(format!("{}.weave", module_name), &weavem)?;
     modules.set_item(format!("{}.pack", module_name), &packm)?;
+    modules.set_item(format!("{}.pack_repo", module_name), &pack_repom)?;
     modules.set_item(format!("{}.index", module_name), &indexm)?;
     modules.set_item(format!("{}.btree_index", module_name), &btree_indexm)?;
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
