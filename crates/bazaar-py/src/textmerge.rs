@@ -1,6 +1,6 @@
 use bazaar::textmerge;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
 type ExtractedLines = (Vec<Py<PyBytes>>, Vec<Vec<u8>>);
 
@@ -235,23 +235,7 @@ impl Merge2 {
         py: Python<'py>,
         struct_iter: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let mut out: Vec<Bound<PyTuple>> = Vec::new();
-        for item in struct_iter.try_iter()? {
-            let group = item?.cast_into::<PyTuple>()?;
-            let len = group.len();
-            let first = group.get_item(0)?;
-            if first.try_iter()?.next().is_some() {
-                out.push(group);
-                continue;
-            }
-            if len > 1 {
-                let second = group.get_item(1)?;
-                if second.try_iter()?.next().is_some() {
-                    out.push(group);
-                }
-            }
-        }
-        PyList::new(py, out)
+        iter_useful_impl(py, struct_iter)
     }
 
     /// Render structured merge info to a flat line list using this instance's
@@ -446,9 +430,196 @@ fn base_from_plan<'py>(py: Python<'py>, plan: &Bound<'py, PyAny>) -> PyResult<Bo
     PyList::new(py, indices.into_iter().map(|i| lines[i].bind(py).clone()))
 }
 
+/// Base class for text-mergers.
+///
+/// Subclasses must implement ``_merge_struct``. This is the Python-facing
+/// base that `PlanWeaveMerge` and downstream `Merge3` subclass; the marker
+/// bookkeeping (`struct_to_lines`, `iter_useful`, `merge_lines`,
+/// `merge_struct`) is shared with `Merge2` via the module-level helpers.
+///
+/// `subclass` so Python subclasses can override `_merge_struct`; the
+/// `merge_struct`/`merge_lines` methods dispatch back through
+/// `self._merge_struct()` so the override is honoured.
+#[pyclass(subclass, dict, module = "bzrformats._bzr_rs.textmerge")]
+struct TextMerge;
+
+#[pymethods]
+impl TextMerge {
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn A_MARKER(py: Python) -> Bound<PyBytes> {
+        PyBytes::new(py, textmerge::A_MARKER)
+    }
+
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn B_MARKER(py: Python) -> Bound<PyBytes> {
+        PyBytes::new(py, textmerge::B_MARKER)
+    }
+
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn SPLIT_MARKER(py: Python) -> Bound<PyBytes> {
+        PyBytes::new(py, textmerge::SPLIT_MARKER)
+    }
+
+    // `__new__` ignores its arguments so Python subclasses (e.g.
+    // `PlanWeaveMerge`) can pass their own constructor args straight
+    // through; the markers are set in `__init__`.
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn new(_args: Bound<'_, PyTuple>, _kwargs: Option<Bound<'_, PyDict>>) -> Self {
+        TextMerge
+    }
+
+    /// Store the three conflict markers as instance attributes, defaulting
+    /// to the standard markers when omitted.
+    #[pyo3(signature = (a_marker = None, b_marker = None, split_marker = None))]
+    fn __init__(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        a_marker: Option<Py<PyBytes>>,
+        b_marker: Option<Py<PyBytes>>,
+        split_marker: Option<Py<PyBytes>>,
+    ) -> PyResult<()> {
+        let a = a_marker.unwrap_or_else(|| PyBytes::new(py, textmerge::A_MARKER).unbind());
+        let b = b_marker.unwrap_or_else(|| PyBytes::new(py, textmerge::B_MARKER).unbind());
+        let split =
+            split_marker.unwrap_or_else(|| PyBytes::new(py, textmerge::SPLIT_MARKER).unbind());
+        slf.setattr("a_marker", a)?;
+        slf.setattr("b_marker", b)?;
+        slf.setattr("split_marker", split)?;
+        Ok(())
+    }
+
+    /// Return structured merge info.  Must be implemented by subclasses.
+    fn _merge_struct(&self) -> PyResult<()> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "_merge_struct is abstract",
+        ))
+    }
+
+    /// Render structured merge info to a flat line list using this instance's
+    /// conflict markers.
+    fn struct_to_lines<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        struct_iter: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let groups = iter_to_groups(struct_iter)?;
+        let (a, b, split) = markers(slf)?;
+        let (lines, _) = render_lines(py, &groups, &a, &b, &split)?;
+        Ok(lines)
+    }
+
+    /// Filter empty groups out of a structured merge iterator.
+    fn iter_useful<'py>(
+        &self,
+        py: Python<'py>,
+        struct_iter: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        iter_useful_impl(py, struct_iter)
+    }
+
+    /// Produce `(merged_lines, had_conflicts)`. Dispatches through
+    /// `self._merge_struct()` so a Python subclass override is honoured.
+    #[pyo3(signature = (reprocess = false))]
+    fn merge_lines<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        reprocess: bool,
+    ) -> PyResult<(Bound<'py, PyList>, bool)> {
+        let struct_iter = Self::merge_struct(slf, py, reprocess)?;
+        let groups = iter_to_groups(struct_iter.as_any())?;
+        let (a, b, split) = markers(slf)?;
+        let (lines, conflicts) = render_lines(py, &groups, &a, &b, &split)?;
+        Ok((lines, conflicts))
+    }
+
+    /// Produce structured merge info, filtering empty groups (and optionally
+    /// reprocessing conflicts). Dispatches through `self._merge_struct()`.
+    #[pyo3(signature = (reprocess = false))]
+    fn merge_struct<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        reprocess: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let raw = slf.call_method0("_merge_struct")?;
+        let useful = iter_useful_impl(py, &raw)?;
+        if reprocess {
+            let groups = iter_to_groups(useful.as_any())?;
+            let reprocessed = reprocess_groups(py, groups)?;
+            let tuples: Vec<Bound<PyTuple>> = reprocessed
+                .iter()
+                .map(|g| group_to_tuple(py, g))
+                .collect::<PyResult<_>>()?;
+            PyList::new(py, tuples)
+        } else {
+            Ok(useful)
+        }
+    }
+
+    /// Re-run a two-way merge over each conflict region, shrinking conflicts to
+    /// their minimal diverging core.
+    #[staticmethod]
+    fn reprocess_struct<'py>(
+        py: Python<'py>,
+        struct_iter: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let groups = iter_to_groups(struct_iter)?;
+        let reprocessed = reprocess_groups(py, groups)?;
+        let tuples: Vec<Bound<PyTuple>> = reprocessed
+            .iter()
+            .map(|g| group_to_tuple(py, g))
+            .collect::<PyResult<_>>()?;
+        PyList::new(py, tuples)
+    }
+}
+
+/// Read the three conflict-marker instance attributes off a `TextMerge`
+/// (or subclass), which `__init__` set as `bytes`.
+fn markers<'py>(
+    slf: &Bound<'py, TextMerge>,
+) -> PyResult<(
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyBytes>,
+)> {
+    let a = slf.getattr("a_marker")?.cast_into::<PyBytes>()?;
+    let b = slf.getattr("b_marker")?.cast_into::<PyBytes>()?;
+    let split = slf.getattr("split_marker")?.cast_into::<PyBytes>()?;
+    Ok((a, b, split))
+}
+
+/// Shared `iter_useful` body: keep groups whose first list is non-empty, or
+/// (for conflicts) whose second list is non-empty.
+fn iter_useful_impl<'py>(
+    py: Python<'py>,
+    struct_iter: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut out: Vec<Bound<PyTuple>> = Vec::new();
+    for item in struct_iter.try_iter()? {
+        let group = item?.cast_into::<PyTuple>()?;
+        let len = group.len();
+        let first = group.get_item(0)?;
+        if first.try_iter()?.next().is_some() {
+            out.push(group);
+            continue;
+        }
+        if len > 1 {
+            let second = group.get_item(1)?;
+            if second.try_iter()?.next().is_some() {
+                out.push(group);
+            }
+        }
+    }
+    PyList::new(py, out)
+}
+
 pub fn _textmerge_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "textmerge")?;
     m.add_class::<Merge2>()?;
+    m.add_class::<TextMerge>()?;
     m.add("A_MARKER", PyBytes::new(py, textmerge::A_MARKER))?;
     m.add("B_MARKER", PyBytes::new(py, textmerge::B_MARKER))?;
     m.add("SPLIT_MARKER", PyBytes::new(py, textmerge::SPLIT_MARKER))?;
