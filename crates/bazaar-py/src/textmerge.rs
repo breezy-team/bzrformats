@@ -616,10 +616,132 @@ fn iter_useful_impl<'py>(
     PyList::new(py, out)
 }
 
+/// Weave merge that takes a plan as input. Mirrors
+/// `bzrformats.versionedfile.PlanWeaveMerge`. Extends the Rust `TextMerge`;
+/// `_merge_struct`/`base_from_plan` drive the Rust plan helpers.
+#[pyclass(
+    extends = TextMerge,
+    subclass,
+    name = "PlanWeaveMerge",
+    module = "bzrformats._bzr_rs.textmerge"
+)]
+struct PlanWeaveMerge {
+    plan: Py<PyAny>,
+}
+
+#[pymethods]
+impl PlanWeaveMerge {
+    #[new]
+    #[pyo3(signature = (plan, a_marker=None, b_marker=None))]
+    fn new<'py>(
+        py: Python<'py>,
+        plan: Bound<'py, PyAny>,
+        a_marker: Option<Py<PyBytes>>,
+        b_marker: Option<Py<PyBytes>>,
+    ) -> PyResult<PyClassInitializer<Self>> {
+        let _ = (a_marker, b_marker);
+        let plan_list = PyList::new(py, plan.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+        Ok(
+            PyClassInitializer::from(TextMerge).add_subclass(PlanWeaveMerge {
+                plan: plan_list.into_any().unbind(),
+            }),
+        )
+    }
+
+    /// TextMerge.__init__ stores the markers as instance attributes; mirror
+    /// the Python `PlanWeaveMerge.__init__(plan, a_marker, b_marker)` which
+    /// calls `TextMerge.__init__(self, a_marker, b_marker)` then `self.plan`.
+    #[pyo3(signature = (plan, a_marker=None, b_marker=None))]
+    fn __init__<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        plan: Bound<'py, PyAny>,
+        a_marker: Option<Py<PyBytes>>,
+        b_marker: Option<Py<PyBytes>>,
+    ) -> PyResult<()> {
+        let _ = plan;
+        let a = a_marker.unwrap_or_else(|| PyBytes::new(py, textmerge::A_MARKER).unbind());
+        let b = b_marker.unwrap_or_else(|| PyBytes::new(py, textmerge::B_MARKER).unbind());
+        let split = PyBytes::new(py, textmerge::SPLIT_MARKER);
+        slf.setattr("a_marker", a)?;
+        slf.setattr("b_marker", b)?;
+        slf.setattr("split_marker", split)?;
+        Ok(())
+    }
+
+    #[getter]
+    fn plan<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
+        self.plan.bind(py).clone()
+    }
+
+    fn _merge_struct<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let lst = merge_struct_from_plan(py, self.plan.bind(py))?;
+        lst.into_any().call_method0("__iter__")
+    }
+
+    fn base_from_plan<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        base_from_plan(py, self.plan.bind(py))
+    }
+}
+
+/// Weave merge taking a `VersionedFile` and two versions. Mirrors
+/// `bzrformats.versionedfile.WeaveMerge`. Extends `PlanWeaveMerge`.
+#[pyclass(
+    extends = PlanWeaveMerge,
+    name = "WeaveMerge",
+    module = "bzrformats._bzr_rs.textmerge"
+)]
+struct WeaveMerge;
+
+#[pymethods]
+impl WeaveMerge {
+    #[new]
+    #[pyo3(signature = (versionedfile, ver_a, ver_b, a_marker=None, b_marker=None))]
+    fn new<'py>(
+        py: Python<'py>,
+        versionedfile: Bound<'py, PyAny>,
+        ver_a: Bound<'py, PyAny>,
+        ver_b: Bound<'py, PyAny>,
+        a_marker: Option<Py<PyBytes>>,
+        b_marker: Option<Py<PyBytes>>,
+    ) -> PyResult<PyClassInitializer<Self>> {
+        let _ = (a_marker, b_marker);
+        let plan = versionedfile.call_method1("plan_merge", (ver_a, ver_b))?;
+        let plan_list = PyList::new(py, plan.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+        Ok(PyClassInitializer::from(TextMerge)
+            .add_subclass(PlanWeaveMerge {
+                plan: plan_list.into_any().unbind(),
+            })
+            .add_subclass(WeaveMerge))
+    }
+
+    #[pyo3(signature = (versionedfile, ver_a, ver_b, a_marker=None, b_marker=None))]
+    fn __init__<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        versionedfile: Bound<'py, PyAny>,
+        ver_a: Bound<'py, PyAny>,
+        ver_b: Bound<'py, PyAny>,
+        a_marker: Option<Py<PyBytes>>,
+        b_marker: Option<Py<PyBytes>>,
+    ) -> PyResult<()> {
+        let _ = (versionedfile, ver_a, ver_b);
+        let a = a_marker.unwrap_or_else(|| PyBytes::new(py, textmerge::A_MARKER).unbind());
+        let b = b_marker.unwrap_or_else(|| PyBytes::new(py, textmerge::B_MARKER).unbind());
+        let split = PyBytes::new(py, textmerge::SPLIT_MARKER);
+        slf.setattr("a_marker", a)?;
+        slf.setattr("b_marker", b)?;
+        slf.setattr("split_marker", split)?;
+        Ok(())
+    }
+}
+
 pub fn _textmerge_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "textmerge")?;
     m.add_class::<Merge2>()?;
     m.add_class::<TextMerge>()?;
+    m.add_class::<PlanWeaveMerge>()?;
+    m.add_class::<WeaveMerge>()?;
     m.add("A_MARKER", PyBytes::new(py, textmerge::A_MARKER))?;
     m.add("B_MARKER", PyBytes::new(py, textmerge::B_MARKER))?;
     m.add("SPLIT_MARKER", PyBytes::new(py, textmerge::SPLIT_MARKER))?;

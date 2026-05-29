@@ -5496,7 +5496,12 @@ impl KnitRecordStreamLazy {
 /// Wraps [`bazaar::knit::KnitVersionedFiles`] with [`PyKnitIndex`] and
 /// [`PyKnitAccess`] adapters so pure-Rust logic (add_lines, get_text, get_sha1s,
 /// check_should_delta, …) drives the Python index and access objects.
-#[pyclass(name = "KnitVersionedFiles", subclass, dict)]
+#[pyclass(
+    name = "KnitVersionedFiles",
+    extends = crate::versionedfile::PyVersionedFilesWithFallbacks,
+    subclass,
+    dict
+)]
 pub struct PyKnitVersionedFiles {
     /// Held so Python callers can read `._index` / `._access`.
     index_obj: Py<PyAny>,
@@ -5519,15 +5524,15 @@ impl PyKnitVersionedFiles {
         max_delta_chain: usize,
         annotated: bool,
         reload_func: Option<Bound<'_, PyAny>>,
-    ) -> Self {
-        Self {
+    ) -> PyClassInitializer<Self> {
+        crate::versionedfile::vfwf_initializer().add_subclass(Self {
             index_obj: index.unbind(),
             access_obj: data_access.unbind(),
             annotated,
             max_delta_chain,
             reload_func: reload_func.map(|f| f.unbind()).unwrap_or_else(|| py.None()),
             immediate_fallback_vfs: Vec::new(),
-        }
+        })
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
@@ -5577,7 +5582,9 @@ impl PyKnitVersionedFiles {
             reload_func: self.reload_func.clone_ref(py),
             immediate_fallback_vfs: Vec::new(),
         };
-        Py::new(py, result).map(|p| p.into_any())
+        let init = crate::versionedfile::vfwf_initializer().add_subclass(result);
+        let obj: Py<PyKnitVersionedFiles> = Py::new(py, init)?;
+        Ok(obj.into_any())
     }
 
     fn add_fallback_versioned_files(&mut self, a_versioned_files: Bound<'_, PyAny>) {
@@ -8036,6 +8043,224 @@ fn py_parse_storage_kind(storage_kind: &str) -> Option<(&'static str, bool)> {
     bazaar::knit::parse_storage_kind(storage_kind).map(|(m, a)| (m.as_str(), a))
 }
 
+/// Convert a `knit-delta-closure` network record into a record stream.
+/// Mirrors `bzrformats.knit.knit_delta_closure_to_records`.
+#[pyfunction]
+fn knit_delta_closure_to_records<'py>(
+    py: Python<'py>,
+    storage_kind: &str,
+    bytes: Bound<'py, PyAny>,
+    line_end: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = storage_kind;
+    let cls = py
+        .import("bzrformats.knit")?
+        .getattr("_NetworkContentMapGenerator")?;
+    let generator = cls.call1((bytes, line_end))?;
+    generator.call_method0("get_record_stream")
+}
+
+/// Convert a knit network record into a single-element record list.
+/// Mirrors `bzrformats.knit.knit_network_to_record`.
+#[pyfunction]
+fn knit_network_to_record<'py>(
+    py: Python<'py>,
+    storage_kind: &str,
+    bytes: Bound<'py, PyBytes>,
+    line_end: usize,
+) -> PyResult<Bound<'py, PyList>> {
+    // Own the wire bytes so the parsed header doesn't borrow the `bytes`
+    // parameter for longer than this function's body.
+    let raw: Vec<u8> = bytes.as_bytes().to_vec();
+    // (key, parents, noeol, raw_offset)
+    let (key, parents, noeol, raw_offset) = {
+        let (k, p, n, off) = parse_network_record_header_rs(py, &raw, line_end)?;
+        (k.unbind(), p.unbind(), n, off)
+    };
+    let (method, annotated) = py_parse_storage_kind(storage_kind)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown storage kind: {}", storage_kind)))?;
+    let build_details = PyTuple::new(
+        py,
+        [
+            method.into_pyobject(py)?.into_any(),
+            noeol.into_pyobject(py)?.to_owned().into_any(),
+        ],
+    )?;
+    let raw_record = PyBytes::new(py, &raw[raw_offset..]);
+    let kcf_cls = py
+        .import("bzrformats.knit")?
+        .getattr("KnitContentFactory")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("network_bytes", &bytes)?;
+    let factory = kcf_cls.call(
+        (
+            key.bind(py),
+            parents.bind(py),
+            build_details,
+            py.None(),
+            raw_record,
+            annotated,
+        ),
+        Some(&kwargs),
+    )?;
+    PyList::new(py, [factory])
+}
+
+/// Clean up a pack-knit versioned files instance. Mirrors
+/// `bzrformats.knit.cleanup_pack_knit`.
+#[pyfunction]
+fn cleanup_pack_knit(versioned_files: Bound<'_, PyAny>) -> PyResult<()> {
+    versioned_files.getattr("writer")?.call_method0("end")?;
+    versioned_files.getattr("stream")?.call_method0("close")?;
+    Ok(())
+}
+
+/// Callable returned by [`make_knit_file_factory`]. Mirrors the inner
+/// `factory` closure of `bzrformats.knit.make_file_factory`.
+#[pyclass(module = "bzrformats._bzr_rs.knit")]
+struct KnitFileFactory {
+    annotated: bool,
+    mapper: Py<PyAny>,
+}
+
+#[pymethods]
+impl KnitFileFactory {
+    fn __call__<'py>(
+        &self,
+        py: Python<'py>,
+        transport: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let knit = py.import("bzrformats.knit")?;
+        let none = PyTuple::empty(py);
+        let lambda_none = py.eval(
+            std::ffi::CString::new("lambda: None").unwrap().as_c_str(),
+            None,
+            None,
+        )?;
+        let lambda_true = py.eval(
+            std::ffi::CString::new("lambda: True").unwrap().as_c_str(),
+            None,
+            None,
+        )?;
+        let _ = none;
+        // index = _KndxIndex(transport, mapper, lambda: None, lambda: True, lambda: True)
+        let index = knit.getattr("_KndxIndex")?.call1((
+            transport.clone(),
+            self.mapper.bind(py).clone(),
+            lambda_none,
+            lambda_true.clone(),
+            lambda_true,
+        ))?;
+        let access = knit
+            .getattr("_KnitKeyAccess")?
+            .call1((transport, self.mapper.bind(py).clone()))?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("annotated", self.annotated)?;
+        knit.getattr("KnitVersionedFiles")?
+            .call((index, access), Some(&kwargs))
+    }
+}
+
+/// Create a factory for a file-based `KnitVersionedFiles`. Mirrors
+/// `bzrformats.knit.make_file_factory`.
+#[pyfunction]
+#[pyo3(name = "make_file_factory")]
+fn make_knit_file_factory(annotated: bool, mapper: Py<PyAny>) -> KnitFileFactory {
+    KnitFileFactory { annotated, mapper }
+}
+
+/// Callable returned by [`make_knit_pack_factory`]. Mirrors the inner
+/// `factory` closure of `bzrformats.knit.make_pack_factory`.
+#[pyclass(module = "bzrformats._bzr_rs.knit")]
+struct KnitPackFactory {
+    graph: bool,
+    delta: bool,
+    keylength: usize,
+}
+
+#[pymethods]
+impl KnitPackFactory {
+    fn __call__<'py>(
+        &self,
+        py: Python<'py>,
+        transport: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let parents = self.graph || self.delta;
+        let mut ref_length = 0;
+        if self.graph {
+            ref_length += 1;
+        }
+        let max_delta_chain = if self.delta {
+            ref_length += 1;
+            200
+        } else {
+            0
+        };
+        let graph_index = py
+            .import("bzrformats.index")?
+            .getattr("InMemoryGraphIndex")?;
+        let gi_kwargs = PyDict::new(py);
+        gi_kwargs.set_item("reference_lists", ref_length)?;
+        gi_kwargs.set_item("key_elements", self.keylength)?;
+        let graph_index = graph_index.call((), Some(&gi_kwargs))?;
+
+        let stream = transport.call_method1("open_write_stream", ("newpack",))?;
+        let writer = py
+            .import("bzrformats.pack")?
+            .getattr("ContainerWriter")?
+            .call1((stream.getattr("write")?,))?;
+        writer.call_method0("begin")?;
+
+        let lambda_true = py.eval(
+            std::ffi::CString::new("lambda: True").unwrap().as_c_str(),
+            None,
+            None,
+        )?;
+        let knit = py.import("bzrformats.knit")?;
+        let idx_kwargs = PyDict::new(py);
+        idx_kwargs.set_item("parents", parents)?;
+        idx_kwargs.set_item("deltas", self.delta)?;
+        idx_kwargs.set_item("add_callback", graph_index.getattr("add_nodes")?)?;
+        let index = knit
+            .getattr("_KnitGraphIndex")?
+            .call((graph_index.clone(), lambda_true), Some(&idx_kwargs))?;
+
+        let access = py
+            .import("bzrformats.pack_repo")?
+            .getattr("_DirectPackAccess")?
+            .call1((PyDict::new(py),))?;
+        let location = PyTuple::new(
+            py,
+            [
+                transport.clone().into_any(),
+                pyo3::types::PyString::new(py, "newpack").into_any(),
+            ],
+        )?;
+        access.call_method1("set_writer", (writer.clone(), graph_index, location))?;
+
+        let kvf_kwargs = PyDict::new(py);
+        kvf_kwargs.set_item("max_delta_chain", max_delta_chain)?;
+        let result = knit
+            .getattr("KnitVersionedFiles")?
+            .call((index, access), Some(&kvf_kwargs))?;
+        result.setattr("stream", stream)?;
+        result.setattr("writer", writer)?;
+        Ok(result)
+    }
+}
+
+/// Create a factory for a pack-based `KnitVersionedFiles`. Mirrors
+/// `bzrformats.knit.make_pack_factory`.
+#[pyfunction]
+#[pyo3(name = "make_pack_factory")]
+fn make_knit_pack_factory(graph: bool, delta: bool, keylength: usize) -> KnitPackFactory {
+    KnitPackFactory {
+        graph,
+        delta,
+        keylength,
+    }
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data, &m)?)?;
@@ -8081,5 +8306,13 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<PyVFContentMapGenerator>()?;
     m.add_class::<PyKnitAdapter>()?;
     m.add_function(wrap_pyfunction!(get_knit_adapter, &m)?)?;
+    m.add_function(wrap_pyfunction!(knit_delta_closure_to_records, &m)?)?;
+    m.add_function(wrap_pyfunction!(knit_network_to_record, &m)?)?;
+    m.add_function(wrap_pyfunction!(cleanup_pack_knit, &m)?)?;
+    m.add_function(wrap_pyfunction!(make_knit_file_factory, &m)?)?;
+    m.add_function(wrap_pyfunction!(make_knit_pack_factory, &m)?)?;
+    m.add_class::<KnitFileFactory>()?;
+    m.add_class::<KnitPackFactory>()?;
+    m.add_class::<PyKnitContentFactory>()?;
     Ok(m)
 }
