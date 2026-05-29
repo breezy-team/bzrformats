@@ -62,8 +62,7 @@ impl PyFileTransport {
         f: impl FnOnce(&std::fs::File) -> Result<T, bazaar::dirstate::TransportError>,
     ) -> Result<T, bazaar::dirstate::TransportError> {
         Python::attach(|py| {
-            use std::os::fd::FromRawFd;
-            let fileno: std::os::fd::RawFd = self
+            let fileno: std::os::raw::c_int = self
                 .file
                 .bind(py)
                 .call_method0("fileno")
@@ -73,7 +72,28 @@ impl PyFileTransport {
             // SAFETY: `fileno` is a live fd owned by the Python file
             // object for the duration of this call. `ManuallyDrop`
             // prevents the borrowed `File` from closing it.
-            let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fileno) });
+            #[cfg(unix)]
+            let file = {
+                use std::os::fd::FromRawFd;
+                std::mem::ManuallyDrop::new(unsafe {
+                    std::fs::File::from_raw_fd(fileno as std::os::fd::RawFd)
+                })
+            };
+            // On Windows `fileno()` is a CRT file descriptor; translate it
+            // to the underlying OS handle via `msvcrt.get_osfhandle` before
+            // building a borrowed `File`.
+            #[cfg(windows)]
+            let file = {
+                use std::os::windows::io::{FromRawHandle, RawHandle};
+                let handle: isize = py
+                    .import("msvcrt")
+                    .and_then(|m| m.call_method1("get_osfhandle", (fileno,)))
+                    .and_then(|h| h.extract())
+                    .map_err(|e| Self::map_err(py, e))?;
+                std::mem::ManuallyDrop::new(unsafe {
+                    std::fs::File::from_raw_handle(handle as RawHandle)
+                })
+            };
             f(&file)
         })
     }
