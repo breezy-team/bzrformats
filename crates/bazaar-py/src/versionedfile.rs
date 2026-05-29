@@ -718,6 +718,7 @@ impl PyHashEscapedPrefixMapper {
 /// paths raise `NotImplementedError`, matching the Python implementation.
 #[pyclass(
     name = "VirtualVersionedFiles",
+    extends = PyVersionedFilesBase,
     module = "bzrformats._bzr_rs.versionedfile"
 )]
 struct PyVirtualVersionedFiles {
@@ -917,11 +918,11 @@ fn key_single_bytes(key: &Key) -> Result<&[u8], bazaar::knit::KnitError> {
 #[pymethods]
 impl PyVirtualVersionedFiles {
     #[new]
-    fn new(get_parent_map: Py<PyAny>, get_lines: Py<PyAny>) -> Self {
-        Self {
+    fn new(get_parent_map: Py<PyAny>, get_lines: Py<PyAny>) -> PyClassInitializer<Self> {
+        vf_initializer().add_subclass(Self {
             get_parent_map_cb: get_parent_map,
             get_lines_cb: get_lines,
-        }
+        })
     }
 
     #[pyo3(signature = (progressbar=None))]
@@ -2324,6 +2325,891 @@ fn make_mpdiffs<'py>(
     Ok(out)
 }
 
+/// Sort and group the keys in `parent_map` into groupcompress order
+/// (reverse-topological, grouped by key prefix). Mirrors
+/// `bzrformats.versionedfile.sort_groupcompress`: bare-bytes keys (used by
+/// Weave) are wrapped into single-element tuples for the Rust
+/// `sort_gc_optimal`, then unwrapped on the way back.
+#[pyfunction]
+fn sort_groupcompress<'py>(
+    py: Python<'py>,
+    parent_map: Bound<'py, PyDict>,
+) -> PyResult<Bound<'py, PyList>> {
+    // bytes_keys = any(isinstance(k, bytes) for k in parent_map)
+    let mut bytes_keys = false;
+    for key in parent_map.keys() {
+        if key.is_instance_of::<PyBytes>() {
+            bytes_keys = true;
+            break;
+        }
+    }
+    let gc = py.import("bzrformats._bzr_rs.groupcompress")?;
+    if bytes_keys {
+        let wrapped = PyDict::new(py);
+        for (k, v) in parent_map.iter() {
+            let k_tup = PyTuple::new(py, [k])?;
+            // Values must be a *tuple* of single-element key tuples, matching
+            // the Python `tuple((p,) for p in v)`.
+            let mut v_items: Vec<Bound<PyAny>> = Vec::new();
+            for p in v.try_iter()? {
+                v_items.push(PyTuple::new(py, [p?])?.into_any());
+            }
+            wrapped.set_item(k_tup, PyTuple::new(py, v_items)?)?;
+        }
+        let sorted = gc.call_method1("sort_gc_optimal", (wrapped,))?;
+        let out = PyList::empty(py);
+        for k in sorted.try_iter()? {
+            out.append(k?.get_item(0)?)?;
+        }
+        Ok(out)
+    } else {
+        let sorted = gc.call_method1("sort_gc_optimal", (parent_map,))?;
+        sorted.cast_into::<PyList>().map_err(Into::into)
+    }
+}
+
+/// Decorator for a `VersionedFiles` that skips `add_lines` when the key is
+/// already present. Mirrors
+/// `bzrformats.versionedfile.NoDupeAddLinesDecorator`.
+#[pyclass(
+    name = "NoDupeAddLinesDecorator",
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+struct NoDupeAddLinesDecorator {
+    store: Py<PyAny>,
+}
+
+#[pymethods]
+impl NoDupeAddLinesDecorator {
+    #[new]
+    fn new(store: Py<PyAny>) -> Self {
+        Self { store }
+    }
+
+    #[pyo3(signature = (key, parents, lines, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_lines<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+        parents: Bound<'py, PyAny>,
+        lines: Bound<'py, PyAny>,
+        parent_texts: Option<Bound<'py, PyAny>>,
+        left_matching_blocks: Option<Bound<'py, PyAny>>,
+        nostore_sha: Option<Bound<'py, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let store = self.store.bind(py);
+        if let Some(ns) = &nostore_sha {
+            if ns.is_truthy()? {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "NoDupeAddLinesDecorator.add_lines does not implement the nostore_sha behaviour.",
+                ));
+            }
+        }
+        let osutils = py.import("bzrformats.osutils")?;
+        // key[-1] is None?
+        let last = key.get_item(-1)?;
+        let (key, sha1): (Bound<PyAny>, Option<Bound<PyAny>>) = if last.is_none() {
+            let s = osutils.call_method1("sha_strings", (lines.clone(),))?;
+            let new_key = PyTuple::new(
+                py,
+                [PyBytes::new(py, b"sha1:").call_method1("__add__", (&s,))?],
+            )?;
+            (new_key.into_any(), Some(s))
+        } else {
+            (key, None)
+        };
+        // if key in store.get_parent_map([key]):
+        let pm = store.call_method1("get_parent_map", (PyList::new(py, [&key])?,))?;
+        if pm.contains(&key)? {
+            let sha1 = match sha1 {
+                Some(s) => s,
+                None => osutils.call_method1("sha_strings", (lines.clone(),))?,
+            };
+            let mut total = 0usize;
+            for l in lines.try_iter()? {
+                total += l?.len()?;
+            }
+            return PyTuple::new(
+                py,
+                [
+                    sha1.into_any(),
+                    total.into_pyobject(py)?.into_any(),
+                    py.None().into_bound(py),
+                ],
+            )
+            .map(|t| t.into_any());
+        }
+        let none = py.None().into_bound(py);
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("parent_texts", parent_texts.unwrap_or_else(|| none.clone()))?;
+        kwargs.set_item(
+            "left_matching_blocks",
+            left_matching_blocks.unwrap_or_else(|| none.clone()),
+        )?;
+        kwargs.set_item("nostore_sha", nostore_sha.unwrap_or_else(|| none.clone()))?;
+        kwargs.set_item("random_id", random_id)?;
+        kwargs.set_item("check_content", check_content)?;
+        store.call_method("add_lines", (key, parents, lines), Some(&kwargs))
+    }
+
+    fn __getattr__<'py>(
+        &self,
+        py: Python<'py>,
+        name: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.store
+            .bind(py)
+            .getattr(name.cast::<pyo3::types::PyString>()?)
+    }
+}
+
+/// A record_stream which reconstitutes a serialised stream. Mirrors
+/// `bzrformats.versionedfile.NetworkRecordStream`.
+#[pyclass(
+    name = "NetworkRecordStream",
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+struct NetworkRecordStream {
+    bytes_iterator: Py<PyAny>,
+}
+
+#[pymethods]
+impl NetworkRecordStream {
+    #[new]
+    fn new(bytes_iterator: Py<PyAny>) -> Self {
+        Self { bytes_iterator }
+    }
+
+    /// Read the stream, yielding records as per
+    /// `VersionedFiles.get_record_stream`. The per-kind factory dispatch
+    /// matches the Python `_kind_factory` table.
+    fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let vf = py.import("bzrformats.versionedfile")?;
+        let groupcompress = py.import("bzrformats.groupcompress")?;
+        let knit = py.import("bzrformats.knit")?;
+        let kind_factory = PyDict::new(py);
+        kind_factory.set_item("fulltext", vf.getattr("fulltext_network_to_record")?)?;
+        kind_factory.set_item(
+            "groupcompress-block",
+            groupcompress.getattr("network_block_to_records")?,
+        )?;
+        let knit_net = knit.getattr("knit_network_to_record")?;
+        for k in [
+            "knit-ft-gz",
+            "knit-delta-gz",
+            "knit-annotated-ft-gz",
+            "knit-annotated-delta-gz",
+        ] {
+            kind_factory.set_item(k, &knit_net)?;
+        }
+        kind_factory.set_item(
+            "knit-delta-closure",
+            knit.getattr("knit_delta_closure_to_records")?,
+        )?;
+
+        let kind_offset = vf.getattr("network_bytes_to_kind_and_offset")?;
+        let out = PyList::empty(py);
+        for bytes in self.bytes_iterator.bind(py).try_iter()? {
+            let bytes = bytes?;
+            let pair = kind_offset.call1((bytes.clone(),))?;
+            let storage_kind = pair.get_item(0)?;
+            let line_end = pair.get_item(1)?;
+            let factory = kind_factory.get_item(&storage_kind)?.ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(storage_kind.clone().unbind())
+            })?;
+            let records = factory.call1((storage_kind, bytes, line_end))?;
+            for record in records.try_iter()? {
+                out.append(record?)?;
+            }
+        }
+        out.call_method0("__iter__")
+    }
+}
+
+/// Helper: `version_id is not None and revision.check_not_reserved_id(...)`.
+fn check_not_reserved_id_impl(py: Python<'_>, version_id: &Bound<'_, PyAny>) -> PyResult<()> {
+    if !version_id.is_none() {
+        py.import("bzrformats.revision")?
+            .getattr("check_not_reserved_id")?
+            .call1((version_id,))?;
+    }
+    Ok(())
+}
+
+/// Abstract base for a single versioned text file. Mirrors
+/// `bzrformats.versionedfile.VersionedFile`. The `Weave` pyclass extends
+/// this; breezy subclasses it in Python. Abstract methods raise
+/// `NotImplementedError`; concrete helpers are provided.
+#[pyclass(
+    subclass,
+    name = "VersionedFile",
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+pub struct PyVersionedFileBase;
+
+/// Build the base initializer for a `VersionedFile` subclass implemented in
+/// another module (weave).
+pub fn versionedfile_initializer() -> PyClassInitializer<PyVersionedFileBase> {
+    PyClassInitializer::from(PyVersionedFileBase)
+}
+
+#[pymethods]
+impl PyVersionedFileBase {
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn new(_args: Bound<'_, PyTuple>, _kwargs: Option<Bound<'_, PyDict>>) -> Self {
+        PyVersionedFileBase
+    }
+
+    #[staticmethod]
+    fn check_not_reserved_id(py: Python<'_>, version_id: Bound<'_, PyAny>) -> PyResult<()> {
+        check_not_reserved_id_impl(py, &version_id)
+    }
+
+    fn copy_to(
+        slf: &Bound<'_, Self>,
+        name: Bound<'_, PyAny>,
+        transport: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let _ = (name, transport);
+        Err(not_implemented(slf, "copy_to"))
+    }
+
+    fn get_record_stream(
+        slf: &Bound<'_, Self>,
+        versions: Bound<'_, PyAny>,
+        ordering: Bound<'_, PyAny>,
+        include_delta_closure: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let _ = (versions, ordering, include_delta_closure);
+        Err(not_implemented(slf, "get_record_stream"))
+    }
+
+    fn has_version(slf: &Bound<'_, Self>, version_id: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = version_id;
+        Err(not_implemented(slf, "has_version"))
+    }
+
+    fn insert_record_stream(slf: &Bound<'_, Self>, stream: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = stream;
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(()))
+    }
+
+    #[pyo3(signature = (version_id, parents, lines, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_lines<'py>(
+        slf: &Bound<'py, Self>,
+        version_id: Bound<'py, PyAny>,
+        parents: Bound<'py, PyAny>,
+        lines: Bound<'py, PyAny>,
+        parent_texts: Option<Bound<'py, PyAny>>,
+        left_matching_blocks: Option<Bound<'py, PyAny>>,
+        nostore_sha: Option<Bound<'py, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        slf.call_method0("_check_write_ok")?;
+        let none = py.None().into_bound(py);
+        slf.call_method1(
+            "_add_lines",
+            (
+                version_id,
+                parents,
+                lines,
+                parent_texts.unwrap_or_else(|| none.clone()),
+                left_matching_blocks.unwrap_or_else(|| none.clone()),
+                nostore_sha.unwrap_or_else(|| none.clone()),
+                random_id,
+                check_content,
+            ),
+        )
+    }
+
+    #[pyo3(signature = (version_id, parents, lines, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    fn _add_lines(
+        slf: &Bound<'_, Self>,
+        version_id: Bound<'_, PyAny>,
+        parents: Bound<'_, PyAny>,
+        lines: Bound<'_, PyAny>,
+        parent_texts: Option<Bound<'_, PyAny>>,
+        left_matching_blocks: Option<Bound<'_, PyAny>>,
+        nostore_sha: Option<Bound<'_, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<()> {
+        Err(not_implemented(slf, "add_lines"))
+    }
+
+    #[pyo3(signature = (version_id, parents, lines, parent_texts=None, nostore_sha=None, random_id=false, check_content=true, left_matching_blocks=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_lines_with_ghosts<'py>(
+        slf: &Bound<'py, Self>,
+        version_id: Bound<'py, PyAny>,
+        parents: Bound<'py, PyAny>,
+        lines: Bound<'py, PyAny>,
+        parent_texts: Option<Bound<'py, PyAny>>,
+        nostore_sha: Option<Bound<'py, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+        left_matching_blocks: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        slf.call_method0("_check_write_ok")?;
+        let none = py.None().into_bound(py);
+        slf.call_method1(
+            "_add_lines_with_ghosts",
+            (
+                version_id,
+                parents,
+                lines,
+                parent_texts.unwrap_or_else(|| none.clone()),
+                nostore_sha.unwrap_or_else(|| none.clone()),
+                random_id,
+                check_content,
+                left_matching_blocks.unwrap_or_else(|| none.clone()),
+            ),
+        )
+    }
+
+    #[pyo3(signature = (version_id, parents, lines, parent_texts=None, nostore_sha=None, random_id=false, check_content=true, left_matching_blocks=None))]
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    fn _add_lines_with_ghosts(
+        slf: &Bound<'_, Self>,
+        version_id: Bound<'_, PyAny>,
+        parents: Bound<'_, PyAny>,
+        lines: Bound<'_, PyAny>,
+        parent_texts: Option<Bound<'_, PyAny>>,
+        nostore_sha: Option<Bound<'_, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+        left_matching_blocks: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        Err(not_implemented(slf, "add_lines_with_ghosts"))
+    }
+
+    #[pyo3(signature = (progress_bar=None))]
+    fn check(slf: &Bound<'_, Self>, progress_bar: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        let _ = progress_bar;
+        Err(not_implemented(slf, "check"))
+    }
+
+    fn _check_lines_not_unicode(&self, py: Python<'_>, lines: Bound<'_, PyAny>) -> PyResult<()> {
+        py.import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("check_lines_not_unicode")?
+            .call1((lines,))?;
+        Ok(())
+    }
+
+    fn _check_lines_are_lines(&self, py: Python<'_>, lines: Bound<'_, PyAny>) -> PyResult<()> {
+        py.import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("check_lines_are_lines")?
+            .call1((lines,))?;
+        Ok(())
+    }
+
+    fn get_format_signature(slf: &Bound<'_, Self>) -> PyResult<()> {
+        Err(not_implemented(slf, "get_format_signature"))
+    }
+
+    /// make_mpdiffs(version_ids) — singular VersionedFile variant.
+    fn make_mpdiffs<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        version_ids: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let ids = PyList::new(py, version_ids.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+        let res = py
+            .import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("make_mpdiffs_singular")?
+            .call1((slf, ids))?;
+        PyList::new(py, res.try_iter()?.collect::<PyResult<Vec<_>>>()?)
+    }
+
+    fn add_mpdiffs(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        records: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let recs = PyList::new(py, records.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+        py.import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("add_mpdiffs_singular")?
+            .call1((slf, recs))?;
+        Ok(())
+    }
+
+    /// get_text = b"".join(get_lines(version_id)).
+    fn get_text<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        version_id: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let lines = slf.call_method1("get_lines", (version_id,))?;
+        join_bytes(py, &lines)
+    }
+
+    fn get_string<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        version_id: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        Self::get_text(slf, py, version_id)
+    }
+
+    fn get_texts<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        version_ids: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        for v in version_ids.try_iter()? {
+            let lines = slf.call_method1("get_lines", (v?,))?;
+            out.append(join_bytes(py, &lines)?)?;
+        }
+        Ok(out)
+    }
+
+    fn get_lines(slf: &Bound<'_, Self>, version_id: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = version_id;
+        Err(not_implemented(slf, "get_lines"))
+    }
+
+    /// [BytesIO(t).readlines() for t in get_texts(version_ids)]
+    fn _get_lf_split_line_list<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        version_ids: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let texts = slf.call_method1("get_texts", (version_ids,))?;
+        let bio_cls = py.import("io")?.getattr("BytesIO")?;
+        let out = PyList::empty(py);
+        for t in texts.try_iter()? {
+            out.append(bio_cls.call1((t?,))?.call_method0("readlines")?)?;
+        }
+        Ok(out)
+    }
+
+    fn get_ancestry(slf: &Bound<'_, Self>, version_ids: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = version_ids;
+        Err(not_implemented(slf, "get_ancestry"))
+    }
+
+    fn get_ancestry_with_ghosts(
+        slf: &Bound<'_, Self>,
+        version_ids: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let _ = version_ids;
+        Err(not_implemented(slf, "get_ancestry_with_ghosts"))
+    }
+
+    fn get_parent_map(slf: &Bound<'_, Self>, version_ids: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = version_ids;
+        Err(not_implemented(slf, "get_parent_map"))
+    }
+
+    fn get_parents_with_ghosts<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        version_id: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pm = slf.call_method1("get_parent_map", (PyList::new(py, [&version_id])?,))?;
+        match pm.get_item(&version_id) {
+            Ok(parents) => Ok(pyo3::types::PyList::new(
+                py,
+                parents.try_iter()?.collect::<PyResult<Vec<_>>>()?,
+            )?
+            .into_any()),
+            Err(_) => Err(PyErr::from_value(
+                py.import("bzrformats.errors")?
+                    .getattr("RevisionNotPresent")?
+                    .call1((version_id, slf))?,
+            )),
+        }
+    }
+
+    fn annotate(slf: &Bound<'_, Self>, version_id: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = version_id;
+        Err(not_implemented(slf, "annotate"))
+    }
+
+    #[pyo3(signature = (version_ids=None, pb=None))]
+    fn iter_lines_added_or_present_in_versions(
+        slf: &Bound<'_, Self>,
+        version_ids: Option<Bound<'_, PyAny>>,
+        pb: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let _ = (version_ids, pb);
+        Err(not_implemented(
+            slf,
+            "iter_lines_added_or_present_in_versions",
+        ))
+    }
+
+    #[pyo3(signature = (ver_a, ver_b, base=None))]
+    fn plan_merge(
+        slf: &Bound<'_, Self>,
+        ver_a: Bound<'_, PyAny>,
+        ver_b: Bound<'_, PyAny>,
+        base: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let _ = (ver_a, ver_b, base);
+        // Mirrors `raise NotImplementedError(VersionedFile.plan_merge)` (the
+        // unbound class method).
+        let cls = slf.py().get_type::<PyVersionedFileBase>();
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            cls.getattr("plan_merge")?.unbind(),
+        ))
+    }
+
+    #[pyo3(signature = (plan, a_marker=None, b_marker=None))]
+    fn weave_merge<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        plan: Bound<'py, PyAny>,
+        a_marker: Option<Bound<'py, PyAny>>,
+        b_marker: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = slf;
+        let pwm_cls = py
+            .import("bzrformats.versionedfile")?
+            .getattr("PlanWeaveMerge")?;
+        let a =
+            a_marker.unwrap_or_else(|| PyBytes::new(py, bazaar::textmerge::A_MARKER).into_any());
+        let b =
+            b_marker.unwrap_or_else(|| PyBytes::new(py, bazaar::textmerge::B_MARKER).into_any());
+        let pwm = pwm_cls.call1((plan, a, b))?;
+        let res = pwm.call_method0("merge_lines")?;
+        res.get_item(0)
+    }
+}
+
+/// `b"".join(iterable_of_bytes)` for a Python iterable of bytes chunks.
+fn join_bytes<'py>(py: Python<'py>, chunks: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    let mut out: Vec<u8> = Vec::new();
+    for c in chunks.try_iter()? {
+        out.extend_from_slice(c?.cast_into::<PyBytes>()?.as_bytes());
+    }
+    Ok(PyBytes::new(py, &out))
+}
+
+/// Abstract base for storage of many versioned files. Mirrors
+/// `bzrformats.versionedfile.VersionedFiles`. Subclassable from Python; the
+/// concrete backends (knit, groupcompress, weave) and breezy repos subclass
+/// it. Most methods raise `NotImplementedError`; the concrete helpers
+/// delegate to the Rust core.
+#[pyclass(
+    subclass,
+    name = "VersionedFiles",
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+pub struct PyVersionedFilesBase;
+
+#[pymethods]
+impl PyVersionedFilesBase {
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn new(_args: Bound<'_, PyTuple>, _kwargs: Option<Bound<'_, PyDict>>) -> Self {
+        PyVersionedFilesBase
+    }
+
+    #[pyo3(signature = (key, parents, lines, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    fn add_lines(
+        slf: &Bound<'_, Self>,
+        key: Bound<'_, PyAny>,
+        parents: Bound<'_, PyAny>,
+        lines: Bound<'_, PyAny>,
+        parent_texts: Option<Bound<'_, PyAny>>,
+        left_matching_blocks: Option<Bound<'_, PyAny>>,
+        nostore_sha: Option<Bound<'_, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<()> {
+        Err(not_implemented(slf, "add_lines"))
+    }
+
+    #[pyo3(signature = (factory, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    fn add_content(
+        slf: &Bound<'_, Self>,
+        factory: Bound<'_, PyAny>,
+        parent_texts: Option<Bound<'_, PyAny>>,
+        left_matching_blocks: Option<Bound<'_, PyAny>>,
+        nostore_sha: Option<Bound<'_, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<()> {
+        Err(not_implemented(slf, "add_content"))
+    }
+
+    /// Add mpdiffs. Drives the Rust build/fetch/reconstruct/add_lines loop,
+    /// calling back into `self.get_record_stream` and `self.add_lines`.
+    fn add_mpdiffs(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        records: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let vf = py.import("bzrformats._bzr_rs.versionedfile")?;
+        vf.getattr("add_mpdiffs")?.call1((slf, records))?;
+        Ok(())
+    }
+
+    fn annotate(slf: &Bound<'_, Self>, key: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = key;
+        Err(not_implemented(slf, "annotate"))
+    }
+
+    #[pyo3(signature = (progress_bar=None))]
+    fn check(slf: &Bound<'_, Self>, progress_bar: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        let _ = progress_bar;
+        Err(not_implemented(slf, "check"))
+    }
+
+    #[staticmethod]
+    fn check_not_reserved_id(py: Python<'_>, version_id: Bound<'_, PyAny>) -> PyResult<()> {
+        check_not_reserved_id_impl(py, &version_id)
+    }
+
+    /// Clear whatever caches this VersionedFiles holds. Default no-op.
+    fn clear_cache(&self) {}
+
+    fn _check_lines_not_unicode(&self, py: Python<'_>, lines: Bound<'_, PyAny>) -> PyResult<()> {
+        py.import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("check_lines_not_unicode")?
+            .call1((lines,))?;
+        Ok(())
+    }
+
+    fn _check_lines_are_lines(&self, py: Python<'_>, lines: Bound<'_, PyAny>) -> PyResult<()> {
+        py.import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("check_lines_are_lines")?
+            .call1((lines,))?;
+        Ok(())
+    }
+
+    /// Get a KnownGraph instance with the ancestry of keys.
+    fn get_known_graph_ancestry<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let keys_list = PyList::new(py, keys.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+        let parent_map = py
+            .import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("known_graph_ancestry_map")?
+            .call1((slf, keys_list))?;
+        py.import("vcsgraph.known_graph")?
+            .getattr("KnownGraph")?
+            .call1((parent_map,))
+    }
+
+    fn get_parent_map(slf: &Bound<'_, Self>, keys: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = keys;
+        Err(not_implemented(slf, "get_parent_map"))
+    }
+
+    fn get_record_stream(
+        slf: &Bound<'_, Self>,
+        keys: Bound<'_, PyAny>,
+        ordering: Bound<'_, PyAny>,
+        include_delta_closure: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let _ = (keys, ordering, include_delta_closure);
+        Err(not_implemented(slf, "get_record_stream"))
+    }
+
+    fn get_sha1s(slf: &Bound<'_, Self>, keys: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = keys;
+        Err(not_implemented(slf, "get_sha1s"))
+    }
+
+    /// `key in self` — mirrors `index._has_key_from_parent_map`.
+    fn __contains__(slf: &Bound<'_, Self>, key: Bound<'_, PyAny>) -> PyResult<bool> {
+        let pm = slf.call_method1("get_parent_map", (PyList::new(slf.py(), [&key])?,))?;
+        pm.contains(key)
+    }
+
+    fn get_missing_compression_parent_keys(slf: &Bound<'_, Self>) -> PyResult<()> {
+        Err(not_implemented(slf, "get_missing_compression_parent_keys"))
+    }
+
+    fn insert_record_stream(slf: &Bound<'_, Self>, stream: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = stream;
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(()))
+    }
+
+    #[pyo3(signature = (keys, pb=None))]
+    fn iter_lines_added_or_present_in_keys(
+        slf: &Bound<'_, Self>,
+        keys: Bound<'_, PyAny>,
+        pb: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let _ = (keys, pb);
+        Err(not_implemented(slf, "iter_lines_added_or_present_in_keys"))
+    }
+
+    fn keys(slf: &Bound<'_, Self>) -> PyResult<()> {
+        Err(not_implemented(slf, "keys"))
+    }
+
+    /// Create multiparent diffs for specified keys.
+    fn make_mpdiffs<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let gen = py
+            .import("bzrformats.versionedfile")?
+            .getattr("_MPDiffGenerator")?
+            .call1((slf, keys))?;
+        gen.call_method0("compute_diffs")
+    }
+
+    /// `missing_keys` — keys absent from get_parent_map. Mirrors
+    /// `index._missing_keys_from_parent_map`.
+    fn missing_keys<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PySet>> {
+        let keys_list = PyList::new(py, keys.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+        let pm = slf.call_method1("get_parent_map", (&keys_list,))?;
+        let out = PySet::empty(py)?;
+        for k in keys_list.iter() {
+            if !pm.contains(&k)? {
+                out.add(k)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Build a VersionedFileAnnotator over this versioned file.
+    fn get_annotator<'py>(slf: &Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        py.import("bzrformats.annotate")?
+            .getattr("VersionedFileAnnotator")?
+            .call1((slf,))
+    }
+
+    /// Return the whole stack of fallback versionedfiles.
+    fn _transitive_fallbacks<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        let fallbacks = slf.getattr("_immediate_fallback_vfs")?;
+        for a_vfs in fallbacks.try_iter()? {
+            let a_vfs = a_vfs?;
+            out.append(&a_vfs)?;
+            let sub = a_vfs.call_method0("_transitive_fallbacks")?;
+            for f in sub.try_iter()? {
+                out.append(f?)?;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// `NotImplementedError(self.<method>)` — match the Python ABC, whose
+/// `raise NotImplementedError(self.method)` carries the bound method.
+fn not_implemented(slf: &Bound<'_, impl pyo3::PyClass>, method: &str) -> PyErr {
+    match slf.as_any().getattr(method) {
+        Ok(m) => pyo3::exceptions::PyNotImplementedError::new_err(m.unbind()),
+        Err(e) => e,
+    }
+}
+
+/// `NotImplementedError(self.<method>)` for a plain `Bound<PyAny>` receiver.
+fn not_implemented_any(slf: &Bound<'_, PyAny>, method: &str) -> PyErr {
+    match slf.getattr(method) {
+        Ok(m) => pyo3::exceptions::PyNotImplementedError::new_err(m.unbind()),
+        Err(e) => e,
+    }
+}
+
+/// A `VersionedFiles` that supports fallback sources. Mirrors
+/// `bzrformats.versionedfile.VersionedFilesWithFallbacks`. Extends the
+/// `VersionedFiles` ABC; the knit and groupcompress backends extend this.
+#[pyclass(
+    extends = PyVersionedFilesBase,
+    subclass,
+    name = "VersionedFilesWithFallbacks",
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+pub struct PyVersionedFilesWithFallbacks;
+
+/// Build the base initializer chain for a `VersionedFilesWithFallbacks`
+/// subclass implemented in another module (knit, groupcompress). Lets those
+/// pyclasses do `vfwf_initializer().add_subclass(Self { .. })`.
+pub fn vfwf_initializer() -> PyClassInitializer<PyVersionedFilesWithFallbacks> {
+    PyClassInitializer::from(PyVersionedFilesBase).add_subclass(PyVersionedFilesWithFallbacks)
+}
+
+/// Build the base initializer for a plain `VersionedFiles` subclass.
+pub fn vf_initializer() -> PyClassInitializer<PyVersionedFilesBase> {
+    PyClassInitializer::from(PyVersionedFilesBase)
+}
+
+#[pymethods]
+impl PyVersionedFilesWithFallbacks {
+    #[new]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn new(
+        _args: Bound<'_, PyTuple>,
+        _kwargs: Option<Bound<'_, PyDict>>,
+    ) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyVersionedFilesBase).add_subclass(PyVersionedFilesWithFallbacks)
+    }
+
+    fn without_fallbacks(slf: &Bound<'_, Self>) -> PyResult<()> {
+        Err(not_implemented_any(slf.as_any(), "without_fallbacks"))
+    }
+
+    fn add_fallback_versioned_files(
+        slf: &Bound<'_, Self>,
+        a_versioned_files: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let _ = a_versioned_files;
+        Err(not_implemented_any(
+            slf.as_any(),
+            "add_fallback_versioned_files",
+        ))
+    }
+
+    /// Get a KnownGraph with the ancestry of keys, walking fallbacks via
+    /// each store's `_index.find_ancestry`.
+    fn get_known_graph_ancestry<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let slf = slf.as_any();
+        let index = slf.getattr("_index")?;
+        let res = index.call_method1("find_ancestry", (keys,))?;
+        let parent_map = res.get_item(0)?;
+        let mut missing_keys = res.get_item(1)?;
+        let fallbacks = slf.call_method0("_transitive_fallbacks")?;
+        for fallback in fallbacks.try_iter()? {
+            if !missing_keys.is_truthy()? {
+                break;
+            }
+            let fallback = fallback?;
+            let fres = fallback
+                .getattr("_index")?
+                .call_method1("find_ancestry", (&missing_keys,))?;
+            let f_parent_map = fres.get_item(0)?;
+            parent_map.call_method1("update", (f_parent_map,))?;
+            missing_keys = fres.get_item(1)?;
+        }
+        py.import("vcsgraph.known_graph")?
+            .getattr("KnownGraph")?
+            .call1((parent_map,))
+    }
+}
+
 pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "versionedfile")?;
     m.add_class::<AbstractContentFactory>()?;
@@ -2350,5 +3236,11 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(add_mpdiffs, &m)?)?;
     m.add_function(wrap_pyfunction!(add_mpdiffs_singular, &m)?)?;
     m.add_function(wrap_pyfunction!(make_mpdiffs_singular, &m)?)?;
+    m.add_function(wrap_pyfunction!(sort_groupcompress, &m)?)?;
+    m.add_class::<NoDupeAddLinesDecorator>()?;
+    m.add_class::<NetworkRecordStream>()?;
+    m.add_class::<PyVersionedFileBase>()?;
+    m.add_class::<PyVersionedFilesBase>()?;
+    m.add_class::<PyVersionedFilesWithFallbacks>()?;
     Ok(m)
 }

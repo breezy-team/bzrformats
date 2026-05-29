@@ -27,12 +27,8 @@ from ._bzr_rs.groupcompress import (  # noqa: F401
 from ._bzr_rs.groupcompress import (
     GroupCompressVersionedFiles as _GroupCompressVersionedFilesRs,
 )
-from .btree_index import BTreeBuilder
 from .errors import (
     BzrFormatsError,
-)
-from .versionedfile import (
-    VersionedFilesWithFallbacks,
 )
 
 logger = logging.getLogger("bzrformats.groupcompress")
@@ -67,116 +63,27 @@ class DecompressCorruption(BzrFormatsError):
 _LazyGroupCompressFactory = _groupcompress_rs.LazyGroupCompressFactory
 _LazyGroupContentManager = _groupcompress_rs.LazyGroupContentManager
 
-
-def network_block_to_records(storage_kind, bytes, line_end):
-    """Convert a network block to records.
-
-    Args:
-        storage_kind: The type of storage (must be 'groupcompress-block').
-        bytes: The block data bytes.
-        line_end: Line ending marker.
-
-    Returns:
-        Generator yielding (key, data) tuples.
-    """
-    if storage_kind != "groupcompress-block":
-        raise ValueError(f"Unknown storage kind: {storage_kind}")
-    manager = _LazyGroupContentManager.from_bytes(bytes)
-    return manager.get_record_stream()
+# network_block_to_records, make_pack_factory and cleanup_pack_group are
+# implemented in the Rust extension; re-export them here.
+network_block_to_records = _groupcompress_rs.network_block_to_records
+make_pack_factory = _groupcompress_rs.make_pack_factory
+cleanup_pack_group = _groupcompress_rs.cleanup_pack_group
 
 
-def make_pack_factory(graph, delta, keylength, inconsistency_fatal=True):
-    """Create a factory for creating a pack based groupcompress.
-
-    This is only functional enough to run interface tests, it doesn't try to
-    provide a full pack environment.
-
-    :param graph: Store a graph.
-    :param delta: Delta compress contents.
-    :param keylength: How long should keys be.
-    """
-    from .pack import ContainerWriter
-    from .pack_repo import _DirectPackAccess
-
-    def factory(transport):
-        parents = graph
-        ref_length = 0
-        if graph:
-            ref_length = 1
-        graph_index = BTreeBuilder(reference_lists=ref_length, key_elements=keylength)
-        stream = transport.open_write_stream("newpack")
-        writer = ContainerWriter(stream.write)
-        writer.begin()
-        index = _GCGraphIndex(
-            graph_index,
-            lambda: True,
-            parents=parents,
-            add_callback=graph_index.add_nodes,
-            inconsistency_fatal=inconsistency_fatal,
-        )
-        access = _DirectPackAccess({})
-        access.set_writer(writer, graph_index, (transport, "newpack"))
-        result = GroupCompressVersionedFiles(index, access, delta)
-        result.stream = stream
-        result.writer = writer
-        return result
-
-    return factory
-
-
-def cleanup_pack_group(versioned_files):
-    """Clean up after packing a group of versioned files.
-
-    Args:
-        versioned_files: The versioned files to clean up.
-    """
-    versioned_files.writer.end()
-    versioned_files.stream.close()
-
-
-class GroupCompressVersionedFiles(
-    _GroupCompressVersionedFilesRs, VersionedFilesWithFallbacks
-):
+class GroupCompressVersionedFiles(_GroupCompressVersionedFilesRs):
     """A group-compress based VersionedFiles implementation.
 
-    Storage state (the index/access objects, the block cache, fallbacks)
-    and construction, ``without_fallbacks``, ``add_fallback_versioned_files``
-    and ``clear_cache`` come from the Rust pyclass. ``VersionedFilesWithFallbacks``
-    is mixed in so ``isinstance(x, VersionedFiles)`` holds. The remaining
-    record-stream and insert methods are still defined here and migrate onto
-    the Rust class over time.
+    The full implementation -- storage state, record streams, inserts,
+    ``annotate``/``get_annotator`` and the compressor-setting class
+    attributes -- lives in the Rust pyclass, which extends the Rust
+    ``VersionedFilesWithFallbacks`` base so ``isinstance(x, VersionedFiles)``
+    holds.
     """
-
-    # This controls how the GroupCompress DeltaIndex works. Basically, we
-    # compute hash pointers into the source blocks (so hash(text) => text).
-    # However each of these references costs some memory in trade against a
-    # more accurate match result. For very large files, they either are
-    # pre-compressed and change in bulk whenever they change, or change in just
-    # local blocks. Either way, 'improved resolution' is not very helpful,
-    # versus running out of memory trying to track everything. The default max
-    # gives 100% sampling of a 1MB file.
-    _DEFAULT_MAX_BYTES_TO_INDEX = 1024 * 1024
-    _DEFAULT_COMPRESSOR_SETTINGS = {"max_bytes_to_index": _DEFAULT_MAX_BYTES_TO_INDEX}
-
-    def annotate(self, key):
-        """See VersionedFiles.annotate."""
-        ann = self.get_annotator()
-        return ann.annotate_flat(key)
-
-    def get_annotator(self):
-        """Get an annotator for this versioned file.
-
-        Returns:
-            A VersionedFileAnnotator instance.
-        """
-        from .annotate import VersionedFileAnnotator
-
-        return VersionedFileAnnotator(self)
 
 
 from ._bzr_rs import groupcompress
 from ._bzr_rs.groupcompress import GCBuildDetails as _GCBuildDetails  # noqa: F401
-from ._bzr_rs.groupcompress import _GCGraphIndex
+from ._bzr_rs.groupcompress import _GCGraphIndex  # noqa: F401
 
 encode_base128_int = groupcompress.encode_base128_int
 encode_copy_instruction = groupcompress.encode_copy_instruction

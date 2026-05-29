@@ -23,21 +23,14 @@ module exposes that core to Python and adds the transport-backed
 ``WeaveFile`` subclass plus the package-public exception classes.
 """
 
-import contextlib
 import os
 from io import BytesIO
 
 from ._bzr_rs import weave as _weave_rs
 from .errors import (
     BzrFormatsError,
-    RevisionAlreadyPresent,
-    RevisionNotPresent,
 )
 from .transport import TransportNoSuchFile
-from .versionedfile import (
-    VersionedFile,
-    adapter_registry,
-)
 from .weavefile import _read_weave_v5, write_weave_v5
 
 
@@ -139,17 +132,17 @@ class WeaveTextDiffers(WeaveError):
 WeaveContentFactory = _weave_rs.WeaveContentFactory
 
 
-class Weave(_weave_rs.Weave, VersionedFile):
+class Weave(_weave_rs.Weave):
     """weave - versioned text file storage.
 
     A Weave manages versions of line-based text files, keeping track
     of the originating version for each line.
 
     The pure-logic core (parent table, sha1 list, weave entry stream
-    plus all algorithms over them) lives in the Rust extension module.
-    This Python class adds the ``VersionedFile`` API surface and the
-    adapter-driven ``insert_record_stream`` that depends on the
-    Python-side adapter registry.
+    plus all algorithms over them), ``add_lines``, ``get_record_stream``
+    and the adapter-driven ``insert_record_stream`` all live in the Rust
+    extension module, which itself extends the Rust ``VersionedFile`` base
+    so ``isinstance(x, VersionedFile)`` holds.
     """
 
     def __new__(cls, *args, **kwargs):
@@ -190,70 +183,12 @@ class Weave(_weave_rs.Weave, VersionedFile):
         # ``_add`` is hard-coded to ``patiencediff::SequenceMatcher`` in
         # Rust. ``matcher`` is accepted for API compatibility.
         del matcher, weave_name, access_mode, get_scope, allow_reserved
-        # Pyclass __new__ already initialised the Rust state; finish off
-        # the VersionedFile side.
-        VersionedFile.__init__(self)
+        # Pyclass __new__ already initialised the Rust state (including the
+        # VersionedFile base).
 
-    # ------------------------------------------------------------------
-    # add_lines: the public ``VersionedFile`` entry point. The base class
-    # delegates to ``_add_lines``; the Rust core provides ``_add_lines``
-    # directly so we just need to surface the line-validation checks the
-    # base class does. We also handle the ``check_content`` opt-out.
-    # ------------------------------------------------------------------
-
-    def add_lines(
-        self,
-        version_id,
-        parents,
-        lines,
-        parent_texts=None,
-        left_matching_blocks=None,
-        nostore_sha=None,
-        random_id=False,
-        check_content=True,
-    ):
-        """Add a single text on top of the versioned file. See VersionedFile.add_lines.
-
-        Line validation (`_check_lines_not_unicode` + `_check_lines_are_lines`)
-        is delegated to the Rust `_add_lines`, which honours the
-        ``check_content`` flag.
-        """
-        self._check_write_ok()
-        return self._add_lines(
-            version_id,
-            list(parents),
-            lines,
-            parent_texts,
-            left_matching_blocks,
-            nostore_sha,
-            random_id,
-            check_content,
-        )
-
-    # `get_record_stream` is provided by the Rust `_weave_rs.Weave` base.
-    # It returns a list (vs. the previous Python generator); callers
-    # treat the result as iterable, which still works.
-
-    def insert_record_stream(self, stream):
-        """See VersionedFile.insert_record_stream."""
-        adapters = {}
-        for record in stream:
-            if record.storage_kind == "absent":
-                raise RevisionNotPresent([record.key[0]], self)
-            parents = [parent[0] for parent in record.parents]
-            if record.storage_kind in ("fulltext", "chunked", "lines"):
-                self.add_lines(record.key[0], parents, record.get_bytes_as("lines"))
-            else:
-                adapter_key = record.storage_kind, "lines"
-                try:
-                    adapter = adapters[adapter_key]
-                except KeyError:
-                    adapter_factory = adapter_registry.get(adapter_key)
-                    adapter = adapter_factory(self)
-                    adapters[adapter_key] = adapter
-                lines = adapter.get_bytes(record, "lines")
-                with contextlib.suppress(RevisionAlreadyPresent):
-                    self.add_lines(record.key[0], parents, lines)
+    # `add_lines`, `get_record_stream` and `insert_record_stream` are
+    # provided by the Rust `_weave_rs.Weave` base. `insert_record_stream`
+    # consults the Python `adapter_registry` for non-fulltext records.
 
 
 class WeaveFile(Weave):

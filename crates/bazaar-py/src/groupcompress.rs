@@ -3234,7 +3234,12 @@ type PureGcvf =
 /// expects (the Python-side `_group_cache`, `_unadded_refs`, the original
 /// fallback objects, etc.). Methods marshal arguments in, call the pure
 /// store, and marshal results back.
-#[pyclass(name = "GroupCompressVersionedFiles", subclass, dict)]
+#[pyclass(
+    name = "GroupCompressVersionedFiles",
+    extends = crate::versionedfile::PyVersionedFilesWithFallbacks,
+    subclass,
+    dict
+)]
 pub struct GroupCompressVersionedFiles {
     /// The pure-Rust store; all real operations go through this.
     pure: PureGcvf,
@@ -3269,7 +3274,7 @@ impl GroupCompressVersionedFiles {
         delta: bool,
         _unadded_refs: Option<Bound<'_, PyDict>>,
         _group_cache: Option<Bound<'_, PyAny>>,
-    ) -> PyResult<Self> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let unadded_refs = match _unadded_refs {
             Some(d) => d.unbind(),
             None => PyDict::new(py).unbind(),
@@ -3290,7 +3295,7 @@ impl GroupCompressVersionedFiles {
             delta,
             PyBlockCache::new(group_cache.clone_ref(py)),
         );
-        Ok(Self {
+        Ok(crate::versionedfile::vfwf_initializer().add_subclass(Self {
             pure,
             index_obj: index.unbind(),
             access_obj: access.unbind(),
@@ -3299,7 +3304,7 @@ impl GroupCompressVersionedFiles {
             group_cache,
             immediate_fallback_vfs: Vec::new(),
             max_bytes_to_index: None,
-        })
+        }))
     }
 
     #[getter]
@@ -4124,6 +4129,42 @@ impl GroupCompressVersionedFiles {
         }
         Ok(out)
     }
+
+    /// This controls how the GroupCompress DeltaIndex works: the default
+    /// max gives 100% sampling of a 1MB file.
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn _DEFAULT_MAX_BYTES_TO_INDEX() -> usize {
+        1024 * 1024
+    }
+
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn _DEFAULT_COMPRESSOR_SETTINGS(py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("max_bytes_to_index", 1024 * 1024)?;
+        Ok(d.unbind())
+    }
+
+    /// See VersionedFiles.annotate.
+    fn annotate<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ann = Self::get_annotator(slf, py)?;
+        ann.call_method1("annotate_flat", (key,))
+    }
+
+    /// Build a `VersionedFileAnnotator` over this versioned file. Mirrors
+    /// the Python `get_annotator`; the annotator itself still lives in
+    /// `bzrformats.annotate`.
+    fn get_annotator<'py>(slf: &Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cls = py
+            .import("bzrformats.annotate")?
+            .getattr("VersionedFileAnnotator")?;
+        cls.call1((slf,))
+    }
 }
 
 impl GroupCompressVersionedFiles {
@@ -4535,6 +4576,138 @@ impl GroupCompressVersionedFiles {
     }
 }
 
+/// Convert a network block to records. Mirrors
+/// `bzrformats.groupcompress.network_block_to_records`: validates the
+/// storage kind, rebuilds a `LazyGroupContentManager` from the wire bytes
+/// and returns its record stream.
+#[pyfunction]
+fn network_block_to_records<'py>(
+    py: Python<'py>,
+    storage_kind: &str,
+    bytes: &[u8],
+    line_end: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = line_end;
+    if storage_kind != "groupcompress-block" {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown storage kind: {}",
+            storage_kind
+        )));
+    }
+    let cls = py.get_type::<LazyGroupContentManager>();
+    let manager = cls.call_method1("from_bytes", (PyBytes::new(py, bytes),))?;
+    manager.call_method0("get_record_stream")
+}
+
+/// Clean up after packing a group of versioned files. Mirrors
+/// `bzrformats.groupcompress.cleanup_pack_group`: ends the container
+/// writer and closes the write stream.
+#[pyfunction]
+fn cleanup_pack_group(versioned_files: Bound<'_, PyAny>) -> PyResult<()> {
+    versioned_files.getattr("writer")?.call_method0("end")?;
+    versioned_files.getattr("stream")?.call_method0("close")?;
+    Ok(())
+}
+
+/// The callable returned by [`make_pack_factory`]. Closes over the
+/// `graph`/`delta`/`keylength` settings; calling it with a transport sets
+/// up a fresh in-memory pack-backed `GroupCompressVersionedFiles`. Mirrors
+/// the inner `factory` closure of
+/// `bzrformats.groupcompress.make_pack_factory`.
+#[pyclass(module = "bzrformats._bzr_rs.groupcompress")]
+struct PackFactory {
+    graph: bool,
+    delta: bool,
+    keylength: usize,
+    inconsistency_fatal: bool,
+}
+
+#[pymethods]
+impl PackFactory {
+    fn __call__<'py>(
+        &self,
+        py: Python<'py>,
+        transport: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let ref_length = if self.graph { 1 } else { 0 };
+        // graph_index = BTreeBuilder(reference_lists=ref_length,
+        //                            key_elements=keylength)
+        let btree = py
+            .import("bzrformats.btree_index")?
+            .getattr("BTreeBuilder")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("reference_lists", ref_length)?;
+        kwargs.set_item("key_elements", self.keylength)?;
+        let graph_index = btree.call((), Some(&kwargs))?;
+
+        let stream = transport.call_method1("open_write_stream", ("newpack",))?;
+        let writer = py
+            .import("bzrformats.pack")?
+            .getattr("ContainerWriter")?
+            .call1((stream.getattr("write")?,))?;
+        writer.call_method0("begin")?;
+
+        // index = _GCGraphIndex(graph_index, lambda: True, parents=graph,
+        //                       add_callback=graph_index.add_nodes,
+        //                       inconsistency_fatal=...)
+        let code = std::ffi::CString::new("lambda: True").unwrap();
+        let is_locked = py.eval(code.as_c_str(), None, None)?;
+        let gc_index_cls = py
+            .import("bzrformats._bzr_rs.groupcompress")?
+            .getattr("_GCGraphIndex")?;
+        let idx_kwargs = PyDict::new(py);
+        idx_kwargs.set_item("parents", self.graph)?;
+        idx_kwargs.set_item("add_callback", graph_index.getattr("add_nodes")?)?;
+        idx_kwargs.set_item("inconsistency_fatal", self.inconsistency_fatal)?;
+        let index = gc_index_cls.call((graph_index.clone(), is_locked), Some(&idx_kwargs))?;
+
+        let access = py
+            .import("bzrformats.pack_repo")?
+            .getattr("_DirectPackAccess")?
+            .call1((PyDict::new(py),))?;
+        // access.set_writer(writer, graph_index, (transport, "newpack"))
+        let location = PyTuple::new(
+            py,
+            [
+                transport.clone().into_any(),
+                pyo3::types::PyString::new(py, "newpack").into_any(),
+            ],
+        )?;
+        access.call_method1("set_writer", (writer.clone(), graph_index, location))?;
+
+        // Instantiate the Python `GroupCompressVersionedFiles` subclass (it
+        // mixes in VersionedFilesWithFallbacks), not the bare Rust pyclass,
+        // so methods like check_not_reserved_id are present.
+        let gcvf_cls = py
+            .import("bzrformats.groupcompress")?
+            .getattr("GroupCompressVersionedFiles")?;
+        let result = gcvf_cls.call1((index, access, self.delta))?;
+        result.setattr("stream", stream)?;
+        result.setattr("writer", writer)?;
+        Ok(result)
+    }
+}
+
+/// Create a factory for a pack-based groupcompress store. Mirrors
+/// `bzrformats.groupcompress.make_pack_factory`: returns a callable that
+/// builds a `GroupCompressVersionedFiles` over a fresh in-memory pack when
+/// given a transport. Only complete enough to run interface tests.
+#[pyfunction]
+#[pyo3(signature = (graph, delta, keylength, inconsistency_fatal = true))]
+fn make_pack_factory(
+    graph: bool,
+    delta: bool,
+    keylength: usize,
+    inconsistency_fatal: bool,
+) -> PackFactory {
+    PackFactory {
+        graph,
+        delta,
+        keylength,
+        inconsistency_fatal,
+    }
+}
+
 pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "groupcompress")?;
     m.add_wrapped(wrap_pyfunction!(encode_base128_int))?;
@@ -4572,6 +4745,10 @@ pub(crate) fn _groupcompress_rs(py: Python) -> PyResult<Bound<PyModule>> {
         crate::groupcompress_delta::make_delta,
         &m
     )?)?;
+    m.add_function(wrap_pyfunction!(network_block_to_records, &m)?)?;
+    m.add_function(wrap_pyfunction!(cleanup_pack_group, &m)?)?;
+    m.add_function(wrap_pyfunction!(make_pack_factory, &m)?)?;
+    m.add_class::<PackFactory>()?;
     m.add(
         "NULL_SHA1",
         pyo3::types::PyBytes::new(py, &bazaar::groupcompress::NULL_SHA1),

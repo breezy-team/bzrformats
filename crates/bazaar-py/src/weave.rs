@@ -442,7 +442,12 @@ fn weave_name_for_err(py: Python<'_>, name: Option<&Py<PyAny>>) -> Py<PyAny> {
 /// same surface the previous Python class did. The Python `bzrformats.weave`
 /// module subclasses this to add transport-backed `WeaveFile` (which
 /// overrides `_add_lines` to save).
-#[pyclass(subclass, name = "Weave", module = "bzrformats._bzr_rs.weave")]
+#[pyclass(
+    subclass,
+    name = "Weave",
+    extends = crate::versionedfile::PyVersionedFileBase,
+    module = "bzrformats._bzr_rs.weave"
+)]
 pub struct PyWeave {
     inner: WeaveFile,
     /// Opaque "name" attached to this weave. Python keeps it as
@@ -468,7 +473,7 @@ impl PyWeave {
         access_mode: String,
         get_scope: Option<Py<PyAny>>,
         allow_reserved: bool,
-    ) -> PyResult<Self> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let weave_name = match weave_name {
             None => None,
             Some(obj) if obj.is_none(py) => None,
@@ -478,14 +483,16 @@ impl PyWeave {
             None => None,
             Some(cb) => Some(cb.call0(py)?),
         };
-        Ok(Self {
-            inner: WeaveFile::default(),
-            weave_name,
-            access_mode,
-            allow_reserved,
-            get_scope,
-            scope,
-        })
+        Ok(
+            crate::versionedfile::versionedfile_initializer().add_subclass(Self {
+                inner: WeaveFile::default(),
+                weave_name,
+                access_mode,
+                allow_reserved,
+                get_scope,
+                scope,
+            }),
+        )
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
@@ -549,17 +556,15 @@ impl PyWeave {
 
     /// Return a fresh deep copy. Mirrors `Weave.copy`.
     fn copy(&self, py: Python<'_>) -> PyResult<Py<Self>> {
-        Py::new(
-            py,
-            Self {
-                inner: self.inner.clone(),
-                weave_name: self.weave_name.as_ref().map(|n| n.clone_ref(py)),
-                access_mode: self.access_mode.clone(),
-                allow_reserved: self.allow_reserved,
-                get_scope: self.get_scope.as_ref().map(|c| c.clone_ref(py)),
-                scope: self.scope.as_ref().map(|s| s.clone_ref(py)),
-            },
-        )
+        let init = crate::versionedfile::versionedfile_initializer().add_subclass(Self {
+            inner: self.inner.clone(),
+            weave_name: self.weave_name.as_ref().map(|n| n.clone_ref(py)),
+            access_mode: self.access_mode.clone(),
+            allow_reserved: self.allow_reserved,
+            get_scope: self.get_scope.as_ref().map(|c| c.clone_ref(py)),
+            scope: self.scope.as_ref().map(|s| s.clone_ref(py)),
+        });
+        Py::new(py, init)
     }
 
     /// Copy from `other` into self in place. Mirrors `Weave._copy_weave_content`.
@@ -1397,6 +1402,101 @@ impl PyWeave {
         // Wrap the eager list in an iterator object so callers can
         // `next()` it just like the original Python generator.
         out.call_method0("__iter__")
+    }
+
+    /// Add a single text on top of the versioned file. Mirrors the Python
+    /// `Weave.add_lines`: checks the write guard, then delegates to
+    /// `_add_lines` (which the subclass `WeaveFile` overrides to also save).
+    #[pyo3(signature = (version_id, parents, lines, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_lines<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        version_id: Bound<'py, PyAny>,
+        parents: Bound<'py, PyAny>,
+        lines: Bound<'py, PyAny>,
+        parent_texts: Option<Bound<'py, PyAny>>,
+        left_matching_blocks: Option<Bound<'py, PyAny>>,
+        nostore_sha: Option<Bound<'py, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        Self::_check_write_ok(slf.borrow(), py)?;
+        let parents_list =
+            pyo3::types::PyList::new(py, parents.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+        let none = py.None().into_bound(py);
+        slf.call_method1(
+            "_add_lines",
+            (
+                version_id,
+                parents_list,
+                lines,
+                parent_texts.unwrap_or_else(|| none.clone()),
+                left_matching_blocks.unwrap_or_else(|| none.clone()),
+                nostore_sha.unwrap_or_else(|| none.clone()),
+                random_id,
+                check_content,
+            ),
+        )
+    }
+
+    /// Insert a stream of records. Mirrors the Python
+    /// `Weave.insert_record_stream`: fulltext-like records add directly,
+    /// others go through the Python `adapter_registry`. Duplicate adds
+    /// (`RevisionAlreadyPresent`) are suppressed for the adapter path.
+    fn insert_record_stream<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        stream: Bound<'py, PyAny>,
+    ) -> PyResult<()> {
+        let errors = py.import("bzrformats.errors")?;
+        let rev_not_present = errors.getattr("RevisionNotPresent")?;
+        let rev_already_present = errors.getattr("RevisionAlreadyPresent")?;
+        let adapter_registry = py
+            .import("bzrformats.versionedfile")?
+            .getattr("adapter_registry")?;
+        let adapters = pyo3::types::PyDict::new(py);
+        for record in stream.try_iter()? {
+            let record = record?;
+            let storage_kind: String = record.getattr("storage_kind")?.extract()?;
+            if storage_kind == "absent" {
+                let key = record.getattr("key")?;
+                let key0 = key.get_item(0)?;
+                return Err(PyErr::from_value(
+                    rev_not_present.call1((pyo3::types::PyList::new(py, [key0])?, slf))?,
+                ));
+            }
+            // parents = [parent[0] for parent in record.parents]
+            let parents = pyo3::types::PyList::empty(py);
+            for parent in record.getattr("parents")?.try_iter()? {
+                parents.append(parent?.get_item(0)?)?;
+            }
+            let key0 = record.getattr("key")?.get_item(0)?;
+            if matches!(storage_kind.as_str(), "fulltext" | "chunked" | "lines") {
+                let lines = record.call_method1("get_bytes_as", ("lines",))?;
+                slf.call_method1("add_lines", (key0, parents, lines))?;
+            } else {
+                let adapter_key = PyTuple::new(py, [storage_kind.as_str(), "lines"])?;
+                let adapter = match adapters.get_item(&adapter_key)? {
+                    Some(a) => a,
+                    None => {
+                        let adapter_factory =
+                            adapter_registry.call_method1("get", (adapter_key.clone(),))?;
+                        let adapter = adapter_factory.call1((slf,))?;
+                        adapters.set_item(&adapter_key, &adapter)?;
+                        adapter
+                    }
+                };
+                let lines = adapter.call_method1("get_bytes", (&record, "lines"))?;
+                // with contextlib.suppress(RevisionAlreadyPresent):
+                match slf.call_method1("add_lines", (key0, parents, lines)) {
+                    Ok(_) => {}
+                    Err(e) if e.is_instance(py, &rev_already_present) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
     }
 }
 

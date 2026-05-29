@@ -53,9 +53,6 @@ in the deltas to provide line annotation
 
 import logging
 
-from bzrformats import pack
-
-from . import index as _mod_index
 from . import pack_repo
 from .annotate import VersionedFileAnnotator
 from .errors import (
@@ -65,7 +62,6 @@ from .errors import (
 from .versionedfile import (
     ContentFactory,
     UnavailableRepresentation,
-    VersionedFilesWithFallbacks,
     adapter_registry,
 )
 
@@ -377,112 +373,8 @@ class KnitContentFactory(ContentFactory):
         return iter(self.get_bytes_as(storage_kind))
 
 
-class LazyKnitContentFactory(ContentFactory):
-    """A ContentFactory which can either generate full text or a wire form.
-
-    :seealso ContentFactory:
-    """
-
-    def __init__(self, key, parents, generator, first):
-        """Create a LazyKnitContentFactory.
-
-        :param key: The key of the record.
-        :param parents: The parents of the record.
-        :param generator: A _ContentMapGenerator containing the record for this
-            key.
-        :param first: Is this the first content object returned from generator?
-            if it is, its storage kind is knit-delta-closure, otherwise it is
-            knit-delta-closure-ref
-        """
-        self.key = key
-        self.parents = parents
-        self.sha1 = None
-        self.size = None
-        self._generator = generator
-        self.storage_kind = "knit-delta-closure"
-        if not first:
-            self.storage_kind = self.storage_kind + "-ref"
-        self._first = first
-
-    def get_bytes_as(self, storage_kind):
-        """Get the bytes for this lazy content in the specified storage format.
-
-        Args:
-            storage_kind: The desired storage format.
-
-        Returns:
-            The content bytes in the requested format.
-
-        Raises:
-            UnavailableRepresentation: If the format is not available.
-        """
-        if storage_kind == self.storage_kind:
-            if self._first:
-                return self._generator._wire_bytes()
-            else:
-                # all the keys etc are contained in the bytes returned in the
-                # first record.
-                return b""
-        if storage_kind in ("chunked", "fulltext", "lines"):
-            chunks = self._generator._get_one_work(self.key).text()
-            if storage_kind in ("chunked", "lines"):
-                return chunks
-            else:
-                return b"".join(chunks)
-        raise UnavailableRepresentation(self.key, storage_kind, self.storage_kind)
-
-    def iter_bytes_as(self, storage_kind):
-        """Iterate over the bytes for this lazy content in the specified format.
-
-        Args:
-            storage_kind: The desired storage format.
-
-        Returns:
-            An iterator over the content chunks.
-
-        Raises:
-            UnavailableRepresentation: If the format is not available.
-        """
-        if storage_kind in ("chunked", "lines"):
-            chunks = self._generator._get_one_work(self.key).text()
-            return iter(chunks)
-        raise UnavailableRepresentation(self.key, storage_kind, self.storage_kind)
-
-
-def knit_delta_closure_to_records(storage_kind, bytes, line_end):
-    """Convert a network record to a iterator over stream records.
-
-    :param storage_kind: The storage kind of the record.
-        Must be 'knit-delta-closure'.
-    :param bytes: The bytes of the record on the network.
-    """
-    generator = _NetworkContentMapGenerator(bytes, line_end)
-    return generator.get_record_stream()
-
-
-def knit_network_to_record(storage_kind, bytes, line_end):
-    """Convert a network record to a record object.
-
-    :param storage_kind: The storage kind of the record.
-    :param bytes: The bytes of the record on the network.
-    """
-    key, parents, noeol, raw_offset = _knit_rs.parse_network_record_header_rs(
-        bytes, line_end
-    )
-    method, annotated = _knit_rs.parse_storage_kind(storage_kind)
-    build_details = (method, noeol)
-    raw_record = bytes[raw_offset:]
-    return [
-        KnitContentFactory(
-            key,
-            parents,
-            build_details,
-            None,
-            raw_record,
-            annotated,
-            network_bytes=bytes,
-        )
-    ]
+# LazyKnitContentFactory is implemented as a Rust pyclass; re-exported near
+# the bottom of this module (after the _knit_rs import).
 
 
 class KnitContent:
@@ -508,19 +400,17 @@ from ._bzr_rs.knit import (
     _KnitGraphIndex,
     _KnitKeyAccess,
     _load_data,  # noqa: F401  re-exported for breezy's test suite
-    _NetworkContentMapGenerator,
+    _NetworkContentMapGenerator,  # noqa: F401  re-exported for compatibility
     _VFContentMapGenerator,
 )
 from ._bzr_rs.knit import KnitVersionedFiles as _KnitVersionedFilesRs
 
 
-class KnitVersionedFiles(_KnitVersionedFilesRs, VersionedFilesWithFallbacks):
+class KnitVersionedFiles(_KnitVersionedFilesRs):
     """Python view of the Rust-backed KnitVersionedFiles.
 
-    Inherits the Rust pyclass for storage/methods and
-    `VersionedFilesWithFallbacks` so `isinstance(x, VersionedFiles)`
-    holds — the Rust pyclass has `__module__ == 'builtins'` and
-    cannot itself extend a pure-Python class via PyO3.
+    The Rust pyclass extends the Rust ``VersionedFilesWithFallbacks`` base,
+    so ``isinstance(x, VersionedFiles)`` holds without a Python mixin.
     """
 
 
@@ -550,78 +440,12 @@ __all__ = [
 ]
 
 
-def make_file_factory(annotated, mapper):
-    """Create a factory for creating a file based KnitVersionedFiles.
-
-    This is only functional enough to run interface tests, it doesn't try to
-    provide a full pack environment.
-
-    :param annotated: knit annotations are wanted.
-    :param mapper: The mapper from keys to paths.
-    """
-
-    def factory(transport):
-        index = _KndxIndex(transport, mapper, lambda: None, lambda: True, lambda: True)
-        access = _KnitKeyAccess(transport, mapper)
-        return KnitVersionedFiles(index, access, annotated=annotated)
-
-    return factory
-
-
-def make_pack_factory(graph, delta, keylength):
-    """Create a factory for creating a pack based VersionedFiles.
-
-    This is only functional enough to run interface tests, it doesn't try to
-    provide a full pack environment.
-
-    :param graph: Store a graph.
-    :param delta: Delta compress contents.
-    :param keylength: How long should keys be.
-    """
-
-    def factory(transport):
-        parents = graph or delta
-        ref_length = 0
-        if graph:
-            ref_length += 1
-        if delta:
-            ref_length += 1
-            max_delta_chain = 200
-        else:
-            max_delta_chain = 0
-        graph_index = _mod_index.InMemoryGraphIndex(
-            reference_lists=ref_length, key_elements=keylength
-        )
-        stream = transport.open_write_stream("newpack")
-        writer = pack.ContainerWriter(stream.write)
-        writer.begin()
-        index = _KnitGraphIndex(
-            graph_index,
-            lambda: True,
-            parents=parents,
-            deltas=delta,
-            add_callback=graph_index.add_nodes,
-        )
-        access = pack_repo._DirectPackAccess({})
-        access.set_writer(writer, graph_index, (transport, "newpack"))
-        result = KnitVersionedFiles(index, access, max_delta_chain=max_delta_chain)
-        result.stream = stream
-        result.writer = writer
-        return result
-
-    return factory
-
-
-def cleanup_pack_knit(versioned_files):
-    """Clean up resources used by a pack knit versioned files instance.
-
-    Args:
-        versioned_files: The KnitVersionedFiles instance to clean up.
-    """
-    # writer.end() writes the trailing record marker through the same
-    # stream, so it has to run before stream.close() releases the fd.
-    versioned_files.writer.end()
-    versioned_files.stream.close()
+# make_file_factory, make_pack_factory, cleanup_pack_knit,
+# knit_delta_closure_to_records and knit_network_to_record are implemented in
+# the Rust extension; see the re-exports near the bottom of this module (after
+# the _knit_rs import). The factories instantiate the Python
+# KnitVersionedFiles (and _KndxIndex/_KnitGraphIndex/etc.) by importing them
+# from this module.
 
 
 def _get_total_build_size(self, keys, positions):
@@ -846,3 +670,12 @@ def annotate_knit(knit, revision_id):
 
 
 from ._bzr_rs import knit as _knit_rs
+
+# Rust-backed factory functions, network record converters and the lazy
+# content factory.
+knit_delta_closure_to_records = _knit_rs.knit_delta_closure_to_records
+knit_network_to_record = _knit_rs.knit_network_to_record
+make_file_factory = _knit_rs.make_file_factory
+make_pack_factory = _knit_rs.make_pack_factory
+cleanup_pack_knit = _knit_rs.cleanup_pack_knit
+LazyKnitContentFactory = _knit_rs.LazyKnitContentFactory
