@@ -22,6 +22,7 @@ mod index;
 mod inventory;
 mod knit;
 mod lock;
+mod lru_cache;
 mod multiparent;
 mod osutils;
 mod pack;
@@ -1215,6 +1216,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let lockm = lock::_lock_rs(py)?;
     m.add_submodule(&lockm)?;
 
+    let lru_cachem = lru_cache::_lru_cache_rs(py)?;
+    m.add_submodule(&lru_cachem)?;
+
     let groupcompressm = groupcompress::_groupcompress_rs(py)?;
     m.add_submodule(&groupcompressm)?;
 
@@ -1288,6 +1292,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.hashcache", module_name), &hashcachem)?;
     modules.set_item(format!("{}.dirstate", module_name), &dirstatem)?;
     modules.set_item(format!("{}.lock", module_name), &lockm)?;
+    modules.set_item(format!("{}.lru_cache", module_name), &lru_cachem)?;
     modules.set_item(format!("{}.groupcompress", module_name), &groupcompressm)?;
     modules.set_item(format!("{}.chk_map", module_name), &chk_mapm)?;
     modules.set_item(format!("{}.knit", module_name), &knitm)?;
