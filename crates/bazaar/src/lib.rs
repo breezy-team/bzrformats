@@ -23,6 +23,7 @@ pub mod inventory_delta;
 pub mod key_mapper;
 pub mod knit;
 pub mod lock;
+pub mod lru_cache;
 pub mod multiparent;
 pub mod osutils;
 pub mod pack;
