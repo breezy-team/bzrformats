@@ -257,6 +257,18 @@ impl MultiParent {
         matches!(self.hunks.as_slice(), [Hunk::NewText(_)])
     }
 
+    /// The length in bytes of the gzip-compressed patch. Mirrors
+    /// `MultiParent.zipped_patch_len`.
+    pub fn zipped_patch_len(&self) -> usize {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        for chunk in self.to_patch() {
+            // Writing to an in-memory Vec never fails.
+            let _ = enc.write_all(&chunk);
+        }
+        enc.finish().map(|v| v.len()).unwrap_or(0)
+    }
+
     /// Serialize to the patch wire format, yielding one byte chunk per line.
     pub fn to_patch(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
@@ -1015,6 +1027,347 @@ where
     pub fn max_snapshots(&self) -> Option<usize> {
         self.max_snapshots
     }
+
+    /// The set of version ids currently recorded as snapshots.
+    pub fn snapshots_set(&self) -> &std::collections::HashSet<K> {
+        &self.snapshots
+    }
+
+    /// Record `version_id` as a snapshot without recomputing its diff. Used
+    /// when restoring state (e.g. loading a disk index).
+    pub fn mark_snapshot(&mut self, version_id: K) {
+        self.snapshots.insert(version_id);
+    }
+}
+
+/// Error from a [`DiskMultiVersionedFile`] operation: either reconstruction
+/// failed or the underlying disk I/O failed.
+#[derive(Debug)]
+pub enum DiskError {
+    Reconstruct(ReconstructError),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for DiskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiskError::Reconstruct(e) => write!(f, "{}", e),
+            DiskError::Io(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for DiskError {}
+
+impl From<ReconstructError> for DiskError {
+    fn from(e: ReconstructError) -> Self {
+        DiskError::Reconstruct(e)
+    }
+}
+
+impl From<std::io::Error> for DiskError {
+    fn from(e: std::io::Error) -> Self {
+        DiskError::Io(e)
+    }
+}
+
+/// Disk-backed multi-parent versioned file, ported from
+/// `bzrformats.multiparent.MultiVersionedFile`.
+///
+/// Diffs are appended to `<filename>.mpknit` as independent gzip members (each
+/// prefixed with a `version <id>\n` line) and the parents/snapshots/offsets
+/// index is bencoded to `<filename>.mpidx`. An in-memory
+/// [`MultiMemoryVersionedFile`] holds the live diffs so reconstruction reuses
+/// the shared engine; `load` repopulates it by reading every diff off disk.
+pub struct DiskMultiVersionedFile {
+    filename: String,
+    mem: MultiMemoryVersionedFile<Vec<u8>>,
+    /// version id -> (byte offset, byte length) of its gzip member in .mpknit
+    diff_offset: std::collections::HashMap<Vec<u8>, (u64, u64)>,
+}
+
+impl DiskMultiVersionedFile {
+    pub fn new(
+        filename: String,
+        snapshot_interval: Option<usize>,
+        max_snapshots: Option<usize>,
+    ) -> Self {
+        Self {
+            filename,
+            mem: MultiMemoryVersionedFile::new(snapshot_interval, max_snapshots),
+            diff_offset: std::collections::HashMap::new(),
+        }
+    }
+
+    fn knit_path(&self) -> String {
+        format!("{}.mpknit", self.filename)
+    }
+
+    fn idx_path(&self) -> String {
+        format!("{}.mpidx", self.filename)
+    }
+
+    /// Append `diff` for `version_id` to the .mpknit file as a gzip member and
+    /// record its offset. Mirrors `MultiVersionedFile.add_diff`.
+    fn write_diff_to_disk(&mut self, diff: &MultiParent, version_id: &[u8]) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut outfile = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.knit_path())?;
+        let start = outfile.seek(SeekFrom::End(0))?;
+        {
+            let mut enc =
+                flate2::write::GzEncoder::new(&mut outfile, flate2::Compression::default());
+            enc.write_all(b"version ")?;
+            enc.write_all(version_id)?;
+            enc.write_all(b"\n")?;
+            for chunk in diff.to_patch() {
+                enc.write_all(&chunk)?;
+            }
+            enc.finish()?;
+        }
+        let end = outfile.seek(SeekFrom::End(0))?;
+        self.diff_offset
+            .insert(version_id.to_vec(), (start, end - start));
+        Ok(())
+    }
+
+    /// Add a fulltext version: compute its diff against parents (deciding
+    /// snapshots), store it in the in-memory VF and append it to disk.
+    pub fn add_version(
+        &mut self,
+        lines: Vec<Vec<u8>>,
+        version_id: Vec<u8>,
+        parent_ids: Vec<Vec<u8>>,
+        force_snapshot: Option<bool>,
+        single_parent: bool,
+    ) -> Result<(), DiskError> {
+        self.mem.add_version(
+            lines,
+            version_id.clone(),
+            parent_ids,
+            force_snapshot,
+            single_parent,
+        )?;
+        let diff = self.mem.get_diff(&version_id).expect("just added").clone();
+        self.write_diff_to_disk(&diff, &version_id)?;
+        Ok(())
+    }
+
+    /// Reconstruct the fulltext line lists for `version_ids`.
+    pub fn get_line_list(
+        &mut self,
+        version_ids: &[Vec<u8>],
+    ) -> Result<Vec<Vec<Vec<u8>>>, ReconstructError> {
+        self.mem.get_line_list(version_ids)
+    }
+
+    /// Read a single diff back from the .mpknit file.
+    pub fn read_diff_from_disk(&self, version_id: &[u8]) -> std::io::Result<MultiParent> {
+        use std::io::{Read, Seek, SeekFrom};
+        let (start, count) = *self
+            .diff_offset
+            .get(version_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "unknown version"))?;
+        let mut infile = std::fs::File::open(self.knit_path())?;
+        infile.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; count as usize];
+        infile.read_exact(&mut buf)?;
+        let mut dec = flate2::read::GzDecoder::new(&buf[..]);
+        let mut content = Vec::new();
+        dec.read_to_end(&mut content)?;
+        // Drop the leading `version <id>\n` header line.
+        let body = match content.iter().position(|&b| b == b'\n') {
+            Some(i) => &content[i + 1..],
+            None => &content[..],
+        };
+        MultiParent::from_patch(body)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Persist the parents/snapshots/offsets index to the .mpidx file as a
+    /// bencoded `(parents, snapshots, diff_offset)` tuple, matching the
+    /// `fastbencode` layout the Python implementation wrote.
+    pub fn save(&self) -> std::io::Result<()> {
+        let data = self.encode_index();
+        std::fs::write(self.idx_path(), data)
+    }
+
+    /// Load the index from .mpidx and repopulate the in-memory VF by reading
+    /// every diff back off the .mpknit file.
+    pub fn load(&mut self) -> std::io::Result<()> {
+        let data = std::fs::read(self.idx_path())?;
+        let (parents, snapshots, diff_offset) = Self::decode_index(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.diff_offset = diff_offset;
+        let mut mem: MultiMemoryVersionedFile<Vec<u8>> =
+            MultiMemoryVersionedFile::new(self.mem.snapshot_interval(), self.mem.max_snapshots());
+        // Re-add each diff in the on-disk order so reconstruction has them.
+        for (version_id, parent_ids) in &parents {
+            let diff = self.read_diff_from_disk(version_id)?;
+            mem.add_diff(diff, version_id.clone(), parent_ids.clone());
+        }
+        for snap in snapshots {
+            mem.mark_snapshot(snap);
+        }
+        self.mem = mem;
+        Ok(())
+    }
+
+    /// Remove the .mpknit and .mpidx files from disk.
+    pub fn destroy(&self) -> std::io::Result<()> {
+        for path in [self.knit_path(), self.idx_path()] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Bencode the `(parents, snapshots, diff_offset)` index.
+    ///
+    /// `parents` is a dict version_id -> [parent_id, ...]; `snapshots` is a
+    /// list of version_ids; `diff_offset` is a dict version_id ->
+    /// [start, length]. Dict keys are emitted in sorted order, as bencode
+    /// requires.
+    fn encode_index(&self) -> Vec<u8> {
+        use bendy::encoding::Encoder;
+        let mut parents: Vec<(Vec<u8>, Vec<Vec<u8>>)> = self
+            .mem
+            .parents_map()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        parents.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut offsets: Vec<(Vec<u8>, (u64, u64))> = self
+            .diff_offset
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        offsets.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut snapshots: Vec<Vec<u8>> = self.mem.snapshots_set().iter().cloned().collect();
+        snapshots.sort();
+
+        let mut e = Encoder::new();
+        e.emit_list(|list| {
+            // parents dict
+            list.emit_dict(|mut d| {
+                for (k, v) in &parents {
+                    d.emit_pair_with(k, |e| {
+                        e.emit_list(|l| {
+                            for p in v {
+                                l.emit_bytes(p)?;
+                            }
+                            Ok(())
+                        })
+                    })?;
+                }
+                Ok(())
+            })?;
+            // snapshots list
+            list.emit_list(|l| {
+                for s in &snapshots {
+                    l.emit_bytes(s)?;
+                }
+                Ok(())
+            })?;
+            // diff_offset dict
+            list.emit_dict(|mut d| {
+                for (k, (start, len)) in &offsets {
+                    d.emit_pair_with(k, |e| {
+                        e.emit_list(|l| {
+                            l.emit_int(*start)?;
+                            l.emit_int(*len)?;
+                            Ok(())
+                        })
+                    })?;
+                }
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .expect("bencode index");
+        e.get_output().expect("bencode index")
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn decode_index(
+        data: &[u8],
+    ) -> Result<
+        (
+            Vec<(Vec<u8>, Vec<Vec<u8>>)>,
+            Vec<Vec<u8>>,
+            std::collections::HashMap<Vec<u8>, (u64, u64)>,
+        ),
+        String,
+    > {
+        use bendy::decoding::{Decoder, Object};
+        let mut decoder = Decoder::new(data);
+        let mut top = match decoder.next_object().map_err(|e| e.to_string())? {
+            Some(Object::List(l)) => l,
+            _ => return Err("index is not a bencode list".to_string()),
+        };
+        // parents dict
+        let mut parents: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+        match top.next_object().map_err(|e| e.to_string())? {
+            Some(Object::Dict(mut d)) => {
+                while let Some((k, v)) = d.next_pair().map_err(|e| e.to_string())? {
+                    let key = k.to_vec();
+                    let mut ps = Vec::new();
+                    if let Object::List(mut pl) = v {
+                        while let Some(p) = pl.next_object().map_err(|e| e.to_string())? {
+                            ps.push(bytes_of(p)?);
+                        }
+                    }
+                    parents.push((key, ps));
+                }
+            }
+            _ => return Err("expected parents dict".to_string()),
+        }
+        // snapshots list
+        let mut snapshots = Vec::new();
+        match top.next_object().map_err(|e| e.to_string())? {
+            Some(Object::List(mut l)) => {
+                while let Some(s) = l.next_object().map_err(|e| e.to_string())? {
+                    snapshots.push(bytes_of(s)?);
+                }
+            }
+            _ => return Err("expected snapshots list".to_string()),
+        }
+        // diff_offset dict
+        let mut diff_offset = std::collections::HashMap::new();
+        match top.next_object().map_err(|e| e.to_string())? {
+            Some(Object::Dict(mut d)) => {
+                while let Some((k, v)) = d.next_pair().map_err(|e| e.to_string())? {
+                    let key = k.to_vec();
+                    if let Object::List(mut pair) = v {
+                        let start = int_of(pair.next_object().map_err(|e| e.to_string())?)?;
+                        let len = int_of(pair.next_object().map_err(|e| e.to_string())?)?;
+                        diff_offset.insert(key, (start, len));
+                    }
+                }
+            }
+            _ => return Err("expected diff_offset dict".to_string()),
+        }
+        Ok((parents, snapshots, diff_offset))
+    }
+}
+
+fn bytes_of(obj: bendy::decoding::Object<'_, '_>) -> Result<Vec<u8>, String> {
+    match obj {
+        bendy::decoding::Object::Bytes(b) => Ok(b.to_vec()),
+        _ => Err("expected bencode bytes".to_string()),
+    }
+}
+
+fn int_of(obj: Option<bendy::decoding::Object<'_, '_>>) -> Result<u64, String> {
+    match obj {
+        Some(bendy::decoding::Object::Integer(s)) => s.parse::<u64>().map_err(|e| e.to_string()),
+        _ => Err("expected bencode integer".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1023,6 +1376,42 @@ mod tests {
 
     fn lines(s: &[&[u8]]) -> Vec<Vec<u8>> {
         s.iter().map(|l| l.to_vec()).collect()
+    }
+
+    #[test]
+    fn disk_vf_save_load_roundtrip() {
+        // Mirrors bzrformats test_multiparent.TestMultiVersionedFile.test_save_load.
+        let dir = std::env::temp_dir().join(format!("mpvf-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("foop").to_str().unwrap().to_string();
+
+        let mut vf = DiskMultiVersionedFile::new(base.clone(), Some(25), None);
+        vf.add_version(
+            lines(&[b"a\n", b"b\n", b"c\n", b"d"]),
+            b"a".to_vec(),
+            vec![],
+            None,
+            false,
+        )
+        .unwrap();
+        vf.add_version(
+            lines(&[b"a\n", b"e\n", b"d\n"]),
+            b"b".to_vec(),
+            vec![b"a".to_vec()],
+            None,
+            false,
+        )
+        .unwrap();
+        vf.save().unwrap();
+
+        let mut newvf = DiskMultiVersionedFile::new(base, Some(25), None);
+        newvf.load().unwrap();
+        let a = newvf.get_line_list(&[b"a".to_vec()]).unwrap();
+        assert_eq!(a[0].concat(), b"a\nb\nc\nd");
+        let b = newvf.get_line_list(&[b"b".to_vec()]).unwrap();
+        assert_eq!(b[0].concat(), b"a\ne\nd\n");
+        newvf.destroy().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

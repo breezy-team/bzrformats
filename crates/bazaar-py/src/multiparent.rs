@@ -779,12 +779,8 @@ impl PyMultiParent {
 
     /// The length of the gzipped patch in bytes.
     fn zipped_patch_len(&self, py: Python<'_>) -> PyResult<usize> {
-        let patch = self.to_patch(py)?;
-        let gzip = py
-            .import("bzrformats.multiparent")?
-            .getattr("gzip_string")?;
-        let compressed = gzip.call1((patch,))?;
-        Ok(compressed.downcast::<PyBytes>()?.as_bytes().len())
+        let mp = py_hunks_to_rust(&self.hunks_list(py))?;
+        Ok(mp.zipped_patch_len())
     }
 
     /// The number of lines in the output text.
@@ -954,8 +950,101 @@ fn split_readlines(data: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// Disk-backed pseudo-versionedfile, ported from
+/// `bzrformats.multiparent.MultiVersionedFile`.
+#[pyclass(name = "MultiVersionedFile", module = "bzrformats._bzr_rs.multiparent")]
+pub struct PyMultiVersionedFile {
+    inner: bazaar::multiparent::DiskMultiVersionedFile,
+}
+
+fn disk_err_to_py(e: bazaar::multiparent::DiskError) -> PyErr {
+    match e {
+        bazaar::multiparent::DiskError::Reconstruct(r) => reconstruct_err(r),
+        bazaar::multiparent::DiskError::Io(io) => {
+            pyo3::exceptions::PyOSError::new_err(io.to_string())
+        }
+    }
+}
+
+#[pymethods]
+impl PyMultiVersionedFile {
+    #[new]
+    #[pyo3(signature = (filename, snapshot_interval=25, max_snapshots=None))]
+    fn new(
+        filename: String,
+        snapshot_interval: Option<usize>,
+        max_snapshots: Option<usize>,
+    ) -> Self {
+        Self {
+            inner: bazaar::multiparent::DiskMultiVersionedFile::new(
+                filename,
+                snapshot_interval,
+                max_snapshots,
+            ),
+        }
+    }
+
+    #[pyo3(signature = (lines, version_id, parent_ids, force_snapshot=None, single_parent=false))]
+    fn add_version(
+        &mut self,
+        lines: Vec<Vec<u8>>,
+        version_id: Vec<u8>,
+        parent_ids: Vec<Vec<u8>>,
+        force_snapshot: Option<bool>,
+        single_parent: bool,
+    ) -> PyResult<()> {
+        self.inner
+            .add_version(lines, version_id, parent_ids, force_snapshot, single_parent)
+            .map_err(disk_err_to_py)
+    }
+
+    fn get_line_list<'py>(
+        &mut self,
+        py: Python<'py>,
+        version_ids: Vec<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let lists = self
+            .inner
+            .get_line_list(&version_ids)
+            .map_err(reconstruct_err)?;
+        let outer = PyList::empty(py);
+        for lines in lists {
+            let inner: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
+            outer.append(PyList::new(py, inner)?)?;
+        }
+        Ok(outer)
+    }
+
+    fn get_diff<'py>(&self, py: Python<'py>, version_id: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        let mp = self
+            .inner
+            .read_diff_from_disk(&version_id)
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+        rust_to_py_multiparent(py, &mp)
+    }
+
+    fn save(&self) -> PyResult<()> {
+        self.inner
+            .save()
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+    }
+
+    fn load(&mut self) -> PyResult<()> {
+        self.inner
+            .load()
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+    }
+
+    fn destroy(&self) -> PyResult<()> {
+        self.inner
+            .destroy()
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+    }
+}
+
 pub fn _multiparent_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "multiparent")?;
+    m.add_class::<PyMultiVersionedFile>()?;
     m.add_function(wrap_pyfunction!(to_patch, &m)?)?;
     m.add_function(wrap_pyfunction!(num_lines, &m)?)?;
     m.add_function(wrap_pyfunction!(is_snapshot, &m)?)?;
