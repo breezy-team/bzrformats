@@ -1,4 +1,5 @@
 use bazaar::versionedfile::{ContentFactory, Key};
+use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
 
@@ -3237,8 +3238,269 @@ impl PyVersionedFilesWithFallbacks {
     }
 }
 
+/// A `VersionedFiles` for uncommitted and committed texts, used to plan merges
+/// against working-tree texts. Ported from
+/// `bzrformats.versionedfile._PlanMergeVersionedFile`.
+///
+/// Holds local `(key -> parents)` / `(key -> lines)` maps plus a list of
+/// fallback `VersionedFiles`, and drives the Rust `_PlanMerge` / `_PlanLCAMerge`
+/// (via `bzrformats.merge`). Instance state lives in `__dict__`.
+#[pyclass(
+    name = "_PlanMergeVersionedFile",
+    extends = PyVersionedFilesBase,
+    dict,
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+pub struct PyPlanMergeVersionedFile;
+
+#[pymethods]
+impl PyPlanMergeVersionedFile {
+    #[new]
+    fn new(file_id: Py<PyAny>) -> PyClassInitializer<Self> {
+        let _ = file_id;
+        vf_initializer().add_subclass(PyPlanMergeVersionedFile)
+    }
+
+    fn __init__(slf: &Bound<'_, Self>, file_id: Bound<'_, PyAny>) -> PyResult<()> {
+        let py = slf.py();
+        slf.setattr("_file_id", file_id)?;
+        slf.setattr("fallback_versionedfiles", PyList::empty(py))?;
+        let parents = PyDict::new(py);
+        slf.setattr("_parents", &parents)?;
+        slf.setattr("_lines", PyDict::new(py))?;
+        // _providers = [DictParentsProvider(self._parents)]
+        let provider = py
+            .import("vcsgraph.graph")?
+            .getattr("DictParentsProvider")?
+            .call1((&parents,))?;
+        slf.setattr("_providers", PyList::new(py, [provider])?)?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (ver_a, ver_b, base=None))]
+    fn plan_merge<'py>(
+        slf: &Bound<'py, Self>,
+        ver_a: Bound<'py, PyAny>,
+        ver_b: Bound<'py, PyAny>,
+        base: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let plan_merge_cls = py.import("bzrformats.merge")?.getattr("_PlanMerge")?;
+        let file_id = slf.getattr("_file_id")?;
+        let prefix = PyTuple::new(py, [&file_id])?;
+        match base {
+            None => {
+                let pm = plan_merge_cls.call1((&ver_a, &ver_b, slf, &prefix))?;
+                pm.call_method0("plan_merge")
+            }
+            Some(base) => {
+                let old = plan_merge_cls
+                    .call1((&ver_a, &base, slf, &prefix))?
+                    .call_method0("plan_merge")?;
+                let old = py.import("builtins")?.getattr("list")?.call1((old,))?;
+                let new = plan_merge_cls
+                    .call1((&ver_a, &ver_b, slf, &prefix))?
+                    .call_method0("plan_merge")?;
+                let new = py.import("builtins")?.getattr("list")?.call1((new,))?;
+                plan_merge_cls.getattr("_subtract_plans")?.call1((old, new))
+            }
+        }
+    }
+
+    #[pyo3(signature = (ver_a, ver_b, base=None))]
+    fn plan_lca_merge<'py>(
+        slf: &Bound<'py, Self>,
+        ver_a: Bound<'py, PyAny>,
+        ver_b: Bound<'py, PyAny>,
+        base: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let merge = py.import("bzrformats.merge")?;
+        let lca_cls = merge.getattr("_PlanLCAMerge")?;
+        let graph = py
+            .import("vcsgraph.graph")?
+            .getattr("Graph")?
+            .call1((slf,))?;
+        let file_id = slf.getattr("_file_id")?;
+        let prefix = PyTuple::new(py, [&file_id])?;
+        let list = py.import("builtins")?.getattr("list")?;
+        let new = lca_cls
+            .call1((&ver_a, &ver_b, slf, &prefix, &graph))?
+            .call_method0("plan_merge")?;
+        match base {
+            None => Ok(new),
+            Some(base) => {
+                let old = lca_cls
+                    .call1((&ver_a, &base, slf, &prefix, &graph))?
+                    .call_method0("plan_merge")?;
+                let old = list.call1((old,))?;
+                let new = list.call1((new,))?;
+                lca_cls.getattr("_subtract_plans")?.call1((old, new))
+            }
+        }
+    }
+
+    fn add_content<'py>(
+        slf: &Bound<'py, Self>,
+        factory: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let key = factory.getattr("key")?;
+        let parents = factory.getattr("parents")?;
+        let lines = factory.call_method1("get_bytes_as", ("lines",))?;
+        Self::add_lines(slf, key, parents, lines)
+    }
+
+    fn add_lines<'py>(
+        slf: &Bound<'py, Self>,
+        key: Bound<'py, PyAny>,
+        parents: Bound<'py, PyAny>,
+        lines: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        if !key.is_instance_of::<PyTuple>() {
+            return Err(PyTypeError::new_err(key.unbind()));
+        }
+        // Only reserved ids may be used.
+        let last = key.get_item(key.len()? - 1)?;
+        let is_reserved = py
+            .import("bzrformats.revision")?
+            .getattr("is_reserved_id")?
+            .call1((&last,))?
+            .is_truthy()?;
+        if !is_reserved {
+            return Err(PyValueError::new_err("Only reserved ids may be used"));
+        }
+        if parents.is_none() {
+            return Err(PyValueError::new_err("Parents may not be None"));
+        }
+        if lines.is_none() {
+            return Err(PyValueError::new_err("Lines may not be None"));
+        }
+        let parents_tuple = py
+            .import("builtins")?
+            .getattr("tuple")?
+            .call1((&parents,))?;
+        slf.getattr("_parents")?
+            .downcast::<PyDict>()?
+            .set_item(&key, parents_tuple)?;
+        slf.getattr("_lines")?
+            .downcast::<PyDict>()?
+            .set_item(&key, lines)?;
+        Ok(py.None().into_bound(py))
+    }
+
+    fn get_record_stream<'py>(
+        slf: &Bound<'py, Self>,
+        keys: Bound<'py, PyAny>,
+        ordering: Bound<'py, PyAny>,
+        include_delta_closure: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = (ordering, include_delta_closure);
+        let py = slf.py();
+        let out = PyList::empty(py);
+        let lines_map = slf.getattr("_lines")?;
+        let lines_map = lines_map.downcast::<PyDict>()?;
+        let parents_map = slf.getattr("_parents")?;
+        let parents_map = parents_map.downcast::<PyDict>()?;
+        // pending = set(keys); locally-held keys yield ChunkedContentFactory.
+        let pending = PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            pending.add(k?)?;
+        }
+        let keys_list: Vec<Bound<PyAny>> = pending.iter().collect();
+        for key in keys_list {
+            if let Some(lines) = lines_map.get_item(&key)? {
+                let parents = parents_map
+                    .get_item(&key)?
+                    .ok_or_else(|| PyKeyError::new_err(key.clone().unbind()))?;
+                pending.discard(&key)?;
+                let cf = py.get_type::<ChunkedContentFactory>().call1((
+                    &key,
+                    parents,
+                    py.None(),
+                    lines,
+                ))?;
+                out.append(cf)?;
+            }
+        }
+        // Then consult fallback versionedfiles.
+        let fallbacks = slf.getattr("fallback_versionedfiles")?;
+        for vf in fallbacks.try_iter()? {
+            let vf = vf?;
+            let stream = vf.call_method1("get_record_stream", (&pending, "unordered", true))?;
+            for record in stream.try_iter()? {
+                let record = record?;
+                let kind: String = record.getattr("storage_kind")?.extract()?;
+                if kind == "absent" {
+                    continue;
+                }
+                pending.discard(record.getattr("key")?)?;
+                out.append(record)?;
+            }
+            if pending.is_empty() {
+                return out.into_any().try_iter().map(|i| i.into_any());
+            }
+        }
+        // Report absent entries.
+        for key in pending.iter() {
+            let cf = py.get_type::<AbsentContentFactory>().call1((key,))?;
+            out.append(cf)?;
+        }
+        out.into_any().try_iter().map(|i| i.into_any())
+    }
+
+    fn get_parent_map<'py>(
+        slf: &Bound<'py, Self>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let py = slf.py();
+        let revision = py.import("bzrformats.revision")?;
+        let null_rev = revision.getattr("NULL_REVISION")?;
+        let key_set = PySet::empty(py)?;
+        for k in keys.try_iter()? {
+            key_set.add(k?)?;
+        }
+        let result = PyDict::new(py);
+        if key_set.contains(&null_rev)? {
+            key_set.discard(&null_rev)?;
+            result.set_item(&null_rev, PyTuple::empty(py))?;
+        }
+        // _providers = self._providers[:1] + fallback_versionedfiles
+        let providers = slf.getattr("_providers")?;
+        let first = providers.get_item(0)?;
+        let combined = PyList::new(py, [first])?;
+        for vf in slf.getattr("fallback_versionedfiles")?.try_iter()? {
+            combined.append(vf?)?;
+        }
+        slf.setattr("_providers", &combined)?;
+        let stacked = py
+            .import("vcsgraph.graph")?
+            .getattr("StackedParentsProvider")?
+            .call1((&combined,))?;
+        let looked_up = stacked.call_method1("get_parent_map", (&key_set,))?;
+        result.call_method1("update", (looked_up,))?;
+        // Replace empty parents with (NULL_REVISION,).
+        let empty = PyTuple::empty(py);
+        let items: Vec<(Bound<PyAny>, Bound<PyAny>)> = result
+            .items()
+            .iter()
+            .map(|it| {
+                let t = it.downcast::<PyTuple>().unwrap();
+                (t.get_item(0).unwrap(), t.get_item(1).unwrap())
+            })
+            .collect();
+        for (key, parents) in items {
+            if parents.eq(&empty)? {
+                result.set_item(&key, PyTuple::new(py, [&null_rev])?)?;
+            }
+        }
+        Ok(result)
+    }
+}
+
 pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "versionedfile")?;
+    m.add_class::<PyPlanMergeVersionedFile>()?;
     m.add_class::<AbstractContentFactory>()?;
     m.add_class::<FulltextContentFactory>()?;
     m.add_class::<ChunkedContentFactory>()?;
