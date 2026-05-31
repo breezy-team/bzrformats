@@ -24,14 +24,9 @@ from io import BytesIO
 from typing import Protocol, runtime_checkable
 from urllib.parse import unquote
 
-from .errors import PathError
-
-
-class NoSuchFile(PathError):
-    """A file or directory does not exist."""
-
-    _fmt = "No such file: %(path)r%(extra)s"
-
+# The transport error classes live in the Rust errors module; re-export them so
+# bzrformats.transport.NoSuchFile / FileExists keep working.
+from .errors import FileExists, NoSuchFile  # noqa: F401
 
 # Tuple for catching NoSuchFile from both bzrformats and breezy transports.
 # Use this in except clauses when the transport may be either implementation.
@@ -41,12 +36,6 @@ try:
     TransportNoSuchFile = (NoSuchFile, _BreezyNoSuchFile)
 except ImportError:
     TransportNoSuchFile = NoSuchFile
-
-
-class FileExists(PathError):
-    """A file or directory already exists."""
-
-    _fmt = "File exists: %(path)r%(extra)s"
 
 
 @runtime_checkable

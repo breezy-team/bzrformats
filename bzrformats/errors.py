@@ -60,6 +60,7 @@ ReservedId = _errors.ReservedId
 BadFileKindError = _errors.BadFileKindError
 PathError = _errors.PathError
 NoSuchFile = _errors.NoSuchFile
+FileExists = _errors.FileExists
 InvalidNormalization = _errors.InvalidNormalization
 InconsistentDelta = _errors.InconsistentDelta
 InconsistentDeltaDelta = _errors.InconsistentDeltaDelta
@@ -91,6 +92,7 @@ __all__ = [
     "DecompressCorruption",
     "DuplicateFileId",
     "ExistingContent",
+    "FileExists",
     "InconsistentDelta",
     "InconsistentDeltaDelta",
     "InternalBzrFormatsError",

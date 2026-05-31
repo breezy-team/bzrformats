@@ -530,6 +530,11 @@ path_error_subclass!(
     NoSuchFile, "No such file: %(path)r%(extra)s"
 );
 path_error_subclass!(
+    /// Raised by transports when a file or directory already exists.
+    FileExists,
+    "File exists: %(path)r%(extra)s"
+);
+path_error_subclass!(
     InvalidNormalization,
     "Path \"%(path)s\" is not unicode normalized"
 );
@@ -776,6 +781,7 @@ pub(crate) fn errors_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_class::<BadFileKindError>()?;
     m.add_class::<PathError>()?;
     m.add_class::<NoSuchFile>()?;
+    m.add_class::<FileExists>()?;
     m.add_class::<InvalidNormalization>()?;
     m.add_class::<InconsistentDelta>()?;
     m.add_class::<InconsistentDeltaDelta>()?;
