@@ -39,6 +39,11 @@ BTreeGraphIndex = _btree_index_rs.BTreeGraphIndex
 _LeafNode = _btree_index_rs._LeafNode
 _InternalNode = _btree_index_rs._InternalNode
 
+# Page size of a B+Tree node, re-exported for consumers that stride a raw
+# index file (e.g. breezy's bzr/debug_commands.py dump-btree).
+PAGE_SIZE = _btree_index_rs.PAGE_SIZE
+_PAGE_SIZE = _btree_index_rs._PAGE_SIZE
+
 # Factory used for chk indices: parses leaf bytes into the chk-optimised
 # leaf node. Pack repositories assign this to a BTreeGraphIndex's
 # `_leaf_factory` to read chk indices more efficiently.

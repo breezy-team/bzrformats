@@ -2386,5 +2386,9 @@ pub fn _btree_index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<BTreeBuilder>()?;
     m.add_class::<LeafNodePy>()?;
     m.add_class::<InternalNodePy>()?;
+    // Page-size constants read by downstream consumers (e.g. breezy's
+    // bzr/debug_commands.py iterates a B+Tree file in PAGE_SIZE strides).
+    m.add("PAGE_SIZE", bazaar::btree_index::PAGE_SIZE)?;
+    m.add("_PAGE_SIZE", bazaar::btree_index::PAGE_SIZE)?;
     Ok(m)
 }
