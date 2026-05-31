@@ -65,6 +65,32 @@ impl LruOrder {
         self.least_recently_used
     }
 
+    /// The current most-recently-used entry, if any.
+    pub fn mru(&self) -> Option<NodeId> {
+        self.most_recently_used
+    }
+
+    /// The id following `id` towards the least-recently-used end, if any.
+    pub fn next(&self, id: NodeId) -> Option<NodeId> {
+        self.nodes.get(&id).and_then(|n| n.next)
+    }
+
+    /// The id preceding `id` towards the most-recently-used end, if any.
+    pub fn prev(&self, id: NodeId) -> Option<NodeId> {
+        self.nodes.get(&id).and_then(|n| n.prev)
+    }
+
+    /// The entry ids in most-recently-used to least-recently-used order.
+    pub fn order_mru_to_lru(&self) -> Vec<NodeId> {
+        let mut out = Vec::with_capacity(self.nodes.len());
+        let mut cur = self.most_recently_used;
+        while let Some(id) = cur {
+            out.push(id);
+            cur = self.nodes.get(&id).and_then(|n| n.next);
+        }
+        out
+    }
+
     /// Insert a brand-new entry at the most-recently-used position.
     ///
     /// The caller must ensure `id` is not already present (use
