@@ -214,12 +214,6 @@ class KnitContentFactory(ContentFactory):
     def get_bytes_as(self, storage_kind):
         """Get the bytes for this content in the specified storage format.
 
-        Args:
-            storage_kind: The desired storage format.
-
-        Returns:
-            The content bytes in the requested format.
-
         Raises:
             UnavailableRepresentation: If the format is not available.
         """
@@ -246,38 +240,17 @@ class KnitContentFactory(ContentFactory):
         raise UnavailableRepresentation(self.key, storage_kind, self.storage_kind)
 
     def iter_bytes_as(self, storage_kind):
-        """Iterate over the bytes for this content in the specified format.
-
-        Args:
-            storage_kind: The desired storage format.
-
-        Returns:
-            An iterator over the content bytes.
-        """
+        """Iterate over the bytes for this content in the specified format."""
         return iter(self.get_bytes_as(storage_kind))
 
 
-# LazyKnitContentFactory is implemented as a Rust pyclass; re-exported near
-# the bottom of this module (after the _knit_rs import).
-
-
-class KnitContent:
-    r"""Base class for knit content objects.
-
-    Provides the static get_line_delta_blocks helper used by callers that
-    hold a plain KnitContent reference.  The concrete implementations
-    (AnnotatedKnitContent, PlainKnitContent) are backed by Rust.
-    """
-
-    @staticmethod
-    def get_line_delta_blocks(knit_delta, source, target):
-        """Extract SequenceMatcher.get_matching_blocks() from a knit delta."""
-        yield from _knit_rs.get_line_delta_blocks_rs(knit_delta, source, target)
-
-
+# KnitContent (with its get_line_delta_blocks static helper),
+# LazyKnitContentFactory, and the AnnotatedKnitContent / PlainKnitContent
+# concrete contents are Rust-backed and re-exported below.
 from ._bzr_rs.knit import (
     AnnotatedKnitContent,
     KnitAnnotateFactory,
+    KnitContent,
     KnitPlainFactory,
     PlainKnitContent,
     _KndxIndex,
@@ -302,6 +275,7 @@ __all__ = [
     "AnnotatedKnitContent",
     "KnitAnnotateFactory",
     "KnitContent",
+    "KnitContentFactory",
     "KnitCorrupt",
     "KnitDataStreamIncompatible",
     "KnitDataStreamUnknown",

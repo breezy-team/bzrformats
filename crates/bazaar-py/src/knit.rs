@@ -8249,6 +8249,26 @@ fn make_knit_pack_factory(graph: bool, delta: bool, keylength: usize) -> KnitPac
     }
 }
 
+/// Base class for knit content objects, exposing the `get_line_delta_blocks`
+/// static helper used by callers holding a plain `KnitContent` reference. The
+/// concrete implementations are `AnnotatedKnitContent` / `PlainKnitContent`.
+#[pyclass(name = "KnitContent", subclass)]
+struct PyKnitContent;
+
+#[pymethods]
+impl PyKnitContent {
+    /// Extract `SequenceMatcher.get_matching_blocks()` from a knit delta.
+    #[staticmethod]
+    fn get_line_delta_blocks<'py>(
+        py: Python<'py>,
+        knit_delta: Bound<'py, PyAny>,
+        source: Bound<'py, PyAny>,
+        target: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        get_line_delta_blocks_rs(py, knit_delta, source, target)
+    }
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data, &m)?)?;
@@ -8302,5 +8322,6 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<KnitFileFactory>()?;
     m.add_class::<KnitPackFactory>()?;
     m.add_class::<PyKnitContentFactory>()?;
+    m.add_class::<PyKnitContent>()?;
     Ok(m)
 }
