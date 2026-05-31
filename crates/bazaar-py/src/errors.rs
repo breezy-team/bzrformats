@@ -353,10 +353,16 @@ impl UnexpectedInventoryFormat {
         Ok(())
     }
 }
-simple_error!(KnitCorrupt: BzrFormatsError, "Knit %(knit)s corrupt: %(how)s"; knit, how);
-simple_error!(KnitDataStreamIncompatible: BzrFormatsError, "Cannot insert knit data stream for %(key)s: %(msg)s"; key, msg);
-simple_error!(KnitDataStreamUnknown: BzrFormatsError, "Unknown knit data stream for %(key)s"; key);
-simple_error!(KnitHeaderError: BzrFormatsError, "Knit header error: %(badline)r"; badline);
+// Knit error hierarchy. Definitions match the live knit.py (the stale
+// errors.py copies, which nothing imported, are replaced here). The Rust knit
+// code raises these via import_exception!(bzrformats.knit, ...).
+simple_error!(KnitError: BzrFormatsError, "Knit error");
+simple_error!(KnitCorrupt: KnitError, "Knit %(filename)s corrupt: %(how)s"; filename, how);
+simple_error!(SHA1KnitCorrupt: KnitCorrupt, "Knit %(filename)s corrupt: sha-1 of reconstructed text does not match expected sha-1. key %(key)s expected sha %(expected)s actual sha %(actual)s"; filename, actual, expected, key, content);
+simple_error!(KnitDataStreamIncompatible: KnitError, "Cannot insert knit data stream of format \"%(stream_format)s\" into knit of format \"%(target_format)s\"."; stream_format, target_format);
+simple_error!(KnitDataStreamUnknown: KnitError, "Cannot parse knit data stream of format \"%(stream_format)s\"."; stream_format);
+simple_error!(KnitHeaderError: KnitError, "Knit header error: %(badline)r unexpected for file \"%(filename)s\"."; badline, filename);
+simple_error!(KnitIndexUnknownMethod: KnitError, "Knit index %(filename)s does not have a known method in options: %(options)r"; filename, options);
 simple_error!(BadIndexFormatSignature: BzrFormatsError, "%(value)s is not an index of type %(_type)s."; value, _type);
 simple_error!(BadIndexData: BzrFormatsError, "Error in data for index %(value)s."; value);
 simple_error!(BadIndexDuplicateKey: BzrFormatsError, "The key '%(key)s' is already in index '%(index)s'."; key, index);
@@ -792,10 +798,13 @@ pub(crate) fn errors_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_class::<BzrFormatsError>()?;
     m.add_class::<UnexpectedInventoryFormat>()?;
     m.add_class::<UnsupportedInventoryKind>()?;
+    m.add_class::<KnitError>()?;
     m.add_class::<KnitCorrupt>()?;
+    m.add_class::<SHA1KnitCorrupt>()?;
     m.add_class::<KnitDataStreamIncompatible>()?;
     m.add_class::<KnitDataStreamUnknown>()?;
     m.add_class::<KnitHeaderError>()?;
+    m.add_class::<KnitIndexUnknownMethod>()?;
     m.add_class::<BadIndexFormatSignature>()?;
     m.add_class::<BadIndexData>()?;
     m.add_class::<BadIndexDuplicateKey>()?;

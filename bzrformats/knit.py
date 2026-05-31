@@ -55,9 +55,19 @@ import logging
 
 from . import pack_repo
 from .annotate import VersionedFileAnnotator
-from .errors import (
-    BzrFormatsError,
+
+# The knit error hierarchy lives in the Rust errors module; re-export it so
+# bzrformats.knit.KnitCorrupt (and friends) keep working for callers and for
+# the Rust import_exception!(bzrformats.knit, ...) sites.
+from .errors import (  # noqa: F401
+    KnitCorrupt,
+    KnitDataStreamIncompatible,
+    KnitDataStreamUnknown,
+    KnitError,
+    KnitHeaderError,
+    KnitIndexUnknownMethod,
     RevisionNotPresent,
+    SHA1KnitCorrupt,
 )
 from .versionedfile import (
     ContentFactory,
@@ -84,132 +94,6 @@ logger = logging.getLogger("bzrformats.knit")
 DATA_SUFFIX = ".knit"
 INDEX_SUFFIX = ".kndx"
 _STREAM_MIN_BUFFER_SIZE = 5 * 1024 * 1024
-
-
-class KnitError(BzrFormatsError):
-    """Base exception for errors related to knit file operations."""
-
-    _fmt = "Knit error"
-
-
-class KnitCorrupt(KnitError):
-    """Raised when a knit file is found to be corrupt."""
-
-    _fmt = "Knit %(filename)s corrupt: %(how)s"
-
-    def __init__(self, filename, how):
-        """Initialize KnitCorrupt exception.
-
-        Args:
-            filename: The path to the corrupt knit file.
-            how: Description of how the file is corrupt.
-        """
-        KnitError.__init__(self)
-        self.filename = filename
-        self.how = how
-
-
-class SHA1KnitCorrupt(KnitCorrupt):
-    """Raised when SHA-1 checksum validation fails for knit content."""
-
-    _fmt = (
-        "Knit %(filename)s corrupt: sha-1 of reconstructed text does not "
-        "match expected sha-1. key %(key)s expected sha %(expected)s actual "
-        "sha %(actual)s"
-    )
-
-    def __init__(self, filename, actual, expected, key, content):
-        """Initialize SHA1KnitCorrupt exception.
-
-        Args:
-            filename: The path to the corrupt knit file.
-            actual: The actual SHA-1 hash computed.
-            expected: The expected SHA-1 hash.
-            key: The key of the corrupt content.
-            content: The content that failed validation.
-        """
-        KnitError.__init__(self)
-        self.filename = filename
-        self.actual = actual
-        self.expected = expected
-        self.key = key
-        self.content = content
-
-
-class KnitDataStreamIncompatible(KnitError):
-    """Raised when attempting to insert incompatible knit data streams.
-
-    Not raised anymore, as we can convert data streams. In future we may
-    need it again for more exotic cases, so we're keeping it around for now.
-    """
-
-    _fmt = 'Cannot insert knit data stream of format "%(stream_format)s" into knit of format "%(target_format)s".'
-
-    def __init__(self, stream_format, target_format):
-        """Initialize KnitDataStreamIncompatible exception.
-
-        Args:
-            stream_format: The format of the data stream being inserted.
-            target_format: The format of the target knit.
-        """
-        self.stream_format = stream_format
-        self.target_format = target_format
-
-
-class KnitDataStreamUnknown(KnitError):
-    """Raised when encountering an unknown knit data stream format.
-
-    Indicates a data stream we don't know how to handle.
-    """
-
-    _fmt = 'Cannot parse knit data stream of format "%(stream_format)s".'
-
-    def __init__(self, stream_format):
-        """Initialize KnitDataStreamUnknown exception.
-
-        Args:
-            stream_format: The unknown format of the data stream.
-        """
-        self.stream_format = stream_format
-
-
-class KnitHeaderError(KnitError):
-    """Raised when a knit file header is malformed or unexpected."""
-
-    _fmt = 'Knit header error: %(badline)r unexpected for file "%(filename)s".'
-
-    def __init__(self, badline, filename):
-        """Initialize KnitHeaderError exception.
-
-        Args:
-            badline: The malformed header line.
-            filename: The path to the knit file with the bad header.
-        """
-        KnitError.__init__(self)
-        self.badline = badline
-        self.filename = filename
-
-
-class KnitIndexUnknownMethod(KnitError):
-    """Raised when we don't understand the storage method.
-
-    Currently only 'fulltext' and 'line-delta' are supported.
-    """
-
-    _fmt = (
-        "Knit index %(filename)s does not have a known method in options: %(options)r"
-    )
-
-    def __init__(self, filename, options):
-        """Initialize KnitIndexUnknownMethod exception.
-
-        Args:
-            filename: The path to the knit index file.
-            options: The unknown options/methods found in the index.
-        """
-        KnitError.__init__(self)
-        self.filename = filename
-        self.options = options
 
 
 class KnitAdapter:

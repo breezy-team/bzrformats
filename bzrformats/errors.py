@@ -28,10 +28,15 @@ from ._bzr_rs import errors as _errors
 BzrFormatsError = _errors.BzrFormatsError
 UnexpectedInventoryFormat = _errors.UnexpectedInventoryFormat
 UnsupportedInventoryKind = _errors.UnsupportedInventoryKind
+# Knit errors are re-exported from bzrformats.knit (their natural home); they
+# remain importable from here too for any historical callers.
+KnitError = _errors.KnitError
 KnitCorrupt = _errors.KnitCorrupt
+SHA1KnitCorrupt = _errors.SHA1KnitCorrupt
 KnitDataStreamIncompatible = _errors.KnitDataStreamIncompatible
 KnitDataStreamUnknown = _errors.KnitDataStreamUnknown
 KnitHeaderError = _errors.KnitHeaderError
+KnitIndexUnknownMethod = _errors.KnitIndexUnknownMethod
 BadIndexFormatSignature = _errors.BadIndexFormatSignature
 BadIndexData = _errors.BadIndexData
 BadIndexDuplicateKey = _errors.BadIndexDuplicateKey
@@ -114,7 +119,9 @@ __all__ = [
     "KnitCorrupt",
     "KnitDataStreamIncompatible",
     "KnitDataStreamUnknown",
+    "KnitError",
     "KnitHeaderError",
+    "KnitIndexUnknownMethod",
     "LockContention",
     "LockError",
     "LockNotHeld",
@@ -130,6 +137,7 @@ __all__ = [
     "ReservedId",
     "RevisionAlreadyPresent",
     "RevisionNotPresent",
+    "SHA1KnitCorrupt",
     "UnavailableRepresentation",
     "UnexpectedEndOfContainerError",
     "UnexpectedInventoryFormat",
