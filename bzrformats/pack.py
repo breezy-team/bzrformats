@@ -20,90 +20,22 @@
 doc/developers/container-format.txt.
 """
 
-from . import errors
 from ._bzr_rs import pack as _pack_rs
 
+# The container error classes live in the Rust errors module; re-export them so
+# bzrformats.pack.ContainerError (and friends) keep working for callers and for
+# the Rust import_exception!(bzrformats.pack, ...) sites.
+from .errors import (  # noqa: F401
+    ContainerError,
+    ContainerHasExcessDataError,
+    DuplicateRecordNameError,
+    InvalidRecordError,
+    UnexpectedEndOfContainerError,
+    UnknownContainerFormatError,
+    UnknownRecordTypeError,
+)
+
 FORMAT_ONE = _pack_rs.FORMAT_ONE
-
-
-class ContainerError(errors.BzrFormatsError):
-    """Base class of container errors."""
-
-
-class UnknownContainerFormatError(ContainerError):
-    """Exception raised when encountering unknown container format."""
-
-    _fmt = "Unrecognised container format: %(container_format)r"
-
-    def __init__(self, container_format):
-        """Initialize UnknownContainerFormatError.
-
-        Args:
-            container_format: The unknown container format encountered.
-        """
-        self.container_format = container_format
-
-
-class UnexpectedEndOfContainerError(ContainerError):
-    """Exception raised when container stream ends unexpectedly."""
-
-    _fmt = "Unexpected end of container stream"
-
-
-class UnknownRecordTypeError(ContainerError):
-    """Exception raised when encountering unknown record type."""
-
-    _fmt = "Unknown record type: %(record_type)r"
-
-    def __init__(self, record_type):
-        """Initialize UnknownRecordTypeError.
-
-        Args:
-            record_type: The unknown record type encountered.
-        """
-        self.record_type = record_type
-
-
-class InvalidRecordError(ContainerError):
-    """Exception raised when a record is invalid."""
-
-    _fmt = "Invalid record: %(reason)s"
-
-    def __init__(self, reason):
-        """Initialize InvalidRecordError.
-
-        Args:
-            reason: The reason the record is invalid.
-        """
-        self.reason = reason
-
-
-class ContainerHasExcessDataError(ContainerError):
-    """Exception raised when container has excess data after end marker."""
-
-    _fmt = "Container has data after end marker: %(excess)r"
-
-    def __init__(self, excess):
-        """Initialize ContainerHasExcessDataError.
-
-        Args:
-            excess: The excess data found after end marker.
-        """
-        self.excess = excess
-
-
-class DuplicateRecordNameError(ContainerError):
-    """Exception raised when container has duplicate record names."""
-
-    _fmt = "Container has multiple records with the same name: %(name)s"
-
-    def __init__(self, name):
-        """Initialize DuplicateRecordNameError.
-
-        Args:
-            name: The duplicate record name.
-        """
-        self.name = name.decode("utf-8")
 
 
 _check_name = _pack_rs._check_name

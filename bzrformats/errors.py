@@ -68,6 +68,13 @@ InconsistentDeltaDelta = _errors.InconsistentDeltaDelta
 InternalBzrFormatsError = _errors.InternalBzrFormatsError
 BzrCheckError = _errors.BzrCheckError
 NoSuchRevision = _errors.NoSuchRevision
+ContainerError = _errors.ContainerError
+UnknownContainerFormatError = _errors.UnknownContainerFormatError
+UnexpectedEndOfContainerError = _errors.UnexpectedEndOfContainerError
+UnknownRecordTypeError = _errors.UnknownRecordTypeError
+InvalidRecordError = _errors.InvalidRecordError
+ContainerHasExcessDataError = _errors.ContainerHasExcessDataError
+DuplicateRecordNameError = _errors.DuplicateRecordNameError
 LockError = _errors.LockError
 ObjectNotLocked = _errors.ObjectNotLocked
 ReadOnlyError = _errors.ReadOnlyError
@@ -90,8 +97,11 @@ __all__ = [
     "BadInventoryFormat",
     "BzrCheckError",
     "BzrFormatsError",
+    "ContainerError",
+    "ContainerHasExcessDataError",
     "DecompressCorruption",
     "DuplicateFileId",
+    "DuplicateRecordNameError",
     "ExistingContent",
     "FileExists",
     "InconsistentDelta",
@@ -99,6 +109,7 @@ __all__ = [
     "InternalBzrFormatsError",
     "InvalidEntryName",
     "InvalidNormalization",
+    "InvalidRecordError",
     "InvalidRevisionId",
     "KnitCorrupt",
     "KnitDataStreamIncompatible",
@@ -120,7 +131,10 @@ __all__ = [
     "RevisionAlreadyPresent",
     "RevisionNotPresent",
     "UnavailableRepresentation",
+    "UnexpectedEndOfContainerError",
     "UnexpectedInventoryFormat",
+    "UnknownContainerFormatError",
+    "UnknownRecordTypeError",
     "UnsupportedInventoryKind",
     "VersionedFileError",
     "VersionedFileInvalidChecksum",

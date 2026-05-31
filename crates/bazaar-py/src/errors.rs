@@ -427,6 +427,48 @@ simple_error!(InternalBzrFormatsError: BzrFormatsError, "Internal error", intern
 simple_error!(BzrCheckError: InternalBzrFormatsError, "Internal check failed: %(msg)s"; msg);
 simple_error!(NoSuchRevision: InternalBzrFormatsError, "%(branch)s has no revision %(revision)s"; branch, revision);
 
+// Container (pack) format errors, ported from bzrformats.pack.
+simple_error!(ContainerError: BzrFormatsError, "Container error");
+simple_error!(UnknownContainerFormatError: ContainerError, "Unrecognised container format: %(container_format)r"; container_format);
+simple_error!(UnexpectedEndOfContainerError: ContainerError, "Unexpected end of container stream");
+simple_error!(UnknownRecordTypeError: ContainerError, "Unknown record type: %(record_type)r"; record_type);
+simple_error!(InvalidRecordError: ContainerError, "Invalid record: %(reason)s"; reason);
+simple_error!(ContainerHasExcessDataError: ContainerError, "Container has data after end marker: %(excess)r"; excess);
+
+/// DuplicateRecordNameError decodes the (utf-8 bytes) name before storing it.
+#[pyclass(extends = ContainerError, dict, module = "bzrformats._bzr_rs.errors")]
+pub struct DuplicateRecordNameError;
+
+impl ErrInit for DuplicateRecordNameError {
+    fn init_chain() -> PyClassInitializer<Self> {
+        <ContainerError as ErrInit>::init_chain().add_subclass(DuplicateRecordNameError)
+    }
+}
+
+#[pymethods]
+impl DuplicateRecordNameError {
+    #[classattr]
+    fn _fmt() -> &'static str {
+        "Container has multiple records with the same name: %(name)s"
+    }
+
+    #[new]
+    #[pyo3(signature = (*args, **kwds))]
+    fn new(
+        args: &Bound<'_, PyTuple>,
+        kwds: Option<&Bound<'_, PyDict>>,
+    ) -> PyClassInitializer<Self> {
+        let _ = (args, kwds);
+        <DuplicateRecordNameError as ErrInit>::init_chain()
+    }
+
+    fn __init__(slf: &Bound<'_, Self>, name: Bound<'_, PyAny>) -> PyResult<()> {
+        let decoded = name.call_method1("decode", ("utf-8",))?;
+        slf.setattr("name", decoded)?;
+        Ok(())
+    }
+}
+
 simple_error!(LockError: BzrFormatsError, "Lock error: %(msg)s", internal_error = false);
 simple_error!(ObjectNotLocked: LockError, "%(obj)r is not locked"; obj);
 simple_error!(ReadOnlyError: LockError, "A write attempt was made in a read only transaction on %(obj)s"; obj);
@@ -790,6 +832,13 @@ pub(crate) fn errors_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_class::<InternalBzrFormatsError>()?;
     m.add_class::<BzrCheckError>()?;
     m.add_class::<NoSuchRevision>()?;
+    m.add_class::<ContainerError>()?;
+    m.add_class::<UnknownContainerFormatError>()?;
+    m.add_class::<UnexpectedEndOfContainerError>()?;
+    m.add_class::<UnknownRecordTypeError>()?;
+    m.add_class::<InvalidRecordError>()?;
+    m.add_class::<ContainerHasExcessDataError>()?;
+    m.add_class::<DuplicateRecordNameError>()?;
     m.add_class::<LockError>()?;
     m.add_class::<ObjectNotLocked>()?;
     m.add_class::<ReadOnlyError>()?;
