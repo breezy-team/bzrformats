@@ -32,7 +32,7 @@ xz2 = "0.1.7"
 patiencediff = { version = "0.2.1", default-features = false }
 vcs-graph = "3.5.0"
 adler = "1.0.2"
-memchr = "2.7.4"
+memchr = "2.8.1"
 rand = "0.10"
 unicode-normalization = "0.1.19"
 inventory = "0.3"
