@@ -311,8 +311,48 @@ impl BzrFormatsError {
 }
 
 // Errors whose __init__ stores positional args verbatim.
-simple_error!(UnexpectedInventoryFormat: BzrFormatsError, "Unexpected inventory format: %(msg)s"; msg);
-simple_error!(UnsupportedInventoryKind: BzrFormatsError, "Unsupported inventory kind: %(kind)s"; kind);
+// Inventory-serialization errors. BadInventoryFormat is the base; serializer
+// code raises the subclasses. (Definitions match the live serializer.py, which
+// diverged from the stale errors.py copies before the port.)
+simple_error!(BadInventoryFormat: BzrFormatsError, "Root class for inventory serialization errors");
+simple_error!(UnsupportedInventoryKind: BzrFormatsError, "Unsupported entry kind %(kind)s"; kind);
+
+/// UnexpectedInventoryFormat passes its message as the preformatted string
+/// (via `BzrFormatsError.__init__(msg=...)`), so `str()` returns the message
+/// verbatim rather than expanding `_fmt`.
+#[pyclass(extends = BadInventoryFormat, dict, module = "bzrformats._bzr_rs.errors")]
+pub struct UnexpectedInventoryFormat;
+
+impl ErrInit for UnexpectedInventoryFormat {
+    fn init_chain() -> PyClassInitializer<Self> {
+        <BadInventoryFormat as ErrInit>::init_chain().add_subclass(UnexpectedInventoryFormat)
+    }
+}
+
+#[pymethods]
+impl UnexpectedInventoryFormat {
+    #[classattr]
+    fn _fmt() -> &'static str {
+        "The inventory was not in the expected format:\n %(msg)s"
+    }
+
+    #[new]
+    #[pyo3(signature = (*args, **kwds))]
+    fn new(
+        args: &Bound<'_, PyTuple>,
+        kwds: Option<&Bound<'_, PyDict>>,
+    ) -> PyClassInitializer<Self> {
+        let _ = (args, kwds);
+        <UnexpectedInventoryFormat as ErrInit>::init_chain()
+    }
+
+    fn __init__(slf: &Bound<'_, Self>, msg: Bound<'_, PyAny>) -> PyResult<()> {
+        // Mirror serializer.py: super().__init__(msg=msg) sets the preformatted
+        // string, so str() is the bare message.
+        slf.setattr("_preformatted_string", msg)?;
+        Ok(())
+    }
+}
 simple_error!(KnitCorrupt: BzrFormatsError, "Knit %(knit)s corrupt: %(how)s"; knit, how);
 simple_error!(KnitDataStreamIncompatible: BzrFormatsError, "Cannot insert knit data stream for %(key)s: %(msg)s"; key, msg);
 simple_error!(KnitDataStreamUnknown: BzrFormatsError, "Unknown knit data stream for %(key)s"; key);
@@ -335,15 +375,50 @@ simple_error!(InvalidRevisionId: BzrFormatsError, "Invalid revision-id {%(revisi
 simple_error!(UnavailableRepresentation: BzrFormatsError, "The encoding '%(wanted)s' is not available for key %(key)s which is encoded as '%(native)s'."; key, wanted, native);
 simple_error!(ExistingContent: BzrFormatsError, "The content being inserted is already present.");
 
-simple_error!(WeaveError: BzrFormatsError, "Error in processing weave");
-simple_error!(WeaveRevisionAlreadyPresent: WeaveError, "Revision {%(revision_id)s} already present in weave"; revision_id);
-simple_error!(WeaveRevisionNotPresent: WeaveError, "Revision {%(revision_id)s} not present in weave"; revision_id);
+// Weave errors. Definitions match the live weave.py (which diverged from the
+// stale errors.py copies); breezy's weave_fmt plugin raises some of these.
+simple_error!(WeaveRevisionAlreadyPresent: WeaveError, "Revision {%(revision_id)s} already present in %(weave)s"; revision_id, weave);
+simple_error!(WeaveRevisionNotPresent: WeaveError, "Revision {%(revision_id)s} not present in %(weave)s"; revision_id, weave);
 simple_error!(WeaveFormatError: WeaveError, "Weave invariant violated: %(what)s"; what);
-simple_error!(WeaveParentMismatch: WeaveError, "Parents are mismatched between two revisions. %(message)s");
-simple_error!(WeaveInvalidChecksum: WeaveError, "Text did not match it's checksum: %(message)s");
+simple_error!(WeaveParentMismatch: WeaveError, "Parents are mismatched between two revisions. %(msg)s");
+simple_error!(WeaveInvalidChecksum: WeaveError, "Text did not match its checksum: %(msg)s");
 simple_error!(WeaveTextDiffers: WeaveError, "Weaves differ on text content. Revision: {%(revision_id)s}, %(weave_a)s, %(weave_b)s"; revision_id, weave_a, weave_b);
 
-simple_error!(BadInventoryFormat: BzrFormatsError, "Root tag is %(tag)r"; tag);
+/// WeaveError stores an optional `msg` (default None).
+#[pyclass(extends = BzrFormatsError, subclass, dict, module = "bzrformats._bzr_rs.errors")]
+pub struct WeaveError;
+
+impl ErrInit for WeaveError {
+    fn init_chain() -> PyClassInitializer<Self> {
+        <BzrFormatsError as ErrInit>::init_chain().add_subclass(WeaveError)
+    }
+}
+
+#[pymethods]
+impl WeaveError {
+    #[classattr]
+    fn _fmt() -> &'static str {
+        "Error in processing weave: %(msg)s"
+    }
+
+    #[new]
+    #[pyo3(signature = (*args, **kwds))]
+    fn new(
+        args: &Bound<'_, PyTuple>,
+        kwds: Option<&Bound<'_, PyDict>>,
+    ) -> PyClassInitializer<Self> {
+        let _ = (args, kwds);
+        <WeaveError as ErrInit>::init_chain()
+    }
+
+    #[pyo3(signature = (msg = None))]
+    fn __init__(slf: &Bound<'_, Self>, msg: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        let py = slf.py();
+        slf.setattr("msg", msg.unwrap_or_else(|| py.None().into_bound(py)))?;
+        Ok(())
+    }
+}
+
 simple_error!(ReservedId: BzrFormatsError, "Reserved revision-id {%(revision_id)s}"; revision_id);
 simple_error!(BadFileKindError: BzrFormatsError, "Cannot operate on %(filename)s of unsupported kind %(kind)s"; filename, kind);
 

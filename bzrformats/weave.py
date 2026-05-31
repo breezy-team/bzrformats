@@ -27,104 +27,34 @@ import os
 from io import BytesIO
 
 from ._bzr_rs import weave as _weave_rs
+
+# The weave error hierarchy lives in the Rust errors module; re-export it here
+# so ``bzrformats.weave.WeaveError`` (and friends) keep working for callers and
+# for the Rust ``import_exception!(bzrformats.weave, ...)`` sites.
 from .errors import (
-    BzrFormatsError,
+    WeaveError,
+    WeaveFormatError,
+    WeaveInvalidChecksum,
+    WeaveParentMismatch,
+    WeaveRevisionAlreadyPresent,
+    WeaveRevisionNotPresent,
+    WeaveTextDiffers,
 )
 from .transport import TransportNoSuchFile
 from .weavefile import _read_weave_v5, write_weave_v5
 
-
-class WeaveError(BzrFormatsError):
-    """Base class for weave-related errors."""
-
-    _fmt = "Error in processing weave: %(msg)s"
-
-    def __init__(self, msg=None):
-        """Initialize the error.
-
-        :param msg: Error message.
-        """
-        super().__init__()
-        self.msg = msg
-
-
-class WeaveRevisionAlreadyPresent(WeaveError):
-    """Error raised when attempting to add a revision that already exists."""
-
-    _fmt = "Revision {%(revision_id)s} already present in %(weave)s"
-
-    def __init__(self, revision_id, weave):
-        """Initialize the error.
-
-        :param revision_id: The revision that is already present.
-        :param weave: The weave it is present in.
-        """
-        super().__init__()
-        self.revision_id = revision_id
-        self.weave = weave
-
-
-class WeaveRevisionNotPresent(WeaveError):
-    """Error raised when requesting a revision that doesn't exist."""
-
-    _fmt = "Revision {%(revision_id)s} not present in %(weave)s"
-
-    def __init__(self, revision_id, weave):
-        """Initialize the error.
-
-        :param revision_id: The revision that is missing.
-        :param weave: The weave it is missing from.
-        """
-        super().__init__()
-        self.revision_id = revision_id
-        self.weave = weave
-
-
-class WeaveFormatError(WeaveError):
-    """Error raised when weave format is invalid or invariants are violated."""
-
-    _fmt = "Weave invariant violated: %(what)s"
-
-    def __init__(self, what):
-        """Initialize the error.
-
-        :param what: Description of the violation.
-        """
-        super().__init__()
-        self.what = what
-
-
-class WeaveParentMismatch(WeaveError):
-    """Error raised when parent information doesn't match between revisions."""
-
-    _fmt = "Parents are mismatched between two revisions. %(msg)s"
-
-
-class WeaveInvalidChecksum(WeaveError):
-    """Error raised when text content doesn't match its expected checksum."""
-
-    _fmt = "Text did not match its checksum: %(msg)s"
-
-
-class WeaveTextDiffers(WeaveError):
-    """Error raised when two weaves have different text content for the same revision."""
-
-    _fmt = (
-        "Weaves differ on text content. Revision:"
-        " {%(revision_id)s}, %(weave_a)s, %(weave_b)s"
-    )
-
-    def __init__(self, revision_id, weave_a, weave_b):
-        """Initialize the error.
-
-        :param revision_id: The revision that differs.
-        :param weave_a: The first weave.
-        :param weave_b: The second weave.
-        """
-        super().__init__()
-        self.revision_id = revision_id
-        self.weave_a = weave_a
-        self.weave_b = weave_b
+__all__ = [
+    "Weave",
+    "WeaveContentFactory",
+    "WeaveError",
+    "WeaveFile",
+    "WeaveFormatError",
+    "WeaveInvalidChecksum",
+    "WeaveParentMismatch",
+    "WeaveRevisionAlreadyPresent",
+    "WeaveRevisionNotPresent",
+    "WeaveTextDiffers",
+]
 
 
 # Re-export the Rust-backed WeaveContentFactory so callers that previously

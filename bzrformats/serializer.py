@@ -17,42 +17,16 @@
 """Inventory/revision serialization."""
 
 from . import registry
-from .errors import BzrFormatsError
 
-
-class BadInventoryFormat(BzrFormatsError):
-    """Base exception class for inventory serialization errors."""
-
-    _fmt = "Root class for inventory serialization errors"
-
-
-class UnexpectedInventoryFormat(BadInventoryFormat):
-    """Raised when an inventory is not in the expected format."""
-
-    _fmt = "The inventory was not in the expected format:\n %(msg)s"
-
-    def __init__(self, msg):
-        """Initialize UnexpectedInventoryFormat exception.
-
-        Args:
-            msg: Error message describing the unexpected format.
-        """
-        super().__init__(msg=msg)
-
-
-class UnsupportedInventoryKind(BzrFormatsError):
-    """Raised when an unsupported inventory entry kind is encountered."""
-
-    _fmt = """Unsupported entry kind %(kind)s"""
-
-    def __init__(self, kind):
-        """Initialize UnsupportedInventoryKind exception.
-
-        Args:
-            kind: The unsupported entry kind.
-        """
-        super().__init__()
-        self.kind = kind
+# The inventory-serialization error hierarchy lives in the Rust errors module;
+# re-export it here so ``bzrformats.serializer.BadInventoryFormat`` (and
+# friends) keep working for callers and for the Rust
+# ``import_exception!(bzrformats.serializer, ...)`` sites.
+from .errors import (  # noqa: F401
+    BadInventoryFormat,
+    UnexpectedInventoryFormat,
+    UnsupportedInventoryKind,
+)
 
 
 class RevisionSerializer:
