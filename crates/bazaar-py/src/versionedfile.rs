@@ -3238,6 +3238,472 @@ impl PyVersionedFilesWithFallbacks {
     }
 }
 
+/// Storage for many versioned files thunked onto a per-prefix `VersionedFile`
+/// class. Ported from `bzrformats.versionedfile.ThunkedVersionedFiles`.
+///
+/// Maps a single (prefix, suffix) keyspace onto per-prefix old-style
+/// `VersionedFile`s obtained via a `file_factory` over a `transport`. Used by
+/// breezy's weave_fmt plugin. Instance state lives in `__dict__`.
+#[pyclass(
+    name = "ThunkedVersionedFiles",
+    extends = PyVersionedFilesBase,
+    dict,
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+pub struct PyThunkedVersionedFiles;
+
+impl PyThunkedVersionedFiles {
+    /// `self._get_vf(path)`: build the per-prefix VersionedFile, requiring the
+    /// store be locked.
+    fn get_vf<'py>(
+        slf: &Bound<'py, Self>,
+        path: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        if !slf.getattr("_is_locked")?.call0()?.is_truthy()? {
+            let exc = py
+                .import("bzrformats.errors")?
+                .getattr("ObjectNotLocked")?
+                .call1((slf,))?;
+            return Err(PyErr::from_value(exc));
+        }
+        let factory = slf.getattr("_file_factory")?;
+        let transport = slf.getattr("_transport")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("create", true)?;
+        let get_scope = py.eval(
+            std::ffi::CString::new("lambda: None").unwrap().as_c_str(),
+            None,
+            None,
+        )?;
+        kwargs.set_item("get_scope", get_scope)?;
+        factory.call((path, transport), Some(&kwargs))
+    }
+
+    /// `self._partition_keys(keys)` -> {prefix: [suffix, ...]}.
+    fn partition_keys<'py>(
+        py: Python<'py>,
+        keys: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let result = PyDict::new(py);
+        for key in keys.try_iter()? {
+            let key = key?;
+            let n = key.len()?;
+            let prefix = key.get_item(pyo3::types::PySlice::new(py, 0, (n - 1) as isize, 1))?;
+            let suffix = key.get_item(n - 1)?;
+            match result.get_item(&prefix)? {
+                Some(lst) => {
+                    lst.call_method1("append", (suffix,))?;
+                }
+                None => {
+                    let lst = PyList::empty(py);
+                    lst.append(suffix)?;
+                    result.set_item(&prefix, lst)?;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Iterate `(prefix, suffixes, vf)` for the partitioned `keys`.
+    fn iter_keys_vf<'py>(
+        slf: &Bound<'py, Self>,
+        keys: &Bound<'py, PyAny>,
+    ) -> PyResult<Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+        let py = slf.py();
+        let mapper = slf.getattr("_mapper")?;
+        let prefixes = Self::partition_keys(py, keys)?;
+        let mut out = Vec::new();
+        for (prefix, suffixes) in prefixes.iter() {
+            let path = mapper.call_method1("map", (&prefix,))?;
+            let vf = Self::get_vf(slf, &path)?;
+            out.push((prefix, suffixes, vf));
+        }
+        Ok(out)
+    }
+
+    /// Iterate `(path, prefix)` for every key prefix in the store.
+    fn iter_all_prefixes<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+        let py = slf.py();
+        let mapper = slf.getattr("_mapper")?;
+        let constant_mapper = py
+            .import("bzrformats.versionedfile")?
+            .getattr("ConstantMapper")?;
+        let mut out = Vec::new();
+        if mapper.is_instance(&constant_mapper)? {
+            let path = mapper.call_method1("map", (PyTuple::empty(py),))?;
+            out.push((path, PyTuple::empty(py).into_any()));
+        } else {
+            let relpaths = PySet::empty(py)?;
+            let transport = slf.getattr("_transport")?;
+            for quoted in transport.call_method0("iter_files_recursive")?.try_iter()? {
+                let quoted = quoted?;
+                let splitext = py.import("os.path")?.getattr("splitext")?;
+                let parts = splitext.call1((quoted,))?;
+                relpaths.add(parts.get_item(0)?)?;
+            }
+            for path in relpaths.iter() {
+                let prefix = mapper.call_method1("unmap", (&path,))?;
+                out.push((path, prefix));
+            }
+        }
+        Ok(out)
+    }
+
+    fn iter_all_components<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+        let mut out = Vec::new();
+        for (path, prefix) in Self::iter_all_prefixes(slf)? {
+            let vf = Self::get_vf(slf, &path)?;
+            out.push((prefix, vf));
+        }
+        Ok(out)
+    }
+}
+
+#[pymethods]
+impl PyThunkedVersionedFiles {
+    #[new]
+    fn new(
+        transport: Py<PyAny>,
+        file_factory: Py<PyAny>,
+        mapper: Py<PyAny>,
+        is_locked: Py<PyAny>,
+    ) -> PyClassInitializer<Self> {
+        let _ = (transport, file_factory, mapper, is_locked);
+        vf_initializer().add_subclass(PyThunkedVersionedFiles)
+    }
+
+    fn __init__(
+        slf: &Bound<'_, Self>,
+        transport: Bound<'_, PyAny>,
+        file_factory: Bound<'_, PyAny>,
+        mapper: Bound<'_, PyAny>,
+        is_locked: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        slf.setattr("_transport", transport)?;
+        slf.setattr("_file_factory", file_factory)?;
+        slf.setattr("_mapper", mapper)?;
+        slf.setattr("_is_locked", is_locked)?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (factory, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false))]
+    fn add_content<'py>(
+        slf: &Bound<'py, Self>,
+        factory: Bound<'py, PyAny>,
+        parent_texts: Option<Bound<'py, PyAny>>,
+        left_matching_blocks: Option<Bound<'py, PyAny>>,
+        nostore_sha: Option<Bound<'py, PyAny>>,
+        random_id: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let lines = factory.call_method1("get_bytes_as", ("lines",))?;
+        let key = factory.getattr("key")?;
+        let parents = factory.getattr("parents")?;
+        Self::add_lines(
+            slf,
+            key,
+            parents,
+            lines,
+            parent_texts,
+            left_matching_blocks,
+            nostore_sha,
+            random_id,
+            true,
+        )
+    }
+
+    #[pyo3(signature = (key, parents, lines, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_lines<'py>(
+        slf: &Bound<'py, Self>,
+        key: Bound<'py, PyAny>,
+        parents: Bound<'py, PyAny>,
+        lines: Bound<'py, PyAny>,
+        parent_texts: Option<Bound<'py, PyAny>>,
+        left_matching_blocks: Option<Bound<'py, PyAny>>,
+        nostore_sha: Option<Bound<'py, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let mapper = slf.getattr("_mapper")?;
+        let path = mapper.call_method1("map", (&key,))?;
+        let version_id = key.get_item(key.len()? - 1)?;
+        let suffix_parents = PyList::empty(py);
+        for parent in parents.try_iter()? {
+            let parent = parent?;
+            suffix_parents.append(parent.get_item(parent.len()? - 1)?)?;
+        }
+        let vf = Self::get_vf(slf, &path)?;
+        let kwargs = PyDict::new(py);
+        if let Some(v) = &parent_texts {
+            kwargs.set_item("parent_texts", v)?;
+        }
+        if let Some(v) = &left_matching_blocks {
+            kwargs.set_item("left_matching_blocks", v)?;
+        }
+        if let Some(v) = &nostore_sha {
+            kwargs.set_item("nostore_sha", v)?;
+        }
+        kwargs.set_item("random_id", random_id)?;
+        kwargs.set_item("check_content", check_content)?;
+
+        let try_add = |vf: &Bound<'py, PyAny>| -> PyResult<Bound<'py, PyAny>> {
+            match vf.call_method(
+                "add_lines_with_ghosts",
+                (&version_id, &suffix_parents, &lines),
+                Some(&kwargs),
+            ) {
+                Ok(r) => Ok(r),
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py) => vf
+                    .call_method(
+                        "add_lines",
+                        (&version_id, &suffix_parents, &lines),
+                        Some(&kwargs),
+                    ),
+                Err(e) => Err(e),
+            }
+        };
+
+        match try_add(&vf) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                let tnsf = py
+                    .import("bzrformats.transport")?
+                    .getattr("TransportNoSuchFile")?;
+                if e.value(py).is_instance(&tnsf)? {
+                    let dirname = py
+                        .import("bzrformats.osutils")?
+                        .getattr("dirname")?
+                        .call1((&path,))?;
+                    slf.getattr("_transport")?
+                        .call_method1("mkdir", (dirname,))?;
+                    try_add(&vf)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    fn annotate<'py>(
+        slf: &Bound<'py, Self>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let py = slf.py();
+        let n = key.len()?;
+        let prefix = key.get_item(pyo3::types::PySlice::new(py, 0, (n - 1) as isize, 1))?;
+        let mapper = slf.getattr("_mapper")?;
+        let path = mapper.call_method1("map", (&prefix,))?;
+        let vf = Self::get_vf(slf, &path)?;
+        let origins = vf.call_method1("annotate", (key.get_item(n - 1)?,))?;
+        let result = PyList::empty(py);
+        for origin_line in origins.try_iter()? {
+            let origin_line = origin_line?;
+            let origin = origin_line.get_item(0)?;
+            let line = origin_line.get_item(1)?;
+            let new_key = prefix.call_method1("__add__", (PyTuple::new(py, [origin])?,))?;
+            result.append((new_key, line))?;
+        }
+        Ok(result)
+    }
+
+    #[pyo3(signature = (progress_bar=None, keys=None))]
+    fn check<'py>(
+        slf: &Bound<'py, Self>,
+        progress_bar: Option<Bound<'py, PyAny>>,
+        keys: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = progress_bar;
+        let py = slf.py();
+        for (_prefix, vf) in Self::iter_all_components(slf)? {
+            vf.call_method0("check")?;
+        }
+        match keys {
+            Some(keys) => {
+                let unordered = pyo3::types::PyString::new(py, "unordered").into_any();
+                Self::get_record_stream(slf, keys, unordered, true)
+            }
+            None => Ok(py.None().into_bound(py)),
+        }
+    }
+
+    fn get_parent_map<'py>(
+        slf: &Bound<'py, Self>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let py = slf.py();
+        let result = PyDict::new(py);
+        for (prefix, suffixes, vf) in Self::iter_keys_vf(slf, &keys)? {
+            let parent_map = vf.call_method1("get_parent_map", (&suffixes,))?;
+            let parent_map = parent_map.downcast::<PyDict>()?;
+            for (k, parents) in parent_map.iter() {
+                let new_key = prefix.call_method1("__add__", (PyTuple::new(py, [&k])?,))?;
+                let new_parents = PyList::empty(py);
+                for parent in parents.try_iter()? {
+                    let parent = parent?;
+                    new_parents
+                        .append(prefix.call_method1("__add__", (PyTuple::new(py, [parent])?,))?)?;
+                }
+                let new_parents = py
+                    .import("builtins")?
+                    .getattr("tuple")?
+                    .call1((new_parents,))?;
+                result.set_item(new_key, new_parents)?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn get_record_stream<'py>(
+        slf: &Bound<'py, Self>,
+        keys: Bound<'py, PyAny>,
+        ordering: Bound<'py, PyAny>,
+        include_delta_closure: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let sorted_keys = py.import("builtins")?.getattr("sorted")?.call1((&keys,))?;
+        let out = PyList::empty(py);
+        for (prefix, suffixes, vf) in Self::iter_keys_vf(slf, &sorted_keys)? {
+            let suffix_keys = PyList::empty(py);
+            for suffix in suffixes.try_iter()? {
+                suffix_keys.append(PyTuple::new(py, [suffix?])?)?;
+            }
+            let stream = vf.call_method1(
+                "get_record_stream",
+                (suffix_keys, &ordering, include_delta_closure),
+            )?;
+            for record in stream.try_iter()? {
+                let record = record?;
+                let add_prefix = ThunkPrefixAdder {
+                    prefix: prefix.clone().unbind(),
+                };
+                record.call_method1("map_key", (Py::new(py, add_prefix)?,))?;
+                out.append(record)?;
+            }
+        }
+        out.into_any().try_iter().map(|i| i.into_any())
+    }
+
+    fn get_sha1s<'py>(
+        slf: &Bound<'py, Self>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let py = slf.py();
+        let result = PyDict::new(py);
+        for (prefix, suffixes, vf) in Self::iter_keys_vf(slf, &keys)? {
+            let vf_sha1s = vf.call_method1("get_sha1s", (&suffixes,))?;
+            let vf_sha1s = vf_sha1s.downcast::<PyDict>()?;
+            for (suffix, sha1) in vf_sha1s.iter() {
+                let new_key = prefix.call_method1("__add__", (PyTuple::new(py, [suffix])?,))?;
+                result.set_item(new_key, sha1)?;
+            }
+        }
+        Ok(result)
+    }
+
+    fn insert_record_stream<'py>(
+        slf: &Bound<'py, Self>,
+        stream: Bound<'py, PyAny>,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        let mapper = slf.getattr("_mapper")?;
+        let adapter_factory = py
+            .import("bzrformats.versionedfile")?
+            .getattr("AdapterFactory")?;
+        for record in stream.try_iter()? {
+            let record = record?;
+            let key = record.getattr("key")?;
+            let n = key.len()?;
+            let prefix = key.get_item(pyo3::types::PySlice::new(py, 0, (n - 1) as isize, 1))?;
+            let suffix_key = key.get_item(pyo3::types::PySlice::new(
+                py,
+                (n - 1) as isize,
+                n as isize,
+                1,
+            ))?;
+            let rec_parents = record.getattr("parents")?;
+            let parents = if rec_parents.is_none() {
+                py.None().into_bound(py)
+            } else {
+                let ps = PyList::empty(py);
+                for parent in rec_parents.try_iter()? {
+                    let parent = parent?;
+                    let pn = parent.len()?;
+                    ps.append(parent.get_item(pyo3::types::PySlice::new(
+                        py,
+                        (pn - 1) as isize,
+                        pn as isize,
+                        1,
+                    ))?)?;
+                }
+                ps.into_any()
+            };
+            let thunk_record = adapter_factory.call1((suffix_key, parents, &record))?;
+            let path = mapper.call_method1("map", (&prefix,))?;
+            let vf = Self::get_vf(slf, &path)?;
+            vf.call_method1("insert_record_stream", (PyList::new(py, [thunk_record])?,))?;
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (keys, pb=None))]
+    fn iter_lines_added_or_present_in_keys<'py>(
+        slf: &Bound<'py, Self>,
+        keys: Bound<'py, PyAny>,
+        pb: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = pb;
+        let py = slf.py();
+        let out = PyList::empty(py);
+        for (prefix, suffixes, vf) in Self::iter_keys_vf(slf, &keys)? {
+            let it = vf.call_method1("iter_lines_added_or_present_in_versions", (&suffixes,))?;
+            for line_version in it.try_iter()? {
+                let line_version = line_version?;
+                let line = line_version.get_item(0)?;
+                let version = line_version.get_item(1)?;
+                let new_key = prefix.call_method1("__add__", (PyTuple::new(py, [version])?,))?;
+                out.append((line, new_key))?;
+            }
+        }
+        out.into_any().try_iter().map(|i| i.into_any())
+    }
+
+    fn keys<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PySet>> {
+        let py = slf.py();
+        let result = PySet::empty(py)?;
+        for (prefix, vf) in Self::iter_all_components(slf)? {
+            for suffix in vf.call_method0("versions")?.try_iter()? {
+                let new_key = prefix.call_method1("__add__", (PyTuple::new(py, [suffix?])?,))?;
+                result.add(new_key)?;
+            }
+        }
+        Ok(result)
+    }
+}
+
+/// Callable passed to `ContentFactory.map_key` that prepends a fixed prefix
+/// tuple to a key.
+#[pyclass]
+struct ThunkPrefixAdder {
+    prefix: Py<PyAny>,
+}
+
+#[pymethods]
+impl ThunkPrefixAdder {
+    fn __call__<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.prefix.bind(py).call_method1("__add__", (key,))
+    }
+}
+
 /// A `VersionedFiles` for uncommitted and committed texts, used to plan merges
 /// against working-tree texts. Ported from
 /// `bzrformats.versionedfile._PlanMergeVersionedFile`.
@@ -3501,6 +3967,7 @@ impl PyPlanMergeVersionedFile {
 pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "versionedfile")?;
     m.add_class::<PyPlanMergeVersionedFile>()?;
+    m.add_class::<PyThunkedVersionedFiles>()?;
     m.add_class::<AbstractContentFactory>()?;
     m.add_class::<FulltextContentFactory>()?;
     m.add_class::<ChunkedContentFactory>()?;
