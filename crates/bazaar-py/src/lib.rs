@@ -9,6 +9,7 @@ use pyo3_filelike::PyBinaryFile;
 use std::collections::HashMap;
 use std::io::Write;
 
+mod annotate;
 mod bisect_multi;
 mod btree_index;
 mod btree_serializer;
@@ -1279,6 +1280,8 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_submodule(&plan_mergem)?;
     let recordcounterm = recordcounter::_recordcounter_rs(py)?;
     m.add_submodule(&recordcounterm)?;
+    let annotatem = annotate::_annotate_rs(py)?;
+    m.add_submodule(&annotatem)?;
 
     let btree_serializerm = btree_serializer::_btree_serializer_rs(py)?;
     m.add_submodule(&btree_serializerm)?;
@@ -1330,6 +1333,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
     modules.set_item(format!("{}.plan_merge", module_name), &plan_mergem)?;
     modules.set_item(format!("{}.recordcounter", module_name), &recordcounterm)?;
+    modules.set_item(format!("{}.annotate", module_name), &annotatem)?;
     modules.set_item(
         format!("{}.btree_serializer", module_name),
         &btree_serializerm,
