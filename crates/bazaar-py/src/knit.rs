@@ -4906,10 +4906,65 @@ struct PyKnitContentFactory {
     inner_sha1: Option<Vec<u8>>,
     raw_record: Vec<u8>,
     annotated: bool,
+    /// Pre-computed network bytes, if known (else built on demand).
+    network_bytes: Option<Vec<u8>>,
+    /// The owning knit, used to reconstruct delta records as fulltext/lines.
+    knit: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl PyKnitContentFactory {
+    /// Create a KnitContentFactory. Mirrors the Python constructor signature
+    /// so callers (e.g. `knit_network_to_record`) build it the same way.
+    #[new]
+    #[pyo3(signature = (key, parents, build_details, sha1, raw_record, annotated, knit=None, network_bytes=None))]
+    fn new(
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        parents: Bound<'_, PyAny>,
+        build_details: Bound<'_, PyAny>,
+        sha1: Option<Vec<u8>>,
+        raw_record: Vec<u8>,
+        annotated: bool,
+        knit: Option<Py<PyAny>>,
+        network_bytes: Option<Vec<u8>>,
+    ) -> PyResult<Self> {
+        let inner_key = extract_py_knit_key(&key)?;
+        let inner_parents = if parents.is_none() {
+            None
+        } else {
+            Some(
+                parents
+                    .try_iter()?
+                    .map(|p| extract_py_knit_key(&p?))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )
+        };
+        // build_details[0] is the method string ("line-delta"/"fulltext"),
+        // build_details[1] is the noeol flag.
+        let method_str: String = build_details.get_item(0)?.extract()?;
+        let method = match method_str.as_str() {
+            "fulltext" => KnitMethod::Fulltext,
+            "line-delta" => KnitMethod::LineDelta,
+            other => {
+                return Err(PyValueError::new_err(format!("unknown method: {}", other)));
+            }
+        };
+        let noeol: bool = build_details.get_item(1)?.is_truthy()?;
+        let _ = py;
+        Ok(PyKnitContentFactory {
+            inner_key,
+            inner_parents,
+            method,
+            noeol,
+            inner_sha1: sha1,
+            raw_record,
+            annotated,
+            network_bytes,
+            knit,
+        })
+    }
+
     #[getter]
     fn key<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         py_knit_key_to_py(py, &self.inner_key)
@@ -4968,11 +5023,14 @@ impl PyKnitContentFactory {
     fn get_bytes_as<'py>(&self, py: Python<'py>, storage_kind: &str) -> PyResult<Py<PyAny>> {
         let my_kind = self.storage_kind();
         if storage_kind == my_kind.as_str() {
-            // Return network bytes.
-            let network = build_network_record_bytes(py, self)?;
+            // Our native kind: serialise (or return the cached) network bytes.
+            let network = match &self.network_bytes {
+                Some(b) => PyBytes::new(py, b),
+                None => build_network_record_bytes(py, self)?,
+            };
             return Ok(network.into_any().unbind());
         }
-        // Fulltext/lines/chunked from a fulltext raw record.
+        // Fulltext/lines/chunked directly from a fulltext raw record.
         if self.method == KnitMethod::Fulltext
             && matches!(storage_kind, "fulltext" | "lines" | "chunked")
         {
@@ -4986,6 +5044,26 @@ impl PyKnitContentFactory {
                     lst.append(PyBytes::new(py, l))?;
                 }
                 return Ok(lst.into_any().unbind());
+            }
+        }
+        // Delta records: reconstruct via the owning knit, if we have one.
+        // Mirrors the Python `self._knit.get_lines / get_text` fallback.
+        if let Some(knit) = &self.knit {
+            let version_id = py_knit_key_to_py(py, &self.inner_key)?.get_item(0)?;
+            match storage_kind {
+                "chunked" | "lines" => {
+                    return Ok(knit
+                        .bind(py)
+                        .call_method1("get_lines", (version_id,))?
+                        .unbind());
+                }
+                "fulltext" => {
+                    return Ok(knit
+                        .bind(py)
+                        .call_method1("get_text", (version_id,))?
+                        .unbind());
+                }
+                _ => {}
             }
         }
         let exc_cls = py
@@ -5448,6 +5526,8 @@ impl KnitRecordStreamLazy {
                         inner_sha1: None,
                         raw_record: raw_bytes,
                         annotated: self.annotated,
+                        network_bytes: None,
+                        knit: None,
                     };
                     state.emitted += 1;
                     return Ok(Some(factory.into_pyobject(py)?.into_any().unbind()));

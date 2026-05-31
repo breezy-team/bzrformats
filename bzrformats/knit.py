@@ -70,9 +70,7 @@ from .errors import (  # noqa: F401
     SHA1KnitCorrupt,
 )
 from .versionedfile import (
-    ContentFactory,
     UnavailableRepresentation,
-    adapter_registry,
 )
 
 evil_logger = logging.getLogger("bzrformats.evil")
@@ -162,95 +160,17 @@ class DeltaPlainToFullText(KnitAdapter):
     _source_kind = "knit-delta-gz"
 
 
-class KnitContentFactory(ContentFactory):
-    """Content factory for streaming from knits.
-
-    :seealso ContentFactory:
-    """
-
-    def __init__(
-        self,
-        key,
-        parents,
-        build_details,
-        sha1,
-        raw_record,
-        annotated,
-        knit=None,
-        network_bytes=None,
-    ):
-        """Create a KnitContentFactory for key.
-
-        :param key: The key.
-        :param parents: The parents.
-        :param build_details: The build details as returned from
-            get_build_details.
-        :param sha1: The sha1 expected from the full text of this object.
-        :param raw_record: The bytes of the knit data from disk.
-        :param annotated: True if the raw data is annotated.
-        :param network_bytes: None to calculate the network bytes on demand,
-            not-none if they are already known.
-        """
-        ContentFactory.__init__(self)
-        self.sha1 = sha1
-        self.key = key
-        self.parents = parents
-        self.storage_kind = _knit_rs.format_storage_kind(build_details[0], annotated)
-        self._raw_record = raw_record
-        self._network_bytes = network_bytes
-        self._build_details = build_details
-        self._knit = knit
-
-    def _create_network_bytes(self):
-        """Create a fully serialised network version for transmission."""
-        self._network_bytes = _knit_rs.build_network_record_rs(
-            self.storage_kind,
-            list(self.key),
-            None if self.parents is None else [list(p) for p in self.parents],
-            bool(self._build_details[1]),
-            self._raw_record,
-        )
-
-    def get_bytes_as(self, storage_kind):
-        """Get the bytes for this content in the specified storage format.
-
-        Raises:
-            UnavailableRepresentation: If the format is not available.
-        """
-        if storage_kind == self.storage_kind:
-            if self._network_bytes is None:
-                self._create_network_bytes()
-            return self._network_bytes
-        if "-ft-" in self.storage_kind and storage_kind in (
-            "chunked",
-            "fulltext",
-            "lines",
-        ):
-            adapter_key = (self.storage_kind, storage_kind)
-            adapter_factory = adapter_registry.get(adapter_key)
-            adapter = adapter_factory(None)
-            return adapter.get_bytes(self, storage_kind)
-        if self._knit is not None:
-            # Not redundant with direct conversion above - that only handles
-            # fulltext cases.
-            if storage_kind in ("chunked", "lines"):
-                return self._knit.get_lines(self.key[0])
-            elif storage_kind == "fulltext":
-                return self._knit.get_text(self.key[0])
-        raise UnavailableRepresentation(self.key, storage_kind, self.storage_kind)
-
-    def iter_bytes_as(self, storage_kind):
-        """Iterate over the bytes for this content in the specified format."""
-        return iter(self.get_bytes_as(storage_kind))
-
-
-# KnitContent (with its get_line_delta_blocks static helper),
-# LazyKnitContentFactory, and the AnnotatedKnitContent / PlainKnitContent
-# concrete contents are Rust-backed and re-exported below.
+# KnitContentFactory, KnitContent (with its get_line_delta_blocks static
+# helper), LazyKnitContentFactory, and the AnnotatedKnitContent /
+# PlainKnitContent concrete contents are Rust-backed and re-exported below.
+# KnitContentFactory reproduces the Python constructor (network_bytes/knit) and
+# get_bytes_as (native network bytes, fulltext decompression, and the knit
+# delta fallback) in Rust.
 from ._bzr_rs.knit import (
     AnnotatedKnitContent,
     KnitAnnotateFactory,
     KnitContent,
+    KnitContentFactory,
     KnitPlainFactory,
     PlainKnitContent,
     _KndxIndex,
