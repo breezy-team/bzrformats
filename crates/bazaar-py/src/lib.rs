@@ -1114,6 +1114,10 @@ mod rio;
 
 #[pymodule]
 fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
+    // Forward Rust `log` records to Python's `logging` so messages emitted
+    // from the extension reach the same handlers as the Python code. Ignore
+    // the error if a logger is already installed (e.g. on module re-import).
+    let _ = pyo3_log::try_init();
     m.add_wrapped(wrap_pyfunction!(_next_id_suffix))?;
     m.add_wrapped(wrap_pyfunction!(gen_file_id))?;
     m.add_wrapped(wrap_pyfunction!(gen_root_id))?;

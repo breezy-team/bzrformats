@@ -9,6 +9,9 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use pyo3::wrap_pyfunction;
 
+pyo3::import_exception!(bzrformats.errors, InconsistentDeltaDelta);
+pyo3::import_exception!(bzrformats.errors, NoSuchRevision);
+
 fn chk_err_to_py(err: ChkError) -> PyErr {
     match err {
         ChkError::DeserializeError(msg) => pyo3::exceptions::PyValueError::new_err(msg),
@@ -295,13 +298,8 @@ static UNKNOWN_SENTINEL: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 fn unknown_sentinel(py: Python<'_>) -> &Py<PyAny> {
     UNKNOWN_SENTINEL.get_or_init(py, || {
         // `object()` — identity-only, no other behaviour required.
-        py.import("builtins")
-            .unwrap()
-            .getattr("object")
-            .unwrap()
-            .call0()
-            .unwrap()
-            .unbind()
+        // `PyAny` is the `object` base type (`PyBaseObject_Type`).
+        py.get_type::<PyAny>().call0().unwrap().unbind()
     })
 }
 
@@ -2860,14 +2858,14 @@ impl CHKMap {
                 .try_iter()?
                 .collect::<PyResult<Vec<_>>>()?;
         if !existing_new.is_empty() {
-            let exc = py
-                .import("bzrformats.errors")?
-                .getattr("InconsistentDeltaDelta")?;
             let msg = format!(
                 "New items are already in the map {}",
                 PyList::new(py, &existing_new)?.repr()?
             );
-            return Err(PyErr::from_value(exc.call1((&delta, msg))?));
+            return Err(InconsistentDeltaDelta::new_err((
+                delta.clone().unbind(),
+                msg,
+            )));
         }
         let mut has_deletes = false;
         for (old, new, _value) in &entries {
@@ -3167,14 +3165,8 @@ impl CHKMap {
 
 /// Build a `bzrformats.errors.NoSuchRevision(store, key)` error, matching
 /// what the Python difference algorithm raises for an absent record.
-fn no_such_revision(
-    py: Python<'_>,
-    store: &Bound<'_, PyAny>,
-    key: &Bound<'_, PyAny>,
-) -> PyResult<PyErr> {
-    let cls = py.import("bzrformats.errors")?.getattr("NoSuchRevision")?;
-    let exc = cls.call1((store, key))?;
-    Ok(PyErr::from_value(exc))
+fn no_such_revision(store: &Bound<'_, PyAny>, key: &Bound<'_, PyAny>) -> PyErr {
+    NoSuchRevision::new_err((store.clone().unbind(), key.clone().unbind()))
 }
 
 /// A CHK page reference: the flat sha1 bytes that form the single
@@ -3243,7 +3235,7 @@ impl CHKMapDifference {
             let storage_kind: String = record.getattr("storage_kind")?.extract()?;
             if storage_kind == "absent" {
                 let key = record.getattr("key")?;
-                return Err(no_such_revision(py, self.store.bind(py), &key)?);
+                return Err(no_such_revision(self.store.bind(py), &key));
             }
             let bytes_obj = record.call_method1("get_bytes_as", ("fulltext",))?;
             let bytes_py = bytes_obj.cast_into::<PyBytes>()?;

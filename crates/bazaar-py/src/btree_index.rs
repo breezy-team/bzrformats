@@ -21,13 +21,25 @@ import_exception!(bzrformats.index, BadIndexFormatSignature);
 import_exception!(bzrformats.index, BadIndexOptions);
 import_exception!(bzrformats.index, BadIndexDuplicateKey);
 
-/// Read `_PAGE_SIZE` from the `bzrformats.btree_index` module. The tests
-/// monkeypatch this module-level constant (via `shrink_page_size`), so it
-/// must be read fresh each time rather than cached from the crate const.
-fn page_size(py: Python<'_>) -> PyResult<usize> {
-    py.import("bzrformats.btree_index")?
-        .getattr("_PAGE_SIZE")?
-        .extract()
+/// The on-disk B+Tree page size.
+fn page_size() -> usize {
+    bazaar::btree_index::PAGE_SIZE
+}
+
+/// Stand-in transport for spilled backing indices.
+///
+/// A spilled backing is read directly from the open tempfile handle, so
+/// its `BTreeGraphIndex`'s transport is never used for I/O. This only has
+/// to satisfy the `recommended_page_size` protocol. Mirrors the Python
+/// `bzrformats.btree_index._DummyTransport`.
+#[pyclass]
+struct DummyTransport;
+
+#[pymethods]
+impl DummyTransport {
+    fn recommended_page_size(&self) -> usize {
+        page_size()
+    }
 }
 
 fn header_err_to_py(err: BTreeIndexError) -> PyErr {
@@ -301,7 +313,7 @@ impl BTreeGraphIndex {
         unlimited_cache: bool,
         offset: u64,
     ) -> PyResult<Self> {
-        let ps = page_size(py)?;
+        let ps = page_size();
         let recommended_read: u64 = transport
             .bind(py)
             .call_method0("recommended_page_size")?
@@ -309,19 +321,18 @@ impl BTreeGraphIndex {
         let recommended_pages = recommended_read.div_ceil(ps as u64) as usize;
 
         let lru_mod = py.import("bzrformats.lru_cache")?;
-        let btree_mod = py.import("bzrformats.btree_index")?;
         let (leaf_cache, internal_cache): (Py<PyAny>, Py<PyAny>) = if unlimited_cache {
             (
                 PyDict::new(py).into_any().unbind(),
                 PyDict::new(py).into_any().unbind(),
             )
         } else {
-            let node_cache_size: usize = btree_mod.getattr("_NODE_CACHE_SIZE")?.extract()?;
+            let node_cache_size = bazaar::btree_index::NODE_CACHE_SIZE;
             let leaf = lru_mod.getattr("LRUCache")?.call1((node_cache_size,))?;
             let internal = lru_mod.getattr("FIFOCache")?.call1((100,))?;
             (leaf.unbind(), internal.unbind())
         };
-        let leaf_factory = btree_mod.getattr("_LeafNode")?;
+        let leaf_factory = py.get_type::<LeafNodePy>();
 
         Ok(Self {
             transport,
@@ -338,7 +349,7 @@ impl BTreeGraphIndex {
             root_node: Mutex::new(None),
             leaf_node_cache: Mutex::new(leaf_cache),
             internal_node_cache: Mutex::new(internal_cache),
-            leaf_factory: Mutex::new(leaf_factory.unbind()),
+            leaf_factory: Mutex::new(leaf_factory.into_any().unbind()),
             leaf_value_cache: Mutex::new(None),
         })
     }
@@ -573,7 +584,7 @@ impl BTreeGraphIndex {
     }
 
     /// How many pages the index spans. Mirrors `_compute_total_pages_in_index`.
-    fn _compute_total_pages_in_index(&self, py: Python<'_>) -> PyResult<usize> {
+    fn _compute_total_pages_in_index(&self) -> PyResult<usize> {
         let size = self.lock_size();
         let root_present = self.root_node.lock().unwrap().is_some();
         let row_offsets_last = self.lock_row_offsets().and_then(|ro| ro.last().copied());
@@ -582,10 +593,9 @@ impl BTreeGraphIndex {
                 "_compute_total_pages_in_index should not be called when self._size is None",
             ));
         }
-        compute_total_pages_in_index(size, root_present, row_offsets_last, page_size(py)?)
-            .ok_or_else(|| {
-                pyo3::exceptions::PyAssertionError::new_err("cannot compute total pages")
-            })
+        compute_total_pages_in_index(size, root_present, row_offsets_last, page_size()).ok_or_else(
+            || pyo3::exceptions::PyAssertionError::new_err("cannot compute total pages"),
+        )
     }
 
     /// Start/end page of the layer containing `offset`.
@@ -631,7 +641,7 @@ impl BTreeGraphIndex {
         let root_present = me.root_node.lock().unwrap().is_some();
         let row_lengths = me.row_lengths.lock().unwrap().clone().unwrap_or_default();
         let row_offsets = me.lock_row_offsets().unwrap_or_default();
-        let total_pages = me._compute_total_pages_in_index(py)?;
+        let total_pages = me._compute_total_pages_in_index()?;
         drop(me);
 
         let cached_set = slf.call_method0("_get_offsets_to_cached_pages")?;
@@ -1259,7 +1269,7 @@ impl BTreeGraphIndex {
         py: Python<'py>,
         pages: Vec<usize>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let ps = page_size(py)?;
+        let ps = page_size();
         let base_offset = slf.borrow().base_offset;
         let size = slf.borrow().lock_size();
         let plan = bazaar::btree_index::plan_page_reads(&pages, size, base_offset, ps)
@@ -1710,15 +1720,10 @@ impl BTreeBuilder {
             return a.bind(py).lt(b.bind(py));
         }
         // Existing on-disk indices sort before still-being-built ones.
-        // Accept both the Rust pyclass and the Python wrapper class, since
-        // spilled backings are constructed via the Python BTreeGraphIndex.
+        // `bzrformats.btree_index.BTreeGraphIndex` is an alias for this Rust
+        // pyclass, so this instance check also covers spilled backings
+        // constructed via the Python name.
         if other.is_instance_of::<BTreeGraphIndex>() {
-            return Ok(false);
-        }
-        let py_btree_graph_index = py
-            .import("bzrformats.btree_index")?
-            .getattr("BTreeGraphIndex")?;
-        if other.is_instance(&py_btree_graph_index)? {
             return Ok(false);
         }
         Err(PyTypeError::new_err(other.unbind()))
@@ -2106,10 +2111,12 @@ fn ensure_key_tuple<'py>(
     if let Ok(t) = obj.downcast::<PyTuple>() {
         return Ok(t.clone());
     }
-    let builtins = py.import("builtins")?;
-    let tuple_class = builtins.getattr("tuple")?;
-    let coerced = tuple_class.call1((obj.clone(),))?;
-    Ok(coerced.cast_into()?)
+    // Equivalent to Python's `tuple(obj)`: materialise the iterable. A
+    // non-iterable raises the same `TypeError` via `try_iter`.
+    let items = obj
+        .try_iter()?
+        .collect::<PyResult<Vec<Bound<'py, PyAny>>>>()?;
+    PyTuple::new(py, items)
 }
 
 /// Non-pyo3 helpers for [`BTreeBuilder`]. These are called from the
@@ -2214,14 +2221,14 @@ impl BTreeBuilder {
             (file, size, slot)
         };
 
-        // Build a Python BTreeGraphIndex over a dummy transport that
-        // returns a fixed recommended_page_size. The transport itself
-        // is never used for I/O because we overwrite `_file` to point
-        // at the just-written tempfile.
-        let btree_index_py = py.import("bzrformats.btree_index")?;
-        let dummy_transport = btree_index_py.getattr("_DummyTransport")?.call0()?;
-        let new_backing_cls = btree_index_py.getattr("BTreeGraphIndex")?;
-        let new_backing = new_backing_cls.call1((dummy_transport, "<temp>", size))?;
+        // Build a BTreeGraphIndex over a dummy transport that returns a
+        // fixed recommended_page_size. The transport itself is never used
+        // for I/O because we overwrite `_file` to point at the
+        // just-written tempfile.
+        let dummy_transport = Py::new(py, DummyTransport)?;
+        let new_backing =
+            py.get_type::<BTreeGraphIndex>()
+                .call1((dummy_transport, "<temp>", size))?;
         new_backing.setattr("_file", file)?;
 
         {
@@ -2328,15 +2335,7 @@ impl BTreeBuilder {
             false
         };
         drop(parent);
-        // Read _PAGE_SIZE and _RESERVED_HEADER_BYTES from the Python
-        // btree_index module so the historical test pattern of
-        // monkey-patching those module-level constants (via
-        // overrideAttr) keeps working.
-        let btree_index_mod = py.import("bzrformats.btree_index")?;
-        let page_size: usize = btree_index_mod.getattr("_PAGE_SIZE")?.extract()?;
-        let reserved_header_bytes: usize = btree_index_mod
-            .getattr("_RESERVED_HEADER_BYTES")?
-            .extract()?;
+        let page_size = bazaar::btree_index::PAGE_SIZE;
         let blob = crate::btree_serializer::serialize_btree_index(
             py,
             &node_iterator,
@@ -2344,7 +2343,7 @@ impl BTreeBuilder {
             key_length,
             optimize_for_size,
             Some(page_size),
-            Some(reserved_header_bytes),
+            Some(bazaar::btree_index::RESERVED_HEADER_BYTES),
         )?;
         let blob_bytes = blob.as_bytes();
         let size = blob_bytes.len();

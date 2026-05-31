@@ -196,101 +196,19 @@ impl Transport for FileTransport {
     }
 
     fn lstat(&self, abspath: &[u8]) -> Result<StatInfo, TransportError> {
-        let path = bytes_to_path(abspath)?;
-        let metadata = std::fs::symlink_metadata(&path).map_err(TransportError::from)?;
-        stat_info_from_metadata(&metadata)
+        super::transport::lstat_path(abspath)
     }
 
     fn read_link(&self, abspath: &[u8]) -> Result<Vec<u8>, TransportError> {
-        let path = bytes_to_path(abspath)?;
-        let target = std::fs::read_link(&path).map_err(TransportError::from)?;
-        Ok(path_to_bytes(&target))
+        super::transport::read_link_path(abspath)
     }
 
     fn is_tree_reference_dir(&self, abspath: &[u8]) -> Result<bool, TransportError> {
-        let path = bytes_to_path(abspath)?;
-        let bzr_dir = path.join(".bzr");
-        Ok(bzr_dir.is_dir())
+        super::transport::is_tree_reference_dir_path(abspath)
     }
 
     fn list_dir(&self, abspath: &[u8]) -> Result<Vec<DirEntryInfo>, TransportError> {
-        let path = bytes_to_path(abspath)?;
-        let entries = std::fs::read_dir(&path).map_err(TransportError::from)?;
-        let mut out = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(TransportError::from)?;
-            let name = entry.file_name();
-            let basename = path_to_bytes(Path::new(&name));
-            let metadata = entry.metadata().map_err(TransportError::from)?;
-            let stat = stat_info_from_metadata(&metadata)?;
-            let kind = osutils_kind_from_stat(&stat);
-            let abs = entry.path();
-            out.push(DirEntryInfo {
-                basename,
-                kind,
-                stat,
-                abspath: path_to_bytes(&abs),
-            });
-        }
-        Ok(out)
-    }
-}
-
-#[cfg(unix)]
-fn bytes_to_path(b: &[u8]) -> Result<PathBuf, TransportError> {
-    use std::os::unix::ffi::OsStrExt;
-    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(b)))
-}
-
-#[cfg(not(unix))]
-fn bytes_to_path(b: &[u8]) -> Result<PathBuf, TransportError> {
-    String::from_utf8(b.to_vec())
-        .map(PathBuf::from)
-        .map_err(|e| TransportError::Other(e.to_string()))
-}
-
-#[cfg(unix)]
-fn path_to_bytes(p: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    p.as_os_str().as_bytes().to_vec()
-}
-
-#[cfg(not(unix))]
-fn path_to_bytes(p: &Path) -> Vec<u8> {
-    p.to_string_lossy().into_owned().into_bytes()
-}
-
-fn stat_info_from_metadata(m: &std::fs::Metadata) -> Result<StatInfo, TransportError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(StatInfo {
-            mode: m.mode(),
-            size: m.size(),
-            mtime: m.mtime(),
-            ctime: m.ctime(),
-            dev: m.dev(),
-            ino: m.ino(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = m;
-        Err(TransportError::Other(
-            "lstat unsupported on this platform".to_string(),
-        ))
-    }
-}
-
-fn osutils_kind_from_stat(stat: &StatInfo) -> Option<crate::osutils::Kind> {
-    if stat.is_file() {
-        Some(crate::osutils::Kind::File)
-    } else if stat.is_dir() {
-        Some(crate::osutils::Kind::Directory)
-    } else if stat.is_symlink() {
-        Some(crate::osutils::Kind::Symlink)
-    } else {
-        None
+        super::transport::list_dir_path(abspath)
     }
 }
 

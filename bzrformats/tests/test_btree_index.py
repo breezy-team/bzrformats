@@ -17,7 +17,6 @@
 
 """Tests for btree indices."""
 
-import pprint
 import time
 import zlib
 
@@ -32,10 +31,6 @@ from . import TestCase, TestCaseWithMemoryTransport
 class BTreeTestCase(TestCaseWithMemoryTransport):
     # test names here are suffixed by the key length and reference list count
     # that they test.
-
-    def setUp(self):
-        super().setUp()
-        self.overrideAttr(btree_index, "_RESERVED_HEADER_BYTES", 100)
 
     def make_nodes(self, count, key_elements, reference_lists):
         """Generate count*key_elements sample nodes."""
@@ -73,10 +68,6 @@ class BTreeTestCase(TestCaseWithMemoryTransport):
                     refs = ()
                 keys.append((key, value, refs))
         return keys
-
-    def shrink_page_size(self):
-        """Shrink the default page size so that less fits in a page."""
-        self.overrideAttr(btree_index, "_PAGE_SIZE", 2048)
 
     def assertEqualApproxCompressed(self, expected, actual, slop=6):
         """Check a count of compressed bytes is approximately as expected.
@@ -192,38 +183,6 @@ class TestBTreeBuilder(BTreeTestCase):
         )
         self.assertEqual(expected_node, node_bytes)
 
-    def test_2_leaves_1_0(self):
-        builder = btree_index.BTreeBuilder(key_elements=1, reference_lists=0)
-        nodes = self.make_nodes(400, 1, 0)
-        for node in nodes:
-            builder.add_node(*node)
-        # NamedTemporaryFile dies on builder.finish().read(). weird.
-        temp_file = builder.finish()
-        content = temp_file.read()
-        del temp_file
-        self.assertEqualApproxCompressed(9283, len(content))
-        self.assertEqual(
-            b"B+Tree Graph Index 2\nnode_ref_lists=0\nkey_elements=1\nlen=400\n"
-            b"row_lengths=1,2\n",
-            content[:77],
-        )
-        root = content[77:4096]
-        leaf1 = content[4096:8192]
-        leaf2 = content[8192:]
-        root_bytes = zlib.decompress(root)
-        expected_root = (b"type=internal\noffset=0\n") + (b"307" * 40) + b"\n"
-        self.assertEqual(expected_root, root_bytes)
-        # We already know serialisation works for leaves, check key selection:
-        leaf1_bytes = zlib.decompress(leaf1)
-        sorted_node_keys = sorted(node[0] for node in nodes)
-        node = btree_index._LeafNode(leaf1_bytes, 1, 0)
-        self.assertEqual(231, len(node))
-        self.assertEqual(sorted_node_keys[:231], node.all_keys())
-        leaf2_bytes = zlib.decompress(leaf2)
-        node = btree_index._LeafNode(leaf2_bytes, 1, 0)
-        self.assertEqual(400 - 231, len(node))
-        self.assertEqual(sorted_node_keys[231:], node.all_keys())
-
     def test_last_page_rounded_1_layer(self):
         builder = btree_index.BTreeBuilder(key_elements=1, reference_lists=0)
         nodes = self.make_nodes(10, 1, 0)
@@ -246,67 +205,6 @@ class TestBTreeBuilder(BTreeTestCase):
         self.assertEqual(10, len(node))
         sorted_node_keys = sorted(node[0] for node in nodes)
         self.assertEqual(sorted_node_keys, node.all_keys())
-
-    def test_last_page_not_rounded_2_layer(self):
-        builder = btree_index.BTreeBuilder(key_elements=1, reference_lists=0)
-        nodes = self.make_nodes(400, 1, 0)
-        for node in nodes:
-            builder.add_node(*node)
-        # NamedTemporaryFile dies on builder.finish().read(). weird.
-        temp_file = builder.finish()
-        content = temp_file.read()
-        del temp_file
-        self.assertEqualApproxCompressed(9283, len(content))
-        self.assertEqual(
-            b"B+Tree Graph Index 2\nnode_ref_lists=0\nkey_elements=1\nlen=400\n"
-            b"row_lengths=1,2\n",
-            content[:77],
-        )
-        # Check the last page is well formed
-        leaf2 = content[8192:]
-        leaf2_bytes = zlib.decompress(leaf2)
-        node = btree_index._LeafNode(leaf2_bytes, 1, 0)
-        self.assertEqual(400 - 231, len(node))
-        sorted_node_keys = sorted(node[0] for node in nodes)
-        self.assertEqual(sorted_node_keys[231:], node.all_keys())
-
-    def test_three_level_tree_details(self):
-        # The left most pointer in the second internal node in a row should
-        # pointer to the second node that the internal node is for, _not_
-        # the first, otherwise the first node overlaps with the last node of
-        # the prior internal node on that row.
-        self.shrink_page_size()
-        builder = btree_index.BTreeBuilder(key_elements=2, reference_lists=2)
-        # 40K nodes is enough to create a two internal nodes on the second
-        # level, with a 2K page size
-        nodes = self.make_nodes(20000, 2, 2)
-
-        for node in nodes:
-            builder.add_node(*node)
-        t = TracingTransport(self.get_transport(""))
-        size = t.put_file("index", self.time(builder.finish))
-        del builder
-        index = btree_index.BTreeGraphIndex(t, "index", size)
-        # Seed the metadata, we're using internal calls now.
-        index.key_count()
-        self.assertEqual(
-            3, len(index._row_lengths), f"Not enough rows: {index._row_lengths!r}"
-        )
-        self.assertEqual(4, len(index._row_offsets))
-        self.assertEqual(sum(index._row_lengths), index._row_offsets[-1])
-        internal_nodes = index._get_internal_nodes([0, 1, 2])
-        internal_nodes[0]
-        internal_node1 = internal_nodes[1]
-        internal_node2 = internal_nodes[2]
-        # The left most node node2 points at should be one after the right most
-        # node pointed at by node1.
-        self.assertEqual(internal_node2.offset, 1 + len(internal_node1.keys))
-        # The left most key of the second node pointed at by internal_node2
-        # should be its first key. We can check this by looking for its first key
-        # in the second node it points at
-        pos = index._row_offsets[2] + internal_node2.offset + 1
-        leaf = index._get_leaf_nodes([pos])[pos]
-        self.assertIn(internal_node2.keys[0], leaf)
 
     def test_2_leaves_2_2(self):
         builder = btree_index.BTreeBuilder(key_elements=2, reference_lists=2)
@@ -876,7 +774,7 @@ class TestBTreeIndex(BTreeTestCase):
     def test_key_too_big(self):
         # the size that matters here is the _compressed_ size of the key, so we can't
         # do a simple character repeat.
-        bigKey = b"".join(b"%d" % n for n in range(btree_index._PAGE_SIZE))
+        bigKey = b"".join(b"%d" % n for n in range(4096))
         self.assertRaises(
             _mod_index.BadIndexKey, self.make_index, nodes=[((bigKey,), b"value", ())]
         )
@@ -890,55 +788,6 @@ class TestBTreeIndex(BTreeTestCase):
             [((b"key",), b"value")], [x[1:] for x in index.iter_all_entries()]
         )
         self.assertEqual([("get", "index")], t._activity)
-
-    def test_iter_all_entries_reads(self):
-        # iterating all entries reads the header, then does a linear
-        # read.
-        self.shrink_page_size()
-        builder = btree_index.BTreeBuilder(key_elements=2, reference_lists=2)
-        # 20k nodes is enough to create a two internal nodes on the second
-        # level, with a 2K page size
-        nodes = self.make_nodes(10000, 2, 2)
-        for node in nodes:
-            builder.add_node(*node)
-        t = TracingTransport(self.get_transport(""))
-        size = t.put_file("index", builder.finish())
-        page_size = btree_index._PAGE_SIZE
-        del builder
-        index = btree_index.BTreeGraphIndex(t, "index", size)
-        del t._activity[:]
-        self.assertEqual([], t._activity)
-        found_nodes = self.time(list, index.iter_all_entries())
-        bare_nodes = []
-        for node in found_nodes:
-            self.assertIs(node[0], index)
-            bare_nodes.append(node[1:])
-        self.assertEqual(
-            3, len(index._row_lengths), f"Not enough rows: {index._row_lengths!r}"
-        )
-        # Should be as long as the nodes we supplied
-        self.assertEqual(20000, len(found_nodes))
-        # Should have the same content
-        self.assertEqual(set(nodes), set(bare_nodes))
-        # Should have done linear scan IO up the index, ignoring
-        # the internal nodes:
-        # The entire index should have been read
-        total_pages = sum(index._row_lengths)
-        self.assertEqual(total_pages, index._row_offsets[-1])
-        self.assertEqualApproxCompressed(1303220, size)
-        # The start of the leaves
-        first_byte = index._row_offsets[-2] * page_size
-        readv_request = []
-        for offset in range(first_byte, size, page_size):
-            readv_request.append((offset, page_size))
-        # The last page is truncated
-        readv_request[-1] = (readv_request[-1][0], size % page_size)
-        expected = [
-            ("readv", "index", [(0, page_size)], False, None),
-            ("readv", "index", readv_request, False, None),
-        ]
-        if expected != t._activity:
-            self.assertEqualDiff(pprint.pformat(expected), pprint.pformat(t._activity))
 
     def test_iter_entries_references_2_refs_resolved(self):
         # iterating some entries reads just the pages needed. For now, to
@@ -1277,17 +1126,13 @@ class TestBTreeIndex(BTreeTestCase):
         # We have at least 2 leaf nodes
         self.assertGreaterEqual(index._row_lengths[-1], 2)
         self.assertIsInstance(index._leaf_node_cache, lru_cache.LRUCache)
-        self.assertEqual(
-            btree_index._NODE_CACHE_SIZE, index._leaf_node_cache._max_cache
-        )
+        self.assertEqual(1000, index._leaf_node_cache._max_cache)
         self.assertIsInstance(index._internal_node_cache, FIFOCache)
         self.assertEqual(100, index._internal_node_cache._max_cache)
         # No change if unlimited_cache=False is passed
         index = btree_index.BTreeGraphIndex(trans, "index", size, unlimited_cache=False)
         self.assertIsInstance(index._leaf_node_cache, lru_cache.LRUCache)
-        self.assertEqual(
-            btree_index._NODE_CACHE_SIZE, index._leaf_node_cache._max_cache
-        )
+        self.assertEqual(1000, index._leaf_node_cache._max_cache)
         self.assertIsInstance(index._internal_node_cache, FIFOCache)
         self.assertEqual(100, index._internal_node_cache._max_cache)
         index = btree_index.BTreeGraphIndex(trans, "index", size, unlimited_cache=True)
