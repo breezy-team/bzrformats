@@ -29,12 +29,14 @@ mod osutils;
 mod pack;
 mod pack_repo;
 mod plan_merge;
+mod recordcounter;
 mod smart;
 mod textmerge;
 mod transport;
 mod tuned_gzip;
 mod versionedfile;
 mod weave;
+mod weavefile;
 
 import_exception!(bzrformats._bzr_rs.errors, ReservedId);
 import_exception!(breezy.bugtracker, InvalidLineInBugsProperty);
@@ -1255,6 +1257,8 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
 
     let weavem = weave::_weave_rs(py)?;
     m.add_submodule(&weavem)?;
+    let weavefilem = weavefile::_weavefile_rs(py)?;
+    m.add_submodule(&weavefilem)?;
 
     let packm = pack::_pack_rs(py)?;
     m.add_submodule(&packm)?;
@@ -1273,6 +1277,8 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
 
     let plan_mergem = plan_merge::_plan_merge_rs(py)?;
     m.add_submodule(&plan_mergem)?;
+    let recordcounterm = recordcounter::_recordcounter_rs(py)?;
+    m.add_submodule(&recordcounterm)?;
 
     let btree_serializerm = btree_serializer::_btree_serializer_rs(py)?;
     m.add_submodule(&btree_serializerm)?;
@@ -1316,12 +1322,14 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.textmerge", module_name), &textmergem)?;
     modules.set_item(format!("{}.multiparent", module_name), &multiparentm)?;
     modules.set_item(format!("{}.weave", module_name), &weavem)?;
+    modules.set_item(format!("{}.weavefile", module_name), &weavefilem)?;
     modules.set_item(format!("{}.pack", module_name), &packm)?;
     modules.set_item(format!("{}.pack_repo", module_name), &pack_repom)?;
     modules.set_item(format!("{}.index", module_name), &indexm)?;
     modules.set_item(format!("{}.btree_index", module_name), &btree_indexm)?;
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
     modules.set_item(format!("{}.plan_merge", module_name), &plan_mergem)?;
+    modules.set_item(format!("{}.recordcounter", module_name), &recordcounterm)?;
     modules.set_item(
         format!("{}.btree_serializer", module_name),
         &btree_serializerm,

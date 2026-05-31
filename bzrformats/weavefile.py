@@ -32,58 +32,22 @@ The inclusions do not need to list versions included by a parent.
 The weave is bracketed by 'w' and 'W' lines, and includes the '{}[]'
 processing instructions.  Lines of text are prefixed by '.' if the
 line contains a newline, or ',' if not.
+
+The reading/writing functions are implemented in Rust
+(``bzrformats._bzr_rs.weavefile``) and re-exported here.
 """
 
-FORMAT_1 = b"# bzr weave file v5\n"
+from ._bzr_rs.weavefile import (  # noqa: F401
+    FORMAT_1,
+    _read_weave_v5,
+    read_weave,
+    write_weave,
+    write_weave_v5,
+)
 
-
-def write_weave(weave, f, format=None):
-    """Write a weave to a file.
-
-    Args:
-        weave: The weave object to write.
-        f: File-like object to write to.
-        format: The weave format version to use. Currently only supports None or 1.
-
-    Raises:
-        ValueError: If an unknown format is specified.
-    """
-    if format is None or format == 1:
-        return write_weave_v5(weave, f)
-    else:
-        raise ValueError(f"unknown weave format {format!r}")
-
-
-def write_weave_v5(weave, f):
-    """Write weave to file f."""
-    f.write(weave._to_v5_bytes())
-
-
-def read_weave(f):
-    """Read a weave from a file.
-
-    Args:
-        f: File-like object to read from.
-
-    Returns:
-        A Weave object containing the data read from the file.
-    """
-    # FIXME: detect the weave type and dispatch
-    from .weave import Weave
-
-    w = Weave(getattr(f, "name", None))
-    _read_weave_v5(f, w)
-    return w
-
-
-def _read_weave_v5(f, w):
-    """Private helper routine to read a weave format 5 file into memory.
-
-    This is only to be used by read_weave and WeaveFile.__init__.
-    """
-    try:
-        data = f.read()
-    finally:
-        f.close()
-    w._load_from_v5_bytes(data)
-    return w
+__all__ = [
+    "FORMAT_1",
+    "read_weave",
+    "write_weave",
+    "write_weave_v5",
+]
