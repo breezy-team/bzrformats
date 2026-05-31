@@ -9,8 +9,8 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use pyo3::wrap_pyfunction;
 
-pyo3::import_exception!(bzrformats.errors, InconsistentDeltaDelta);
-pyo3::import_exception!(bzrformats.errors, NoSuchRevision);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, InconsistentDeltaDelta);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, NoSuchRevision);
 
 fn chk_err_to_py(err: ChkError) -> PyErr {
     match err {

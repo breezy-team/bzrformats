@@ -23,13 +23,13 @@ use std::iter::FromIterator;
 import_exception!(bzrformats.inventory, InvalidEntryName);
 import_exception!(bzrformats.inventory, DuplicateFileId);
 import_exception!(bzrformats.inventory, NoSuchId);
-import_exception!(bzrformats.errors, BzrCheckError);
-import_exception!(bzrformats.errors, InvalidNormalization);
-import_exception!(bzrformats.errors, InconsistentDelta);
-import_exception!(bzrformats.errors, AlreadyVersionedError);
-import_exception!(bzrformats.errors, BzrFormatsError);
+import_exception!(bzrformats._bzr_rs.errors, BzrCheckError);
+import_exception!(bzrformats._bzr_rs.errors, InvalidNormalization);
+import_exception!(bzrformats._bzr_rs.errors, InconsistentDelta);
+import_exception!(bzrformats._bzr_rs.errors, AlreadyVersionedError);
+import_exception!(bzrformats._bzr_rs.errors, BzrFormatsError);
 import_exception!(bzrformats.errors, NotADirectory);
-import_exception!(bzrformats.errors, NotVersionedError);
+import_exception!(bzrformats._bzr_rs.errors, NotVersionedError);
 create_exception!(
     bzrformats.inventory_delta,
     IncompatibleInventoryDelta,

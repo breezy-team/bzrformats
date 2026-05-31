@@ -13,10 +13,10 @@ import_exception!(bzrformats.weave, WeaveFormatError);
 import_exception!(bzrformats.weave, WeaveInvalidChecksum);
 import_exception!(bzrformats.weave, WeaveParentMismatch);
 import_exception!(bzrformats.weave, WeaveTextDiffers);
-import_exception!(bzrformats.errors, RevisionAlreadyPresent);
-import_exception!(bzrformats.errors, RevisionNotPresent);
-import_exception!(bzrformats.errors, OutSideTransaction);
-import_exception!(bzrformats.errors, ReadOnlyObjectDirtiedError);
+import_exception!(bzrformats._bzr_rs.errors, RevisionAlreadyPresent);
+import_exception!(bzrformats._bzr_rs.errors, RevisionNotPresent);
+import_exception!(bzrformats._bzr_rs.errors, OutSideTransaction);
+import_exception!(bzrformats._bzr_rs.errors, ReadOnlyObjectDirtiedError);
 import_exception!(bzrformats.versionedfile, ExistingContent);
 import_exception!(bzrformats.versionedfile, UnavailableRepresentation);
 
@@ -417,7 +417,7 @@ fn py_weave_add<'py>(
     Ok((p, s, n, w, idx))
 }
 
-import_exception!(bzrformats.errors, ReservedId);
+import_exception!(bzrformats._bzr_rs.errors, ReservedId);
 
 /// Reserved-id check, mirroring `Weave.check_not_reserved_id`. A reserved
 /// id has a trailing `:`. Always allowed when `_allow_reserved` is True.

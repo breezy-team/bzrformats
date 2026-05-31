@@ -5,7 +5,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
 #[pyclass(subclass)]
 pub(crate) struct AbstractContentFactory(Box<dyn ContentFactory + Send + Sync>);
 
-pyo3::import_exception!(bzrformats.errors, UnavailableRepresentation);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, UnavailableRepresentation);
 
 #[pymethods]
 impl AbstractContentFactory {
@@ -1878,7 +1878,7 @@ fn known_graph_ancestry_map<'py>(
     Ok(out)
 }
 
-pyo3::import_exception!(bzrformats.errors, VersionedFileInvalidChecksum);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, VersionedFileInvalidChecksum);
 
 /// Drive `VersionedFiles.add_mpdiffs(records)` in Rust.
 ///

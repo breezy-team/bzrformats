@@ -7,10 +7,10 @@ use pyo3::wrap_pyfunction;
 use std::borrow::Cow;
 use std::convert::TryInto;
 
-pyo3::import_exception!(bzrformats.errors, ObjectNotLocked);
-pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
-pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
-pyo3::import_exception!(bzrformats.errors, InvalidRevisionId);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, ObjectNotLocked);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, ReadOnlyError);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, RevisionNotPresent);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, InvalidRevisionId);
 pyo3::import_exception!(bzrformats.groupcompress, DecompressCorruption);
 pyo3::import_exception!(bzrformats.pack_repo, RetryWithNewPacks);
 pyo3::import_exception!(bzrformats.versionedfile, UnavailableRepresentation);

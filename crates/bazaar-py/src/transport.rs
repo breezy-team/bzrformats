@@ -39,7 +39,7 @@ impl PyTransport {
 /// everything else to [`TransportError::Other`] with the exception's
 /// `repr()`.
 #[allow(dead_code)]
-pyo3::import_exception!(bzrformats.errors, NoSuchFile);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, NoSuchFile);
 mod transport_exc {
     pyo3::import_exception!(bzrformats.transport, NoSuchFile);
 }

@@ -22,7 +22,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use pyo3::PyTypeInfo;
 
 import_exception!(bzrformats.pack_repo, RetryWithNewPacks);
-import_exception!(bzrformats.errors, BzrCheckError);
+import_exception!(bzrformats._bzr_rs.errors, BzrCheckError);
 import_exception!(bzrformats.transport, NoSuchFile);
 
 /// Resolve a Python index-type string to the typed [`IndexKind`],

@@ -15,11 +15,11 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
-pyo3::import_exception!(bzrformats.errors, NoSuchFile);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, RevisionNotPresent);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, NoSuchFile);
 pyo3::import_exception!(bzrformats.versionedfile, UnavailableRepresentation);
-pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
-pyo3::import_exception!(bzrformats.errors, ObjectNotLocked);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, ReadOnlyError);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, ObjectNotLocked);
 pyo3::import_exception!(bzrformats.knit, KnitCorrupt);
 pyo3::import_exception!(bzrformats.knit, KnitHeaderError);
 pyo3::import_exception!(bzrformats.knit, KnitIndexUnknownMethod);

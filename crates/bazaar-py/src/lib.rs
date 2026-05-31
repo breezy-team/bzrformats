@@ -16,6 +16,7 @@ mod chk_map;
 mod chunk_writer;
 mod dirstate;
 mod dirstate_helpers;
+mod errors;
 mod groupcompress;
 mod groupcompress_delta;
 mod index;
@@ -35,7 +36,7 @@ mod tuned_gzip;
 mod versionedfile;
 mod weave;
 
-import_exception!(bzrformats.errors, ReservedId);
+import_exception!(bzrformats._bzr_rs.errors, ReservedId);
 import_exception!(breezy.bugtracker, InvalidLineInBugsProperty);
 import_exception!(breezy.bugtracker, InvalidBugStatus);
 
@@ -1122,6 +1123,17 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(gen_file_id))?;
     m.add_wrapped(wrap_pyfunction!(gen_root_id))?;
     m.add_wrapped(wrap_pyfunction!(gen_revision_id))?;
+    let errorsm = errors::errors_module(py)?;
+    m.add_submodule(&errorsm)?;
+    // Register the errors submodule in sys.modules immediately: other
+    // submodules built below (e.g. inventory) define exception types whose
+    // base classes are `import_exception!(bzrformats._bzr_rs.errors, ...)`,
+    // which is resolved at class-creation time and would otherwise fail.
+    {
+        let sys = py.import("sys")?;
+        let modules = sys.getattr("modules")?;
+        modules.set_item(format!("{}.errors", m.name()?), &errorsm)?;
+    }
     let m_globbing = PyModule::new(py, "globbing")?;
     m_globbing.add_wrapped(wrap_pyfunction!(normalize_pattern))?;
     m_globbing.add_class::<Replacer>()?;
