@@ -17,6 +17,12 @@
 """Indexing facilities."""
 
 __all__ = [
+    "BadIndexData",
+    "BadIndexDuplicateKey",
+    "BadIndexFormatSignature",
+    "BadIndexKey",
+    "BadIndexOptions",
+    "BadIndexValue",
     "CombinedGraphIndex",
     "GraphIndex",
     "GraphIndexBuilder",
@@ -25,57 +31,18 @@ __all__ = [
 ]
 
 from ._bzr_rs import index as _index_rs
-from .errors import BzrFormatsError
 
-
-class BadIndexFormatSignature(BzrFormatsError):
-    _fmt = "%(value)s is not an index of type %(_type)s."
-
-    def __init__(self, value, _type):
-        super().__init__()
-        self.value = value
-        self._type = _type
-
-
-class BadIndexData(BzrFormatsError):
-    _fmt = "Error in data for index %(value)s."
-
-    def __init__(self, value):
-        super().__init__()
-        self.value = value
-
-
-class BadIndexDuplicateKey(BzrFormatsError):
-    _fmt = "The key '%(key)s' is already in index '%(index)s'."
-
-    def __init__(self, key, index):
-        super().__init__()
-        self.key = key
-        self.index = index
-
-
-class BadIndexKey(BzrFormatsError):
-    _fmt = "The key '%(key)s' is not a valid key."
-
-    def __init__(self, key):
-        super().__init__()
-        self.key = key
-
-
-class BadIndexOptions(BzrFormatsError):
-    _fmt = "Could not parse options for index %(value)s."
-
-    def __init__(self, value):
-        super().__init__()
-        self.value = value
-
-
-class BadIndexValue(BzrFormatsError):
-    _fmt = "The value '%(value)s' is not a valid value."
-
-    def __init__(self, value):
-        super().__init__()
-        self.value = value
+# The index error classes live in the Rust errors module; re-export them so
+# bzrformats.index.BadIndex* keep working for callers and for the Rust
+# import_exception!(bzrformats.index, ...) sites.
+from .errors import (
+    BadIndexData,
+    BadIndexDuplicateKey,
+    BadIndexFormatSignature,
+    BadIndexKey,
+    BadIndexOptions,
+    BadIndexValue,
+)
 
 
 def _has_key_from_parent_map(self, key):

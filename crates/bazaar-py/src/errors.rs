@@ -365,6 +365,7 @@ simple_error!(BadIndexOptions: BzrFormatsError, "Could not parse options for ind
 simple_error!(BadIndexValue: BzrFormatsError, "The value '%(value)s' is not a valid value."; value);
 simple_error!(InvalidEntryName: BzrFormatsError, "Invalid entry name: %(name)s"; name);
 simple_error!(DuplicateFileId: BzrFormatsError, "File id {%(file_id)s} already exists in inventory as %(entry)s"; file_id, entry);
+simple_error!(NoSuchId: BzrFormatsError, "The file id \"%(file_id)s\" is not present in the tree %(tree)s."; tree, file_id);
 
 simple_error!(VersionedFileError: BzrFormatsError, "Versioned file error");
 simple_error!(RevisionNotPresent: VersionedFileError, "Revision {%(revision_id)s} not present in \"%(file_id)s\"."; revision_id, file_id);
@@ -761,6 +762,7 @@ pub(crate) fn errors_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_class::<BadIndexValue>()?;
     m.add_class::<InvalidEntryName>()?;
     m.add_class::<DuplicateFileId>()?;
+    m.add_class::<NoSuchId>()?;
     m.add_class::<DecompressCorruption>()?;
     m.add_class::<VersionedFileError>()?;
     m.add_class::<RevisionNotPresent>()?;

@@ -40,6 +40,7 @@ BadIndexOptions = _errors.BadIndexOptions
 BadIndexValue = _errors.BadIndexValue
 InvalidEntryName = _errors.InvalidEntryName
 DuplicateFileId = _errors.DuplicateFileId
+NoSuchId = _errors.NoSuchId
 DecompressCorruption = _errors.DecompressCorruption
 VersionedFileError = _errors.VersionedFileError
 RevisionNotPresent = _errors.RevisionNotPresent
@@ -107,6 +108,7 @@ __all__ = [
     "LockError",
     "LockNotHeld",
     "NoSuchFile",
+    "NoSuchId",
     "NoSuchRevision",
     "NotVersionedError",
     "ObjectNotLocked",
