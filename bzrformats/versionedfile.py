@@ -19,12 +19,10 @@
 from copy import copy
 from typing import Any
 
-from . import multiparent, osutils
 from ._bzr_rs import textmerge as _textmerge_rs
 from ._bzr_rs import versionedfile as _versionedfile_rs
 from .errors import (
     ExistingContent,  # noqa: F401  re-exported for callers (e.g. breezy)
-    RevisionNotPresent,
     UnavailableRepresentation,  # noqa: F401  re-exported for callers
 )
 from .registry import Registry
@@ -124,70 +122,11 @@ def filter_absent(record_stream):
             yield record
 
 
-class _MPDiffGenerator:
-    """Pull out the functionality for generating mp_diffs.
-
-    `compute_diffs` drives a pure-Rust fast path. The other methods exist
-    for callers that need step-by-step access to the intermediate state
-    (parent map, refcounts, ghost parents, chunk cache) - chiefly breezy's
-    whitebox tests.
-    """
-
-    def __init__(self, vf, keys):
-        self.vf = vf
-        self.ordered_keys = tuple(keys)
-        self.needed_keys = ()
-        self.diffs = {}
-        self.parent_map = {}
-        self.ghost_parents = ()
-        self.refcounts = {}
-        self.chunks = {}
-
-    def _find_needed_keys(self):
-        """Find the keys we need to request from the underlying vf.
-
-        Returns ``(needed_keys, refcounts)``. ``needed_keys`` is the set of
-        all texts we need to extract; ``refcounts`` is a dict
-        ``{key: num_children}`` so callers know when a cached parent text
-        can be released.
-        """
-        parent_map = self.vf.get_parent_map(set(self.ordered_keys))
-        self.parent_map = parent_map
-        needed_keys, refcounts, just_parents, missing_keys = (
-            _versionedfile_rs.mpdiff_first_pass(self.ordered_keys, parent_map)
-        )
-        if missing_keys:
-            raise RevisionNotPresent(next(iter(missing_keys)), self.vf)
-        self.present_parents = set(self.vf.get_parent_map(just_parents))
-        self.ghost_parents = just_parents.difference(self.present_parents)
-        needed_keys.difference_update(self.ghost_parents)
-        self.needed_keys = needed_keys
-        self.refcounts = refcounts
-        return needed_keys, refcounts
-
-    def _compute_diff(self, key, parent_lines, lines):
-        diff = multiparent.MultiParent.from_lines(lines, parent_lines, None)
-        self.diffs[key] = diff
-
-    def _process_one_record(self, key, this_chunks):
-        if key in self.parent_map:
-            parent_keys = self.parent_map.pop(key)
-            if parent_keys is None:
-                parent_keys = ()
-            parent_chunks_list = _versionedfile_rs.mpdiff_collect_parent_chunks(
-                parent_keys, self.ghost_parents, self.refcounts, self.chunks
-            )
-            parent_lines = [osutils.chunks_to_lines(pc) for pc in parent_chunks_list]
-            lines = osutils.chunks_to_lines(this_chunks)
-            this_chunks = lines
-            self._compute_diff(key, parent_lines, lines)
-            del lines
-        if key in self.refcounts:
-            self.chunks[key] = this_chunks
-
-    def compute_diffs(self):
-        """Return one `MultiParent` per ordered key, in input order."""
-        return list(_versionedfile_rs.make_mpdiffs(self.vf, self.ordered_keys))
+# _MPDiffGenerator is implemented as a subclassable Rust pyclass: compute_diffs
+# drives the pure-Rust make_mpdiffs fast path, while _find_needed_keys /
+# _process_one_record / _compute_diff and the intermediate state remain
+# available for callers (e.g. breezy's _MPDiffInventoryGenerator subclass).
+_MPDiffGenerator = _versionedfile_rs._MPDiffGenerator
 
 
 # VersionedFile is an abstract base implemented as a Rust pyclass; the

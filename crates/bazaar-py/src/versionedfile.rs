@@ -3238,6 +3238,167 @@ impl PyVersionedFilesWithFallbacks {
     }
 }
 
+/// Pull out the functionality for generating mp_diffs. Ported from
+/// `bzrformats.versionedfile._MPDiffGenerator`.
+///
+/// `compute_diffs` drives the pure-Rust `make_mpdiffs` fast path. The other
+/// methods (`_find_needed_keys`, `_process_one_record`, `_compute_diff`) and
+/// the intermediate state (parent_map, refcounts, ghost_parents, chunks, diffs)
+/// exist for callers that need step-by-step access -- chiefly breezy's
+/// `_MPDiffInventoryGenerator` subclass. Subclassable; state lives in `__dict__`.
+#[pyclass(
+    name = "_MPDiffGenerator",
+    subclass,
+    dict,
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+pub struct PyMPDiffGenerator;
+
+#[pymethods]
+impl PyMPDiffGenerator {
+    #[new]
+    fn new(vf: Py<PyAny>, keys: Py<PyAny>) -> Self {
+        let _ = (vf, keys);
+        PyMPDiffGenerator
+    }
+
+    fn __init__(
+        slf: &Bound<'_, Self>,
+        vf: Bound<'_, PyAny>,
+        keys: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        slf.setattr("vf", vf)?;
+        let ordered = py.import("builtins")?.getattr("tuple")?.call1((keys,))?;
+        slf.setattr("ordered_keys", ordered)?;
+        slf.setattr("needed_keys", PyTuple::empty(py))?;
+        slf.setattr("diffs", PyDict::new(py))?;
+        slf.setattr("parent_map", PyDict::new(py))?;
+        slf.setattr("ghost_parents", PyTuple::empty(py))?;
+        slf.setattr("refcounts", PyDict::new(py))?;
+        slf.setattr("chunks", PyDict::new(py))?;
+        Ok(())
+    }
+
+    /// Find the keys we need to request from the underlying vf, returning
+    /// `(needed_keys, refcounts)`.
+    fn _find_needed_keys<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PySet>, Bound<'py, PyDict>)> {
+        let py = slf.py();
+        let vf = slf.getattr("vf")?;
+        let ordered_keys = slf.getattr("ordered_keys")?;
+        let key_set = PySet::empty(py)?;
+        for k in ordered_keys.try_iter()? {
+            key_set.add(k?)?;
+        }
+        let parent_map = vf.call_method1("get_parent_map", (&key_set,))?;
+        let parent_map = parent_map.downcast::<PyDict>()?;
+        slf.setattr("parent_map", parent_map)?;
+        let module = py.import("bzrformats._bzr_rs.versionedfile")?;
+        let res = module
+            .getattr("mpdiff_first_pass")?
+            .call1((&ordered_keys, parent_map))?;
+        let needed_keys = res.get_item(0)?.downcast_into::<PySet>()?;
+        let refcounts = res.get_item(1)?.downcast_into::<PyDict>()?;
+        let just_parents = res.get_item(2)?;
+        let missing_keys = res.get_item(3)?;
+        if missing_keys.is_truthy()? {
+            let first = missing_keys.try_iter()?.next().unwrap()?;
+            return Err(crate::annotate::revision_not_present(py, first, &vf));
+        }
+        // present_parents = set(vf.get_parent_map(just_parents))
+        let pp_map = vf.call_method1("get_parent_map", (&just_parents,))?;
+        let present_parents = PySet::empty(py)?;
+        for k in pp_map.try_iter()? {
+            present_parents.add(k?)?;
+        }
+        // ghost_parents = just_parents - present_parents
+        let ghost_parents = just_parents.call_method1("difference", (&present_parents,))?;
+        needed_keys.call_method1("difference_update", (&ghost_parents,))?;
+        slf.setattr("present_parents", &present_parents)?;
+        slf.setattr("ghost_parents", &ghost_parents)?;
+        slf.setattr("needed_keys", &needed_keys)?;
+        slf.setattr("refcounts", &refcounts)?;
+        Ok((needed_keys, refcounts))
+    }
+
+    fn _compute_diff(
+        slf: &Bound<'_, Self>,
+        key: Bound<'_, PyAny>,
+        parent_lines: Bound<'_, PyAny>,
+        lines: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        let diff = py
+            .import("bzrformats.multiparent")?
+            .getattr("MultiParent")?
+            .getattr("from_lines")?
+            .call1((lines, parent_lines, py.None()))?;
+        slf.getattr("diffs")?
+            .downcast::<PyDict>()?
+            .set_item(&key, diff)?;
+        Ok(())
+    }
+
+    fn _process_one_record(
+        slf: &Bound<'_, Self>,
+        key: Bound<'_, PyAny>,
+        this_chunks: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        let parent_map = slf.getattr("parent_map")?;
+        let parent_map = parent_map.downcast::<PyDict>()?;
+        let refcounts = slf.getattr("refcounts")?;
+        let refcounts = refcounts.downcast::<PyDict>()?;
+        let chunks = slf.getattr("chunks")?;
+        let chunks = chunks.downcast::<PyDict>()?;
+        let osutils = py.import("bzrformats.osutils")?;
+        let chunks_to_lines = osutils.getattr("chunks_to_lines")?;
+        let mut this_chunks = this_chunks;
+        if parent_map.contains(&key)? {
+            let parent_keys = parent_map.call_method1("pop", (&key,))?;
+            let parent_keys = if parent_keys.is_none() {
+                PyTuple::empty(py).into_any()
+            } else {
+                parent_keys
+            };
+            let ghost_parents = slf.getattr("ghost_parents")?;
+            let parent_chunks_list = py
+                .import("bzrformats._bzr_rs.versionedfile")?
+                .getattr("mpdiff_collect_parent_chunks")?
+                .call1((&parent_keys, ghost_parents, refcounts, chunks))?;
+            let parent_lines = PyList::empty(py);
+            for pc in parent_chunks_list.try_iter()? {
+                parent_lines.append(chunks_to_lines.call1((pc?,))?)?;
+            }
+            let lines = chunks_to_lines.call1((&this_chunks,))?;
+            this_chunks = lines.clone();
+            Self::_compute_diff(slf, key.clone(), parent_lines.into_any(), lines)?;
+        }
+        if refcounts.contains(&key)? {
+            chunks.set_item(&key, this_chunks)?;
+        }
+        Ok(())
+    }
+
+    /// Return one `MultiParent` per ordered key, in input order.
+    fn compute_diffs<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyList>> {
+        let py = slf.py();
+        let vf = slf.getattr("vf")?;
+        let ordered_keys = slf.getattr("ordered_keys")?;
+        let diffs = py
+            .import("bzrformats._bzr_rs.versionedfile")?
+            .getattr("make_mpdiffs")?
+            .call1((&vf, &ordered_keys))?;
+        py.import("builtins")?
+            .getattr("list")?
+            .call1((diffs,))?
+            .downcast_into::<PyList>()
+            .map_err(Into::into)
+    }
+}
+
 /// Storage for many versioned files thunked onto a per-prefix `VersionedFile`
 /// class. Ported from `bzrformats.versionedfile.ThunkedVersionedFiles`.
 ///
@@ -3966,6 +4127,7 @@ impl PyPlanMergeVersionedFile {
 
 pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "versionedfile")?;
+    m.add_class::<PyMPDiffGenerator>()?;
     m.add_class::<PyPlanMergeVersionedFile>()?;
     m.add_class::<PyThunkedVersionedFiles>()?;
     m.add_class::<AbstractContentFactory>()?;
