@@ -21,7 +21,7 @@ pyo3::import_exception!(bzrformats._bzr_rs.errors, LockNotHeld);
 pyo3::import_exception!(bzrformats._bzr_rs.errors, ObjectNotLocked);
 pyo3::import_exception!(bzrformats.inventory, DuplicateFileId);
 pyo3::import_exception!(bzrformats.inventory, InvalidEntryName);
-pyo3::import_exception!(bzrformats.dirstate, DirstateCorrupt);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, DirstateCorrupt);
 
 /// `bazaar::dirstate::Transport` adapter backed by a Python file-like
 /// object.  Used by `DirStateRs.save_to_file` so the pure-Rust

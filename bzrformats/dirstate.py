@@ -53,30 +53,16 @@ are not - this is done for clarity of reading. All string data is in utf8.
     fingerprint = a nonempty utf8 sequence with meaning defined by minikind.
 """
 
-from .errors import BzrFormatsError
+# DirstateCorrupt lives in the Rust errors module; re-export it so
+# bzrformats.dirstate.DirstateCorrupt keeps working for callers and for the
+# Rust import_exception!(bzrformats._bzr_rs.errors, DirstateCorrupt) sites.
+from .errors import DirstateCorrupt  # noqa: F401
 
 # This is the Windows equivalent of ENOTDIR
 # It is defined in pywin32.winerror, but we don't want a strong dependency for
 # just an error code.
 ERROR_PATH_NOT_FOUND = 3
 ERROR_DIRECTORY = 267
-
-
-class DirstateCorrupt(BzrFormatsError):
-    """Exception raised when a dirstate file is corrupt."""
-
-    _fmt = "The dirstate file (%(state)s) appears to be corrupt: %(msg)s"
-
-    def __init__(self, state, msg):
-        """Create a DirstateCorrupt exception.
-
-        Args:
-            state: The dirstate that is corrupt.
-            msg: Error message describing the corruption.
-        """
-        super().__init__()
-        self.state = state
-        self.msg = msg
 
 
 class SHA1Provider:

@@ -72,6 +72,7 @@ InconsistentDelta = _errors.InconsistentDelta
 InconsistentDeltaDelta = _errors.InconsistentDeltaDelta
 InternalBzrFormatsError = _errors.InternalBzrFormatsError
 BzrCheckError = _errors.BzrCheckError
+DirstateCorrupt = _errors.DirstateCorrupt
 NoSuchRevision = _errors.NoSuchRevision
 ContainerError = _errors.ContainerError
 UnknownContainerFormatError = _errors.UnknownContainerFormatError
@@ -105,6 +106,7 @@ __all__ = [
     "ContainerError",
     "ContainerHasExcessDataError",
     "DecompressCorruption",
+    "DirstateCorrupt",
     "DuplicateFileId",
     "DuplicateRecordNameError",
     "ExistingContent",

@@ -431,6 +431,7 @@ simple_error!(BadFileKindError: BzrFormatsError, "Cannot operate on %(filename)s
 
 simple_error!(InternalBzrFormatsError: BzrFormatsError, "Internal error", internal_error = true);
 simple_error!(BzrCheckError: InternalBzrFormatsError, "Internal check failed: %(msg)s"; msg);
+simple_error!(DirstateCorrupt: BzrFormatsError, "The dirstate file (%(state)s) appears to be corrupt: %(msg)s"; state, msg);
 simple_error!(NoSuchRevision: InternalBzrFormatsError, "%(branch)s has no revision %(revision)s"; branch, revision);
 
 // Container (pack) format errors, ported from bzrformats.pack.
@@ -840,6 +841,7 @@ pub(crate) fn errors_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_class::<InconsistentDeltaDelta>()?;
     m.add_class::<InternalBzrFormatsError>()?;
     m.add_class::<BzrCheckError>()?;
+    m.add_class::<DirstateCorrupt>()?;
     m.add_class::<NoSuchRevision>()?;
     m.add_class::<ContainerError>()?;
     m.add_class::<UnknownContainerFormatError>()?;

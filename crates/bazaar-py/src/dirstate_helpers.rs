@@ -13,7 +13,7 @@ use bazaar::dirstate::{
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 
-pyo3::import_exception!(bzrformats.dirstate, DirstateCorrupt);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, DirstateCorrupt);
 
 /// Convert a `DirblocksError` from the pure crate into the Python-level
 /// `DirstateCorrupt` exception that Python callers expect.
