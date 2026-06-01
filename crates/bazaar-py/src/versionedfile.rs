@@ -3238,6 +3238,305 @@ impl PyVersionedFilesWithFallbacks {
     }
 }
 
+/// A minimal VersionedFiles that records the calls made on it, delegating to a
+/// backing vf. Ported from
+/// `bzrformats.versionedfile.RecordingVersionedFilesDecorator`. Test support.
+#[pyclass(
+    name = "RecordingVersionedFilesDecorator",
+    subclass,
+    dict,
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+pub struct PyRecordingVersionedFilesDecorator;
+
+impl PyRecordingVersionedFilesDecorator {
+    fn record(slf: &Bound<'_, Self>, call: Bound<'_, PyAny>) -> PyResult<()> {
+        slf.getattr("calls")?.call_method1("append", (call,))?;
+        Ok(())
+    }
+
+    fn backing<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        slf.getattr("_backing_vf")
+    }
+}
+
+#[pymethods]
+impl PyRecordingVersionedFilesDecorator {
+    #[new]
+    fn new(backing_vf: Py<PyAny>) -> Self {
+        let _ = backing_vf;
+        PyRecordingVersionedFilesDecorator
+    }
+
+    fn __init__(slf: &Bound<'_, Self>, backing_vf: Bound<'_, PyAny>) -> PyResult<()> {
+        slf.setattr("_backing_vf", backing_vf)?;
+        slf.setattr("calls", PyList::empty(slf.py()))?;
+        Ok(())
+    }
+
+    #[pyo3(signature = (key, parents, lines, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_lines<'py>(
+        slf: &Bound<'py, Self>,
+        key: Bound<'py, PyAny>,
+        parents: Bound<'py, PyAny>,
+        lines: Bound<'py, PyAny>,
+        parent_texts: Option<Bound<'py, PyAny>>,
+        left_matching_blocks: Option<Bound<'py, PyAny>>,
+        nostore_sha: Option<Bound<'py, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let none = py.None();
+        let pt = parent_texts.unwrap_or_else(|| none.clone_ref(py).into_bound(py));
+        let lmb = left_matching_blocks.unwrap_or_else(|| none.clone_ref(py).into_bound(py));
+        let nss = nostore_sha.unwrap_or_else(|| none.clone_ref(py).into_bound(py));
+        Self::record(
+            slf,
+            (
+                "add_lines",
+                &key,
+                &parents,
+                &lines,
+                &pt,
+                &lmb,
+                &nss,
+                random_id,
+                check_content,
+            )
+                .into_pyobject(py)?
+                .into_any(),
+        )?;
+        Self::backing(slf)?.call_method1(
+            "add_lines",
+            (key, parents, lines, pt, lmb, nss, random_id, check_content),
+        )
+    }
+
+    #[pyo3(signature = (factory, parent_texts=None, left_matching_blocks=None, nostore_sha=None, random_id=false, check_content=true))]
+    fn add_content<'py>(
+        slf: &Bound<'py, Self>,
+        factory: Bound<'py, PyAny>,
+        parent_texts: Option<Bound<'py, PyAny>>,
+        left_matching_blocks: Option<Bound<'py, PyAny>>,
+        nostore_sha: Option<Bound<'py, PyAny>>,
+        random_id: bool,
+        check_content: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let none = py.None();
+        let pt = parent_texts.unwrap_or_else(|| none.clone_ref(py).into_bound(py));
+        let lmb = left_matching_blocks.unwrap_or_else(|| none.clone_ref(py).into_bound(py));
+        let nss = nostore_sha.unwrap_or_else(|| none.clone_ref(py).into_bound(py));
+        Self::record(
+            slf,
+            (
+                "add_content",
+                &factory,
+                &pt,
+                &lmb,
+                &nss,
+                random_id,
+                check_content,
+            )
+                .into_pyobject(py)?
+                .into_any(),
+        )?;
+        Self::backing(slf)?.call_method1(
+            "add_content",
+            (factory, pt, lmb, nss, random_id, check_content),
+        )
+    }
+
+    fn check(slf: &Bound<'_, Self>) -> PyResult<()> {
+        Self::backing(slf)?.call_method0("check")?;
+        Ok(())
+    }
+
+    fn get_parent_map<'py>(
+        slf: &Bound<'py, Self>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let copied = py.import("copy")?.getattr("copy")?.call1((&keys,))?;
+        Self::record(
+            slf,
+            ("get_parent_map", copied).into_pyobject(py)?.into_any(),
+        )?;
+        Self::backing(slf)?.call_method1("get_parent_map", (keys,))
+    }
+
+    fn get_record_stream<'py>(
+        slf: &Bound<'py, Self>,
+        keys: Bound<'py, PyAny>,
+        sort_order: Bound<'py, PyAny>,
+        include_delta_closure: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let keys_list = py.import("builtins")?.getattr("list")?.call1((&keys,))?;
+        Self::record(
+            slf,
+            (
+                "get_record_stream",
+                keys_list,
+                &sort_order,
+                &include_delta_closure,
+            )
+                .into_pyobject(py)?
+                .into_any(),
+        )?;
+        Self::backing(slf)?.call_method1(
+            "get_record_stream",
+            (keys, sort_order, include_delta_closure),
+        )
+    }
+
+    fn get_sha1s<'py>(
+        slf: &Bound<'py, Self>,
+        keys: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let copied = py.import("copy")?.getattr("copy")?.call1((&keys,))?;
+        Self::record(slf, ("get_sha1s", copied).into_pyobject(py)?.into_any())?;
+        Self::backing(slf)?.call_method1("get_sha1s", (keys,))
+    }
+
+    #[pyo3(signature = (keys, pb=None))]
+    fn iter_lines_added_or_present_in_keys<'py>(
+        slf: &Bound<'py, Self>,
+        keys: Bound<'py, PyAny>,
+        pb: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let copied = py.import("copy")?.getattr("copy")?.call1((&keys,))?;
+        Self::record(
+            slf,
+            ("iter_lines_added_or_present_in_keys", copied)
+                .into_pyobject(py)?
+                .into_any(),
+        )?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("pb", pb)?;
+        Self::backing(slf)?.call_method(
+            "iter_lines_added_or_present_in_keys",
+            (keys,),
+            Some(&kwargs),
+        )
+    }
+
+    fn keys<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        Self::record(slf, ("keys",).into_pyobject(py)?.into_any())?;
+        Self::backing(slf)?.call_method0("keys")
+    }
+}
+
+/// A `RecordingVersionedFilesDecorator` that returns keys in a defined priority
+/// order for `unordered` get_record_stream requests. Ported from
+/// `bzrformats.versionedfile.OrderingVersionedFilesDecorator`. Test support.
+#[pyclass(
+    name = "OrderingVersionedFilesDecorator",
+    extends = PyRecordingVersionedFilesDecorator,
+    dict,
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+pub struct PyOrderingVersionedFilesDecorator;
+
+#[pymethods]
+impl PyOrderingVersionedFilesDecorator {
+    #[new]
+    fn new(backing_vf: Py<PyAny>, key_priority: Py<PyAny>) -> PyClassInitializer<Self> {
+        let _ = (backing_vf, key_priority);
+        PyClassInitializer::from(PyRecordingVersionedFilesDecorator)
+            .add_subclass(PyOrderingVersionedFilesDecorator)
+    }
+
+    fn __init__(
+        slf: &Bound<'_, Self>,
+        backing_vf: Bound<'_, PyAny>,
+        key_priority: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        slf.setattr("_backing_vf", backing_vf)?;
+        slf.setattr("calls", PyList::empty(slf.py()))?;
+        slf.setattr("_key_priority", key_priority)?;
+        Ok(())
+    }
+
+    fn get_record_stream<'py>(
+        slf: &Bound<'py, Self>,
+        keys: Bound<'py, PyAny>,
+        sort_order: Bound<'py, PyAny>,
+        include_delta_closure: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let keys_list = py.import("builtins")?.getattr("list")?.call1((&keys,))?;
+        slf.getattr("calls")?.call_method1(
+            "append",
+            ((
+                "get_record_stream",
+                &keys_list,
+                &sort_order,
+                &include_delta_closure,
+            )
+                .into_pyobject(py)?,),
+        )?;
+        let backing = slf.getattr("_backing_vf")?;
+        let out = PyList::empty(py);
+        let is_unordered = sort_order
+            .extract::<String>()
+            .map(|s| s == "unordered")
+            .unwrap_or(false);
+        if is_unordered {
+            let key_priority = slf.getattr("_key_priority")?;
+            let mut keyed: Vec<(i64, Py<PyAny>)> = Vec::new();
+            for key in keys_list.try_iter()? {
+                let key = key?;
+                let prio: i64 = key_priority
+                    .call_method1("get", (&key, 0))?
+                    .extract()
+                    .unwrap_or(0);
+                keyed.push((prio, key.unbind()));
+            }
+            keyed.sort_by(|a, b| {
+                if a.0 != b.0 {
+                    return a.0.cmp(&b.0);
+                }
+                Python::attach(|py| {
+                    let ak = a.1.bind(py);
+                    let bk = b.1.bind(py);
+                    if ak.lt(bk).unwrap_or(false) {
+                        std::cmp::Ordering::Less
+                    } else if ak.gt(bk).unwrap_or(false) {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+            });
+            for (_prio, key) in keyed {
+                let single = PyList::new(py, [key.bind(py)])?;
+                let stream = backing.call_method1(
+                    "get_record_stream",
+                    (single, "unordered", &include_delta_closure),
+                )?;
+                for record in stream.try_iter()? {
+                    out.append(record?)?;
+                }
+            }
+        } else {
+            let stream = backing.call_method1(
+                "get_record_stream",
+                (keys, sort_order, include_delta_closure),
+            )?;
+            for record in stream.try_iter()? {
+                out.append(record?)?;
+            }
+        }
+        out.into_any().try_iter().map(|i| i.into_any())
+    }
+}
+
 /// Pull out the functionality for generating mp_diffs. Ported from
 /// `bzrformats.versionedfile._MPDiffGenerator`.
 ///
@@ -4128,6 +4427,8 @@ impl PyPlanMergeVersionedFile {
 pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "versionedfile")?;
     m.add_class::<PyMPDiffGenerator>()?;
+    m.add_class::<PyRecordingVersionedFilesDecorator>()?;
+    m.add_class::<PyOrderingVersionedFilesDecorator>()?;
     m.add_class::<PyPlanMergeVersionedFile>()?;
     m.add_class::<PyThunkedVersionedFiles>()?;
     m.add_class::<AbstractContentFactory>()?;
