@@ -22,6 +22,8 @@ import shutil
 import sys
 import unicodedata
 
+from ._bzr_rs import osutils as _osutils_rs
+
 
 def isdir(path):
     """Return True if the given path exists and is a directory."""
@@ -255,12 +257,9 @@ def safe_unicode(unicode_or_utf8_string):
     Otherwise it is decoded from utf-8. If decoding fails, the exception is
     wrapped in a TypeError exception.
     """
-    if isinstance(unicode_or_utf8_string, (str, os.PathLike)):
-        return unicode_or_utf8_string
-    try:
-        return unicode_or_utf8_string.decode("utf8")
-    except UnicodeDecodeError as e:
-        raise TypeError(unicode_or_utf8_string) from e
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.safe_unicode(unicode_or_utf8_string)
 
 
 def safe_utf8(unicode_or_utf8_string):
@@ -269,14 +268,9 @@ def safe_utf8(unicode_or_utf8_string):
     If it is a str, it is returned.
     If it is Unicode, it is encoded into a utf-8 string.
     """
-    if isinstance(unicode_or_utf8_string, bytes):
-        # Make sure it is a valid utf-8 string
-        try:
-            unicode_or_utf8_string.decode("utf-8")
-        except UnicodeDecodeError as e:
-            raise TypeError(unicode_or_utf8_string) from e
-        return unicode_or_utf8_string
-    return unicode_or_utf8_string.encode("utf-8")
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.safe_utf8(unicode_or_utf8_string)
 
 
 def _walkdirs_utf8(top, prefix="", fs_enc=None):
@@ -423,59 +417,6 @@ def split_lines(text):
     return _osutils_rs.split_lines(text)
 
 
-class IterableFile:
-    """A file-like object backed by an iterator of byte strings.
-
-    Supports ``read()`` and ``readline()`` over a lazy sequence of chunks.
-    """
-
-    def __init__(self, iterable):
-        """Initialize with an iterable of byte chunks."""
-        self._iter = iter(iterable)
-        self._buf = b""
-
-    def read(self, size=-1):
-        """Read up to *size* bytes, or all remaining if *size* < 0."""
-        if size < 0:
-            return self._buf + b"".join(self._iter)
-        while len(self._buf) < size:
-            try:
-                self._buf += next(self._iter)
-            except StopIteration:
-                break
-        result = self._buf[:size]
-        self._buf = self._buf[size:]
-        return result
-
-    def readline(self):
-        r"""Read one line (up to and including ``\\n``)."""
-        while b"\n" not in self._buf:
-            try:
-                self._buf += next(self._iter)
-            except StopIteration:
-                # Return whatever is left
-                result = self._buf
-                self._buf = b""
-                return result
-        idx = self._buf.index(b"\n") + 1
-        result = self._buf[:idx]
-        self._buf = self._buf[idx:]
-        return result
-
-    def readlines(self):
-        """Return all remaining lines as a list."""
-        lines = []
-        while True:
-            line = self.readline()
-            if not line:
-                break
-            lines.append(line)
-        return lines
-
-    def __iter__(self):
-        """Iterate over lines."""
-        while True:
-            line = self.readline()
-            if not line:
-                break
-            yield line
+# IterableFile is a Rust pyclass (a file-like object over an iterator of byte
+# chunks); re-exported here.
+IterableFile = _osutils_rs.IterableFile

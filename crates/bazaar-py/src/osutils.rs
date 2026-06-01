@@ -1,3 +1,4 @@
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyModule};
 use std::path::{Path, PathBuf};
@@ -219,6 +220,143 @@ fn file_kind_from_stat_mode(mode: u32) -> &'static str {
     }
 }
 
+/// Coerce a str/PathLike/utf-8-bytes value to str. Mirrors
+/// `osutils.safe_unicode` (raises TypeError on invalid utf-8 bytes).
+#[pyfunction]
+fn safe_unicode<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    if value.is_instance_of::<pyo3::types::PyString>() {
+        return Ok(value);
+    }
+    // os.PathLike is left as-is too.
+    let pathlike = py.import("os")?.getattr("PathLike")?;
+    if value.is_instance(&pathlike)? {
+        return Ok(value);
+    }
+    match value.call_method1("decode", ("utf8",)) {
+        Ok(s) => Ok(s),
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyUnicodeDecodeError>(py) => {
+            Err(PyTypeError::new_err(value.unbind()))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Coerce a str/utf-8-bytes value to utf-8 bytes. Mirrors `osutils.safe_utf8`
+/// (raises TypeError on invalid utf-8 bytes).
+#[pyfunction]
+fn safe_utf8<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    if let Ok(b) = value.downcast::<PyBytes>() {
+        // Validate utf-8, matching the Python guard.
+        if std::str::from_utf8(b.as_bytes()).is_err() {
+            return Err(PyTypeError::new_err(value.unbind()));
+        }
+        return Ok(value);
+    }
+    value.call_method1("encode", ("utf-8",))
+}
+
+/// A file-like object backed by an iterator of byte chunks, supporting
+/// read/readline/readlines and line iteration. Mirrors `osutils.IterableFile`.
+#[pyclass(name = "IterableFile", module = "bzrformats._bzr_rs.osutils")]
+struct PyIterableFile {
+    iter: Py<PyAny>,
+    buf: Vec<u8>,
+}
+
+impl PyIterableFile {
+    /// Pull the next chunk from the iterator into `buf`; return false at end.
+    fn fill_one(&mut self, py: Python<'_>) -> PyResult<bool> {
+        match self.iter.bind(py).call_method0("__next__") {
+            Ok(chunk) => {
+                self.buf
+                    .extend_from_slice(chunk.downcast::<PyBytes>()?.as_bytes());
+                Ok(true)
+            }
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[pymethods]
+impl PyIterableFile {
+    #[new]
+    fn new(py: Python<'_>, iterable: Bound<'_, PyAny>) -> PyResult<Self> {
+        let iter = py
+            .import("builtins")?
+            .getattr("iter")?
+            .call1((iterable,))?
+            .unbind();
+        Ok(PyIterableFile {
+            iter,
+            buf: Vec::new(),
+        })
+    }
+
+    #[pyo3(signature = (size=-1))]
+    fn read<'py>(&mut self, py: Python<'py>, size: isize) -> PyResult<Bound<'py, PyBytes>> {
+        if size < 0 {
+            while self.fill_one(py)? {}
+            let out = PyBytes::new(py, &self.buf);
+            self.buf.clear();
+            return Ok(out);
+        }
+        let size = size as usize;
+        while self.buf.len() < size {
+            if !self.fill_one(py)? {
+                break;
+            }
+        }
+        let take = size.min(self.buf.len());
+        let out = PyBytes::new(py, &self.buf[..take]);
+        self.buf.drain(..take);
+        Ok(out)
+    }
+
+    fn readline<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                let out = PyBytes::new(py, &self.buf[..=pos]);
+                self.buf.drain(..=pos);
+                return Ok(out);
+            }
+            if !self.fill_one(py)? {
+                let out = PyBytes::new(py, &self.buf);
+                self.buf.clear();
+                return Ok(out);
+            }
+        }
+    }
+
+    fn readlines<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        loop {
+            let line = self.readline(py)?;
+            if line.as_bytes().is_empty() {
+                break;
+            }
+            out.append(line)?;
+        }
+        Ok(out)
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let line = slf.readline(py)?;
+        if line.as_bytes().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(line))
+        }
+    }
+}
+
 pub fn _osutils_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(split_lines, m)?)?;
     m.add_function(wrap_pyfunction!(rand_chars, m)?)?;
@@ -235,5 +373,8 @@ pub fn _osutils_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sha_file, m)?)?;
     m.add_function(wrap_pyfunction!(splitpath, m)?)?;
     m.add_function(wrap_pyfunction!(file_kind_from_stat_mode, m)?)?;
+    m.add_function(wrap_pyfunction!(safe_unicode, m)?)?;
+    m.add_function(wrap_pyfunction!(safe_utf8, m)?)?;
+    m.add_class::<PyIterableFile>()?;
     Ok(())
 }
