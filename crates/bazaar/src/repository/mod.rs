@@ -54,4 +54,4 @@ pub trait RepositoryFormat {
 
 mod pack_2a;
 
-pub use pack_2a::{Pack2aRepository, RepositoryError};
+pub use pack_2a::{Pack2aRepository, RepositoryError, SharedTransport};

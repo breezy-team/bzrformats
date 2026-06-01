@@ -209,18 +209,26 @@ impl GcIndex for PackGcIndex {
     }
 }
 
+/// A transport that can be shared across the repository's stores.
+///
+/// The stores are `VersionedFiles`, which is `Send + Sync`, so the
+/// transport they read through must be too. The repository owns it via an
+/// `Arc` rather than borrowing, so the stores (and the `CHKInventory`s
+/// they back) can hold their own references with no lifetime threading.
+pub type SharedTransport = std::sync::Arc<dyn Transport + Send + Sync>;
+
 /// A [`GcAccess`] that reads raw groupcompress block bytes from the
 /// `.pack` files of the repository.
-struct PackGcAccess<'t> {
-    transport: &'t dyn Transport,
+struct PackGcAccess {
+    transport: SharedTransport,
     /// Cache of whole pack files, keyed by pack name. The packs a single
     /// repository produces are small enough to hold in memory; this avoids
     /// re-reading the file for every record.
     cache: std::sync::Mutex<HashMap<PackName, std::sync::Arc<Vec<u8>>>>,
 }
 
-impl<'t> PackGcAccess<'t> {
-    fn new(transport: &'t dyn Transport) -> Self {
+impl PackGcAccess {
+    fn new(transport: SharedTransport) -> Self {
         PackGcAccess {
             transport,
             cache: std::sync::Mutex::new(HashMap::new()),
@@ -245,7 +253,7 @@ impl<'t> PackGcAccess<'t> {
     }
 }
 
-impl GcAccess for PackGcAccess<'_> {
+impl GcAccess for PackGcAccess {
     type F = PackName;
 
     fn get_raw_records(&self, memos: &[ReadMemo<Self::F>]) -> Result<Vec<Vec<u8>>, KnitError> {
@@ -281,22 +289,59 @@ impl GcAccess for PackGcAccess<'_> {
 }
 
 /// A groupcompress store for one kind of object in the repository.
-type Store<'t> = GroupCompressVersionedFiles<PackGcIndex, PackGcAccess<'t>>;
+type Store = GroupCompressVersionedFiles<PackGcIndex, PackGcAccess>;
 
-/// A read-only view of a 2a pack repository.
-pub struct Pack2aRepository<'t> {
-    revisions: Store<'t>,
+/// Build the groupcompress store for one index kind across all packs.
+fn build_store(
+    transport: &SharedTransport,
+    packs: &[PackName],
+    kind: IndexKind,
+) -> Result<Store, RepositoryError> {
+    let index = PackGcIndex::load(transport.as_ref(), packs, kind)?;
+    let access = PackGcAccess::new(transport.clone());
+    Ok(GroupCompressVersionedFiles::new(index, access, false))
 }
 
-impl<'t> Pack2aRepository<'t> {
+/// The CHK byte store as a trait object, so it can be shared with the
+/// `CHKInventory`s it materializes without leaking the concrete store
+/// type into the public API.
+type SharedChkStore = std::sync::Arc<dyn crate::versionedfile::VersionedFiles + Send + Sync>;
+
+/// A read-only view of a 2a pack repository.
+pub struct Pack2aRepository {
+    /// Retained so the write side can re-read `pack-names` and add packs.
+    #[allow(dead_code)]
+    transport: SharedTransport,
+    revisions: Store,
+    inventories: Store,
+    texts: Store,
+    /// The CHK byte store, shared with the `CHKInventory`s it materializes.
+    chk_bytes: SharedChkStore,
+}
+
+impl Pack2aRepository {
     /// Open the repository whose `.bzr/repository` directory is rooted at
     /// `transport`.
-    pub fn open(transport: &'t dyn Transport) -> Result<Self, RepositoryError> {
-        let packs = read_pack_names(transport)?;
-        let rev_index = PackGcIndex::load(transport, &packs, IndexKind::Revision)?;
-        let rev_access = PackGcAccess::new(transport);
-        let revisions = GroupCompressVersionedFiles::new(rev_index, rev_access, false);
-        Ok(Pack2aRepository { revisions })
+    pub fn open(transport: SharedTransport) -> Result<Self, RepositoryError> {
+        let packs = read_pack_names(transport.as_ref())?;
+        let revisions = build_store(&transport, &packs, IndexKind::Revision)?;
+        let inventories = build_store(&transport, &packs, IndexKind::Inventory)?;
+        let texts = build_store(&transport, &packs, IndexKind::Text)?;
+        let chk_bytes: SharedChkStore =
+            std::sync::Arc::new(build_store(&transport, &packs, IndexKind::Chk)?);
+        Ok(Pack2aRepository {
+            transport,
+            revisions,
+            inventories,
+            texts,
+            chk_bytes,
+        })
+    }
+
+    /// The list of pack names, read fresh from `pack-names`.
+    #[allow(dead_code)]
+    fn pack_names(&self) -> Result<Vec<PackName>, RepositoryError> {
+        read_pack_names(self.transport.as_ref())
     }
 
     /// All revision ids stored in this repository.
@@ -331,6 +376,68 @@ impl<'t> Pack2aRepository<'t> {
         crate::bencode_serializer::BEncodeRevisionSerializer1
             .read_revision_from_string(&bytes)
             .map_err(|e| RepositoryError::Corrupt(format!("revision parse: {e:?}")))
+    }
+
+    /// Read the CHK inventory for a revision.
+    ///
+    /// Reads the serialised `CHKInventory` header from the inventories
+    /// store, then materializes it by walking the CHK maps through the
+    /// shared chk-bytes store.
+    pub fn get_inventory(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<
+        crate::chk_inventory::CHKInventory<dyn crate::versionedfile::VersionedFiles + Send + Sync>,
+        RepositoryError,
+    > {
+        let key = Key::fixed(vec![revision_id.to_vec()]);
+        let mut stream = self.inventories.get_record_stream(&[key], "unordered")?;
+        let record = stream
+            .pop()
+            .ok_or_else(|| RepositoryError::NoSuchRevision(revision_id.to_vec()))?;
+        if record.storage_kind() == "absent" {
+            return Err(RepositoryError::NoSuchRevision(revision_id.to_vec()));
+        }
+        let lines: Vec<Vec<u8>> = record.to_lines().map(|l| l.into_owned()).collect();
+        let cache: std::sync::Arc<dyn crate::chk_map::PageCache> =
+            std::sync::Arc::new(crate::chk_map::InMemoryPageCache::new());
+        let rev_id = crate::RevisionId::from(revision_id);
+        crate::chk_inventory::CHKInventory::deserialise(
+            self.chk_bytes.clone(),
+            cache,
+            &lines,
+            &rev_id,
+        )
+        .map_err(|e| RepositoryError::Corrupt(format!("inventory deserialise: {e:?}")))
+    }
+
+    /// Read the full text of a versioned file at a given revision.
+    ///
+    /// Texts are keyed by `(file_id, revision)` — the revision that last
+    /// modified the file, as recorded in its inventory entry (not
+    /// necessarily the revision being inspected).
+    pub fn get_file_text(
+        &self,
+        file_id: &[u8],
+        revision: &[u8],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        let key = Key::fixed(vec![file_id.to_vec(), revision.to_vec()]);
+        let mut stream = self.texts.get_record_stream(&[key], "unordered")?;
+        let record = stream.pop().ok_or_else(|| {
+            RepositoryError::Corrupt(format!(
+                "no text for ({}, {})",
+                String::from_utf8_lossy(file_id),
+                String::from_utf8_lossy(revision)
+            ))
+        })?;
+        if record.storage_kind() == "absent" {
+            return Err(RepositoryError::Corrupt(format!(
+                "no text for ({}, {})",
+                String::from_utf8_lossy(file_id),
+                String::from_utf8_lossy(revision)
+            )));
+        }
+        Ok(record.to_fulltext().into_owned())
     }
 }
 
