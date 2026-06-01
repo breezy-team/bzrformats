@@ -11,7 +11,7 @@ pyo3::import_exception!(bzrformats._bzr_rs.errors, ObjectNotLocked);
 pyo3::import_exception!(bzrformats._bzr_rs.errors, ReadOnlyError);
 pyo3::import_exception!(bzrformats._bzr_rs.errors, RevisionNotPresent);
 pyo3::import_exception!(bzrformats._bzr_rs.errors, InvalidRevisionId);
-pyo3::import_exception!(bzrformats.groupcompress, DecompressCorruption);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, DecompressCorruption);
 pyo3::import_exception!(bzrformats.pack_repo, RetryWithNewPacks);
 pyo3::import_exception!(bzrformats.versionedfile, UnavailableRepresentation);
 

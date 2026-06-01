@@ -27,9 +27,11 @@ from ._bzr_rs.groupcompress import (  # noqa: F401
 from ._bzr_rs.groupcompress import (
     GroupCompressVersionedFiles as _GroupCompressVersionedFilesRs,
 )
-from .errors import (
-    BzrFormatsError,
-)
+
+# DecompressCorruption lives in the Rust errors module; re-export it so
+# bzrformats.groupcompress.DecompressCorruption keeps working for callers and
+# the Rust import_exception! site.
+from .errors import DecompressCorruption  # noqa: F401
 
 logger = logging.getLogger("bzrformats.groupcompress")
 
@@ -40,24 +42,6 @@ rabin_hash = _groupcompress_rs.rabin_hash
 # Minimum number of uncompressed bytes to try fetch at once when retrieving
 # groupcompress blocks.
 BATCH_SIZE = 2**16
-
-
-class DecompressCorruption(BzrFormatsError):
-    """Exception raised when repository file decompression fails."""
-
-    _fmt = "Corruption while decompressing repository file%(orig_error)s"
-
-    def __init__(self, orig_error=None):
-        """Initialize DecompressCorruption.
-
-        Args:
-            orig_error: The original error that caused the corruption.
-        """
-        if orig_error is not None:
-            self.orig_error = f", {orig_error}"
-        else:
-            self.orig_error = ""
-        super().__init__()
 
 
 _LazyGroupCompressFactory = _groupcompress_rs.LazyGroupCompressFactory
