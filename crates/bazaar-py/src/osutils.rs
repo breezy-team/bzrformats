@@ -207,17 +207,7 @@ fn splitpath<'py>(py: Python<'py>, path: Bound<'py, PyAny>) -> PyResult<Bound<'p
 /// `osutils.file_kind_from_stat_mode`.
 #[pyfunction]
 fn file_kind_from_stat_mode(mode: u32) -> &'static str {
-    // S_IFMT mask = 0o170000; compare the format bits.
-    match mode & 0o170000 {
-        0o100000 => "file",
-        0o040000 => "directory",
-        0o120000 => "symlink",
-        0o010000 => "fifo",
-        0o140000 => "socket",
-        0o020000 => "chardev",
-        0o060000 => "block",
-        _ => "unknown",
-    }
+    bazaar::osutils::kind_from_stat_mode(mode).as_str()
 }
 
 /// Coerce a str/PathLike/utf-8-bytes value to str. Mirrors

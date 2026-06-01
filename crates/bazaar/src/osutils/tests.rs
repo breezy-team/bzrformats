@@ -1,6 +1,43 @@
-use super::chunks_to_lines;
 use super::path::{accessible_normalized_filename, inaccessible_normalized_filename};
+use super::{chunks_to_lines, contains_whitespace, kind_from_stat_mode, StatKind};
 use std::path::{Path, PathBuf};
+
+#[test]
+fn test_contains_whitespace() {
+    assert!(contains_whitespace("hello world"));
+    assert!(contains_whitespace("hello\tworld"));
+    assert!(contains_whitespace("hello\nworld"));
+    assert!(contains_whitespace("hello\rworld"));
+    assert!(contains_whitespace("hello\u{000B}world"));
+    assert!(contains_whitespace("hello\u{000C}world"));
+    assert!(!contains_whitespace("helloworld"));
+    assert!(!contains_whitespace(""));
+}
+
+#[test]
+fn test_kind_from_stat_mode() {
+    // Format bits OR-ed with permission bits; permissions must not affect kind.
+    assert_eq!(kind_from_stat_mode(0o100000 | 0o644), StatKind::File);
+    assert_eq!(kind_from_stat_mode(0o040000 | 0o755), StatKind::Directory);
+    assert_eq!(kind_from_stat_mode(0o120000 | 0o777), StatKind::Symlink);
+    assert_eq!(kind_from_stat_mode(0o010000 | 0o666), StatKind::Fifo);
+    assert_eq!(kind_from_stat_mode(0o140000 | 0o666), StatKind::Socket);
+    assert_eq!(kind_from_stat_mode(0o020000 | 0o666), StatKind::CharDevice);
+    assert_eq!(kind_from_stat_mode(0o060000 | 0o666), StatKind::BlockDevice);
+    assert_eq!(kind_from_stat_mode(0o644), StatKind::Unknown);
+}
+
+#[test]
+fn test_stat_kind_as_str() {
+    assert_eq!(StatKind::File.as_str(), "file");
+    assert_eq!(StatKind::Directory.as_str(), "directory");
+    assert_eq!(StatKind::Symlink.as_str(), "symlink");
+    assert_eq!(StatKind::Fifo.as_str(), "fifo");
+    assert_eq!(StatKind::Socket.as_str(), "socket");
+    assert_eq!(StatKind::CharDevice.as_str(), "chardev");
+    assert_eq!(StatKind::BlockDevice.as_str(), "block");
+    assert_eq!(StatKind::Unknown.as_str(), "unknown");
+}
 
 fn assert_chunks_to_lines(input: Vec<&str>, expected: Vec<&str>) {
     let iter = input.iter().map(|l| Ok::<&[u8], String>(l.as_bytes()));
