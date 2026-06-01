@@ -3,9 +3,6 @@ name: Breezy test suite
 
 "on": [push, pull_request]
 
-env:
-  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
-
 jobs:
   breezy:
     name: Run breezy 3.4 tests against this bzrformats
