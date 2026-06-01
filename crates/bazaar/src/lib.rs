@@ -7,6 +7,7 @@ pub const DEFAULT_CHUNK_SIZE: usize = 4096;
 pub mod bencode_serializer;
 pub mod bisect_multi;
 pub mod btree_builder;
+pub mod btree_graph_index;
 pub mod btree_index;
 pub mod btree_serializer;
 pub mod bzrdir;
