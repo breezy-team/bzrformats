@@ -16,7 +16,6 @@
 
 """OS utilities for bzrformats using only standard library."""
 
-import hashlib
 import logging
 import os
 import shutil
@@ -120,40 +119,16 @@ def fdatasync(fileno):
 
 def splitpath(path):
     """Split a path into a list of components."""
-    if isinstance(path, bytes):
-        if path.startswith(b"/"):
-            path = path[1:]
-        if not path:
-            return []
-        return path.split(b"/")
-    else:
-        if path.startswith("/"):
-            path = path[1:]
-        if not path:
-            return []
-        return path.split("/")
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.splitpath(path)
 
 
 def file_kind_from_stat_mode(mode):
     """Return the file kind based on the stat mode."""
-    import stat
+    from ._bzr_rs import osutils as _osutils_rs
 
-    if stat.S_ISREG(mode):
-        return "file"
-    elif stat.S_ISDIR(mode):
-        return "directory"
-    elif stat.S_ISLNK(mode):
-        return "symlink"
-    elif stat.S_ISFIFO(mode):
-        return "fifo"
-    elif stat.S_ISSOCK(mode):
-        return "socket"
-    elif stat.S_ISCHR(mode):
-        return "chardev"
-    elif stat.S_ISBLK(mode):
-        return "block"
-    else:
-        return "unknown"
+    return _osutils_rs.file_kind_from_stat_mode(mode)
 
 
 def contains_whitespace(s):
@@ -167,34 +142,23 @@ def contains_whitespace(s):
 
 def sha_strings(strings):
     """Return the sha1 of concatenated strings."""
-    sha = hashlib.sha1()  # noqa: S324
-    for string in strings:
-        if isinstance(string, str):
-            # Convert unicode strings to bytes using UTF-8
-            string = string.encode("utf-8")
-        sha.update(string)
-    return sha.hexdigest().encode("ascii")
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.sha_strings(strings)
 
 
 def sha_string(string):
     """Return the sha1 of a single string."""
-    if isinstance(string, str):
-        # Convert unicode strings to bytes using UTF-8
-        string = string.encode("utf-8")
-    sha = hashlib.sha1()  # noqa: S324
-    sha.update(string)
-    return sha.hexdigest().encode("ascii")
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.sha_string(string)
 
 
 def sha_file(file_obj):
     """Return the sha1 of a file."""
-    sha = hashlib.sha1()  # noqa: S324
-    while True:
-        chunk = file_obj.read(65536)
-        if not chunk:
-            break
-        sha.update(chunk)
-    return sha.hexdigest().encode("ascii")
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.sha_file(file_obj)
 
 
 def dirname(path):

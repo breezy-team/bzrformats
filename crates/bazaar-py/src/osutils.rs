@@ -123,6 +123,102 @@ pub fn supports_symlinks(path: PathBuf) -> Option<bool> {
     bazaar::osutils::mounts::supports_symlinks(path)
 }
 
+/// Extract the utf-8 bytes of a str-or-bytes value (str is encoded utf-8).
+fn str_or_bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(b) = value.downcast::<PyBytes>() {
+        Ok(b.as_bytes().to_vec())
+    } else {
+        let s: String = value.extract()?;
+        Ok(s.into_bytes())
+    }
+}
+
+/// The sha1 of concatenated strings, as ascii hex bytes. str items are utf-8
+/// encoded. Mirrors `osutils.sha_strings`.
+#[pyfunction]
+fn sha_strings<'py>(py: Python<'py>, strings: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    for s in strings.try_iter()? {
+        chunks.push(str_or_bytes(&s?)?);
+    }
+    let hex = bazaar::osutils::sha::sha_chunks(chunks.iter());
+    Ok(PyBytes::new(py, hex.as_bytes()))
+}
+
+/// The sha1 of a single string, as ascii hex bytes. Mirrors
+/// `osutils.sha_string`.
+#[pyfunction]
+fn sha_string<'py>(py: Python<'py>, string: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    let bytes = str_or_bytes(&string)?;
+    let hex = bazaar::osutils::sha::sha_string(&bytes);
+    Ok(PyBytes::new(py, hex.as_bytes()))
+}
+
+/// The sha1 of a file object (read in 64KiB chunks), as ascii hex bytes.
+/// Mirrors `osutils.sha_file`.
+#[pyfunction]
+fn sha_file<'py>(py: Python<'py>, file_obj: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    loop {
+        let chunk = file_obj.call_method1("read", (65536,))?;
+        let bytes = chunk.downcast::<PyBytes>()?.as_bytes();
+        if bytes.is_empty() {
+            break;
+        }
+        hasher.update(bytes);
+    }
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+    Ok(PyBytes::new(py, hex.as_bytes()))
+}
+
+/// Split a path into a list of components, dropping a leading `/`. Preserves
+/// the str-vs-bytes type of `path`. Mirrors `osutils.splitpath`.
+#[pyfunction]
+fn splitpath<'py>(py: Python<'py>, path: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
+    if let Ok(b) = path.downcast::<PyBytes>() {
+        let mut data = b.as_bytes();
+        if data.first() == Some(&b'/') {
+            data = &data[1..];
+        }
+        let out = PyList::empty(py);
+        if !data.is_empty() {
+            for seg in data.split(|&c| c == b'/') {
+                out.append(PyBytes::new(py, seg))?;
+            }
+        }
+        Ok(out)
+    } else {
+        let s: String = path.extract()?;
+        let s = s.strip_prefix('/').unwrap_or(&s);
+        let out = PyList::empty(py);
+        if !s.is_empty() {
+            for seg in s.split('/') {
+                out.append(seg)?;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Map a stat `st_mode` to a bzr file-kind string. Mirrors
+/// `osutils.file_kind_from_stat_mode`.
+#[pyfunction]
+fn file_kind_from_stat_mode(mode: u32) -> &'static str {
+    // S_IFMT mask = 0o170000; compare the format bits.
+    match mode & 0o170000 {
+        0o100000 => "file",
+        0o040000 => "directory",
+        0o120000 => "symlink",
+        0o010000 => "fifo",
+        0o140000 => "socket",
+        0o020000 => "chardev",
+        0o060000 => "block",
+        _ => "unknown",
+    }
+}
+
 pub fn _osutils_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(split_lines, m)?)?;
     m.add_function(wrap_pyfunction!(rand_chars, m)?)?;
@@ -134,5 +230,10 @@ pub fn _osutils_rs(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(walkdirs_utf8, m)?)?;
     m.add_function(wrap_pyfunction!(normalizes_filenames, m)?)?;
     m.add_function(wrap_pyfunction!(supports_symlinks, m)?)?;
+    m.add_function(wrap_pyfunction!(sha_strings, m)?)?;
+    m.add_function(wrap_pyfunction!(sha_string, m)?)?;
+    m.add_function(wrap_pyfunction!(sha_file, m)?)?;
+    m.add_function(wrap_pyfunction!(splitpath, m)?)?;
+    m.add_function(wrap_pyfunction!(file_kind_from_stat_mode, m)?)?;
     Ok(())
 }
