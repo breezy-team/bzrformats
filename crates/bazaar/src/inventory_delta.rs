@@ -944,4 +944,198 @@ tree_references: true\n";
         let entry = Entry::tree_reference(file_id(), "a tree".to_string(), parent_id(), None, None);
         assert!(serialize_inventory_entry(&entry).is_err());
     }
+
+    fn rev(s: &[u8]) -> RevisionId {
+        RevisionId::from(s)
+    }
+
+    fn null_rev() -> RevisionId {
+        RevisionId::from(NULL_REVISION)
+    }
+
+    fn joined(lines: Vec<Vec<u8>>) -> Vec<u8> {
+        lines.concat()
+    }
+
+    #[test]
+    fn serialize_empty_delta_to_lines() {
+        let lines = serialize_inventory_delta(
+            &null_rev(),
+            &null_rev(),
+            &InventoryDelta(vec![]),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            joined(lines),
+            b"format: bzr inventory delta v1 (bzr 1.14)\n\
+              parent: null:\nversion: null:\n\
+              versioned_root: true\ntree_references: true\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_root_only_to_lines() {
+        // A single (added) versioned root entry.
+        let root = Entry::root(
+            FileId::from(&b"an-id"[..]),
+            Some(rev(b"a@e\xc3\xa5ample.com--2004")),
+        );
+        let delta = InventoryDelta(vec![InventoryDeltaEntry {
+            old_path: None,
+            new_path: Some("".to_string()),
+            file_id: FileId::from(&b"an-id"[..]),
+            new_entry: Some(root),
+        }]);
+        let lines =
+            serialize_inventory_delta(&null_rev(), &rev(b"entry-version"), &delta, true, true)
+                .unwrap();
+        assert_eq!(
+            joined(lines),
+            b"format: bzr inventory delta v1 (bzr 1.14)\n\
+              parent: null:\nversion: entry-version\n\
+              versioned_root: true\ntree_references: true\n\
+              None\x00/\x00an-id\x00\x00a@e\xc3\xa5ample.com--2004\x00dir\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_unversioned_root_to_lines() {
+        // versioned_root=false: the root's last_modified must equal the new
+        // version, and it serialises with an empty version field.
+        let root = Entry::root(FileId::from(&b"TREE_ROOT"[..]), Some(rev(b"entry-version")));
+        let delta = InventoryDelta(vec![InventoryDeltaEntry {
+            old_path: None,
+            new_path: Some("".to_string()),
+            file_id: FileId::from(&b"TREE_ROOT"[..]),
+            new_entry: Some(root),
+        }]);
+        let lines =
+            serialize_inventory_delta(&null_rev(), &rev(b"entry-version"), &delta, false, false)
+                .unwrap();
+        assert_eq!(
+            joined(lines),
+            b"format: bzr inventory delta v1 (bzr 1.14)\n\
+              parent: null:\nversion: entry-version\n\
+              versioned_root: false\ntree_references: false\n\
+              None\x00/\x00TREE_ROOT\x00\x00entry-version\x00dir\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn serialize_delete_entry_line() {
+        // A delete (new_path None) produces a 'deleted' content line.
+        let delta = InventoryDelta(vec![InventoryDeltaEntry {
+            old_path: Some("foo".to_string()),
+            new_path: None,
+            file_id: FileId::from(&b"foo-id"[..]),
+            new_entry: None,
+        }]);
+        let lines =
+            serialize_inventory_delta(&rev(b"old"), &rev(b"new"), &delta, true, true).unwrap();
+        // Last line is the delete record.
+        assert_eq!(
+            lines.last().unwrap().as_slice(),
+            b"/foo\x00None\x00foo-id\x00\x00null:\x00deleted\x00\x00\n"
+        );
+    }
+
+    #[test]
+    fn serialize_errors_when_no_version_for_fileid() {
+        // A non-root entry without a revision is rejected.
+        let entry = Entry::directory(
+            FileId::from(&b"id"[..]),
+            "foo".to_string(),
+            FileId::from(&b"TREE_ROOT"[..]),
+            None,
+        );
+        let delta = InventoryDelta(vec![InventoryDeltaEntry {
+            old_path: None,
+            new_path: Some("foo".to_string()),
+            file_id: FileId::from(&b"id"[..]),
+            new_entry: Some(entry),
+        }]);
+        let err =
+            serialize_inventory_delta(&null_rev(), &rev(b"entry-version"), &delta, true, true)
+                .unwrap_err();
+        match err {
+            InventoryDeltaSerializeError::Invalid(msg) => assert!(msg.contains("no version")),
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn serialize_errors_on_versioned_root_when_unversioned() {
+        // versioned_root=false but the root's revision differs from the new
+        // version: invalid.
+        let root = Entry::root(
+            FileId::from(&b"TREE_ROOT"[..]),
+            Some(rev(b"some-other-rev")),
+        );
+        let delta = InventoryDelta(vec![InventoryDeltaEntry {
+            old_path: None,
+            new_path: Some("".to_string()),
+            file_id: FileId::from(&b"TREE_ROOT"[..]),
+            new_entry: Some(root),
+        }]);
+        let err =
+            serialize_inventory_delta(&null_rev(), &rev(b"entry-version"), &delta, false, false)
+                .unwrap_err();
+        match err {
+            InventoryDeltaSerializeError::Invalid(msg) => assert!(msg.contains("Version present")),
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn serialize_errors_on_tree_reference_when_disabled() {
+        let entry = Entry::tree_reference(
+            FileId::from(&b"ref-id"[..]),
+            "sub".to_string(),
+            FileId::from(&b"TREE_ROOT"[..]),
+            Some(rev(b"ref-rev")),
+            Some(rev(b"entry-version")),
+        );
+        let delta = InventoryDelta(vec![InventoryDeltaEntry {
+            old_path: None,
+            new_path: Some("sub".to_string()),
+            file_id: FileId::from(&b"ref-id"[..]),
+            new_entry: Some(entry),
+        }]);
+        let err =
+            serialize_inventory_delta(&null_rev(), &rev(b"entry-version"), &delta, true, false)
+                .unwrap_err();
+        match err {
+            InventoryDeltaSerializeError::UnsupportedKind(k) => assert_eq!(k, "tree-reference"),
+            other => panic!("expected UnsupportedKind, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn serialize_errors_on_slash_newpath() {
+        let entry = Entry::directory(
+            FileId::from(&b"id"[..]),
+            "x".to_string(),
+            FileId::from(&b"TREE_ROOT"[..]),
+            Some(rev(b"r")),
+        );
+        let delta = InventoryDelta(vec![InventoryDeltaEntry {
+            old_path: None,
+            new_path: Some("/".to_string()),
+            file_id: FileId::from(&b"id"[..]),
+            new_entry: Some(entry),
+        }]);
+        let err =
+            serialize_inventory_delta(&null_rev(), &rev(b"v"), &delta, true, true).unwrap_err();
+        match err {
+            InventoryDeltaSerializeError::Invalid(msg) => {
+                assert!(msg.contains("not a valid newpath"))
+            }
+            other => panic!("expected Invalid, got {:?}", other),
+        }
+    }
 }
