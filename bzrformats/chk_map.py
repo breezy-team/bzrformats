@@ -55,34 +55,14 @@ clear_cache = _chk_map_rs.clear_cache
 _page_cache_get = _chk_map_rs._page_cache_get
 _page_cache_set = _chk_map_rs._page_cache_set
 
-
-class _PageCacheProxy:
-    """Dict-like view onto the Rust-backed CHK page cache.
-
-    Returned by :func:`_get_cache` for compatibility with callers
-    (notably breezy's test suite) that historically reached into the
-    pure-Python ``LRUSizeCache`` instance directly.
-    """
-
-    def __getitem__(self, key):
-        value = _page_cache_get(key)
-        if value is None:
-            raise KeyError(key)
-        return value
-
-    def __setitem__(self, key, value):
-        _page_cache_set(key, value)
-
-    def __contains__(self, key):
-        return _page_cache_get(key) is not None
-
-
-_page_cache_proxy = _PageCacheProxy()
-
-
-def _get_cache():
-    """Return a dict-like view onto the shared CHK page cache."""
-    return _page_cache_proxy
+# The dict-like page-cache view, the node deserialisers (which normalise a
+# bare-bytes key into a 1-tuple) and the _check_key debug helper are all
+# implemented in Rust and re-exported here.
+_PageCacheProxy = _chk_map_rs._PageCacheProxy
+_get_cache = _chk_map_rs._get_cache
+_deserialise_leaf_node = _chk_map_rs._deserialise_leaf_node
+_deserialise_internal_node = _chk_map_rs._deserialise_internal_node
+_check_key = _chk_map_rs._check_key
 
 
 # Plain search-key transform comes from the Rust extension so the
@@ -93,25 +73,6 @@ _search_key_plain = _chk_map_rs._search_key_plain
 
 search_key_registry = Registry[bytes, Callable[[Key], SerialisedKey], None]()
 search_key_registry.register(b"plain", _search_key_plain)
-
-
-def _deserialise_leaf_node(data, key, search_key_func=None):
-    """Deserialise bytes into a LeafNode pyclass instance.
-
-    Wraps a bare-bytes `key` into a 1-tuple — some callers/tests
-    pass a placeholder bytes value where the canonical form is
-    `(b"sha1:...",)`.
-    """
-    if isinstance(key, bytes):
-        key = (key,)
-    return _chk_map_rs.LeafNode.deserialise(data, key, search_key_func)
-
-
-def _deserialise_internal_node(data, key, search_key_func=None):
-    """Deserialise bytes into an InternalNode pyclass instance."""
-    if isinstance(key, bytes):
-        key = (key,)
-    return _chk_map_rs.InternalNode.deserialise(data, key, search_key_func)
 
 
 CHKMap = _chk_map_rs.CHKMap
@@ -250,19 +211,3 @@ _search_key_255 = _chk_map_rs._search_key_255
 
 search_key_registry.register(b"hash-16-way", _search_key_16)
 search_key_registry.register(b"hash-255-way", _search_key_255)
-
-
-def _check_key(key):
-    """Helper function to assert that a key is properly formatted.
-
-    This generally shouldn't be used in production code, but it can be helpful
-    to debug problems.
-    """
-    if not isinstance(key, tuple):
-        raise TypeError(f"key {key!r} is not tuple but {type(key)}")
-    if len(key) != 1:
-        raise ValueError(f"key {key!r} should have length 1, not {len(key)}")
-    if not isinstance(key[0], str):
-        raise TypeError(f"key {key!r} should hold a str, not {type(key[0])!r}")
-    if not key[0].startswith("sha1:"):
-        raise ValueError(f"key {key!r} should point to a sha1:")

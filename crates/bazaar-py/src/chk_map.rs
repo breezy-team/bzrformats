@@ -6,7 +6,7 @@ use bazaar::chk_map::{
 };
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use pyo3::wrap_pyfunction;
 
 pyo3::import_exception!(bzrformats._bzr_rs.errors, InconsistentDeltaDelta);
@@ -69,79 +69,48 @@ fn common_prefix_many(py: Python, keys: Vec<Vec<u8>>) -> Option<Bound<PyBytes>> 
 /// Deserialise a CHK leaf node body. Returns
 /// `(maximum_size, key_width, length, common_serialised_prefix, items, raw_size)`
 /// where `items` is a list of `(key_tuple, value)` pairs in file order.
+/// Normalise a CHK node `key`: callers/tests sometimes pass a bare bytes
+/// value where the canonical form is a 1-tuple `(b"sha1:...",)`. Wrap bare
+/// bytes into a 1-tuple; pass tuples through unchanged.
+fn normalise_node_key<'py>(
+    py: Python<'py>,
+    key: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    if let Ok(b) = key.clone().cast_into::<PyBytes>() {
+        return PyTuple::new(py, [b]);
+    }
+    Ok(key.cast_into::<PyTuple>()?)
+}
+
+/// Deserialise serialised bytes into a `LeafNode`. Mirrors the Python
+/// `chk_map._deserialise_leaf_node`: a bare-bytes `key` is wrapped into a
+/// 1-tuple before dispatching to `LeafNode.deserialise`.
 #[pyfunction]
-#[pyo3(name = "_deserialise_leaf_node")]
-#[allow(clippy::type_complexity)]
+#[pyo3(name = "_deserialise_leaf_node", signature = (data, key, search_key_func = None))]
 fn py_deserialise_leaf_node<'py>(
     py: Python<'py>,
     data: &[u8],
-) -> PyResult<(
-    usize,
-    usize,
-    usize,
-    Bound<'py, PyBytes>,
-    Bound<'py, PyList>,
-    usize,
-)> {
-    let p = deserialise_leaf_node(data).map_err(chk_err_to_py)?;
-    let items = PyList::empty(py);
-    for (key_elements, value) in &p.items {
-        let key_parts: Vec<Bound<PyBytes>> =
-            key_elements.iter().map(|e| PyBytes::new(py, e)).collect();
-        let key_tuple = PyTuple::new(py, key_parts)?;
-        let pair = PyTuple::new(
-            py,
-            [key_tuple.into_any(), PyBytes::new(py, value).into_any()],
-        )?;
-        items.append(pair)?;
-    }
-    Ok((
-        p.maximum_size,
-        p.key_width,
-        p.length,
-        PyBytes::new(py, &p.common_serialised_prefix),
-        items,
-        p.raw_size,
-    ))
+    key: Bound<'py, PyAny>,
+    search_key_func: Option<Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let key = normalise_node_key(py, key)?;
+    py.get_type::<LeafNode>()
+        .call_method("deserialise", (data, key, search_key_func), None)
 }
 
-/// Deserialise a CHK internal node body. Returns
-/// `(maximum_size, key_width, length, search_prefix, items, node_width)`
-/// where `items` is a list of `(prefix_bytes, flat_key_bytes)` pairs.
+/// Deserialise serialised bytes into an `InternalNode`. Mirrors the Python
+/// `chk_map._deserialise_internal_node`.
 #[pyfunction]
-#[pyo3(name = "_deserialise_internal_node")]
-#[allow(clippy::type_complexity)]
+#[pyo3(name = "_deserialise_internal_node", signature = (data, key, search_key_func = None))]
 fn py_deserialise_internal_node<'py>(
     py: Python<'py>,
     data: &[u8],
-) -> PyResult<(
-    usize,
-    usize,
-    usize,
-    Bound<'py, PyBytes>,
-    Bound<'py, PyList>,
-    usize,
-)> {
-    let p = deserialise_internal_node(data).map_err(chk_err_to_py)?;
-    let items = PyList::empty(py);
-    for (prefix, flat_key) in &p.items {
-        let pair = PyTuple::new(
-            py,
-            [
-                PyBytes::new(py, prefix).into_any(),
-                PyBytes::new(py, flat_key).into_any(),
-            ],
-        )?;
-        items.append(pair)?;
-    }
-    Ok((
-        p.maximum_size,
-        p.key_width,
-        p.length,
-        PyBytes::new(py, &p.search_prefix),
-        items,
-        p.node_width,
-    ))
+    key: Bound<'py, PyAny>,
+    search_key_func: Option<Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let key = normalise_node_key(py, key)?;
+    py.get_type::<InternalNode>()
+        .call_method("deserialise", (data, key, search_key_func), None)
 }
 
 /// Convert serialised node bytes into a `LeafNode` or `InternalNode`,
@@ -3680,6 +3649,78 @@ fn iter_interesting_nodes(
     CHKMapDifference::process(diff, py)
 }
 
+/// Dict-like view onto the Rust-backed CHK page cache.
+///
+/// Returned by [`get_cache`]. Callers (notably breezy's test suite) index it
+/// like a dict — `cache[key]` raises `KeyError` when absent, `cache[key] = v`
+/// stores, and `key in cache` tests membership.
+#[pyclass(name = "_PageCacheProxy", module = "bzrformats._bzr_rs.chk_map")]
+struct PageCacheProxy;
+
+#[pymethods]
+impl PageCacheProxy {
+    fn __getitem__<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'py, PyTuple>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        match _page_cache_get(py, key.clone())? {
+            Some(b) => Ok(b),
+            None => Err(pyo3::exceptions::PyKeyError::new_err(key.unbind())),
+        }
+    }
+
+    fn __setitem__(&self, key: Bound<'_, PyTuple>, value: &[u8]) -> PyResult<()> {
+        _page_cache_set(key, value)
+    }
+
+    fn __contains__(&self, py: Python<'_>, key: Bound<'_, PyTuple>) -> PyResult<bool> {
+        Ok(_page_cache_get(py, key)?.is_some())
+    }
+}
+
+/// Return a dict-like view onto the shared CHK page cache.
+#[pyfunction]
+fn _get_cache(py: Python<'_>) -> PyResult<Py<PageCacheProxy>> {
+    Py::new(py, PageCacheProxy)
+}
+
+/// Assert that `key` is a 1-tuple holding a `str` that starts with `sha1:`.
+/// A debugging helper, mirroring `chk_map._check_key`.
+#[pyfunction]
+fn _check_key(py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<()> {
+    let Ok(tuple) = key.clone().cast_into::<PyTuple>() else {
+        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "key {} is not tuple but {}",
+            key.repr()?,
+            key.get_type().name()?
+        )));
+    };
+    if tuple.len() != 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "key {} should have length 1, not {}",
+            tuple.repr()?,
+            tuple.len()
+        )));
+    }
+    let elem = tuple.get_item(0)?;
+    let Ok(s) = elem.clone().cast_into::<PyString>() else {
+        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "key {} should hold a str, not {}",
+            tuple.repr()?,
+            elem.get_type().repr()?
+        )));
+    };
+    if !s.to_str()?.starts_with("sha1:") {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "key {} should point to a sha1:",
+            tuple.repr()?
+        )));
+    }
+    let _ = py;
+    Ok(())
+}
+
 pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "chk_map")?;
     m.add_wrapped(wrap_pyfunction!(_search_key_plain))?;
@@ -3702,6 +3743,9 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(clear_cache))?;
     m.add_wrapped(wrap_pyfunction!(_page_cache_get))?;
     m.add_wrapped(wrap_pyfunction!(_page_cache_set))?;
+    m.add_wrapped(wrap_pyfunction!(_get_cache))?;
+    m.add_wrapped(wrap_pyfunction!(_check_key))?;
+    m.add_class::<PageCacheProxy>()?;
     // Stash the per-variant pyfunctions so pyclass `#[new]` and
     // cross-module helpers (`search_key_callable_for_name`) can hand
     // them back without going through Python's search-key registry.
