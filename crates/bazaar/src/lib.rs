@@ -9,6 +9,7 @@ pub mod bisect_multi;
 pub mod btree_builder;
 pub mod btree_index;
 pub mod btree_serializer;
+pub mod bzrdir;
 pub mod chk_inventory;
 pub mod chk_map;
 pub mod chunk_writer;
