@@ -39,7 +39,6 @@ Densely packed upper nodes.
 from collections.abc import Callable
 
 from ._bzr_rs import chk_map as _chk_map_rs
-from .registry import Registry
 
 common_prefix_many = _chk_map_rs.common_prefix_many
 common_prefix_pair = _chk_map_rs.common_prefix_pair
@@ -66,8 +65,11 @@ _check_key = _chk_map_rs._check_key
 _search_key_plain = _chk_map_rs._search_key_plain
 
 
-search_key_registry = Registry[bytes, Callable[[Key], SerialisedKey], None]()
-search_key_registry.register(b"plain", _search_key_plain)
+# The search-key registry is built and pre-populated in Rust (the three
+# built-in variants under "plain"/"hash-16-way"/"hash-255-way"); the callables
+# it returns are the same objects the node/inventory `_search_key_func` getters
+# return, so identity comparisons hold.
+search_key_registry = _chk_map_rs.search_key_registry
 
 
 CHKMap = _chk_map_rs.CHKMap
@@ -96,6 +98,3 @@ iter_interesting_nodes = _chk_map_rs.iter_interesting_nodes
 _bytes_to_text_key = _chk_map_rs._bytes_to_text_key
 _search_key_16 = _chk_map_rs._search_key_16
 _search_key_255 = _chk_map_rs._search_key_255
-
-search_key_registry.register(b"hash-16-way", _search_key_16)
-search_key_registry.register(b"hash-255-way", _search_key_255)

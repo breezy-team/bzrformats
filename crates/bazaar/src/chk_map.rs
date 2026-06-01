@@ -3641,10 +3641,11 @@ mod tests {
 
     #[test]
     fn search_key_16_joins_multi_element_keys_with_nul() {
-        let out = search_key_16(&key(&[b"a", b"b"]));
-        // Two 8-char hex blocks separated by a single \x00.
-        assert_eq!(out.len(), 17);
-        assert_eq!(out[8], b'\x00');
+        // Exact values, matching the Python test
+        // test_iteritems_keys_prefixed_by_2_width_nodes_hashed.
+        assert_eq!(search_key_16(&key(&[b"a", b"a"])), b"E8B7BE43\x00E8B7BE43");
+        assert_eq!(search_key_16(&key(&[b"a", b"b"])), b"E8B7BE43\x0071BEEFF9");
+        assert_eq!(search_key_16(&key(&[b"b", b""])), b"71BEEFF9\x0000000000");
     }
 
     #[test]
@@ -3667,9 +3668,12 @@ mod tests {
 
     #[test]
     fn search_key_255_multi_element_keys_use_nul_separator() {
-        let out = search_key_255(&key(&[b"a", b"b"]));
-        assert_eq!(out.len(), 9);
-        assert_eq!(out[4], b'\x00');
+        // Raw big-endian CRC bytes of each element, nul-joined (the \n->_
+        // post-processing does not affect these inputs).
+        assert_eq!(
+            search_key_255(&key(&[b"a", b"b"])),
+            b"\xe8\xb7\xbeC\x00q\xbe\xef\xf9"
+        );
     }
 
     #[test]
@@ -4736,6 +4740,98 @@ da39a3ee5e6b4b0d3255bfef95601890afd80709\n100\nN";
             vec![
                 (key_vec(&[b"aaa"]), b"v".to_vec()),
                 (key_vec(&[b"aab"]), b"v".to_vec()),
+            ]
+        );
+    }
+
+    /// Collect the sorted child prefixes of an internal root node, asserting
+    /// the root did split into an internal node.
+    fn root_child_prefixes(root: &NodeRef) -> Vec<Vec<u8>> {
+        match root {
+            NodeRef::Loaded(Node::Internal(internal)) => {
+                let mut prefixes: Vec<Vec<u8>> = internal.items.keys().cloned().collect();
+                prefixes.sort();
+                prefixes
+            }
+            other => panic!("expected internal root, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn chkmap_search_key_16_tree_layout() {
+        // Port of TestMapSearchKeys.test_search_key_16: with a small max_size
+        // and the hash-16 search key, three single-char keys land under the
+        // hex prefixes '1'/'6'/'8'. (Python asserts this via _dump_tree.)
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(store.clone(), cache.clone(), None, SearchKeyFunc::Hash16Way);
+        if let NodeRef::Loaded(Node::Leaf(l)) = &mut m.root {
+            l.maximum_size = 10;
+        }
+        m.map(key_vec(&[b"1"]), b"foo".to_vec()).unwrap();
+        m.map(key_vec(&[b"2"]), b"bar".to_vec()).unwrap();
+        m.map(key_vec(&[b"3"]), b"baz".to_vec()).unwrap();
+
+        assert_eq!(
+            root_child_prefixes(&m.root),
+            vec![b"1".to_vec(), b"6".to_vec(), b"8".to_vec()]
+        );
+        let mut items = m.iteritems(None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"1"]), b"foo".to_vec()),
+                (key_vec(&[b"2"]), b"bar".to_vec()),
+                (key_vec(&[b"3"]), b"baz".to_vec()),
+            ]
+        );
+
+        // Round-trips through save/reload (Python re-opens from the root key).
+        let root_key = m.save().unwrap();
+        let mut reloaded = CHKMap::new(
+            store.clone(),
+            cache.clone(),
+            Some(root_key),
+            SearchKeyFunc::Hash16Way,
+        );
+        assert_eq!(
+            reloaded.iteritems(Some(&[key_vec(&[b"1"])])).unwrap(),
+            vec![(key_vec(&[b"1"]), b"foo".to_vec())]
+        );
+    }
+
+    #[test]
+    fn chkmap_search_key_255_tree_layout() {
+        // Port of TestMapSearchKeys.test_search_key_255: the raw-byte search
+        // key places the three keys under the byte prefixes 0x1a / 'm' / 0x83.
+        let store: std::sync::Arc<FakeChkStore> = std::sync::Arc::new(FakeChkStore::new());
+        let cache: std::sync::Arc<dyn PageCache> = std::sync::Arc::new(InMemoryPageCache::new());
+        let mut m = CHKMap::new(
+            store.clone(),
+            cache.clone(),
+            None,
+            SearchKeyFunc::Hash255Way,
+        );
+        if let NodeRef::Loaded(Node::Leaf(l)) = &mut m.root {
+            l.maximum_size = 10;
+        }
+        m.map(key_vec(&[b"1"]), b"foo".to_vec()).unwrap();
+        m.map(key_vec(&[b"2"]), b"bar".to_vec()).unwrap();
+        m.map(key_vec(&[b"3"]), b"baz".to_vec()).unwrap();
+
+        assert_eq!(
+            root_child_prefixes(&m.root),
+            vec![vec![0x1a], b"m".to_vec(), vec![0x83]]
+        );
+        let mut items = m.iteritems(None).unwrap();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![
+                (key_vec(&[b"1"]), b"foo".to_vec()),
+                (key_vec(&[b"2"]), b"bar".to_vec()),
+                (key_vec(&[b"3"]), b"baz".to_vec()),
             ]
         );
     }

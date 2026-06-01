@@ -3813,6 +3813,96 @@ fn _check_key(py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<()> {
     Ok(())
 }
 
+/// The `chk_map.search_key_registry`: maps a search-key name
+/// (`b"plain"` / `b"hash-16-way"` / `b"hash-255-way"`) to the matching
+/// search-key callable. Mirrors the `catalogus.Registry` API surface that
+/// callers use (`get`/`register`/`items`/`keys`), pre-populated with the
+/// three built-in variants. The callables handed back are the same objects
+/// the node/inventory `_search_key_func` getters return, so the identity
+/// comparisons that breezy does (`func == ..._search_key_func`) hold.
+#[pyclass(module = "bzrformats._bzr_rs.chk_map", name = "SearchKeyRegistry")]
+struct SearchKeyRegistry {
+    entries: Vec<(Py<PyBytes>, Py<PyAny>)>,
+}
+
+#[pymethods]
+impl SearchKeyRegistry {
+    #[new]
+    fn new() -> Self {
+        SearchKeyRegistry {
+            entries: Vec::new(),
+        }
+    }
+
+    fn register(&mut self, py: Python<'_>, key: &Bound<'_, PyBytes>, value: Bound<'_, PyAny>) {
+        // Replace an existing entry with the same key, else append.
+        let key_bytes = key.as_bytes().to_vec();
+        if let Some(slot) = self
+            .entries
+            .iter_mut()
+            .find(|(k, _)| k.bind(py).as_bytes() == key_bytes.as_slice())
+        {
+            slot.1 = value.unbind();
+        } else {
+            self.entries.push((key.clone().unbind(), value.unbind()));
+        }
+    }
+
+    fn get<'py>(&self, py: Python<'py>, key: &Bound<'py, PyBytes>) -> PyResult<Bound<'py, PyAny>> {
+        let want = key.as_bytes();
+        for (k, v) in &self.entries {
+            if k.bind(py).as_bytes() == want {
+                return Ok(v.bind(py).clone());
+            }
+        }
+        Err(pyo3::exceptions::PyKeyError::new_err(key.clone().unbind()))
+    }
+
+    fn keys<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyBytes>> {
+        self.entries
+            .iter()
+            .map(|(k, _)| k.bind(py).clone())
+            .collect()
+    }
+
+    fn items<'py>(&self, py: Python<'py>) -> Vec<(Bound<'py, PyBytes>, Bound<'py, PyAny>)> {
+        self.entries
+            .iter()
+            .map(|(k, v)| (k.bind(py).clone(), v.bind(py).clone()))
+            .collect()
+    }
+
+    fn __contains__(&self, py: Python<'_>, key: &Bound<'_, PyBytes>) -> bool {
+        let want = key.as_bytes();
+        self.entries
+            .iter()
+            .any(|(k, _)| k.bind(py).as_bytes() == want)
+    }
+}
+
+/// Build the populated `search_key_registry` instance for the chk_map module,
+/// registering the three built-in search-key variants under their names.
+fn build_search_key_registry(py: Python<'_>) -> PyResult<Py<SearchKeyRegistry>> {
+    let reg = Py::new(py, SearchKeyRegistry::new())?;
+    {
+        let mut borrowed = reg.borrow_mut(py);
+        for (name, func) in [
+            (&b"plain"[..], default_search_key_plain(py).clone_ref(py)),
+            (
+                &b"hash-16-way"[..],
+                SEARCH_KEY_16_CALLABLE.get(py).unwrap().clone_ref(py),
+            ),
+            (
+                &b"hash-255-way"[..],
+                SEARCH_KEY_255_CALLABLE.get(py).unwrap().clone_ref(py),
+            ),
+        ] {
+            borrowed.register(py, &PyBytes::new(py, name), func.into_bound(py));
+        }
+    }
+    Ok(reg)
+}
+
 pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "chk_map")?;
     m.add_wrapped(wrap_pyfunction!(_search_key_plain))?;
@@ -3863,5 +3953,9 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<CHKMapDifference>()?;
     m.add_class::<CHKDifferenceIterator>()?;
     m.add_class::<InternalNodeIterator>()?;
+    m.add_class::<SearchKeyRegistry>()?;
+    // Pre-populated registry of the three built-in search-key variants. Built
+    // after the callables above are stashed so it shares their identity.
+    m.add("search_key_registry", build_search_key_registry(py)?)?;
     Ok(m)
 }
