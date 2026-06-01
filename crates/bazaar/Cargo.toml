@@ -40,9 +40,13 @@ rand = "0.10"
 unicode-normalization = "0.1.19"
 inventory = "0.3"
 indexmap = "2"
+hostname = "0.4.1"
+whoami = "1.5"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["fs"] }
+nix = { workspace = true, features = ["fs", "signal"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
