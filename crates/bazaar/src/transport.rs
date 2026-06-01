@@ -110,6 +110,16 @@ pub trait Transport {
         create_parent_dir: bool,
     ) -> Result<(), TransportError>;
 
+    /// Atomically write `bytes` to `path`, replacing any existing content.
+    /// `mode` is an optional Unix permission bits value for the new file.
+    ///
+    /// The default implementation defers to [`Transport::put_file_non_atomic`]
+    /// (ignoring `mode`); backends with a native atomic put should override it.
+    fn put_bytes(&self, path: &str, bytes: &[u8], mode: Option<u32>) -> Result<(), TransportError> {
+        let _ = mode;
+        self.put_file_non_atomic(path, bytes, false)
+    }
+
     /// Append `bytes` to the end of `path`, creating it if missing.
     /// Returns the byte offset where the appended data starts.
     fn append_bytes(&self, path: &str, bytes: &[u8]) -> Result<u64, TransportError>;

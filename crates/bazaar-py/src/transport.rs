@@ -102,6 +102,18 @@ impl Transport for PyTransport {
         })
     }
 
+    fn put_bytes(&self, path: &str, bytes: &[u8], mode: Option<u32>) -> Result<(), TransportError> {
+        Python::attach(|py| -> Result<(), TransportError> {
+            let py_bytes = PyBytes::new(py, bytes);
+            // bzrformats Transport.put_bytes(path, raw_bytes, mode=None).
+            self.0
+                .bind(py)
+                .call_method1("put_bytes", (path, py_bytes, mode))
+                .map_err(|e| map_py_err(py, e))?;
+            Ok(())
+        })
+    }
+
     fn mkdir(&self, path: &str) -> Result<(), TransportError> {
         Python::attach(|py| -> Result<(), TransportError> {
             self.0
