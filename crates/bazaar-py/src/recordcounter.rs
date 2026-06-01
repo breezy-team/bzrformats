@@ -16,27 +16,15 @@
 
 //! Record counting support for showing progress of revision fetch.
 //!
-//! Ported from `bzrformats.recordcounter`. `RecordCounter` keeps an estimate
-//! of how much work a fetch (push, pull, branch, checkout) will involve so a
-//! progress bar can show a fetched-vs-estimate ratio.
+//! Thin pyo3 wrapper over [`bazaar::recordcounter::RecordCounter`].
 
+use bazaar::recordcounter::RecordCounter as RsRecordCounter;
 use pyo3::prelude::*;
 
 /// Container that maintains estimates of the work required for a fetch.
 #[pyclass(name = "RecordCounter", module = "bzrformats._bzr_rs.recordcounter")]
 pub struct RecordCounter {
-    #[pyo3(get, set)]
-    initialized: bool,
-    #[pyo3(get, set)]
-    current: i64,
-    #[pyo3(get, set)]
-    key_count: i64,
-    #[pyo3(get, set)]
-    max: i64,
-    /// Users update the progress bar every `STEP` records. An odd number keeps
-    /// the last digit of the fetched-vs-estimate ratio changing periodically.
-    #[pyo3(get, set, name = "STEP")]
-    step: i64,
+    inner: RsRecordCounter,
 }
 
 #[pymethods]
@@ -44,43 +32,76 @@ impl RecordCounter {
     #[new]
     fn new() -> Self {
         Self {
-            initialized: false,
-            current: 0,
-            key_count: 0,
-            max: 0,
-            step: 7,
+            inner: RsRecordCounter::new(),
         }
+    }
+
+    #[getter]
+    fn initialized(&self) -> bool {
+        self.inner.initialized
+    }
+
+    #[setter]
+    fn set_initialized(&mut self, value: bool) {
+        self.inner.initialized = value;
+    }
+
+    #[getter]
+    fn current(&self) -> i64 {
+        self.inner.current
+    }
+
+    #[setter]
+    fn set_current(&mut self, value: i64) {
+        self.inner.current = value;
+    }
+
+    #[getter]
+    fn key_count(&self) -> i64 {
+        self.inner.key_count
+    }
+
+    #[setter]
+    fn set_key_count(&mut self, value: i64) {
+        self.inner.key_count = value;
+    }
+
+    #[getter]
+    fn max(&self) -> i64 {
+        self.inner.max
+    }
+
+    #[setter]
+    fn set_max(&mut self, value: i64) {
+        self.inner.max = value;
+    }
+
+    #[getter(STEP)]
+    fn step(&self) -> i64 {
+        self.inner.step
+    }
+
+    #[setter(STEP)]
+    fn set_step(&mut self, value: i64) {
+        self.inner.step = value;
     }
 
     /// Whether `setup()` has been called.
     fn is_initialized(&self) -> bool {
-        self.initialized
+        self.inner.is_initialized()
     }
 
-    /// Estimate the maximum amount of "inserting stream" work.
-    ///
-    /// The 10.3 multiplier comes from empirical data across three projects; it
-    /// is chosen to under-promise/over-deliver and to render a realistic
-    /// progress ratio. See the original Python for the derivation.
     fn _estimate_max(&self, key_count: i64) -> i64 {
-        (key_count as f64 * 10.3) as i64
+        self.inner.estimate_max(key_count)
     }
 
-    /// Set up `max`/`current` to reflect the amount of work pending.
     #[pyo3(signature = (key_count, current=0))]
     fn setup(&mut self, key_count: i64, current: i64) {
-        self.current = current;
-        self.key_count = key_count;
-        self.max = self._estimate_max(key_count);
-        self.initialized = true;
+        self.inner.setup(key_count, current);
     }
 
-    /// Increment `current` by `count`, growing `max` so it stays ahead.
     fn increment(&mut self, count: i64) {
-        self.current += count;
-        if self.current > self.max {
-            self.max += self.key_count;
-        }
+        self.inner.increment(count);
     }
 }
 

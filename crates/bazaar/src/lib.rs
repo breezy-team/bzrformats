@@ -29,6 +29,7 @@ pub mod osutils;
 pub mod pack;
 pub mod pack_repo;
 pub mod plan_merge;
+pub mod recordcounter;
 pub mod repository;
 pub mod revision;
 pub mod rio;
