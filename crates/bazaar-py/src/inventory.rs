@@ -1831,6 +1831,90 @@ fn serialize_inventory_delta<'a>(
     .collect())
 }
 
+/// Serialize inventory deltas. Ported from
+/// `bzrformats.inventory_delta.InventoryDeltaSerializer`.
+#[pyclass(
+    name = "InventoryDeltaSerializer",
+    module = "bzrformats._bzr_rs.inventory"
+)]
+struct PyInventoryDeltaSerializer {
+    versioned_root: bool,
+    tree_references: bool,
+}
+
+#[pymethods]
+impl PyInventoryDeltaSerializer {
+    #[new]
+    fn new(versioned_root: bool, tree_references: bool) -> Self {
+        Self {
+            versioned_root,
+            tree_references,
+        }
+    }
+
+    /// Return a line sequence for `delta_to_new`.
+    fn delta_to_lines<'a>(
+        &self,
+        py: Python<'a>,
+        old_name: RevisionId,
+        new_name: RevisionId,
+        delta_to_new: &'a InventoryDelta,
+    ) -> PyResult<Vec<Bound<'a, PyBytes>>> {
+        serialize_inventory_delta(
+            py,
+            old_name,
+            new_name,
+            delta_to_new,
+            self.versioned_root,
+            self.tree_references,
+        )
+    }
+}
+
+/// Deserialize inventory deltas. Ported from
+/// `bzrformats.inventory_delta.InventoryDeltaDeserializer`.
+#[pyclass(
+    name = "InventoryDeltaDeserializer",
+    module = "bzrformats._bzr_rs.inventory"
+)]
+struct PyInventoryDeltaDeserializer {
+    allow_versioned_root: bool,
+    allow_tree_references: bool,
+}
+
+#[pymethods]
+impl PyInventoryDeltaDeserializer {
+    #[new]
+    #[pyo3(signature = (allow_versioned_root=true, allow_tree_references=true))]
+    fn new(allow_versioned_root: bool, allow_tree_references: bool) -> Self {
+        Self {
+            allow_versioned_root,
+            allow_tree_references,
+        }
+    }
+
+    /// Parse the text bytes of a serialized inventory delta, returning
+    /// `(parent_id, new_id, versioned_root, tree_references, inventory_delta)`.
+    fn parse_text_bytes<'a>(
+        &self,
+        py: Python<'a>,
+        lines: Vec<Vec<u8>>,
+    ) -> PyResult<(
+        Bound<'a, PyBytes>,
+        Bound<'a, PyBytes>,
+        bool,
+        bool,
+        Bound<'a, InventoryDelta>,
+    )> {
+        parse_inventory_delta(
+            py,
+            lines,
+            Some(self.allow_versioned_root),
+            Some(self.allow_tree_references),
+        )
+    }
+}
+
 #[pyfunction]
 fn chk_inventory_entry_to_bytes<'a>(
     py: Python<'a>,
@@ -4327,6 +4411,8 @@ pub fn _inventory_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(parse_inventory_entry))?;
     m.add_wrapped(wrap_pyfunction!(serialize_inventory_delta))?;
     m.add_wrapped(wrap_pyfunction!(serialize_inventory_entry))?;
+    m.add_class::<PyInventoryDeltaSerializer>()?;
+    m.add_class::<PyInventoryDeltaDeserializer>()?;
     m.add("InventoryDeltaError", py.get_type::<InventoryDeltaError>())?;
     m.add(
         "IncompatibleInventoryDelta",
