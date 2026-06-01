@@ -829,9 +829,106 @@ pub fn prune_tails<K: Clone + Eq + std::hash::Hash>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::versionedfile::VirtualVersionedFiles;
+    use std::sync::Arc;
 
     fn line(b: &[u8]) -> Vec<u8> {
         b.to_vec()
+    }
+
+    /// Split a byte string into one `"x\n"` line per byte (the Python merge
+    /// tests build revision texts the same way).
+    fn char_lines(s: &[u8]) -> Vec<Vec<u8>> {
+        s.iter().map(|b| vec![*b, b'\n']).collect()
+    }
+
+    /// Build a VirtualVersionedFiles over an in-memory `{rev: (parents, text)}`
+    /// graph, keyed by single-byte revision ids (empty key prefix).
+    #[allow(clippy::type_complexity)]
+    fn make_vf(
+        revs: Vec<(&[u8], Vec<&[u8]>, &[u8])>,
+    ) -> VirtualVersionedFiles<
+        impl Fn(&[Vec<u8>]) -> Result<HashMap<Vec<u8>, Vec<Vec<u8>>>, KnitError> + Send + Sync,
+        impl Fn(&[u8]) -> Result<Option<Vec<Vec<u8>>>, KnitError> + Send + Sync,
+    > {
+        let mut parents: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+        let mut lines: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+        for (rev, ps, text) in revs {
+            parents.insert(rev.to_vec(), ps.iter().map(|p| p.to_vec()).collect());
+            lines.insert(rev.to_vec(), char_lines(text));
+        }
+        let parents = Arc::new(parents);
+        let lines = Arc::new(lines);
+        let pclone = parents.clone();
+        VirtualVersionedFiles::new(
+            move |keys: &[Vec<u8>]| {
+                Ok(keys
+                    .iter()
+                    .filter_map(|k| pclone.get(k).map(|p| (k.clone(), p.clone())))
+                    .collect())
+            },
+            move |key: &[u8]| Ok(lines.get(key).cloned()),
+        )
+    }
+
+    fn plan_strings(plan: Vec<(MergeTag, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
+        plan.into_iter()
+            .map(|(tag, l)| (tag.as_str().to_string(), l))
+            .collect()
+    }
+
+    #[test]
+    fn plan_merge_three_way() {
+        // Port of test_merge.test_plan_merge: A=abc, B(A)=acehg, C(A)=fabg.
+        let vf = make_vf(vec![
+            (b"A", vec![], b"abc"),
+            (b"B", vec![b"A"], b"acehg"),
+            (b"C", vec![b"A"], b"fabg"),
+        ]);
+        let mut pm = PlanMerge::new(&vf, b"B".to_vec(), b"C".to_vec(), vec![]).unwrap();
+        let plan = plan_strings(pm.plan_merge().unwrap());
+        assert_eq!(
+            plan,
+            vec![
+                ("new-b".to_string(), b"f\n".to_vec()),
+                ("unchanged".to_string(), b"a\n".to_vec()),
+                ("killed-a".to_string(), b"b\n".to_vec()),
+                ("killed-b".to_string(), b"c\n".to_vec()),
+                ("new-a".to_string(), b"e\n".to_vec()),
+                ("new-a".to_string(), b"h\n".to_vec()),
+                ("new-a".to_string(), b"g\n".to_vec()),
+                ("new-b".to_string(), b"g\n".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_merge_no_common_ancestor() {
+        // Two disjoint roots: every line is tagged new-a or new-b.
+        let vf = make_vf(vec![(b"A", vec![], b"ab"), (b"B", vec![], b"cd")]);
+        let mut pm = PlanMerge::new(&vf, b"A".to_vec(), b"B".to_vec(), vec![]).unwrap();
+        let plan = plan_strings(pm.plan_merge().unwrap());
+        // All of A's lines are new-a and all of B's lines are new-b.
+        assert!(plan.iter().all(|(t, _)| t == "new-a" || t == "new-b"));
+        assert_eq!(plan.iter().filter(|(t, _)| t == "new-a").count(), 2,);
+        assert_eq!(plan.iter().filter(|(t, _)| t == "new-b").count(), 2,);
+    }
+
+    #[test]
+    fn plan_merge_dominating_head_shortcuts() {
+        // B descends from A: B dominates, so merging A and B returns B's lines
+        // tagged new-b without a weave comparison.
+        let vf = make_vf(vec![(b"A", vec![], b"ab"), (b"B", vec![b"A"], b"abc")]);
+        let mut pm = PlanMerge::new(&vf, b"A".to_vec(), b"B".to_vec(), vec![]).unwrap();
+        let plan = plan_strings(pm.plan_merge().unwrap());
+        assert_eq!(
+            plan,
+            vec![
+                ("new-b".to_string(), b"a\n".to_vec()),
+                ("new-b".to_string(), b"b\n".to_vec()),
+                ("new-b".to_string(), b"c\n".to_vec()),
+            ]
+        );
     }
 
     #[test]
