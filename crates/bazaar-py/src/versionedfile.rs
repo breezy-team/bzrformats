@@ -3,7 +3,16 @@ use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
 
-#[pyclass(subclass)]
+/// The abstract `ContentFactory` base shared by every concrete content
+/// factory (fulltext/chunked/file/adapter/absent/knit/...). Exposed to Python
+/// as `ContentFactory` so `isinstance(x, ContentFactory)` holds through real
+/// inheritance; it carries the full key/parents/sha1/size/storage_kind/
+/// get_bytes_as/iter_bytes_as/map_key surface.
+#[pyclass(
+    subclass,
+    name = "ContentFactory",
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
 pub(crate) struct AbstractContentFactory(Box<dyn ContentFactory + Send + Sync>);
 
 pyo3::import_exception!(bzrformats._bzr_rs.errors, UnavailableRepresentation);

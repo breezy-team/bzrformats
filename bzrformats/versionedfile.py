@@ -65,37 +65,10 @@ for target_storage_kind in ("fulltext", "chunked", "lines"):
     )
 
 
-class ContentFactory:
-    """Abstract interface for insertion and retrieval from a VersionedFile.
-
-    :ivar sha1: None, or the sha1 of the content fulltext.
-    :ivar size: None, or the size of the content fulltext.
-    :ivar storage_kind: The native storage kind of this factory. One of
-        'mpdiff', 'knit-annotated-ft', 'knit-annotated-delta', 'knit-ft',
-        'knit-delta', 'fulltext', 'knit-annotated-ft-gz',
-        'knit-annotated-delta-gz', 'knit-ft-gz', 'knit-delta-gz'.
-    :ivar key: The key of this content. Each key is a tuple with a single
-        string in it.
-    :ivar parents: A tuple of parent keys for self.key. If the object has
-        no parent information, None (as opposed to () for an empty list of
-        parents).
-    """
-
-    def __init__(self) -> None:
-        """Create a ContentFactory."""
-        self.sha1: bytes | None = None
-        self.size: int | None = None
-        self.storage_kind: str | None = None
-        self.key: tuple[bytes, ...] | None = None
-        self.parents = None
-
-    def map_key(self, cb):
-        """Add prefix to all keys."""
-        if self.key is not None:
-            self.key = cb(self.key)
-        if self.parents is not None:
-            self.parents = tuple([cb(parent) for parent in self.parents])
-        return self
+# ContentFactory is the abstract base shared by every concrete content factory
+# (the Rust AbstractContentFactory). The concrete factories extend it in Rust,
+# so isinstance(x, ContentFactory) holds through real inheritance.
+ContentFactory = _versionedfile_rs.ContentFactory
 
 
 FileContentFactory = _versionedfile_rs.FileContentFactory
