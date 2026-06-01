@@ -296,6 +296,7 @@ fn py_multiparent_to_rust(diff: &Bound<'_, PyAny>) -> PyResult<MultiParent> {
 }
 
 #[pyclass(
+    extends = PyBaseVersionedFile,
     module = "bzrformats._multiparent_rs",
     name = "MultiMemoryVersionedFile"
 )]
@@ -307,10 +308,13 @@ pub struct PyMultiMemoryVersionedFile {
 impl PyMultiMemoryVersionedFile {
     #[new]
     #[pyo3(signature = (snapshot_interval=Some(25), max_snapshots=None))]
-    fn new(snapshot_interval: Option<usize>, max_snapshots: Option<usize>) -> Self {
-        Self {
+    fn new(
+        snapshot_interval: Option<usize>,
+        max_snapshots: Option<usize>,
+    ) -> pyo3::PyClassInitializer<Self> {
+        pyo3::PyClassInitializer::from(PyBaseVersionedFile).add_subclass(Self {
             inner: MultiMemoryVersionedFile::new(snapshot_interval, max_snapshots),
-        }
+        })
     }
 
     #[getter]
@@ -549,8 +553,742 @@ fn py_iter_to_hashable(obj: &Bound<'_, PyAny>) -> PyResult<Vec<PyHashable>> {
     Ok(out)
 }
 
+/// A run of new lines introduced by a text (no parent reference).
+#[pyclass(name = "NewText", module = "bzrformats._bzr_rs.multiparent")]
+pub struct NewText {
+    #[pyo3(get, set)]
+    lines: Py<PyAny>,
+}
+
+#[pymethods]
+impl NewText {
+    #[new]
+    fn new(lines: Py<PyAny>) -> Self {
+        NewText { lines }
+    }
+
+    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let Ok(other) = other.downcast::<NewText>() else {
+            return Ok(false);
+        };
+        self.lines.bind(py).eq(&other.borrow().lines)
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!("NewText({})", self.lines.bind(py).repr()?))
+    }
+
+    /// Generate patch lines for this NewText.
+    fn to_patch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let lines = self.lines.bind(py).try_iter()?;
+        let mut count = 0usize;
+        let mut body: Vec<Py<PyAny>> = Vec::new();
+        for line in lines {
+            body.push(line?.unbind());
+            count += 1;
+        }
+        let out = PyList::empty(py);
+        out.append(PyBytes::new(py, format!("i {}\n", count).as_bytes()))?;
+        for line in body {
+            out.append(line)?;
+        }
+        out.append(PyBytes::new(py, b"\n"))?;
+        Ok(out)
+    }
+}
+
+/// A reference to a slice of lines present in a parent text.
+#[pyclass(name = "ParentText", module = "bzrformats._bzr_rs.multiparent")]
+#[derive(Clone)]
+pub struct ParentText {
+    #[pyo3(get, set)]
+    parent: usize,
+    #[pyo3(get, set)]
+    parent_pos: usize,
+    #[pyo3(get, set)]
+    child_pos: usize,
+    #[pyo3(get, set)]
+    num_lines: usize,
+}
+
+#[pymethods]
+impl ParentText {
+    #[new]
+    fn new(parent: usize, parent_pos: usize, child_pos: usize, num_lines: usize) -> Self {
+        ParentText {
+            parent,
+            parent_pos,
+            child_pos,
+            num_lines,
+        }
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        match other.downcast::<ParentText>() {
+            Ok(o) => {
+                let o = o.borrow();
+                self.parent == o.parent
+                    && self.parent_pos == o.parent_pos
+                    && self.child_pos == o.child_pos
+                    && self.num_lines == o.num_lines
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ParentText({}, {}, {}, {})",
+            self.parent, self.parent_pos, self.child_pos, self.num_lines
+        )
+    }
+
+    /// Generate patch lines for this ParentText.
+    fn to_patch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let line = format!(
+            "c {} {} {} {}\n",
+            self.parent, self.parent_pos, self.child_pos, self.num_lines
+        );
+        PyList::new(py, [PyBytes::new(py, line.as_bytes())])
+    }
+}
+
+/// A multi-parent diff: an ordered list of `NewText` / `ParentText` hunks.
+#[pyclass(name = "MultiParent", module = "bzrformats._bzr_rs.multiparent")]
+pub struct PyMultiParent {
+    /// The hunks, kept as a live Python list so callers can mutate it
+    /// (`diff.hunks.append(...)`).
+    #[pyo3(get, set)]
+    hunks: Py<PyList>,
+}
+
+impl PyMultiParent {
+    fn hunks_list<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
+        self.hunks.bind(py).clone()
+    }
+}
+
+#[pymethods]
+impl PyMultiParent {
+    #[new]
+    #[pyo3(signature = (hunks=None))]
+    fn new(py: Python<'_>, hunks: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
+        let hunks = match hunks {
+            Some(h) if !h.is_none() => {
+                if let Ok(list) = h.downcast::<PyList>() {
+                    list.clone().unbind()
+                } else {
+                    // Accept any iterable, materialising into a list.
+                    let list = PyList::empty(py);
+                    for item in h.try_iter()? {
+                        list.append(item?)?;
+                    }
+                    list.unbind()
+                }
+            }
+            _ => PyList::empty(py).unbind(),
+        };
+        Ok(PyMultiParent { hunks })
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!("MultiParent({})", self.hunks.bind(py).repr()?))
+    }
+
+    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let Ok(other) = other.downcast::<PyMultiParent>() else {
+            return Ok(false);
+        };
+        self.hunks.bind(py).eq(&other.borrow().hunks)
+    }
+
+    /// Produce a MultiParent from a list of lines and parents.
+    #[staticmethod]
+    #[pyo3(signature = (text, parents=None, left_blocks=None))]
+    fn from_lines(
+        py: Python<'_>,
+        text: Bound<'_, PyAny>,
+        parents: Option<Bound<'_, PyAny>>,
+        left_blocks: Option<Vec<(usize, usize, usize)>>,
+    ) -> PyResult<Py<Self>> {
+        let text: Vec<Vec<u8>> = extract_lines(&text)?;
+        let parents: Vec<Vec<Vec<u8>>> = match parents {
+            Some(ps) if !ps.is_none() => {
+                let mut out = Vec::new();
+                for p in ps.try_iter()? {
+                    out.push(extract_lines(&p?)?);
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
+        let parent_refs: Vec<&[Vec<u8>]> = parents.iter().map(|p| p.as_slice()).collect();
+        let mp = MultiParent::from_lines(&text, &parent_refs, left_blocks);
+        Self::from_rust(py, mp)
+    }
+
+    /// Produce a MultiParent from a text and list of parent texts.
+    #[classmethod]
+    #[pyo3(signature = (text, parents=None))]
+    fn from_texts(
+        cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        text: &[u8],
+        parents: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<Self>> {
+        let _ = cls;
+        let text_lines = split_readlines(text);
+        let parent_lists: Vec<Vec<Vec<u8>>> = match parents {
+            Some(ps) if !ps.is_none() => {
+                let mut out = Vec::new();
+                for p in ps.try_iter()? {
+                    let p = p?;
+                    let bytes = p.downcast::<PyBytes>()?;
+                    out.push(split_readlines(bytes.as_bytes()));
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
+        let parent_refs: Vec<&[Vec<u8>]> = parent_lists.iter().map(|p| p.as_slice()).collect();
+        let mp = MultiParent::from_lines(&text_lines, &parent_refs, None);
+        Self::from_rust(py, mp)
+    }
+
+    /// Create a MultiParent from its serialised patch form.
+    #[classmethod]
+    fn from_patch(
+        cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        text: &[u8],
+    ) -> PyResult<Py<Self>> {
+        let _ = cls;
+        let mp = MultiParent::from_patch(text).map_err(parse_error_to_py)?;
+        Self::from_rust(py, mp)
+    }
+
+    /// Yield text lines for a patch.
+    fn to_patch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let mp = py_hunks_to_rust(&self.hunks_list(py))?;
+        let chunks = mp.to_patch();
+        let items: Vec<Bound<PyBytes>> = chunks.iter().map(|c| PyBytes::new(py, c)).collect();
+        PyList::new(py, items)
+    }
+
+    /// The length of the patch in bytes.
+    fn patch_len(&self, py: Python<'_>) -> PyResult<usize> {
+        let mp = py_hunks_to_rust(&self.hunks_list(py))?;
+        Ok(mp.to_patch().iter().map(|c| c.len()).sum())
+    }
+
+    /// The length of the gzipped patch in bytes.
+    fn zipped_patch_len(&self, py: Python<'_>) -> PyResult<usize> {
+        let mp = py_hunks_to_rust(&self.hunks_list(py))?;
+        Ok(mp.zipped_patch_len())
+    }
+
+    /// The number of lines in the output text.
+    fn num_lines(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(py_hunks_to_rust(&self.hunks_list(py))?.num_lines())
+    }
+
+    /// True if these hunks represent a fulltext (single NewText hunk).
+    fn is_snapshot(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(py_hunks_to_rust(&self.hunks_list(py))?.is_snapshot())
+    }
+
+    /// Yield `(parent_pos, child_pos, num_lines)` matches for `parent`, ending
+    /// with the `(parent_len, num_lines, 0)` sentinel.
+    fn get_matching_blocks<'py>(
+        &self,
+        py: Python<'py>,
+        parent: usize,
+        parent_len: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let out = PyList::empty(py);
+        for hunk in self.hunks_list(py).iter() {
+            if let Ok(pt) = hunk.downcast::<ParentText>() {
+                let pt = pt.borrow();
+                if pt.parent == parent {
+                    out.append((pt.parent_pos, pt.child_pos, pt.num_lines))?;
+                }
+            }
+        }
+        out.append((parent_len, self.num_lines(py)?, 0usize))?;
+        Ok(out)
+    }
+
+    /// Iterate the hunks with `(start, end, kind, data)` ranges. `kind` is
+    /// `"new"` (data: list of lines) or `"parent"` (data:
+    /// `(parent, parent_start, parent_end)`). Returns a true iterator (callers
+    /// such as `_Reconstructor` call `next()` on it).
+    fn range_iterator<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let out = PyList::empty(py);
+        let mut start: usize = 0;
+        for hunk in self.hunks_list(py).iter() {
+            let (start_v, end, kind, data): (usize, usize, &str, Py<PyAny>) =
+                if let Ok(nt) = hunk.downcast::<NewText>() {
+                    let lines = nt.borrow().lines.bind(py).clone();
+                    let len = lines.len()?;
+                    (start, start + len, "new", lines.unbind())
+                } else {
+                    let pt = hunk.downcast::<ParentText>()?.borrow();
+                    let s = pt.child_pos;
+                    let data = (pt.parent, pt.parent_pos, pt.parent_pos + pt.num_lines)
+                        .into_pyobject(py)?;
+                    (s, s + pt.num_lines, "parent", data.into_any().unbind())
+                };
+            out.append((start_v, end, kind, data))?;
+            start = end;
+        }
+        Ok(out.into_any().try_iter()?.into_any())
+    }
+
+    /// Reconstruct a fulltext from this diff and its parents.
+    #[pyo3(signature = (parents=None))]
+    fn to_lines<'py>(
+        &self,
+        py: Python<'py>,
+        parents: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let parent_lists: Vec<Vec<Vec<u8>>> = match parents {
+            Some(ps) if !ps.is_none() => {
+                let mut out = Vec::new();
+                for p in ps.try_iter()? {
+                    let p = p?;
+                    let bytes = p.downcast::<PyBytes>()?;
+                    out.push(split_readlines(bytes.as_bytes()));
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
+        let mp = py_hunks_to_rust(&self.hunks_list(py))?;
+        // Mirror the Python `to_lines`: register each parent as its own
+        // version (keyed by its index) in a scratch MultiMemoryVersionedFile,
+        // add this diff referencing all parents, then reconstruct it. The diff
+        // version is keyed -1 to stay distinct from the parent indices.
+        let mut mpvf: MultiMemoryVersionedFile<i64> = MultiMemoryVersionedFile::new(Some(25), None);
+        for (num, parent) in parent_lists.into_iter().enumerate() {
+            mpvf.add_version(parent, num as i64, Vec::new(), None, false)
+                .map_err(reconstruct_err)?;
+        }
+        let parent_ids: Vec<i64> = (0..mpvf.versions().count() as i64).collect();
+        mpvf.add_diff(mp, -1, parent_ids);
+        let lines = mpvf.get_line_list(&[-1]).map_err(reconstruct_err)?;
+        let items: Vec<Bound<PyBytes>> = lines[0].iter().map(|l| PyBytes::new(py, l)).collect();
+        PyList::new(py, items)
+    }
+}
+
+impl PyMultiParent {
+    /// Build a Python `MultiParent` (with real NewText/ParentText hunks) from a
+    /// Rust [`MultiParent`].
+    fn from_rust(py: Python<'_>, mp: MultiParent) -> PyResult<Py<Self>> {
+        let hunks = PyList::empty(py);
+        for hunk in mp.hunks {
+            match hunk {
+                Hunk::NewText(lines) => {
+                    let py_lines: Vec<Bound<PyBytes>> =
+                        lines.iter().map(|l| PyBytes::new(py, l)).collect();
+                    let lines_list = PyList::new(py, py_lines)?;
+                    hunks.append(Py::new(
+                        py,
+                        NewText {
+                            lines: lines_list.into_any().unbind(),
+                        },
+                    )?)?;
+                }
+                Hunk::ParentText {
+                    parent,
+                    parent_pos,
+                    child_pos,
+                    num_lines,
+                } => {
+                    hunks.append(Py::new(
+                        py,
+                        ParentText {
+                            parent,
+                            parent_pos,
+                            child_pos,
+                            num_lines,
+                        },
+                    )?)?;
+                }
+            }
+        }
+        Py::new(
+            py,
+            PyMultiParent {
+                hunks: hunks.unbind(),
+            },
+        )
+    }
+}
+
+/// Extract a list of `bytes` lines from a Python iterable of bytes.
+fn extract_lines(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    for line in obj.try_iter()? {
+        let line = line?;
+        out.push(line.downcast::<PyBytes>()?.as_bytes().to_vec());
+    }
+    Ok(out)
+}
+
+/// Split a byte string into lines the way `BytesIO(text).readlines()` does:
+/// each line keeps its trailing newline; a final line without a newline is
+/// kept as-is.
+fn split_readlines(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b == b'\n' {
+            out.push(data[start..=i].to_vec());
+            start = i + 1;
+        }
+    }
+    if start < data.len() {
+        out.push(data[start..].to_vec());
+    }
+    out
+}
+
+/// Disk-backed pseudo-versionedfile, ported from
+/// `bzrformats.multiparent.MultiVersionedFile`.
+#[pyclass(
+    extends = PyBaseVersionedFile,
+    name = "MultiVersionedFile",
+    module = "bzrformats._bzr_rs.multiparent"
+)]
+pub struct PyMultiVersionedFile {
+    inner: bazaar::multiparent::DiskMultiVersionedFile,
+}
+
+fn disk_err_to_py(e: bazaar::multiparent::DiskError) -> PyErr {
+    match e {
+        bazaar::multiparent::DiskError::Reconstruct(r) => reconstruct_err(r),
+        bazaar::multiparent::DiskError::Io(io) => {
+            pyo3::exceptions::PyOSError::new_err(io.to_string())
+        }
+    }
+}
+
+#[pymethods]
+impl PyMultiVersionedFile {
+    #[new]
+    #[pyo3(signature = (filename, snapshot_interval=25, max_snapshots=None))]
+    fn new(
+        filename: String,
+        snapshot_interval: Option<usize>,
+        max_snapshots: Option<usize>,
+    ) -> pyo3::PyClassInitializer<Self> {
+        pyo3::PyClassInitializer::from(PyBaseVersionedFile).add_subclass(Self {
+            inner: bazaar::multiparent::DiskMultiVersionedFile::new(
+                filename,
+                snapshot_interval,
+                max_snapshots,
+            ),
+        })
+    }
+
+    #[pyo3(signature = (lines, version_id, parent_ids, force_snapshot=None, single_parent=false))]
+    fn add_version(
+        &mut self,
+        lines: Vec<Vec<u8>>,
+        version_id: Vec<u8>,
+        parent_ids: Vec<Vec<u8>>,
+        force_snapshot: Option<bool>,
+        single_parent: bool,
+    ) -> PyResult<()> {
+        self.inner
+            .add_version(lines, version_id, parent_ids, force_snapshot, single_parent)
+            .map_err(disk_err_to_py)
+    }
+
+    fn get_line_list<'py>(
+        &mut self,
+        py: Python<'py>,
+        version_ids: Vec<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let lists = self
+            .inner
+            .get_line_list(&version_ids)
+            .map_err(reconstruct_err)?;
+        let outer = PyList::empty(py);
+        for lines in lists {
+            let inner: Vec<Bound<PyBytes>> = lines.iter().map(|l| PyBytes::new(py, l)).collect();
+            outer.append(PyList::new(py, inner)?)?;
+        }
+        Ok(outer)
+    }
+
+    fn get_diff<'py>(&self, py: Python<'py>, version_id: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        let mp = self
+            .inner
+            .read_diff_from_disk(&version_id)
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+        rust_to_py_multiparent(py, &mp)
+    }
+
+    fn save(&self) -> PyResult<()> {
+        self.inner
+            .save()
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+    }
+
+    fn load(&mut self) -> PyResult<()> {
+        self.inner
+            .load()
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+    }
+
+    fn destroy(&self) -> PyResult<()> {
+        self.inner
+            .destroy()
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+    }
+}
+
+/// Pseudo-VersionedFile base class for the MultiParent backends.
+///
+/// Port of the `bzrformats.multiparent.BaseVersionedFile` skeleton. The
+/// concrete backends (`MultiMemoryVersionedFile`, `MultiVersionedFile`) each
+/// keep their own Rust-backed state and reimplement the skeleton methods, so
+/// this base carries no state of its own; it exists so the backends share a
+/// common type and `isinstance` behaviour matches the original Python
+/// hierarchy. breezy re-exports it for API compatibility.
+#[pyclass(
+    subclass,
+    name = "BaseVersionedFile",
+    module = "bzrformats._bzr_rs.multiparent"
+)]
+pub struct PyBaseVersionedFile;
+
+#[pymethods]
+impl PyBaseVersionedFile {
+    #[new]
+    #[pyo3(signature = (snapshot_interval=25, max_snapshots=None))]
+    fn new(snapshot_interval: Option<usize>, max_snapshots: Option<usize>) -> Self {
+        let _ = (snapshot_interval, max_snapshots);
+        PyBaseVersionedFile
+    }
+}
+
+/// Gzip-compress an iterable of `bytes` lines into a single gzip container.
+#[pyfunction]
+fn gzip_string<'py>(py: Python<'py>, lines: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    let lines = extract_lines(&lines)?;
+    let compressed = multiparent::gzip_string(lines.iter().map(Vec::as_slice));
+    Ok(PyBytes::new(py, &compressed))
+}
+
+/// Build a text from the diffs, ancestry graph and cached lines.
+///
+/// Port of `bzrformats.multiparent._Reconstructor`. `diffs` is any object
+/// with a `get_diff(version_id)` method returning a `MultiParent` (whose
+/// `range_iterator()` yields `(start, end, kind, data)`); `lines` and
+/// `parents` are the version->lines and version->parent-ids maps (typically a
+/// backend's `_lines` / `_parents`).
+#[pyclass(name = "_Reconstructor", module = "bzrformats._bzr_rs.multiparent")]
+pub struct PyReconstructor {
+    diffs: Py<PyAny>,
+    lines: Py<PyAny>,
+    parents: Py<PyAny>,
+    /// Per-version cursor: version_id -> (start, end, kind, data, iterator).
+    cursor: HashMap<PyHashable, Py<PyTuple>>,
+}
+
+#[pymethods]
+impl PyReconstructor {
+    #[new]
+    fn new(diffs: Py<PyAny>, lines: Py<PyAny>, parents: Py<PyAny>) -> Self {
+        Self {
+            diffs,
+            lines,
+            parents,
+            cursor: HashMap::new(),
+        }
+    }
+
+    /// Append the lines referred to by a `ParentText` to `lines`.
+    fn reconstruct(
+        &mut self,
+        py: Python<'_>,
+        lines: &Bound<'_, PyAny>,
+        parent_text: &Bound<'_, PyAny>,
+        version_id: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let parent_idx: usize = parent_text.getattr("parent")?.extract()?;
+        let parent_pos: usize = parent_text.getattr("parent_pos")?.extract()?;
+        let num_lines: usize = parent_text.getattr("num_lines")?.extract()?;
+        let parent_id = self
+            .parents
+            .bind(py)
+            .get_item(&version_id)?
+            .get_item(parent_idx)?;
+        let end = parent_pos + num_lines;
+        self._reconstruct(py, lines, parent_id, parent_pos, end)
+    }
+
+    /// Append lines for the requested `version_id` range `[req_start, req_end)`.
+    fn _reconstruct(
+        &mut self,
+        py: Python<'_>,
+        lines: &Bound<'_, PyAny>,
+        req_version_id: Bound<'_, PyAny>,
+        req_start: usize,
+        req_end: usize,
+    ) -> PyResult<()> {
+        if req_start == req_end {
+            return Ok(());
+        }
+        let mut pending: Vec<(Py<PyAny>, usize, usize)> =
+            vec![(req_version_id.unbind(), req_start, req_end)];
+        let lines_map = self.lines.bind(py);
+        let parents_map = self.parents.bind(py);
+        let diffs = self.diffs.bind(py);
+        while let Some((version_obj, req_start, mut req_end)) = pending.pop() {
+            let version = version_obj.bind(py);
+            // Already-cached fulltext: slice straight out of it.
+            if lines_map.contains(version)? {
+                let cached = lines_map.get_item(version)?;
+                let slice = cached.get_item(pyo3::types::PySlice::new(
+                    py,
+                    req_start as isize,
+                    req_end as isize,
+                    1,
+                ))?;
+                lines.call_method1("extend", (slice,))?;
+                continue;
+            }
+            let key = PyHashable::new(version.clone())?;
+            let (mut start, mut end, mut kind, mut data, mut iterator) = match self.cursor.get(&key)
+            {
+                Some(t) => unpack_cursor(t.bind(py))?,
+                None => {
+                    let it = diffs
+                        .call_method1("get_diff", (version,))?
+                        .call_method0("range_iterator")?;
+                    let (s, e, k, d) = next_range(&it)?;
+                    (s, e, k, d, it)
+                }
+            };
+            // A stored cursor may be ahead of this request; restart the
+            // iterator from the top in that case.
+            if start > req_start {
+                iterator = diffs
+                    .call_method1("get_diff", (version,))?
+                    .call_method0("range_iterator")?;
+                let (s, e, k, d) = next_range(&iterator)?;
+                start = s;
+                end = e;
+                kind = k;
+                data = d;
+            }
+            // Advance to the first hunk relevant to the request.
+            while end <= req_start {
+                let (s, e, k, d) = next_range(&iterator)?;
+                start = s;
+                end = e;
+                kind = k;
+                data = d;
+            }
+            self.cursor.insert(
+                key.clone(),
+                pack_cursor(py, start, end, &kind, &data, &iterator)?,
+            );
+            // Split the request if the current hunk can't satisfy it all.
+            if req_end > end {
+                pending.push((version.clone().unbind(), end, req_end));
+                req_end = end;
+            }
+            if kind == "new" {
+                let slice = data.bind(py).get_item(pyo3::types::PySlice::new(
+                    py,
+                    (req_start - start) as isize,
+                    (req_end - start) as isize,
+                    1,
+                ))?;
+                lines.call_method1("extend", (slice,))?;
+            } else {
+                // ParentText: rewrite as a range request against the parent.
+                let tup = data.bind(py);
+                let parent_idx: usize = tup.get_item(0)?.extract()?;
+                let parent_start: usize = tup.get_item(1)?.extract()?;
+                let parent_end: usize = tup.get_item(2)?.extract()?;
+                let new_version = parents_map.get_item(version)?.get_item(parent_idx)?;
+                let new_start = parent_start + req_start - start;
+                let new_end = parent_end + req_end - end;
+                pending.push((new_version.unbind(), new_start, new_end));
+            }
+        }
+        Ok(())
+    }
+
+    fn reconstruct_version(
+        &mut self,
+        py: Python<'_>,
+        lines: &Bound<'_, PyAny>,
+        version_id: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let length: usize = self
+            .diffs
+            .bind(py)
+            .call_method1("get_diff", (&version_id,))?
+            .call_method0("num_lines")?
+            .extract()?;
+        self._reconstruct(py, lines, version_id, 0, length)
+    }
+}
+
+/// Pull the next `(start, end, kind, data)` range off a `range_iterator`.
+fn next_range(iterator: &Bound<'_, PyAny>) -> PyResult<(usize, usize, String, Py<PyAny>)> {
+    let item = iterator.call_method0("__next__")?;
+    let start: usize = item.get_item(0)?.extract()?;
+    let end: usize = item.get_item(1)?.extract()?;
+    let kind: String = item.get_item(2)?.extract()?;
+    let data = item.get_item(3)?.unbind();
+    Ok((start, end, kind, data))
+}
+
+/// Pack a cursor tuple `(start, end, kind, data, iterator)`.
+fn pack_cursor(
+    py: Python<'_>,
+    start: usize,
+    end: usize,
+    kind: &str,
+    data: &Py<PyAny>,
+    iterator: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyTuple>> {
+    Ok(PyTuple::new(
+        py,
+        [
+            start.into_pyobject(py)?.into_any(),
+            end.into_pyobject(py)?.into_any(),
+            kind.into_pyobject(py)?.into_any(),
+            data.bind(py).clone(),
+            iterator.clone(),
+        ],
+    )?
+    .unbind())
+}
+
+/// Unpack a stored cursor tuple back into its parts.
+fn unpack_cursor<'py>(
+    t: &Bound<'py, PyAny>,
+) -> PyResult<(usize, usize, String, Py<PyAny>, Bound<'py, PyAny>)> {
+    let start: usize = t.get_item(0)?.extract()?;
+    let end: usize = t.get_item(1)?.extract()?;
+    let kind: String = t.get_item(2)?.extract()?;
+    let data = t.get_item(3)?.unbind();
+    let iterator = t.get_item(4)?;
+    Ok((start, end, kind, data, iterator))
+}
+
 pub fn _multiparent_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "multiparent")?;
+    m.add_class::<PyMultiVersionedFile>()?;
     m.add_function(wrap_pyfunction!(to_patch, &m)?)?;
     m.add_function(wrap_pyfunction!(num_lines, &m)?)?;
     m.add_function(wrap_pyfunction!(is_snapshot, &m)?)?;
@@ -558,6 +1296,12 @@ pub fn _multiparent_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(topo_iter, &m)?)?;
     m.add_function(wrap_pyfunction!(from_lines_with_blocks, &m)?)?;
     m.add_function(wrap_pyfunction!(from_lines, &m)?)?;
+    m.add_function(wrap_pyfunction!(gzip_string, &m)?)?;
+    m.add_class::<PyBaseVersionedFile>()?;
+    m.add_class::<PyReconstructor>()?;
     m.add_class::<PyMultiMemoryVersionedFile>()?;
+    m.add_class::<PyMultiParent>()?;
+    m.add_class::<NewText>()?;
+    m.add_class::<ParentText>()?;
     Ok(m)
 }

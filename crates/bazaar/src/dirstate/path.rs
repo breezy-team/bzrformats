@@ -176,4 +176,123 @@ mod tests {
             assert_eq!(bisect_path_right(&paths, path), i + 1);
         }
     }
+
+    /// Assert `paths` is in strict dirblock order: lt holds exactly when the
+    /// first index precedes the second. Mirrors Python assertLtPathByDirblock.
+    fn assert_lt_dirblock_order(paths: &[&str]) {
+        let paths: Vec<&Path> = paths.iter().map(|s| p(s)).collect();
+        for (i, a) in paths.iter().enumerate() {
+            for (j, b) in paths.iter().enumerate() {
+                assert_eq!(
+                    lt_path_by_dirblock(a, b),
+                    i < j,
+                    "lt_path_by_dirblock({:?}, {:?}) mismatched i={} j={}",
+                    a,
+                    b,
+                    i,
+                    j,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lt_path_by_dirblock_tricky_paths() {
+        assert_lt_dirblock_order(&[
+            "",
+            "a",
+            "a-a",
+            "a=a",
+            "b", // contents of ''
+            "a/a",
+            "a/a-a",
+            "a/a=a",
+            "a/b", // contents of 'a'
+            "a/a/a",
+            "a/a/a-a",
+            "a/a/a=a", // contents of 'a/a'
+            "a/a/a/a",
+            "a/a/a/b", // contents of 'a/a/a'
+            "a/a/a-a/a",
+            "a/a/a-a/b", // contents of 'a/a/a-a'
+            "a/a/a=a/a",
+            "a/a/a=a/b", // contents of 'a/a/a=a'
+            "a/a-a/a",   // contents of 'a/a-a'
+            "a/a-a/a/a",
+            "a/a-a/a/b", // contents of 'a/a-a/a'
+            "a/a=a/a",   // contents of 'a/a=a'
+            "a/b/a",
+            "a/b/b", // contents of 'a/b'
+            "a-a/a",
+            "a-a/b", // contents of 'a-a'
+            "a=a/a",
+            "a=a/b", // contents of 'a=a'
+            "b/a",
+            "b/b", // contents of 'b'
+        ]);
+    }
+
+    #[test]
+    fn lt_path_by_dirblock_non_ascii() {
+        // \u{b5} = b"\xc2\xb5", \u{e5} = b"\xc3\xa5".
+        assert_lt_dirblock_order(&[
+            "",
+            "a",
+            "\u{b5}",
+            "\u{e5}", // content of ''
+            "a/a",
+            "a/\u{b5}",
+            "a/\u{e5}", // content of 'a'
+            "a/a/a",
+            "a/a/\u{b5}",
+            "a/a/\u{e5}", // content of 'a/a'
+            "a/\u{b5}/a",
+            "a/\u{b5}/\u{b5}",
+            "a/\u{b5}/\u{e5}", // content of 'a/\u{b5}'
+            "a/\u{e5}/a",
+            "a/\u{e5}/\u{b5}",
+            "a/\u{e5}/\u{e5}", // content of 'a/\u{e5}'
+            "\u{b5}/a",
+            "\u{b5}/\u{b5}",
+            "\u{b5}/\u{e5}", // content of '\u{b5}'
+            "\u{e5}/a",
+            "\u{e5}/\u{b5}",
+            "\u{e5}/\u{e5}", // content of '\u{e5}'
+        ]);
+    }
+
+    /// The deeply-nested dirblock-sorted fixture from the Python
+    /// TestBisectPathMixin.test_involved.
+    const INVOLVED_PATHS: &[&str] = &[
+        "", "a", "a-a", "a-z", "a=a", "a=z", // content of '/'
+        "a/a", "a/a-a", "a/a-z", "a/a=a", "a/a=z", "a/z", "a/z-a", "a/z-z", "a/z=a",
+        "a/z=z", // content of 'a/'
+        "a/a/a", "a/a/z",   // content of 'a/a/'
+        "a/a-a/a", // content of 'a/a-a'
+        "a/a-z/z", // content of 'a/a-z'
+        "a/a=a/a", // content of 'a/a=a'
+        "a/a=z/z", // content of 'a/a=z'
+        "a/z/a", "a/z/z", // content of 'a/z/'
+        "a-a/a", // content of 'a-a'
+        "a-z/z", // content of 'a-z'
+        "a=a/a", // content of 'a=a'
+        "a=z/z", // content of 'a=z'
+    ];
+
+    #[test]
+    fn bisect_path_left_involved_fixture() {
+        let paths: Vec<&Path> = INVOLVED_PATHS.iter().map(|s| p(s)).collect();
+        // The fixture is dirblock-sorted, so bisect_path_left finds each entry.
+        for (i, path) in paths.iter().enumerate() {
+            assert_eq!(bisect_path_left(&paths, path), i, "path {:?}", path);
+        }
+    }
+
+    #[test]
+    fn bisect_path_right_involved_fixture() {
+        let paths: Vec<&Path> = INVOLVED_PATHS.iter().map(|s| p(s)).collect();
+        for (i, path) in paths.iter().enumerate() {
+            assert_eq!(bisect_path_right(&paths, path), i + 1, "path {:?}", path);
+        }
+    }
 }

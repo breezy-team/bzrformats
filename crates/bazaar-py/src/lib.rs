@@ -9,6 +9,7 @@ use pyo3_filelike::PyBinaryFile;
 use std::collections::HashMap;
 use std::io::Write;
 
+mod annotate;
 mod bisect_multi;
 mod btree_index;
 mod btree_serializer;
@@ -16,6 +17,7 @@ mod chk_map;
 mod chunk_writer;
 mod dirstate;
 mod dirstate_helpers;
+mod errors;
 mod groupcompress;
 mod groupcompress_delta;
 mod index;
@@ -28,14 +30,16 @@ mod osutils;
 mod pack;
 mod pack_repo;
 mod plan_merge;
+mod recordcounter;
 mod smart;
 mod textmerge;
 mod transport;
 mod tuned_gzip;
 mod versionedfile;
 mod weave;
+mod weavefile;
 
-import_exception!(bzrformats.errors, ReservedId);
+import_exception!(bzrformats._bzr_rs.errors, ReservedId);
 import_exception!(breezy.bugtracker, InvalidLineInBugsProperty);
 import_exception!(breezy.bugtracker, InvalidBugStatus);
 
@@ -1109,6 +1113,21 @@ fn encode_and_escape(py: Python, unicode_or_utf8_str: Py<PyAny>) -> PyResult<Bou
     Ok(PyBytes::new(py, ret.as_bytes()))
 }
 
+/// Unescape predefined XML entities in a string of data. Mirrors
+/// `bzrformats.xml8._unescape_xml`; an unknown entity raises `KeyError`.
+#[pyfunction]
+fn _unescape_xml<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+    match bazaar::xml_serializer::unescape_xml(data) {
+        Ok(out) => Ok(PyBytes::new(py, &out)),
+        // unescape_xml only ever fails with a decode error (unknown entity);
+        // the Python original raised KeyError for that case.
+        Err(bazaar::serializer::Error::DecodeError(msg)) => {
+            Err(pyo3::exceptions::PyKeyError::new_err(msg))
+        }
+        Err(other) => Err(PyValueError::new_err(format!("{:?}", other))),
+    }
+}
+
 mod hashcache;
 mod rio;
 
@@ -1122,6 +1141,17 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(gen_file_id))?;
     m.add_wrapped(wrap_pyfunction!(gen_root_id))?;
     m.add_wrapped(wrap_pyfunction!(gen_revision_id))?;
+    let errorsm = errors::errors_module(py)?;
+    m.add_submodule(&errorsm)?;
+    // Register the errors submodule in sys.modules immediately: other
+    // submodules built below (e.g. inventory) define exception types whose
+    // base classes are `import_exception!(bzrformats._bzr_rs.errors, ...)`,
+    // which is resolved at class-creation time and would otherwise fail.
+    {
+        let sys = py.import("sys")?;
+        let modules = sys.getattr("modules")?;
+        modules.set_item(format!("{}.errors", m.name()?), &errorsm)?;
+    }
     let m_globbing = PyModule::new(py, "globbing")?;
     m_globbing.add_wrapped(wrap_pyfunction!(normalize_pattern))?;
     m_globbing.add_class::<Replacer>()?;
@@ -1205,6 +1235,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(check_not_reserved_id))?;
     m.add_wrapped(wrap_pyfunction!(escape_invalid_chars))?;
     m.add_wrapped(wrap_pyfunction!(encode_and_escape))?;
+    m.add_wrapped(wrap_pyfunction!(_unescape_xml))?;
 
     let riom = PyModule::new(py, "rio")?;
     rio::rio(&riom)?;
@@ -1243,6 +1274,8 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
 
     let weavem = weave::_weave_rs(py)?;
     m.add_submodule(&weavem)?;
+    let weavefilem = weavefile::_weavefile_rs(py)?;
+    m.add_submodule(&weavefilem)?;
 
     let packm = pack::_pack_rs(py)?;
     m.add_submodule(&packm)?;
@@ -1261,6 +1294,10 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
 
     let plan_mergem = plan_merge::_plan_merge_rs(py)?;
     m.add_submodule(&plan_mergem)?;
+    let recordcounterm = recordcounter::_recordcounter_rs(py)?;
+    m.add_submodule(&recordcounterm)?;
+    let annotatem = annotate::_annotate_rs(py)?;
+    m.add_submodule(&annotatem)?;
 
     let btree_serializerm = btree_serializer::_btree_serializer_rs(py)?;
     m.add_submodule(&btree_serializerm)?;
@@ -1304,12 +1341,15 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.textmerge", module_name), &textmergem)?;
     modules.set_item(format!("{}.multiparent", module_name), &multiparentm)?;
     modules.set_item(format!("{}.weave", module_name), &weavem)?;
+    modules.set_item(format!("{}.weavefile", module_name), &weavefilem)?;
     modules.set_item(format!("{}.pack", module_name), &packm)?;
     modules.set_item(format!("{}.pack_repo", module_name), &pack_repom)?;
     modules.set_item(format!("{}.index", module_name), &indexm)?;
     modules.set_item(format!("{}.btree_index", module_name), &btree_indexm)?;
     modules.set_item(format!("{}.versionedfile", module_name), &versionedfilem)?;
     modules.set_item(format!("{}.plan_merge", module_name), &plan_mergem)?;
+    modules.set_item(format!("{}.recordcounter", module_name), &recordcounterm)?;
+    modules.set_item(format!("{}.annotate", module_name), &annotatem)?;
     modules.set_item(
         format!("{}.btree_serializer", module_name),
         &btree_serializerm,
@@ -1320,6 +1360,341 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.osutils", module_name), &osutilsm)?;
     modules.set_item(format!("{}.chunk_writer", module_name), &chunk_writerm)?;
     modules.set_item(format!("{}.bisect_multi", module_name), &bisect_multim)?;
+
+    register_bzrformats_modules(py, m, &packm, &weavem, &btree_indexm, &btree_serializerm)?;
+
+    Ok(())
+}
+
+/// Build the public `bzrformats.<name>` modules that used to be one-line Python
+/// re-export shims, registering them in `sys.modules` and as attributes of the
+/// top-level `bzrformats` package. Each module exposes EXACTLY the names the
+/// former Python shim did, composed from the Rust extension's objects.
+fn register_bzrformats_modules(
+    py: Python<'_>,
+    m: &Bound<'_, PyModule>,
+    packm: &Bound<'_, PyModule>,
+    weavem: &Bound<'_, PyModule>,
+    btree_indexm: &Bound<'_, PyModule>,
+    btree_serializerm: &Bound<'_, PyModule>,
+) -> PyResult<()> {
+    let sys = py.import("sys")?;
+    let modules = sys.getattr("modules")?;
+    // The top-level `bzrformats` package object (already importing us).
+    let pkg = py.import("bzrformats")?;
+    let errors = py.import("bzrformats._bzr_rs.errors")?;
+
+    // Build one module from (public_name, object) pairs and register it under
+    // `bzrformats.<name>` plus as an attribute of the bzrformats package.
+    let build = |name: &str, items: &[(&str, Bound<'_, PyAny>)]| -> PyResult<()> {
+        let module = PyModule::new(py, name)?;
+        for (attr, obj) in items {
+            module.add(*attr, obj.clone())?;
+        }
+        modules.set_item(format!("bzrformats.{}", name), &module)?;
+        pkg.setattr(name, &module)?;
+        Ok(())
+    };
+
+    let logging = py.import("logging")?;
+
+    // --- xml serializer family ---
+    build(
+        "xml4",
+        &[
+            (
+                "inventory_serializer_v4",
+                m.getattr("inventory_serializer_v4")?,
+            ),
+            (
+                "revision_serializer_v4",
+                m.getattr("revision_serializer_v4")?,
+            ),
+        ],
+    )?;
+    build(
+        "xml5",
+        &[
+            (
+                "inventory_serializer_v5",
+                m.getattr("inventory_serializer_v5")?,
+            ),
+            (
+                "revision_serializer_v5",
+                m.getattr("revision_serializer_v5")?,
+            ),
+        ],
+    )?;
+    build(
+        "xml6",
+        &[(
+            "inventory_serializer_v6",
+            m.getattr("inventory_serializer_v6")?,
+        )],
+    )?;
+    build(
+        "xml7",
+        &[(
+            "inventory_serializer_v7",
+            m.getattr("inventory_serializer_v7")?,
+        )],
+    )?;
+    build(
+        "xml8",
+        &[
+            (
+                "inventory_serializer_v8",
+                m.getattr("inventory_serializer_v8")?,
+            ),
+            (
+                "revision_serializer_v8",
+                m.getattr("revision_serializer_v8")?,
+            ),
+            ("_unescape_xml", m.getattr("_unescape_xml")?),
+        ],
+    )?;
+    build(
+        "xml_serializer",
+        &[
+            ("encode_and_escape", m.getattr("encode_and_escape")?),
+            ("escape_invalid_chars", m.getattr("escape_invalid_chars")?),
+        ],
+    )?;
+    build(
+        "chk_serializer",
+        &[
+            ("CHKSerializer", m.getattr("CHKInventorySerializer")?),
+            (
+                "inventory_chk_serializer_255_bigpage_9",
+                m.getattr("inventory_chk_serializer_255_bigpage_9")?,
+            ),
+            (
+                "inventory_chk_serializer_255_bigpage_10",
+                m.getattr("inventory_chk_serializer_255_bigpage_10")?,
+            ),
+        ],
+    )?;
+
+    // --- generate_ids / revision ---
+    build(
+        "generate_ids",
+        &[
+            ("_next_id_suffix", m.getattr("_next_id_suffix")?),
+            ("gen_file_id", m.getattr("gen_file_id")?),
+            ("gen_revision_id", m.getattr("gen_revision_id")?),
+            ("gen_root_id", m.getattr("gen_root_id")?),
+        ],
+    )?;
+    {
+        // revision.py defines RevisionID = bytes and Revision = BzrRevision.
+        let revision_cls = m.getattr("Revision")?;
+        build(
+            "revision",
+            &[
+                ("CURRENT_REVISION", m.getattr("CURRENT_REVISION")?),
+                ("NULL_REVISION", m.getattr("NULL_REVISION")?),
+                ("check_not_reserved_id", m.getattr("check_not_reserved_id")?),
+                ("is_null", m.getattr("is_null")?),
+                ("is_reserved_id", m.getattr("is_reserved_id")?),
+                ("BzrRevision", revision_cls.clone()),
+                ("Revision", revision_cls.clone()),
+                ("RevisionID", py.get_type::<PyBytes>().into_any()),
+            ],
+        )?;
+    }
+
+    // --- merge / textmerge / rio_patch (curated subsets of existing submodules) ---
+    {
+        let plan_merge = py.import("bzrformats._bzr_rs.plan_merge")?;
+        build(
+            "merge",
+            &[
+                ("_PlanMerge", plan_merge.getattr("_PlanMerge")?),
+                ("_PlanLCAMerge", plan_merge.getattr("_PlanLCAMerge")?),
+            ],
+        )?;
+    }
+    {
+        let textmerge = py.import("bzrformats._bzr_rs.textmerge")?;
+        build(
+            "textmerge",
+            &[
+                ("Merge2", textmerge.getattr("Merge2")?),
+                ("TextMerge", textmerge.getattr("TextMerge")?),
+            ],
+        )?;
+    }
+    {
+        let rio = py.import("bzrformats._bzr_rs.rio")?;
+        build(
+            "rio",
+            &[
+                ("RioReader", rio.getattr("RioReader")?),
+                ("RioWriter", rio.getattr("RioWriter")?),
+                ("Stanza", rio.getattr("Stanza")?),
+                ("read_stanza", rio.getattr("read_stanza")?),
+                ("read_stanza_file", rio.getattr("read_stanza_file")?),
+                ("read_stanzas", rio.getattr("read_stanzas")?),
+                ("rio_iter", rio.getattr("rio_iter")?),
+                ("valid_tag", rio.getattr("valid_tag")?),
+            ],
+        )?;
+        build(
+            "rio_patch",
+            &[
+                ("read_patch_stanza", rio.getattr("read_patch_stanza")?),
+                ("to_patch_lines", rio.getattr("to_patch_lines")?),
+            ],
+        )?;
+    }
+
+    // --- inventory_delta ---
+    {
+        let inv = py.import("bzrformats._bzr_rs.inventory")?;
+        build(
+            "inventory_delta",
+            &[
+                ("InventoryDeltaError", inv.getattr("InventoryDeltaError")?),
+                (
+                    "IncompatibleInventoryDelta",
+                    inv.getattr("IncompatibleInventoryDelta")?,
+                ),
+                (
+                    "parse_inventory_entry",
+                    inv.getattr("parse_inventory_entry")?,
+                ),
+                (
+                    "serialize_inventory_entry",
+                    inv.getattr("serialize_inventory_entry")?,
+                ),
+                ("InventoryDelta", inv.getattr("InventoryDelta")?),
+                (
+                    "InventoryDeltaSerializer",
+                    inv.getattr("InventoryDeltaSerializer")?,
+                ),
+                (
+                    "InventoryDeltaDeserializer",
+                    inv.getattr("InventoryDeltaDeserializer")?,
+                ),
+            ],
+        )?;
+    }
+
+    // --- pack (re-exports its submodule names + the container errors) ---
+    build(
+        "pack",
+        &[
+            ("FORMAT_ONE", packm.getattr("FORMAT_ONE")?),
+            ("_check_name", packm.getattr("_check_name")?),
+            (
+                "_check_name_encoding",
+                packm.getattr("_check_name_encoding")?,
+            ),
+            ("ContainerSerialiser", packm.getattr("ContainerSerialiser")?),
+            ("ContainerWriter", packm.getattr("ContainerWriter")?),
+            ("ContainerReader", packm.getattr("ContainerReader")?),
+            ("BytesRecordReader", packm.getattr("BytesRecordReader")?),
+            ("ContainerPushParser", packm.getattr("ContainerPushParser")?),
+            ("ReadVFile", packm.getattr("ReadVFile")?),
+            ("make_readv_reader", packm.getattr("make_readv_reader")?),
+            (
+                "iter_records_from_file",
+                packm.getattr("iter_records_from_file")?,
+            ),
+            ("ContainerError", errors.getattr("ContainerError")?),
+            (
+                "ContainerHasExcessDataError",
+                errors.getattr("ContainerHasExcessDataError")?,
+            ),
+            (
+                "DuplicateRecordNameError",
+                errors.getattr("DuplicateRecordNameError")?,
+            ),
+            ("InvalidRecordError", errors.getattr("InvalidRecordError")?),
+            (
+                "UnexpectedEndOfContainerError",
+                errors.getattr("UnexpectedEndOfContainerError")?,
+            ),
+            (
+                "UnknownContainerFormatError",
+                errors.getattr("UnknownContainerFormatError")?,
+            ),
+            (
+                "UnknownRecordTypeError",
+                errors.getattr("UnknownRecordTypeError")?,
+            ),
+        ],
+    )?;
+
+    // --- weave (core classes + the weave error hierarchy) ---
+    build(
+        "weave",
+        &[
+            ("Weave", weavem.getattr("Weave")?),
+            ("WeaveFile", weavem.getattr("WeaveFile")?),
+            (
+                "WeaveContentFactory",
+                weavem.getattr("WeaveContentFactory")?,
+            ),
+            ("WeaveError", errors.getattr("WeaveError")?),
+            ("WeaveFormatError", errors.getattr("WeaveFormatError")?),
+            (
+                "WeaveInvalidChecksum",
+                errors.getattr("WeaveInvalidChecksum")?,
+            ),
+            (
+                "WeaveParentMismatch",
+                errors.getattr("WeaveParentMismatch")?,
+            ),
+            (
+                "WeaveRevisionAlreadyPresent",
+                errors.getattr("WeaveRevisionAlreadyPresent")?,
+            ),
+            (
+                "WeaveRevisionNotPresent",
+                errors.getattr("WeaveRevisionNotPresent")?,
+            ),
+            ("WeaveTextDiffers", errors.getattr("WeaveTextDiffers")?),
+        ],
+    )?;
+
+    // --- btree_index (classes/constants from the submodule + the chk factory
+    //     from btree_serializer + the byte constants and loggers). pyo3-log
+    //     forwards Rust log records, but the module still exposes named
+    //     `logging` loggers as attributes for API compatibility. ---
+    build(
+        "btree_index",
+        &[
+            ("BTreeBuilder", btree_indexm.getattr("BTreeBuilder")?),
+            ("BTreeGraphIndex", btree_indexm.getattr("BTreeGraphIndex")?),
+            ("_LeafNode", btree_indexm.getattr("_LeafNode")?),
+            ("_InternalNode", btree_indexm.getattr("_InternalNode")?),
+            ("PAGE_SIZE", btree_indexm.getattr("PAGE_SIZE")?),
+            ("_PAGE_SIZE", btree_indexm.getattr("_PAGE_SIZE")?),
+            (
+                "_gcchk_factory",
+                btree_serializerm.getattr("_parse_into_chk")?,
+            ),
+            ("_btree_serializer", btree_serializerm.clone().into_any()),
+            (
+                "_BTSIGNATURE",
+                PyBytes::new(py, b"B+Tree Graph Index 2\n").into_any(),
+            ),
+            ("_LEAF_FLAG", PyBytes::new(py, b"type=leaf\n").into_any()),
+            (
+                "_INTERNAL_FLAG",
+                PyBytes::new(py, b"type=internal\n").into_any(),
+            ),
+            (
+                "logger",
+                logging.call_method1("getLogger", ("bzrformats.btree_index",))?,
+            ),
+            (
+                "evil_logger",
+                logging.call_method1("getLogger", ("bzrformats.evil",))?,
+            ),
+        ],
+    )?;
 
     Ok(())
 }

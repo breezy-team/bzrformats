@@ -13,10 +13,10 @@ import_exception!(bzrformats.weave, WeaveFormatError);
 import_exception!(bzrformats.weave, WeaveInvalidChecksum);
 import_exception!(bzrformats.weave, WeaveParentMismatch);
 import_exception!(bzrformats.weave, WeaveTextDiffers);
-import_exception!(bzrformats.errors, RevisionAlreadyPresent);
-import_exception!(bzrformats.errors, RevisionNotPresent);
-import_exception!(bzrformats.errors, OutSideTransaction);
-import_exception!(bzrformats.errors, ReadOnlyObjectDirtiedError);
+import_exception!(bzrformats._bzr_rs.errors, RevisionAlreadyPresent);
+import_exception!(bzrformats._bzr_rs.errors, RevisionNotPresent);
+import_exception!(bzrformats._bzr_rs.errors, OutSideTransaction);
+import_exception!(bzrformats._bzr_rs.errors, ReadOnlyObjectDirtiedError);
 import_exception!(bzrformats.versionedfile, ExistingContent);
 import_exception!(bzrformats.versionedfile, UnavailableRepresentation);
 
@@ -417,7 +417,7 @@ fn py_weave_add<'py>(
     Ok((p, s, n, w, idx))
 }
 
-import_exception!(bzrformats.errors, ReservedId);
+import_exception!(bzrformats._bzr_rs.errors, ReservedId);
 
 /// Reserved-id check, mirroring `Weave.check_not_reserved_id`. A reserved
 /// id has a trailing `:`. Always allowed when `_allow_reserved` is True.
@@ -465,11 +465,11 @@ pub struct PyWeave {
     scope: Option<Py<PyAny>>,
 }
 
-#[pymethods]
 impl PyWeave {
-    #[new]
-    #[pyo3(signature = (weave_name=None, access_mode="w".to_string(), get_scope=None, allow_reserved=false))]
-    fn new(
+    /// Build the `VersionedFile -> PyWeave` initializer chain shared by
+    /// `PyWeave::new` and the `PyWeaveFile` subclass. `get_scope`, if given, is
+    /// invoked once to cache the scope.
+    pub(crate) fn base_initializer(
         py: Python<'_>,
         weave_name: Option<Py<PyAny>>,
         access_mode: String,
@@ -495,6 +495,25 @@ impl PyWeave {
                 scope,
             }),
         )
+    }
+}
+
+#[pymethods]
+impl PyWeave {
+    #[new]
+    #[pyo3(signature = (weave_name=None, access_mode="w".to_string(), matcher=None, get_scope=None, allow_reserved=false))]
+    fn new(
+        py: Python<'_>,
+        weave_name: Option<Py<PyAny>>,
+        access_mode: String,
+        matcher: Option<Py<PyAny>>,
+        get_scope: Option<Py<PyAny>>,
+        allow_reserved: bool,
+    ) -> PyResult<PyClassInitializer<Self>> {
+        // `matcher` is accepted for API compatibility; the diff matcher used by
+        // `_add` is hard-coded to patiencediff in the Rust core.
+        let _ = matcher;
+        Self::base_initializer(py, weave_name, access_mode, get_scope, allow_reserved)
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
@@ -1679,6 +1698,234 @@ impl WeaveContentFactory {
     }
 }
 
+const WEAVE_SUFFIX: &str = ".weave";
+
+/// True if `e` is a NoSuchFile from any transport backend: bzrformats,
+/// breezy, or dromedary. `bzrformats.transport.TransportNoSuchFile` covers
+/// the first two (it is a class or class-tuple); dromedary's is checked
+/// separately and tolerated-as-absent so this works without breezy installed.
+fn is_no_such_file(py: Python<'_>, e: &PyErr) -> PyResult<bool> {
+    let value = e.value(py);
+    let isinstance = py.import("builtins")?.getattr("isinstance")?;
+    if let Ok(tnsf) = py
+        .import("bzrformats.transport")
+        .and_then(|m| m.getattr("TransportNoSuchFile"))
+    {
+        if isinstance.call1((value, tnsf))?.is_truthy()? {
+            return Ok(true);
+        }
+    }
+    if let Ok(dnsf) = py
+        .import("dromedary.errors")
+        .and_then(|m| m.getattr("NoSuchFile"))
+    {
+        if isinstance.call1((value, dnsf))?.is_truthy()? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Convert a [`bazaar::transport::TransportError`] back into a Python
+/// exception. `NoSuchFile` round-trips to `bzrformats.transport.NoSuchFile`;
+/// everything else surfaces as a generic transport error.
+fn transport_err_to_py(e: bazaar::transport::TransportError) -> PyErr {
+    use bazaar::transport::TransportError;
+    Python::attach(|py| match e {
+        TransportError::NoSuchFile(path) => py
+            .import("bzrformats.transport")
+            .and_then(|m| m.getattr("NoSuchFile"))
+            .and_then(|c| c.call1((path,)))
+            .map(PyErr::from_value)
+            .unwrap_or_else(|err| err),
+        other => PyValueError::new_err(other.to_string()),
+    })
+}
+
+/// A `Weave` persisted to a transport, writing on every change.
+///
+/// Mirrors `bzrformats.weave.WeaveFile`. The transport (any Python
+/// `Transport`) is wrapped in [`crate::transport::PyTransport`] so the
+/// save/load paths go through the Rust `Transport` trait. `_transport` and
+/// `_filemode` are kept on the instance `__dict__` for API compatibility.
+#[pyclass(
+    name = "WeaveFile",
+    extends = PyWeave,
+    dict,
+    module = "bzrformats._bzr_rs.weave"
+)]
+pub struct WeaveFilePy;
+
+impl WeaveFilePy {
+    /// Wrap `self._transport` as a Rust Transport adapter.
+    fn transport(slf: &Bound<'_, Self>) -> PyResult<crate::transport::PyTransport> {
+        Ok(crate::transport::PyTransport::new(
+            slf.getattr("_transport")?,
+        ))
+    }
+
+    fn filemode(slf: &Bound<'_, Self>) -> PyResult<Option<u32>> {
+        slf.getattr("_filemode")?.extract()
+    }
+
+    /// Persist the weave to `<name>.weave` on the transport, creating the
+    /// parent directory if the first write fails with NoSuchFile.
+    fn save(slf: &Bound<'_, Self>) -> PyResult<()> {
+        use bazaar::transport::{Transport, TransportError};
+        let py = slf.py();
+        // _check_write_ok() (scope/read-only guard) lives on the base.
+        slf.call_method0("_check_write_ok")?;
+        let data: Vec<u8> = slf
+            .call_method0("_to_v5_bytes")?
+            .cast_into::<PyBytes>()?
+            .as_bytes()
+            .to_vec();
+        let name = slf.getattr("_weave_name")?;
+        let path = format!("{}{}", name.str()?.to_str()?, WEAVE_SUFFIX);
+        let transport = Self::transport(slf)?;
+        let mode = Self::filemode(slf)?;
+        match transport.put_bytes(&path, &data, mode) {
+            Ok(()) => Ok(()),
+            Err(TransportError::NoSuchFile(_)) => {
+                // Parent directory missing: create it and retry.
+                let dirname = py
+                    .import("posixpath")?
+                    .call_method1("dirname", (&path,))?
+                    .extract::<String>()?;
+                transport.mkdir(&dirname).map_err(transport_err_to_py)?;
+                transport
+                    .put_bytes(&path, &data, mode)
+                    .map_err(transport_err_to_py)
+            }
+            Err(e) => Err(transport_err_to_py(e)),
+        }
+    }
+}
+
+#[pymethods]
+impl WeaveFilePy {
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const WEAVE_SUFFIX: &'static str = WEAVE_SUFFIX;
+
+    #[new]
+    #[pyo3(signature = (name, transport, filemode=None, create=false, access_mode="w".to_string(), get_scope=None))]
+    fn new(
+        py: Python<'_>,
+        name: Py<PyAny>,
+        transport: Py<PyAny>,
+        filemode: Option<Py<PyAny>>,
+        create: bool,
+        access_mode: String,
+        get_scope: Option<Py<PyAny>>,
+    ) -> PyResult<PyClassInitializer<Self>> {
+        let _ = (transport, filemode, create);
+        // Build the PyWeave (and VersionedFile base) layer with this name.
+        let base = PyWeave::new(py, Some(name), access_mode, None, get_scope, false)?;
+        Ok(base.add_subclass(WeaveFilePy))
+    }
+
+    #[pyo3(signature = (name, transport, filemode=None, create=false, access_mode="w".to_string(), get_scope=None))]
+    fn __init__(
+        slf: &Bound<'_, Self>,
+        name: Py<PyAny>,
+        transport: Py<PyAny>,
+        filemode: Option<Py<PyAny>>,
+        create: bool,
+        access_mode: String,
+        get_scope: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        let _ = (name, access_mode, get_scope);
+        slf.setattr("_transport", &transport)?;
+        slf.setattr("_filemode", filemode.unwrap_or_else(|| py.None()))?;
+        let weave_name = slf.getattr("_weave_name")?;
+        let path = format!("{}{}", weave_name.str()?.to_str()?, WEAVE_SUFFIX);
+        // Read through the Python transport so its *native* NoSuchFile (which
+        // may be dromedary.errors.NoSuchFile in breezy) propagates unchanged --
+        // callers like the weave_fmt store catch that specific class. We only
+        // swallow it (matching bzrformats.transport.TransportNoSuchFile) to
+        // create a new empty weave; otherwise the original exception bubbles up.
+        let transport_obj = slf.getattr("_transport")?;
+        match transport_obj.call_method1("get_bytes", (&path,)) {
+            Ok(data) => {
+                slf.call_method1("_load_from_v5_bytes", (data,))?;
+                Ok(())
+            }
+            Err(e) => {
+                // Recognise NoSuchFile from any transport backend (bzrformats,
+                // breezy, or dromedary). When create=True we swallow it and
+                // save a new empty weave; otherwise (and for any other error)
+                // the original exception propagates unchanged, so callers that
+                // catch the transport's own NoSuchFile class still match.
+                if create && is_no_such_file(py, &e)? {
+                    Self::save(slf)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// See `VersionedFile.get_suffixes`.
+    #[staticmethod]
+    fn get_suffixes() -> Vec<&'static str> {
+        vec![WEAVE_SUFFIX]
+    }
+
+    /// Add a version then persist the weave.
+    #[pyo3(signature = (version_id, parents, lines, parent_texts, left_matching_blocks, nostore_sha, random_id, check_content))]
+    #[allow(clippy::too_many_arguments)]
+    fn _add_lines<'py>(
+        slf: &Bound<'py, Self>,
+        version_id: Bound<'py, PyAny>,
+        parents: Bound<'py, PyAny>,
+        lines: Bound<'py, PyAny>,
+        parent_texts: Bound<'py, PyAny>,
+        left_matching_blocks: Bound<'py, PyAny>,
+        nostore_sha: Bound<'py, PyAny>,
+        random_id: Bound<'py, PyAny>,
+        check_content: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        slf.call_method1("check_not_reserved_id", (&version_id,))?;
+        // super()._add_lines(...) via the PyWeave base, then save.
+        let base = slf.get_type().getattr("__mro__")?.get_item(1)?; // PyWeave
+        let result = base.getattr("_add_lines")?.call1((
+            slf,
+            version_id,
+            parents,
+            lines,
+            parent_texts,
+            left_matching_blocks,
+            nostore_sha,
+            random_id,
+            check_content,
+        ))?;
+        Self::save(slf)?;
+        Ok(result)
+    }
+
+    /// See `VersionedFile.copy_to`: serialise to the given transport.
+    fn copy_to(slf: &Bound<'_, Self>, name: &str, transport: Bound<'_, PyAny>) -> PyResult<()> {
+        let py = slf.py();
+        let data = slf.call_method0("_to_v5_bytes")?;
+        let io = py.import("io")?;
+        let sio = io.call_method1("BytesIO", (data,))?;
+        sio.call_method1("seek", (0,))?;
+        let path = format!("{}{}", name, WEAVE_SUFFIX);
+        let filemode = slf.getattr("_filemode")?;
+        transport.call_method1("put_file", (path, sio, filemode))?;
+        Ok(())
+    }
+
+    /// Insert records then persist the weave.
+    fn insert_record_stream(slf: &Bound<'_, Self>, stream: Bound<'_, PyAny>) -> PyResult<()> {
+        let base = slf.get_type().getattr("__mro__")?.get_item(1)?; // PyWeave
+        base.getattr("insert_record_stream")?.call1((slf, stream))?;
+        Self::save(slf)
+    }
+}
+
 pub fn _weave_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "weave")?;
     m.add_function(wrap_pyfunction!(py_extract, &m)?)?;
@@ -1688,6 +1935,7 @@ pub fn _weave_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(py_write_weave_v5, &m)?)?;
     m.add_function(wrap_pyfunction!(py_weave_add, &m)?)?;
     m.add_class::<PyWeave>()?;
+    m.add_class::<WeaveFilePy>()?;
     m.add_class::<WeaveContentFactory>()?;
     Ok(m)
 }

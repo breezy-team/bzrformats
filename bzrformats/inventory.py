@@ -45,22 +45,16 @@ __all__ = [
 
 from ._bzr_rs import ROOT_ID
 from ._bzr_rs import inventory as _mod_inventory_rs
-from .errors import BadFileKindError, BzrFormatsError
 
-
-class NoSuchId(BzrFormatsError):
-    """File ID not found in tree.
-
-    Raised when a requested file ID is not present in the tree.
-    """
-
-    _fmt = 'The file id "%(file_id)s" is not present in the tree %(tree)s.'
-
-    def __init__(self, tree, file_id):
-        super().__init__()
-        self.tree = tree
-        self.file_id = file_id
-
+# The inventory error classes live in the Rust errors module; re-export them so
+# bzrformats.inventory.NoSuchId / InvalidEntryName / DuplicateFileId keep
+# working for callers (e.g. breezy) and the Rust import_exception! sites.
+from .errors import (  # noqa: F401
+    BadFileKindError,
+    DuplicateFileId,
+    InvalidEntryName,
+    NoSuchId,
+)
 
 FileId = bytes
 InventoryEntry = _mod_inventory_rs.InventoryEntry
@@ -69,23 +63,6 @@ InventoryDirectory = _mod_inventory_rs.InventoryDirectory
 TreeReference = _mod_inventory_rs.TreeReference
 InventoryLink = _mod_inventory_rs.InventoryLink
 Inventory = _mod_inventory_rs.Inventory
-
-
-class InvalidEntryName(BzrFormatsError):
-    _fmt = "Invalid entry name: %(name)s"
-
-    def __init__(self, name):
-        super().__init__()
-        self.name = name
-
-
-class DuplicateFileId(BzrFormatsError):
-    _fmt = "File id {%(file_id)s} already exists in inventory as %(entry)s"
-
-    def __init__(self, file_id, entry):
-        super().__init__()
-        self.file_id = file_id
-        self.entry = entry
 
 
 class CHKInventory(_mod_inventory_rs.CHKInventory):

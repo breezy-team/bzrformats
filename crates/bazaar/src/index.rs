@@ -3502,4 +3502,196 @@ mod tests {
         ));
         assert!(!key_matches_any_prefix(&[p1, p2], &key(&[b"c", b"z"])));
     }
+
+    #[test]
+    fn find_ancestors_single_index_walks_frontier() {
+        // key1 -> key2 -> (). Mirrors test__find_ancestors.
+        let mut b = GraphIndexBuilder::new(1, 1);
+        b.add_node(
+            key(&[b"key-1"]),
+            b"value".to_vec(),
+            vec![vec![key(&[b"key-2"])]],
+        )
+        .unwrap();
+        b.add_node(key(&[b"key-2"]), b"value".to_vec(), vec![vec![]])
+            .unwrap();
+
+        let mut parent_map: HashMap<IndexKey, Vec<IndexKey>> = HashMap::new();
+        let mut missing: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        let search = b
+            .find_ancestors(&[key(&[b"key-1"])], 0, &mut parent_map, &mut missing)
+            .unwrap();
+        assert_eq!(
+            parent_map.get(&key(&[b"key-1"])),
+            Some(&vec![key(&[b"key-2"])])
+        );
+        assert!(missing.is_empty());
+        let expected: std::collections::HashSet<IndexKey> =
+            vec![key(&[b"key-2"])].into_iter().collect();
+        assert_eq!(search, expected);
+
+        let search2: Vec<IndexKey> = search.into_iter().collect();
+        let search = b
+            .find_ancestors(&search2, 0, &mut parent_map, &mut missing)
+            .unwrap();
+        assert_eq!(parent_map.get(&key(&[b"key-2"])), Some(&vec![]));
+        assert!(missing.is_empty());
+        assert!(search.is_empty());
+    }
+
+    #[test]
+    fn find_ancestors_records_missing_keys() {
+        // Mirrors test__find_ancestors_w_missing: key3 is absent.
+        let mut b = GraphIndexBuilder::new(1, 1);
+        b.add_node(
+            key(&[b"key-1"]),
+            b"value".to_vec(),
+            vec![vec![key(&[b"key-2"])]],
+        )
+        .unwrap();
+        b.add_node(key(&[b"key-2"]), b"value".to_vec(), vec![vec![]])
+            .unwrap();
+        let mut parent_map: HashMap<IndexKey, Vec<IndexKey>> = HashMap::new();
+        let mut missing: std::collections::HashSet<IndexKey> = std::collections::HashSet::new();
+        let search = b
+            .find_ancestors(
+                &[key(&[b"key-2"]), key(&[b"key-3"])],
+                0,
+                &mut parent_map,
+                &mut missing,
+            )
+            .unwrap();
+        assert_eq!(parent_map.get(&key(&[b"key-2"])), Some(&vec![]));
+        let expected: std::collections::HashSet<IndexKey> =
+            vec![key(&[b"key-3"])].into_iter().collect();
+        assert_eq!(missing, expected);
+        assert!(search.is_empty());
+    }
+
+    #[test]
+    fn combined_find_ancestry_across_indexes() {
+        // index1: key1->(), key2->key1; index2: key3->key2, key4->key3.
+        let mut b1 = GraphIndexBuilder::new(1, 1);
+        b1.add_node(key(&[b"key-1"]), b"value".to_vec(), vec![vec![]])
+            .unwrap();
+        b1.add_node(
+            key(&[b"key-2"]),
+            b"value".to_vec(),
+            vec![vec![key(&[b"key-1"])]],
+        )
+        .unwrap();
+        let mut b2 = GraphIndexBuilder::new(1, 1);
+        b2.add_node(
+            key(&[b"key-3"]),
+            b"value".to_vec(),
+            vec![vec![key(&[b"key-2"])]],
+        )
+        .unwrap();
+        b2.add_node(
+            key(&[b"key-4"]),
+            b"value".to_vec(),
+            vec![vec![key(&[b"key-3"])]],
+        )
+        .unwrap();
+        let combined = CombinedGraphIndex::from_indices(vec![Box::new(b1), Box::new(b2)]);
+
+        let (pm, missing) = combined.find_ancestry(&[key(&[b"key-1"])], 0).unwrap();
+        assert_eq!(pm.get(&key(&[b"key-1"])), Some(&vec![]));
+        assert_eq!(pm.len(), 1);
+        assert!(missing.is_empty());
+
+        // key3 forces a continuation into the first index for its parents.
+        let (pm, missing) = combined.find_ancestry(&[key(&[b"key-3"])], 0).unwrap();
+        assert_eq!(pm.get(&key(&[b"key-1"])), Some(&vec![]));
+        assert_eq!(pm.get(&key(&[b"key-2"])), Some(&vec![key(&[b"key-1"])]));
+        assert_eq!(pm.get(&key(&[b"key-3"])), Some(&vec![key(&[b"key-2"])]));
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn combined_find_ancestry_missing_and_no_indexes() {
+        // No indexes: the requested key lands in missing.
+        let combined = CombinedGraphIndex::new();
+        let (pm, missing) = combined.find_ancestry(&[key(&[b"key-1"])], 0).unwrap();
+        assert!(pm.is_empty());
+        let expected: std::collections::HashSet<IndexKey> =
+            vec![key(&[b"key-1"])].into_iter().collect();
+        assert_eq!(missing, expected);
+
+        // Present key whose parent is a ghost: parent is reported missing.
+        let mut b = GraphIndexBuilder::new(1, 1);
+        b.add_node(
+            key(&[b"key-1"]),
+            b"value".to_vec(),
+            vec![vec![key(&[b"ghost"])]],
+        )
+        .unwrap();
+        let combined = CombinedGraphIndex::from_indices(vec![Box::new(b)]);
+        let (pm, missing) = combined.find_ancestry(&[key(&[b"key-1"])], 0).unwrap();
+        assert_eq!(pm.get(&key(&[b"key-1"])), Some(&vec![key(&[b"ghost"])]));
+        let expected: std::collections::HashSet<IndexKey> =
+            vec![key(&[b"ghost"])].into_iter().collect();
+        assert_eq!(missing, expected);
+    }
+
+    #[test]
+    fn combined_get_parent_map_fills_null_for_roots() {
+        let null: IndexKey = vec![b"null:".to_vec()];
+        let mut b = GraphIndexBuilder::new(1, 1);
+        // key1 has a parent; key2 has none (a root).
+        b.add_node(
+            key(&[b"key-1"]),
+            b"v".to_vec(),
+            vec![vec![key(&[b"key-2"])]],
+        )
+        .unwrap();
+        b.add_node(key(&[b"key-2"]), b"v".to_vec(), vec![vec![]])
+            .unwrap();
+        let combined = CombinedGraphIndex::from_indices(vec![Box::new(b)]);
+        let pm = combined
+            .get_parent_map(&[key(&[b"key-1"]), key(&[b"key-2"]), null.clone()], &null)
+            .unwrap();
+        assert_eq!(pm.get(&key(&[b"key-1"])), Some(&vec![key(&[b"key-2"])]));
+        // A root's empty parent list becomes [NULL_REVISION].
+        assert_eq!(pm.get(&key(&[b"key-2"])), Some(&vec![null.clone()]));
+        // NULL_REVISION maps to no parents.
+        assert_eq!(pm.get(&null), Some(&vec![]));
+    }
+
+    #[test]
+    fn combined_iter_with_hits_then_move_to_front() {
+        // Four single-key indices; query keys from index 3 and 1.
+        let mk = |k: &[u8]| {
+            let mut b = GraphIndexBuilder::new(0, 1);
+            b.add_node(key(&[k]), b"v".to_vec(), vec![]).unwrap();
+            Box::new(b) as Box<dyn IndexLike + Send + Sync>
+        };
+        let mut combined =
+            CombinedGraphIndex::from_indices(vec![mk(b"k0"), mk(b"k1"), mk(b"k2"), mk(b"k3")]);
+        let (entries, hits) = combined
+            .iter_entries_with_hits(&[key(&[b"k3"]), key(&[b"k1"])])
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        // Hits are reported in index order (1 before 3).
+        assert_eq!(hits, vec![1, 3]);
+
+        combined.move_to_front(&hits);
+        // After moving 1 and 3 to the front (in hit order), the remaining
+        // indices keep their relative order: [1, 3, 0, 2]. Verify by which
+        // key each index now holds.
+        let key_at = |c: &CombinedGraphIndex, i: usize| {
+            c.indices()[i].iter(&[]).ok();
+            c.indices()[i]
+                .iter_all()
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .0
+        };
+        assert_eq!(key_at(&combined, 0), key(&[b"k1"]));
+        assert_eq!(key_at(&combined, 1), key(&[b"k3"]));
+        assert_eq!(key_at(&combined, 2), key(&[b"k0"]));
+        assert_eq!(key_at(&combined, 3), key(&[b"k2"]));
+    }
 }

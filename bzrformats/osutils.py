@@ -16,12 +16,13 @@
 
 """OS utilities for bzrformats using only standard library."""
 
-import hashlib
 import logging
 import os
 import shutil
 import sys
 import unicodedata
+
+from ._bzr_rs import osutils as _osutils_rs
 
 
 def isdir(path):
@@ -120,40 +121,16 @@ def fdatasync(fileno):
 
 def splitpath(path):
     """Split a path into a list of components."""
-    if isinstance(path, bytes):
-        if path.startswith(b"/"):
-            path = path[1:]
-        if not path:
-            return []
-        return path.split(b"/")
-    else:
-        if path.startswith("/"):
-            path = path[1:]
-        if not path:
-            return []
-        return path.split("/")
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.splitpath(path)
 
 
 def file_kind_from_stat_mode(mode):
     """Return the file kind based on the stat mode."""
-    import stat
+    from ._bzr_rs import osutils as _osutils_rs
 
-    if stat.S_ISREG(mode):
-        return "file"
-    elif stat.S_ISDIR(mode):
-        return "directory"
-    elif stat.S_ISLNK(mode):
-        return "symlink"
-    elif stat.S_ISFIFO(mode):
-        return "fifo"
-    elif stat.S_ISSOCK(mode):
-        return "socket"
-    elif stat.S_ISCHR(mode):
-        return "chardev"
-    elif stat.S_ISBLK(mode):
-        return "block"
-    else:
-        return "unknown"
+    return _osutils_rs.file_kind_from_stat_mode(mode)
 
 
 def contains_whitespace(s):
@@ -167,34 +144,23 @@ def contains_whitespace(s):
 
 def sha_strings(strings):
     """Return the sha1 of concatenated strings."""
-    sha = hashlib.sha1()  # noqa: S324
-    for string in strings:
-        if isinstance(string, str):
-            # Convert unicode strings to bytes using UTF-8
-            string = string.encode("utf-8")
-        sha.update(string)
-    return sha.hexdigest().encode("ascii")
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.sha_strings(strings)
 
 
 def sha_string(string):
     """Return the sha1 of a single string."""
-    if isinstance(string, str):
-        # Convert unicode strings to bytes using UTF-8
-        string = string.encode("utf-8")
-    sha = hashlib.sha1()  # noqa: S324
-    sha.update(string)
-    return sha.hexdigest().encode("ascii")
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.sha_string(string)
 
 
 def sha_file(file_obj):
     """Return the sha1 of a file."""
-    sha = hashlib.sha1()  # noqa: S324
-    while True:
-        chunk = file_obj.read(65536)
-        if not chunk:
-            break
-        sha.update(chunk)
-    return sha.hexdigest().encode("ascii")
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.sha_file(file_obj)
 
 
 def dirname(path):
@@ -291,12 +257,9 @@ def safe_unicode(unicode_or_utf8_string):
     Otherwise it is decoded from utf-8. If decoding fails, the exception is
     wrapped in a TypeError exception.
     """
-    if isinstance(unicode_or_utf8_string, (str, os.PathLike)):
-        return unicode_or_utf8_string
-    try:
-        return unicode_or_utf8_string.decode("utf8")
-    except UnicodeDecodeError as e:
-        raise TypeError(unicode_or_utf8_string) from e
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.safe_unicode(unicode_or_utf8_string)
 
 
 def safe_utf8(unicode_or_utf8_string):
@@ -305,14 +268,9 @@ def safe_utf8(unicode_or_utf8_string):
     If it is a str, it is returned.
     If it is Unicode, it is encoded into a utf-8 string.
     """
-    if isinstance(unicode_or_utf8_string, bytes):
-        # Make sure it is a valid utf-8 string
-        try:
-            unicode_or_utf8_string.decode("utf-8")
-        except UnicodeDecodeError as e:
-            raise TypeError(unicode_or_utf8_string) from e
-        return unicode_or_utf8_string
-    return unicode_or_utf8_string.encode("utf-8")
+    from ._bzr_rs import osutils as _osutils_rs
+
+    return _osutils_rs.safe_utf8(unicode_or_utf8_string)
 
 
 def _walkdirs_utf8(top, prefix="", fs_enc=None):
@@ -459,59 +417,6 @@ def split_lines(text):
     return _osutils_rs.split_lines(text)
 
 
-class IterableFile:
-    """A file-like object backed by an iterator of byte strings.
-
-    Supports ``read()`` and ``readline()`` over a lazy sequence of chunks.
-    """
-
-    def __init__(self, iterable):
-        """Initialize with an iterable of byte chunks."""
-        self._iter = iter(iterable)
-        self._buf = b""
-
-    def read(self, size=-1):
-        """Read up to *size* bytes, or all remaining if *size* < 0."""
-        if size < 0:
-            return self._buf + b"".join(self._iter)
-        while len(self._buf) < size:
-            try:
-                self._buf += next(self._iter)
-            except StopIteration:
-                break
-        result = self._buf[:size]
-        self._buf = self._buf[size:]
-        return result
-
-    def readline(self):
-        r"""Read one line (up to and including ``\\n``)."""
-        while b"\n" not in self._buf:
-            try:
-                self._buf += next(self._iter)
-            except StopIteration:
-                # Return whatever is left
-                result = self._buf
-                self._buf = b""
-                return result
-        idx = self._buf.index(b"\n") + 1
-        result = self._buf[:idx]
-        self._buf = self._buf[idx:]
-        return result
-
-    def readlines(self):
-        """Return all remaining lines as a list."""
-        lines = []
-        while True:
-            line = self.readline()
-            if not line:
-                break
-            lines.append(line)
-        return lines
-
-    def __iter__(self):
-        """Iterate over lines."""
-        while True:
-            line = self.readline()
-            if not line:
-                break
-            yield line
+# IterableFile is a Rust pyclass (a file-like object over an iterator of byte
+# chunks); re-exported here.
+IterableFile = _osutils_rs.IterableFile

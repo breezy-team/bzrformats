@@ -828,4 +828,54 @@ mod tests {
         // [Some, None, Some] -> next spill merges slot 0 with mem, lands at 1.
         assert_eq!(spill_landing_slot(&[true, false, true]), 1);
     }
+
+    #[test]
+    fn add_node_rejects_duplicate_key() {
+        let mut builder = BTreeBuilder::new(0, 1);
+        builder
+            .add_node(vec![b"key".to_vec()], b"value".to_vec(), vec![])
+            .unwrap();
+        match builder.add_node(vec![b"key".to_vec()], b"other".to_vec(), vec![]) {
+            Err(Error::DuplicateKey(k)) => assert_eq!(k, vec![b"key".to_vec()]),
+            other => panic!("expected DuplicateKey, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn add_node_rejects_value_with_newline() {
+        let mut builder = BTreeBuilder::new(0, 1);
+        match builder.add_node(vec![b"key".to_vec()], b"bad\nvalue".to_vec(), vec![]) {
+            Err(Error::BadValue(v)) => assert_eq!(v, b"bad\nvalue"),
+            other => panic!("expected BadValue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn add_node_rejects_key_with_null() {
+        let mut builder = BTreeBuilder::new(0, 1);
+        match builder.add_node(vec![b"bad\x00key".to_vec()], b"value".to_vec(), vec![]) {
+            Err(Error::BadKey(k, _)) => assert_eq!(k, vec![b"bad\x00key".to_vec()]),
+            other => panic!("expected BadKey, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn finish_rejects_key_too_big_for_one_node() {
+        // A key whose compressed size exceeds a page cannot be placed; finish
+        // must report KeyTooBig. Mirrors test_btree_index.test_key_too_big:
+        // the key is incompressible (concatenated distinct numbers), so a
+        // simple character repeat would not do.
+        let mut big_key = Vec::new();
+        for n in 0..4096u32 {
+            big_key.extend_from_slice(n.to_string().as_bytes());
+        }
+        let mut builder = BTreeBuilder::new(0, 1);
+        builder
+            .add_node(vec![big_key], b"value".to_vec(), vec![])
+            .unwrap();
+        match builder.finish() {
+            Err(Error::KeyTooBig(_)) => {}
+            other => panic!("expected KeyTooBig, got {:?}", other.map(|_| "Ok(bytes)")),
+        }
+    }
 }

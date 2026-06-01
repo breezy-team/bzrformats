@@ -98,3 +98,98 @@ impl ContentFilter for ContentFilterStack {
             .fold(input, |input, filter| filter.writer(input))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    type Chunks = Box<dyn Iterator<Item = Result<Vec<u8>, Error>> + Send + Sync>;
+
+    /// A filter that maps each byte through a per-direction function, applied
+    /// chunk by chunk. `read_fn` runs on read, `write_fn` on write.
+    struct ByteMapFilter {
+        read_fn: fn(u8) -> u8,
+        write_fn: fn(u8) -> u8,
+    }
+
+    fn map_chunks(input: Chunks, f: fn(u8) -> u8) -> Chunks {
+        Box::new(input.map(move |r| r.map(|chunk| chunk.into_iter().map(f).collect())))
+    }
+
+    impl ContentFilter for ByteMapFilter {
+        fn reader(&self, input: Chunks) -> Chunks {
+            map_chunks(input, self.read_fn)
+        }
+        fn writer(&self, input: Chunks) -> Chunks {
+            map_chunks(input, self.write_fn)
+        }
+    }
+
+    fn collect(chunks: Chunks) -> Vec<u8> {
+        chunks.flat_map(|r| r.unwrap()).collect()
+    }
+
+    fn one_chunk(bytes: &[u8]) -> Chunks {
+        Box::new(std::iter::once(Ok(bytes.to_vec())))
+    }
+
+    #[test]
+    fn test_empty_stack_is_identity() {
+        let stack = ContentFilterStack::new();
+        assert_eq!(collect(stack.reader(one_chunk(b"hello"))), b"hello");
+        assert_eq!(collect(stack.writer(one_chunk(b"hello"))), b"hello");
+    }
+
+    #[test]
+    fn test_single_filter_applied() {
+        let stack = ContentFilterStack::from(vec![Box::new(ByteMapFilter {
+            read_fn: |b| b.to_ascii_uppercase(),
+            write_fn: |b| b.to_ascii_lowercase(),
+        }) as Box<dyn ContentFilter>]);
+        assert_eq!(collect(stack.reader(one_chunk(b"Hello"))), b"HELLO");
+        assert_eq!(collect(stack.writer(one_chunk(b"Hello"))), b"hello");
+    }
+
+    #[test]
+    fn test_stack_composes_filters_in_order() {
+        // First filter adds 1 on read, second adds 10 on read: read applies
+        // them in fold order (first, then second).
+        let stack = ContentFilterStack::from(vec![
+            Box::new(ByteMapFilter {
+                read_fn: |b| b + 1,
+                write_fn: |b| b - 1,
+            }) as Box<dyn ContentFilter>,
+            Box::new(ByteMapFilter {
+                read_fn: |b| b + 10,
+                write_fn: |b| b - 10,
+            }) as Box<dyn ContentFilter>,
+        ]);
+        assert_eq!(collect(stack.reader(one_chunk(&[0, 100]))), vec![11, 111]);
+        assert_eq!(collect(stack.writer(one_chunk(&[11, 111]))), vec![0, 100]);
+    }
+
+    #[test]
+    fn test_sha1_file_runs_content_through_reader() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"hello world").unwrap();
+        tmp.flush().unwrap();
+
+        // No filters: sha1 of the raw file content.
+        let stack = ContentFilterStack::new();
+        assert_eq!(
+            stack.sha1_file(tmp.path()).unwrap(),
+            "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed"
+        );
+
+        // An uppercasing read filter: sha1 must be of "HELLO WORLD".
+        let upper = ContentFilterStack::from(vec![Box::new(ByteMapFilter {
+            read_fn: |b| b.to_ascii_uppercase(),
+            write_fn: |b| b.to_ascii_lowercase(),
+        }) as Box<dyn ContentFilter>]);
+        assert_eq!(
+            upper.sha1_file(tmp.path()).unwrap(),
+            crate::osutils::sha::sha_string(b"HELLO WORLD")
+        );
+    }
+}

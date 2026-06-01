@@ -174,6 +174,59 @@ pub fn contains_whitespace(s: &str) -> bool {
     false
 }
 
+/// A file kind as derived from a stat `st_mode`. Unlike [`Kind`], this covers
+/// every format the kernel can report, including the kinds bzr does not track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StatKind {
+    File,
+    Directory,
+    Symlink,
+    Fifo,
+    Socket,
+    CharDevice,
+    BlockDevice,
+    Unknown,
+}
+
+impl StatKind {
+    /// The string token bzr uses for this kind (the same names Python's
+    /// `osutils.file_kind_from_stat_mode` returns).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StatKind::File => "file",
+            StatKind::Directory => "directory",
+            StatKind::Symlink => "symlink",
+            StatKind::Fifo => "fifo",
+            StatKind::Socket => "socket",
+            StatKind::CharDevice => "chardev",
+            StatKind::BlockDevice => "block",
+            StatKind::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for StatKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Map a stat `st_mode` to a [`StatKind`]. Mirrors
+/// `osutils.file_kind_from_stat_mode`.
+pub fn kind_from_stat_mode(mode: u32) -> StatKind {
+    // S_IFMT mask = 0o170000; compare the format bits.
+    match mode & 0o170000 {
+        0o100000 => StatKind::File,
+        0o040000 => StatKind::Directory,
+        0o120000 => StatKind::Symlink,
+        0o010000 => StatKind::Fifo,
+        0o140000 => StatKind::Socket,
+        0o020000 => StatKind::CharDevice,
+        0o060000 => StatKind::BlockDevice,
+        _ => StatKind::Unknown,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     File,

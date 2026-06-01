@@ -39,7 +39,7 @@ impl PyTransport {
 /// everything else to [`TransportError::Other`] with the exception's
 /// `repr()`.
 #[allow(dead_code)]
-pyo3::import_exception!(bzrformats.errors, NoSuchFile);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, NoSuchFile);
 mod transport_exc {
     pyo3::import_exception!(bzrformats.transport, NoSuchFile);
 }
@@ -97,6 +97,18 @@ impl Transport for PyTransport {
             self.0
                 .bind(py)
                 .call_method("put_file_non_atomic", (path, sio), Some(&kwargs))
+                .map_err(|e| map_py_err(py, e))?;
+            Ok(())
+        })
+    }
+
+    fn put_bytes(&self, path: &str, bytes: &[u8], mode: Option<u32>) -> Result<(), TransportError> {
+        Python::attach(|py| -> Result<(), TransportError> {
+            let py_bytes = PyBytes::new(py, bytes);
+            // bzrformats Transport.put_bytes(path, raw_bytes, mode=None).
+            self.0
+                .bind(py)
+                .call_method1("put_bytes", (path, py_bytes, mode))
                 .map_err(|e| map_py_err(py, e))?;
             Ok(())
         })

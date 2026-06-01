@@ -11,17 +11,17 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
-pyo3::import_exception!(bzrformats.errors, NotVersionedError);
-pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
-pyo3::import_exception!(bzrformats.errors, InconsistentDelta);
-pyo3::import_exception!(bzrformats.errors, InvalidNormalization);
-pyo3::import_exception!(bzrformats.errors, BadFileKindError);
-pyo3::import_exception!(bzrformats.errors, LockContention);
-pyo3::import_exception!(bzrformats.errors, LockNotHeld);
-pyo3::import_exception!(bzrformats.errors, ObjectNotLocked);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, NotVersionedError);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, BzrFormatsError);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, InconsistentDelta);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, InvalidNormalization);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, BadFileKindError);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, LockContention);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, LockNotHeld);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, ObjectNotLocked);
 pyo3::import_exception!(bzrformats.inventory, DuplicateFileId);
 pyo3::import_exception!(bzrformats.inventory, InvalidEntryName);
-pyo3::import_exception!(bzrformats.dirstate, DirstateCorrupt);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, DirstateCorrupt);
 
 /// `bazaar::dirstate::Transport` adapter backed by a Python file-like
 /// object.  Used by `DirStateRs.save_to_file` so the pure-Rust
@@ -662,13 +662,63 @@ impl StatResult {
     }
 }
 
-#[pyclass]
-struct SHA1Provider {
+/// Abstract base for sha1 providers, ported from
+/// `bzrformats.dirstate.SHA1Provider`. Concrete providers (and breezy's
+/// `ContentFilterAwareSHA1Provider`) extend it; the abstract methods raise
+/// `NotImplementedError` so a bare instance behaves like the old ABC.
+#[pyclass(
+    subclass,
+    name = "SHA1Provider",
+    module = "bzrformats._bzr_rs.dirstate"
+)]
+struct SHA1Provider;
+
+#[pymethods]
+impl SHA1Provider {
+    #[new]
+    #[pyo3(signature = (*args, **kwargs))]
+    fn new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> Self {
+        // Accept and ignore any args, so Python subclasses (e.g. breezy's
+        // ContentFilterAwareSHA1Provider, whose __init__ takes a tree) don't
+        // trip the native base __new__.
+        let _ = (args, kwargs);
+        SHA1Provider
+    }
+
+    fn sha1(&self, abspath: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = abspath;
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "SHA1Provider.sha1",
+        ))
+    }
+
+    fn stat_and_sha1(&self, abspath: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = abspath;
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "SHA1Provider.stat_and_sha1",
+        ))
+    }
+}
+
+/// The default, filesystem-backed sha1 provider. Extends [`SHA1Provider`].
+#[pyclass(
+    name = "DefaultSHA1Provider",
+    extends = SHA1Provider,
+    module = "bzrformats._bzr_rs.dirstate"
+)]
+struct PyDefaultSHA1Provider {
     provider: Box<dyn bazaar::dirstate::SHA1Provider + Send + Sync>,
 }
 
 #[pymethods]
-impl SHA1Provider {
+impl PyDefaultSHA1Provider {
+    #[new]
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(SHA1Provider).add_subclass(PyDefaultSHA1Provider {
+            provider: Box::new(bazaar::dirstate::DefaultSHA1Provider::new()),
+        })
+    }
+
     fn sha1<'a>(&mut self, py: Python<'a>, path: &Bound<PyAny>) -> PyResult<Bound<'a, PyBytes>> {
         let path = extract_path(path)?;
         let sha1 = self
@@ -691,13 +741,6 @@ impl SHA1Provider {
             PyBytes::new(py, sha1.as_bytes()),
         ))
     }
-}
-
-#[pyfunction]
-fn DefaultSHA1Provider() -> PyResult<SHA1Provider> {
-    Ok(SHA1Provider {
-        provider: Box::new(bazaar::dirstate::DefaultSHA1Provider::new()),
-    })
 }
 
 /// Adapter that lets a Python `SHA1Provider`-shaped object (anything
@@ -4398,7 +4441,8 @@ pub fn _dirstate_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_wrapped(wrap_pyfunction!(bisect_path_right))?;
     m.add_wrapped(wrap_pyfunction!(lt_path_by_dirblock))?;
     m.add_wrapped(wrap_pyfunction!(bisect_dirblock))?;
-    m.add_wrapped(wrap_pyfunction!(DefaultSHA1Provider))?;
+    m.add_class::<SHA1Provider>()?;
+    m.add_class::<PyDefaultSHA1Provider>()?;
     m.add_wrapped(wrap_pyfunction!(pack_stat))?;
     m.add_wrapped(wrap_pyfunction!(fields_per_entry))?;
     m.add_wrapped(wrap_pyfunction!(get_ghosts_line))?;

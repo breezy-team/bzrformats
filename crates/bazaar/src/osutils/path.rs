@@ -101,3 +101,25 @@ pub fn normalizes_filenames() -> bool {
     #[cfg(not(target_os = "macos"))]
     return false;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::splitpath;
+
+    #[test]
+    fn test_splitpath() {
+        assert_eq!(splitpath("foo/bar").unwrap(), vec!["foo", "bar"]);
+        // A leading slash yields an empty first segment, which is dropped.
+        assert_eq!(splitpath("/foo/bar").unwrap(), vec!["foo", "bar"]);
+        assert_eq!(splitpath("").unwrap(), Vec::<&str>::new());
+        assert_eq!(splitpath("/").unwrap(), Vec::<&str>::new());
+        // "." segments are skipped.
+        assert_eq!(splitpath("foo/./bar").unwrap(), vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn test_splitpath_rejects_parent_ref() {
+        assert!(splitpath("foo/../bar").is_err());
+        assert!(splitpath("..").is_err());
+    }
+}

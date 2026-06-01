@@ -660,6 +660,14 @@ impl MutableInventory {
             }
             self.children.insert(new_file_id.clone(), children);
         }
+        // The parent directory's child map indexes by name -> file_id, so it
+        // must be repointed at the new id or the entry becomes unreachable by
+        // path (path2id would resolve to the now-removed old id).
+        if let Some(parent_id) = ie.parent_id() {
+            if let Some(siblings) = self.children.get_mut(parent_id) {
+                siblings.insert(ie.name().to_string(), new_file_id.clone());
+            }
+        }
         ie.set_file_id(new_file_id.clone());
         self.by_id.insert(new_file_id.clone(), ie);
         if self.root_id == Some(old_file_id.clone()) {
@@ -1838,6 +1846,228 @@ mod tests {
                 ("sub".to_string(), b"sub-id".to_vec()),
                 ("sub/b".to_string(), b"b-id".to_vec()),
             ]
+        );
+    }
+
+    /// Add a directory entry under `parent` by path-splitting. Returns the
+    /// generated/used file id.
+    fn add_dir(inv: &mut MutableInventory, relpath: &str, fid: &[u8]) -> FileId {
+        inv.add_path(
+            relpath,
+            Kind::Directory,
+            Some(FileId::from(fid)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn add_file(inv: &mut MutableInventory, relpath: &str, fid: &[u8]) -> FileId {
+        inv.add_path(
+            relpath,
+            Kind::File,
+            Some(FileId::from(fid)),
+            None,
+            Some(b"sha".to_vec()),
+            Some(3),
+            Some(false),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn add_path_root_then_nested() {
+        let mut inv = MutableInventory::new();
+        // Empty relpath sets up (or replaces) the root.
+        let root = inv
+            .add_path(
+                "",
+                Kind::Directory,
+                Some(root_id()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(root, root_id());
+        let src = add_dir(&mut inv, "src", b"src-id");
+        let hello = add_file(&mut inv, "src/hello.c", b"hello-id");
+        assert_eq!(src, FileId::from(&b"src-id"[..]));
+        assert_eq!(hello, FileId::from(&b"hello-id"[..]));
+        // The nested file resolves both ways.
+        assert_eq!(
+            inv.path2id("src/hello.c"),
+            Some(&FileId::from(&b"hello-id"[..]))
+        );
+        assert_eq!(inv.id2path(&hello).unwrap(), "src/hello.c");
+    }
+
+    #[test]
+    fn add_path_under_unversioned_parent_errors() {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        let err = inv
+            .add_path(
+                "missing/file",
+                Kind::File,
+                Some(FileId::from(&b"f"[..])),
+                None,
+                Some(b"sha".to_vec()),
+                Some(1),
+                Some(false),
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::ParentNotVersioned(_)));
+    }
+
+    #[test]
+    fn add_rejects_duplicate_file_id() {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        inv.add(Entry::directory(
+            FileId::from(&b"d"[..]),
+            "d".to_string(),
+            root_id(),
+            None,
+        ))
+        .unwrap();
+        let err = inv
+            .add(Entry::directory(
+                FileId::from(&b"d"[..]),
+                "d2".to_string(),
+                root_id(),
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, Error::DuplicateFileId(..)));
+    }
+
+    #[test]
+    fn path2id_segments_resolves_and_misses() {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        add_dir(&mut inv, "src", b"src-id");
+        add_file(&mut inv, "src/a.c", b"a-id");
+        assert_eq!(
+            inv.path2id_segments(&["src", "a.c"]),
+            Some(&FileId::from(&b"a-id"[..]))
+        );
+        assert_eq!(inv.path2id_segments(&["src", "nope"]), None);
+        assert_eq!(inv.path2id(""), Some(&root_id()));
+    }
+
+    #[test]
+    fn rename_moves_entry_to_new_parent() {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        add_dir(&mut inv, "a", b"a-id");
+        add_dir(&mut inv, "b", b"b-id");
+        let f = add_file(&mut inv, "a/f.c", b"f-id");
+        // Move a/f.c -> b/g.c.
+        inv.rename(&f, &FileId::from(&b"b-id"[..]), "g.c").unwrap();
+        assert_eq!(inv.id2path(&f).unwrap(), "b/g.c");
+        assert_eq!(inv.path2id("a/f.c"), None);
+        assert_eq!(inv.path2id("b/g.c"), Some(&FileId::from(&b"f-id"[..])));
+    }
+
+    #[test]
+    fn rename_into_occupied_name_errors() {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        add_dir(&mut inv, "a", b"a-id");
+        let f = add_file(&mut inv, "a/f.c", b"f-id");
+        add_file(&mut inv, "g.c", b"g-id");
+        // Renaming f.c to the root as "g.c" collides with the existing g.c.
+        let err = inv.rename(&f, &root_id(), "g.c").unwrap_err();
+        assert!(matches!(err, Error::PathAlreadyVersioned(..)));
+    }
+
+    #[test]
+    fn rename_id_changes_file_id() {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        let f = add_file(&mut inv, "f.c", b"old-id");
+        inv.rename_id(&f, &FileId::from(&b"new-id"[..])).unwrap();
+        assert!(inv.get_entry(&FileId::from(&b"new-id"[..])).is_some());
+        assert!(inv.get_entry(&FileId::from(&b"old-id"[..])).is_none());
+        assert_eq!(inv.path2id("f.c"), Some(&FileId::from(&b"new-id"[..])));
+    }
+
+    #[test]
+    fn filter_keeps_subtree_and_ancestors() {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        add_dir(&mut inv, "src", b"src-id");
+        add_file(&mut inv, "src/a.c", b"a-id");
+        add_file(&mut inv, "src/b.c", b"b-id");
+        add_file(&mut inv, "top.c", b"top-id");
+
+        let mut keep: HashSet<&FileId> = HashSet::new();
+        let a = FileId::from(&b"a-id"[..]);
+        keep.insert(&a);
+        let filtered = inv.filter(&keep).unwrap();
+        // a.c and its ancestors (src, root) are kept; b.c and top.c dropped.
+        assert!(filtered.get_entry(&FileId::from(&b"a-id"[..])).is_some());
+        assert!(filtered.get_entry(&FileId::from(&b"src-id"[..])).is_some());
+        assert!(filtered.get_entry(&root_id()).is_some());
+        assert!(filtered.get_entry(&FileId::from(&b"b-id"[..])).is_none());
+        assert!(filtered.get_entry(&FileId::from(&b"top-id"[..])).is_none());
+    }
+
+    #[test]
+    fn create_by_apply_delta_adds_and_deletes() {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        add_file(&mut inv, "old.c", b"old-id");
+
+        // Delta: delete old.c, add new.c.
+        let new_file = Entry::file(
+            FileId::from(&b"new-id"[..]),
+            "new.c".to_string(),
+            root_id(),
+            Some(RevisionId::from(&b"rev"[..])),
+            Some(b"sha".to_vec()),
+            Some(3),
+            Some(false),
+            None,
+        );
+        let delta = InventoryDelta(vec![
+            InventoryDeltaEntry {
+                old_path: Some("old.c".to_string()),
+                new_path: None,
+                file_id: FileId::from(&b"old-id"[..]),
+                new_entry: None,
+            },
+            InventoryDeltaEntry {
+                old_path: None,
+                new_path: Some("new.c".to_string()),
+                file_id: FileId::from(&b"new-id"[..]),
+                new_entry: Some(new_file),
+            },
+        ]);
+        let new_inv = inv
+            .create_by_apply_delta(&delta, RevisionId::from(&b"rev"[..]))
+            .unwrap();
+        assert!(new_inv.get_entry(&FileId::from(&b"new-id"[..])).is_some());
+        assert!(new_inv.get_entry(&FileId::from(&b"old-id"[..])).is_none());
+        assert_eq!(
+            new_inv.path2id("new.c"),
+            Some(&FileId::from(&b"new-id"[..]))
         );
     }
 }

@@ -9,17 +9,17 @@ use bazaar::knit::{
     KnitRecordDetails, PlainKnitContent,
 };
 use bazaar::transport::Transport as _;
-use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-pyo3::import_exception!(bzrformats.errors, RevisionNotPresent);
-pyo3::import_exception!(bzrformats.errors, NoSuchFile);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, RevisionNotPresent);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, NoSuchFile);
 pyo3::import_exception!(bzrformats.versionedfile, UnavailableRepresentation);
-pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
-pyo3::import_exception!(bzrformats.errors, ObjectNotLocked);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, ReadOnlyError);
+pyo3::import_exception!(bzrformats._bzr_rs.errors, ObjectNotLocked);
 pyo3::import_exception!(bzrformats.knit, KnitCorrupt);
 pyo3::import_exception!(bzrformats.knit, KnitHeaderError);
 pyo3::import_exception!(bzrformats.knit, KnitIndexUnknownMethod);
@@ -3122,8 +3122,11 @@ fn convert_stream_record<'py>(
     })
 }
 
-/// Python-accessible wrapper around [`KnitAnnotator`].
-#[pyclass(name = "_KnitAnnotator")]
+/// Fast-path annotator returned by `KnitVersionedFiles.get_annotator`,
+/// wrapping the pure-Rust [`KnitAnnotator`] engine. The whitebox-observable
+/// `_KnitAnnotator` (built by `annotate_knit` and poked by breezy's tests)
+/// is the separate [`KnitAnnotatorPy`] below.
+#[pyclass(name = "_KnitAnnotatorFast")]
 pub struct PyKnitAnnotator {
     inner: AnyKnitAnnotator,
     /// The versioned file this annotator was constructed from.  Exposed as
@@ -3232,6 +3235,626 @@ impl PyKnitAnnotator {
         let anns_list = PyList::new(py, anns_py)?;
         let lines_list = PyList::new(py, lines.iter().map(|l| PyBytes::new(py, l)))?;
         PyTuple::new(py, [anns_list.into_any(), lines_list.into_any()])
+    }
+}
+
+/// Whitebox-faithful port of Python's `knit._KnitAnnotator`.
+///
+/// Extends [`VersionedFileAnnotator`](crate::annotate::VersionedFileAnnotator)
+/// and reproduces the per-step build-graph bookkeeping that breezy's
+/// `Test_KnitAnnotator` reaches into: `_num_compression_children`,
+/// `_content_objects`, `_pending_deltas`, `_pending_annotation`,
+/// `_matching_blocks`, `_all_build_details`, plus `_expand_record` /
+/// `_process_pending` / `_get_build_graph` / `_extract_texts`. All mutable
+/// state lives in the instance `__dict__` (the base carries `dict`), and the
+/// inherited `annotate` / `annotate_flat` drive `_get_needed_texts` here.
+#[pyclass(name = "_KnitAnnotator", extends = crate::annotate::VersionedFileAnnotator, dict)]
+pub struct KnitAnnotatorPy;
+
+impl KnitAnnotatorPy {
+    fn dict<'py>(slf: &Bound<'py, Self>, name: &str) -> PyResult<Bound<'py, PyDict>> {
+        Ok(slf.getattr(name)?.cast_into::<PyDict>()?)
+    }
+}
+
+#[pymethods]
+impl KnitAnnotatorPy {
+    #[new]
+    fn new(vf: Bound<'_, PyAny>) -> PyClassInitializer<Self> {
+        let _ = vf;
+        PyClassInitializer::from(crate::annotate::VersionedFileAnnotator)
+            .add_subclass(KnitAnnotatorPy)
+    }
+
+    fn __init__(slf: &Bound<'_, Self>, vf: Bound<'_, PyAny>) -> PyResult<()> {
+        let py = slf.py();
+        // Initialise the VersionedFileAnnotator base state (_vf, _parent_map,
+        // _text_cache, _num_needed_children, _annotations_cache, ...) by
+        // invoking the base __init__ through the unbound method object.
+        let base_cls = py
+            .import("bzrformats.annotate")?
+            .getattr("VersionedFileAnnotator")?;
+        base_cls.getattr("__init__")?.call1((slf, vf))?;
+        slf.setattr("_matching_blocks", PyDict::new(py))?;
+        slf.setattr("_content_objects", PyDict::new(py))?;
+        slf.setattr("_num_compression_children", PyDict::new(py))?;
+        slf.setattr("_pending_deltas", PyDict::new(py))?;
+        slf.setattr("_pending_annotation", PyDict::new(py))?;
+        slf.setattr("_all_build_details", PyDict::new(py))?;
+        Ok(())
+    }
+
+    /// Build the records-to-fetch graph for `key`, populating
+    /// `_all_build_details`, `_parent_map`, `_num_needed_children` and
+    /// `_num_compression_children`. Returns `(records, ann_keys)`.
+    fn _get_build_graph<'py>(
+        slf: &Bound<'py, Self>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PySet>)> {
+        let py = slf.py();
+        let vf = slf.getattr("_vf")?;
+        let index = vf.getattr("_index")?;
+        let parent_map = Self::dict(slf, "_parent_map")?;
+        let num_needed = Self::dict(slf, "_num_needed_children")?;
+        let num_comp = Self::dict(slf, "_num_compression_children")?;
+        let all_build_details = Self::dict(slf, "_all_build_details")?;
+
+        let mut pending = PySet::empty(py)?;
+        pending.add(&key)?;
+        let records = PyList::empty(py);
+        let ann_keys = PySet::empty(py)?;
+        num_needed.set_item(&key, 1)?;
+
+        while !pending.is_empty() {
+            let this_iteration = pending;
+            let build_details = index.call_method1("get_build_details", (&this_iteration,))?;
+            let build_details = build_details.cast::<PyDict>()?;
+            all_build_details.call_method1("update", (&build_details,))?;
+            pending = PySet::empty(py)?;
+            for (k, details) in build_details.iter() {
+                // details = (index_memo, compression_parent, parent_keys, record_details)
+                let index_memo = details.get_item(0)?;
+                let compression_parent = details.get_item(1)?;
+                let parent_keys = details.get_item(2)?;
+                parent_map.set_item(&k, &parent_keys)?;
+                slf.setattr("_heads_provider", py.None())?;
+                records.append((&k, index_memo))?;
+                for p in parent_keys.try_iter()? {
+                    let p = p?;
+                    if !all_build_details.contains(&p)? {
+                        pending.add(p)?;
+                    }
+                }
+                if parent_keys.is_truthy()? {
+                    for parent_key in parent_keys.try_iter()? {
+                        let parent_key = parent_key?;
+                        match num_needed.get_item(&parent_key)? {
+                            Some(v) => num_needed.set_item(&parent_key, v.extract::<i64>()? + 1)?,
+                            None => num_needed.set_item(&parent_key, 1)?,
+                        }
+                    }
+                }
+                if compression_parent.is_truthy()? {
+                    match num_comp.get_item(&compression_parent)? {
+                        Some(v) => {
+                            num_comp.set_item(&compression_parent, v.extract::<i64>()? + 1)?
+                        }
+                        None => num_comp.set_item(&compression_parent, 1)?,
+                    }
+                }
+            }
+            // missing_versions = this_iteration - build_details
+            let missing = this_iteration.call_method1("difference", (&build_details,))?;
+            for k in missing.try_iter()? {
+                let k = k?;
+                let text_cache = Self::dict(slf, "_text_cache")?;
+                if parent_map.contains(&k)? && text_cache.contains(&k)? {
+                    ann_keys.add(&k)?;
+                    let parent_keys = parent_map
+                        .get_item(&k)?
+                        .ok_or_else(|| PyKeyError::new_err(k.clone().unbind()))?;
+                    for parent_key in parent_keys.try_iter()? {
+                        let parent_key = parent_key?;
+                        match num_needed.get_item(&parent_key)? {
+                            Some(v) => num_needed.set_item(&parent_key, v.extract::<i64>()? + 1)?,
+                            None => num_needed.set_item(&parent_key, 1)?,
+                        }
+                    }
+                    for p in parent_keys.try_iter()? {
+                        let p = p?;
+                        if !all_build_details.contains(&p)? {
+                            pending.add(p)?;
+                        }
+                    }
+                } else {
+                    return Err(crate::annotate::revision_not_present(py, k, &vf));
+                }
+            }
+        }
+        records.call_method0("reverse")?;
+        Ok((records, ann_keys))
+    }
+
+    /// Yield `(this_key, lines, num_lines)` for `key`. Falls back to the base
+    /// implementation when the vf has fallbacks; otherwise drives the knit
+    /// build-graph / record-extraction machinery.
+    #[pyo3(signature = (key, pb=None))]
+    fn _get_needed_texts<'py>(
+        slf: &Bound<'py, Self>,
+        key: Bound<'py, PyAny>,
+        pb: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let vf = slf.getattr("_vf")?;
+        let fallbacks = vf.getattr("_immediate_fallback_vfs")?;
+        if fallbacks.len()? > 0 {
+            // Delegate to VersionedFileAnnotator._get_needed_texts (unbound).
+            let base_cls = py
+                .import("bzrformats.annotate")?
+                .getattr("VersionedFileAnnotator")?;
+            return base_cls.getattr("_get_needed_texts")?.call1((slf, key, pb));
+        }
+        // Return a lazy iterator. Laziness is essential: the caller (the base
+        // `annotate`) annotates each yielded key before requesting the next,
+        // which is what makes parked records become ready for annotation. An
+        // eager list would deadlock those records in `_pending_annotation`.
+        let annotator: Py<KnitAnnotatorPy> = slf.clone().unbind();
+        let iter = KnitNeededTextsIter {
+            annotator,
+            pb: pb.map(|p| p.unbind()),
+            seed_key: key.unbind(),
+            state: None,
+            idx: 0,
+        };
+        Ok(Py::new(py, iter)?.into_any().into_bound(py))
+    }
+
+    fn _cache_delta_blocks(
+        slf: &Bound<'_, Self>,
+        key: Bound<'_, PyAny>,
+        compression_parent: Bound<'_, PyAny>,
+        delta: Bound<'_, PyAny>,
+        lines: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        let parent_lines = Self::dict(slf, "_text_cache")?
+            .get_item(&compression_parent)?
+            .ok_or_else(|| PyKeyError::new_err(compression_parent.clone().unbind()))?;
+        let kc = py.import("bzrformats.knit")?.getattr("KnitContent")?;
+        let blocks = kc.call_method1("get_line_delta_blocks", (delta, parent_lines, lines))?;
+        let blocks_list = PyList::empty(py);
+        for b in blocks.try_iter()? {
+            blocks_list.append(b?)?;
+        }
+        let block_key = PyTuple::new(py, [&key, &compression_parent])?;
+        Self::dict(slf, "_matching_blocks")?.set_item(block_key, blocks_list)?;
+        Ok(())
+    }
+
+    fn _expand_record<'py>(
+        slf: &Bound<'py, Self>,
+        key: Bound<'py, PyAny>,
+        parent_keys: Bound<'py, PyAny>,
+        compression_parent: Bound<'py, PyAny>,
+        record: Bound<'py, PyAny>,
+        record_details: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let vf = slf.getattr("_vf")?;
+        let factory = vf.getattr("_factory")?;
+        let content_objects = Self::dict(slf, "_content_objects")?;
+        let num_comp = Self::dict(slf, "_num_compression_children")?;
+        let mut delta: Option<Bound<'py, PyAny>> = None;
+        let content;
+        if compression_parent.is_truthy()? {
+            if !content_objects.contains(&compression_parent)? {
+                // Park this record until its compression parent arrives.
+                let pending_deltas = Self::dict(slf, "_pending_deltas")?;
+                let entry = PyTuple::new(py, [&key, &parent_keys, &record, &record_details])?;
+                match pending_deltas.get_item(&compression_parent)? {
+                    Some(lst) => {
+                        lst.call_method1("append", (entry,))?;
+                    }
+                    None => {
+                        let lst = PyList::empty(py);
+                        lst.append(entry)?;
+                        pending_deltas.set_item(&compression_parent, lst)?;
+                    }
+                }
+                return Ok(py.None().into_bound(py));
+            }
+            let num: i64 = num_comp
+                .get_item(&compression_parent)?
+                .ok_or_else(|| PyKeyError::new_err(compression_parent.clone().unbind()))?
+                .extract()?;
+            let num = num - 1;
+            let base_content;
+            if num == 0 {
+                base_content = content_objects.call_method1("pop", (&compression_parent,))?;
+                num_comp.call_method1("pop", (&compression_parent,))?;
+            } else {
+                num_comp.set_item(&compression_parent, num)?;
+                base_content = content_objects
+                    .get_item(&compression_parent)?
+                    .ok_or_else(|| PyKeyError::new_err(compression_parent.clone().unbind()))?;
+            }
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("copy_base_content", true)?;
+            let res = factory.call_method(
+                "parse_record",
+                (&key, &record, &record_details, base_content),
+                Some(&kwargs),
+            )?;
+            content = res.get_item(0)?;
+            delta = Some(res.get_item(1)?);
+        } else {
+            let res = factory
+                .call_method1("parse_record", (&key, &record, &record_details, py.None()))?;
+            content = res.get_item(0)?;
+        }
+        let key_children: i64 = match num_comp.get_item(&key)? {
+            Some(v) => v.extract()?,
+            None => 0,
+        };
+        if key_children > 0 {
+            content_objects.set_item(&key, &content)?;
+        }
+        let lines = content.call_method0("text")?;
+        Self::dict(slf, "_text_cache")?.set_item(&key, &lines)?;
+        if let Some(delta) = delta {
+            if !delta.is_none() {
+                Self::_cache_delta_blocks(slf, key, compression_parent, delta, lines.clone())?;
+            }
+        }
+        Ok(lines)
+    }
+
+    fn _get_parent_annotations_and_matches<'py>(
+        slf: &Bound<'py, Self>,
+        key: Bound<'py, PyAny>,
+        text: Bound<'py, PyAny>,
+        parent_key: Bound<'py, PyAny>,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        let py = slf.py();
+        let matching_blocks = Self::dict(slf, "_matching_blocks")?;
+        let block_key = PyTuple::new(py, [&key, &parent_key])?;
+        if matching_blocks.contains(&block_key)? {
+            let blocks = matching_blocks.call_method1("pop", (&block_key,))?;
+            let parent_annotations = Self::dict(slf, "_annotations_cache")?
+                .get_item(&parent_key)?
+                .ok_or_else(|| PyKeyError::new_err(parent_key.clone().unbind()))?;
+            return Ok((parent_annotations, blocks));
+        }
+        let base_cls = py
+            .import("bzrformats.annotate")?
+            .getattr("VersionedFileAnnotator")?;
+        let res = base_cls
+            .getattr("_get_parent_annotations_and_matches")?
+            .call1((slf, key, text, parent_key))?;
+        Ok((res.get_item(0)?, res.get_item(1)?))
+    }
+
+    fn _process_pending<'py>(
+        slf: &Bound<'py, Self>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let py = slf.py();
+        let to_return = PyList::empty(py);
+        let pending_deltas = Self::dict(slf, "_pending_deltas")?;
+        if pending_deltas.contains(&key)? {
+            let compression_parent = key.clone();
+            let children = pending_deltas.call_method1("pop", (&key,))?;
+            for child in children.try_iter()? {
+                let child = child?;
+                let child_key = child.get_item(0)?;
+                let parent_keys = child.get_item(1)?;
+                let record = child.get_item(2)?;
+                let record_details = child.get_item(3)?;
+                Self::_expand_record(
+                    slf,
+                    child_key.clone(),
+                    parent_keys.clone(),
+                    compression_parent.clone(),
+                    record,
+                    record_details,
+                )?;
+                if Self::_check_ready_for_annotations(slf, child_key.clone(), parent_keys)? {
+                    to_return.append(child_key)?;
+                }
+            }
+        }
+        let pending_annotation = Self::dict(slf, "_pending_annotation")?;
+        if pending_annotation.contains(&key)? {
+            let children = pending_annotation.call_method1("pop", (&key,))?;
+            for child in children.try_iter()? {
+                let child = child?;
+                let c = child.get_item(0)?;
+                let p_keys = child.get_item(1)?;
+                if Self::_check_ready_for_annotations(slf, c.clone(), p_keys)? {
+                    to_return.append(c)?;
+                }
+            }
+        }
+        Ok(to_return)
+    }
+
+    fn _check_ready_for_annotations(
+        slf: &Bound<'_, Self>,
+        key: Bound<'_, PyAny>,
+        parent_keys: Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        let py = slf.py();
+        let annotations_cache = Self::dict(slf, "_annotations_cache")?;
+        let pending_annotation = Self::dict(slf, "_pending_annotation")?;
+        for parent_key in parent_keys.try_iter()? {
+            let parent_key = parent_key?;
+            if !annotations_cache.contains(&parent_key)? {
+                let entry = PyTuple::new(py, [&key, &parent_keys])?;
+                match pending_annotation.get_item(&parent_key)? {
+                    Some(lst) => {
+                        lst.call_method1("append", (entry,))?;
+                    }
+                    None => {
+                        let lst = PyList::empty(py);
+                        lst.append(entry)?;
+                        pending_annotation.set_item(&parent_key, lst)?;
+                    }
+                }
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whitebox helper: eagerly extract all `(key, lines, num_lines)` for
+    /// `records`. Only correct when the caller is not relying on interleaved
+    /// annotation (e.g. there is no compression delta chain). Retained because
+    /// breezy's tests call `_extract_texts` directly on simple inputs; the
+    /// lazy `KnitNeededTextsIter` is used for the real annotate path.
+    fn _extract_texts<'py>(
+        slf: &Bound<'py, Self>,
+        records: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let py = slf.py();
+        let out = PyList::empty(py);
+        let mut state = ExtractState::new(slf, records)?;
+        while let Some(item) = state.next_item(slf)? {
+            out.append(item)?;
+        }
+        Ok(out)
+    }
+}
+
+/// Lazy driver for `_KnitAnnotator._extract_texts` plus the trailing
+/// `ann_keys`. Reproduces the Python generator's interleaving: each item is
+/// produced on demand so the caller can annotate it (which makes parked
+/// records ready) before the next item is computed.
+struct ExtractState {
+    /// The `vf._read_records_iter(records)` iterator.
+    read_iter: Py<PyAny>,
+    /// Keys whose text is cached and waiting to be yielded (the inner
+    /// `to_process` worklist of the Python generator).
+    to_process: std::collections::VecDeque<Py<PyAny>>,
+    /// A key that was yielded on the previous call and whose
+    /// `_process_pending` must run now (mirrors the Python generator
+    /// resuming *after* the consumer annotated the yielded key — so
+    /// dependents waiting on its annotation become ready). Processing it
+    /// before the yield, as an eager port would, leaves those dependents
+    /// stuck because the key is not yet in `_annotations_cache`.
+    resume_key: Option<Py<PyAny>>,
+    done: bool,
+}
+
+impl ExtractState {
+    fn new(slf: &Bound<'_, KnitAnnotatorPy>, records: Bound<'_, PyAny>) -> PyResult<Self> {
+        let vf = slf.getattr("_vf")?;
+        let read_iter = vf
+            .call_method1("_read_records_iter", (records,))?
+            .try_iter()?
+            .into_any()
+            .unbind();
+        Ok(ExtractState {
+            read_iter,
+            to_process: std::collections::VecDeque::new(),
+            resume_key: None,
+            done: false,
+        })
+    }
+
+    /// Produce the next `(key, lines, num_lines)` tuple, or `None` when
+    /// exhausted. Mirrors the body of the Python `_extract_texts` generator.
+    fn next_item<'py>(
+        &mut self,
+        slf: &Bound<'py, KnitAnnotatorPy>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let py = slf.py();
+        let text_cache = KnitAnnotatorPy::dict(slf, "_text_cache")?;
+        loop {
+            // Resume point: the Python generator runs `_process_pending(key)`
+            // only *after* the consumer has annotated the previously yielded
+            // `key`. Do that here, at the start of the call following the
+            // yield, so dependents waiting on `key`'s annotation are released.
+            if let Some(resume) = self.resume_key.take() {
+                let resume = resume.bind(py).clone();
+                for nk in KnitAnnotatorPy::_process_pending(slf, resume)?.iter() {
+                    self.to_process.push_back(nk.unbind());
+                }
+            }
+            // Drain the to_process worklist (the Python inner while-loop): each
+            // of these keys' text is cached and ready; yield it, deferring its
+            // own `_process_pending` to the next resume.
+            if let Some(k) = self.to_process.pop_front() {
+                let k = k.bind(py).clone();
+                let lines = text_cache
+                    .get_item(&k)?
+                    .ok_or_else(|| PyKeyError::new_err(k.clone().unbind()))?;
+                let num_lines = lines.len()?;
+                self.resume_key = Some(k.clone().unbind());
+                let item = PyTuple::new(
+                    py,
+                    [k.into_any(), lines.clone(), {
+                        num_lines.into_pyobject(py)?.into_any()
+                    }],
+                )?;
+                return Ok(Some(item.into_any()));
+            }
+            if self.done {
+                return Ok(None);
+            }
+            // Pull the next record.
+            let next = self.read_iter.bind(py).call_method0("__next__");
+            let rec = match next {
+                Ok(r) => r,
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                    self.done = true;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+            let key = rec.get_item(0)?;
+            let record = rec.get_item(1)?;
+            let all_build_details = KnitAnnotatorPy::dict(slf, "_all_build_details")?;
+            let details = all_build_details
+                .get_item(&key)?
+                .ok_or_else(|| PyKeyError::new_err(key.clone().unbind()))?;
+            let compression_parent = details.get_item(1)?;
+            let parent_keys = details.get_item(2)?;
+            let record_details = details.get_item(3)?;
+            let lines = KnitAnnotatorPy::_expand_record(
+                slf,
+                key.clone(),
+                parent_keys.clone(),
+                compression_parent,
+                record,
+                record_details,
+            )?;
+            if lines.is_none() {
+                continue;
+            }
+            // yield_this_text = _check_ready_for_annotations(key, parent_keys).
+            // If ready, yield it and defer its `_process_pending` to the next
+            // resume; otherwise it has been parked in `_pending_annotation`,
+            // and we still must run `_process_pending(key)` (the Python code
+            // calls it unconditionally) before pulling the next record.
+            if KnitAnnotatorPy::_check_ready_for_annotations(slf, key.clone(), parent_keys)? {
+                let num_lines = lines.len()?;
+                self.resume_key = Some(key.clone().unbind());
+                let item = PyTuple::new(
+                    py,
+                    [
+                        key.into_any(),
+                        lines,
+                        num_lines.into_pyobject(py)?.into_any(),
+                    ],
+                )?;
+                return Ok(Some(item.into_any()));
+            }
+            for nk in KnitAnnotatorPy::_process_pending(slf, key.clone())?.iter() {
+                self.to_process.push_back(nk.unbind());
+            }
+            // Not ready and nothing seeded that is ready: loop to next record.
+        }
+    }
+}
+
+/// Lazy iterator returned by `_KnitAnnotator._get_needed_texts`.
+///
+/// On the first `__next__` it builds the record graph; thereafter it drives
+/// [`ExtractState`] and then yields the trailing `ann_keys`. Laziness lets the
+/// caller annotate each yielded key before the next is produced.
+#[pyclass]
+struct KnitNeededTextsIter {
+    annotator: Py<KnitAnnotatorPy>,
+    pb: Option<Py<PyAny>>,
+    seed_key: Py<PyAny>,
+    state: Option<KnitNeededState>,
+    idx: usize,
+}
+
+struct KnitNeededState {
+    extract: ExtractState,
+    /// Remaining keys whose text is cached (from `_get_build_graph`).
+    ann_keys: std::collections::VecDeque<Py<PyAny>>,
+    records_len: usize,
+}
+
+#[pymethods]
+impl KnitNeededTextsIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(mut slf: PyRefMut<'py, Self>, py: Python<'py>) -> PyResult<Option<Py<PyAny>>> {
+        let annotator = slf.annotator.clone_ref(py);
+        let annotator = annotator.bind(py);
+        // First call: build the graph (with RetryWithNewPacks handling).
+        if slf.state.is_none() {
+            let retry_cls = py
+                .import("bzrformats.pack_repo")?
+                .getattr("RetryWithNewPacks")?;
+            let seed = slf.seed_key.bind(py).clone();
+            let (records, ann_keys) = loop {
+                match KnitAnnotatorPy::_get_build_graph(annotator, seed.clone()) {
+                    Ok(v) => break v,
+                    Err(e) if e.value(py).is_instance(&retry_cls)? => {
+                        annotator
+                            .getattr("_vf")?
+                            .getattr("_access")?
+                            .call_method1("reload_or_raise", (e.value(py),))?;
+                        KnitAnnotatorPy::dict(annotator, "_all_build_details")?
+                            .call_method0("clear")?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            let records_len = records.len();
+            let extract = ExtractState::new(annotator, records.into_any())?;
+            let mut ann_q = std::collections::VecDeque::new();
+            for k in ann_keys.iter() {
+                ann_q.push_back(k.unbind());
+            }
+            slf.state = Some(KnitNeededState {
+                extract,
+                ann_keys: ann_q,
+                records_len,
+            });
+        }
+
+        // Phase 1: extracted texts. `next_item` already loops internally, so a
+        // single pull either yields the next item or signals exhaustion.
+        let records_len = slf.state.as_ref().unwrap().records_len;
+        let item = {
+            let state = slf.state.as_mut().unwrap();
+            state.extract.next_item(annotator)?
+        };
+        if let Some(it) = item {
+            if let Some(pb) = &slf.pb {
+                pb.bind(py)
+                    .call_method1("update", ("annotating", slf.idx, records_len))?;
+            }
+            slf.idx += 1;
+            return Ok(Some(it.unbind()));
+        }
+
+        // Phase 2: trailing ann_keys (texts already cached, never annotated).
+        let text_cache = KnitAnnotatorPy::dict(annotator, "_text_cache")?;
+        let Some(sub_key) = slf.state.as_mut().unwrap().ann_keys.pop_front() else {
+            return Ok(None);
+        };
+        let sub_key = sub_key.bind(py).clone();
+        let text = text_cache
+            .get_item(&sub_key)?
+            .ok_or_else(|| PyKeyError::new_err(sub_key.clone().unbind()))?;
+        let num_lines = text.len()?;
+        let item = PyTuple::new(
+            py,
+            [
+                sub_key.into_any(),
+                text,
+                num_lines.into_pyobject(py)?.into_any(),
+            ],
+        )?;
+        Ok(Some(item.into_any().unbind()))
     }
 }
 
@@ -4906,10 +5529,65 @@ struct PyKnitContentFactory {
     inner_sha1: Option<Vec<u8>>,
     raw_record: Vec<u8>,
     annotated: bool,
+    /// Pre-computed network bytes, if known (else built on demand).
+    network_bytes: Option<Vec<u8>>,
+    /// The owning knit, used to reconstruct delta records as fulltext/lines.
+    knit: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl PyKnitContentFactory {
+    /// Create a KnitContentFactory. Mirrors the Python constructor signature
+    /// so callers (e.g. `knit_network_to_record`) build it the same way.
+    #[new]
+    #[pyo3(signature = (key, parents, build_details, sha1, raw_record, annotated, knit=None, network_bytes=None))]
+    fn new(
+        py: Python<'_>,
+        key: Bound<'_, PyAny>,
+        parents: Bound<'_, PyAny>,
+        build_details: Bound<'_, PyAny>,
+        sha1: Option<Vec<u8>>,
+        raw_record: Vec<u8>,
+        annotated: bool,
+        knit: Option<Py<PyAny>>,
+        network_bytes: Option<Vec<u8>>,
+    ) -> PyResult<Self> {
+        let inner_key = extract_py_knit_key(&key)?;
+        let inner_parents = if parents.is_none() {
+            None
+        } else {
+            Some(
+                parents
+                    .try_iter()?
+                    .map(|p| extract_py_knit_key(&p?))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )
+        };
+        // build_details[0] is the method string ("line-delta"/"fulltext"),
+        // build_details[1] is the noeol flag.
+        let method_str: String = build_details.get_item(0)?.extract()?;
+        let method = match method_str.as_str() {
+            "fulltext" => KnitMethod::Fulltext,
+            "line-delta" => KnitMethod::LineDelta,
+            other => {
+                return Err(PyValueError::new_err(format!("unknown method: {}", other)));
+            }
+        };
+        let noeol: bool = build_details.get_item(1)?.is_truthy()?;
+        let _ = py;
+        Ok(PyKnitContentFactory {
+            inner_key,
+            inner_parents,
+            method,
+            noeol,
+            inner_sha1: sha1,
+            raw_record,
+            annotated,
+            network_bytes,
+            knit,
+        })
+    }
+
     #[getter]
     fn key<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         py_knit_key_to_py(py, &self.inner_key)
@@ -4968,11 +5646,14 @@ impl PyKnitContentFactory {
     fn get_bytes_as<'py>(&self, py: Python<'py>, storage_kind: &str) -> PyResult<Py<PyAny>> {
         let my_kind = self.storage_kind();
         if storage_kind == my_kind.as_str() {
-            // Return network bytes.
-            let network = build_network_record_bytes(py, self)?;
+            // Our native kind: serialise (or return the cached) network bytes.
+            let network = match &self.network_bytes {
+                Some(b) => PyBytes::new(py, b),
+                None => build_network_record_bytes(py, self)?,
+            };
             return Ok(network.into_any().unbind());
         }
-        // Fulltext/lines/chunked from a fulltext raw record.
+        // Fulltext/lines/chunked directly from a fulltext raw record.
         if self.method == KnitMethod::Fulltext
             && matches!(storage_kind, "fulltext" | "lines" | "chunked")
         {
@@ -4986,6 +5667,26 @@ impl PyKnitContentFactory {
                     lst.append(PyBytes::new(py, l))?;
                 }
                 return Ok(lst.into_any().unbind());
+            }
+        }
+        // Delta records: reconstruct via the owning knit, if we have one.
+        // Mirrors the Python `self._knit.get_lines / get_text` fallback.
+        if let Some(knit) = &self.knit {
+            let version_id = py_knit_key_to_py(py, &self.inner_key)?.get_item(0)?;
+            match storage_kind {
+                "chunked" | "lines" => {
+                    return Ok(knit
+                        .bind(py)
+                        .call_method1("get_lines", (version_id,))?
+                        .unbind());
+                }
+                "fulltext" => {
+                    return Ok(knit
+                        .bind(py)
+                        .call_method1("get_text", (version_id,))?
+                        .unbind());
+                }
+                _ => {}
             }
         }
         let exc_cls = py
@@ -5448,6 +6149,8 @@ impl KnitRecordStreamLazy {
                         inner_sha1: None,
                         raw_record: raw_bytes,
                         annotated: self.annotated,
+                        network_bytes: None,
+                        knit: None,
                     };
                     state.emitted += 1;
                     return Ok(Some(factory.into_pyobject(py)?.into_any().unbind()));
@@ -8009,6 +8712,101 @@ fn get_knit_adapter(
     })
 }
 
+/// Adapter shim wrapping the Rust knit adapter registry. Ported from
+/// `bzrformats.knit.KnitAdapter`.
+///
+/// Subclasses set `_source_kind`; `get_bytes` looks up the
+/// `(source, target)` adapter via `get_knit_adapter` and delegates. The base
+/// is subclassable so the registered concrete adapters can extend it.
+#[pyclass(name = "KnitAdapter", subclass, module = "bzrformats._bzr_rs.knit")]
+struct PyKnitAdapterShim {
+    basis_vf: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyKnitAdapterShim {
+    #[classattr]
+    fn _source_kind() -> &'static str {
+        ""
+    }
+
+    #[new]
+    fn new(basis_vf: Option<Py<PyAny>>) -> Self {
+        PyKnitAdapterShim {
+            basis_vf: basis_vf.filter(|v| Python::attach(|py| !v.is_none(py))),
+        }
+    }
+
+    fn get_bytes<'py>(
+        slf: &Bound<'py, Self>,
+        factory: Bound<'py, PyAny>,
+        target_storage_kind: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        // _source_kind is read off the instance type so subclass overrides win.
+        let source_kind: String = slf.getattr("_source_kind")?.extract()?;
+        let target: String = target_storage_kind.extract()?;
+        let basis_vf = slf
+            .borrow()
+            .basis_vf
+            .as_ref()
+            .map(|v| v.clone_ref(py).into_bound(py));
+        match get_knit_adapter(&source_kind, &target, basis_vf) {
+            Some(adapter) => {
+                let adapter = Py::new(py, adapter)?;
+                adapter
+                    .bind(py)
+                    .call_method1("get_bytes", (factory, target_storage_kind))
+            }
+            None => {
+                let exc = py
+                    .import("bzrformats.versionedfile")?
+                    .getattr("UnavailableRepresentation")?
+                    .call1((
+                        factory.getattr("key")?,
+                        target_storage_kind,
+                        factory.getattr("storage_kind")?,
+                    ))?;
+                Err(PyErr::from_value(exc))
+            }
+        }
+    }
+}
+
+/// Define a concrete `KnitAdapter` subclass that only overrides `_source_kind`.
+macro_rules! knit_adapter {
+    ($name:ident, $source:expr) => {
+        // The struct ident is the Python class name (pyo3 default).
+        #[pyclass(extends = PyKnitAdapterShim, module = "bzrformats._bzr_rs.knit")]
+        struct $name;
+
+        #[pymethods]
+        impl $name {
+            #[classattr]
+            fn _source_kind() -> &'static str {
+                $source
+            }
+
+            #[new]
+            fn new(basis_vf: Option<Py<PyAny>>) -> (Self, PyKnitAdapterShim) {
+                (
+                    $name,
+                    PyKnitAdapterShim {
+                        basis_vf: basis_vf.filter(|v| Python::attach(|py| !v.is_none(py))),
+                    },
+                )
+            }
+        }
+    };
+}
+
+knit_adapter!(FTAnnotatedToUnannotated, "knit-annotated-ft-gz");
+knit_adapter!(DeltaAnnotatedToUnannotated, "knit-annotated-delta-gz");
+knit_adapter!(FTAnnotatedToFullText, "knit-annotated-ft-gz");
+knit_adapter!(DeltaAnnotatedToFullText, "knit-annotated-delta-gz");
+knit_adapter!(FTPlainToFullText, "knit-ft-gz");
+knit_adapter!(DeltaPlainToFullText, "knit-delta-gz");
+
 /// Format the `storage_kind` string for a knit content record.
 ///
 /// Mirrors the Python expression
@@ -8249,6 +9047,26 @@ fn make_knit_pack_factory(graph: bool, delta: bool, keylength: usize) -> KnitPac
     }
 }
 
+/// Base class for knit content objects, exposing the `get_line_delta_blocks`
+/// static helper used by callers holding a plain `KnitContent` reference. The
+/// concrete implementations are `AnnotatedKnitContent` / `PlainKnitContent`.
+#[pyclass(name = "KnitContent", subclass)]
+struct PyKnitContent;
+
+#[pymethods]
+impl PyKnitContent {
+    /// Extract `SequenceMatcher.get_matching_blocks()` from a knit delta.
+    #[staticmethod]
+    fn get_line_delta_blocks<'py>(
+        py: Python<'py>,
+        knit_delta: Bound<'py, PyAny>,
+        source: Bound<'py, PyAny>,
+        target: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        get_line_delta_blocks_rs(py, knit_delta, source, target)
+    }
+}
+
 pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "knit")?;
     m.add_function(wrap_pyfunction!(_load_data, &m)?)?;
@@ -8293,6 +9111,13 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<PyNetworkContentMapGenerator>()?;
     m.add_class::<PyVFContentMapGenerator>()?;
     m.add_class::<PyKnitAdapter>()?;
+    m.add_class::<PyKnitAdapterShim>()?;
+    m.add_class::<FTAnnotatedToUnannotated>()?;
+    m.add_class::<DeltaAnnotatedToUnannotated>()?;
+    m.add_class::<FTAnnotatedToFullText>()?;
+    m.add_class::<DeltaAnnotatedToFullText>()?;
+    m.add_class::<FTPlainToFullText>()?;
+    m.add_class::<DeltaPlainToFullText>()?;
     m.add_function(wrap_pyfunction!(get_knit_adapter, &m)?)?;
     m.add_function(wrap_pyfunction!(knit_delta_closure_to_records, &m)?)?;
     m.add_function(wrap_pyfunction!(knit_network_to_record, &m)?)?;
@@ -8302,5 +9127,7 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<KnitFileFactory>()?;
     m.add_class::<KnitPackFactory>()?;
     m.add_class::<PyKnitContentFactory>()?;
+    m.add_class::<PyKnitContent>()?;
+    m.add_class::<KnitAnnotatorPy>()?;
     Ok(m)
 }

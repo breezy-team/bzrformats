@@ -12,8 +12,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyDict, PyTuple};
 use std::path::PathBuf;
 
-import_exception!(bzrformats.errors, LockContention);
-import_exception!(bzrformats.errors, LockNotHeld);
+import_exception!(bzrformats._bzr_rs.errors, LockContention);
+import_exception!(bzrformats._bzr_rs.errors, LockNotHeld);
 
 fn lock_err_to_py(err: LockError) -> PyErr {
     match err {

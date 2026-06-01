@@ -131,3 +131,92 @@ impl Replacer {
             .to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(text: &str) -> Replacement {
+        Replacement::String(text.to_string())
+    }
+
+    #[test]
+    fn test_replacer_simple() {
+        let mut r = Replacer::empty();
+        r.add("a", s("b"));
+        assert_eq!(r.replace("a").unwrap(), "b");
+    }
+
+    #[test]
+    fn test_replacer_function() {
+        let mut r = Replacer::empty();
+        r.add(
+            "a",
+            Replacement::Function(|m| {
+                assert_eq!(m, "a");
+                "c".to_string()
+            }),
+        );
+        assert_eq!(r.replace("a").unwrap(), "c");
+    }
+
+    #[test]
+    fn test_replacer_multiple() {
+        let mut r = Replacer::empty();
+        r.add("a", s("b"));
+        r.add("c", s("d"));
+        assert_eq!(r.replace("a").unwrap(), "b");
+        assert_eq!(r.replace("c").unwrap(), "d");
+    }
+
+    #[test]
+    fn test_replacer_none() {
+        let mut r = Replacer::empty();
+        assert_eq!(r.replace("a").unwrap(), "a");
+    }
+
+    #[test]
+    fn test_replacer_partial() {
+        let mut r = Replacer::empty();
+        r.add("a", s("b"));
+        assert_eq!(r.replace("ac").unwrap(), "bc");
+    }
+
+    #[test]
+    fn test_replacer_expands_ampersand() {
+        // "\&" in the replacement expands to the matched text.
+        let mut r = Replacer::empty();
+        r.add("a", s("[\\&]"));
+        assert_eq!(r.replace("xax").unwrap(), "x[a]x");
+    }
+
+    #[test]
+    fn test_normalize_pattern_backslashes() {
+        assert_eq!(normalize_pattern("\\"), "/");
+        assert_eq!(normalize_pattern("\\\\"), "/");
+        assert_eq!(normalize_pattern("\\foo\\bar"), "/foo/bar");
+        assert_eq!(normalize_pattern("foo\\bar\\"), "foo/bar");
+        assert_eq!(normalize_pattern("\\\\foo\\\\bar\\\\"), "/foo/bar");
+    }
+
+    #[test]
+    fn test_normalize_pattern_forward_slashes() {
+        assert_eq!(normalize_pattern("/"), "/");
+        assert_eq!(normalize_pattern("//"), "/");
+        assert_eq!(normalize_pattern("/foo/bar"), "/foo/bar");
+        assert_eq!(normalize_pattern("foo/bar/"), "foo/bar");
+        assert_eq!(normalize_pattern("//foo//bar//"), "/foo/bar");
+    }
+
+    #[test]
+    fn test_normalize_pattern_mixed_slashes() {
+        assert_eq!(normalize_pattern("\\/\\foo//\\///bar/\\\\/"), "/foo/bar");
+    }
+
+    #[test]
+    fn test_normalize_pattern_leaves_regex_untouched() {
+        // RE:/!RE: prefixed patterns must not have their slashes collapsed.
+        assert_eq!(normalize_pattern("RE:a//b"), "RE:a//b");
+        assert_eq!(normalize_pattern("!RE:a\\\\b"), "!RE:a\\\\b");
+    }
+}

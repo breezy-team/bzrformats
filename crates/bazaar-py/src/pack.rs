@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use std::sync::{Arc, Mutex};
 
-import_exception!(bzrformats.errors, BzrFormatsError);
+import_exception!(bzrformats._bzr_rs.errors, BzrFormatsError);
 import_exception!(bzrformats.pack, ContainerHasExcessDataError);
 import_exception!(bzrformats.pack, DuplicateRecordNameError);
 import_exception!(bzrformats.pack, InvalidRecordError);

@@ -36,11 +36,9 @@ Densely packed upper nodes.
 
 """
 
-import abc
 from collections.abc import Callable
 
 from ._bzr_rs import chk_map as _chk_map_rs
-from .registry import Registry
 
 common_prefix_many = _chk_map_rs.common_prefix_many
 common_prefix_pair = _chk_map_rs.common_prefix_pair
@@ -55,184 +53,39 @@ clear_cache = _chk_map_rs.clear_cache
 _page_cache_get = _chk_map_rs._page_cache_get
 _page_cache_set = _chk_map_rs._page_cache_set
 
-
-class _PageCacheProxy:
-    """Dict-like view onto the Rust-backed CHK page cache.
-
-    Returned by :func:`_get_cache` for compatibility with callers
-    (notably breezy's test suite) that historically reached into the
-    pure-Python ``LRUSizeCache`` instance directly.
-    """
-
-    def __getitem__(self, key):
-        value = _page_cache_get(key)
-        if value is None:
-            raise KeyError(key)
-        return value
-
-    def __setitem__(self, key, value):
-        _page_cache_set(key, value)
-
-    def __contains__(self, key):
-        return _page_cache_get(key) is not None
+_PageCacheProxy = _chk_map_rs._PageCacheProxy
+_get_cache = _chk_map_rs._get_cache
+_deserialise_leaf_node = _chk_map_rs._deserialise_leaf_node
+_deserialise_internal_node = _chk_map_rs._deserialise_internal_node
+_check_key = _chk_map_rs._check_key
 
 
-_page_cache_proxy = _PageCacheProxy()
-
-
-def _get_cache():
-    """Return a dict-like view onto the shared CHK page cache."""
-    return _page_cache_proxy
-
-
-# Plain search-key transform comes from the Rust extension so the
-# pyclass `_search_key_func` getter and the registry hand back the
-# same callable object (identity comparisons in tests rely on this).
+# Same object as the pyclass `_search_key_func` getter returns, so identity
+# comparisons in tests hold.
 _search_key_plain = _chk_map_rs._search_key_plain
 
 
-search_key_registry = Registry[bytes, Callable[[Key], SerialisedKey], None]()
-search_key_registry.register(b"plain", _search_key_plain)
-
-
-def _deserialise_leaf_node(data, key, search_key_func=None):
-    """Deserialise bytes into a LeafNode pyclass instance.
-
-    Wraps a bare-bytes `key` into a 1-tuple — some callers/tests
-    pass a placeholder bytes value where the canonical form is
-    `(b"sha1:...",)`.
-    """
-    if isinstance(key, bytes):
-        key = (key,)
-    return _chk_map_rs.LeafNode.deserialise(data, key, search_key_func)
-
-
-def _deserialise_internal_node(data, key, search_key_func=None):
-    """Deserialise bytes into an InternalNode pyclass instance."""
-    if isinstance(key, bytes):
-        key = (key,)
-    return _chk_map_rs.InternalNode.deserialise(data, key, search_key_func)
+# The search-key registry is built and pre-populated in Rust (the three
+# built-in variants under "plain"/"hash-16-way"/"hash-255-way"); the callables
+# it returns are the same objects the node/inventory `_search_key_func` getters
+# return, so identity comparisons hold.
+search_key_registry = _chk_map_rs.search_key_registry
 
 
 CHKMap = _chk_map_rs.CHKMap
 
 
-class Node(metaclass=abc.ABCMeta):
-    """Base class defining the protocol for CHK Map nodes.
-
-    :ivar _raw_size: The total size of the serialized key:value data, before
-        adding the header bytes, and without prefix compression.
-
-    The Rust-backed pyclass LeafNode is registered as a virtual
-    subclass at the bottom of this module so `isinstance(_, Node)`
-    works uniformly across LeafNode and InternalNode.
-    """
-
-    __slots__ = (
-        "_items",
-        "_key",
-        "_key_width",
-        "_len",
-        "_maximum_size",
-        "_raw_size",
-        "_search_key_func",
-        "_search_prefix",
-    )
-
-    def __init__(self, key_width=1):
-        """Create a node.
-
-        :param key_width: The width of keys for this node.
-        """
-        self._key = None
-        # Current number of elements
-        self._len = 0
-        self._maximum_size = 0
-        self._key_width = key_width
-        # current size in bytes
-        self._raw_size = 0
-        # The pointers/values this node has - meaning defined by child classes.
-        self._items = {}
-        # The common search prefix
-        self._search_prefix = None
-
-    def __repr__(self):
-        """Return string representation of the node."""
-        items_str = str(sorted(self._items))
-        if len(items_str) > 20:
-            items_str = items_str[:16] + "...]"
-        return "{}(key:{} len:{} size:{} max:{} prefix:{} items:{})".format(
-            self.__class__.__name__,
-            self._key,
-            self._len,
-            self._raw_size,
-            self._maximum_size,
-            self._search_prefix,
-            items_str,
-        )
-
-    @abc.abstractmethod
-    def iteritems(self, store, key_filter=None):
-        """Iterate over items in the node.
-
-        :param key_filter: A filter to apply to the node. It should be a
-            list/set/dict or similar repeatedly iterable container.
-        """
-        raise NotImplementedError(self.iteritems)
-
-    @abc.abstractmethod
-    def unmap(self, store, key):
-        """Unmap key from the node."""
-        raise NotImplementedError(self.unmap)
-
-    @abc.abstractmethod
-    def map(self, store, key: Key, value):
-        """Map key to value."""
-        raise NotImplementedError(self.map)
-
-    def key(self) -> Key:
-        """Return the key for this node."""
-        return self._key
-
-    def __len__(self) -> int:
-        """Return the number of items in this node."""
-        return self._len
-
-    @property
-    def maximum_size(self) -> int:
-        """What is the upper limit for adding references to a node."""
-        return self._maximum_size
-
-    def set_maximum_size(self, new_size):
-        """Set the size threshold for nodes.
-
-        :param new_size: The size at which no data is added to a node. 0 for
-            unlimited.
-        """
-        self._maximum_size = new_size
+Node = _chk_map_rs.Node
 
 
-# Singleton indicating we have not computed _search_prefix yet. Re-exported
-# from the Rust extension so identity comparisons line up across the
-# boundary: the LeafNode pyclass's `_search_prefix` getter returns this
-# exact object when the underlying Rust state is `SearchPrefix::Unknown`.
+# "_search_prefix not yet computed" sentinel. Same object the LeafNode pyclass
+# `_search_prefix` getter returns for SearchPrefix::Unknown, so `is _unknown`
+# checks hold across the boundary.
 _unknown = _chk_map_rs._unknown
 
 
 LeafNode = _chk_map_rs.LeafNode
-
-
-# Register the Rust-backed pyclasses with the Node ABC so existing
-# `isinstance(_, Node)` checks across this module match LeafNode and
-# InternalNode instances.
-Node.register(LeafNode)
-
-
 InternalNode = _chk_map_rs.InternalNode
-
-
-# Virtual subclass for isinstance(_, Node) checks.
-Node.register(InternalNode)
 
 
 _deserialise = _chk_map_rs._deserialise
@@ -242,27 +95,6 @@ CHKMapDifference = _chk_map_rs.CHKMapDifference
 iter_interesting_nodes = _chk_map_rs.iter_interesting_nodes
 
 
-from ._bzr_rs import chk_map as _chk_map_rs
-
 _bytes_to_text_key = _chk_map_rs._bytes_to_text_key
 _search_key_16 = _chk_map_rs._search_key_16
 _search_key_255 = _chk_map_rs._search_key_255
-
-search_key_registry.register(b"hash-16-way", _search_key_16)
-search_key_registry.register(b"hash-255-way", _search_key_255)
-
-
-def _check_key(key):
-    """Helper function to assert that a key is properly formatted.
-
-    This generally shouldn't be used in production code, but it can be helpful
-    to debug problems.
-    """
-    if not isinstance(key, tuple):
-        raise TypeError(f"key {key!r} is not tuple but {type(key)}")
-    if len(key) != 1:
-        raise ValueError(f"key {key!r} should have length 1, not {len(key)}")
-    if not isinstance(key[0], str):
-        raise TypeError(f"key {key!r} should hold a str, not {type(key[0])!r}")
-    if not key[0].startswith("sha1:"):
-        raise ValueError(f"key {key!r} should point to a sha1:")

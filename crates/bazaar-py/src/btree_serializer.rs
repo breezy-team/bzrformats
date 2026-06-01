@@ -17,62 +17,13 @@
 
 //! Rust/PyO3 implementation of the btree serializer extension.
 
+use bazaar::btree_serializer::{
+    hexlify_sha1, sha1_bin_to_bytes, sha1_bytes_to_bin, unhexlify_sha1, ChkLeafNode, ChkSha1Record,
+};
 use pyo3::exceptions::{PyAssertionError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use std::convert::TryInto;
-
-/// A record for a gc-chk-sha1 leaf node entry.
-#[derive(Clone)]
-struct GcChkSha1Record {
-    block_offset: u64,
-    block_length: u32,
-    record_start: u32,
-    record_end: u32,
-    sha1: [u8; 20],
-}
-
-/// Lookup table for unhexlifying: maps ASCII byte value to 0..15, or -1 for invalid.
-fn build_unhex_table() -> [i8; 256] {
-    let mut table = [-1i8; 256];
-    for i in 0u8..10 {
-        table[(b'0' + i) as usize] = i as i8;
-    }
-    for i in 0u8..6 {
-        table[(b'a' + i) as usize] = (10 + i) as i8;
-        table[(b'A' + i) as usize] = (10 + i) as i8;
-    }
-    table
-}
-
-static HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-
-/// Convert 40 hex bytes into 20 binary bytes. Returns false on invalid input.
-fn unhexlify_sha1(hex: &[u8], bin: &mut [u8; 20]) -> bool {
-    let table = build_unhex_table();
-    if hex.len() != 40 {
-        return false;
-    }
-    for i in 0..20 {
-        let top = table[hex[i * 2] as usize];
-        let bot = table[hex[i * 2 + 1] as usize];
-        if top < 0 || bot < 0 {
-            return false;
-        }
-        bin[i] = ((top << 4) | bot) as u8;
-    }
-    true
-}
-
-/// Convert 20 binary bytes into 40 hex bytes.
-fn hexlify_sha1(bin: &[u8; 20]) -> [u8; 40] {
-    let mut hex = [0u8; 40];
-    for i in 0..20 {
-        hex[i * 2] = HEX_CHARS[((bin[i] >> 4) & 0xf) as usize];
-        hex[i * 2 + 1] = HEX_CHARS[(bin[i] & 0xf) as usize];
-    }
-    hex
-}
 
 /// Convert a key tuple of the form (b'sha1:xxxx...',) to 20-byte binary sha1.
 /// Returns None if the key is not a valid sha1 key.
@@ -83,40 +34,13 @@ fn key_to_sha1(key: &Bound<PyAny>) -> Option<[u8; 20]> {
     }
     let item = tuple.get_item(0).ok()?;
     let bytes_obj: &Bound<PyBytes> = item.cast().ok()?;
-    let data = bytes_obj.as_bytes();
-    if data.len() != 45 || !data.starts_with(b"sha1:") {
-        return None;
-    }
-    let mut sha1 = [0u8; 20];
-    if unhexlify_sha1(&data[5..], &mut sha1) {
-        Some(sha1)
-    } else {
-        None
-    }
+    sha1_bytes_to_bin(bytes_obj.as_bytes())
 }
 
 /// Convert 20-byte binary sha1 into a key tuple (b'sha1:xxxx...',).
 fn sha1_to_key<'py>(py: Python<'py>, sha1: &[u8; 20]) -> PyResult<Bound<'py, PyTuple>> {
-    let hex = hexlify_sha1(sha1);
-    let mut buf = Vec::with_capacity(45);
-    buf.extend_from_slice(b"sha1:");
-    buf.extend_from_slice(&hex);
-    let py_bytes = PyBytes::new(py, &buf);
+    let py_bytes = PyBytes::new(py, &sha1_bin_to_bytes(sha1));
     PyTuple::new(py, &[py_bytes.as_any()])
-}
-
-/// Interpret the first 4 bytes of a sha1 as a big-endian u32.
-fn sha1_to_uint(sha1: &[u8; 20]) -> u32 {
-    u32::from_be_bytes(sha1[..4].try_into().unwrap())
-}
-
-/// Format a record value as bytes like "block_offset block_length record_start record_end".
-fn format_record(record: &GcChkSha1Record) -> Vec<u8> {
-    format!(
-        "{} {} {} {}",
-        record.block_offset, record.block_length, record.record_start, record.record_end
-    )
-    .into_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -235,187 +159,24 @@ fn _parse_leaf_lines(
 
 /// Track all the entries for a given leaf node.
 ///
-/// This is a performance-critical class that uses binary search with a
-/// precomputed offset table for fast lookups of sha1-keyed records.
+/// Thin wrapper over [`bazaar::btree_serializer::ChkLeafNode`], which owns the
+/// performance-critical parse + offset-table + binary-search logic. This layer
+/// only marshals sha1 key tuples and `(value, refs)` shapes, plus the
+/// `__contains__`/`__getitem__` last-record cache.
 #[pyclass]
 struct GCCHKSHA1LeafNode {
-    records: Vec<GcChkSha1Record>,
+    inner: ChkLeafNode,
     last_key: Option<Py<PyAny>>,
     last_record_idx: Option<usize>,
-    /// Number of bits to shift to get to the interesting byte.
-    /// 24 means the very first byte changes across all keys.
-    #[pyo3(get)]
-    common_shift: u8,
-    /// Maps an interesting byte to the first record that matches.
-    offsets: [u8; 257],
 }
 
 impl GCCHKSHA1LeafNode {
-    fn parse_bytes(&mut self, data: &[u8]) -> PyResult<()> {
-        if !data.starts_with(b"type=leaf\n") {
-            return Err(PyValueError::new_err(format!(
-                "bytes did not start with 'type=leaf\\n': {:?}",
-                &data[..std::cmp::min(10, data.len())]
-            )));
-        }
-
-        let content = &data[10..];
-        // Count records (number of newlines)
-        let num_records = content.iter().filter(|&&b| b == b'\n').count();
-        self.records.reserve(num_records);
-
-        let mut cur = content;
-        while !cur.is_empty() {
-            // Find next newline
-            let nl_pos = match cur.iter().position(|&b| b == b'\n') {
-                Some(p) => p,
-                None => break,
-            };
-            let line = &cur[..nl_pos];
-            cur = &cur[nl_pos + 1..];
-
-            if line.is_empty() {
-                continue;
-            }
-
-            let record = self.parse_one_entry(line)?;
-            self.records.push(record);
-        }
-
-        self.compute_common();
-        Ok(())
-    }
-
-    fn parse_one_entry(&self, line: &[u8]) -> PyResult<GcChkSha1Record> {
-        if !line.starts_with(b"sha1:") {
-            return Err(PyValueError::new_err(format!(
-                "line did not start with sha1: {:?}",
-                &line[..std::cmp::min(10, line.len())]
-            )));
-        }
-        let after_prefix = &line[5..];
-
-        // Find the first \0 after the 40-byte hex sha1
-        let nul_pos = after_prefix
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(|| PyValueError::new_err("Line did not contain expected null byte"))?;
-        if nul_pos != 40 {
-            return Err(PyValueError::new_err("Line did not contain 40 hex bytes"));
-        }
-
-        let mut sha1 = [0u8; 20];
-        if !unhexlify_sha1(&after_prefix[..40], &mut sha1) {
-            return Err(PyValueError::new_err("We failed to unhexlify"));
-        }
-
-        // After the 40 hex chars + \0, expect another \0
-        let rest = &after_prefix[41..];
-        if rest.is_empty() || rest[0] != 0 {
-            return Err(PyValueError::new_err("only 1 null, not 2 as expected"));
-        }
-        let value_str = &rest[1..];
-
-        // Parse "block_offset block_length record_start record_end"
-        let parts: Vec<&[u8]> = value_str.split(|&b| b == b' ').collect();
-        if parts.len() != 4 {
-            return Err(PyValueError::new_err(
-                "Expected 4 space-separated values in record",
-            ));
-        }
-
-        let block_offset: u64 = std::str::from_utf8(parts[0])
-            .map_err(|_| PyValueError::new_err("Failed to parse block offset"))?
-            .parse()
-            .map_err(|_| PyValueError::new_err("Failed to parse block offset"))?;
-        let block_length: u32 = std::str::from_utf8(parts[1])
-            .map_err(|_| PyValueError::new_err("Failed to parse block length"))?
-            .parse()
-            .map_err(|_| PyValueError::new_err("Failed to parse block length"))?;
-        let record_start: u32 = std::str::from_utf8(parts[2])
-            .map_err(|_| PyValueError::new_err("Failed to parse record start"))?
-            .parse()
-            .map_err(|_| PyValueError::new_err("Failed to parse record start"))?;
-        let record_end: u32 = std::str::from_utf8(parts[3])
-            .map_err(|_| PyValueError::new_err("Failed to parse record end"))?
-            .parse()
-            .map_err(|_| PyValueError::new_err("Failed to parse record end"))?;
-
-        Ok(GcChkSha1Record {
-            block_offset,
-            block_length,
-            record_start,
-            record_end,
-            sha1,
-        })
-    }
-
-    fn offset_for_sha1(&self, sha1: &[u8; 20]) -> usize {
-        let as_uint = sha1_to_uint(sha1);
-        ((as_uint >> self.common_shift) & 0xFF) as usize
-    }
-
-    fn compute_common(&mut self) {
-        if self.records.len() < 2 {
-            self.common_shift = 24;
-        } else {
-            let mut common_mask: u32 = 0xFFFFFFFF;
-            let first = sha1_to_uint(&self.records[0].sha1);
-            for record in &self.records[1..] {
-                let this = sha1_to_uint(&record.sha1);
-                common_mask &= !(first ^ this);
-            }
-            let mut shift: u8 = 24;
-            while common_mask & 0x80000000 != 0 && shift > 0 {
-                common_mask <<= 1;
-                shift -= 1;
-            }
-            self.common_shift = shift;
-        }
-
-        let max_offset = std::cmp::min(self.records.len(), 255);
-        let mut offset: usize = 0;
-        for i in 0..max_offset {
-            let this_offset = self.offset_for_sha1(&self.records[i].sha1);
-            while offset <= this_offset {
-                self.offsets[offset] = i as u8;
-                offset += 1;
-            }
-        }
-        while offset < 257 {
-            self.offsets[offset] = max_offset as u8;
-            offset += 1;
-        }
-    }
-
-    fn lookup_record(&self, sha1: &[u8; 20]) -> Option<usize> {
-        let offset = self.offset_for_sha1(sha1);
-        let lo_val = self.offsets[offset] as usize;
-        let hi_val = self.offsets[offset + 1];
-        let mut hi = if hi_val == 255 {
-            self.records.len()
-        } else {
-            hi_val as usize
-        };
-        let mut lo = lo_val;
-
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            match self.records[mid].sha1.cmp(sha1) {
-                std::cmp::Ordering::Equal => return Some(mid),
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-            }
-        }
-        None
-    }
-
     fn record_to_value_and_refs<'py>(
         &self,
         py: Python<'py>,
-        record: &GcChkSha1Record,
+        record: &ChkSha1Record,
     ) -> PyResult<Bound<'py, PyTuple>> {
-        let value = PyBytes::new(py, &format_record(record));
+        let value = PyBytes::new(py, &record.format_value());
         let empty = PyTuple::empty(py);
         PyTuple::new(py, &[value.as_any(), empty.as_any()])
     }
@@ -423,7 +184,7 @@ impl GCCHKSHA1LeafNode {
     fn record_to_item<'py>(
         &self,
         py: Python<'py>,
-        record: &GcChkSha1Record,
+        record: &ChkSha1Record,
     ) -> PyResult<Bound<'py, PyTuple>> {
         let key = sha1_to_key(py, &record.sha1)?;
         let value_and_refs = self.record_to_value_and_refs(py, record)?;
@@ -435,27 +196,28 @@ impl GCCHKSHA1LeafNode {
 impl GCCHKSHA1LeafNode {
     #[new]
     fn new(data: &Bound<PyBytes>) -> PyResult<Self> {
-        let bytes = data.as_bytes();
-        let mut node = GCCHKSHA1LeafNode {
-            records: Vec::new(),
+        let inner = ChkLeafNode::parse(data.as_bytes())
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(GCCHKSHA1LeafNode {
+            inner,
             last_key: None,
             last_record_idx: None,
-            common_shift: 0,
-            offsets: [0u8; 257],
-        };
-        node.parse_bytes(bytes)?;
-        Ok(node)
+        })
+    }
+
+    #[getter]
+    fn common_shift(&self) -> u8 {
+        self.inner.common_shift()
     }
 
     fn __sizeof__(&self) -> usize {
-        // Approximate: base struct size + per-record allocation
         std::mem::size_of::<GCCHKSHA1LeafNode>()
-            + self.records.len() * std::mem::size_of::<GcChkSha1Record>()
+            + self.inner.len() * std::mem::size_of::<ChkSha1Record>()
     }
 
     fn __contains__(&mut self, key: &Bound<PyAny>) -> bool {
         if let Some(sha1) = key_to_sha1(key) {
-            if let Some(idx) = self.lookup_record(&sha1) {
+            if let Some(idx) = self.inner.lookup_record(&sha1) {
                 self.last_key = Some(key.clone().unbind());
                 self.last_record_idx = Some(idx);
                 return true;
@@ -473,14 +235,16 @@ impl GCCHKSHA1LeafNode {
         if let Some(ref last_key) = self.last_key {
             if key.is(last_key.bind(py)) {
                 if let Some(idx) = self.last_record_idx {
-                    return self.record_to_value_and_refs(py, &self.records[idx].clone());
+                    let record = self.inner.records()[idx].clone();
+                    return self.record_to_value_and_refs(py, &record);
                 }
             }
         }
 
         if let Some(sha1) = key_to_sha1(key) {
-            if let Some(idx) = self.lookup_record(&sha1) {
-                return self.record_to_value_and_refs(py, &self.records[idx].clone());
+            if let Some(idx) = self.inner.lookup_record(&sha1) {
+                let record = self.inner.records()[idx].clone();
+                return self.record_to_value_and_refs(py, &record);
             }
         }
 
@@ -488,31 +252,28 @@ impl GCCHKSHA1LeafNode {
     }
 
     fn __len__(&self) -> usize {
-        self.records.len()
+        self.inner.len()
     }
 
     #[getter]
     fn min_key<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
-        if self.records.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(sha1_to_key(py, &self.records[0].sha1)?))
+        match self.inner.min_record() {
+            None => Ok(None),
+            Some(r) => Ok(Some(sha1_to_key(py, &r.sha1)?)),
         }
     }
 
     #[getter]
     fn max_key<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
-        if self.records.is_empty() {
-            Ok(None)
-        } else {
-            let last = &self.records[self.records.len() - 1];
-            Ok(Some(sha1_to_key(py, &last.sha1)?))
+        match self.inner.max_record() {
+            None => Ok(None),
+            Some(r) => Ok(Some(sha1_to_key(py, &r.sha1)?)),
         }
     }
 
     fn all_keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let result = PyList::empty(py);
-        for record in &self.records {
+        for record in self.inner.records() {
             result.append(sha1_to_key(py, &record.sha1)?)?;
         }
         Ok(result)
@@ -520,7 +281,7 @@ impl GCCHKSHA1LeafNode {
 
     fn all_items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let result = PyList::empty(py);
-        for record in &self.records {
+        for record in self.inner.records() {
             result.append(self.record_to_item(py, record)?)?;
         }
         Ok(result)
@@ -528,7 +289,7 @@ impl GCCHKSHA1LeafNode {
 
     fn _get_offsets<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let result = PyList::empty(py);
-        for &offset in self.offsets.iter() {
+        for &offset in self.inner.offsets().iter() {
             result.append(offset)?;
         }
         Ok(result)
@@ -538,7 +299,7 @@ impl GCCHKSHA1LeafNode {
         let bytes = sha1.as_bytes();
         let mut arr = [0u8; 20];
         arr.copy_from_slice(&bytes[..std::cmp::min(20, bytes.len())]);
-        self.offset_for_sha1(&arr)
+        self.inner.offset_for_sha1(&arr)
     }
 }
 

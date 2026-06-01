@@ -15,7 +15,7 @@ import_exception!(bzrformats.index, BadIndexData);
 import_exception!(bzrformats.index, BadIndexKey);
 import_exception!(bzrformats.index, BadIndexValue);
 import_exception!(bzrformats.index, BadIndexDuplicateKey);
-import_exception!(bzrformats.errors, BzrFormatsError);
+import_exception!(bzrformats._bzr_rs.errors, BzrFormatsError);
 import_exception!(bzrformats.transport, NoSuchFile);
 
 fn is_no_such_file(py: Python<'_>, err: &PyErr) -> bool {

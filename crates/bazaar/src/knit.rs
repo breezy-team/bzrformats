@@ -8282,6 +8282,64 @@ mod tests {
     }
 
     #[test]
+    fn annotator_special_text_merges_origins_from_two_parents() {
+        // Port of Test_KnitAnnotator.test_annotate_special_text, driven via
+        // seed_text + annotate_seeded so it exercises the multi-parent
+        // annotation-merge in annotate_one without building raw knit records.
+        let mut ann = make_annotator();
+        let rev1 = ann_key(b"rev-1");
+        let rev2 = ann_key(b"rev-2");
+        let rev3 = ann_key(b"rev-3");
+        let spec = ann_key(b"special:");
+
+        ann.seed_text(rev1.clone(), vec![], vec![b"initial content\n".to_vec()]);
+        ann.seed_text(
+            rev2.clone(),
+            vec![rev1.clone()],
+            vec![
+                b"initial content\n".to_vec(),
+                b"common content\n".to_vec(),
+                b"content in 2\n".to_vec(),
+            ],
+        );
+        ann.seed_text(
+            rev3.clone(),
+            vec![rev1.clone()],
+            vec![
+                b"initial content\n".to_vec(),
+                b"common content\n".to_vec(),
+                b"content in 3\n".to_vec(),
+            ],
+        );
+        let spec_text = vec![
+            b"initial content\n".to_vec(),
+            b"common content\n".to_vec(),
+            b"content in 2\n".to_vec(),
+            b"content in 3\n".to_vec(),
+        ];
+        ann.add_special_text(
+            spec.clone(),
+            vec![rev2.clone(), rev3.clone()],
+            spec_text.clone(),
+        );
+
+        let order = vec![rev1.clone(), rev2.clone(), rev3.clone(), spec.clone()];
+        let (annotations, lines) = ann.annotate_seeded(&spec, &order).unwrap();
+        assert_eq!(
+            annotations,
+            vec![
+                vec![rev1.clone()],
+                // "common content" is introduced independently by both rev2
+                // and rev3, so its origin is the merged set.
+                vec![rev2.clone(), rev3.clone()],
+                vec![rev2.clone()],
+                vec![rev3.clone()],
+            ]
+        );
+        assert_eq!(lines, spec_text);
+    }
+
+    #[test]
     fn annotator_expand_fulltext_caches_content_and_text() {
         // Mirrors Test_KnitAnnotator.test__expand_fulltext
         let mut ann = make_annotator();
@@ -8867,5 +8925,126 @@ mod tests {
         }];
         let err = verify_dedup_records(&prepared, &existing).unwrap_err();
         assert!(matches!(err, KnitError::Corrupt(_)));
+    }
+
+    /// AddCallback that records every batch it receives.
+    #[derive(Default)]
+    struct CapturingCallback {
+        batches: std::rc::Rc<std::cell::RefCell<Vec<Vec<KnitKey>>>>,
+    }
+
+    impl AddCallback for CapturingCallback {
+        fn call(
+            &mut self,
+            entries: &[(KnitKey, Vec<u8>, Vec<Vec<KnitKey>>)],
+            _has_parents: bool,
+        ) -> Result<(), KnitError> {
+            self.batches
+                .borrow_mut()
+                .push(entries.iter().map(|(k, _, _)| k.clone()).collect());
+            Ok(())
+        }
+    }
+
+    fn graph_index_with_capture() -> (
+        KnitGraphIndex<CapturingCallback>,
+        std::rc::Rc<std::cell::RefCell<Vec<Vec<KnitKey>>>>,
+    ) {
+        let mut idx = KnitGraphIndex::new(true, true);
+        let batches = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        idx.set_add_callback(CapturingCallback {
+            batches: batches.clone(),
+        });
+        (idx, batches)
+    }
+
+    #[test]
+    fn knit_graph_index_encode_and_dispatch_calls_back() {
+        let (mut idx, batches) = graph_index_with_capture();
+        idx.encode_and_dispatch(
+            vec![(knit_key("a"), b"fulltext".to_vec(), 0, 10, vec![])],
+            false,
+        )
+        .unwrap();
+        assert_eq!(batches.borrow().as_slice(), &[vec![knit_key("a")]]);
+        assert!(idx.missing_compression_parents.is_empty());
+    }
+
+    #[test]
+    fn knit_graph_index_read_only_without_callback_errors() {
+        let mut idx: KnitGraphIndex<CapturingCallback> = KnitGraphIndex::new(true, true);
+        let err = idx
+            .encode_and_dispatch(
+                vec![(knit_key("a"), b"fulltext".to_vec(), 0, 10, vec![])],
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, KnitError::ReadOnly));
+    }
+
+    #[test]
+    fn knit_graph_index_tracks_then_clears_missing_compression_parent() {
+        let (mut idx, _batches) = graph_index_with_capture();
+        // A line-delta record whose compression parent ("base") is absent.
+        idx.encode_and_dispatch(
+            vec![(
+                knit_key("child"),
+                b"line-delta".to_vec(),
+                0,
+                10,
+                vec![knit_key("base")],
+            )],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            idx.missing_compression_parents,
+            std::iter::once(knit_key("base")).collect()
+        );
+        // Now add "base" itself; it satisfies the outstanding requirement.
+        idx.encode_and_dispatch(
+            vec![(knit_key("base"), b"fulltext".to_vec(), 10, 10, vec![])],
+            true,
+        )
+        .unwrap();
+        assert!(idx.missing_compression_parents.is_empty());
+    }
+
+    #[test]
+    fn knit_graph_index_tracks_external_parent_refs() {
+        let (mut idx, _batches) = graph_index_with_capture();
+        idx.enable_key_dependencies(false);
+        // "a" references parent "missing" which is not present.
+        idx.encode_and_dispatch(
+            vec![(
+                knit_key("a"),
+                b"fulltext".to_vec(),
+                0,
+                10,
+                vec![knit_key("missing")],
+            )],
+            false,
+        )
+        .unwrap();
+        let unsatisfied: std::collections::HashSet<KnitKey> =
+            idx.unsatisfied_refs().cloned().collect();
+        assert_eq!(unsatisfied, std::iter::once(knit_key("missing")).collect());
+
+        // Adding "missing" satisfies the dependency.
+        idx.satisfy_refs_for_keys(std::iter::once(knit_key("missing")));
+        assert_eq!(idx.unsatisfied_refs().count(), 0);
+    }
+
+    #[test]
+    fn knit_graph_index_update_missing_compression_parents_skips_present() {
+        let mut idx: KnitGraphIndex<CapturingCallback> = KnitGraphIndex::new(true, true);
+        let present: std::collections::HashSet<KnitKey> =
+            std::iter::once(knit_key("here")).collect();
+        idx.update_missing_compression_parents(vec![knit_key("here"), knit_key("gone")], &present);
+        // "here" is present so only "gone" is recorded as missing.
+        assert_eq!(
+            idx.missing_compression_parents,
+            std::iter::once(knit_key("gone")).collect()
+        );
     }
 }

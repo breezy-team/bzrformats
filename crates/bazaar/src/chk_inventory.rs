@@ -188,7 +188,7 @@ mod tests {
     use super::*;
     use crate::chk_map::testing::FakeChkStore;
     use crate::chk_map::{CHKMap, InMemoryPageCache, PageCache, SearchKeyFunc};
-    use crate::FileId;
+    use crate::{FileId, RevisionId};
 
     fn build_test_inv() -> (
         CHKInventory<FakeChkStore>,
@@ -752,6 +752,95 @@ mod tests {
         };
         let key = parent_id_basename_key(&entry);
         assert_eq!(key, vec![b"".to_vec(), b"".to_vec()]);
+    }
+
+    #[test]
+    fn entry_to_bytes_executable_file_round_trips() {
+        let ie = Entry::File {
+            file_id: FileId::from(&b"file-id"[..]),
+            name: "filename".to_string(),
+            parent_id: FileId::from(&b"parent-id"[..]),
+            revision: Some(RevisionId::from(&b"file-rev-id"[..])),
+            text_sha1: Some(b"abcdefgh".to_vec()),
+            text_size: Some(100),
+            text_id: None,
+            executable: true,
+        };
+        let bytes = chk_inventory_entry_to_bytes(&ie);
+        assert_eq!(
+            bytes,
+            b"file: file-id\nparent-id\nfilename\nfile-rev-id\nabcdefgh\n100\nY"
+        );
+        assert_eq!(chk_inventory_bytes_to_entry(&bytes), ie);
+        let (name, fid, rev) = chk_inventory_bytes_to_utf8_name_key(&bytes);
+        assert_eq!(name, b"filename");
+        assert_eq!(fid, FileId::from(&b"file-id"[..]));
+        assert_eq!(rev, RevisionId::from(&b"file-rev-id"[..]));
+    }
+
+    #[test]
+    fn entry_to_bytes_non_executable_file_with_unicode_name() {
+        // \u{3a9} (omega) encodes as \xce\xa9; executable=false -> N flag.
+        let ie = Entry::File {
+            file_id: FileId::from(&b"file-id"[..]),
+            name: "\u{3a9}name".to_string(),
+            parent_id: FileId::from(&b"parent-id"[..]),
+            revision: Some(RevisionId::from(&b"file-rev-id"[..])),
+            text_sha1: Some(b"123456".to_vec()),
+            text_size: Some(25),
+            text_id: None,
+            executable: false,
+        };
+        let bytes = chk_inventory_entry_to_bytes(&ie);
+        assert_eq!(
+            bytes,
+            b"file: file-id\nparent-id\n\xce\xa9name\nfile-rev-id\n123456\n25\nN"
+        );
+        assert_eq!(chk_inventory_bytes_to_entry(&bytes), ie);
+        let (name, _, _) = chk_inventory_bytes_to_utf8_name_key(&bytes);
+        assert_eq!(name, b"\xce\xa9name");
+    }
+
+    #[test]
+    fn entry_to_bytes_symlink_round_trips() {
+        let ie = Entry::Link {
+            file_id: FileId::from(&b"link-id"[..]),
+            name: "link\u{3a9}name".to_string(),
+            parent_id: FileId::from(&b"parent-id"[..]),
+            symlink_target: Some("target/\u{3a9}path".to_string()),
+            revision: Some(RevisionId::from(&b"link-rev-id"[..])),
+        };
+        let bytes = chk_inventory_entry_to_bytes(&ie);
+        assert_eq!(
+            bytes,
+            b"symlink: link-id\nparent-id\nlink\xce\xa9name\nlink-rev-id\ntarget/\xce\xa9path"
+        );
+        assert_eq!(chk_inventory_bytes_to_entry(&bytes), ie);
+        let (name, fid, rev) = chk_inventory_bytes_to_utf8_name_key(&bytes);
+        assert_eq!(name, b"link\xce\xa9name");
+        assert_eq!(fid, FileId::from(&b"link-id"[..]));
+        assert_eq!(rev, RevisionId::from(&b"link-rev-id"[..]));
+    }
+
+    #[test]
+    fn entry_to_bytes_tree_reference_round_trips() {
+        let ie = Entry::TreeReference {
+            file_id: FileId::from(&b"tree-root-id"[..]),
+            name: "tree\u{3a9}name".to_string(),
+            parent_id: FileId::from(&b"parent-id"[..]),
+            reference_revision: Some(RevisionId::from(&b"ref-rev-id"[..])),
+            revision: Some(RevisionId::from(&b"tree-rev-id"[..])),
+        };
+        let bytes = chk_inventory_entry_to_bytes(&ie);
+        assert_eq!(
+            bytes,
+            b"tree: tree-root-id\nparent-id\ntree\xce\xa9name\ntree-rev-id\nref-rev-id"
+        );
+        assert_eq!(chk_inventory_bytes_to_entry(&bytes), ie);
+        let (name, fid, rev) = chk_inventory_bytes_to_utf8_name_key(&bytes);
+        assert_eq!(name, b"tree\xce\xa9name");
+        assert_eq!(fid, FileId::from(&b"tree-root-id"[..]));
+        assert_eq!(rev, RevisionId::from(&b"tree-rev-id"[..]));
     }
 }
 

@@ -53,7 +53,7 @@ are not - this is done for clarity of reading. All string data is in utf8.
     fingerprint = a nonempty utf8 sequence with meaning defined by minikind.
 """
 
-from .errors import BzrFormatsError
+from .errors import DirstateCorrupt  # noqa: F401
 
 # This is the Windows equivalent of ENOTDIR
 # It is defined in pywin32.winerror, but we don't want a strong dependency for
@@ -62,49 +62,10 @@ ERROR_PATH_NOT_FOUND = 3
 ERROR_DIRECTORY = 267
 
 
-class DirstateCorrupt(BzrFormatsError):
-    """Exception raised when a dirstate file is corrupt."""
-
-    _fmt = "The dirstate file (%(state)s) appears to be corrupt: %(msg)s"
-
-    def __init__(self, state, msg):
-        """Create a DirstateCorrupt exception.
-
-        Args:
-            state: The dirstate that is corrupt.
-            msg: Error message describing the corruption.
-        """
-        super().__init__()
-        self.state = state
-        self.msg = msg
-
-
-class SHA1Provider:
-    """An interface for getting sha1s of a file."""
-
-    def sha1(self, abspath):
-        """Return the sha1 of a file given its absolute path.
-
-        :param abspath:  May be a filesystem encoded absolute path
-             or a unicode path.
-        """
-        raise NotImplementedError(self.sha1)
-
-    def stat_and_sha1(self, abspath):
-        """Return the stat and sha1 of a file given its absolute path.
-
-        :param abspath:  May be a filesystem encoded absolute path
-             or a unicode path.
-
-        Note: the stat should be the stat of the physical file
-        while the sha may be the sha of its canonical content.
-        """
-        raise NotImplementedError(self.stat_and_sha1)
-
-
 from ._bzr_rs import dirstate as _dirstate_rs
 from ._bzr_rs.dirstate import DirstateInventoryChange  # noqa: F401
 
+SHA1Provider = _dirstate_rs.SHA1Provider
 DirState = _dirstate_rs.DirState
 DefaultSHA1Provider = _dirstate_rs.DefaultSHA1Provider
 bisect_dirblock = _dirstate_rs.bisect_dirblock
