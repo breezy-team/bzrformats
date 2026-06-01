@@ -65,9 +65,6 @@ from .errors import (  # noqa: F401
     KnitIndexUnknownMethod,
     SHA1KnitCorrupt,
 )
-from .versionedfile import (
-    UnavailableRepresentation,
-)
 
 evil_logger = logging.getLogger("bzrformats.evil")
 logger = logging.getLogger("bzrformats.knit")
@@ -90,80 +87,24 @@ INDEX_SUFFIX = ".kndx"
 _STREAM_MIN_BUFFER_SIZE = 5 * 1024 * 1024
 
 
-class KnitAdapter:
-    """Adapter shim wrapping the Rust ``KnitAdapter`` registry.
-
-    Subclasses set ``_source_kind``; ``get_bytes`` looks up the
-    ``(source, target)`` adapter at call time via ``get_knit_adapter`` and
-    delegates to it. The real conversion logic lives in
-    ``crates/bazaar/src/knit.rs``.
-    """
-
-    _source_kind: str = ""
-
-    def __init__(self, basis_vf):
-        """Create an adapter which accesses full texts from basis_vf.
-
-        :param basis_vf: A versioned file to access basis texts of deltas from.
-            May be None for adapters that do not need to access basis texts.
-        """
-        self._basis_vf = basis_vf
-
-    def get_bytes(self, factory, target_storage_kind):
-        adapter = _knit_rs.get_knit_adapter(
-            self._source_kind, target_storage_kind, self._basis_vf
-        )
-        if adapter is None:
-            raise UnavailableRepresentation(
-                factory.key, target_storage_kind, factory.storage_kind
-            )
-        return adapter.get_bytes(factory, target_storage_kind)
-
-
-class FTAnnotatedToUnannotated(KnitAdapter):
-    """Annotated fulltext -> unannotated fulltext."""
-
-    _source_kind = "knit-annotated-ft-gz"
-
-
-class DeltaAnnotatedToUnannotated(KnitAdapter):
-    """Annotated delta -> unannotated delta."""
-
-    _source_kind = "knit-annotated-delta-gz"
-
-
-class FTAnnotatedToFullText(KnitAdapter):
-    """Annotated fulltext -> fulltext / chunked / lines."""
-
-    _source_kind = "knit-annotated-ft-gz"
-
-
-class DeltaAnnotatedToFullText(KnitAdapter):
-    """Annotated delta -> fulltext / chunked / lines."""
-
-    _source_kind = "knit-annotated-delta-gz"
-
-
-class FTPlainToFullText(KnitAdapter):
-    """Plain fulltext -> fulltext / chunked / lines."""
-
-    _source_kind = "knit-ft-gz"
-
-
-class DeltaPlainToFullText(KnitAdapter):
-    """Plain delta -> fulltext / chunked / lines."""
-
-    _source_kind = "knit-delta-gz"
-
-
+# The knit content-record adapters are Rust pyclasses. KnitAdapter is the base
+# (looks up the (source, target) adapter via the Rust registry and delegates);
+# the concrete adapters override _source_kind. Re-exported from the extension.
 # KnitContentFactory, KnitContent (with its get_line_delta_blocks static
 # helper), LazyKnitContentFactory, and the AnnotatedKnitContent /
 # PlainKnitContent concrete contents are Rust-backed and re-exported below.
 # KnitContentFactory reproduces the Python constructor (network_bytes/knit) and
 # get_bytes_as (native network bytes, fulltext decompression, and the knit
 # delta fallback) in Rust.
-from ._bzr_rs.knit import (
+from ._bzr_rs.knit import (  # noqa: F401
     AnnotatedKnitContent,
+    DeltaAnnotatedToFullText,
+    DeltaAnnotatedToUnannotated,
+    DeltaPlainToFullText,
+    FTAnnotatedToFullText,
+    FTAnnotatedToUnannotated,
+    FTPlainToFullText,
+    KnitAdapter,
     KnitAnnotateFactory,
     KnitContent,
     KnitContentFactory,
@@ -173,8 +114,8 @@ from ._bzr_rs.knit import (
     _KnitAnnotator,
     _KnitGraphIndex,
     _KnitKeyAccess,
-    _load_data,  # noqa: F401  re-exported for breezy's test suite
-    _NetworkContentMapGenerator,  # noqa: F401  re-exported for compatibility
+    _load_data,
+    _NetworkContentMapGenerator,
     _VFContentMapGenerator,
 )
 from ._bzr_rs.knit import KnitVersionedFiles as _KnitVersionedFilesRs

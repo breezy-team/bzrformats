@@ -8712,6 +8712,101 @@ fn get_knit_adapter(
     })
 }
 
+/// Adapter shim wrapping the Rust knit adapter registry. Ported from
+/// `bzrformats.knit.KnitAdapter`.
+///
+/// Subclasses set `_source_kind`; `get_bytes` looks up the
+/// `(source, target)` adapter via `get_knit_adapter` and delegates. The base
+/// is subclassable so the registered concrete adapters can extend it.
+#[pyclass(name = "KnitAdapter", subclass, module = "bzrformats._bzr_rs.knit")]
+struct PyKnitAdapterShim {
+    basis_vf: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyKnitAdapterShim {
+    #[classattr]
+    fn _source_kind() -> &'static str {
+        ""
+    }
+
+    #[new]
+    fn new(basis_vf: Option<Py<PyAny>>) -> Self {
+        PyKnitAdapterShim {
+            basis_vf: basis_vf.filter(|v| Python::attach(|py| !v.is_none(py))),
+        }
+    }
+
+    fn get_bytes<'py>(
+        slf: &Bound<'py, Self>,
+        factory: Bound<'py, PyAny>,
+        target_storage_kind: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        // _source_kind is read off the instance type so subclass overrides win.
+        let source_kind: String = slf.getattr("_source_kind")?.extract()?;
+        let target: String = target_storage_kind.extract()?;
+        let basis_vf = slf
+            .borrow()
+            .basis_vf
+            .as_ref()
+            .map(|v| v.clone_ref(py).into_bound(py));
+        match get_knit_adapter(&source_kind, &target, basis_vf) {
+            Some(adapter) => {
+                let adapter = Py::new(py, adapter)?;
+                adapter
+                    .bind(py)
+                    .call_method1("get_bytes", (factory, target_storage_kind))
+            }
+            None => {
+                let exc = py
+                    .import("bzrformats.versionedfile")?
+                    .getattr("UnavailableRepresentation")?
+                    .call1((
+                        factory.getattr("key")?,
+                        target_storage_kind,
+                        factory.getattr("storage_kind")?,
+                    ))?;
+                Err(PyErr::from_value(exc))
+            }
+        }
+    }
+}
+
+/// Define a concrete `KnitAdapter` subclass that only overrides `_source_kind`.
+macro_rules! knit_adapter {
+    ($name:ident, $source:expr) => {
+        // The struct ident is the Python class name (pyo3 default).
+        #[pyclass(extends = PyKnitAdapterShim, module = "bzrformats._bzr_rs.knit")]
+        struct $name;
+
+        #[pymethods]
+        impl $name {
+            #[classattr]
+            fn _source_kind() -> &'static str {
+                $source
+            }
+
+            #[new]
+            fn new(basis_vf: Option<Py<PyAny>>) -> (Self, PyKnitAdapterShim) {
+                (
+                    $name,
+                    PyKnitAdapterShim {
+                        basis_vf: basis_vf.filter(|v| Python::attach(|py| !v.is_none(py))),
+                    },
+                )
+            }
+        }
+    };
+}
+
+knit_adapter!(FTAnnotatedToUnannotated, "knit-annotated-ft-gz");
+knit_adapter!(DeltaAnnotatedToUnannotated, "knit-annotated-delta-gz");
+knit_adapter!(FTAnnotatedToFullText, "knit-annotated-ft-gz");
+knit_adapter!(DeltaAnnotatedToFullText, "knit-annotated-delta-gz");
+knit_adapter!(FTPlainToFullText, "knit-ft-gz");
+knit_adapter!(DeltaPlainToFullText, "knit-delta-gz");
+
 /// Format the `storage_kind` string for a knit content record.
 ///
 /// Mirrors the Python expression
@@ -9016,6 +9111,13 @@ pub(crate) fn _knit_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<PyNetworkContentMapGenerator>()?;
     m.add_class::<PyVFContentMapGenerator>()?;
     m.add_class::<PyKnitAdapter>()?;
+    m.add_class::<PyKnitAdapterShim>()?;
+    m.add_class::<FTAnnotatedToUnannotated>()?;
+    m.add_class::<DeltaAnnotatedToUnannotated>()?;
+    m.add_class::<FTAnnotatedToFullText>()?;
+    m.add_class::<DeltaAnnotatedToFullText>()?;
+    m.add_class::<FTPlainToFullText>()?;
+    m.add_class::<DeltaPlainToFullText>()?;
     m.add_function(wrap_pyfunction!(get_knit_adapter, &m)?)?;
     m.add_function(wrap_pyfunction!(knit_delta_closure_to_records, &m)?)?;
     m.add_function(wrap_pyfunction!(knit_network_to_record, &m)?)?;
