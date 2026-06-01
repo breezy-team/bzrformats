@@ -82,3 +82,36 @@ __all__ = [
     "version_info",
     "version_string",
 ]
+
+
+def _alias_rust_submodules():
+    """Expose selected ``_bzr_rs`` submodules under their ``bzrformats.*`` names.
+
+    These modules used to be one-line Python shims that did
+    ``from ._bzr_rs.foo import *``. Since the Rust submodule already exposes
+    exactly the public API, we register it directly under ``bzrformats.foo``
+    instead of keeping a stub file. Both ``import bzrformats.foo`` and
+    ``from bzrformats.foo import X`` then resolve to the Rust submodule.
+    """
+    import sys
+
+    from . import _bzr_rs
+
+    # Public name -> attribute on _bzr_rs holding the module object. For the
+    # common case the names match; aliases are listed explicitly.
+    aliased = {
+        "bisect_multi": "bisect_multi",
+        "tuned_gzip": "tuned_gzip",
+        "recordcounter": "recordcounter",
+        "chunk_writer": "chunk_writer",
+        "hashcache": "hashcache",
+        "lock": "lock",
+    }
+    for public_name, rust_attr in aliased.items():
+        submodule = getattr(_bzr_rs, rust_attr)
+        sys.modules[f"{__name__}.{public_name}"] = submodule
+        # Make `from bzrformats import foo` (package attribute access) work too.
+        setattr(sys.modules[__name__], public_name, submodule)
+
+
+_alias_rust_submodules()

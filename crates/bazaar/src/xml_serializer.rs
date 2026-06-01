@@ -440,7 +440,14 @@ impl XMLRevisionSerializer for XMLRevisionSerializer5 {
 
 const ROOT_ID_BYTES: &[u8] = b"TREE_ROOT";
 
-fn unescape_xml(data: &[u8]) -> Result<Vec<u8>, Error> {
+/// Unescape the predefined XML entities (`&apos; &quot; &amp; &lt; &gt;`) and
+/// numeric `&#NNN;` references in `data`. Mirrors `bzrformats.xml8._unescape_xml`.
+///
+/// An unknown entity name that is not a numeric reference is a
+/// [`Error::DecodeError`] (the Python original raises `KeyError`). A lone `&`
+/// with no terminating `;` is left literal, matching the Python `&([^;]*);`
+/// regex which simply does not match it.
+pub fn unescape_xml(data: &[u8]) -> Result<Vec<u8>, Error> {
     // Replicates the behaviour of Python's _unescape_xml in xml8.py:
     // expand &name; entities for the standard XML named refs and numeric
     // character references like &#181; into their UTF-8 byte equivalents.
@@ -456,9 +463,10 @@ fn unescape_xml(data: &[u8]) -> Result<Vec<u8>, Error> {
         let end = match data[i + 1..].iter().position(|&c| c == b';') {
             Some(p) => i + 1 + p,
             None => {
-                return Err(Error::DecodeError(
-                    "unterminated entity reference".to_string(),
-                ));
+                // No terminator: the '&' is literal (the regex never matches).
+                out.push(b);
+                i += 1;
+                continue;
             }
         };
         let code = &data[i + 1..end];
@@ -2222,5 +2230,37 @@ mod tests {
             Error::UnexpectedInventoryFormat(_) | Error::DecodeError(_) => {}
             other => panic!("expected a decode/format error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_unescape_xml_predefined_entities() {
+        assert_eq!(
+            unescape_xml(b"a&amp;b&lt;c&gt;d&quot;e&apos;f").unwrap(),
+            b"a&b<c>d\"e'f"
+        );
+        // No entities: passthrough.
+        assert_eq!(unescape_xml(b"plain text").unwrap(), b"plain text");
+    }
+
+    #[test]
+    fn test_unescape_xml_numeric() {
+        // &#65; is 'A', &#955; is the Greek small lambda (utf-8 cebb).
+        assert_eq!(unescape_xml(b"&#65;").unwrap(), b"A");
+        assert_eq!(unescape_xml(b"x&#955;y").unwrap(), b"x\xce\xbby");
+    }
+
+    #[test]
+    fn test_unescape_xml_unknown_entity_errors() {
+        // Mirrors breezy test_unescape_xml: "foo&bar;" raises (unknown entity).
+        match unescape_xml(b"foo&bar;") {
+            Err(Error::DecodeError(msg)) => assert!(msg.contains("bar")),
+            other => panic!("expected DecodeError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unescape_xml_lone_ampersand_is_literal() {
+        // An '&' with no terminating ';' is kept verbatim.
+        assert_eq!(unescape_xml(b"a & b").unwrap(), b"a & b");
     }
 }
