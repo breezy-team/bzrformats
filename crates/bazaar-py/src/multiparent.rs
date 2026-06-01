@@ -296,6 +296,7 @@ fn py_multiparent_to_rust(diff: &Bound<'_, PyAny>) -> PyResult<MultiParent> {
 }
 
 #[pyclass(
+    extends = PyBaseVersionedFile,
     module = "bzrformats._multiparent_rs",
     name = "MultiMemoryVersionedFile"
 )]
@@ -307,10 +308,13 @@ pub struct PyMultiMemoryVersionedFile {
 impl PyMultiMemoryVersionedFile {
     #[new]
     #[pyo3(signature = (snapshot_interval=Some(25), max_snapshots=None))]
-    fn new(snapshot_interval: Option<usize>, max_snapshots: Option<usize>) -> Self {
-        Self {
+    fn new(
+        snapshot_interval: Option<usize>,
+        max_snapshots: Option<usize>,
+    ) -> pyo3::PyClassInitializer<Self> {
+        pyo3::PyClassInitializer::from(PyBaseVersionedFile).add_subclass(Self {
             inner: MultiMemoryVersionedFile::new(snapshot_interval, max_snapshots),
-        }
+        })
     }
 
     #[getter]
@@ -952,7 +956,11 @@ fn split_readlines(data: &[u8]) -> Vec<Vec<u8>> {
 
 /// Disk-backed pseudo-versionedfile, ported from
 /// `bzrformats.multiparent.MultiVersionedFile`.
-#[pyclass(name = "MultiVersionedFile", module = "bzrformats._bzr_rs.multiparent")]
+#[pyclass(
+    extends = PyBaseVersionedFile,
+    name = "MultiVersionedFile",
+    module = "bzrformats._bzr_rs.multiparent"
+)]
 pub struct PyMultiVersionedFile {
     inner: bazaar::multiparent::DiskMultiVersionedFile,
 }
@@ -974,14 +982,14 @@ impl PyMultiVersionedFile {
         filename: String,
         snapshot_interval: Option<usize>,
         max_snapshots: Option<usize>,
-    ) -> Self {
-        Self {
+    ) -> pyo3::PyClassInitializer<Self> {
+        pyo3::PyClassInitializer::from(PyBaseVersionedFile).add_subclass(Self {
             inner: bazaar::multiparent::DiskMultiVersionedFile::new(
                 filename,
                 snapshot_interval,
                 max_snapshots,
             ),
-        }
+        })
     }
 
     #[pyo3(signature = (lines, version_id, parent_ids, force_snapshot=None, single_parent=false))]
@@ -1042,6 +1050,242 @@ impl PyMultiVersionedFile {
     }
 }
 
+/// Pseudo-VersionedFile base class for the MultiParent backends.
+///
+/// Port of the `bzrformats.multiparent.BaseVersionedFile` skeleton. The
+/// concrete backends (`MultiMemoryVersionedFile`, `MultiVersionedFile`) each
+/// keep their own Rust-backed state and reimplement the skeleton methods, so
+/// this base carries no state of its own; it exists so the backends share a
+/// common type and `isinstance` behaviour matches the original Python
+/// hierarchy. breezy re-exports it for API compatibility.
+#[pyclass(
+    subclass,
+    name = "BaseVersionedFile",
+    module = "bzrformats._bzr_rs.multiparent"
+)]
+pub struct PyBaseVersionedFile;
+
+#[pymethods]
+impl PyBaseVersionedFile {
+    #[new]
+    #[pyo3(signature = (snapshot_interval=25, max_snapshots=None))]
+    fn new(snapshot_interval: Option<usize>, max_snapshots: Option<usize>) -> Self {
+        let _ = (snapshot_interval, max_snapshots);
+        PyBaseVersionedFile
+    }
+}
+
+/// Gzip-compress an iterable of `bytes` lines into a single gzip container.
+#[pyfunction]
+fn gzip_string<'py>(py: Python<'py>, lines: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    let lines = extract_lines(&lines)?;
+    let compressed = multiparent::gzip_string(lines.iter().map(Vec::as_slice));
+    Ok(PyBytes::new(py, &compressed))
+}
+
+/// Build a text from the diffs, ancestry graph and cached lines.
+///
+/// Port of `bzrformats.multiparent._Reconstructor`. `diffs` is any object
+/// with a `get_diff(version_id)` method returning a `MultiParent` (whose
+/// `range_iterator()` yields `(start, end, kind, data)`); `lines` and
+/// `parents` are the version->lines and version->parent-ids maps (typically a
+/// backend's `_lines` / `_parents`).
+#[pyclass(name = "_Reconstructor", module = "bzrformats._bzr_rs.multiparent")]
+pub struct PyReconstructor {
+    diffs: Py<PyAny>,
+    lines: Py<PyAny>,
+    parents: Py<PyAny>,
+    /// Per-version cursor: version_id -> (start, end, kind, data, iterator).
+    cursor: HashMap<PyHashable, Py<PyTuple>>,
+}
+
+#[pymethods]
+impl PyReconstructor {
+    #[new]
+    fn new(diffs: Py<PyAny>, lines: Py<PyAny>, parents: Py<PyAny>) -> Self {
+        Self {
+            diffs,
+            lines,
+            parents,
+            cursor: HashMap::new(),
+        }
+    }
+
+    /// Append the lines referred to by a `ParentText` to `lines`.
+    fn reconstruct(
+        &mut self,
+        py: Python<'_>,
+        lines: &Bound<'_, PyAny>,
+        parent_text: &Bound<'_, PyAny>,
+        version_id: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let parent_idx: usize = parent_text.getattr("parent")?.extract()?;
+        let parent_pos: usize = parent_text.getattr("parent_pos")?.extract()?;
+        let num_lines: usize = parent_text.getattr("num_lines")?.extract()?;
+        let parent_id = self
+            .parents
+            .bind(py)
+            .get_item(&version_id)?
+            .get_item(parent_idx)?;
+        let end = parent_pos + num_lines;
+        self._reconstruct(py, lines, parent_id, parent_pos, end)
+    }
+
+    /// Append lines for the requested `version_id` range `[req_start, req_end)`.
+    fn _reconstruct(
+        &mut self,
+        py: Python<'_>,
+        lines: &Bound<'_, PyAny>,
+        req_version_id: Bound<'_, PyAny>,
+        req_start: usize,
+        req_end: usize,
+    ) -> PyResult<()> {
+        if req_start == req_end {
+            return Ok(());
+        }
+        let mut pending: Vec<(Py<PyAny>, usize, usize)> =
+            vec![(req_version_id.unbind(), req_start, req_end)];
+        let lines_map = self.lines.bind(py);
+        let parents_map = self.parents.bind(py);
+        let diffs = self.diffs.bind(py);
+        while let Some((version_obj, req_start, mut req_end)) = pending.pop() {
+            let version = version_obj.bind(py);
+            // Already-cached fulltext: slice straight out of it.
+            if lines_map.contains(version)? {
+                let cached = lines_map.get_item(version)?;
+                let slice = cached.get_item(pyo3::types::PySlice::new(
+                    py,
+                    req_start as isize,
+                    req_end as isize,
+                    1,
+                ))?;
+                lines.call_method1("extend", (slice,))?;
+                continue;
+            }
+            let key = PyHashable::new(version.clone())?;
+            let (mut start, mut end, mut kind, mut data, mut iterator) = match self.cursor.get(&key)
+            {
+                Some(t) => unpack_cursor(t.bind(py))?,
+                None => {
+                    let it = diffs
+                        .call_method1("get_diff", (version,))?
+                        .call_method0("range_iterator")?;
+                    let (s, e, k, d) = next_range(&it)?;
+                    (s, e, k, d, it)
+                }
+            };
+            // A stored cursor may be ahead of this request; restart the
+            // iterator from the top in that case.
+            if start > req_start {
+                iterator = diffs
+                    .call_method1("get_diff", (version,))?
+                    .call_method0("range_iterator")?;
+                let (s, e, k, d) = next_range(&iterator)?;
+                start = s;
+                end = e;
+                kind = k;
+                data = d;
+            }
+            // Advance to the first hunk relevant to the request.
+            while end <= req_start {
+                let (s, e, k, d) = next_range(&iterator)?;
+                start = s;
+                end = e;
+                kind = k;
+                data = d;
+            }
+            self.cursor.insert(
+                key.clone(),
+                pack_cursor(py, start, end, &kind, &data, &iterator)?,
+            );
+            // Split the request if the current hunk can't satisfy it all.
+            if req_end > end {
+                pending.push((version.clone().unbind(), end, req_end));
+                req_end = end;
+            }
+            if kind == "new" {
+                let slice = data.bind(py).get_item(pyo3::types::PySlice::new(
+                    py,
+                    (req_start - start) as isize,
+                    (req_end - start) as isize,
+                    1,
+                ))?;
+                lines.call_method1("extend", (slice,))?;
+            } else {
+                // ParentText: rewrite as a range request against the parent.
+                let tup = data.bind(py);
+                let parent_idx: usize = tup.get_item(0)?.extract()?;
+                let parent_start: usize = tup.get_item(1)?.extract()?;
+                let parent_end: usize = tup.get_item(2)?.extract()?;
+                let new_version = parents_map.get_item(version)?.get_item(parent_idx)?;
+                let new_start = parent_start + req_start - start;
+                let new_end = parent_end + req_end - end;
+                pending.push((new_version.unbind(), new_start, new_end));
+            }
+        }
+        Ok(())
+    }
+
+    fn reconstruct_version(
+        &mut self,
+        py: Python<'_>,
+        lines: &Bound<'_, PyAny>,
+        version_id: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let length: usize = self
+            .diffs
+            .bind(py)
+            .call_method1("get_diff", (&version_id,))?
+            .call_method0("num_lines")?
+            .extract()?;
+        self._reconstruct(py, lines, version_id, 0, length)
+    }
+}
+
+/// Pull the next `(start, end, kind, data)` range off a `range_iterator`.
+fn next_range(iterator: &Bound<'_, PyAny>) -> PyResult<(usize, usize, String, Py<PyAny>)> {
+    let item = iterator.call_method0("__next__")?;
+    let start: usize = item.get_item(0)?.extract()?;
+    let end: usize = item.get_item(1)?.extract()?;
+    let kind: String = item.get_item(2)?.extract()?;
+    let data = item.get_item(3)?.unbind();
+    Ok((start, end, kind, data))
+}
+
+/// Pack a cursor tuple `(start, end, kind, data, iterator)`.
+fn pack_cursor(
+    py: Python<'_>,
+    start: usize,
+    end: usize,
+    kind: &str,
+    data: &Py<PyAny>,
+    iterator: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyTuple>> {
+    Ok(PyTuple::new(
+        py,
+        [
+            start.into_pyobject(py)?.into_any(),
+            end.into_pyobject(py)?.into_any(),
+            kind.into_pyobject(py)?.into_any(),
+            data.bind(py).clone(),
+            iterator.clone(),
+        ],
+    )?
+    .unbind())
+}
+
+/// Unpack a stored cursor tuple back into its parts.
+fn unpack_cursor<'py>(
+    t: &Bound<'py, PyAny>,
+) -> PyResult<(usize, usize, String, Py<PyAny>, Bound<'py, PyAny>)> {
+    let start: usize = t.get_item(0)?.extract()?;
+    let end: usize = t.get_item(1)?.extract()?;
+    let kind: String = t.get_item(2)?.extract()?;
+    let data = t.get_item(3)?.unbind();
+    let iterator = t.get_item(4)?;
+    Ok((start, end, kind, data, iterator))
+}
+
 pub fn _multiparent_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "multiparent")?;
     m.add_class::<PyMultiVersionedFile>()?;
@@ -1052,6 +1296,9 @@ pub fn _multiparent_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(topo_iter, &m)?)?;
     m.add_function(wrap_pyfunction!(from_lines_with_blocks, &m)?)?;
     m.add_function(wrap_pyfunction!(from_lines, &m)?)?;
+    m.add_function(wrap_pyfunction!(gzip_string, &m)?)?;
+    m.add_class::<PyBaseVersionedFile>()?;
+    m.add_class::<PyReconstructor>()?;
     m.add_class::<PyMultiMemoryVersionedFile>()?;
     m.add_class::<PyMultiParent>()?;
     m.add_class::<NewText>()?;

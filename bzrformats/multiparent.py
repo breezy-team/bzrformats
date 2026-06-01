@@ -31,16 +31,22 @@ MultiParent = _multiparent_rs.MultiParent
 NewText = _multiparent_rs.NewText
 ParentText = _multiparent_rs.ParentText
 
-# Memory- and disk-backed pseudo-versionedfiles, backed by Rust.
+# Memory- and disk-backed pseudo-versionedfiles plus the shared skeleton base,
+# the reconstruction helper and gzip_string are all backed by Rust.
+BaseVersionedFile = _multiparent_rs.BaseVersionedFile
 MultiMemoryVersionedFile = _multiparent_rs.MultiMemoryVersionedFile
 MultiVersionedFile = _multiparent_rs.MultiVersionedFile
+_Reconstructor = _multiparent_rs._Reconstructor
+gzip_string = _multiparent_rs.gzip_string
 
 __all__ = [
+    "BaseVersionedFile",
     "MultiMemoryVersionedFile",
     "MultiParent",
     "MultiVersionedFile",
     "NewText",
     "ParentText",
+    "gzip_string",
     "topo_iter",
     "topo_iter_keys",
 ]

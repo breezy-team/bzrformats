@@ -1675,6 +1675,7 @@ fn register_bzrformats_modules(
                 "_gcchk_factory",
                 btree_serializerm.getattr("_parse_into_chk")?,
             ),
+            ("_btree_serializer", btree_serializerm.clone().into_any()),
             (
                 "_BTSIGNATURE",
                 PyBytes::new(py, b"B+Tree Graph Index 2\n").into_any(),

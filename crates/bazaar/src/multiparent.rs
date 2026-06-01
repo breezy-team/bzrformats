@@ -504,6 +504,18 @@ fn parse_c_header(line: &[u8]) -> Result<(usize, usize, usize, usize), ParseErro
     Ok((parent, parent_pos, child_pos, num_lines))
 }
 
+/// Gzip-compress `lines` into a single gzip container. Mirrors
+/// `multiparent.gzip_string`.
+pub fn gzip_string<'a>(lines: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    for line in lines {
+        // Writing to an in-memory Vec never fails.
+        let _ = enc.write_all(line);
+    }
+    enc.finish().unwrap_or_default()
+}
+
 /// Topologically sort `versions` given a `parents` mapping.
 ///
 /// Port of `multiparent._topo_iter`. `parents[v]` is either `Some(parents)`
