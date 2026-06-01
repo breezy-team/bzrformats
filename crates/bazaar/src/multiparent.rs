@@ -1914,6 +1914,86 @@ mod tests {
         assert_eq!(got, vec![lines(&[b"X\n", b"y\n"])]);
     }
 
+    /// Split a byte string into one `"x\n"` line per byte, mirroring the
+    /// Python test helper `add_version`.
+    fn char_lines(s: &[u8]) -> Vec<Vec<u8>> {
+        s.iter().map(|b| vec![*b, b'\n']).collect()
+    }
+
+    /// The 3-version fixture from the Python TestMultiParent.make_vf:
+    /// rev-a=abcd, rev-b=acde, rev-c=abef with parents [rev-a, rev-b].
+    fn make_two_parent_vf() -> MultiMemoryVersionedFile<&'static str> {
+        let mut vf: MultiMemoryVersionedFile<&'static str> = MultiMemoryVersionedFile::default();
+        vf.add_version(char_lines(b"abcd"), "rev-a", vec![], None, false)
+            .unwrap();
+        vf.add_version(char_lines(b"acde"), "rev-b", vec![], None, false)
+            .unwrap();
+        vf.add_version(
+            char_lines(b"abef"),
+            "rev-c",
+            vec!["rev-a", "rev-b"],
+            None,
+            false,
+        )
+        .unwrap();
+        vf
+    }
+
+    #[test]
+    fn mpvf_reconstructs_version_with_two_parents() {
+        // rev-c is a diff against both rev-a and rev-b; reconstructing it
+        // exercises hunks that reference different parent slots.
+        let mut vf = make_two_parent_vf();
+        vf.clear_cache();
+        let got = vf.get_line_list(&["rev-a", "rev-c"]).unwrap();
+        assert_eq!(got[0], char_lines(b"abcd"));
+        assert_eq!(got[1], char_lines(b"abef"));
+    }
+
+    #[test]
+    fn mpvf_get_build_ranking_returns_all_versions() {
+        let vf = make_two_parent_vf();
+        let ranking: std::collections::HashSet<&str> = vf.get_build_ranking().into_iter().collect();
+        let expected: std::collections::HashSet<&str> =
+            vec!["rev-a", "rev-b", "rev-c"].into_iter().collect();
+        assert_eq!(ranking, expected);
+    }
+
+    #[test]
+    fn mpvf_get_build_ranking_single_version() {
+        let mut vf: MultiMemoryVersionedFile<&'static str> = MultiMemoryVersionedFile::default();
+        vf.add_version(char_lines(b"a"), "rev-a", vec![], None, false)
+            .unwrap();
+        assert_eq!(vf.get_build_ranking(), vec!["rev-a"]);
+    }
+
+    #[test]
+    fn mpvf_reordered_lines_from_distinct_parent_hunks() {
+        // The corner case requiring a cursor restart during reconstruction:
+        // rev-e draws one line each from two different hunks of rev-b, in the
+        // opposite order to how they appear in rev-b.
+        let mut vf: MultiMemoryVersionedFile<&'static str> = MultiMemoryVersionedFile::default();
+        vf.add_version(char_lines(b"c"), "rev-a", vec![], None, false)
+            .unwrap();
+        vf.add_version(char_lines(b"acb"), "rev-b", vec!["rev-a"], None, false)
+            .unwrap();
+        vf.add_version(char_lines(b"b"), "rev-c", vec!["rev-b"], None, false)
+            .unwrap();
+        vf.add_version(char_lines(b"a"), "rev-d", vec!["rev-b"], None, false)
+            .unwrap();
+        vf.add_version(
+            char_lines(b"ba"),
+            "rev-e",
+            vec!["rev-c", "rev-d"],
+            None,
+            false,
+        )
+        .unwrap();
+        vf.clear_cache();
+        let got = vf.get_line_list(&["rev-e"]).unwrap();
+        assert_eq!(got[0], char_lines(b"ba"));
+    }
+
     #[test]
     fn mpvf_versions_preserves_insert_order() {
         let mut mpvf: MultiMemoryVersionedFile<&'static str> = MultiMemoryVersionedFile::default();
