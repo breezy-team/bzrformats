@@ -439,20 +439,17 @@ pub fn decompress_page(data: &[u8]) -> Result<Vec<u8>, BTreeIndexError> {
 /// `_row_offsets` entry and a root node is present) that count is
 /// authoritative; otherwise it is derived from the file `size`. Returns
 /// `None` when neither is available — the Python code asserts in that case.
-/// `page_size` is taken as a parameter because the test suite monkeypatches
-/// `_PAGE_SIZE` at the Python level.
 pub fn compute_total_pages_in_index(
     size: Option<u64>,
     root_present: bool,
     row_offsets_last: Option<usize>,
-    page_size: usize,
 ) -> Option<usize> {
     if root_present {
         if let Some(last) = row_offsets_last {
             return Some(last);
         }
     }
-    size.map(|s| s.div_ceil(page_size as u64) as usize)
+    size.map(|s| s.div_ceil(PAGE_SIZE as u64) as usize)
 }
 
 /// Decide which extra pages to prefetch alongside `offsets`. Pure port of
@@ -1144,7 +1141,6 @@ mod tests {
                 self.size,
                 self.with_root,
                 self.row_offsets.last().copied(),
-                PAGE_SIZE,
             )
             .expect("size or header present")
         }
@@ -1190,7 +1186,7 @@ mod tests {
             (4096 * 75 + 10, 76),
         ] {
             assert_eq!(
-                compute_total_pages_in_index(Some(size), false, None, PAGE_SIZE),
+                compute_total_pages_in_index(Some(size), false, None),
                 Some(expected)
             );
         }
@@ -1198,10 +1194,7 @@ mod tests {
 
     #[test]
     fn compute_total_pages_unknown_returns_none() {
-        assert_eq!(
-            compute_total_pages_in_index(None, false, None, PAGE_SIZE),
-            None
-        );
+        assert_eq!(compute_total_pages_in_index(None, false, None), None);
     }
 
     #[test]

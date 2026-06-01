@@ -26,6 +26,10 @@ _BTSIGNATURE = b"B+Tree Graph Index 2\n"
 _LEAF_FLAG = b"type=leaf\n"
 _INTERNAL_FLAG = b"type=internal\n"
 
+# The on-disk B+Tree page size, exposed for consumers that need to walk an
+# index file page by page (e.g. ``brz dump-btree --raw``).
+PAGE_SIZE = _btree_index_rs.PAGE_SIZE
+
 logger = logging.getLogger(name="bzrformats.btree_index")
 evil_logger = logging.getLogger(name="bzrformats.evil")
 
