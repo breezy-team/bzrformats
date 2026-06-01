@@ -593,9 +593,9 @@ impl BTreeGraphIndex {
                 "_compute_total_pages_in_index should not be called when self._size is None",
             ));
         }
-        compute_total_pages_in_index(size, root_present, row_offsets_last, page_size()).ok_or_else(
-            || pyo3::exceptions::PyAssertionError::new_err("cannot compute total pages"),
-        )
+        compute_total_pages_in_index(size, root_present, row_offsets_last).ok_or_else(|| {
+            pyo3::exceptions::PyAssertionError::new_err("cannot compute total pages")
+        })
     }
 
     /// Start/end page of the layer containing `offset`.
@@ -2377,6 +2377,7 @@ fn advance_iter<'py>(iter: &Bound<'py, PyAny>) -> PyResult<Option<Bound<'py, PyT
 
 pub fn _btree_index_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "btree_index")?;
+    m.add("PAGE_SIZE", bazaar::btree_index::PAGE_SIZE)?;
     m.add_function(wrap_pyfunction!(py_parse_btree_header, &m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_internal_node, &m)?)?;
     m.add_class::<BTreeGraphIndex>()?;
