@@ -114,33 +114,9 @@ RecordingVersionedFilesDecorator = _versionedfile_rs.RecordingVersionedFilesDeco
 OrderingVersionedFilesDecorator = _versionedfile_rs.OrderingVersionedFilesDecorator
 
 
-class KeyMapper:
-    """Abstract KeyMapper kept as a Python type for ``isinstance`` checks.
-
-    The concrete mappers (``ConstantMapper``, ``PrefixMapper``,
-    ``HashPrefixMapper``, ``HashEscapedPrefixMapper``) are pyclasses
-    backed by ``crates/bazaar/src/key_mapper.rs``.
-    """
-
-    def map(self, key):
-        """Map key to an underlying storage identifier.
-
-        :param key: A key tuple e.g. (b'file-id', b'revision-id').
-        :return: An underlying storage identifier, specific to the partitioning
-            mechanism.
-        """
-        raise NotImplementedError(self.map)
-
-    def unmap(self, partition_id):
-        """Map a partitioned storage id back to a key prefix.
-
-        :param partition_id: The underlying partition id.
-        :return: As much of a key (or prefix) as is derivable from the partition
-            id.
-        """
-        raise NotImplementedError(self.unmap)
-
-
+# KeyMapper is the abstract base for the concrete mappers; they extend it in
+# Rust so isinstance(x, KeyMapper) holds through real inheritance.
+KeyMapper = _versionedfile_rs.KeyMapper
 ConstantMapper = _versionedfile_rs.ConstantMapper
 PrefixMapper = _versionedfile_rs.PrefixMapper
 HashPrefixMapper = _versionedfile_rs.HashPrefixMapper

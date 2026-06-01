@@ -1,5 +1,5 @@
 use bazaar::versionedfile::{ContentFactory, Key};
-use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
 
@@ -640,10 +640,37 @@ fn mpdiff_collect_parent_chunks<'py>(
     Ok(out.into_any().unbind())
 }
 
+/// Abstract `KeyMapper` base: maps a key tuple to an underlying storage id and
+/// back. The concrete mappers extend it, so `isinstance(x, KeyMapper)` holds
+/// through real inheritance. Mirrors `bzrformats.versionedfile.KeyMapper`.
+#[pyclass(
+    subclass,
+    name = "KeyMapper",
+    module = "bzrformats._bzr_rs.versionedfile"
+)]
+struct PyKeyMapper;
+
+#[pymethods]
+impl PyKeyMapper {
+    #[new]
+    fn new() -> Self {
+        PyKeyMapper
+    }
+
+    fn map(&self, key: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = key;
+        Err(PyNotImplementedError::new_err("KeyMapper.map"))
+    }
+
+    fn unmap(&self, partition_id: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = partition_id;
+        Err(PyNotImplementedError::new_err("KeyMapper.unmap"))
+    }
+}
+
 /// A `KeyMapper` that always returns the same path. Mirrors the Python
 /// `bzrformats.versionedfile.ConstantMapper`.
-#[pyclass(name = "ConstantMapper", module = "bzrformats._bzr_rs.versionedfile")]
-#[derive(Clone)]
+#[pyclass(name = "ConstantMapper", extends = PyKeyMapper, module = "bzrformats._bzr_rs.versionedfile")]
 struct PyConstantMapper {
     result: String,
 }
@@ -651,8 +678,8 @@ struct PyConstantMapper {
 #[pymethods]
 impl PyConstantMapper {
     #[new]
-    fn new(result: String) -> Self {
-        Self { result }
+    fn new(result: String) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyKeyMapper).add_subclass(Self { result })
     }
 
     fn map(&self, _key: &Bound<'_, PyAny>) -> String {
@@ -668,15 +695,14 @@ impl PyConstantMapper {
 
 /// A `KeyMapper` that uses the first key element as the storage path.
 /// Mirrors the Python `bzrformats.versionedfile.PrefixMapper`.
-#[pyclass(name = "PrefixMapper", module = "bzrformats._bzr_rs.versionedfile")]
-#[derive(Clone)]
+#[pyclass(name = "PrefixMapper", extends = PyKeyMapper, module = "bzrformats._bzr_rs.versionedfile")]
 struct PyPrefixMapper;
 
 #[pymethods]
 impl PyPrefixMapper {
     #[new]
-    fn new() -> Self {
-        Self
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyKeyMapper).add_subclass(Self)
     }
 
     fn map(&self, key: &Bound<'_, PyAny>) -> PyResult<String> {
@@ -692,15 +718,14 @@ impl PyPrefixMapper {
 
 /// A `KeyMapper` that prefixes the path with a two-hex adler32 bucket.
 /// Mirrors the Python `bzrformats.versionedfile.HashPrefixMapper`.
-#[pyclass(name = "HashPrefixMapper", module = "bzrformats._bzr_rs.versionedfile")]
-#[derive(Clone)]
+#[pyclass(name = "HashPrefixMapper", extends = PyKeyMapper, module = "bzrformats._bzr_rs.versionedfile")]
 struct PyHashPrefixMapper;
 
 #[pymethods]
 impl PyHashPrefixMapper {
     #[new]
-    fn new() -> Self {
-        Self
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyKeyMapper).add_subclass(Self)
     }
 
     fn map(&self, key: &Bound<'_, PyAny>) -> PyResult<String> {
@@ -718,16 +743,16 @@ impl PyHashPrefixMapper {
 /// Mirrors the Python `bzrformats.versionedfile.HashEscapedPrefixMapper`.
 #[pyclass(
     name = "HashEscapedPrefixMapper",
+    extends = PyKeyMapper,
     module = "bzrformats._bzr_rs.versionedfile"
 )]
-#[derive(Clone)]
 struct PyHashEscapedPrefixMapper;
 
 #[pymethods]
 impl PyHashEscapedPrefixMapper {
     #[new]
-    fn new() -> Self {
-        Self
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyKeyMapper).add_subclass(Self)
     }
 
     fn map(&self, key: &Bound<'_, PyAny>) -> PyResult<String> {
@@ -4447,6 +4472,7 @@ pub(crate) fn _versionedfile_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<PyAdapterFactory>()?;
     m.add_class::<AbsentContentFactory>()?;
     m.add_class::<KeyRefs>()?;
+    m.add_class::<PyKeyMapper>()?;
     m.add_class::<PyConstantMapper>()?;
     m.add_class::<PyPrefixMapper>()?;
     m.add_class::<PyHashPrefixMapper>()?;
