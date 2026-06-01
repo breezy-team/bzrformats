@@ -850,6 +850,63 @@ mod tests {
     }
 
     #[test]
+    fn traditional_compressor_delta_copies_from_two_parents() {
+        // Port of test_three_nosha_delta: the third record draws copies from
+        // BOTH earlier records, and the emitted delta bytes must match exactly.
+        let mut gc = TraditionalGroupCompressor::new();
+        let t1 = b"strange\ncommon very very long line\nwith some extra text\n";
+        gc.compress(
+            &key(&[b"label"]),
+            &[t1.as_slice()],
+            t1.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let t2 = b"different\nmoredifferent\nand then some more\n";
+        gc.compress(
+            &key(&[b"newlabel"]),
+            &[t2.as_slice()],
+            t2.len(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Capture the chunk boundary before the third record so we can isolate
+        // just its delta.
+        let chunks_before: usize = gc.chunks().iter().map(|c| c.len()).sum();
+
+        let t3 = b"new\ncommon very very long line\nwith some extra text\n\
+                   different\nmoredifferent\nand then some more\n";
+        let (sha, _start, end, kind) = gc
+            .compress(
+                &key(&[b"label3"]),
+                &[t3.as_slice()],
+                t3.len(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(kind, RecordKind::Delta);
+        assert_eq!(sha, crate::osutils::sha::sha_string(t3));
+
+        let all: Vec<u8> = gc.chunks().concat();
+        let new_delta = &all[chunks_before..];
+        let expected: &[u8] = b"d\x0c\x5f\x04new\n\x91\x0a\x30\x91\x3c\x2b";
+        assert_eq!(new_delta, expected);
+        // end - chunks_before is the delta's contribution to the endpoint.
+        assert_eq!(end - chunks_before, expected.len());
+
+        // The delta must still extract back to the full text.
+        let (data, _) = gc.extract(&vec![b"label3".to_vec()]).unwrap();
+        assert_eq!(data.concat(), t3.to_vec());
+    }
+
+    #[test]
     fn traditional_compressor_round_trips_delta() {
         // Two records sharing a long common prefix should let the second be
         // line-delta encoded against the first.
