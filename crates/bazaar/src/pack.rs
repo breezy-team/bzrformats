@@ -516,6 +516,26 @@ impl<'a, R: std::io::BufRead> BytesRecordReader<'a, R> {
     }
 }
 
+/// Read the body of a single Bytes record from `data`, which must begin
+/// at the record's `B` type byte (i.e. partway through a container, not at
+/// the format header).
+///
+/// This is the random-access read a pack repository does: an index gives
+/// the `(offset, length)` of one record inside a `.pack`, and the caller
+/// needs the record body (e.g. a groupcompress block) without streaming
+/// the whole container. Returns the body bytes; the record's names are
+/// discarded (groupcompress records are unnamed).
+pub fn read_bytes_record_body(data: &[u8]) -> Result<Vec<u8>, ReadError> {
+    let mut cursor = std::io::Cursor::new(data);
+    match read_byte(&mut cursor)? {
+        Some(b'B') => {}
+        Some(other) => return Err(PackError::UnknownRecordType(other).into()),
+        None => return Err(ReadError::UnexpectedEof),
+    }
+    let mut reader = BytesRecordReader::read_prelude(&mut cursor)?;
+    reader.read_content(None)
+}
+
 /// One entry from [`ContainerReader::iter_records`]: either a Bytes record
 /// being delivered, or end-of-container.
 pub enum RecordKind<'a, R: std::io::BufRead> {

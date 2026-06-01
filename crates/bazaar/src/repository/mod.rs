@@ -51,3 +51,7 @@ pub trait RepositoryFormat {
     /// unique and immutable.
     fn network_name(&self) -> Vec<u8>;
 }
+
+mod pack_2a;
+
+pub use pack_2a::{Pack2aRepository, RepositoryError};
