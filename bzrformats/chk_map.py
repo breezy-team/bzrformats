@@ -54,9 +54,6 @@ clear_cache = _chk_map_rs.clear_cache
 _page_cache_get = _chk_map_rs._page_cache_get
 _page_cache_set = _chk_map_rs._page_cache_set
 
-# The dict-like page-cache view, the node deserialisers (which normalise a
-# bare-bytes key into a 1-tuple) and the _check_key debug helper are all
-# implemented in Rust and re-exported here.
 _PageCacheProxy = _chk_map_rs._PageCacheProxy
 _get_cache = _chk_map_rs._get_cache
 _deserialise_leaf_node = _chk_map_rs._deserialise_leaf_node
@@ -64,9 +61,8 @@ _deserialise_internal_node = _chk_map_rs._deserialise_internal_node
 _check_key = _chk_map_rs._check_key
 
 
-# Plain search-key transform comes from the Rust extension so the
-# pyclass `_search_key_func` getter and the registry hand back the
-# same callable object (identity comparisons in tests rely on this).
+# Same object as the pyclass `_search_key_func` getter returns, so identity
+# comparisons in tests hold.
 _search_key_plain = _chk_map_rs._search_key_plain
 
 
@@ -77,16 +73,12 @@ search_key_registry.register(b"plain", _search_key_plain)
 CHKMap = _chk_map_rs.CHKMap
 
 
-# Node is the base class for CHK map nodes; the concrete LeafNode and
-# InternalNode pyclasses extend it in Rust, so isinstance(x, Node) holds
-# through real inheritance.
 Node = _chk_map_rs.Node
 
 
-# Singleton indicating we have not computed _search_prefix yet. Re-exported
-# from the Rust extension so identity comparisons line up across the
-# boundary: the LeafNode pyclass's `_search_prefix` getter returns this
-# exact object when the underlying Rust state is `SearchPrefix::Unknown`.
+# "_search_prefix not yet computed" sentinel. Same object the LeafNode pyclass
+# `_search_prefix` getter returns for SearchPrefix::Unknown, so `is _unknown`
+# checks hold across the boundary.
 _unknown = _chk_map_rs._unknown
 
 
@@ -100,8 +92,6 @@ _deserialise = _chk_map_rs._deserialise
 CHKMapDifference = _chk_map_rs.CHKMapDifference
 iter_interesting_nodes = _chk_map_rs.iter_interesting_nodes
 
-
-from ._bzr_rs import chk_map as _chk_map_rs
 
 _bytes_to_text_key = _chk_map_rs._bytes_to_text_key
 _search_key_16 = _chk_map_rs._search_key_16

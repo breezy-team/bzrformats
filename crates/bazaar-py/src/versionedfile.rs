@@ -4,10 +4,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
 
 /// The abstract `ContentFactory` base shared by every concrete content
-/// factory (fulltext/chunked/file/adapter/absent/knit/...). Exposed to Python
-/// as `ContentFactory` so `isinstance(x, ContentFactory)` holds through real
-/// inheritance; it carries the full key/parents/sha1/size/storage_kind/
-/// get_bytes_as/iter_bytes_as/map_key surface.
+/// factory (fulltext/chunked/file/adapter/absent/knit/...), carrying the full
+/// key/parents/sha1/size/storage_kind/get_bytes_as/iter_bytes_as/map_key
+/// surface.
 #[pyclass(
     subclass,
     name = "ContentFactory",
@@ -641,8 +640,7 @@ fn mpdiff_collect_parent_chunks<'py>(
 }
 
 /// Abstract `KeyMapper` base: maps a key tuple to an underlying storage id and
-/// back. The concrete mappers extend it, so `isinstance(x, KeyMapper)` holds
-/// through real inheritance. Mirrors `bzrformats.versionedfile.KeyMapper`.
+/// back. The concrete mappers extend it.
 #[pyclass(
     subclass,
     name = "KeyMapper",

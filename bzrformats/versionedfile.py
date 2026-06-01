@@ -65,9 +65,6 @@ for target_storage_kind in ("fulltext", "chunked", "lines"):
     )
 
 
-# ContentFactory is the abstract base shared by every concrete content factory
-# (the Rust AbstractContentFactory). The concrete factories extend it in Rust,
-# so isinstance(x, ContentFactory) holds through real inheritance.
 ContentFactory = _versionedfile_rs.ContentFactory
 
 
@@ -94,28 +91,10 @@ def filter_absent(record_stream):
             yield record
 
 
-# _MPDiffGenerator is implemented as a subclassable Rust pyclass: compute_diffs
-# drives the pure-Rust make_mpdiffs fast path, while _find_needed_keys /
-# _process_one_record / _compute_diff and the intermediate state remain
-# available for callers (e.g. breezy's _MPDiffInventoryGenerator subclass).
 _MPDiffGenerator = _versionedfile_rs._MPDiffGenerator
-
-
-# VersionedFile is an abstract base implemented as a Rust pyclass; the
-# concrete `Weave` extends it (in Rust), and breezy subclasses it in Python.
 VersionedFile = _versionedfile_rs.VersionedFile
-
-
-# RecordingVersionedFilesDecorator and OrderingVersionedFilesDecorator are
-# implemented as Rust pyclasses (test support: they record calls made on a
-# backing vf; the Ordering variant also returns keys in a defined priority
-# order for 'unordered' get_record_stream requests).
 RecordingVersionedFilesDecorator = _versionedfile_rs.RecordingVersionedFilesDecorator
 OrderingVersionedFilesDecorator = _versionedfile_rs.OrderingVersionedFilesDecorator
-
-
-# KeyMapper is the abstract base for the concrete mappers; they extend it in
-# Rust so isinstance(x, KeyMapper) holds through real inheritance.
 KeyMapper = _versionedfile_rs.KeyMapper
 ConstantMapper = _versionedfile_rs.ConstantMapper
 PrefixMapper = _versionedfile_rs.PrefixMapper
@@ -139,33 +118,10 @@ def make_versioned_files_factory(versioned_file_factory, mapper):
     return factory
 
 
-# VersionedFiles is an abstract base implemented as a Rust pyclass. The
-# concrete backends (knit, groupcompress) extend it via
-# VersionedFilesWithFallbacks (also a Rust pyclass); the thunk/merge helpers
-# below subclass it in Python.
 VersionedFiles = _versionedfile_rs.VersionedFiles
-
-
-# ThunkedVersionedFiles is implemented as a Rust pyclass extending
-# VersionedFiles; it thunks a single (prefix, suffix) keyspace onto per-prefix
-# old-style VersionedFile objects (used by breezy's weave_fmt plugin).
 ThunkedVersionedFiles = _versionedfile_rs.ThunkedVersionedFiles
-
-
-# VersionedFilesWithFallbacks is a Rust pyclass extending VersionedFiles.
 VersionedFilesWithFallbacks = _versionedfile_rs.VersionedFilesWithFallbacks
-
-
-# _PlanMergeVersionedFile is implemented as a Rust pyclass extending
-# VersionedFiles; it holds uncommitted+committed texts to let merges be planned
-# against working-tree texts, falling back to other VersionedFiles for missing
-# texts. Re-exported here for callers (and breezy).
 _PlanMergeVersionedFile = _versionedfile_rs._PlanMergeVersionedFile
-
-
-# PlanWeaveMerge and WeaveMerge are TextMerge subclasses implemented as Rust
-# pyclasses; re-exported here so callers (and breezy) keep importing them
-# from bzrformats.versionedfile.
 PlanWeaveMerge = _textmerge_rs.PlanWeaveMerge
 WeaveMerge = _textmerge_rs.WeaveMerge
 
@@ -174,15 +130,10 @@ VirtualVersionedFiles = _versionedfile_rs.VirtualVersionedFiles
 """See VersionedFiles. Storage-less implementation backed by two callbacks.
 
 `__init__(get_parent_map, get_lines)`: caller-supplied callables operating
-on bare bytes keys. Backed by the Rust pyclass; the Python wrapper used
-to live here and applied the same `(k,) <-> k` rewrapping the Rust
-pyclass now does internally.
+on bare bytes keys, which the pyclass rewraps as `(k,)` internally.
 """
 
 
-# NoDupeAddLinesDecorator, NetworkRecordStream and sort_groupcompress are
-# implemented in the Rust extension. NetworkRecordStream dispatches to the
-# per-kind network factories by importing them at read() time.
 NoDupeAddLinesDecorator = _versionedfile_rs.NoDupeAddLinesDecorator
 
 network_bytes_to_kind_and_offset = _versionedfile_rs.network_bytes_to_kind_and_offset

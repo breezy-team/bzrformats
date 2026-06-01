@@ -53,9 +53,6 @@ are not - this is done for clarity of reading. All string data is in utf8.
     fingerprint = a nonempty utf8 sequence with meaning defined by minikind.
 """
 
-# DirstateCorrupt lives in the Rust errors module; re-export it so
-# bzrformats.dirstate.DirstateCorrupt keeps working for callers and for the
-# Rust import_exception!(bzrformats._bzr_rs.errors, DirstateCorrupt) sites.
 from .errors import DirstateCorrupt  # noqa: F401
 
 # This is the Windows equivalent of ENOTDIR
@@ -68,9 +65,6 @@ ERROR_DIRECTORY = 267
 from ._bzr_rs import dirstate as _dirstate_rs
 from ._bzr_rs.dirstate import DirstateInventoryChange  # noqa: F401
 
-# SHA1Provider is the abstract base for sha1 providers; DefaultSHA1Provider
-# extends it in Rust, and breezy's ContentFilterAwareSHA1Provider subclasses it
-# in Python. isinstance(x, SHA1Provider) holds through real inheritance.
 SHA1Provider = _dirstate_rs.SHA1Provider
 DirState = _dirstate_rs.DirState
 DefaultSHA1Provider = _dirstate_rs.DefaultSHA1Provider

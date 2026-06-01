@@ -462,13 +462,8 @@ fn py_are_search_keys_identical(search_keys: Bound<'_, PyAny>) -> PyResult<bool>
     Ok(are_search_keys_identical(keys.iter()))
 }
 
-/// Base class defining the protocol for CHK Map nodes. Ported from the
-/// `bzrformats.chk_map.Node` abstract base.
-///
-/// `LeafNode` and `InternalNode` extend this so `isinstance(x, Node)` holds
-/// through real inheritance (no `abc.register` needed). The concrete nodes
-/// implement every method themselves; the base only carries the abstract-method
-/// stubs so a direct `Node()` use raises like the Python ABC did.
+/// Abstract base for CHK Map nodes. `LeafNode` and `InternalNode` extend it and
+/// override every method; the stubs here just make a bare `Node` raise.
 #[pyclass(subclass, module = "bzrformats._bzr_rs.chk_map", name = "Node")]
 pub struct Node;
 
