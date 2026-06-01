@@ -1010,6 +1010,103 @@ where
     }
 }
 
+/// `GroupCompressVersionedFiles` is a full [`VersionedFiles`] backend, so
+/// it can be used anywhere the trait is expected (as a CHK store for
+/// `CHKInventory`, as a fallback store, etc.). The trait methods delegate
+/// to the inherent ones, adapting the few signatures that differ (the
+/// trait borrows keys/lines and boxes the record stream).
+impl<I, A, C> crate::versionedfile::VersionedFiles for GroupCompressVersionedFiles<I, A, C>
+where
+    I: GcIndex + Send + Sync,
+    A: GcAccess<F = I::F> + Send + Sync,
+    C: BlockCache<I::F> + Send + Sync,
+{
+    fn get_parent_map(
+        &self,
+        keys: &[GcKey],
+    ) -> Result<std::collections::HashMap<GcKey, Vec<GcKey>>, crate::knit::KnitError> {
+        GroupCompressVersionedFiles::get_parent_map(self, keys)
+    }
+
+    fn get_record_stream(
+        &self,
+        keys: &[GcKey],
+        ordering: &str,
+        _include_delta_closure: bool,
+    ) -> Result<
+        Box<
+            dyn Iterator<
+                Item = Result<
+                    Box<dyn crate::versionedfile::ContentFactory>,
+                    crate::knit::KnitError,
+                >,
+            >,
+        >,
+        crate::knit::KnitError,
+    > {
+        let records = GroupCompressVersionedFiles::get_record_stream(self, keys, ordering)?;
+        Ok(Box::new(records.into_iter().map(Ok)))
+    }
+
+    fn get_sha1s(
+        &self,
+        keys: &[GcKey],
+    ) -> Result<std::collections::HashMap<GcKey, Vec<u8>>, crate::knit::KnitError> {
+        GroupCompressVersionedFiles::get_sha1s(self, keys)
+    }
+
+    fn keys(&self) -> Result<Vec<GcKey>, crate::knit::KnitError> {
+        GroupCompressVersionedFiles::keys(self)
+    }
+
+    fn add_lines(
+        &self,
+        key: &GcKey,
+        parents: Option<&[GcKey]>,
+        lines: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, usize), crate::knit::KnitError> {
+        GroupCompressVersionedFiles::add_lines(
+            self,
+            key.clone(),
+            parents.map(|p| p.to_vec()),
+            lines.to_vec(),
+        )
+    }
+
+    fn insert_record_stream(
+        &self,
+        stream: Box<dyn Iterator<Item = Box<dyn crate::versionedfile::ContentFactory>>>,
+    ) -> Result<(), crate::knit::KnitError> {
+        GroupCompressVersionedFiles::insert_record_stream(self, stream, false)?;
+        Ok(())
+    }
+
+    fn iter_lines_added_or_present_in_keys(
+        &self,
+        keys: &[GcKey],
+    ) -> Result<Vec<(Vec<u8>, GcKey)>, crate::knit::KnitError> {
+        GroupCompressVersionedFiles::iter_lines_added_or_present_in_keys(self, keys)
+    }
+
+    fn annotate(&self, _key: &GcKey) -> Result<Vec<(GcKey, Vec<u8>)>, crate::knit::KnitError> {
+        Err(crate::knit::KnitError::NotImplemented(
+            "groupcompress annotate",
+        ))
+    }
+
+    fn get_missing_compression_parent_keys(&self) -> Result<Vec<GcKey>, crate::knit::KnitError> {
+        Ok(GroupCompressVersionedFiles::get_missing_compression_parent_keys(self))
+    }
+
+    fn clear_cache(&self) {
+        GroupCompressVersionedFiles::clear_cache(self)
+    }
+
+    fn check(&self) -> Result<(), crate::knit::KnitError> {
+        GroupCompressVersionedFiles::check(self)
+    }
+}
+
 /// Compress one record into `compressor`, mapping the result to plain
 /// types and `nostore_sha` rejection to `KnitError::ExistingContent`.
 fn compress_record(
