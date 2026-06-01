@@ -4,6 +4,7 @@ use bazaar::chk_map::{
     serialise_internal_node, serialise_leaf_node, Error as ChkError, InternalNodeChild, Key,
     LeafNode as RsLeafNode, SearchKeyFunc, SearchPrefix,
 };
+use pyo3::exceptions::PyNotImplementedError;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
@@ -461,6 +462,51 @@ fn py_are_search_keys_identical(search_keys: Bound<'_, PyAny>) -> PyResult<bool>
     Ok(are_search_keys_identical(keys.iter()))
 }
 
+/// Base class defining the protocol for CHK Map nodes. Ported from the
+/// `bzrformats.chk_map.Node` abstract base.
+///
+/// `LeafNode` and `InternalNode` extend this so `isinstance(x, Node)` holds
+/// through real inheritance (no `abc.register` needed). The concrete nodes
+/// implement every method themselves; the base only carries the abstract-method
+/// stubs so a direct `Node()` use raises like the Python ABC did.
+#[pyclass(subclass, module = "bzrformats._bzr_rs.chk_map", name = "Node")]
+pub struct Node;
+
+#[pymethods]
+impl Node {
+    #[new]
+    #[pyo3(signature = (key_width = 1))]
+    fn new(key_width: usize) -> Self {
+        let _ = key_width;
+        Node
+    }
+
+    #[pyo3(signature = (store, key_filter = None))]
+    fn iteritems(
+        &self,
+        store: Bound<'_, PyAny>,
+        key_filter: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let _ = (store, key_filter);
+        Err(PyNotImplementedError::new_err("Node.iteritems"))
+    }
+
+    fn unmap(&self, store: Bound<'_, PyAny>, key: Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = (store, key);
+        Err(PyNotImplementedError::new_err("Node.unmap"))
+    }
+
+    fn map(
+        &self,
+        store: Bound<'_, PyAny>,
+        key: Bound<'_, PyAny>,
+        value: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let _ = (store, key, value);
+        Err(PyNotImplementedError::new_err("Node.map"))
+    }
+}
+
 /// CHK leaf node — actual key/value storage.
 ///
 /// Owns its state in Rust via `bazaar::chk_map::LeafNode`. The Python
@@ -468,7 +514,7 @@ fn py_are_search_keys_identical(search_keys: Bound<'_, PyAny>) -> PyResult<bool>
 /// passed at construction (or `None`, which resolves to the plain
 /// variant); internal algorithms always run against the resolved
 /// `SearchKeyFunc` enum.
-#[pyclass(module = "bzrformats._bzr_rs.chk_map", name = "LeafNode")]
+#[pyclass(module = "bzrformats._bzr_rs.chk_map", name = "LeafNode", extends = Node)]
 pub struct LeafNode {
     inner: RsLeafNode,
     /// Original Python callable as passed in; preserved so the
@@ -478,11 +524,10 @@ pub struct LeafNode {
     search_key_callable: Option<Py<PyAny>>,
 }
 
-#[pymethods]
 impl LeafNode {
-    #[new]
-    #[pyo3(signature = (search_key_func = None))]
-    fn new(py: Python<'_>, search_key_func: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
+    /// Build a bare `LeafNode` value (without the `Node` base layer). Used by
+    /// `#[new]` and by [`LeafNode::bound`] for internal construction.
+    fn build(py: Python<'_>, search_key_func: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
         let (func, callable) = match search_key_func {
             None => (
                 SearchKeyFunc::Plain,
@@ -497,6 +542,29 @@ impl LeafNode {
             inner: RsLeafNode::new(func),
             search_key_callable: callable,
         })
+    }
+
+    /// Construct a `LeafNode` as a bound pyobject with its `Node` base layer.
+    fn bound<'py>(
+        py: Python<'py>,
+        search_key_func: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, LeafNode>> {
+        Bound::new(
+            py,
+            PyClassInitializer::from(Node).add_subclass(Self::build(py, search_key_func)?),
+        )
+    }
+}
+
+#[pymethods]
+impl LeafNode {
+    #[new]
+    #[pyo3(signature = (search_key_func = None))]
+    fn new(
+        py: Python<'_>,
+        search_key_func: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(Node).add_subclass(Self::build(py, search_key_func)?))
     }
 
     fn __len__(&self) -> usize {
@@ -969,7 +1037,7 @@ impl LeafNode {
             let node: Bound<'py, PyAny> = if let Some(existing) = result.get_item(&prefix_py)? {
                 existing
             } else {
-                let leaf = Bound::new(py, LeafNode::new(py, callable.clone())?)?;
+                let leaf = LeafNode::bound(py, callable.clone())?;
                 leaf.borrow_mut().inner.maximum_size = maximum_size;
                 leaf.borrow_mut().inner.key_width = key_width;
                 result.set_item(&prefix_py, &leaf)?;
@@ -1058,13 +1126,13 @@ impl LeafNode {
     /// is optional and defaults to plain.
     #[classmethod]
     #[pyo3(signature = (data, key, search_key_func = None))]
-    fn deserialise(
-        _cls: &Bound<'_, pyo3::types::PyType>,
-        py: Python<'_>,
+    fn deserialise<'py>(
+        _cls: &Bound<'py, pyo3::types::PyType>,
+        py: Python<'py>,
         data: &[u8],
-        key: Bound<'_, PyTuple>,
-        search_key_func: Option<Bound<'_, PyAny>>,
-    ) -> PyResult<Self> {
+        key: Bound<'py, PyTuple>,
+        search_key_func: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, Self>> {
         // Parse the data first so bad-data errors surface before any
         // key-shape complaints.
         let parsed = deserialise_leaf_node(data).map_err(chk_err_to_py)?;
@@ -1084,10 +1152,13 @@ impl LeafNode {
                 "_current_size computed incorrectly",
             ));
         }
-        Ok(Self {
-            inner: leaf,
-            search_key_callable: callable,
-        })
+        Bound::new(
+            py,
+            PyClassInitializer::from(Node).add_subclass(Self {
+                inner: leaf,
+                search_key_callable: callable,
+            }),
+        )
     }
 }
 
@@ -1100,7 +1171,7 @@ impl LeafNode {
 /// orchestration methods (`map`, `unmap`, `serialise`, `iteritems`)
 /// stay in Python — they need to construct sibling pyclass instances
 /// and walk the heterogeneous items dict.
-#[pyclass(module = "bzrformats._bzr_rs.chk_map", name = "InternalNode")]
+#[pyclass(module = "bzrformats._bzr_rs.chk_map", name = "InternalNode", extends = Node)]
 pub struct InternalNode {
     key: Option<Vec<u8>>,
     maximum_size: usize,
@@ -1120,11 +1191,9 @@ pub struct InternalNode {
     items: Py<PyDict>,
 }
 
-#[pymethods]
 impl InternalNode {
-    #[new]
-    #[pyo3(signature = (prefix = None, search_key_func = None))]
-    fn new(
+    /// Build a bare `InternalNode` value (without the `Node` base layer).
+    fn build(
         py: Python<'_>,
         prefix: Option<&[u8]>,
         search_key_func: Option<Bound<'_, PyAny>>,
@@ -1151,6 +1220,31 @@ impl InternalNode {
             search_key_callable: callable,
             items: PyDict::new(py).unbind(),
         })
+    }
+
+    /// Construct an `InternalNode` as a bound pyobject with its `Node` base.
+    fn bound<'py>(
+        py: Python<'py>,
+        prefix: Option<&[u8]>,
+        search_key_func: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, InternalNode>> {
+        Bound::new(
+            py,
+            PyClassInitializer::from(Node).add_subclass(Self::build(py, prefix, search_key_func)?),
+        )
+    }
+}
+
+#[pymethods]
+impl InternalNode {
+    #[new]
+    #[pyo3(signature = (prefix = None, search_key_func = None))]
+    fn new(
+        py: Python<'_>,
+        prefix: Option<&[u8]>,
+        search_key_func: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<PyClassInitializer<Self>> {
+        Ok(PyClassInitializer::from(Node).add_subclass(Self::build(py, prefix, search_key_func)?))
     }
 
     fn __len__(&self) -> usize {
@@ -1458,13 +1552,13 @@ impl InternalNode {
     /// `(b"sha1:...",)` reference.
     #[classmethod]
     #[pyo3(signature = (data, key, search_key_func = None))]
-    fn deserialise(
-        _cls: &Bound<'_, pyo3::types::PyType>,
-        py: Python<'_>,
+    fn deserialise<'py>(
+        _cls: &Bound<'py, pyo3::types::PyType>,
+        py: Python<'py>,
         data: &[u8],
-        key: Bound<'_, PyAny>,
-        search_key_func: Option<Bound<'_, PyAny>>,
-    ) -> PyResult<Self> {
+        key: Bound<'py, PyAny>,
+        search_key_func: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, Self>> {
         let parsed = deserialise_internal_node(data).map_err(chk_err_to_py)?;
         let (func, callable) = match search_key_func {
             None => (SearchKeyFunc::Plain, None),
@@ -1488,18 +1582,21 @@ impl InternalNode {
             let tuple = PyTuple::new(py, [PyBytes::new(py, &flat_key)])?;
             items.set_item(PyBytes::new(py, &prefix), tuple)?;
         }
-        Ok(Self {
-            key: Some(key_bytes),
-            maximum_size: parsed.maximum_size,
-            key_width: parsed.key_width,
-            len: parsed.length,
-            node_width: parsed.node_width,
-            raw_size: 0,
-            search_prefix: Some(parsed.search_prefix),
-            search_key_func: func,
-            search_key_callable: callable,
-            items: items.unbind(),
-        })
+        Bound::new(
+            py,
+            PyClassInitializer::from(Node).add_subclass(Self {
+                key: Some(key_bytes),
+                maximum_size: parsed.maximum_size,
+                key_width: parsed.key_width,
+                len: parsed.length,
+                node_width: parsed.node_width,
+                raw_size: 0,
+                search_prefix: Some(parsed.search_prefix),
+                search_key_func: func,
+                search_key_callable: callable,
+                items: items.unbind(),
+            }),
+        )
     }
 
     /// Iterate over child nodes matching `key_filter`, demand-loading
@@ -1823,7 +1920,7 @@ impl InternalNode {
                 me.key_width,
             )
         };
-        let new_leaf = Bound::new(py, LeafNode::new(py, callable)?)?;
+        let new_leaf = LeafNode::bound(py, callable)?;
         new_leaf.borrow_mut().inner.maximum_size = maximum_size;
         new_leaf.borrow_mut().inner.key_width = key_width;
         let nodes = InternalNode::_iter_nodes(slf.clone(), py, store, None, Some(16))?;
@@ -1886,7 +1983,7 @@ impl InternalNode {
                 .search_key_callable
                 .as_ref()
                 .map(|c| c.bind(py).clone());
-            let new_parent = Bound::new(py, InternalNode::new(py, Some(&new_prefix), callable)?)?;
+            let new_parent = InternalNode::bound(py, Some(&new_prefix), callable)?;
             new_parent.borrow_mut().maximum_size = slf.borrow().maximum_size;
             new_parent.borrow_mut().key_width = slf.borrow().key_width;
             let self_prefix = search_prefix[..new_prefix.len() + 1].to_vec();
@@ -2070,12 +2167,12 @@ fn internal_new_child<'py>(
         )
     };
     let child: Bound<'py, PyAny> = if internal {
-        let node = Bound::new(py, InternalNode::new(py, None, callable)?)?;
+        let node = InternalNode::bound(py, None, callable)?;
         node.borrow_mut().maximum_size = maximum_size;
         node.borrow_mut().key_width = key_width;
         node.into_any()
     } else {
-        let node = Bound::new(py, LeafNode::new(py, callable)?)?;
+        let node = LeafNode::bound(py, callable)?;
         node.borrow_mut().inner.maximum_size = maximum_size;
         node.borrow_mut().inner.key_width = key_width;
         node.into_any()
@@ -2472,7 +2569,7 @@ impl CHKMap {
                 inner: RsLeafNode::new(func.clone()),
                 search_key_callable: callable.as_ref().map(|cb| cb.clone_ref(py)),
             };
-            Py::new(py, leaf)?.into_any()
+            Py::new(py, PyClassInitializer::from(Node).add_subclass(leaf))?.into_any()
         } else if let Ok(_) = root_key.clone().cast_into::<PyTuple>() {
             root_key.unbind()
         } else {
@@ -2993,7 +3090,7 @@ impl CHKMap {
         key_width: usize,
         search_key_func: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let leaf = Bound::new(py, LeafNode::new(py, search_key_func.clone())?)?;
+        let leaf = LeafNode::bound(py, search_key_func.clone())?;
         {
             let mut l = leaf.borrow_mut();
             l.inner.maximum_size = maximum_size;
@@ -3764,6 +3861,7 @@ pub(crate) fn _chk_map_rs(py: Python) -> PyResult<Bound<PyModule>> {
     // as `chk_map._unknown` and identity comparisons line up with what
     // the Rust mutators write back.
     m.add("_unknown", py_unknown_sentinel(py))?;
+    m.add_class::<Node>()?;
     m.add_class::<LeafNode>()?;
     m.add_class::<InternalNode>()?;
     m.add_class::<CHKMap>()?;

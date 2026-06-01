@@ -36,7 +36,6 @@ Densely packed upper nodes.
 
 """
 
-import abc
 from collections.abc import Callable
 
 from ._bzr_rs import chk_map as _chk_map_rs
@@ -78,99 +77,10 @@ search_key_registry.register(b"plain", _search_key_plain)
 CHKMap = _chk_map_rs.CHKMap
 
 
-class Node(metaclass=abc.ABCMeta):
-    """Base class defining the protocol for CHK Map nodes.
-
-    :ivar _raw_size: The total size of the serialized key:value data, before
-        adding the header bytes, and without prefix compression.
-
-    The Rust-backed pyclass LeafNode is registered as a virtual
-    subclass at the bottom of this module so `isinstance(_, Node)`
-    works uniformly across LeafNode and InternalNode.
-    """
-
-    __slots__ = (
-        "_items",
-        "_key",
-        "_key_width",
-        "_len",
-        "_maximum_size",
-        "_raw_size",
-        "_search_key_func",
-        "_search_prefix",
-    )
-
-    def __init__(self, key_width=1):
-        """Create a node.
-
-        :param key_width: The width of keys for this node.
-        """
-        self._key = None
-        # Current number of elements
-        self._len = 0
-        self._maximum_size = 0
-        self._key_width = key_width
-        # current size in bytes
-        self._raw_size = 0
-        # The pointers/values this node has - meaning defined by child classes.
-        self._items = {}
-        # The common search prefix
-        self._search_prefix = None
-
-    def __repr__(self):
-        """Return string representation of the node."""
-        items_str = str(sorted(self._items))
-        if len(items_str) > 20:
-            items_str = items_str[:16] + "...]"
-        return "{}(key:{} len:{} size:{} max:{} prefix:{} items:{})".format(
-            self.__class__.__name__,
-            self._key,
-            self._len,
-            self._raw_size,
-            self._maximum_size,
-            self._search_prefix,
-            items_str,
-        )
-
-    @abc.abstractmethod
-    def iteritems(self, store, key_filter=None):
-        """Iterate over items in the node.
-
-        :param key_filter: A filter to apply to the node. It should be a
-            list/set/dict or similar repeatedly iterable container.
-        """
-        raise NotImplementedError(self.iteritems)
-
-    @abc.abstractmethod
-    def unmap(self, store, key):
-        """Unmap key from the node."""
-        raise NotImplementedError(self.unmap)
-
-    @abc.abstractmethod
-    def map(self, store, key: Key, value):
-        """Map key to value."""
-        raise NotImplementedError(self.map)
-
-    def key(self) -> Key:
-        """Return the key for this node."""
-        return self._key
-
-    def __len__(self) -> int:
-        """Return the number of items in this node."""
-        return self._len
-
-    @property
-    def maximum_size(self) -> int:
-        """What is the upper limit for adding references to a node."""
-        return self._maximum_size
-
-    def set_maximum_size(self, new_size):
-        """Set the size threshold for nodes.
-
-        :param new_size: The size at which no data is added to a node. 0 for
-            unlimited.
-        """
-        self._maximum_size = new_size
+# Node is the base class for CHK map nodes; the concrete LeafNode and
+# InternalNode pyclasses extend it in Rust, so isinstance(x, Node) holds
+# through real inheritance.
+Node = _chk_map_rs.Node
 
 
 # Singleton indicating we have not computed _search_prefix yet. Re-exported
@@ -181,19 +91,7 @@ _unknown = _chk_map_rs._unknown
 
 
 LeafNode = _chk_map_rs.LeafNode
-
-
-# Register the Rust-backed pyclasses with the Node ABC so existing
-# `isinstance(_, Node)` checks across this module match LeafNode and
-# InternalNode instances.
-Node.register(LeafNode)
-
-
 InternalNode = _chk_map_rs.InternalNode
-
-
-# Virtual subclass for isinstance(_, Node) checks.
-Node.register(InternalNode)
 
 
 _deserialise = _chk_map_rs._deserialise
