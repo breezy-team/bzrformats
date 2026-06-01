@@ -1187,6 +1187,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bytes_record_reader_eof_after_length() {
+        // EOF after the length line, before any name: read_prelude must fail.
+        let mut data: &[u8] = b"123\n";
+        match BytesRecordReader::read_prelude(&mut data) {
+            Err(ReadError::UnexpectedEof) => {}
+            Err(other) => panic!("expected UnexpectedEof, got {:?}", other),
+            Ok(_) => panic!("expected UnexpectedEof, got Ok"),
+        }
+    }
+
+    #[test]
+    fn bytes_record_reader_early_eof_sweep() {
+        // Every truncation of a complete record must surface as UnexpectedEof,
+        // whether the stream ends mid-length-line, mid-name, mid-blank-line or
+        // mid-body. Mirrors the Python test_early_eof sweep.
+        let complete: &[u8] = b"6\nname\n\nabcdef";
+        for count in 0..complete.len() {
+            let mut data = &complete[..count];
+            let result = (|| -> Result<(), ReadError> {
+                let mut r = BytesRecordReader::read_prelude(&mut data)?;
+                // Drain the body; a truncated body must error here.
+                loop {
+                    let chunk = r.read_content(None)?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                }
+                Ok(())
+            })();
+            match result {
+                Err(ReadError::UnexpectedEof) => {}
+                other => panic!(
+                    "prefix of length {} ({:?}): expected UnexpectedEof, got {:?}",
+                    count,
+                    &complete[..count],
+                    other
+                ),
+            }
+        }
+    }
+
     /// Drive a [`ReadVFile`] from a fixed list of hunks. Panics if the file
     /// asks for more hunks than provided (the tests never should).
     struct HunkFeeder {
