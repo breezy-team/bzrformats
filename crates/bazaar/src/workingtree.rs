@@ -425,6 +425,9 @@ fn split_path(path: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bzrdir::BzrDir;
+    use crate::transport::{LocalTransport, SharedTransport};
+    use std::sync::Arc;
 
     #[test]
     fn split_and_join_round_trip() {
@@ -432,5 +435,37 @@ mod tests {
             let (d, b) = split_path(p);
             assert_eq!(join_path(d.as_bytes(), b.as_bytes()), p);
         }
+    }
+
+    /// Create a fresh tree, commit its (empty) state, and read the
+    /// resulting revision back -- a self-contained create -> commit ->
+    /// read loop with no external fixtures. Cross-compatibility with brz
+    /// is verified separately against a real tree.
+    #[test]
+    fn create_and_commit_empty_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDir::create(&parent).unwrap();
+
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let mut wt = cd.open_workingtree().unwrap();
+
+        let revid = wt
+            .commit(&mut repo, &branch, "T <t@e>", "empty commit", 1577880000, 0)
+            .unwrap();
+
+        // Branch advanced to revno 1 at the new revision.
+        let reopened = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let branch = reopened.open_branch().unwrap();
+        assert_eq!(branch.last_revision_info().unwrap(), (1, revid.clone()));
+
+        // The revision and its inventory are readable.
+        let repo = reopened.open_repository().unwrap();
+        let rev = repo.get_revision(&revid).unwrap();
+        assert_eq!(rev.message, "empty commit");
+        let inv = repo.get_inventory(&revid).unwrap();
+        // An empty tree has only the root, so no non-root entries.
+        assert!(inv.entries().unwrap().is_empty());
     }
 }

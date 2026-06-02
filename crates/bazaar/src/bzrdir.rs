@@ -167,6 +167,48 @@ impl BzrDir {
         })
     }
 
+    /// Create a fresh 2a control directory under `parent` (the directory
+    /// that will contain `.bzr`), with an empty repository, branch and
+    /// working tree, and open it.
+    ///
+    /// Writes the full meta-directory scaffold: the `.bzr` marker, each
+    /// component's `format` file, an empty repository (`pack-names`), an
+    /// empty branch (`null:` tip, empty tags/config), and an empty
+    /// dirstate-based working tree.
+    pub fn create(parent: &SharedTransport) -> Result<Self, BzrDirError> {
+        let bzr = parent.subtransport(".bzr")?;
+        bzr.mkdir("")?;
+        bzr.put_bytes("branch-format", METADIR_MARKER)?;
+        bzr.put_bytes(
+            "README",
+            b"This is a Bazaar control directory.\n\
+              Do not change any files in this directory.\n\
+              See http://bazaar.canonical.com/ for more information about Bazaar.\n",
+        )?;
+
+        // Repository: empty 2a.
+        crate::repository::Pack2aRepository::create(bzr.subtransport("repository")?)
+            .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
+
+        // Branch: format marker, null tip, empty config and tags.
+        let branch = bzr.subtransport("branch")?;
+        branch.mkdir("")?;
+        branch.put_bytes("format", BRANCH_FORMAT_7)?;
+        branch.put_bytes("last-revision", b"0 null:\n")?;
+        branch.put_bytes("branch.conf", b"")?;
+        branch.put_bytes("tags", b"")?;
+
+        // Working tree: format marker, empty dirstate, conflicts and views.
+        let checkout = bzr.subtransport("checkout")?;
+        checkout.mkdir("")?;
+        checkout.put_bytes("format", WORKINGTREE_FORMAT_6)?;
+        checkout.put_bytes("conflicts", b"BZR conflict list format 1\n")?;
+        checkout.put_bytes("views", b"")?;
+        checkout.put_bytes("dirstate", &empty_dirstate_bytes())?;
+
+        Self::open(bzr)
+    }
+
     /// Verify a component's format if it is present.
     ///
     /// Returns `Ok(true)` if the component exists and is a supported
@@ -254,6 +296,14 @@ impl BzrDir {
         crate::workingtree::WorkingTree::open(root)
             .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))
     }
+}
+
+/// Serialise an empty dirstate (one root entry, no parents).
+fn empty_dirstate_bytes() -> Vec<u8> {
+    use crate::dirstate::{DefaultSHA1Provider, DirState};
+    let mut state = DirState::new("dirstate", Box::new(DefaultSHA1Provider), 0, true, false);
+    state.set_data(Vec::new(), DirState::empty_tree_dirblocks());
+    state.get_lines().concat()
 }
 
 #[cfg(test)]

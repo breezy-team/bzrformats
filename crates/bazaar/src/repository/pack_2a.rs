@@ -345,6 +345,9 @@ impl Pack2aRepository {
     /// Writes the `format` marker, an empty `pack-names`, and the
     /// `indices/` and `packs/` directories.
     pub fn create(transport: SharedTransport) -> Result<Self, RepositoryError> {
+        // The repository directory itself may not exist yet (mkdir does not
+        // create parents).
+        transport.mkdir("")?;
         transport.mkdir("indices")?;
         transport.mkdir("packs")?;
         transport.put_bytes(
