@@ -537,6 +537,35 @@ impl DirState {
         Ok(())
     }
 
+    /// Load a complete dirstate from its on-disk bytes.
+    ///
+    /// Reads the header (parents, ghosts, entry count), parses the
+    /// dirblock rows for `1 + num_present_parents` trees, and splits the
+    /// root block into its sentinel shape. After this, [`iter_entries`]
+    /// yields every entry. This is the read-side counterpart to the
+    /// header/parse/split helpers, composed into one call.
+    ///
+    /// [`iter_entries`]: DirState::iter_entries
+    pub fn load_bytes(&mut self, data: &[u8]) -> Result<(), LoadError> {
+        self.read_header(data).map_err(LoadError::Header)?;
+        let body_start = self
+            .end_of_header
+            .expect("read_header sets end_of_header on success") as usize;
+        let num_trees = 1 + self.num_present_parents();
+        let body = &data[body_start.min(data.len())..];
+        let dirblocks =
+            parse_dirblocks(body, num_trees, self.num_entries).map_err(LoadError::Dirblocks)?;
+        self.dirblocks = dirblocks;
+        self.id_index = None;
+        self.packed_stat_index = None;
+        if !self.dirblocks.is_empty() {
+            split_root_dirblock_into_contents(&mut self.dirblocks).map_err(LoadError::SplitRoot)?;
+        }
+        self.header_state = MemoryState::InMemoryUnmodified;
+        self.dirblock_state = MemoryState::InMemoryUnmodified;
+        Ok(())
+    }
+
     /// Split `self.dirblocks[0]` — which the parser fills with *both* root
     /// entries and contents-of-root entries — into the two sentinel
     /// blocks Python's `_read_dirblocks` / `_split_root_dirblock_into_contents`
@@ -5459,8 +5488,8 @@ use bisect::{bisect_bytes, cmp_by_dirs_bytes, BisectMode};
 mod errors;
 pub use errors::{
     AddError, BasisAdd, BasisApplyError, EnsureBlockError, EntriesToStateError,
-    FlatBasisDeltaEntry, FlatDeltaEntry, MakeAbsentError, SetPathIdError, SplitRootError,
-    UpdateEntryError, ValidateError,
+    FlatBasisDeltaEntry, FlatDeltaEntry, LoadError, MakeAbsentError, SetPathIdError,
+    SplitRootError, UpdateEntryError, ValidateError,
 };
 
 /// Seconds-since-epoch from a [`Metadata::modified`] reading.  Returns

@@ -65,6 +65,34 @@ fn read_header_no_parents_no_ghosts() {
 }
 
 #[test]
+fn load_bytes_reads_an_initialised_dirstate() {
+    // Initialise an empty dirstate to disk, read its bytes back, and
+    // load them: the root entry should reappear.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("dirstate");
+    {
+        let mut transport = FileTransport::new(&path);
+        let mut state =
+            DirState::initialize(&mut transport, path.clone(), Box::new(DefaultSHA1Provider))
+                .expect("initialize");
+        // Drop the write lock so the bytes are flushed.
+        state.save_to(&mut transport).unwrap();
+    }
+
+    let data = std::fs::read(&path).unwrap();
+    let mut loaded = DirState::new(&path, Box::new(DefaultSHA1Provider), 0, true, false);
+    loaded.load_bytes(&data).expect("load_bytes");
+    assert!(loaded.parents.is_empty());
+    // The empty tree has exactly the root entry.
+    let roots: Vec<_> = loaded
+        .iter_entries()
+        .filter(|e| e.key.dirname.is_empty() && e.key.basename.is_empty())
+        .collect();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].key.file_id, crate::inventory::ROOT_ID.to_vec());
+}
+
+#[test]
 fn read_header_with_parents_and_ghosts() {
     let bytes = make_header_bytes(&[b"rev-a", b"rev-b"], &[b"ghost-1"]);
     let header = read_header(&bytes).expect("parse header");
