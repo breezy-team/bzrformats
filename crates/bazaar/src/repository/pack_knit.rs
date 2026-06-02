@@ -284,12 +284,18 @@ fn build_store(
     ))
 }
 
-/// A read-only view of a knit-pack repository.
+/// A knit-pack repository.
+///
+/// Reading is available after [`open`](Self::open); writing follows the
+/// breezy write-group lifecycle ([`start_write_group`](Self::start_write_group),
+/// `add_*`, [`commit_write_group`](Self::commit_write_group)).
 pub struct KnitPackRepository {
     format: &'static RepositoryFormat,
+    transport: SharedTransport,
     revisions: Store,
     inventories: Store,
     texts: Store,
+    write_group: Option<WriteGroup>,
 }
 
 impl KnitPackRepository {
@@ -303,7 +309,114 @@ impl KnitPackRepository {
             revisions: build_store(&transport, &packs, IndexKind::Revision)?,
             inventories: build_store(&transport, &packs, IndexKind::Inventory)?,
             texts: build_store(&transport, &packs, IndexKind::Text)?,
+            transport,
+            write_group: None,
         })
+    }
+
+    /// Create an empty knit-pack repository of `format` at `transport` and
+    /// open it. `format` must be a `KnitPack` storage format.
+    pub fn create(
+        transport: SharedTransport,
+        format: &'static RepositoryFormat,
+    ) -> Result<Self, RepositoryError> {
+        if format.storage != StorageKind::KnitPack {
+            return Err(RepositoryError::UnsupportedFormat(
+                format.get_format_description(),
+            ));
+        }
+        transport.mkdir("")?;
+        transport.mkdir("indices")?;
+        transport.mkdir("packs")?;
+        transport.put_bytes("format", format.format_string())?;
+        let empty = crate::btree_builder::BTreeBuilder::new(0, 1)
+            .finish()
+            .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e:?}")))?;
+        transport.put_bytes("pack-names", &empty)?;
+        Self::open(transport)
+    }
+
+    /// Open a write group.
+    pub fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::Corrupt(
+                "a write group is already open".to_string(),
+            ));
+        }
+        self.write_group = Some(WriteGroup::new(&new_pack_name())?);
+        Ok(())
+    }
+
+    fn group(&self) -> Result<&WriteGroup, RepositoryError> {
+        self.write_group
+            .as_ref()
+            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))
+    }
+
+    /// Add a revision, serialised to XML (v5).
+    pub fn add_revision(
+        &mut self,
+        revision: &crate::revision::Revision,
+        parents: &[Vec<u8>],
+    ) -> Result<(), RepositoryError> {
+        use crate::serializer::RevisionSerializer;
+        let bytes = crate::xml_serializer::XMLRevisionSerializer5
+            .write_revision_to_string(revision)
+            .map_err(|e| RepositoryError::Corrupt(format!("write revision: {e:?}")))?;
+        let key: KnitKey = vec![revision.revision_id.as_bytes().to_vec()];
+        let parent_keys: Vec<KnitKey> = parents.iter().map(|p| vec![p.clone()]).collect();
+        self.group()?
+            .revisions
+            .add_lines(key, parent_keys, split_lines(&bytes), false)
+            .map_err(|e| RepositoryError::Corrupt(format!("add revision: {e}")))?;
+        Ok(())
+    }
+
+    /// Add an inventory, given its already-serialised XML bytes.
+    pub fn add_inventory_xml(
+        &mut self,
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        xml: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let key: KnitKey = vec![revision_id.to_vec()];
+        let parent_keys: Vec<KnitKey> = parents.iter().map(|p| vec![p.clone()]).collect();
+        self.group()?
+            .inventories
+            .add_lines(key, parent_keys, split_lines(xml), false)
+            .map_err(|e| RepositoryError::Corrupt(format!("add inventory: {e}")))?;
+        Ok(())
+    }
+
+    /// Add a file text, keyed by `(file_id, revision)`.
+    pub fn add_text(
+        &mut self,
+        file_id: &[u8],
+        revision: &[u8],
+        parents: &[(Vec<u8>, Vec<u8>)],
+        bytes: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let key: KnitKey = vec![file_id.to_vec(), revision.to_vec()];
+        let parent_keys: Vec<KnitKey> = parents
+            .iter()
+            .map(|(f, r)| vec![f.clone(), r.clone()])
+            .collect();
+        self.group()?
+            .texts
+            .add_lines(key, parent_keys, split_lines(bytes), false)
+            .map_err(|e| RepositoryError::Corrupt(format!("add text: {e}")))?;
+        Ok(())
+    }
+
+    /// Flush the open write group.
+    pub fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+        let group = self
+            .write_group
+            .take()
+            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))?;
+        let existing = read_pack_names_with_values(self.transport.as_ref())?;
+        group.finish(self.transport.as_ref(), &existing)?;
+        Ok(())
     }
 
     /// All revision ids in this repository, sorted.
@@ -408,6 +521,28 @@ fn check_format(transport: &dyn Transport) -> Result<&'static RepositoryFormat, 
     Ok(format)
 }
 
+/// Generate a fresh 32-hex-character pack name.
+fn new_pack_name() -> String {
+    crate::osutils::rand_chars(32)
+        .chars()
+        .map(|ch| char::from_digit((ch as u32) % 16, 16).unwrap())
+        .collect()
+}
+
+/// Read `pack-names`, returning each `(pack_name, value_bytes)` pair.
+fn read_pack_names_with_values(
+    transport: &dyn Transport,
+) -> Result<Vec<(String, Vec<u8>)>, RepositoryError> {
+    let index = BTreeGraphIndex::open(transport, "pack-names")?;
+    let mut out = Vec::new();
+    for (key, value, _refs) in index.iter_all_entries() {
+        if let Some(name) = key.first() {
+            out.push((String::from_utf8_lossy(name).into_owned(), value.clone()));
+        }
+    }
+    Ok(out)
+}
+
 /// Read `pack-names` and return the pack names in it.
 fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, RepositoryError> {
     let index = BTreeGraphIndex::open(transport, "pack-names")?;
@@ -434,4 +569,382 @@ fn split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
         lines.push(bytes[start..].to_vec());
     }
     lines
+}
+
+use std::sync::{Arc, Mutex};
+
+use crate::knit::{encode_graph_index_record, KnitMethod as KM};
+use crate::pack::ContainerWriter;
+
+/// One collected knit index record.
+type KnitWriteRecord = (
+    KnitKey,
+    Vec<KnitMethod>,
+    KnitIndexMemo<PackName>,
+    Vec<KnitKey>,
+);
+
+/// A writable [`KnitIndex`] that collects records for one object kind.
+///
+/// `has_deltas` distinguishes the texts/inventories indices (which carry a
+/// compression-parent reference list) from the revisions index (parents
+/// only); `has_parents` is always true for the kinds we write.
+struct KnitWriteIndex {
+    has_deltas: bool,
+    records: Mutex<Vec<KnitWriteRecord>>,
+}
+
+impl KnitWriteIndex {
+    fn new(has_deltas: bool) -> Self {
+        KnitWriteIndex {
+            has_deltas,
+            records: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take_records(&self) -> Vec<KnitWriteRecord> {
+        std::mem::take(&mut self.records.lock().unwrap())
+    }
+}
+
+impl KnitIndex for KnitWriteIndex {
+    type F = PackName;
+
+    fn get_build_details(
+        &self,
+        _keys: &[KnitKey],
+    ) -> Result<HashMap<KnitKey, KnitRecordDetails<Self::F>>, KnitError> {
+        Ok(HashMap::new())
+    }
+
+    fn keys(&self) -> Result<Vec<KnitKey>, KnitError> {
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, _, _, _)| k.clone())
+            .collect())
+    }
+
+    fn get_parent_map(
+        &self,
+        _keys: &[KnitKey],
+    ) -> Result<HashMap<KnitKey, Vec<KnitKey>>, KnitError> {
+        Ok(HashMap::new())
+    }
+
+    fn get_method(&self, key: &KnitKey) -> Result<KnitMethod, KnitError> {
+        Err(KnitError::RevisionNotPresent(key.clone()))
+    }
+
+    fn get_total_build_size(
+        &self,
+        _keys: &[KnitKey],
+        _positions: &HashMap<KnitKey, KnitRecordDetails<Self::F>>,
+    ) -> usize {
+        0
+    }
+
+    fn sort_keys_by_io(
+        &self,
+        _keys: &mut [KnitKey],
+        _positions: &HashMap<KnitKey, KnitRecordDetails<Self::F>>,
+    ) {
+    }
+
+    fn has_graph(&self) -> bool {
+        true
+    }
+
+    fn contains(&self, _key: &KnitKey) -> Result<bool, KnitError> {
+        Ok(false)
+    }
+
+    fn get_missing_compression_parents(&self) -> Result<Vec<KnitKey>, KnitError> {
+        Ok(Vec::new())
+    }
+
+    fn check_write_ok(&self) -> Result<(), KnitError> {
+        Ok(())
+    }
+
+    fn add_records(
+        &self,
+        records: &[KnitWriteRecord],
+        _random_id: bool,
+        _missing_compression_parents: bool,
+    ) -> Result<(), KnitError> {
+        self.records.lock().unwrap().extend_from_slice(records);
+        Ok(())
+    }
+}
+
+/// A writable [`KnitAccess`] that appends knit records to a shared pack.
+#[derive(Clone)]
+struct KnitWriteAccess {
+    pack_name: PackName,
+    pack: Arc<Mutex<ContainerWriter<Vec<u8>>>>,
+}
+
+impl KnitAccess for KnitWriteAccess {
+    type F = PackName;
+
+    fn get_raw_record(&self, _memo: &KnitIndexMemo<Self::F>) -> Result<Vec<u8>, KnitError> {
+        Err(KnitError::Corrupt("write-only access".to_string()))
+    }
+
+    fn get_raw_records(
+        &self,
+        _memos: &[KnitIndexMemo<Self::F>],
+    ) -> Result<Vec<Vec<u8>>, KnitError> {
+        Err(KnitError::Corrupt("write-only access".to_string()))
+    }
+
+    fn add_raw_record(
+        &self,
+        _key: &KnitKey,
+        size: usize,
+        data: Vec<Vec<u8>>,
+    ) -> Result<KnitIndexMemo<Self::F>, KnitError> {
+        let refs: Vec<&[u8]> = data.iter().map(|c| c.as_slice()).collect();
+        let mut pack = self.pack.lock().unwrap();
+        let (start, length) = pack
+            .add_bytes_record(&refs, size, &[])
+            .map_err(|e| KnitError::Corrupt(format!("writing pack record: {e}")))?;
+        Ok(KnitIndexMemo {
+            file_ref: self.pack_name.clone(),
+            offset: start,
+            length: length as usize,
+        })
+    }
+
+    fn flush(&self) -> Result<(), KnitError> {
+        Ok(())
+    }
+
+    fn reload_or_raise(&self, err: KnitError) -> Result<(), KnitError> {
+        Err(err)
+    }
+}
+
+type WriteStore = KnitVersionedFiles<KnitWriteIndex, KnitWriteAccess, KnitPlainFactory>;
+
+/// The in-progress new pack for a knit-pack write group.
+struct WriteGroup {
+    pack_name: PackName,
+    pack: Arc<Mutex<ContainerWriter<Vec<u8>>>>,
+    revisions: WriteStore,
+    inventories: WriteStore,
+    texts: WriteStore,
+}
+
+impl WriteGroup {
+    fn new(pack_name: &str) -> Result<Self, RepositoryError> {
+        let mut writer = ContainerWriter::new(Vec::new());
+        writer
+            .begin()
+            .map_err(|e| RepositoryError::Corrupt(format!("pack begin: {e}")))?;
+        let pack = Arc::new(Mutex::new(writer));
+        let make = |has_deltas: bool| -> WriteStore {
+            let access = KnitWriteAccess {
+                pack_name: pack_name.to_string(),
+                pack: pack.clone(),
+            };
+            // max_delta_chain 0 -> always fulltext (the write side does not
+            // delta-compress; readers handle both).
+            KnitVersionedFiles::new(KnitWriteIndex::new(has_deltas), access, KnitPlainFactory, 0)
+        };
+        let revisions = make(false);
+        let inventories = make(true);
+        let texts = make(true);
+        Ok(WriteGroup {
+            pack_name: pack_name.to_string(),
+            pack,
+            revisions,
+            inventories,
+            texts,
+        })
+    }
+
+    /// Flush the pack, its four indices and an updated `pack-names`.
+    fn finish(
+        self,
+        transport: &dyn Transport,
+        existing: &[(String, Vec<u8>)],
+    ) -> Result<(), RepositoryError> {
+        let WriteGroup {
+            pack_name,
+            pack,
+            revisions,
+            inventories,
+            texts,
+        } = self;
+        let rix = serialise_index(revisions.index, 1)?;
+        let iix = serialise_index(inventories.index, 1)?;
+        let tix = serialise_index(texts.index, 2)?;
+        // Knit-pack has no chk index; the signatures index is empty.
+        let six = crate::btree_builder::BTreeBuilder::new(1, 1)
+            .finish()
+            .map_err(|e| RepositoryError::Corrupt(format!("empty six: {e:?}")))?;
+
+        let pack_bytes = {
+            let mut writer = pack.lock().unwrap();
+            writer
+                .end()
+                .map_err(|e| RepositoryError::Corrupt(format!("pack end: {e}")))?;
+            std::mem::take(writer.get_mut())
+        };
+        transport.put_bytes(&format!("packs/{}.pack", pack_name), &pack_bytes)?;
+
+        let write_index = |ext: &str, bytes: &[u8]| -> Result<usize, RepositoryError> {
+            transport.put_bytes(&format!("indices/{}{ext}", pack_name), bytes)?;
+            Ok(bytes.len())
+        };
+        // Knit-pack pack-names order: rix iix tix six (no cix).
+        let sizes = [
+            write_index(index_extension(IndexKind::Revision), &rix)?,
+            write_index(index_extension(IndexKind::Inventory), &iix)?,
+            write_index(index_extension(IndexKind::Text), &tix)?,
+            write_index(index_extension(IndexKind::Signature), &six)?,
+        ];
+        let new_value = sizes
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .into_bytes();
+
+        let mut names = crate::btree_builder::BTreeBuilder::new(0, 1);
+        for (name, value) in existing {
+            names
+                .add_node(vec![name.clone().into_bytes()], value.clone(), vec![])
+                .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e:?}")))?;
+        }
+        names
+            .add_node(vec![pack_name.clone().into_bytes()], new_value, vec![])
+            .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e:?}")))?;
+        let names_bytes = names
+            .finish()
+            .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e:?}")))?;
+        transport.put_bytes("pack-names", &names_bytes)?;
+        Ok(())
+    }
+}
+
+/// Serialise a write index's collected records into a btree index.
+fn serialise_index(index: KnitWriteIndex, key_elements: usize) -> Result<Vec<u8>, RepositoryError> {
+    let has_deltas = index.has_deltas;
+    let ref_lists = if has_deltas { 2 } else { 1 };
+    let mut builder = crate::btree_builder::BTreeBuilder::new(ref_lists, key_elements);
+    for (key, options, memo, parents) in index.take_records() {
+        let noeol = options.contains(&KM::NoEol);
+        let method = if options.contains(&KM::LineDelta) {
+            KM::LineDelta
+        } else {
+            KM::Fulltext
+        };
+        let (value, node_refs) = encode_graph_index_record(
+            noeol,
+            memo.offset,
+            memo.length as u64,
+            method,
+            true,
+            has_deltas,
+            &parents,
+        )
+        .map_err(|e| RepositoryError::Corrupt(format!("encode index: {e}")))?;
+        builder
+            .add_node(key, value, node_refs)
+            .map_err(|e| RepositoryError::Corrupt(format!("index node: {e:?}")))?;
+    }
+    builder
+        .finish()
+        .map_err(|e| RepositoryError::Corrupt(format!("index finish: {e:?}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::LocalTransport;
+    use std::sync::Arc;
+
+    fn knitpack6() -> &'static RepositoryFormat {
+        super::super::format::find_format(b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n").unwrap()
+    }
+
+    fn temp() -> (tempfile::TempDir, SharedTransport) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repository");
+        std::fs::create_dir_all(&path).unwrap();
+        (dir, Arc::new(LocalTransport::new(&path)))
+    }
+
+    #[test]
+    fn write_then_read_round_trip() {
+        let (_d, t) = temp();
+        let mut repo = KnitPackRepository::create(t.clone(), knitpack6()).unwrap();
+        repo.start_write_group().unwrap();
+        let r1 = crate::revision::Revision::new(
+            crate::RevisionId::from(&b"rev-1"[..]),
+            vec![],
+            Some("T <t@e>".into()),
+            "first".into(),
+            std::collections::HashMap::new(),
+            None,
+            1577880000.0,
+            Some(0),
+        );
+        let r2 = crate::revision::Revision::new(
+            crate::RevisionId::from(&b"rev-2"[..]),
+            vec![crate::RevisionId::from(&b"rev-1"[..])],
+            Some("T <t@e>".into()),
+            "second".into(),
+            std::collections::HashMap::new(),
+            None,
+            1577966400.0,
+            Some(0),
+        );
+        repo.add_revision(&r1, &[]).unwrap();
+        repo.add_revision(&r2, &[b"rev-1".to_vec()]).unwrap();
+        repo.add_text(b"file-1", b"rev-1", &[], b"hello\n").unwrap();
+        repo.add_text(
+            b"file-1",
+            b"rev-2",
+            &[(b"file-1".to_vec(), b"rev-1".to_vec())],
+            b"hello\ngoodbye\n",
+        )
+        .unwrap();
+        repo.commit_write_group().unwrap();
+
+        let repo = KnitPackRepository::open(t).unwrap();
+        let mut ids = repo.all_revision_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![b"rev-1".to_vec(), b"rev-2".to_vec()]);
+        assert_eq!(repo.get_revision(b"rev-1").unwrap().message, "first");
+        let got2 = repo.get_revision(b"rev-2").unwrap();
+        assert_eq!(got2.message, "second");
+        assert_eq!(
+            got2.parent_ids
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"rev-1".to_vec()]
+        );
+        assert_eq!(repo.get_file_text(b"file-1", b"rev-1").unwrap(), b"hello\n");
+        assert_eq!(
+            repo.get_file_text(b"file-1", b"rev-2").unwrap(),
+            b"hello\ngoodbye\n"
+        );
+    }
+
+    #[test]
+    fn create_rejects_non_knitpack_format() {
+        let (_d, t) = temp();
+        let fmt = super::super::format::find_format(
+            b"Bazaar repository format 2a (needs bzr 1.16 or later)\n",
+        )
+        .unwrap();
+        assert!(KnitPackRepository::create(t, fmt).is_err());
+    }
 }
