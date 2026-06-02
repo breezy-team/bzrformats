@@ -485,26 +485,114 @@ impl KnitPackRepository {
         }
     }
 
-    /// Parse the inventory for a revision into entries `(path, Entry)`.
+    /// Read the inventory for a revision as an in-memory
+    /// [`MutableInventory`](crate::inventory::MutableInventory) (parsed from
+    /// the format's XML serializer). The same type the 2a reader returns.
     pub fn get_inventory(
         &self,
         revision_id: &[u8],
-    ) -> Result<Vec<(String, crate::inventory::Entry)>, RepositoryError> {
+    ) -> Result<crate::inventory::MutableInventory, RepositoryError> {
         let xml = self.get_inventory_xml(revision_id)?;
         let lines: Vec<Vec<u8>> = split_lines(&xml);
         let line_refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
-        let inv = self
-            .inventory_serializer()
+        self.inventory_serializer()
             .read_inventory_from_lines(&line_refs, Some(crate::RevisionId::from(revision_id)))
-            .map_err(|e| RepositoryError::Corrupt(format!("inventory parse: {e:?}")))?;
-        let mut out = Vec::new();
-        for (path, entry) in inv.iter_entries(None) {
-            if path.is_empty() {
-                continue;
-            }
-            out.push((path, entry.clone()));
+            .map_err(|e| RepositoryError::Corrupt(format!("inventory parse: {e:?}")))
+    }
+
+    /// Build an inventory from `entries` (the root entry first, then its
+    /// descendants in parent-before-child order), serialise it to XML with
+    /// the format's serializer, add it to the open write group, and return
+    /// the serialised inventory's sha1 to record on the revision.
+    pub fn add_inventory_from_entries(
+        &mut self,
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        _root_id: &[u8],
+        entries: &[crate::inventory::Entry],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        let mut inv = crate::inventory::MutableInventory::new();
+        inv.revision_id = Some(crate::RevisionId::from(revision_id));
+        for entry in entries {
+            inv.add(entry.clone())
+                .map_err(|e| RepositoryError::Corrupt(format!("build inventory: {e:?}")))?;
         }
-        Ok(out)
+        let lines = self
+            .inventory_serializer()
+            .write_inventory_to_lines(&inv, false)
+            .map_err(|e| RepositoryError::Corrupt(format!("serialise inventory: {e:?}")))?;
+        let line_refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
+        let sha1 = crate::weave::sha_strings(&line_refs);
+        let xml: Vec<u8> = lines.concat();
+        self.add_inventory_xml(revision_id, parents, &xml)?;
+        Ok(sha1)
+    }
+}
+
+impl super::Repository for KnitPackRepository {
+    fn format(&self) -> &'static RepositoryFormat {
+        KnitPackRepository::format(self)
+    }
+
+    fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
+        KnitPackRepository::all_revision_ids(self)
+    }
+
+    fn get_revision(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<crate::revision::Revision, RepositoryError> {
+        KnitPackRepository::get_revision(self, revision_id)
+    }
+
+    fn get_inventory(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<Box<dyn crate::inventory::Inventory>, RepositoryError> {
+        Ok(Box::new(KnitPackRepository::get_inventory(
+            self,
+            revision_id,
+        )?))
+    }
+
+    fn get_file_text(&self, file_id: &[u8], revision: &[u8]) -> Result<Vec<u8>, RepositoryError> {
+        KnitPackRepository::get_file_text(self, file_id, revision)
+    }
+
+    fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        KnitPackRepository::start_write_group(self)
+    }
+
+    fn add_revision(
+        &mut self,
+        revision: &crate::revision::Revision,
+        parents: &[Vec<u8>],
+    ) -> Result<(), RepositoryError> {
+        KnitPackRepository::add_revision(self, revision, parents)
+    }
+
+    fn add_inventory_from_entries(
+        &mut self,
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        root_id: &[u8],
+        entries: &[crate::inventory::Entry],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        KnitPackRepository::add_inventory_from_entries(self, revision_id, parents, root_id, entries)
+    }
+
+    fn add_text(
+        &mut self,
+        file_id: &[u8],
+        revision: &[u8],
+        parents: &[(Vec<u8>, Vec<u8>)],
+        bytes: &[u8],
+    ) -> Result<(), RepositoryError> {
+        KnitPackRepository::add_text(self, file_id, revision, parents, bytes)
+    }
+
+    fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+        KnitPackRepository::commit_write_group(self)
     }
 }
 

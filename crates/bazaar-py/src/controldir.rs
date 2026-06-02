@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bazaar::branch::Branch as RsBranch;
 use bazaar::bzrdir::BzrDir as RsBzrDir;
-use bazaar::repository::Pack2aRepository as RsRepository;
+use bazaar::repository::Repository as RsRepository;
 use bazaar::transport::{LocalTransport, SharedTransport};
 use bazaar::workingtree::{EntryKind, WorkingTree as RsWorkingTree};
 use pyo3::prelude::*;
@@ -80,7 +80,7 @@ impl BzrDir {
 /// A bzr repository.
 #[pyclass(name = "Repository")]
 struct Repository {
-    inner: RsRepository,
+    inner: Box<dyn RsRepository>,
 }
 
 #[pymethods]
@@ -243,7 +243,7 @@ impl WorkingTree {
         let revid = self
             .inner
             .commit(
-                &mut repo.inner,
+                repo.inner.as_mut(),
                 &branch.inner,
                 committer,
                 message,

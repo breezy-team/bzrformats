@@ -266,14 +266,14 @@ impl BzrDir {
     ///
     /// Errors with [`BzrDirError::NotABzrDir`] if there is no repository
     /// component (a branch- or checkout-only `.bzr`).
-    pub fn open_repository(&self) -> Result<crate::repository::Pack2aRepository, BzrDirError> {
+    pub fn open_repository(&self) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
         if !self.has_repository {
             return Err(BzrDirError::NotABzrDir);
         }
         let sub = self
             .transport
             .subtransport(Component::Repository.subdir())?;
-        crate::repository::Pack2aRepository::open(sub)
+        crate::repository::open(sub)
             .map_err(|e| BzrDirError::Component(format!("opening repository: {e}")))
     }
 

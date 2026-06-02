@@ -25,6 +25,8 @@ use crate::pack_repo::{index_extension, IndexKind};
 use crate::transport::{Transport, TransportError};
 use crate::versionedfile::Key;
 
+use super::format::RepositoryFormat;
+
 /// The pack name is used as the groupcompress `FileRef`, identifying which
 /// `.pack` file a block lives in.
 type PackName = String;
@@ -321,6 +323,7 @@ type SharedChkStore = std::sync::Arc<dyn crate::versionedfile::VersionedFiles + 
 /// [`commit_write_group`](Self::commit_write_group). The new-pack machinery
 /// is private (the [`WriteGroup`]); there is no separate writer type.
 pub struct Pack2aRepository {
+    format: &'static RepositoryFormat,
     transport: SharedTransport,
     revisions: Store,
     inventories: Store,
@@ -340,7 +343,7 @@ impl Pack2aRepository {
     /// recognised but non-groupcompress (or otherwise unsupported) format
     /// is [`RepositoryError::UnsupportedFormat`].
     pub fn open(transport: SharedTransport) -> Result<Self, RepositoryError> {
-        check_format(transport.as_ref())?;
+        let format = check_format(transport.as_ref())?;
         let packs = read_pack_names(transport.as_ref())?;
         let revisions = build_store(&transport, &packs, IndexKind::Revision)?;
         let inventories = build_store(&transport, &packs, IndexKind::Inventory)?;
@@ -348,6 +351,7 @@ impl Pack2aRepository {
         let chk_bytes: SharedChkStore =
             std::sync::Arc::new(build_store(&transport, &packs, IndexKind::Chk)?);
         Ok(Pack2aRepository {
+            format,
             transport,
             revisions,
             inventories,
@@ -355,6 +359,11 @@ impl Pack2aRepository {
             chk_bytes,
             write_group: None,
         })
+    }
+
+    /// The format this repository was opened as.
+    pub fn format(&self) -> &'static RepositoryFormat {
+        self.format
     }
 
     /// Create an empty 2a repository at `transport` (rooted at the
@@ -426,6 +435,8 @@ impl Pack2aRepository {
     /// Reads the serialised `CHKInventory` header from the inventories
     /// store, then materializes it by walking the CHK maps through the
     /// shared chk-bytes store.
+    /// Read the inventory for a revision as a (lazy, read-only) CHK
+    /// inventory — this repository's natural inventory type.
     pub fn get_inventory(
         &self,
         revision_id: &[u8],
@@ -503,16 +514,20 @@ impl Pack2aRepository {
             .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))
     }
 
-    /// Add a revision (already serialised to bencode bytes) to the open
-    /// write group.
+    /// Add a revision to the open write group, serialising it to bencode
+    /// (the 2a revision serializer).
     pub fn add_revision(
         &mut self,
-        revision_id: &[u8],
+        revision: &crate::revision::Revision,
         parents: &[Vec<u8>],
-        bytes: &[u8],
     ) -> Result<(), RepositoryError> {
+        use crate::serializer::RevisionSerializer;
+        let bytes = crate::bencode_serializer::BEncodeRevisionSerializer1
+            .write_revision_to_string(revision)
+            .map_err(|e| RepositoryError::Corrupt(format!("serialise revision: {e:?}")))?;
+        let revision_id = revision.revision_id.as_bytes();
         self.write_group_mut()?
-            .add_revision(revision_id, parents, bytes)
+            .add_revision(revision_id, parents, &bytes)
     }
 
     /// Build a CHK inventory from `entries` and add it to the open write
@@ -555,6 +570,73 @@ impl Pack2aRepository {
     }
 }
 
+impl super::Repository for Pack2aRepository {
+    fn format(&self) -> &'static RepositoryFormat {
+        Pack2aRepository::format(self)
+    }
+
+    fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
+        Pack2aRepository::all_revision_ids(self)
+    }
+
+    fn get_revision(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<crate::revision::Revision, RepositoryError> {
+        Pack2aRepository::get_revision(self, revision_id)
+    }
+
+    fn get_inventory(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<Box<dyn crate::inventory::Inventory>, RepositoryError> {
+        Ok(Box::new(Pack2aRepository::get_inventory(
+            self,
+            revision_id,
+        )?))
+    }
+
+    fn get_file_text(&self, file_id: &[u8], revision: &[u8]) -> Result<Vec<u8>, RepositoryError> {
+        Pack2aRepository::get_file_text(self, file_id, revision)
+    }
+
+    fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        Pack2aRepository::start_write_group(self)
+    }
+
+    fn add_revision(
+        &mut self,
+        revision: &crate::revision::Revision,
+        parents: &[Vec<u8>],
+    ) -> Result<(), RepositoryError> {
+        Pack2aRepository::add_revision(self, revision, parents)
+    }
+
+    fn add_inventory_from_entries(
+        &mut self,
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        root_id: &[u8],
+        entries: &[crate::inventory::Entry],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        Pack2aRepository::add_inventory_from_entries(self, revision_id, parents, root_id, entries)
+    }
+
+    fn add_text(
+        &mut self,
+        file_id: &[u8],
+        revision: &[u8],
+        parents: &[(Vec<u8>, Vec<u8>)],
+        bytes: &[u8],
+    ) -> Result<(), RepositoryError> {
+        Pack2aRepository::add_text(self, file_id, revision, parents, bytes)
+    }
+
+    fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+        Pack2aRepository::commit_write_group(self)
+    }
+}
+
 /// Generate a fresh 32-hex-character pack name.
 ///
 /// brz derives the name from a hash of the pack contents; on disk any
@@ -581,8 +663,10 @@ fn read_pack_names_with_values(
 }
 
 /// Verify the repository `format` marker is a supported groupcompress
-/// (2a) format, consulting the format registry.
-fn check_format(transport: &dyn Transport) -> Result<(), RepositoryError> {
+/// (2a) format, consulting the format registry, and return it.
+fn check_format(
+    transport: &dyn Transport,
+) -> Result<&'static super::format::RepositoryFormat, RepositoryError> {
     let marker = transport.get_bytes("format")?;
     let format = super::format::find_format(&marker)
         .ok_or_else(|| RepositoryError::UnknownFormat(marker.clone()))?;
@@ -591,7 +675,7 @@ fn check_format(transport: &dyn Transport) -> Result<(), RepositoryError> {
             format.get_format_description(),
         ));
     }
-    Ok(())
+    Ok(format)
 }
 
 /// Read `pack-names` and return the pack names in it.
@@ -642,19 +726,16 @@ mod tests {
 
     #[test]
     fn revision_and_text_write_round_trip() {
-        let ser = crate::bencode_serializer::BEncodeRevisionSerializer1;
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
         repo.start_write_group().unwrap();
-        let r1 = ser
-            .write_revision_to_string(&make_revision(b"rev-1", vec![], "first", None))
+        repo.add_revision(&make_revision(b"rev-1", vec![], "first", None), &[])
             .unwrap();
-        let r2 = ser
-            .write_revision_to_string(&make_revision(b"rev-2", vec![b"rev-1"], "second", None))
-            .unwrap();
-        repo.add_revision(b"rev-1", &[], &r1).unwrap();
-        repo.add_revision(b"rev-2", &[b"rev-1".to_vec()], &r2)
-            .unwrap();
+        repo.add_revision(
+            &make_revision(b"rev-2", vec![b"rev-1"], "second", None),
+            &[b"rev-1".to_vec()],
+        )
+        .unwrap();
         repo.add_text(b"file-1", b"rev-1", &[], b"hello world\n")
             .unwrap();
         repo.commit_write_group().unwrap();
@@ -675,7 +756,6 @@ mod tests {
     fn chk_inventory_write_round_trip() {
         use crate::inventory::Entry;
         use crate::FileId;
-        let ser = crate::bencode_serializer::BEncodeRevisionSerializer1;
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
         repo.start_write_group().unwrap();
@@ -706,16 +786,14 @@ mod tests {
         let inv_sha1 = repo
             .add_inventory_from_entries(rev, &[], root_id, &entries)
             .unwrap();
-        let rbytes = ser
-            .write_revision_to_string(&make_revision(rev, vec![], "commit", Some(inv_sha1)))
+        repo.add_revision(&make_revision(rev, vec![], "commit", Some(inv_sha1)), &[])
             .unwrap();
-        repo.add_revision(rev, &[], &rbytes).unwrap();
         repo.commit_write_group().unwrap();
 
         // Re-open and materialize the inventory.
         let repo = Pack2aRepository::open(t).unwrap();
         let inv = repo.get_inventory(rev).unwrap();
-        let entries: Vec<_> = inv.entries().unwrap();
+        let entries = inv.entries().unwrap();
         let paths: Vec<String> = entries.iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(paths, vec!["a.txt".to_string()]);
         assert_eq!(

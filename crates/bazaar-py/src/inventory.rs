@@ -1026,6 +1026,7 @@ fn inventory_err_to_py_err(e: Error, py: Python) -> PyErr {
         Error::ParentNotVersioned(path) => {
             NotVersionedError::new_err(format!("parent not versioned: {}", path))
         }
+        Error::Backend(msg) => BzrFormatsError::new_err(msg),
     }
 }
 
@@ -1430,7 +1431,11 @@ impl Inventory {
     }
 
     fn iter_all_ids<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        let ids = self.0.iter_all_ids();
+        use bazaar::inventory::Inventory;
+        let ids = self
+            .0
+            .all_file_ids()
+            .map_err(|e| inventory_err_to_py_err(e, py))?;
         ids.into_iter()
             .collect::<Vec<_>>()
             .into_pyobject(py)?

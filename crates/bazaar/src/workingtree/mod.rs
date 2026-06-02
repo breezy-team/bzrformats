@@ -190,7 +190,7 @@ impl WorkingTree {
     /// refinement.)
     pub fn commit(
         &mut self,
-        repository: &mut crate::repository::Pack2aRepository,
+        repository: &mut dyn crate::repository::Repository,
         branch: &crate::branch::Branch,
         committer: &str,
         message: &str,
@@ -311,14 +311,8 @@ impl WorkingTree {
             timestamp as f64,
             Some(timezone),
         );
-        let rev_bytes = {
-            use crate::serializer::RevisionSerializer;
-            crate::bencode_serializer::BEncodeRevisionSerializer1
-                .write_revision_to_string(&revision)
-                .map_err(|e| WorkingTreeError::Commit(format!("serialise revision: {e:?}")))?
-        };
         repository
-            .add_revision(&revid, &parents, &rev_bytes)
+            .add_revision(&revision, &parents)
             .map_err(WorkingTreeError::Repository)?;
         repository
             .commit_write_group()
@@ -521,7 +515,14 @@ mod tests {
         let mut wt = cd.open_workingtree().unwrap();
 
         let revid = wt
-            .commit(&mut repo, &branch, "T <t@e>", "empty commit", 1577880000, 0)
+            .commit(
+                repo.as_mut(),
+                &branch,
+                "T <t@e>",
+                "empty commit",
+                1577880000,
+                0,
+            )
             .unwrap();
 
         // The dirstate basis was advanced to the new revision, in memory
