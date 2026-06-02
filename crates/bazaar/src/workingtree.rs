@@ -325,7 +325,71 @@ impl WorkingTree {
             .set_last_revision_info(new_revno, &revid)
             .map_err(WorkingTreeError::Branch)?;
 
+        // Record the new revision as the dirstate basis, so the working
+        // tree reads as up to date. Pair each inventory entry with its
+        // tree-relative path: the root is "", the rest follow live order.
+        let mut paths: Vec<String> = vec![String::new()];
+        paths.extend(live.entries.iter().map(|e| e.path.clone()));
+        self.update_basis(&revid, &paths, &inv_entries)?;
+
         Ok(revid)
+    }
+
+    /// Set the dirstate basis (tree 1) to the just-committed revision so
+    /// the working tree no longer reports as out of date.
+    ///
+    /// Requires a local-filesystem transport (the dirstate is rewritten
+    /// under an fcntl lock); on a non-local transport this is skipped.
+    fn update_basis(
+        &mut self,
+        revid: &[u8],
+        paths: &[String],
+        inv_entries: &[crate::inventory::Entry],
+    ) -> Result<(), WorkingTreeError> {
+        use crate::dirstate::{
+            inv_entry_to_details, FileTransport, Transport as DirstateTransport, TreeData,
+        };
+
+        let dirstate_path = match self.transport.local_path(DIRSTATE_PATH) {
+            Some(p) => p,
+            None => return Ok(()), // non-local: skip the basis rewrite.
+        };
+
+        let parent_entries: Vec<(Vec<u8>, Vec<u8>, TreeData)> = paths
+            .iter()
+            .zip(inv_entries)
+            .map(|(path, entry)| {
+                let (minikind, fingerprint, size, executable, _rev) = inv_entry_to_details(entry);
+                let td = TreeData {
+                    minikind,
+                    fingerprint,
+                    size,
+                    executable,
+                    packed_stat: crate::dirstate::NULLSTAT.to_vec(),
+                };
+                (
+                    path.clone().into_bytes(),
+                    entry.file_id().as_bytes().to_vec(),
+                    td,
+                )
+            })
+            .collect();
+
+        self.dirstate
+            .set_parent_trees(vec![revid.to_vec()], Vec::new(), vec![parent_entries])
+            .map_err(|e| WorkingTreeError::Commit(format!("set basis: {e:?}")))?;
+
+        // Rewrite the dirstate under a write lock.
+        let mut ft = FileTransport::new(&dirstate_path);
+        ft.lock_write()
+            .map_err(|e| WorkingTreeError::Commit(format!("lock dirstate: {e:?}")))?;
+        self.dirstate.mark_modified(&[], true);
+        self.dirstate
+            .save_to(&mut ft)
+            .map_err(|e| WorkingTreeError::Commit(format!("save dirstate: {e:?}")))?;
+        ft.unlock()
+            .map_err(|e| WorkingTreeError::Commit(format!("unlock dirstate: {e:?}")))?;
+        Ok(())
     }
 
     /// The current basis revno, derived from the branch the dirstate was
@@ -454,6 +518,12 @@ mod tests {
         let revid = wt
             .commit(&mut repo, &branch, "T <t@e>", "empty commit", 1577880000, 0)
             .unwrap();
+
+        // The dirstate basis was advanced to the new revision, in memory
+        // and on disk (re-opening the tree reads the same basis).
+        assert_eq!(wt.basis_revision().as_deref(), Some(revid.as_slice()));
+        let reread = WorkingTree::open(parent.clone()).unwrap();
+        assert_eq!(reread.basis_revision().as_deref(), Some(revid.as_slice()));
 
         // Branch advanced to revno 1 at the new revision.
         let reopened = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();

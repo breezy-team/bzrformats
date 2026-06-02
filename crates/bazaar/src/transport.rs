@@ -247,6 +247,16 @@ pub trait Transport {
             "subtransport not supported by this transport".to_string(),
         ))
     }
+
+    /// The local filesystem path of `path` relative to this transport, when
+    /// the transport is backed by the local filesystem.
+    ///
+    /// Returns `None` for non-local backends. Used by operations that need
+    /// a real OS path (e.g. taking an fcntl lock to rewrite the dirstate).
+    fn local_path(&self, path: &str) -> Option<std::path::PathBuf> {
+        let _ = path;
+        None
+    }
 }
 
 /// A transport shared across the opener objects (`BzrDir`, `Branch`,
@@ -418,6 +428,10 @@ impl Transport for LocalTransport {
 
     fn subtransport(&self, path: &str) -> Result<SharedTransport, TransportError> {
         Ok(std::sync::Arc::new(LocalTransport::new(self.resolve(path))))
+    }
+
+    fn local_path(&self, path: &str) -> Option<std::path::PathBuf> {
+        Some(self.resolve(path))
     }
 }
 
