@@ -32,6 +32,18 @@ fn kind_str(kind: EntryKind) -> &'static str {
     }
 }
 
+fn kind_from_str(kind: &str) -> PyResult<EntryKind> {
+    match kind {
+        "file" => Ok(EntryKind::File),
+        "directory" => Ok(EntryKind::Directory),
+        "symlink" => Ok(EntryKind::Symlink),
+        "tree-reference" => Ok(EntryKind::TreeReference),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown kind: {other}"
+        ))),
+    }
+}
+
 /// A `.bzr` control directory.
 #[pyclass(name = "BzrDir")]
 struct BzrDir {
@@ -223,6 +235,37 @@ impl WorkingTree {
             py,
             &self.inner.get_file_text(path).map_err(err)?,
         ))
+    }
+
+    /// Version `path` with `kind` ("file"/"directory"/"symlink"/
+    /// "tree-reference"), optionally with an explicit `file_id` (a fresh id
+    /// is generated when omitted). Returns the file id. Already-versioned
+    /// paths are left unchanged.
+    #[pyo3(signature = (path, kind, file_id=None))]
+    fn add<'py>(
+        &mut self,
+        py: Python<'py>,
+        path: &str,
+        kind: &str,
+        file_id: Option<&[u8]>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let id = self
+            .inner
+            .add(path, kind_from_str(kind)?, file_id)
+            .map_err(err)?;
+        Ok(PyBytes::new(py, &id))
+    }
+
+    /// Stop versioning `path` (and its children, if a directory). The files
+    /// are left on disk.
+    fn remove(&mut self, path: &str) -> PyResult<()> {
+        self.inner.remove(path).map_err(err)
+    }
+
+    /// Move a versioned entry from `from_path` to `to_path`, keeping its
+    /// file id, and move the file on disk.
+    fn rename(&mut self, from_path: &str, to_path: &str) -> PyResult<()> {
+        self.inner.rename(from_path, to_path).map_err(err)
     }
 
     /// Commit the live tree state as a new revision and return its id.

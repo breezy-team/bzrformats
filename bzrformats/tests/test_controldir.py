@@ -54,16 +54,55 @@ class TestControlDir(TestCaseInTempDir):
 
     def test_commit_files_round_trip(self):
         cd = controldir.create(self.test_dir)
-        # The empty working tree records only the root; write files and
-        # commit them via a freshly built inventory is out of scope here
-        # (adding to the dirstate is a separate API). This test confirms
-        # the read path of a committed empty tree instead.
-        repo = cd.open_repository()
-        branch = cd.open_branch()
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"hello\n")
         wt = cd.open_workingtree()
-        wt.commit(repo, branch, "T <t@e>", "first", 1577880000, 0)
-        revids = controldir.open(self.test_dir).open_repository().all_revision_ids()
-        self.assertEqual(len(revids), 1)
+        file_id = wt.add("a.txt", "file")
+        revid = wt.commit(
+            cd.open_repository(), cd.open_branch(), "T <t@e>", "add a", 1577880000, 0
+        )
+
+        reopened = controldir.open(self.test_dir)
+        repo = reopened.open_repository()
+        self.assertEqual(repo.all_revision_ids(), [revid])
+        inv = repo.get_inventory(revid)
+        self.assertEqual([entry[0] for entry in inv], ["a.txt"])
+        self.assertEqual(repo.get_file_text(file_id, revid), b"hello\n")
+
+    def test_add_versions_and_persists(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"x\n")
+        wt = cd.open_workingtree()
+        file_id = wt.add("a.txt", "file")
+        self.assertEqual(wt.path2id("a.txt"), file_id)
+        self.assertEqual(wt.list_files(), [("a.txt", "file", file_id)])
+        # Re-opening reads the same versioned set from disk.
+        reread = controldir.open(self.test_dir).open_workingtree()
+        self.assertEqual(reread.path2id("a.txt"), file_id)
+
+    def test_remove_unversions_without_deleting(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"x\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        wt.remove("a.txt")
+        self.assertIs(wt.path2id("a.txt"), None)
+        # The file is left on disk.
+        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "a.txt")))
+
+    def test_rename_keeps_file_id(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"x\n")
+        wt = cd.open_workingtree()
+        file_id = wt.add("a.txt", "file")
+        wt.rename("a.txt", "b.txt")
+        self.assertIs(wt.path2id("a.txt"), None)
+        self.assertEqual(wt.path2id("b.txt"), file_id)
+        self.assertFalse(os.path.exists(os.path.join(self.test_dir, "a.txt")))
+        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "b.txt")))
 
     def test_branch_tags_round_trip(self):
         cd = controldir.create(self.test_dir)

@@ -7,9 +7,9 @@
 //! that contains `.bzr`) and exposes the live tracked files.
 //!
 //! It can read the tree (list the tracked files, map paths to file ids,
-//! read file contents) and [`commit`](WorkingTree::commit) the live state
-//! as a new revision. Mutating the set of versioned files (add/remove/
-//! rename) is a later addition.
+//! read file contents), mutate the tracked set ([`add`](WorkingTree::add),
+//! [`remove`](WorkingTree::remove), [`rename`](WorkingTree::rename)), and
+//! [`commit`](WorkingTree::commit) the live state as a new revision.
 
 pub mod format;
 mod formats;
@@ -29,6 +29,10 @@ pub enum WorkingTreeError {
     Dirstate(LoadError),
     /// A path was not versioned in this tree.
     NotVersioned(String),
+    /// A path could not be versioned (dirstate add failed).
+    Add(crate::dirstate::AddError),
+    /// A path could not be unversioned (dirstate make-absent failed).
+    Remove(crate::dirstate::MakeAbsentError),
     /// A commit could not be assembled.
     Commit(String),
     /// An error from the repository during commit.
@@ -44,6 +48,8 @@ impl std::fmt::Display for WorkingTreeError {
         match self {
             WorkingTreeError::Dirstate(e) => write!(f, "dirstate: {e}"),
             WorkingTreeError::NotVersioned(p) => write!(f, "path not versioned: {p}"),
+            WorkingTreeError::Add(e) => write!(f, "add: {e}"),
+            WorkingTreeError::Remove(e) => write!(f, "remove: {e}"),
             WorkingTreeError::Commit(m) => write!(f, "commit: {m}"),
             WorkingTreeError::Repository(e) => write!(f, "repository: {e}"),
             WorkingTreeError::Branch(e) => write!(f, "branch: {e}"),
@@ -84,6 +90,15 @@ impl EntryKind {
             Kind::TreeReference => Some(EntryKind::TreeReference),
             // Absent and relocated entries are not live in this tree.
             Kind::Absent | Kind::Relocated => None,
+        }
+    }
+
+    fn to_osutils_kind(self) -> crate::osutils::Kind {
+        match self {
+            EntryKind::File => crate::osutils::Kind::File,
+            EntryKind::Directory => crate::osutils::Kind::Directory,
+            EntryKind::Symlink => crate::osutils::Kind::Symlink,
+            EntryKind::TreeReference => crate::osutils::Kind::TreeReference,
         }
     }
 }
@@ -175,6 +190,138 @@ impl WorkingTree {
             return Err(WorkingTreeError::NotVersioned(path.to_string()));
         }
         Ok(self.transport.get_bytes(path)?)
+    }
+
+    /// Version `path` with `kind`, assigning `file_id` (a fresh id is
+    /// generated from the path when `None`). The entry is added with no
+    /// cached stat or sha1; those are gathered on the next access. Already
+    /// versioned paths are left unchanged. The dirstate is rewritten to
+    /// disk. Returns the file id of the (now) versioned path.
+    ///
+    /// The parent directory must already be versioned, mirroring breezy's
+    /// `MutableTree._add` (callers add parents first).
+    pub fn add(
+        &mut self,
+        path: &str,
+        kind: EntryKind,
+        file_id: Option<&[u8]>,
+    ) -> Result<Vec<u8>, WorkingTreeError> {
+        let path = path.trim_matches('/');
+        if let Some(existing) = self.path2id(path) {
+            return Ok(existing);
+        }
+        let file_id = match file_id {
+            Some(id) => id.to_vec(),
+            None => crate::gen_ids::gen_file_id(path),
+        };
+        self.dirstate
+            .add_path(path, &file_id, kind.to_osutils_kind(), None, b"")
+            .map_err(WorkingTreeError::Add)?;
+        self.save_dirstate()?;
+        Ok(file_id)
+    }
+
+    /// Stop versioning `path` and (if it is a directory) everything beneath
+    /// it. The files are left on disk; only the tracked set changes. The
+    /// dirstate is rewritten to disk.
+    ///
+    /// Returns [`WorkingTreeError::NotVersioned`] if `path` is not tracked.
+    pub fn remove(&mut self, path: &str) -> Result<(), WorkingTreeError> {
+        let path = path.trim_matches('/');
+        if self.path2id(path).is_none() {
+            return Err(WorkingTreeError::NotVersioned(path.to_string()));
+        }
+
+        // Collect the keys to make absent: the path itself plus, when it is
+        // a directory, every live descendant. iter_entries yields all
+        // tree-0 rows; a descendant is one whose path is `path` or starts
+        // with `path/`.
+        let prefix = format!("{path}/");
+        let mut keys: Vec<crate::dirstate::EntryKey> = Vec::new();
+        for entry in self.dirstate.iter_entries() {
+            let tree0 = match entry.trees.first() {
+                Some(t) => t,
+                None => continue,
+            };
+            if EntryKind::from_minikind(tree0.minikind).is_none() {
+                continue; // absent / relocated rows are already gone.
+            }
+            let entry_path = join_path(&entry.key.dirname, &entry.key.basename);
+            if entry_path == path || entry_path.starts_with(&prefix) {
+                keys.push(entry.key.clone());
+            }
+        }
+        // Remove deepest paths first so a directory is emptied before it is
+        // itself made absent.
+        keys.sort_by_key(|k| std::cmp::Reverse(k.dirname.len()));
+        for key in &keys {
+            self.dirstate
+                .make_absent(key)
+                .map_err(WorkingTreeError::Remove)?;
+        }
+        self.save_dirstate()
+    }
+
+    /// Move a versioned entry from `from_path` to `to_path`, keeping its
+    /// file id, and move the file on disk. The destination's parent
+    /// directory must already be versioned. The dirstate is rewritten to
+    /// disk.
+    ///
+    /// Only a single file or empty directory is moved; moving a directory
+    /// with versioned children is not yet supported.
+    pub fn rename(&mut self, from_path: &str, to_path: &str) -> Result<(), WorkingTreeError> {
+        let from_path = from_path.trim_matches('/');
+        let to_path = to_path.trim_matches('/');
+
+        let file_id = self
+            .path2id(from_path)
+            .ok_or_else(|| WorkingTreeError::NotVersioned(from_path.to_string()))?;
+        if self.path2id(to_path).is_some() {
+            return Err(WorkingTreeError::Commit(format!(
+                "destination already versioned: {to_path}"
+            )));
+        }
+
+        // Find the source entry's kind, and refuse to move a directory that
+        // still has versioned children (the dirstate-level re-key below only
+        // moves the named row).
+        let (kind, from_key) = self
+            .dirstate
+            .iter_entries()
+            .find_map(|e| {
+                let path = join_path(&e.key.dirname, &e.key.basename);
+                if path != from_path {
+                    return None;
+                }
+                let k = EntryKind::from_minikind(e.trees.first()?.minikind)?;
+                Some((k, e.key.clone()))
+            })
+            .ok_or_else(|| WorkingTreeError::NotVersioned(from_path.to_string()))?;
+        if kind == EntryKind::Directory {
+            let child_prefix = format!("{from_path}/");
+            if self
+                .dirstate
+                .iter_entries()
+                .any(|e| join_path(&e.key.dirname, &e.key.basename).starts_with(&child_prefix))
+            {
+                return Err(WorkingTreeError::Commit(
+                    "moving a directory with versioned children is not supported".to_string(),
+                ));
+            }
+        }
+
+        // Re-key in the dirstate: drop the old row, add the new path under
+        // the same file id, then move the file on disk.
+        self.dirstate
+            .make_absent(&from_key)
+            .map_err(WorkingTreeError::Remove)?;
+        self.dirstate
+            .add_path(to_path, &file_id, kind.to_osutils_kind(), None, b"")
+            .map_err(WorkingTreeError::Add)?;
+        self.transport
+            .rename(from_path, to_path)
+            .map_err(WorkingTreeError::Transport)?;
+        self.save_dirstate()
     }
 
     /// Commit the live working tree as a new revision.
@@ -345,14 +492,11 @@ impl WorkingTree {
         paths: &[String],
         inv_entries: &[crate::inventory::Entry],
     ) -> Result<(), WorkingTreeError> {
-        use crate::dirstate::{
-            inv_entry_to_details, FileTransport, Transport as DirstateTransport, TreeData,
-        };
+        use crate::dirstate::{inv_entry_to_details, TreeData};
 
-        let dirstate_path = match self.transport.local_path(DIRSTATE_PATH) {
-            Some(p) => p,
-            None => return Ok(()), // non-local: skip the basis rewrite.
-        };
+        if self.transport.local_path(DIRSTATE_PATH).is_none() {
+            return Ok(()); // non-local: skip the basis rewrite.
+        }
 
         let parent_entries: Vec<(Vec<u8>, Vec<u8>, TreeData)> = paths
             .iter()
@@ -377,8 +521,21 @@ impl WorkingTree {
         self.dirstate
             .set_parent_trees(vec![revid.to_vec()], Vec::new(), vec![parent_entries])
             .map_err(|e| WorkingTreeError::Commit(format!("set basis: {e:?}")))?;
+        self.save_dirstate()
+    }
 
-        // Rewrite the dirstate under a write lock.
+    /// Rewrite the dirstate to disk under a write lock.
+    ///
+    /// Requires a local-filesystem transport (the dirstate is locked with
+    /// fcntl); on a non-local transport the rewrite is skipped, matching
+    /// [`update_basis`](Self::update_basis).
+    fn save_dirstate(&mut self) -> Result<(), WorkingTreeError> {
+        use crate::dirstate::{FileTransport, Transport as DirstateTransport};
+
+        let dirstate_path = match self.transport.local_path(DIRSTATE_PATH) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
         let mut ft = FileTransport::new(&dirstate_path);
         ft.lock_write()
             .map_err(|e| WorkingTreeError::Commit(format!("lock dirstate: {e:?}")))?;
@@ -543,5 +700,112 @@ mod tests {
         let inv = repo.get_inventory(&revid).unwrap();
         // An empty tree has only the root, so no non-root entries.
         assert!(inv.entries().unwrap().is_empty());
+    }
+
+    /// Build a fresh tree and return its root transport plus an open
+    /// working tree.
+    fn fresh_tree() -> (tempfile::TempDir, SharedTransport, WorkingTree) {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDir::create(&parent).unwrap();
+        let wt = cd.open_workingtree().unwrap();
+        (dir, parent, wt)
+    }
+
+    #[test]
+    fn add_versions_a_path_and_persists() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("a.txt", b"hello\n").unwrap();
+
+        let file_id = wt.add("a.txt", EntryKind::File, None).unwrap();
+        assert_eq!(wt.path2id("a.txt"), Some(file_id.clone()));
+        assert_eq!(
+            wt.list_files(),
+            vec![VersionedEntry {
+                path: "a.txt".to_string(),
+                file_id: file_id.clone(),
+                kind: EntryKind::File,
+            }]
+        );
+
+        // Re-opening the tree reads the same versioned set from disk.
+        let reread = WorkingTree::open(parent.clone()).unwrap();
+        assert_eq!(reread.path2id("a.txt"), Some(file_id));
+    }
+
+    #[test]
+    fn add_is_idempotent_and_honours_explicit_id() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("a.txt", b"x\n").unwrap();
+
+        let id = wt.add("a.txt", EntryKind::File, Some(b"my-id")).unwrap();
+        assert_eq!(id, b"my-id".to_vec());
+        // A second add of the same path is a no-op returning the same id.
+        let id2 = wt.add("a.txt", EntryKind::File, Some(b"other")).unwrap();
+        assert_eq!(id2, b"my-id".to_vec());
+    }
+
+    #[test]
+    fn remove_unversions_directory_and_children() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.mkdir("sub").unwrap();
+        parent.put_bytes("sub/a.txt", b"a\n").unwrap();
+        parent.put_bytes("keep.txt", b"k\n").unwrap();
+        wt.add("sub", EntryKind::Directory, None).unwrap();
+        wt.add("sub/a.txt", EntryKind::File, None).unwrap();
+        wt.add("keep.txt", EntryKind::File, None).unwrap();
+
+        wt.remove("sub").unwrap();
+
+        // The directory and its child are unversioned; the sibling remains.
+        assert_eq!(wt.path2id("sub"), None);
+        assert_eq!(wt.path2id("sub/a.txt"), None);
+        assert!(wt.path2id("keep.txt").is_some());
+        // The files are still on disk.
+        assert!(parent.has("sub/a.txt").unwrap());
+
+        // Removing an unversioned path is an error.
+        assert!(matches!(
+            wt.remove("sub"),
+            Err(WorkingTreeError::NotVersioned(_))
+        ));
+    }
+
+    #[test]
+    fn rename_moves_entry_and_keeps_file_id() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("a.txt", b"hello\n").unwrap();
+        let id = wt.add("a.txt", EntryKind::File, None).unwrap();
+
+        wt.rename("a.txt", "b.txt").unwrap();
+
+        assert_eq!(wt.path2id("a.txt"), None);
+        assert_eq!(wt.path2id("b.txt"), Some(id));
+        // The file moved on disk.
+        assert!(!parent.has("a.txt").unwrap());
+        assert_eq!(wt.get_file_text("b.txt").unwrap(), b"hello\n");
+    }
+
+    /// Add files, commit, and read the committed inventory back.
+    #[test]
+    fn add_then_commit_records_the_files() {
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"hello\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt
+            .commit(repo.as_mut(), &branch, "T <t@e>", "add a", 1577880000, 0)
+            .unwrap();
+
+        let reopened = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let repo = reopened.open_repository().unwrap();
+        let inv = repo.get_inventory(&revid).unwrap();
+        let paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec!["a.txt".to_string()]);
+        let file_id = wt.path2id("a.txt").unwrap();
+        assert_eq!(repo.get_file_text(&file_id, &revid).unwrap(), b"hello\n");
     }
 }
