@@ -47,6 +47,7 @@ pub mod transport;
 pub mod tuned_gzip;
 pub mod versionedfile;
 pub mod weave;
+pub mod workingtree;
 pub mod xml_serializer;
 
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

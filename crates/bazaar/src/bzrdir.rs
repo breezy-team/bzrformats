@@ -237,6 +237,23 @@ impl BzrDir {
         let sub = self.transport.subtransport(Component::Branch.subdir())?;
         Ok(crate::branch::Branch::new(sub))
     }
+
+    /// Open the working tree in this control directory.
+    ///
+    /// The working tree reads `.bzr/checkout/dirstate` and the files on
+    /// disk, so it is rooted at the directory that *contains* `.bzr` (one
+    /// level up from this `BzrDir`'s transport).
+    ///
+    /// Errors with [`BzrDirError::NotABzrDir`] if there is no working-tree
+    /// component.
+    pub fn open_workingtree(&self) -> Result<crate::workingtree::WorkingTree, BzrDirError> {
+        if !self.has_workingtree {
+            return Err(BzrDirError::NotABzrDir);
+        }
+        let root = self.transport.subtransport("..")?;
+        crate::workingtree::WorkingTree::open(root)
+            .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))
+    }
 }
 
 #[cfg(test)]
