@@ -11,6 +11,11 @@
 //! as a new revision. Mutating the set of versioned files (add/remove/
 //! rename) is a later addition.
 
+pub mod format;
+mod formats;
+
+pub use format::{all_formats, find_format, WorkingTreeFormat};
+
 use crate::dirstate::{DefaultSHA1Provider, DirState, Kind, LoadError};
 use crate::transport::{SharedTransport, TransportError};
 

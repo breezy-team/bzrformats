@@ -115,11 +115,19 @@ impl Component {
         }
     }
 
-    fn expected_marker(self) -> &'static [u8] {
+    /// Whether `marker` names a format of this component that this crate
+    /// can open, consulting the per-component format registry.
+    fn format_is_supported(self, marker: &[u8]) -> bool {
         match self {
-            Component::Repository => REPOSITORY_FORMAT_2A,
-            Component::Branch => BRANCH_FORMAT_7,
-            Component::WorkingTree => WORKINGTREE_FORMAT_6,
+            Component::Repository => crate::repository::find_format(marker)
+                .map(|f| f.is_supported())
+                .unwrap_or(false),
+            Component::Branch => crate::branch::find_format(marker)
+                .map(|f| f.is_supported())
+                .unwrap_or(false),
+            Component::WorkingTree => crate::workingtree::find_format(marker)
+                .map(|f| f.is_supported())
+                .unwrap_or(false),
         }
     }
 }
@@ -223,7 +231,7 @@ impl BzrDir {
         let format_path = format!("{}/format", component.subdir());
         match transport.get_bytes(&format_path) {
             Ok(found) => {
-                if found == component.expected_marker() {
+                if component.format_is_supported(&found) {
                     Ok(true)
                 } else {
                     Err(BzrDirError::UnsupportedFormat { component, found })
@@ -312,6 +320,16 @@ mod tests {
     use super::*;
     use crate::transport::LocalTransport;
 
+    /// The supported on-disk marker for a component (used to write
+    /// fixtures). These are the 2a / Branch 7 / Working Tree 6 markers.
+    fn supported_marker(c: Component) -> &'static [u8] {
+        match c {
+            Component::Repository => REPOSITORY_FORMAT_2A,
+            Component::Branch => BRANCH_FORMAT_7,
+            Component::WorkingTree => WORKINGTREE_FORMAT_6,
+        }
+    }
+
     /// Build a minimal valid 2a meta-directory under `root/.bzr` and
     /// return a transport rooted at the `.bzr` directory.
     fn make_bzrdir(root: &std::path::Path, with: &[Component]) {
@@ -321,12 +339,30 @@ mod tests {
         for &c in with {
             let dir = bzr.join(c.subdir());
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("format"), c.expected_marker()).unwrap();
+            std::fs::write(dir.join("format"), supported_marker(c)).unwrap();
         }
     }
 
     fn bzr_transport(root: &std::path::Path) -> SharedTransport {
         std::sync::Arc::new(LocalTransport::new(root.join(".bzr")))
+    }
+
+    #[test]
+    fn format_registries_are_separate() {
+        // A component's marker must only resolve in that component's
+        // registry, never another's.
+        let repo = REPOSITORY_FORMAT_2A;
+        let branch = BRANCH_FORMAT_7;
+        let wt = WORKINGTREE_FORMAT_6;
+        assert!(crate::repository::find_format(repo).is_some());
+        assert!(crate::repository::find_format(branch).is_none());
+        assert!(crate::repository::find_format(wt).is_none());
+        assert!(crate::branch::find_format(branch).is_some());
+        assert!(crate::branch::find_format(repo).is_none());
+        assert!(crate::branch::find_format(wt).is_none());
+        assert!(crate::workingtree::find_format(wt).is_some());
+        assert!(crate::workingtree::find_format(repo).is_none());
+        assert!(crate::workingtree::find_format(branch).is_none());
     }
 
     #[test]
