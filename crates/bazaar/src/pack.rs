@@ -401,6 +401,12 @@ impl<W: std::io::Write> ContainerWriter<W> {
     pub fn into_inner(self) -> W {
         self.out
     }
+
+    /// Mutable access to the underlying writer, for callers that hold the
+    /// `ContainerWriter` behind a lock and cannot consume it.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.out
+    }
 }
 
 /// Read one `\n`-terminated line from `reader`. Returns the bytes without
