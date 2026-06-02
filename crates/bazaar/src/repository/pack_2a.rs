@@ -42,6 +42,10 @@ pub enum RepositoryError {
     Knit(KnitError),
     /// An index file could not be read.
     Index(crate::btree_graph_index::IndexError),
+    /// The `.bzr/repository/format` marker is not a recognised format.
+    UnknownFormat(Vec<u8>),
+    /// The format is recognised but this crate cannot open it yet.
+    UnsupportedFormat(&'static str),
 }
 
 impl std::fmt::Display for RepositoryError {
@@ -54,6 +58,14 @@ impl std::fmt::Display for RepositoryError {
             RepositoryError::Transport(e) => write!(f, "transport error: {e}"),
             RepositoryError::Knit(e) => write!(f, "groupcompress error: {e}"),
             RepositoryError::Index(e) => write!(f, "index error: {e}"),
+            RepositoryError::UnknownFormat(m) => write!(
+                f,
+                "unknown repository format: {:?}",
+                String::from_utf8_lossy(m)
+            ),
+            RepositoryError::UnsupportedFormat(desc) => {
+                write!(f, "unsupported repository format: {desc}")
+            }
         }
     }
 }
@@ -322,7 +334,13 @@ pub struct Pack2aRepository {
 impl Pack2aRepository {
     /// Open the repository whose `.bzr/repository` directory is rooted at
     /// `transport`.
+    ///
+    /// The `format` marker is checked against the format registry: an
+    /// unrecognised marker is [`RepositoryError::UnknownFormat`], and a
+    /// recognised but non-groupcompress (or otherwise unsupported) format
+    /// is [`RepositoryError::UnsupportedFormat`].
     pub fn open(transport: SharedTransport) -> Result<Self, RepositoryError> {
+        check_format(transport.as_ref())?;
         let packs = read_pack_names(transport.as_ref())?;
         let revisions = build_store(&transport, &packs, IndexKind::Revision)?;
         let inventories = build_store(&transport, &packs, IndexKind::Inventory)?;
@@ -560,6 +578,20 @@ fn read_pack_names_with_values(
         }
     }
     Ok(out)
+}
+
+/// Verify the repository `format` marker is a supported groupcompress
+/// (2a) format, consulting the format registry.
+fn check_format(transport: &dyn Transport) -> Result<(), RepositoryError> {
+    let marker = transport.get_bytes("format")?;
+    let format = super::format::find_format(&marker)
+        .ok_or_else(|| RepositoryError::UnknownFormat(marker.clone()))?;
+    if !format.is_supported() || format.storage != super::format::StorageKind::GroupCompress {
+        return Err(RepositoryError::UnsupportedFormat(
+            format.get_format_description(),
+        ));
+    }
+    Ok(())
 }
 
 /// Read `pack-names` and return the pack names in it.
