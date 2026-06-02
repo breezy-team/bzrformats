@@ -314,6 +314,22 @@ impl Entry {
         }
     }
 
+    /// The recorded sha1 of a file entry's text, or `None` for non-files.
+    pub fn text_sha1(&self) -> Option<&[u8]> {
+        match self {
+            Entry::File { text_sha1, .. } => text_sha1.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Whether a file entry is executable; `false` for non-files.
+    pub fn executable(&self) -> bool {
+        match self {
+            Entry::File { executable, .. } => *executable,
+            _ => false,
+        }
+    }
+
     pub fn is_unmodified(&self, other: &Entry) -> bool {
         let other_revision = other.revision();
 

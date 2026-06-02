@@ -504,7 +504,10 @@ impl Pack2aRepository {
             ));
         }
         let pack_name = new_pack_name();
-        self.write_group = Some(super::pack_2a_writer::WriteGroup::new(&pack_name)?);
+        self.write_group = Some(super::pack_2a_writer::WriteGroup::new(
+            &pack_name,
+            Some(self.chk_bytes.clone()),
+        )?);
         Ok(())
     }
 
@@ -541,6 +544,45 @@ impl Pack2aRepository {
     ) -> Result<Vec<u8>, RepositoryError> {
         self.write_group_mut()?
             .add_inventory_from_entries(revision_id, parents, root_id, entries)
+    }
+
+    /// The serialised CHKInventory header lines for `revision_id`, read from
+    /// the inventories store.
+    fn read_inventory_lines(&self, revision_id: &[u8]) -> Result<Vec<Vec<u8>>, RepositoryError> {
+        let key = Key::fixed(vec![revision_id.to_vec()]);
+        let mut stream = self.inventories.get_record_stream(&[key], "unordered")?;
+        let record = stream
+            .pop()
+            .ok_or_else(|| RepositoryError::NoSuchRevision(revision_id.to_vec()))?;
+        if record.storage_kind() == "absent" {
+            return Err(RepositoryError::NoSuchRevision(revision_id.to_vec()));
+        }
+        Ok(record.to_lines().map(|l| l.into_owned()).collect())
+    }
+
+    /// Add the inventory for `new_revision_id` by applying `delta` to the
+    /// `basis_revision_id` inventory, writing only the changed CHK pages
+    /// into the open write group. Returns the new inventory's sha1.
+    ///
+    /// The basis must already be committed (its inventory is read from the
+    /// existing packs); a first commit uses an empty delta against the null
+    /// revision via [`add_inventory_from_entries`](Self::add_inventory_from_entries)
+    /// instead.
+    pub fn add_inventory_by_delta(
+        &mut self,
+        basis_revision_id: &[u8],
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: &[u8],
+        parents: &[Vec<u8>],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        let basis_lines = self.read_inventory_lines(basis_revision_id)?;
+        self.write_group_mut()?.add_inventory_by_delta(
+            basis_revision_id,
+            &basis_lines,
+            delta,
+            new_revision_id,
+            parents,
+        )
     }
 
     /// Add a file text (keyed by `(file_id, revision)`) to the open write
@@ -800,5 +842,120 @@ mod tests {
             repo.get_file_text(b"file-1", rev).unwrap(),
             b"hello\n".to_vec()
         );
+
+        // revision_tree exposes the same inventory and the per-file
+        // last-changed revision.
+        use crate::repository::Repository as _;
+        let tree = repo.revision_tree(rev).unwrap();
+        assert_eq!(tree.revision_id(), rev);
+        let fid = crate::FileId::from(&b"file-1"[..]);
+        assert_eq!(tree.id2path(&fid).as_deref(), Some("a.txt"));
+        assert_eq!(tree.get_file_revision(&fid).as_deref(), Some(&rev[..]));
+
+        // The null revision is the empty tree.
+        let empty = repo.revision_tree(crate::branch::NULL_REVISION).unwrap();
+        assert!(empty.inventory().entries().unwrap().is_empty());
+    }
+
+    /// Commit a base inventory, then a second revision built by applying an
+    /// inventory delta (modify one file, add another) to it. The delta path
+    /// writes only the changed CHK pages; the result must read back as the
+    /// full inventory.
+    #[test]
+    fn add_inventory_by_delta_round_trip() {
+        use crate::inventory::Entry;
+        use crate::inventory_delta::{InventoryDelta, InventoryDeltaEntry};
+        use crate::FileId;
+        let (_d, t) = temp_repo();
+        let root_id = crate::inventory::ROOT_ID;
+
+        // rev-1: a.txt under the root.
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        repo.start_write_group().unwrap();
+        let text1 = b"hello\n";
+        repo.add_text(b"file-a", b"rev-1", &[], text1).unwrap();
+        let entries = vec![
+            Entry::root(
+                FileId::from(root_id),
+                Some(crate::RevisionId::from(&b"rev-1"[..])),
+            ),
+            Entry::file(
+                FileId::from(&b"file-a"[..]),
+                "a.txt".to_string(),
+                FileId::from(root_id),
+                Some(crate::RevisionId::from(&b"rev-1"[..])),
+                Some(crate::weave::sha_strings(&[&text1[..]])),
+                Some(text1.len() as u64),
+                Some(false),
+                None,
+            ),
+        ];
+        let sha1 = repo
+            .add_inventory_from_entries(b"rev-1", &[], root_id, &entries)
+            .unwrap();
+        repo.add_revision(&make_revision(b"rev-1", vec![], "one", Some(sha1)), &[])
+            .unwrap();
+        repo.commit_write_group().unwrap();
+
+        // rev-2: change a.txt, add b.txt -- expressed as an inventory delta.
+        let mut repo = Pack2aRepository::open(t.clone()).unwrap();
+        repo.start_write_group().unwrap();
+        let text1b = b"hello again\n";
+        let text2 = b"world\n";
+        repo.add_text(b"file-a", b"rev-2", &[], text1b).unwrap();
+        repo.add_text(b"file-b", b"rev-2", &[], text2).unwrap();
+        let delta = InventoryDelta(vec![
+            InventoryDeltaEntry {
+                old_path: Some("a.txt".to_string()),
+                new_path: Some("a.txt".to_string()),
+                file_id: FileId::from(&b"file-a"[..]),
+                new_entry: Some(Entry::file(
+                    FileId::from(&b"file-a"[..]),
+                    "a.txt".to_string(),
+                    FileId::from(root_id),
+                    Some(crate::RevisionId::from(&b"rev-2"[..])),
+                    Some(crate::weave::sha_strings(&[&text1b[..]])),
+                    Some(text1b.len() as u64),
+                    Some(false),
+                    None,
+                )),
+            },
+            InventoryDeltaEntry {
+                old_path: None,
+                new_path: Some("b.txt".to_string()),
+                file_id: FileId::from(&b"file-b"[..]),
+                new_entry: Some(Entry::file(
+                    FileId::from(&b"file-b"[..]),
+                    "b.txt".to_string(),
+                    FileId::from(root_id),
+                    Some(crate::RevisionId::from(&b"rev-2"[..])),
+                    Some(crate::weave::sha_strings(&[&text2[..]])),
+                    Some(text2.len() as u64),
+                    Some(false),
+                    None,
+                )),
+            },
+        ]);
+        let sha2 = repo
+            .add_inventory_by_delta(b"rev-1", &delta, b"rev-2", &[b"rev-1".to_vec()])
+            .unwrap();
+        repo.add_revision(
+            &make_revision(b"rev-2", vec![b"rev-1"], "two", Some(sha2)),
+            &[b"rev-1".to_vec()],
+        )
+        .unwrap();
+        repo.commit_write_group().unwrap();
+
+        // rev-2 reads back as the full inventory with both files.
+        let repo = Pack2aRepository::open(t).unwrap();
+        let inv = repo.get_inventory(b"rev-2").unwrap();
+        let mut paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        assert_eq!(repo.get_file_text(b"file-a", b"rev-2").unwrap(), text1b);
+        assert_eq!(repo.get_file_text(b"file-b", b"rev-2").unwrap(), text2);
+        // a.txt's unchanged sibling (the root) is still resolvable, i.e. the
+        // fallback-referenced pages read back.
+        assert_eq!(inv.id2path(&FileId::from(&b"file-a"[..])).unwrap(), "a.txt");
     }
 }

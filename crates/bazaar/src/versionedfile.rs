@@ -992,6 +992,78 @@ pub trait VersionedFiles: Send + Sync {
     }
 }
 
+/// Forward [`VersionedFiles`] through a shared handle, so a read store held
+/// as `Arc<dyn VersionedFiles + Send + Sync>` can be boxed and registered as
+/// a fallback on another store (e.g. a write group's CHK store reading
+/// unchanged pages from the existing packs).
+impl VersionedFiles for std::sync::Arc<dyn VersionedFiles + Send + Sync> {
+    fn get_parent_map(
+        &self,
+        keys: &[Key],
+    ) -> Result<HashMap<Key, Vec<Key>>, crate::knit::KnitError> {
+        (**self).get_parent_map(keys)
+    }
+
+    fn get_record_stream(
+        &self,
+        keys: &[Key],
+        ordering: &str,
+        include_delta_closure: bool,
+    ) -> Result<
+        Box<dyn Iterator<Item = Result<Box<dyn ContentFactory>, crate::knit::KnitError>>>,
+        crate::knit::KnitError,
+    > {
+        (**self).get_record_stream(keys, ordering, include_delta_closure)
+    }
+
+    fn get_sha1s(&self, keys: &[Key]) -> Result<HashMap<Key, Vec<u8>>, crate::knit::KnitError> {
+        (**self).get_sha1s(keys)
+    }
+
+    fn keys(&self) -> Result<Vec<Key>, crate::knit::KnitError> {
+        (**self).keys()
+    }
+
+    fn add_lines(
+        &self,
+        key: &Key,
+        parents: Option<&[Key]>,
+        lines: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, usize), crate::knit::KnitError> {
+        (**self).add_lines(key, parents, lines)
+    }
+
+    fn insert_record_stream(
+        &self,
+        stream: Box<dyn Iterator<Item = Box<dyn ContentFactory>>>,
+    ) -> Result<(), crate::knit::KnitError> {
+        (**self).insert_record_stream(stream)
+    }
+
+    fn iter_lines_added_or_present_in_keys(
+        &self,
+        keys: &[Key],
+    ) -> Result<Vec<(Vec<u8>, Key)>, crate::knit::KnitError> {
+        (**self).iter_lines_added_or_present_in_keys(keys)
+    }
+
+    fn annotate(&self, key: &Key) -> Result<Vec<(Key, Vec<u8>)>, crate::knit::KnitError> {
+        (**self).annotate(key)
+    }
+
+    fn get_missing_compression_parent_keys(&self) -> Result<Vec<Key>, crate::knit::KnitError> {
+        (**self).get_missing_compression_parent_keys()
+    }
+
+    fn clear_cache(&self) {
+        (**self).clear_cache()
+    }
+
+    fn check(&self) -> Result<(), crate::knit::KnitError> {
+        (**self).check()
+    }
+}
+
 /// Storage-less [`VersionedFiles`] backed by two caller-supplied callbacks.
 ///
 /// Mirrors `bzrformats.versionedfile.VirtualVersionedFiles`: callers supply

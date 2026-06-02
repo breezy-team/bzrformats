@@ -12,6 +12,7 @@ mod formats;
 mod pack_2a;
 mod pack_2a_writer;
 mod pack_knit;
+mod tree;
 
 pub use format::{
     all_formats, find_format, InventorySerializerKind, RepositoryFormat, RevisionSerializerKind,
@@ -19,6 +20,7 @@ pub use format::{
 };
 pub use pack_2a::{Pack2aRepository, RepositoryError, SharedTransport};
 pub use pack_knit::KnitPackRepository;
+pub use tree::RevisionTree;
 
 use crate::inventory::Inventory;
 
@@ -43,6 +45,20 @@ pub trait Repository: Send + Sync {
 
     /// Read the inventory for a revision.
     fn get_inventory(&self, revision_id: &[u8]) -> Result<Box<dyn Inventory>, RepositoryError>;
+
+    /// A read-only view of the tree at `revision_id`: its inventory paired
+    /// with the revision id. This is the basis a commit builds its
+    /// inventory delta against.
+    fn revision_tree(&self, revision_id: &[u8]) -> Result<RevisionTree, RepositoryError> {
+        if revision_id == crate::branch::NULL_REVISION {
+            // The null revision is the empty tree (the basis of a first
+            // commit); there is no stored inventory for it.
+            let empty = crate::inventory::MutableInventory::new();
+            return Ok(RevisionTree::new(revision_id.to_vec(), Box::new(empty)));
+        }
+        let inventory = self.get_inventory(revision_id)?;
+        Ok(RevisionTree::new(revision_id.to_vec(), inventory))
+    }
 
     /// Read the full text of a versioned file at a given revision.
     fn get_file_text(&self, file_id: &[u8], revision: &[u8]) -> Result<Vec<u8>, RepositoryError>;

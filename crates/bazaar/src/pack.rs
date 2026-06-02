@@ -398,6 +398,12 @@ impl<W: std::io::Write> ContainerWriter<W> {
     }
 
     /// Consume the writer and yield the underlying writer back.
+    /// A shared reference to the underlying writer, for inspecting the bytes
+    /// written so far (e.g. a `Vec<u8>` pack buffer read back mid-write).
+    pub fn get_ref(&self) -> &W {
+        &self.out
+    }
+
     pub fn into_inner(self) -> W {
         self.out
     }

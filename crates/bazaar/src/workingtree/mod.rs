@@ -101,6 +101,15 @@ impl EntryKind {
             EntryKind::TreeReference => crate::osutils::Kind::TreeReference,
         }
     }
+
+    fn from_inventory_kind(k: crate::osutils::Kind) -> Option<Self> {
+        match k {
+            crate::osutils::Kind::File => Some(EntryKind::File),
+            crate::osutils::Kind::Directory => Some(EntryKind::Directory),
+            crate::osutils::Kind::Symlink => Some(EntryKind::Symlink),
+            crate::osutils::Kind::TreeReference => Some(EntryKind::TreeReference),
+        }
+    }
 }
 
 /// One tracked entry in the working tree: its path (relative to the tree
@@ -110,6 +119,33 @@ pub struct VersionedEntry {
     pub path: String,
     pub file_id: Vec<u8>,
     pub kind: EntryKind,
+}
+
+/// One entry that differs between a working tree and a basis tree, as
+/// produced by [`WorkingTree::iter_changes`] and consumed by the commit
+/// builder. Mirrors the subset of breezy's `TreeChange` a single-parent
+/// commit needs: identity, the path in each tree, whether the file content
+/// changed, and the target-side metadata (name, parent, kind, exec) the new
+/// inventory entry is built from. `basis_revision` is the entry's
+/// last-changed revision in the basis (used to carry an unchanged entry
+/// over at its prior revision), or `None` when the entry is new.
+#[derive(Debug, Clone)]
+pub struct WorkingTreeChange {
+    pub file_id: Vec<u8>,
+    /// Path in the basis tree, or `None` if newly added.
+    pub old_path: Option<String>,
+    /// Path in the working tree, or `None` if removed.
+    pub new_path: Option<String>,
+    /// Whether the file content (or symlink target) changed.
+    pub content_change: bool,
+    /// Target-tree name (basename), parent id, kind and executable bit.
+    /// `None` when the entry is removed in the working tree.
+    pub new_name: Option<String>,
+    pub new_parent_id: Option<Vec<u8>>,
+    pub new_kind: Option<EntryKind>,
+    pub new_executable: bool,
+    /// The entry's last-changed revision in the basis, or `None` if new.
+    pub basis_revision: Option<Vec<u8>>,
 }
 
 /// A dirstate-based working tree, accessed through a transport rooted at
@@ -190,6 +226,140 @@ impl WorkingTree {
             return Err(WorkingTreeError::NotVersioned(path.to_string()));
         }
         Ok(self.transport.get_bytes(path)?)
+    }
+
+    /// The changes between this working tree and `basis`, one
+    /// [`WorkingTreeChange`] per entry that differs (added, removed, moved,
+    /// or with changed content or metadata). This is the input the commit
+    /// builder records.
+    ///
+    /// Content change for a file is determined by comparing the on-disk
+    /// content's sha1 with the basis entry's recorded `text_sha1`; for a
+    /// symlink, by comparing the link target. Entries that are byte- and
+    /// metadata-identical to the basis are omitted.
+    pub fn iter_changes(
+        &self,
+        basis: &crate::repository::RevisionTree,
+    ) -> Result<Vec<WorkingTreeChange>, WorkingTreeError> {
+        use crate::FileId;
+
+        let live = self.collect_live_entries();
+        let mut changes = Vec::new();
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+
+        // Added, moved, or modified entries: walk the working tree's tracked
+        // set and compare each against the basis.
+        for e in &live.entries {
+            seen.insert(e.file_id.clone());
+            let fid = FileId::from(e.file_id.as_slice());
+            let basis_entry = basis.get_entry(&fid);
+            let old_path = basis.id2path(&fid);
+            let basis_revision = basis_entry
+                .as_ref()
+                .and_then(|be| be.revision().map(|r| r.as_bytes().to_vec()));
+
+            let content_change = self.content_changed(e, basis_entry.as_ref())?;
+            let new_parent_id = self.parent_id_of(&e.path, &live);
+            let new_name = basename(&e.path).to_string();
+            let meta_change = match &basis_entry {
+                None => true, // newly added
+                Some(be) => {
+                    let kind_changed = match EntryKind::from_inventory_kind(be.kind()) {
+                        Some(k) => k != e.kind,
+                        None => true,
+                    };
+                    be.name() != new_name
+                        || be.parent_id().map(|p| p.as_bytes()) != Some(new_parent_id.as_slice())
+                        || kind_changed
+                        || be.executable() != e.executable
+                }
+            };
+            let moved = old_path.as_deref() != Some(e.path.as_str());
+
+            if content_change || meta_change || moved {
+                changes.push(WorkingTreeChange {
+                    file_id: e.file_id.clone(),
+                    old_path,
+                    new_path: Some(e.path.clone()),
+                    content_change,
+                    new_name: Some(new_name),
+                    new_parent_id: Some(new_parent_id),
+                    new_kind: Some(e.kind),
+                    new_executable: e.executable,
+                    basis_revision,
+                });
+            }
+        }
+
+        // Removed entries: present in the basis but no longer tracked.
+        for fid in basis
+            .inventory()
+            .all_file_ids()
+            .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
+        {
+            if seen.contains(fid.as_bytes()) {
+                continue;
+            }
+            let old_path = match basis.id2path(&fid) {
+                Some(p) if !p.is_empty() => p, // skip the basis root
+                _ => continue,
+            };
+            let basis_revision = basis
+                .get_entry(&fid)
+                .and_then(|be| be.revision().map(|r| r.as_bytes().to_vec()));
+            changes.push(WorkingTreeChange {
+                file_id: fid.as_bytes().to_vec(),
+                old_path: Some(old_path),
+                new_path: None,
+                content_change: false,
+                new_name: None,
+                new_parent_id: None,
+                new_kind: None,
+                new_executable: false,
+                basis_revision,
+            });
+        }
+
+        Ok(changes)
+    }
+
+    /// Whether `entry`'s on-disk content differs from its basis entry. A new
+    /// entry (no basis) always counts as changed.
+    fn content_changed(
+        &self,
+        entry: &LiveEntry,
+        basis_entry: Option<&crate::inventory::Entry>,
+    ) -> Result<bool, WorkingTreeError> {
+        let basis_entry = match basis_entry {
+            None => return Ok(true),
+            Some(be) => be,
+        };
+        match entry.kind {
+            EntryKind::File => {
+                let content = self.transport.get_bytes(&entry.path)?;
+                let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
+                Ok(basis_entry.text_sha1() != Some(sha1.as_slice()))
+            }
+            EntryKind::Symlink => Ok(basis_entry.symlink_target().map(|s| s.as_bytes())
+                != Some(entry.symlink_target.as_slice())),
+            // Directories and tree references have no content; only metadata
+            // (handled by the caller) can change.
+            EntryKind::Directory | EntryKind::TreeReference => Ok(false),
+        }
+    }
+
+    /// The file id of the directory that contains `path` in the working
+    /// tree (the tree root for a top-level path).
+    fn parent_id_of(&self, path: &str, live: &LiveEntries) -> Vec<u8> {
+        match path.rsplit_once('/') {
+            None => live.root_id.clone(),
+            Some((parent, _)) => live
+                .entries
+                .iter()
+                .find(|e| e.path == parent)
+                .map(|e| e.file_id.clone())
+                .unwrap_or_else(|| live.root_id.clone()),
+        }
     }
 
     /// Version `path` with `kind`, assigning `file_id` (a fresh id is
@@ -642,6 +812,14 @@ fn split_path(path: &str) -> (String, String) {
     }
 }
 
+/// The final component of a tree-relative path.
+fn basename(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((_, base)) => base,
+        None => path,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,5 +985,79 @@ mod tests {
         assert_eq!(paths, vec!["a.txt".to_string()]);
         let file_id = wt.path2id("a.txt").unwrap();
         assert_eq!(repo.get_file_text(&file_id, &revid).unwrap(), b"hello\n");
+    }
+
+    /// After a commit, iter_changes against the committed basis reports
+    /// only the entries that actually differ.
+    #[test]
+    fn iter_changes_reports_only_differences() {
+        use crate::repository::Repository as _;
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"hello\n").unwrap();
+        parent.put_bytes("b.txt", b"world\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        wt.add("b.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                "T <t@e>",
+                "two files",
+                1577880000,
+                0,
+            )
+            .unwrap();
+
+        // Re-open the tree (its basis is now the commit), modify a.txt,
+        // add c.txt, leave b.txt untouched.
+        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"changed\n").unwrap();
+        parent.put_bytes("c.txt", b"new\n").unwrap();
+        wt.add("c.txt", EntryKind::File, None).unwrap();
+
+        let repo = cd.open_repository().unwrap();
+        let basis = repo.revision_tree(&revid).unwrap();
+        let mut changes = wt.iter_changes(&basis).unwrap();
+        changes.sort_by(|x, y| x.new_path.cmp(&y.new_path));
+
+        // a.txt: content changed; c.txt: added. b.txt: unchanged (omitted).
+        let summary: Vec<(Option<String>, Option<String>, bool)> = changes
+            .iter()
+            .map(|c| (c.old_path.clone(), c.new_path.clone(), c.content_change))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (Some("a.txt".to_string()), Some("a.txt".to_string()), true),
+                (None, Some("c.txt".to_string()), true),
+            ]
+        );
+    }
+
+    /// A removed file is reported with a new_path of None.
+    #[test]
+    fn iter_changes_reports_removals() {
+        use crate::repository::Repository as _;
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"hello\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt
+            .commit(repo.as_mut(), &branch, "T <t@e>", "add a", 1577880000, 0)
+            .unwrap();
+
+        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        wt.remove("a.txt").unwrap();
+        let repo = cd.open_repository().unwrap();
+        let basis = repo.revision_tree(&revid).unwrap();
+        let changes = wt.iter_changes(&basis).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].old_path.as_deref(), Some("a.txt"));
+        assert_eq!(changes[0].new_path, None);
     }
 }
