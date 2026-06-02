@@ -21,7 +21,7 @@
 //! Branch 7 / Working Tree 6 formats are supported today; anything else
 //! is reported as [`BzrDirError::UnsupportedFormat`].
 
-use crate::transport::{Transport, TransportError};
+use crate::transport::{SharedTransport, Transport, TransportError};
 
 /// Top-level marker in `.bzr/branch-format` for the meta directory layout.
 pub const METADIR_MARKER: &[u8] = b"Bazaar-NG meta directory, format 1\n";
@@ -51,6 +51,8 @@ pub enum BzrDirError {
         /// The marker string read from the component's `format` file.
         found: Vec<u8>,
     },
+    /// Opening a component (repository/branch/working tree) failed.
+    Component(String),
     /// An underlying transport error.
     Transport(TransportError),
 }
@@ -70,6 +72,7 @@ impl std::fmt::Display for BzrDirError {
                 component.as_str(),
                 String::from_utf8_lossy(found)
             ),
+            BzrDirError::Component(m) => write!(f, "{m}"),
             BzrDirError::Transport(e) => write!(f, "transport error: {e}"),
         }
     }
@@ -123,28 +126,26 @@ impl Component {
 
 /// An opened `.bzr` meta directory.
 ///
-/// Holds the transport rooted *at* the `.bzr` directory and records
-/// which components are present (and format-verified). The
-/// `open_repository` / `open_branch` / `open_workingtree` accessors that
-/// return live objects arrive with the repository/branch/working-tree
-/// phases; for now this verifies the directory and exposes which
-/// components exist.
-pub struct BzrDir<'t> {
-    transport: &'t dyn Transport,
+/// Owns the transport rooted *at* the `.bzr` directory (as a
+/// [`SharedTransport`], consistent with the other opener objects) and
+/// records which components are present and format-verified. The
+/// `open_*` accessors descend into each component's subdirectory and
+/// return owned objects that can outlive this `BzrDir`.
+pub struct BzrDir {
+    transport: SharedTransport,
     has_repository: bool,
     has_branch: bool,
     has_workingtree: bool,
 }
 
-impl<'t> BzrDir<'t> {
+impl BzrDir {
     /// Open the `.bzr` directory reachable through `transport`.
     ///
     /// `transport` must be rooted at the `.bzr` directory itself (i.e.
     /// `transport.get_bytes("branch-format")` reads `.bzr/branch-format`).
-    /// To open from the directory that *contains* `.bzr`, root the
-    /// transport one level down first (a `Transport`-level "clone into
-    /// subdir" helper will make this ergonomic in a later phase).
-    pub fn open(transport: &'t dyn Transport) -> Result<Self, BzrDirError> {
+    /// To open from the directory that *contains* `.bzr`, descend with
+    /// [`Transport::subtransport`] first.
+    pub fn open(transport: SharedTransport) -> Result<Self, BzrDirError> {
         let marker = match transport.get_bytes("branch-format") {
             Ok(b) => b,
             Err(TransportError::NoSuchFile(_)) => return Err(BzrDirError::NotABzrDir),
@@ -154,9 +155,9 @@ impl<'t> BzrDir<'t> {
             return Err(BzrDirError::NotMetaDir(marker));
         }
 
-        let has_repository = Self::verify_component(transport, Component::Repository)?;
-        let has_branch = Self::verify_component(transport, Component::Branch)?;
-        let has_workingtree = Self::verify_component(transport, Component::WorkingTree)?;
+        let has_repository = Self::verify_component(transport.as_ref(), Component::Repository)?;
+        let has_branch = Self::verify_component(transport.as_ref(), Component::Branch)?;
+        let has_workingtree = Self::verify_component(transport.as_ref(), Component::WorkingTree)?;
 
         Ok(BzrDir {
             transport,
@@ -191,8 +192,8 @@ impl<'t> BzrDir<'t> {
     }
 
     /// The transport rooted at the `.bzr` directory.
-    pub fn transport(&self) -> &'t dyn Transport {
-        self.transport
+    pub fn transport(&self) -> &SharedTransport {
+        &self.transport
     }
 
     /// Whether this control directory contains a repository.
@@ -208,6 +209,33 @@ impl<'t> BzrDir<'t> {
     /// Whether this control directory contains a working-tree checkout.
     pub fn has_workingtree(&self) -> bool {
         self.has_workingtree
+    }
+
+    /// Open the repository in this control directory.
+    ///
+    /// Errors with [`BzrDirError::NotABzrDir`] if there is no repository
+    /// component (a branch- or checkout-only `.bzr`).
+    pub fn open_repository(&self) -> Result<crate::repository::Pack2aRepository, BzrDirError> {
+        if !self.has_repository {
+            return Err(BzrDirError::NotABzrDir);
+        }
+        let sub = self
+            .transport
+            .subtransport(Component::Repository.subdir())?;
+        crate::repository::Pack2aRepository::open(sub)
+            .map_err(|e| BzrDirError::Component(format!("opening repository: {e}")))
+    }
+
+    /// Open the branch in this control directory.
+    ///
+    /// Errors with [`BzrDirError::NotABzrDir`] if there is no branch
+    /// component.
+    pub fn open_branch(&self) -> Result<crate::branch::Branch, BzrDirError> {
+        if !self.has_branch {
+            return Err(BzrDirError::NotABzrDir);
+        }
+        let sub = self.transport.subtransport(Component::Branch.subdir())?;
+        Ok(crate::branch::Branch::new(sub))
     }
 }
 
@@ -229,8 +257,8 @@ mod tests {
         }
     }
 
-    fn bzr_transport(root: &std::path::Path) -> LocalTransport {
-        LocalTransport::new(root.join(".bzr"))
+    fn bzr_transport(root: &std::path::Path) -> SharedTransport {
+        std::sync::Arc::new(LocalTransport::new(root.join(".bzr")))
     }
 
     #[test]
@@ -245,7 +273,7 @@ mod tests {
             ],
         );
         let t = bzr_transport(dir.path());
-        let bd = BzrDir::open(&t).unwrap();
+        let bd = BzrDir::open(t).unwrap();
         assert!(bd.has_repository());
         assert!(bd.has_branch());
         assert!(bd.has_workingtree());
@@ -256,7 +284,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         make_bzrdir(dir.path(), &[Component::Repository]);
         let t = bzr_transport(dir.path());
-        let bd = BzrDir::open(&t).unwrap();
+        let bd = BzrDir::open(t).unwrap();
         assert!(bd.has_repository());
         assert!(!bd.has_branch());
         assert!(!bd.has_workingtree());
@@ -266,7 +294,7 @@ mod tests {
     fn missing_dir_is_not_a_bzrdir() {
         let dir = tempfile::tempdir().unwrap();
         let t = bzr_transport(dir.path());
-        match BzrDir::open(&t) {
+        match BzrDir::open(t) {
             Err(BzrDirError::NotABzrDir) => {}
             other => panic!("expected NotABzrDir, got {other:?}"),
         }
@@ -279,7 +307,7 @@ mod tests {
         std::fs::create_dir_all(&bzr).unwrap();
         std::fs::write(bzr.join("branch-format"), b"Bazaar-NG branch, format 6\n").unwrap();
         let t = bzr_transport(dir.path());
-        match BzrDir::open(&t) {
+        match BzrDir::open(t) {
             Err(BzrDirError::NotMetaDir(_)) => {}
             other => panic!("expected NotMetaDir, got {other:?}"),
         }
@@ -297,7 +325,7 @@ mod tests {
         )
         .unwrap();
         let t = bzr_transport(dir.path());
-        match BzrDir::open(&t) {
+        match BzrDir::open(t) {
             Err(BzrDirError::UnsupportedFormat {
                 component: Component::Repository,
                 ..

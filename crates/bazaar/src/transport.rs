@@ -234,7 +234,30 @@ pub trait Transport {
             "stat not supported by this transport".to_string(),
         ))
     }
+
+    /// Return a new transport rooted at `path` relative to this one.
+    ///
+    /// Used to descend from a `.bzr` directory into its `repository`,
+    /// `branch` and `checkout` components. The default returns
+    /// [`TransportError::Other`]; backends that can be re-rooted (e.g.
+    /// [`LocalTransport`]) override it.
+    fn subtransport(&self, path: &str) -> Result<SharedTransport, TransportError> {
+        let _ = path;
+        Err(TransportError::Other(
+            "subtransport not supported by this transport".to_string(),
+        ))
+    }
 }
+
+/// A transport shared across the opener objects (`BzrDir`, `Branch`,
+/// `Repository`, `WorkingTree`).
+///
+/// They own their transport via this `Arc` rather than borrowing it, so a
+/// `BzrDir` can hand out sub-objects that outlive it, and the 2a
+/// repository's CHK store (which needs `Arc<S>` with `S: Send + Sync`) is
+/// satisfiable. `Send + Sync` is required because the groupcompress stores
+/// implement the `Send + Sync` `VersionedFiles` trait.
+pub type SharedTransport = std::sync::Arc<dyn Transport + Send + Sync>;
 
 /// Minimal file metadata returned by [`Transport::stat`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +414,10 @@ impl Transport for LocalTransport {
             size: meta.len(),
             is_dir: meta.is_dir(),
         })
+    }
+
+    fn subtransport(&self, path: &str) -> Result<SharedTransport, TransportError> {
+        Ok(std::sync::Arc::new(LocalTransport::new(self.resolve(path))))
     }
 }
 

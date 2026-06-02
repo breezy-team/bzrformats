@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::lockdir::{Lock, LockDir, LockError};
-use crate::transport::{Transport, TransportError};
+use crate::transport::{SharedTransport, TransportError};
 
 /// The null revision id, used when a branch has no commits.
 pub const NULL_REVISION: &[u8] = b"null:";
@@ -55,14 +55,18 @@ impl From<LockError> for BranchError {
 pub type RevisionInfo = (u64, Vec<u8>);
 
 /// A bzr branch, accessed through a transport rooted at `.bzr/branch`.
-pub struct Branch<'t> {
-    transport: &'t dyn Transport,
+///
+/// Owns its transport (as a [`SharedTransport`]) for consistency with the
+/// other opener objects, so a `BzrDir` can hand out a `Branch` that
+/// outlives it.
+pub struct Branch {
+    transport: SharedTransport,
 }
 
-impl<'t> Branch<'t> {
+impl Branch {
     /// Open the branch reachable through `transport` (rooted at
     /// `.bzr/branch`).
-    pub fn new(transport: &'t dyn Transport) -> Self {
+    pub fn new(transport: SharedTransport) -> Self {
         Branch { transport }
     }
 
@@ -125,7 +129,7 @@ impl<'t> Branch<'t> {
         &self,
         f: impl FnOnce() -> Result<R, BranchError>,
     ) -> Result<R, BranchError> {
-        let mut lock = LockDir::new(self.transport, "lock");
+        let mut lock = LockDir::new(self.transport.as_ref(), "lock");
         lock.create()?;
         lock.attempt_lock()?;
         let result = f();
@@ -229,18 +233,21 @@ fn decode_tags(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, BranchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::LocalTransport;
+    use crate::transport::{LocalTransport, Transport};
+    use std::sync::Arc;
 
-    fn branch_transport() -> (tempfile::TempDir, LocalTransport) {
+    /// A branch over a temp dir, plus a borrowed handle to the same
+    /// transport for asserting on-disk bytes.
+    fn branch_transport() -> (tempfile::TempDir, Branch, Arc<LocalTransport>) {
         let dir = tempfile::tempdir().unwrap();
-        let t = LocalTransport::new(dir.path());
-        (dir, t)
+        let probe = Arc::new(LocalTransport::new(dir.path()));
+        let shared: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        (dir, Branch::new(shared), probe)
     }
 
     #[test]
     fn empty_branch_is_null_revision() {
-        let (_d, t) = branch_transport();
-        let branch = Branch::new(&t);
+        let (_d, branch, _probe) = branch_transport();
         assert_eq!(
             branch.last_revision_info().unwrap(),
             (0, NULL_REVISION.to_vec())
@@ -250,8 +257,7 @@ mod tests {
 
     #[test]
     fn last_revision_round_trips() {
-        let (_d, t) = branch_transport();
-        let branch = Branch::new(&t);
+        let (_d, branch, _probe) = branch_transport();
         branch.set_last_revision_info(5, b"rev-abc").unwrap();
         assert_eq!(
             branch.last_revision_info().unwrap(),
@@ -262,15 +268,14 @@ mod tests {
 
     #[test]
     fn last_revision_on_disk_format() {
-        let (_d, t) = branch_transport();
-        Branch::new(&t).set_last_revision_info(2, b"x").unwrap();
-        assert_eq!(t.get_bytes("last-revision").unwrap(), b"2 x\n");
+        let (_d, branch, probe) = branch_transport();
+        branch.set_last_revision_info(2, b"x").unwrap();
+        assert_eq!(probe.get_bytes("last-revision").unwrap(), b"2 x\n");
     }
 
     #[test]
     fn tags_round_trip() {
-        let (_d, t) = branch_transport();
-        let branch = Branch::new(&t);
+        let (_d, branch, _probe) = branch_transport();
         let mut tags = BTreeMap::new();
         tags.insert("v1.0".to_string(), b"rev-1".to_vec());
         tags.insert("v2.0".to_string(), b"rev-2".to_vec());
@@ -280,8 +285,7 @@ mod tests {
 
     #[test]
     fn tags_on_disk_matches_breezy_bencode() {
-        let (_d, t) = branch_transport();
-        let branch = Branch::new(&t);
+        let (_d, branch, probe) = branch_transport();
         let mut tags = BTreeMap::new();
         tags.insert(
             "v1.0".to_string(),
@@ -290,7 +294,7 @@ mod tests {
         branch.set_tags(&tags).unwrap();
         // Byte-for-byte the format brz writes: d4:v1.0<len>:<rev>e.
         assert_eq!(
-            t.get_bytes("tags").unwrap(),
+            probe.get_bytes("tags").unwrap(),
             b"d4:v1.033:test@example.com-20200101120000-xe".to_vec()
         );
     }

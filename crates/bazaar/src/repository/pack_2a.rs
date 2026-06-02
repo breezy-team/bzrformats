@@ -209,13 +209,7 @@ impl GcIndex for PackGcIndex {
     }
 }
 
-/// A transport that can be shared across the repository's stores.
-///
-/// The stores are `VersionedFiles`, which is `Send + Sync`, so the
-/// transport they read through must be too. The repository owns it via an
-/// `Arc` rather than borrowing, so the stores (and the `CHKInventory`s
-/// they back) can hold their own references with no lifetime threading.
-pub type SharedTransport = std::sync::Arc<dyn Transport + Send + Sync>;
+pub use crate::transport::SharedTransport;
 
 /// A [`GcAccess`] that reads raw groupcompress block bytes from the
 /// `.pack` files of the repository.
