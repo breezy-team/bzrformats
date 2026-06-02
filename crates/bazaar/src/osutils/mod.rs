@@ -227,6 +227,17 @@ pub fn kind_from_stat_mode(mode: u32) -> StatKind {
     }
 }
 
+/// Whether `s` contains any line-break character (newline, carriage
+/// return, or form feed).
+pub fn contains_linebreaks(s: &str) -> bool {
+    for ch in "\n\r\u{000C}".chars() {
+        if s.contains(ch) {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     File,

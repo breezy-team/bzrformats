@@ -32,6 +32,8 @@ mod pack_repo;
 mod plan_merge;
 mod recordcounter;
 mod smart;
+mod testament;
+mod textinv;
 mod textmerge;
 mod transport;
 mod tuned_gzip;
@@ -1269,6 +1271,12 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let textmergem = textmerge::_textmerge_rs(py)?;
     m.add_submodule(&textmergem)?;
 
+    let testamentm = testament::_testament_rs(py)?;
+    m.add_submodule(&testamentm)?;
+
+    let textinvm = textinv::_textinv_rs(py)?;
+    m.add_submodule(&textinvm)?;
+
     let multiparentm = multiparent::_multiparent_rs(py)?;
     m.add_submodule(&multiparentm)?;
 
@@ -1339,6 +1347,8 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.knit", module_name), &knitm)?;
     modules.set_item(format!("{}.smart", module_name), &smartm)?;
     modules.set_item(format!("{}.textmerge", module_name), &textmergem)?;
+    modules.set_item(format!("{}.testament", module_name), &testamentm)?;
+    modules.set_item(format!("{}.textinv", module_name), &textinvm)?;
     modules.set_item(format!("{}.multiparent", module_name), &multiparentm)?;
     modules.set_item(format!("{}.weave", module_name), &weavem)?;
     modules.set_item(format!("{}.weavefile", module_name), &weavefilem)?;
