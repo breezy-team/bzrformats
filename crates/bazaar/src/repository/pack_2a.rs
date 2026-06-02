@@ -301,16 +301,22 @@ fn build_store(
 /// type into the public API.
 type SharedChkStore = std::sync::Arc<dyn crate::versionedfile::VersionedFiles + Send + Sync>;
 
-/// A read-only view of a 2a pack repository.
+/// A 2a pack repository.
+///
+/// Reading is available immediately after [`open`](Self::open). Writing
+/// follows breezy's write-group lifecycle on the same object:
+/// [`start_write_group`](Self::start_write_group), then `add_*`, then
+/// [`commit_write_group`](Self::commit_write_group). The new-pack machinery
+/// is private (the [`WriteGroup`]); there is no separate writer type.
 pub struct Pack2aRepository {
-    /// Retained so the write side can re-read `pack-names` and add packs.
-    #[allow(dead_code)]
     transport: SharedTransport,
     revisions: Store,
     inventories: Store,
     texts: Store,
     /// The CHK byte store, shared with the `CHKInventory`s it materializes.
     chk_bytes: SharedChkStore,
+    /// The in-progress write group, if one is open.
+    write_group: Option<super::pack_2a_writer::WriteGroup>,
 }
 
 impl Pack2aRepository {
@@ -329,7 +335,28 @@ impl Pack2aRepository {
             inventories,
             texts,
             chk_bytes,
+            write_group: None,
         })
+    }
+
+    /// Create an empty 2a repository at `transport` (rooted at the
+    /// `.bzr/repository` directory), then open it.
+    ///
+    /// Writes the `format` marker, an empty `pack-names`, and the
+    /// `indices/` and `packs/` directories.
+    pub fn create(transport: SharedTransport) -> Result<Self, RepositoryError> {
+        transport.mkdir("indices")?;
+        transport.mkdir("packs")?;
+        transport.put_bytes(
+            "format",
+            b"Bazaar repository format 2a (needs bzr 1.16 or later)\n",
+        )?;
+        // An empty pack-names index: no packs yet.
+        let empty = crate::btree_builder::BTreeBuilder::new(0, 1)
+            .finish()
+            .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e:?}")))?;
+        transport.put_bytes("pack-names", &empty)?;
+        Self::open(transport)
     }
 
     /// The list of pack names, read fresh from `pack-names`.
@@ -433,6 +460,102 @@ impl Pack2aRepository {
         }
         Ok(record.to_fulltext().into_owned())
     }
+
+    /// Open a write group: subsequent `add_*` calls accumulate into a new
+    /// pack, made durable by [`commit_write_group`](Self::commit_write_group).
+    /// Errors if a write group is already open.
+    pub fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::Corrupt(
+                "a write group is already open".to_string(),
+            ));
+        }
+        let pack_name = new_pack_name();
+        self.write_group = Some(super::pack_2a_writer::WriteGroup::new(&pack_name)?);
+        Ok(())
+    }
+
+    fn write_group_mut(&mut self) -> Result<&super::pack_2a_writer::WriteGroup, RepositoryError> {
+        self.write_group
+            .as_ref()
+            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))
+    }
+
+    /// Add a revision (already serialised to bencode bytes) to the open
+    /// write group.
+    pub fn add_revision(
+        &mut self,
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        bytes: &[u8],
+    ) -> Result<(), RepositoryError> {
+        self.write_group_mut()?
+            .add_revision(revision_id, parents, bytes)
+    }
+
+    /// Build a CHK inventory from `entries` and add it to the open write
+    /// group, returning the inventory sha1 to record on the revision.
+    pub fn add_inventory_from_entries(
+        &mut self,
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        root_id: &[u8],
+        entries: &[crate::inventory::Entry],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        self.write_group_mut()?
+            .add_inventory_from_entries(revision_id, parents, root_id, entries)
+    }
+
+    /// Add a file text (keyed by `(file_id, revision)`) to the open write
+    /// group.
+    pub fn add_text(
+        &mut self,
+        file_id: &[u8],
+        revision: &[u8],
+        parents: &[(Vec<u8>, Vec<u8>)],
+        bytes: &[u8],
+    ) -> Result<(), RepositoryError> {
+        self.write_group_mut()?
+            .add_text(file_id, revision, parents, bytes)
+    }
+
+    /// Flush the open write group: write its pack, indices and an updated
+    /// `pack-names`. After this, re-open the repository to read the newly
+    /// committed data (the in-memory read stores are not refreshed).
+    pub fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+        let group = self
+            .write_group
+            .take()
+            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))?;
+        let existing = read_pack_names_with_values(self.transport.as_ref())?;
+        group.finish(self.transport.as_ref(), &existing)?;
+        Ok(())
+    }
+}
+
+/// Generate a fresh 32-hex-character pack name.
+///
+/// brz derives the name from a hash of the pack contents; on disk any
+/// unique 32-hex token is valid, so a random one suffices.
+fn new_pack_name() -> String {
+    crate::osutils::rand_chars(32)
+        .chars()
+        .map(|ch| char::from_digit((ch as u32) % 16, 16).unwrap())
+        .collect()
+}
+
+/// Read `pack-names`, returning each `(pack_name, value_bytes)` pair.
+fn read_pack_names_with_values(
+    transport: &dyn Transport,
+) -> Result<Vec<(String, Vec<u8>)>, RepositoryError> {
+    let index = BTreeGraphIndex::open(transport, "pack-names")?;
+    let mut out = Vec::new();
+    for (key, value, _refs) in index.iter_all_entries() {
+        if let Some(name) = key.first() {
+            out.push((String::from_utf8_lossy(name).into_owned(), value.clone()));
+        }
+    }
+    Ok(out)
 }
 
 /// Read `pack-names` and return the pack names in it.
@@ -445,4 +568,123 @@ fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, Repositor
         }
     }
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serializer::RevisionSerializer;
+    use crate::transport::LocalTransport;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn make_revision(
+        id: &[u8],
+        parents: Vec<&[u8]>,
+        message: &str,
+        inv_sha1: Option<Vec<u8>>,
+    ) -> crate::revision::Revision {
+        crate::revision::Revision::new(
+            crate::RevisionId::from(id),
+            parents.into_iter().map(crate::RevisionId::from).collect(),
+            Some("Test User <test@example.com>".to_string()),
+            message.to_string(),
+            HashMap::new(),
+            inv_sha1,
+            1577880000.0,
+            Some(0),
+        )
+    }
+
+    fn temp_repo() -> (tempfile::TempDir, SharedTransport) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repository");
+        std::fs::create_dir_all(&path).unwrap();
+        let t: SharedTransport = Arc::new(LocalTransport::new(&path));
+        (dir, t)
+    }
+
+    #[test]
+    fn revision_and_text_write_round_trip() {
+        let ser = crate::bencode_serializer::BEncodeRevisionSerializer1;
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        repo.start_write_group().unwrap();
+        let r1 = ser
+            .write_revision_to_string(&make_revision(b"rev-1", vec![], "first", None))
+            .unwrap();
+        let r2 = ser
+            .write_revision_to_string(&make_revision(b"rev-2", vec![b"rev-1"], "second", None))
+            .unwrap();
+        repo.add_revision(b"rev-1", &[], &r1).unwrap();
+        repo.add_revision(b"rev-2", &[b"rev-1".to_vec()], &r2)
+            .unwrap();
+        repo.add_text(b"file-1", b"rev-1", &[], b"hello world\n")
+            .unwrap();
+        repo.commit_write_group().unwrap();
+
+        // Re-open to read the committed data.
+        let repo = Pack2aRepository::open(t).unwrap();
+        let mut ids = repo.all_revision_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![b"rev-1".to_vec(), b"rev-2".to_vec()]);
+        assert_eq!(repo.get_revision(b"rev-2").unwrap().message, "second");
+        assert_eq!(
+            repo.get_file_text(b"file-1", b"rev-1").unwrap(),
+            b"hello world\n"
+        );
+    }
+
+    #[test]
+    fn chk_inventory_write_round_trip() {
+        use crate::inventory::Entry;
+        use crate::FileId;
+        let ser = crate::bencode_serializer::BEncodeRevisionSerializer1;
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        repo.start_write_group().unwrap();
+
+        let rev = b"rev-1";
+        let root_id = crate::inventory::ROOT_ID;
+        // One file under the root.
+        let text = b"hello\n";
+        let sha1 = crate::weave::sha_strings(&[&text[..]]);
+        repo.add_text(b"file-1", rev, &[], text).unwrap();
+        let entries = vec![
+            // The root directory must be present in the inventory.
+            Entry::root(
+                FileId::from(root_id),
+                Some(crate::RevisionId::from(&rev[..])),
+            ),
+            Entry::file(
+                FileId::from(&b"file-1"[..]),
+                "a.txt".to_string(),
+                FileId::from(root_id),
+                Some(crate::RevisionId::from(&rev[..])),
+                Some(sha1.clone()),
+                Some(text.len() as u64),
+                Some(false),
+                None,
+            ),
+        ];
+        let inv_sha1 = repo
+            .add_inventory_from_entries(rev, &[], root_id, &entries)
+            .unwrap();
+        let rbytes = ser
+            .write_revision_to_string(&make_revision(rev, vec![], "commit", Some(inv_sha1)))
+            .unwrap();
+        repo.add_revision(rev, &[], &rbytes).unwrap();
+        repo.commit_write_group().unwrap();
+
+        // Re-open and materialize the inventory.
+        let repo = Pack2aRepository::open(t).unwrap();
+        let inv = repo.get_inventory(rev).unwrap();
+        let entries: Vec<_> = inv.entries().unwrap();
+        let paths: Vec<String> = entries.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(paths, vec!["a.txt".to_string()]);
+        assert_eq!(
+            repo.get_file_text(b"file-1", rev).unwrap(),
+            b"hello\n".to_vec()
+        );
+    }
 }

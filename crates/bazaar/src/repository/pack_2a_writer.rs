@@ -1,10 +1,17 @@
-//! Writing a 2a (groupcompress + CHK) pack repository.
+//! The write-group machinery for a 2a (groupcompress + CHK) pack
+//! repository.
 //!
-//! The inverse of [`super::pack_2a`]: groupcompress-compress records into
-//! a single new `.pack`, build the five per-pack btree indices, and write
-//! `pack-names`. The compression and block framing are done by the
-//! existing [`GroupCompressVersionedFiles::insert_record_stream`], driven
-//! through writable [`GcAccess`]/[`GcIndex`] backends defined here:
+//! This is the private implementation behind the write methods on
+//! [`Pack2aRepository`](super::Pack2aRepository): callers open or create a
+//! repository and write through `start_write_group` / `add_*` /
+//! `commit_write_group`, mirroring breezy. [`WriteGroup`] is the in-progress
+//! new pack that backs that lifecycle; it is not a public type.
+//!
+//! It groupcompress-compresses records into a single new `.pack`, builds
+//! the five per-pack btree indices, and writes `pack-names`. The
+//! compression and block framing are done by the existing
+//! [`GroupCompressVersionedFiles::insert_record_stream`], driven through
+//! writable [`GcAccess`]/[`GcIndex`] backends defined here:
 //!
 //! - [`PackWritingAccess`] appends each groupcompress block to a shared
 //!   container writer (one `.pack` for all object kinds) and reports where
@@ -28,9 +35,6 @@ use crate::transport::Transport;
 use crate::versionedfile::Key;
 
 use super::pack_2a::RepositoryError;
-
-/// Format marker written to `.bzr/repository/format`.
-const REPOSITORY_FORMAT_2A: &[u8] = b"Bazaar repository format 2a (needs bzr 1.16 or later)\n";
 
 /// The pack name (used as the groupcompress `FileRef`).
 type PackName = String;
@@ -148,18 +152,20 @@ type WriteStore = GroupCompressVersionedFiles<PackWritingIndex, PackWritingAcces
 ///
 /// Construct with [`new`](Self::new), add objects through the per-kind
 /// `add_*` helpers, then call [`finish`](Self::finish).
-pub struct Pack2aWriter {
+pub(super) struct WriteGroup {
     pack_name: PackName,
     pack: Arc<Mutex<SharedPack>>,
     revisions: WriteStore,
     inventories: WriteStore,
     texts: WriteStore,
-    chk_bytes: WriteStore,
+    /// `Arc`-wrapped so it can be handed to `CHKInventory::from_inventory`,
+    /// which writes CHK pages through it as the inventory is built.
+    chk_bytes: Arc<WriteStore>,
 }
 
-impl Pack2aWriter {
+impl WriteGroup {
     /// Start writing a new pack named `pack_name` (a 32-char hex string).
-    pub fn new(pack_name: &str) -> Result<Self, RepositoryError> {
+    pub(super) fn new(pack_name: &str) -> Result<Self, RepositoryError> {
         let mut writer = ContainerWriter::new(Vec::new());
         writer
             .begin()
@@ -180,9 +186,9 @@ impl Pack2aWriter {
         let revisions = make(true);
         let inventories = make(true);
         let texts = make(true);
-        let chk_bytes = make(false);
+        let chk_bytes = Arc::new(make(false));
 
-        Ok(Pack2aWriter {
+        Ok(WriteGroup {
             pack_name: pack_name.to_string(),
             pack,
             revisions,
@@ -193,7 +199,7 @@ impl Pack2aWriter {
     }
 
     /// Add a revision record (already serialised to bencode bytes).
-    pub fn add_revision(
+    pub(super) fn add_revision(
         &self,
         revision_id: &[u8],
         parents: &[Vec<u8>],
@@ -210,7 +216,7 @@ impl Pack2aWriter {
     }
 
     /// Add an inventory record (the serialised CHKInventory header).
-    pub fn add_inventory(
+    pub(super) fn add_inventory(
         &self,
         revision_id: &[u8],
         parents: &[Vec<u8>],
@@ -226,8 +232,45 @@ impl Pack2aWriter {
         Ok(())
     }
 
+    /// Build a CHK inventory from `entries`, write its CHK pages, and add
+    /// its serialised header as the inventory record for `revision_id`.
+    ///
+    /// Returns the sha1 of the serialised inventory, which the revision
+    /// record records as `inventory_sha1`. `entries` must include every
+    /// versioned object except the root (the root is identified by
+    /// `root_id`). The 2a format parameters (`hash-255-way`, big pages)
+    /// are applied.
+    pub(super) fn add_inventory_from_entries(
+        &self,
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        root_id: &[u8],
+        entries: &[crate::inventory::Entry],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        // Build the CHK inventory, writing its pages through the chk store.
+        let cache: std::sync::Arc<dyn crate::chk_map::PageCache> =
+            std::sync::Arc::new(crate::chk_map::InMemoryPageCache::new());
+        let inv = crate::chk_inventory::CHKInventory::from_inventory(
+            self.chk_bytes.clone(),
+            cache,
+            crate::RevisionId::from(revision_id),
+            crate::FileId::from(root_id),
+            entries,
+            65536,
+            b"hash-255-way".to_vec(),
+        )
+        .map_err(|e| RepositoryError::Corrupt(format!("building chk inventory: {e:?}")))?;
+        let lines = inv
+            .to_lines()
+            .map_err(|e| RepositoryError::Corrupt(format!("serialising chk inventory: {e:?}")))?;
+        let inv_bytes: Vec<u8> = lines.concat();
+        let sha1 = crate::weave::sha_strings(&lines);
+        self.add_inventory(revision_id, parents, &inv_bytes)?;
+        Ok(sha1)
+    }
+
     /// Add a file text, keyed by `(file_id, revision)`.
-    pub fn add_text(
+    pub(super) fn add_text(
         &self,
         file_id: &[u8],
         revision: &[u8],
@@ -244,17 +287,25 @@ impl Pack2aWriter {
         Ok(())
     }
 
-    /// Add a raw CHK page, keyed by its content-hash key `(sha1:...,)`.
-    pub fn add_chk(&self, chk_key: &[u8], bytes: &[u8]) -> Result<(), RepositoryError> {
-        let key = Key::fixed(vec![chk_key.to_vec()]);
-        // CHK keys are content-addressed and have no graph.
-        self.chk_bytes.add_lines(key, None, split_lines(bytes))?;
-        Ok(())
-    }
+    /// Flush this write group to `transport` (rooted at `.bzr/repository`):
+    /// write the new `.pack`, its five indices, and an updated `pack-names`
+    /// that lists `existing_packs` plus the new one.
+    ///
+    /// Returns the new pack's `(name, pack-names value bytes)` so the caller
+    /// can track it. Does nothing and returns `None` when the group is empty
+    /// (no records added).
+    pub(super) fn finish(
+        self,
+        transport: &dyn Transport,
+        existing_packs: &[(String, Vec<u8>)],
+    ) -> Result<Option<(String, Vec<u8>)>, RepositoryError> {
+        // Build each index from its store's collected records.
+        let rix = serialise_index(&self.revisions, 1)?;
+        let iix = serialise_index(&self.inventories, 1)?;
+        let tix = serialise_index(&self.texts, 2)?;
+        let six = empty_index(1);
+        let cix = serialise_index(self.chk_bytes.as_ref(), 1)?;
 
-    /// Flush everything to `transport` (rooted at `.bzr/repository`),
-    /// creating the directory layout if needed.
-    pub fn finish(self, transport: &dyn Transport) -> Result<(), RepositoryError> {
         // Close the container and grab the pack bytes.
         let pack_bytes = {
             let mut pack = self.pack.lock().unwrap();
@@ -264,17 +315,6 @@ impl Pack2aWriter {
             std::mem::take(pack.writer.get_mut())
         };
 
-        // Build each index from its store's collected records.
-        let rix = serialise_index(&self.revisions, 1)?;
-        let iix = serialise_index(&self.inventories, 1)?;
-        let tix = serialise_index(&self.texts, 2)?;
-        let six = empty_index(1);
-        let cix = serialise_index(&self.chk_bytes, 1)?;
-
-        // Lay out the repository.
-        transport.mkdir("indices")?;
-        transport.mkdir("packs")?;
-        transport.put_bytes("format", REPOSITORY_FORMAT_2A)?;
         transport.put_bytes(&format!("packs/{}.pack", self.pack_name), &pack_bytes)?;
         let write_index = |ext: &str, bytes: &[u8]| -> Result<usize, RepositoryError> {
             let name = format!("indices/{}{ext}", self.pack_name);
@@ -289,24 +329,34 @@ impl Pack2aWriter {
             write_index(index_extension(IndexKind::Signature), &six)?,
             write_index(index_extension(IndexKind::Chk), &cix)?,
         ];
-
-        // pack-names: a btree index mapping (pack_name,) -> the five sizes.
-        let mut names = BTreeBuilder::new(0, 1);
-        let value = sizes
+        let new_value = sizes
             .iter()
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .join(" ")
             .into_bytes();
+
+        // pack-names: a btree index mapping (pack_name,) -> the five sizes,
+        // for every existing pack plus the new one.
+        let mut names = BTreeBuilder::new(0, 1);
+        for (name, value) in existing_packs {
+            names
+                .add_node(vec![name.clone().into_bytes()], value.clone(), vec![])
+                .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e:?}")))?;
+        }
         names
-            .add_node(vec![self.pack_name.clone().into_bytes()], value, vec![])
+            .add_node(
+                vec![self.pack_name.clone().into_bytes()],
+                new_value.clone(),
+                vec![],
+            )
             .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e:?}")))?;
         let names_bytes = names
             .finish()
             .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e:?}")))?;
         transport.put_bytes("pack-names", &names_bytes)?;
 
-        Ok(())
+        Ok(Some((self.pack_name, new_value)))
     }
 }
 
@@ -371,97 +421,4 @@ fn empty_index(key_elements: usize) -> Vec<u8> {
     BTreeBuilder::new(1, key_elements)
         .finish()
         .expect("empty index always serialises")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::repository::{Pack2aRepository, SharedTransport};
-    use crate::serializer::RevisionSerializer;
-    use crate::transport::LocalTransport;
-    use std::collections::HashMap;
-
-    fn make_revision(id: &[u8], parents: Vec<&[u8]>, message: &str) -> crate::revision::Revision {
-        crate::revision::Revision::new(
-            crate::RevisionId::from(id),
-            parents.into_iter().map(crate::RevisionId::from).collect(),
-            Some("Test User <test@example.com>".to_string()),
-            message.to_string(),
-            HashMap::new(),
-            None,
-            1577880000.0,
-            Some(0),
-        )
-    }
-
-    /// Write revisions and texts with the writer, read them back with the
-    /// reader, and assert the round-trip is faithful. Exercises the whole
-    /// write path -- groupcompress blocks, pack framing, btree indices and
-    /// pack-names -- short of the CHK inventory (covered separately once
-    /// CHK construction is wired).
-    #[test]
-    fn revision_and_text_round_trip() {
-        let serializer = crate::bencode_serializer::BEncodeRevisionSerializer1;
-        let rev1 = make_revision(b"rev-1", vec![], "first");
-        let rev2 = make_revision(b"rev-2", vec![b"rev-1"], "second");
-        let rev1_bytes = serializer.write_revision_to_string(&rev1).unwrap();
-        let rev2_bytes = serializer.write_revision_to_string(&rev2).unwrap();
-
-        let writer = Pack2aWriter::new("0123456789abcdef0123456789abcdef").unwrap();
-        writer.add_revision(b"rev-1", &[], &rev1_bytes).unwrap();
-        writer
-            .add_revision(b"rev-2", &[b"rev-1".to_vec()], &rev2_bytes)
-            .unwrap();
-        writer
-            .add_text(b"file-1", b"rev-1", &[], b"hello world\n")
-            .unwrap();
-        writer
-            .add_text(
-                b"file-1",
-                b"rev-2",
-                &[(b"file-1".to_vec(), b"rev-1".to_vec())],
-                b"hello world\ngoodbye\n",
-            )
-            .unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let repo_path = dir.path().join("repository");
-        std::fs::create_dir_all(&repo_path).unwrap();
-        let out = LocalTransport::new(&repo_path);
-        writer.finish(&out).unwrap();
-
-        let transport: SharedTransport = std::sync::Arc::new(LocalTransport::new(&repo_path));
-        let repo = Pack2aRepository::open(transport).unwrap();
-
-        // Revision ids round-trip.
-        let mut ids = repo.all_revision_ids().unwrap();
-        ids.sort();
-        assert_eq!(ids, vec![b"rev-1".to_vec(), b"rev-2".to_vec()]);
-
-        // Revision content round-trips.
-        let got1 = repo.get_revision(b"rev-1").unwrap();
-        assert_eq!(got1.revision_id.as_bytes(), b"rev-1");
-        assert_eq!(got1.message, "first");
-        assert!(got1.parent_ids.is_empty());
-
-        let got2 = repo.get_revision(b"rev-2").unwrap();
-        assert_eq!(got2.message, "second");
-        assert_eq!(
-            got2.parent_ids
-                .iter()
-                .map(|p| p.as_bytes().to_vec())
-                .collect::<Vec<_>>(),
-            vec![b"rev-1".to_vec()]
-        );
-
-        // Text content round-trips.
-        assert_eq!(
-            repo.get_file_text(b"file-1", b"rev-1").unwrap(),
-            b"hello world\n"
-        );
-        assert_eq!(
-            repo.get_file_text(b"file-1", b"rev-2").unwrap(),
-            b"hello world\ngoodbye\n"
-        );
-    }
 }
