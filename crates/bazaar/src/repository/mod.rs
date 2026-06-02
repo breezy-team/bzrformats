@@ -7,6 +7,7 @@
 //! inventory representation — 2a a lazy CHK inventory, knit-pack an
 //! in-memory one — behind the box, without converting one into the other.
 
+mod commit;
 pub mod format;
 mod formats;
 mod pack_2a;
@@ -14,6 +15,7 @@ mod pack_2a_writer;
 mod pack_knit;
 mod tree;
 
+pub use commit::CommitBuilder;
 pub use format::{
     all_formats, find_format, InventorySerializerKind, RepositoryFormat, RevisionSerializerKind,
     StorageKind,
@@ -87,6 +89,19 @@ pub trait Repository: Send + Sync {
         entries: &[crate::inventory::Entry],
     ) -> Result<Vec<u8>, RepositoryError>;
 
+    /// Build the inventory for `new_revision_id` by applying `delta` to the
+    /// already-committed `basis_revision_id` inventory, adding it to the open
+    /// write group and returning its sha1. Formats that can share storage
+    /// (2a's CHK inventory) write only the changed pages; others fall back to
+    /// re-serialising the whole inventory.
+    fn add_inventory_by_delta(
+        &mut self,
+        basis_revision_id: &[u8],
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: &[u8],
+        parents: &[Vec<u8>],
+    ) -> Result<Vec<u8>, RepositoryError>;
+
     /// Add a file text (keyed by `(file_id, revision)`) to the open write
     /// group.
     fn add_text(
@@ -99,6 +114,30 @@ pub trait Repository: Send + Sync {
 
     /// Flush the open write group, committing its additions.
     fn commit_write_group(&mut self) -> Result<(), RepositoryError>;
+}
+
+impl dyn Repository + '_ {
+    /// Start an incremental commit against the given parents (the first is
+    /// the basis the changes are recorded against; an empty list means a
+    /// first commit against the null revision). The repository must already
+    /// have an open write group.
+    pub fn get_commit_builder(
+        &mut self,
+        parents: Vec<Vec<u8>>,
+        new_revision_id: Vec<u8>,
+        committer: String,
+        timestamp: u64,
+        timezone: i32,
+    ) -> CommitBuilder<'_> {
+        CommitBuilder::new(
+            self,
+            parents,
+            new_revision_id,
+            committer,
+            timestamp,
+            timezone,
+        )
+    }
 }
 
 /// Open the repository at `transport` (rooted at `.bzr/repository`),

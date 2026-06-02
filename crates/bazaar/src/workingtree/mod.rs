@@ -247,6 +247,25 @@ impl WorkingTree {
         let mut changes = Vec::new();
         let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
 
+        // The tree root: record it when the basis has no root (a first
+        // commit), so its empty text and inventory entry are written at the
+        // new revision. On later commits an unchanged root is carried over.
+        let root_fid = FileId::from(live.root_id.as_slice());
+        seen.insert(live.root_id.clone());
+        if basis.get_entry(&root_fid).is_none() {
+            changes.push(WorkingTreeChange {
+                file_id: live.root_id.clone(),
+                old_path: None,
+                new_path: Some(String::new()),
+                content_change: false,
+                new_name: Some(String::new()),
+                new_parent_id: None,
+                new_kind: Some(EntryKind::Directory),
+                new_executable: false,
+                basis_revision: None,
+            });
+        }
+
         // Added, moved, or modified entries: walk the working tree's tracked
         // set and compare each against the basis.
         for e in &live.entries {
@@ -496,15 +515,16 @@ impl WorkingTree {
 
     /// Commit the live working tree as a new revision.
     ///
-    /// Writes file texts, a CHK inventory and the revision to `repository`,
-    /// advances `branch` to the new tip, and updates the dirstate basis.
-    /// Returns the new revision id.
+    /// Records the changes between the working tree and its basis through a
+    /// [`CommitBuilder`](crate::repository::CommitBuilder): only changed or
+    /// new entries get a new per-file text and are recorded at the new
+    /// revision, while unchanged entries are carried over at their prior
+    /// revision (so the per-file graph and the CHK inventory pages stay
+    /// proportional to the change, not the tree size). Advances `branch` to
+    /// the new tip and updates the dirstate basis. Returns the new revision
+    /// id.
     ///
-    /// This covers the common case of committing a tree with no pending
-    /// merges: every versioned entry is recorded against the new revision.
-    /// (Recording only changed entries against the new revision, leaving
-    /// unchanged ones pointing at their previous revision, is a later
-    /// refinement.)
+    /// Single-parent only: pending merges are not yet recorded.
     pub fn commit(
         &mut self,
         repository: &mut dyn crate::repository::Repository,
@@ -524,113 +544,43 @@ impl WorkingTree {
         let revid = crate::RevisionId::generate(committer, Some(timestamp))
             .as_bytes()
             .to_vec();
+        let basis_revision_id = parents
+            .first()
+            .cloned()
+            .unwrap_or_else(|| crate::branch::NULL_REVISION.to_vec());
 
-        // Gather the live entries and map each path to its file id, so child
-        // entries can name their parent directory.
-        let live = self.collect_live_entries();
-        let mut path_to_id: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
-        path_to_id.insert(String::new(), live.root_id.clone());
-        for e in &live.entries {
-            path_to_id.insert(e.path.clone(), e.file_id.clone());
-        }
+        // Diff the live tree against its basis before opening the write
+        // group, so we know exactly which entries changed.
+        let basis = repository
+            .revision_tree(&basis_revision_id)
+            .map_err(WorkingTreeError::Repository)?;
+        let changes = self.iter_changes(&basis)?;
 
         repository
             .start_write_group()
             .map_err(WorkingTreeError::Repository)?;
-
-        // Build inventory entries (root first), adding a text record per
-        // entry as we go. Every inventory entry has a text in the texts
-        // store keyed (file_id, revision): real content for files, an empty
-        // text for the root, directories and symlinks -- this is what brz
-        // check expects so the per-file graph is complete.
-        let rev = crate::RevisionId::from(revid.as_slice());
-        repository
-            .add_text(&live.root_id, &revid, &[], b"")
-            .map_err(WorkingTreeError::Repository)?;
-        let mut inv_entries = vec![crate::inventory::Entry::root(
-            crate::FileId::from(live.root_id.as_slice()),
-            Some(rev.clone()),
-        )];
-        for e in &live.entries {
-            let (parent_path, basename) = split_path(&e.path);
-            let parent_id = path_to_id
-                .get(&parent_path)
-                .ok_or_else(|| WorkingTreeError::Commit(format!("no parent for {}", e.path)))?;
-            let parent_fid = crate::FileId::from(parent_id.as_slice());
-            let fid = crate::FileId::from(e.file_id.as_slice());
-            match e.kind {
-                EntryKind::Directory => {
-                    repository
-                        .add_text(&e.file_id, &revid, &[], b"")
-                        .map_err(WorkingTreeError::Repository)?;
-                    inv_entries.push(crate::inventory::Entry::directory(
-                        fid,
-                        basename,
-                        parent_fid,
-                        Some(rev.clone()),
-                    ));
-                }
-                EntryKind::File => {
-                    let content = self.transport.get_bytes(&e.path)?;
-                    let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
-                    let size = content.len() as u64;
-                    repository
-                        .add_text(&e.file_id, &revid, &[], &content)
-                        .map_err(WorkingTreeError::Repository)?;
-                    inv_entries.push(crate::inventory::Entry::file(
-                        fid,
-                        basename,
-                        parent_fid,
-                        Some(rev.clone()),
-                        Some(sha1),
-                        Some(size),
-                        Some(e.executable),
-                        None,
-                    ));
-                }
-                EntryKind::Symlink => {
-                    let target = String::from_utf8_lossy(&e.symlink_target).into_owned();
-                    repository
-                        .add_text(&e.file_id, &revid, &[], b"")
-                        .map_err(WorkingTreeError::Repository)?;
-                    inv_entries.push(crate::inventory::Entry::link(
-                        fid,
-                        basename,
-                        parent_fid,
-                        Some(rev.clone()),
-                        Some(target),
-                    ));
-                }
-                EntryKind::TreeReference => {
-                    return Err(WorkingTreeError::Commit(
-                        "tree references are not supported".to_string(),
-                    ));
-                }
-            }
+        {
+            let mut builder = repository.get_commit_builder(
+                parents.clone(),
+                revid.clone(),
+                committer.to_string(),
+                timestamp,
+                timezone,
+            );
+            builder
+                .record_iter_changes(&changes, |path| {
+                    self.transport
+                        .get_bytes(path)
+                        .map_err(crate::repository::RepositoryError::Transport)
+                })
+                .map_err(WorkingTreeError::Repository)?;
+            builder
+                .finish_inventory()
+                .map_err(WorkingTreeError::Repository)?;
+            builder
+                .commit(message)
+                .map_err(WorkingTreeError::Repository)?;
         }
-
-        let inv_sha1 = repository
-            .add_inventory_from_entries(&revid, &parents, &live.root_id, &inv_entries)
-            .map_err(WorkingTreeError::Repository)?;
-
-        // Build and add the revision.
-        let revision = crate::revision::Revision::new(
-            crate::RevisionId::from(revid.as_slice()),
-            parents
-                .iter()
-                .map(|p| crate::RevisionId::from(p.as_slice()))
-                .collect(),
-            Some(committer.to_string()),
-            message.to_string(),
-            std::collections::HashMap::new(),
-            Some(inv_sha1),
-            timestamp as f64,
-            Some(timezone),
-        );
-        repository
-            .add_revision(&revision, &parents)
-            .map_err(WorkingTreeError::Repository)?;
         repository
             .commit_write_group()
             .map_err(WorkingTreeError::Repository)?;
@@ -641,14 +591,107 @@ impl WorkingTree {
             .set_last_revision_info(new_revno, &revid)
             .map_err(WorkingTreeError::Branch)?;
 
-        // Record the new revision as the dirstate basis, so the working
-        // tree reads as up to date. Pair each inventory entry with its
-        // tree-relative path: the root is "", the rest follow live order.
-        let mut paths: Vec<String> = vec![String::new()];
-        paths.extend(live.entries.iter().map(|e| e.path.clone()));
-        self.update_basis(&revid, &paths, &inv_entries)?;
+        // Record the new revision as the dirstate basis. The basis tree is
+        // the full live tree; each entry keeps its last-changed revision
+        // (the new revision for changed/new entries, the prior one for
+        // carried-over entries).
+        self.update_basis_from_changes(&revid, &basis, &changes)?;
 
         Ok(revid)
+    }
+
+    /// Set the dirstate basis to the just-committed tree, deriving each
+    /// entry's last-changed revision from the recorded changes (the new
+    /// revision for changed/new entries, the basis revision otherwise).
+    fn update_basis_from_changes(
+        &mut self,
+        revid: &[u8],
+        basis: &crate::repository::RevisionTree,
+        changes: &[WorkingTreeChange],
+    ) -> Result<(), WorkingTreeError> {
+        use crate::FileId;
+
+        // Map file_id -> last-changed revision for entries recorded at the
+        // new revision (changed or new); everything else keeps its basis
+        // revision.
+        let mut new_rev_ids: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for c in changes {
+            if c.new_path.is_some() && (c.content_change || c.basis_revision.is_none()) {
+                new_rev_ids.insert(c.file_id.clone());
+            }
+        }
+
+        let live = self.collect_live_entries();
+        let mut path_to_id: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        path_to_id.insert(String::new(), live.root_id.clone());
+        for e in &live.entries {
+            path_to_id.insert(e.path.clone(), e.file_id.clone());
+        }
+
+        // The root keeps its basis revision unless this is the first commit
+        // (no basis root), in which case it is recorded at the new revision.
+        let root_fid = FileId::from(live.root_id.as_slice());
+        let root_rev = match basis.get_file_revision(&root_fid) {
+            Some(r) => crate::RevisionId::from(r.as_slice()),
+            None => crate::RevisionId::from(revid),
+        };
+        let mut paths: Vec<String> = vec![String::new()];
+        let mut inv_entries = vec![crate::inventory::Entry::root(root_fid, Some(root_rev))];
+        for e in &live.entries {
+            let (parent_path, basename) = split_path(&e.path);
+            let parent_id = path_to_id
+                .get(&parent_path)
+                .ok_or_else(|| WorkingTreeError::Commit(format!("no parent for {}", e.path)))?;
+            let parent_fid = FileId::from(parent_id.as_slice());
+            let fid = FileId::from(e.file_id.as_slice());
+            // The entry's recorded revision: the new one if it changed,
+            // otherwise its revision in the basis.
+            let entry_rev = if new_rev_ids.contains(&e.file_id) {
+                crate::RevisionId::from(revid)
+            } else {
+                match basis.get_file_revision(&fid) {
+                    Some(r) => crate::RevisionId::from(r.as_slice()),
+                    None => crate::RevisionId::from(revid),
+                }
+            };
+            paths.push(e.path.clone());
+            inv_entries.push(match e.kind {
+                EntryKind::Directory => {
+                    crate::inventory::Entry::directory(fid, basename, parent_fid, Some(entry_rev))
+                }
+                EntryKind::File => {
+                    let content = self.transport.get_bytes(&e.path)?;
+                    let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
+                    crate::inventory::Entry::file(
+                        fid,
+                        basename,
+                        parent_fid,
+                        Some(entry_rev),
+                        Some(sha1),
+                        Some(content.len() as u64),
+                        Some(e.executable),
+                        None,
+                    )
+                }
+                EntryKind::Symlink => {
+                    let target = String::from_utf8_lossy(&e.symlink_target).into_owned();
+                    crate::inventory::Entry::link(
+                        fid,
+                        basename,
+                        parent_fid,
+                        Some(entry_rev),
+                        Some(target),
+                    )
+                }
+                EntryKind::TreeReference => {
+                    return Err(WorkingTreeError::Commit(
+                        "tree references are not supported".to_string(),
+                    ))
+                }
+            });
+        }
+        self.update_basis(revid, &paths, &inv_entries)
     }
 
     /// Set the dirstate basis (tree 1) to the just-committed revision so
@@ -1059,5 +1102,60 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].old_path.as_deref(), Some("a.txt"));
         assert_eq!(changes[0].new_path, None);
+    }
+
+    /// A second commit that changes one file records that file at the new
+    /// revision and carries the unchanged file over at its original
+    /// revision -- the incremental property.
+    #[test]
+    fn second_commit_is_incremental() {
+        use crate::repository::Repository as _;
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"a one\n").unwrap();
+        parent.put_bytes("b.txt", b"b one\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        wt.add("b.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev1 = wt
+            .commit(repo.as_mut(), &branch, "T <t@e>", "first", 1577880000, 0)
+            .unwrap();
+
+        // Second commit: change only a.txt.
+        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"a two\n").unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev2 = wt
+            .commit(repo.as_mut(), &branch, "T <t@e>", "second", 1577890000, 0)
+            .unwrap();
+        assert_ne!(rev1, rev2);
+
+        // rev2 has both files with the new content.
+        let repo = cd.open_repository().unwrap();
+        let inv = repo.get_inventory(&rev2).unwrap();
+        let mut paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["a.txt".to_string(), "b.txt".to_string()]);
+
+        // a.txt was recorded at rev2; b.txt carried over at rev1.
+        let a_id = wt.path2id("a.txt").unwrap();
+        let b_id = wt.path2id("b.txt").unwrap();
+        let a_entry = inv
+            .get_entry(&crate::FileId::from(a_id.as_slice()))
+            .unwrap()
+            .unwrap();
+        let b_entry = inv
+            .get_entry(&crate::FileId::from(b_id.as_slice()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a_entry.revision().unwrap().as_bytes(), rev2.as_slice());
+        assert_eq!(b_entry.revision().unwrap().as_bytes(), rev1.as_slice());
+        // The changed file's new text is stored at rev2; the unchanged file
+        // has no rev2 text (it was not rewritten).
+        assert_eq!(repo.get_file_text(&a_id, &rev2).unwrap(), b"a two\n");
+        assert!(repo.get_file_text(&b_id, &rev2).is_err());
+        assert_eq!(repo.get_file_text(&b_id, &rev1).unwrap(), b"b one\n");
     }
 }

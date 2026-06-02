@@ -575,6 +575,18 @@ impl Pack2aRepository {
         new_revision_id: &[u8],
         parents: &[Vec<u8>],
     ) -> Result<Vec<u8>, RepositoryError> {
+        if basis_revision_id == crate::branch::NULL_REVISION {
+            // First commit: there is no basis inventory to share pages with,
+            // so build the inventory from the delta's added entries plus a
+            // fresh root.
+            let entries = entries_from_null_delta(delta, new_revision_id)?;
+            return self.add_inventory_from_entries(
+                new_revision_id,
+                parents,
+                crate::inventory::ROOT_ID,
+                &entries,
+            );
+        }
         let basis_lines = self.read_inventory_lines(basis_revision_id)?;
         self.write_group_mut()?.add_inventory_by_delta(
             basis_revision_id,
@@ -664,6 +676,22 @@ impl super::Repository for Pack2aRepository {
         Pack2aRepository::add_inventory_from_entries(self, revision_id, parents, root_id, entries)
     }
 
+    fn add_inventory_by_delta(
+        &mut self,
+        basis_revision_id: &[u8],
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: &[u8],
+        parents: &[Vec<u8>],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        Pack2aRepository::add_inventory_by_delta(
+            self,
+            basis_revision_id,
+            delta,
+            new_revision_id,
+            parents,
+        )
+    }
+
     fn add_text(
         &mut self,
         file_id: &[u8],
@@ -677,6 +705,36 @@ impl super::Repository for Pack2aRepository {
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
         Pack2aRepository::commit_write_group(self)
     }
+}
+
+/// Build the full inventory entry list for a first commit (null basis) from
+/// the all-adds `delta`. The delta includes the tree root (path "") as its
+/// root entry; the entries are reordered so the root comes first, as
+/// [`Pack2aRepository::add_inventory_from_entries`] expects.
+fn entries_from_null_delta(
+    delta: &crate::inventory_delta::InventoryDelta,
+    _new_revision_id: &[u8],
+) -> Result<Vec<crate::inventory::Entry>, RepositoryError> {
+    let mut root = None;
+    let mut rest = Vec::new();
+    for d in delta.iter() {
+        match (&d.old_path, &d.new_entry, d.new_path.as_deref()) {
+            (None, Some(entry), Some("")) => root = Some(entry.clone()),
+            (None, Some(entry), Some(_)) => rest.push(entry.clone()),
+            (Some(_), _, _) => {
+                return Err(RepositoryError::Corrupt(
+                    "first-commit delta contains a non-add entry".to_string(),
+                ))
+            }
+            (None, _, _) => {}
+        }
+    }
+    let root = root.ok_or_else(|| {
+        RepositoryError::Corrupt("first-commit delta has no root entry".to_string())
+    })?;
+    let mut entries = vec![root];
+    entries.extend(rest);
+    Ok(entries)
 }
 
 /// Generate a fresh 32-hex-character pack name.

@@ -527,6 +527,39 @@ impl KnitPackRepository {
         self.add_inventory_xml(revision_id, parents, &xml)?;
         Ok(sha1)
     }
+
+    /// Add the inventory for `new_revision_id` by applying `delta` to the
+    /// basis inventory. Knit-pack stores whole-text XML inventories, so the
+    /// basis is materialised, the delta applied, and the result serialised
+    /// in full (there are no shared pages to preserve).
+    pub fn add_inventory_by_delta(
+        &mut self,
+        basis_revision_id: &[u8],
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: &[u8],
+        parents: &[Vec<u8>],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        // For a first commit the basis is the empty inventory; the delta is
+        // all-adds and includes the tree root, so applying it yields the
+        // full inventory.
+        let basis = if basis_revision_id == crate::branch::NULL_REVISION {
+            crate::inventory::MutableInventory::new()
+        } else {
+            self.get_inventory(basis_revision_id)?
+        };
+        let new_inv = basis
+            .create_by_apply_delta(delta, crate::RevisionId::from(new_revision_id))
+            .map_err(|e| RepositoryError::Corrupt(format!("apply inventory delta: {e:?}")))?;
+        let lines = self
+            .inventory_serializer()
+            .write_inventory_to_lines(&new_inv, false)
+            .map_err(|e| RepositoryError::Corrupt(format!("serialise inventory: {e:?}")))?;
+        let line_refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
+        let sha1 = crate::weave::sha_strings(&line_refs);
+        let xml: Vec<u8> = lines.concat();
+        self.add_inventory_xml(new_revision_id, parents, &xml)?;
+        Ok(sha1)
+    }
 }
 
 impl super::Repository for KnitPackRepository {
@@ -579,6 +612,22 @@ impl super::Repository for KnitPackRepository {
         entries: &[crate::inventory::Entry],
     ) -> Result<Vec<u8>, RepositoryError> {
         KnitPackRepository::add_inventory_from_entries(self, revision_id, parents, root_id, entries)
+    }
+
+    fn add_inventory_by_delta(
+        &mut self,
+        basis_revision_id: &[u8],
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: &[u8],
+        parents: &[Vec<u8>],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        KnitPackRepository::add_inventory_by_delta(
+            self,
+            basis_revision_id,
+            delta,
+            new_revision_id,
+            parents,
+        )
     }
 
     fn add_text(
