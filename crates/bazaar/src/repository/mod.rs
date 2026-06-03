@@ -10,6 +10,7 @@
 mod commit;
 pub mod format;
 mod formats;
+mod knit_repo;
 mod pack_2a;
 mod pack_2a_writer;
 mod pack_index;
@@ -18,6 +19,7 @@ mod tree;
 
 pub use commit::CommitBuilder;
 pub use format::{all_formats, find_format, RepositoryFormat};
+pub use knit_repo::KnitRepository;
 pub use pack_2a::{Pack2aRepository, RepositoryError, SharedTransport};
 pub use pack_knit::KnitPackRepository;
 pub use tree::RevisionTree;

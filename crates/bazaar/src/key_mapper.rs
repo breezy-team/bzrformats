@@ -29,6 +29,7 @@ pub trait Mapper: Send + Sync {
 /// A `Mapper` that always returns the same path regardless of the key.
 ///
 /// Mirrors `bzrformats.versionedfile.ConstantMapper`.
+#[derive(Clone)]
 pub struct ConstantMapper {
     pub result: String,
 }
@@ -65,6 +66,7 @@ impl Mapper for PrefixMapper {
 /// A `Mapper` that prefixes the path with a two-hex adler32 bucket.
 ///
 /// Mirrors `bzrformats.versionedfile.HashPrefixMapper`.
+#[derive(Clone)]
 pub struct HashPrefixMapper;
 
 impl Mapper for HashPrefixMapper {

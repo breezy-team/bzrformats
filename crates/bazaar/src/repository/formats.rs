@@ -6,6 +6,7 @@
 //! function that dispatches to their reader; the plain knit formats fall
 //! back to the unsupported opener pending a decoder.
 
+use super::knit_repo::open_knit;
 use super::pack_2a::open_group_compress;
 use super::pack_knit::open_knit_pack;
 use crate::bencode_serializer::BEncodeRevisionSerializer1;
@@ -21,6 +22,8 @@ declare_repository_format! {
         description: "Knit repository format 1",
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer5,
+        open: open_knit,
+        supported: true,
         deprecated: true,
     }
 }
@@ -31,8 +34,10 @@ declare_repository_format! {
         description: "Knit repository format 3 (rich root, subtrees)",
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer7,
+        open: open_knit,
         rich_root_data: true,
         supports_tree_reference: true,
+        supported: true,
         deprecated: true,
     }
 }
@@ -43,7 +48,9 @@ declare_repository_format! {
         description: "Knit repository format 4 (rich root)",
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer6,
+        open: open_knit,
         rich_root_data: true,
+        supported: true,
         deprecated: true,
     }
 }
