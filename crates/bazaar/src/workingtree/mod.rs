@@ -207,6 +207,10 @@ pub struct CommitOptions {
     /// Tree-relative paths (and their descendants) to exclude from the
     /// commit. Cannot be combined with pending merges.
     pub exclude: Vec<String>,
+    /// An OpenPGP secret key (a Transferable Secret Key, armored or binary)
+    /// to sign the commit with. Requires the crate's `gpg` feature; supplying
+    /// a key without it is an error.
+    pub signing_key: Option<Vec<u8>>,
 }
 
 impl CommitOptions {
@@ -266,6 +270,11 @@ impl CommitOptions {
 
     pub fn exclude(mut self, exclude: Vec<String>) -> Self {
         self.exclude = exclude;
+        self
+    }
+
+    pub fn signing_key(mut self, key: Vec<u8>) -> Self {
+        self.signing_key = Some(key);
         self
     }
 
@@ -828,7 +837,7 @@ impl WorkingTree {
                     options.timestamp,
                     options.timezone,
                 )
-                .with_properties(properties);
+                .with_properties(properties.clone());
             builder
                 .record_iter_changes(&changes, |path| {
                     self.transport
@@ -843,6 +852,18 @@ impl WorkingTree {
                 .commit(&options.message)
                 .map_err(WorkingTreeError::Repository)?;
         }
+
+        // Sign the commit while the write group is still open, so the
+        // signature lands in the same pack as the revision.
+        if let Some(key) = &options.signing_key {
+            let (paths, inv_entries) = self.build_committed_entries(&revid, &basis, &changes)?;
+            let signature =
+                self.sign_commit(&revid, options, &properties, &paths, &inv_entries, key)?;
+            repository
+                .add_signature_text(&revid, &signature)
+                .map_err(WorkingTreeError::Repository)?;
+        }
+
         repository
             .commit_write_group()
             .map_err(WorkingTreeError::Repository)?;
@@ -876,15 +897,29 @@ impl WorkingTree {
         Ok(revid)
     }
 
-    /// Set the dirstate basis to the just-committed tree, deriving each
-    /// entry's last-changed revision from the recorded changes (the new
-    /// revision for changed/new entries, the basis revision otherwise).
+    /// Set the dirstate basis to the just-committed tree.
     fn update_basis_from_changes(
         &mut self,
         revid: &[u8],
         basis: &crate::repository::RevisionTree,
         changes: &[WorkingTreeChange],
     ) -> Result<(), WorkingTreeError> {
+        let (paths, inv_entries) = self.build_committed_entries(revid, basis, changes)?;
+        self.update_basis(revid, &paths, &inv_entries)
+    }
+
+    /// Build the full inventory entry list for the just-committed tree,
+    /// deriving each entry's last-changed revision from the recorded changes
+    /// (the new revision for changed/new entries, the basis revision
+    /// otherwise). Returns the entries paired with their tree-relative paths
+    /// (root first). Used both to update the dirstate basis and to build the
+    /// testament for signing.
+    fn build_committed_entries(
+        &self,
+        revid: &[u8],
+        basis: &crate::repository::RevisionTree,
+        changes: &[WorkingTreeChange],
+    ) -> Result<(Vec<String>, Vec<crate::inventory::Entry>), WorkingTreeError> {
         use crate::FileId;
 
         // Map file_id -> last-changed revision for entries recorded at the
@@ -989,7 +1024,99 @@ impl WorkingTree {
                 }
             });
         }
-        self.update_basis(revid, &paths, &inv_entries)
+        Ok((paths, inv_entries))
+    }
+
+    /// Build the strict-v3 testament for the commit and return its
+    /// clearsigned short text (the form brz stores in the signature store).
+    ///
+    /// Requires the `gpg` feature; without it, supplying a signing key is an
+    /// error.
+    #[allow(clippy::too_many_arguments)]
+    fn sign_commit(
+        &self,
+        revid: &[u8],
+        options: &CommitOptions,
+        properties: &std::collections::HashMap<String, Vec<u8>>,
+        paths: &[String],
+        inv_entries: &[crate::inventory::Entry],
+        signing_key: &[u8],
+    ) -> Result<Vec<u8>, WorkingTreeError> {
+        #[cfg(not(feature = "gpg"))]
+        {
+            let _ = (revid, options, properties, paths, inv_entries, signing_key);
+            Err(WorkingTreeError::Commit(
+                "commit signing requires the crate's `gpg` feature".to_string(),
+            ))
+        }
+
+        #[cfg(feature = "gpg")]
+        {
+            use crate::testament::{
+                EntryKind as TKind, Testament, TestamentEntry, TestamentFormat,
+            };
+
+            let revprops: std::collections::BTreeMap<String, String> = properties
+                .iter()
+                .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
+                .collect();
+
+            // Testament entries: every non-root inventory entry, paired with
+            // its tree-relative path.
+            let mut entries = Vec::new();
+            for (path, entry) in paths.iter().zip(inv_entries) {
+                if path.is_empty() {
+                    continue; // the root is not a testament entry.
+                }
+                let (kind, content) = match entry {
+                    crate::inventory::Entry::File { text_sha1, .. } => {
+                        (TKind::File, text_sha1.clone().unwrap_or_default())
+                    }
+                    crate::inventory::Entry::Directory { .. } => (TKind::Directory, Vec::new()),
+                    crate::inventory::Entry::Link { symlink_target, .. } => (
+                        TKind::Symlink,
+                        symlink_target.clone().unwrap_or_default().into_bytes(),
+                    ),
+                    crate::inventory::Entry::TreeReference { .. } => {
+                        (TKind::TreeReference, Vec::new())
+                    }
+                    crate::inventory::Entry::Root { .. } => continue,
+                };
+                entries.push(TestamentEntry {
+                    path: path.clone(),
+                    kind,
+                    file_id: entry.file_id().as_bytes().to_vec(),
+                    content,
+                    revision: entry
+                        .revision()
+                        .map(|r| r.as_bytes().to_vec())
+                        .unwrap_or_default(),
+                    executable: entry.executable(),
+                });
+            }
+
+            let testament = Testament {
+                revision_id: revid.to_vec(),
+                committer: options.committer.clone(),
+                timestamp: options.timestamp as i64,
+                timezone: options.timezone,
+                message: options.message.clone(),
+                parent_ids: self
+                    .dirstate
+                    .parents
+                    .iter()
+                    .filter(|p| p.as_slice() != crate::branch::NULL_REVISION)
+                    .cloned()
+                    .collect(),
+                revprops,
+                entries,
+            };
+            let short = testament
+                .as_short_text(TestamentFormat::Strict3)
+                .map_err(|e| WorkingTreeError::Commit(format!("testament: {e:?}")))?;
+            crate::gpg::clearsign(&short, signing_key)
+                .map_err(|e| WorkingTreeError::Commit(format!("sign: {e}")))
+        }
     }
 
     /// Set the dirstate basis (tree 1) to the just-committed revision so
@@ -1742,5 +1869,42 @@ mod tests {
         assert_eq!(repo.get_file_text(&a_id, &rev2).unwrap(), b"a2\n");
         // b.txt's recorded content is still the rev1 version.
         assert_eq!(repo.get_file_text(&b_id, &rev1).unwrap(), b"b1\n");
+    }
+
+    /// A signed commit stores a clearsigned testament in the signature
+    /// store. (Requires the `gpg` feature.)
+    #[cfg(feature = "gpg")]
+    #[test]
+    fn commit_with_signing_key_stores_signature() {
+        use crate::repository::Repository as _;
+        use sequoia_openpgp::cert::CertBuilder;
+        use sequoia_openpgp::serialize::Serialize;
+
+        let (cert, _) = CertBuilder::new().add_signing_subkey().generate().unwrap();
+        let mut tsk = Vec::new();
+        cert.as_tsk().serialize(&mut tsk).unwrap();
+
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"hi\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "signed")
+                    .timestamp(1577880000)
+                    .signing_key(tsk),
+            )
+            .unwrap();
+
+        let repo = cd.open_repository().unwrap();
+        let sig = repo.get_signature_text(&revid).unwrap().unwrap();
+        let sig = String::from_utf8(sig).unwrap();
+        assert!(sig.starts_with("-----BEGIN PGP SIGNED MESSAGE-----"));
+        assert!(sig.contains("bazaar testament short form 3 strict"));
+        assert!(sig.contains("-----BEGIN PGP SIGNATURE-----"));
     }
 }

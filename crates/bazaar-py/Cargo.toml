@@ -18,3 +18,8 @@ sha1 = "0.10"
 vcs-graph = "3.5.0"
 walkdir = "2"
 indexmap = "2"
+
+[features]
+# Enable in-process OpenPGP commit signing (forwards to bazaar/gpg). Off by
+# default so the Python extension does not pull in a crypto backend.
+gpg = ["bazaar/gpg"]
