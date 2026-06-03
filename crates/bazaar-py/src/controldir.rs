@@ -274,6 +274,11 @@ impl WorkingTree {
         self.inner.rename(from_path, to_path).map_err(err)
     }
 
+    /// The tree-relative paths of on-disk files that are not versioned.
+    fn unknowns(&self) -> PyResult<Vec<String>> {
+        self.inner.unknowns().map_err(err)
+    }
+
     /// Commit the live tree state as a new revision and return its id.
     ///
     /// `revprops` is an optional `{str: bytes}` dict of revision properties;
@@ -281,7 +286,7 @@ impl WorkingTree {
     /// optional explicit id (generated when omitted).
     #[pyo3(signature = (repository, branch, committer, message, timestamp, timezone,
         revprops=None, authors=None, revision_id=None, branch_nick=None,
-        allow_pointless=false))]
+        allow_pointless=false, strict=false))]
     #[allow(clippy::too_many_arguments)]
     fn commit<'py>(
         &mut self,
@@ -297,13 +302,15 @@ impl WorkingTree {
         revision_id: Option<&[u8]>,
         branch_nick: Option<String>,
         allow_pointless: bool,
+        strict: bool,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let mut repo = repository.borrow_mut();
         let branch = branch.borrow();
         let mut options = bazaar::workingtree::CommitOptions::new(committer, message)
             .timestamp(timestamp)
             .timezone(timezone)
-            .allow_pointless(allow_pointless);
+            .allow_pointless(allow_pointless)
+            .strict(strict);
         if let Some(props) = revprops {
             let mut map: std::collections::HashMap<String, Vec<u8>> =
                 std::collections::HashMap::new();

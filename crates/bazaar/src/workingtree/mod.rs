@@ -37,6 +37,8 @@ pub enum WorkingTreeError {
     Commit(String),
     /// The commit would record no change and `allow_pointless` was false.
     PointlessCommit,
+    /// A strict commit found unversioned files in the tree.
+    StrictCommitFailed(Vec<String>),
     /// An error from the repository during commit.
     Repository(crate::repository::RepositoryError),
     /// An error from the branch during commit.
@@ -55,6 +57,13 @@ impl std::fmt::Display for WorkingTreeError {
             WorkingTreeError::Commit(m) => write!(f, "commit: {m}"),
             WorkingTreeError::PointlessCommit => {
                 write!(f, "no changes to commit (use allow_pointless to override)")
+            }
+            WorkingTreeError::StrictCommitFailed(unknowns) => {
+                write!(
+                    f,
+                    "strict commit failed: {} unversioned file(s) present",
+                    unknowns.len()
+                )
             }
             WorkingTreeError::Repository(e) => write!(f, "repository: {e}"),
             WorkingTreeError::Branch(e) => write!(f, "branch: {e}"),
@@ -182,6 +191,9 @@ pub struct CommitOptions {
     /// [`WorkingTreeError::PointlessCommit`]. A commit with pending merges
     /// is never pointless.
     pub allow_pointless: bool,
+    /// Strict mode: refuse the commit if the tree has unversioned files,
+    /// failing with [`WorkingTreeError::StrictCommitFailed`].
+    pub strict: bool,
 }
 
 impl CommitOptions {
@@ -226,6 +238,11 @@ impl CommitOptions {
 
     pub fn allow_pointless(mut self, allow: bool) -> Self {
         self.allow_pointless = allow;
+        self
+    }
+
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
         self
     }
 
@@ -343,6 +360,48 @@ impl WorkingTree {
         Ok(self.transport.get_bytes(path)?)
     }
 
+    /// The tree-relative paths of files and directories on disk that are not
+    /// versioned, in sorted order. The control directory (`.bzr`) is never
+    /// reported. The contents of an unknown directory are not descended
+    /// into (the directory itself is the one unknown).
+    pub fn unknowns(&self) -> Result<Vec<String>, WorkingTreeError> {
+        // Tracked paths, to test membership as we walk.
+        let tracked: std::collections::HashSet<String> =
+            self.list_files().into_iter().map(|e| e.path).collect();
+
+        let mut unknowns = Vec::new();
+        let mut dirs = vec![String::new()];
+        while let Some(dir) = dirs.pop() {
+            let names = match self.transport.list_dir(&dir) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            for name in names {
+                if dir.is_empty() && name == ".bzr" {
+                    continue;
+                }
+                let path = if dir.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{dir}/{name}")
+                };
+                if tracked.contains(&path) {
+                    // Versioned: descend into a versioned directory to find
+                    // unknowns beneath it.
+                    if let Ok(st) = self.transport.stat(&path) {
+                        if st.is_dir {
+                            dirs.push(path);
+                        }
+                    }
+                } else {
+                    unknowns.push(path);
+                }
+            }
+        }
+        unknowns.sort();
+        Ok(unknowns)
+    }
+
     /// The changes between this working tree and `basis`, one
     /// [`WorkingTreeChange`] per entry that differs (added, removed, moved,
     /// or with changed content or metadata). This is the input the commit
@@ -365,6 +424,11 @@ impl WorkingTree {
         // The tree root: record it when the basis has no root (a first
         // commit), so its empty text and inventory entry are written at the
         // new revision. On later commits an unchanged root is carried over.
+        // This is the rich-root behaviour, which the only writable format
+        // here (2a) requires. TODO: for a non-rich-root format the empty
+        // root change must be suppressed (breezy's `_require_root_change`);
+        // commit currently always runs against a 2a tree, so that path is
+        // not yet exercised.
         let root_fid = FileId::from(live.root_id.as_slice());
         seen.insert(live.root_id.clone());
         if basis.get_entry(&root_fid).is_none() {
@@ -669,6 +733,14 @@ impl WorkingTree {
         branch: &crate::branch::Branch,
         options: &CommitOptions,
     ) -> Result<Vec<u8>, WorkingTreeError> {
+        // Strict mode refuses to commit while unversioned files are present.
+        if options.strict {
+            let unknowns = self.unknowns()?;
+            if !unknowns.is_empty() {
+                return Err(WorkingTreeError::StrictCommitFailed(unknowns));
+            }
+        }
+
         let parents: Vec<Vec<u8>> = self
             .dirstate
             .parents
@@ -1485,5 +1557,42 @@ mod tests {
         assert_eq!(paths, vec!["b.txt".to_string()]);
         assert_eq!(wt.path2id("a.txt"), None);
         assert!(wt.path2id("b.txt").is_some());
+    }
+
+    /// unknowns lists on-disk files that are not versioned, skipping .bzr.
+    #[test]
+    fn unknowns_lists_unversioned_files() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("tracked.txt", b"t\n").unwrap();
+        parent.put_bytes("loose.txt", b"l\n").unwrap();
+        wt.add("tracked.txt", EntryKind::File, None).unwrap();
+        let wt = WorkingTree::open(parent.clone()).unwrap();
+        assert_eq!(wt.unknowns().unwrap(), vec!["loose.txt".to_string()]);
+    }
+
+    /// A strict commit is refused while unversioned files are present, and
+    /// succeeds once the tree is clean.
+    #[test]
+    fn strict_commit_refuses_unknown_files() {
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"a\n").unwrap();
+        parent.put_bytes("loose.txt", b"l\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let strict = CommitOptions::new("T <t@e>", "c")
+            .timestamp(1577880000)
+            .strict(true);
+        assert!(matches!(
+            wt.commit(repo.as_mut(), &branch, &strict),
+            Err(WorkingTreeError::StrictCommitFailed(_))
+        ));
+
+        // Remove the unknown file; the strict commit now succeeds.
+        parent.delete("loose.txt").unwrap();
+        let revid = wt.commit(repo.as_mut(), &branch, &strict).unwrap();
+        assert!(!revid.is_empty());
     }
 }

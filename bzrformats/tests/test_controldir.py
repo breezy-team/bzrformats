@@ -111,6 +111,27 @@ class TestControlDir(TestCaseInTempDir):
             0,
         )
 
+    def test_strict_commit_refuses_unknown_files(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"a\n")
+        with open(os.path.join(self.test_dir, "loose.txt"), "wb") as f:
+            f.write(b"l\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        self.assertEqual(wt.unknowns(), ["loose.txt"])
+        self.assertRaises(
+            Exception,
+            wt.commit,
+            cd.open_repository(),
+            cd.open_branch(),
+            "T <t@e>",
+            "c",
+            1577880000,
+            0,
+            strict=True,
+        )
+
     def test_add_versions_and_persists(self):
         cd = controldir.create(self.test_dir)
         with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
