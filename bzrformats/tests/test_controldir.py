@@ -40,7 +40,9 @@ class TestControlDir(TestCaseInTempDir):
         repo = cd.open_repository()
         branch = cd.open_branch()
         wt = cd.open_workingtree()
-        revid = wt.commit(repo, branch, "T <t@e>", "empty", 1577880000, 0)
+        revid = wt.commit(
+            repo, branch, "T <t@e>", "empty", 1577880000, 0, allow_pointless=True
+        )
 
         reopened = controldir.open(self.test_dir)
         self.assertEqual(reopened.open_branch().last_revision_info(), (1, revid))
@@ -68,6 +70,46 @@ class TestControlDir(TestCaseInTempDir):
         inv = repo.get_inventory(revid)
         self.assertEqual([entry[0] for entry in inv], ["a.txt"])
         self.assertEqual(repo.get_file_text(file_id, revid), b"hello\n")
+
+    def test_commit_records_revprops_and_authors(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"hi\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        revid = wt.commit(
+            cd.open_repository(),
+            cd.open_branch(),
+            "T <t@e>",
+            "msg",
+            1577880000,
+            0,
+            revprops={"custom": b"val"},
+            authors=["A <a@e>", "B <b@e>"],
+        )
+        rev = controldir.open(self.test_dir).open_repository().get_revision(revid)
+        self.assertEqual(rev["properties"]["custom"], b"val")
+        self.assertEqual(rev["properties"]["authors"], b"A <a@e>\nB <b@e>")
+
+    def test_pointless_commit_refused(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"hi\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        wt.commit(cd.open_repository(), cd.open_branch(), "T <t@e>", "first", 1577880000, 0)
+        # A second commit with nothing changed is refused.
+        wt2 = controldir.open(self.test_dir).open_workingtree()
+        self.assertRaises(
+            Exception,
+            wt2.commit,
+            cd.open_repository(),
+            cd.open_branch(),
+            "T <t@e>",
+            "empty",
+            1577890000,
+            0,
+        )
 
     def test_add_versions_and_persists(self):
         cd = controldir.create(self.test_dir)

@@ -122,6 +122,12 @@ impl Repository {
                 .map(|p| PyBytes::new(py, p.as_bytes())),
         )?;
         d.set_item("parent_ids", parents)?;
+        d.set_item("timezone", rev.timezone)?;
+        let props = PyDict::new(py);
+        for (k, v) in &rev.properties {
+            props.set_item(k, PyBytes::new(py, v))?;
+        }
+        d.set_item("properties", props)?;
         Ok(d)
     }
 
@@ -274,7 +280,8 @@ impl WorkingTree {
     /// `authors` an optional list of author strings; `revision_id` an
     /// optional explicit id (generated when omitted).
     #[pyo3(signature = (repository, branch, committer, message, timestamp, timezone,
-        revprops=None, authors=None, revision_id=None, branch_nick=None))]
+        revprops=None, authors=None, revision_id=None, branch_nick=None,
+        allow_pointless=false))]
     #[allow(clippy::too_many_arguments)]
     fn commit<'py>(
         &mut self,
@@ -289,12 +296,14 @@ impl WorkingTree {
         authors: Option<Vec<String>>,
         revision_id: Option<&[u8]>,
         branch_nick: Option<String>,
+        allow_pointless: bool,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let mut repo = repository.borrow_mut();
         let branch = branch.borrow();
         let mut options = bazaar::workingtree::CommitOptions::new(committer, message)
             .timestamp(timestamp)
-            .timezone(timezone);
+            .timezone(timezone)
+            .allow_pointless(allow_pointless);
         if let Some(props) = revprops {
             let mut map: std::collections::HashMap<String, Vec<u8>> =
                 std::collections::HashMap::new();

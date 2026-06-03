@@ -68,6 +68,25 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Whether the recorded delta represents a real change.
+    ///
+    /// Mirrors breezy's `_any_changes`: a delta against a non-null basis is
+    /// a change if it touches anything; against the null revision (a first
+    /// commit) the root entry alone does not count, so more than one delta
+    /// entry is required. A commit with pending merges is always considered
+    /// a change.
+    pub fn any_changes(&self) -> bool {
+        if self.parents.len() > 1 {
+            return true;
+        }
+        let basis_is_null = self.basis_revision_id() == crate::branch::NULL_REVISION;
+        if basis_is_null {
+            self.delta.len() > 1
+        } else {
+            !self.delta.is_empty()
+        }
+    }
+
     /// The basis revision the delta is recorded against (the first parent,
     /// or the null revision for a first commit).
     fn basis_revision_id(&self) -> Vec<u8> {

@@ -35,6 +35,8 @@ pub enum WorkingTreeError {
     Remove(crate::dirstate::MakeAbsentError),
     /// A commit could not be assembled.
     Commit(String),
+    /// The commit would record no change and `allow_pointless` was false.
+    PointlessCommit,
     /// An error from the repository during commit.
     Repository(crate::repository::RepositoryError),
     /// An error from the branch during commit.
@@ -51,6 +53,9 @@ impl std::fmt::Display for WorkingTreeError {
             WorkingTreeError::Add(e) => write!(f, "add: {e}"),
             WorkingTreeError::Remove(e) => write!(f, "remove: {e}"),
             WorkingTreeError::Commit(m) => write!(f, "commit: {m}"),
+            WorkingTreeError::PointlessCommit => {
+                write!(f, "no changes to commit (use allow_pointless to override)")
+            }
             WorkingTreeError::Repository(e) => write!(f, "repository: {e}"),
             WorkingTreeError::Branch(e) => write!(f, "branch: {e}"),
             WorkingTreeError::Transport(e) => write!(f, "transport error: {e}"),
@@ -172,6 +177,11 @@ pub struct CommitOptions {
     /// The branch nickname, recorded as the `branch-nick` revision property
     /// when set and not already present in `revprops`.
     pub branch_nick: Option<String>,
+    /// Whether to allow a commit that records no change. When `false`
+    /// (breezy's default), a commit with nothing to record fails with
+    /// [`WorkingTreeError::PointlessCommit`]. A commit with pending merges
+    /// is never pointless.
+    pub allow_pointless: bool,
 }
 
 impl CommitOptions {
@@ -211,6 +221,11 @@ impl CommitOptions {
 
     pub fn branch_nick(mut self, nick: impl Into<String>) -> Self {
         self.branch_nick = Some(nick.into());
+        self
+    }
+
+    pub fn allow_pointless(mut self, allow: bool) -> Self {
+        self.allow_pointless = allow;
         self
     }
 
@@ -657,6 +672,22 @@ impl WorkingTree {
             .map_err(WorkingTreeError::Repository)?;
         let changes = self.iter_changes(&basis)?;
 
+        // Refuse a commit that records no change, unless pending merges make
+        // it meaningful or the caller opts in. Each recorded change yields a
+        // delta entry; against the null revision the root entry alone (one
+        // change) is not a real change.
+        if !options.allow_pointless && parents.len() <= 1 {
+            let basis_is_null = basis_revision_id == crate::branch::NULL_REVISION;
+            let pointless = if basis_is_null {
+                changes.len() <= 1
+            } else {
+                changes.is_empty()
+            };
+            if pointless {
+                return Err(WorkingTreeError::PointlessCommit);
+            }
+        }
+
         repository
             .start_write_group()
             .map_err(WorkingTreeError::Repository)?;
@@ -999,7 +1030,9 @@ mod tests {
             .commit(
                 repo.as_mut(),
                 &branch,
-                &CommitOptions::new("T <t@e>", "empty commit").timestamp(1577880000),
+                &CommitOptions::new("T <t@e>", "empty commit")
+                    .timestamp(1577880000)
+                    .allow_pointless(true),
             )
             .unwrap();
 
@@ -1331,5 +1364,47 @@ mod tests {
             wt.commit(repo.as_mut(), &branch, &options),
             Err(WorkingTreeError::Commit(_))
         ));
+    }
+
+    /// A commit with no changes is refused unless allow_pointless is set.
+    #[test]
+    fn pointless_commit_is_refused_then_allowed() {
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"hi\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        wt.commit(
+            repo.as_mut(),
+            &branch,
+            &CommitOptions::new("T <t@e>", "first").timestamp(1577880000),
+        )
+        .unwrap();
+
+        // Re-open with no changes: a plain commit is pointless.
+        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        assert!(matches!(
+            wt.commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "empty").timestamp(1577890000)
+            ),
+            Err(WorkingTreeError::PointlessCommit)
+        ));
+
+        // With allow_pointless it succeeds.
+        let revid = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "empty")
+                    .timestamp(1577890000)
+                    .allow_pointless(true),
+            )
+            .unwrap();
+        assert!(!revid.is_empty());
     }
 }
