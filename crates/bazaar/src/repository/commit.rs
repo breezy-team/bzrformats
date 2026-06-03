@@ -32,6 +32,8 @@ pub struct CommitBuilder<'a> {
     committer: String,
     timestamp: u64,
     timezone: i32,
+    /// Revision properties to record on the revision.
+    properties: HashMap<String, Vec<u8>>,
     /// The inventory delta recorded so far.
     delta: Vec<InventoryDeltaEntry>,
     /// The new inventory's sha1, set by `finish_inventory`.
@@ -54,9 +56,16 @@ impl<'a> CommitBuilder<'a> {
             committer,
             timestamp,
             timezone,
+            properties: HashMap::new(),
             delta: Vec::new(),
             inventory_sha1: None,
         }
+    }
+
+    /// Set the revision properties recorded on the commit.
+    pub fn with_properties(mut self, properties: HashMap<String, Vec<u8>>) -> Self {
+        self.properties = properties;
+        self
     }
 
     /// The basis revision the delta is recorded against (the first parent,
@@ -247,7 +256,7 @@ impl<'a> CommitBuilder<'a> {
                 .collect(),
             Some(self.committer.clone()),
             message.to_string(),
-            HashMap::new(),
+            self.properties.clone(),
             Some(inventory_sha1),
             self.timestamp as f64,
             Some(self.timezone),

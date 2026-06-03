@@ -148,6 +148,106 @@ pub struct WorkingTreeChange {
     pub basis_revision: Option<Vec<u8>>,
 }
 
+/// Options for [`WorkingTree::commit`], mirroring the parameters of
+/// breezy's `commit`. Build with [`CommitOptions::new`] and the chained
+/// setters; unset fields take breezy's defaults.
+#[derive(Debug, Clone, Default)]
+pub struct CommitOptions {
+    /// The commit message.
+    pub message: String,
+    /// The committer string ("Name <email>"). Required.
+    pub committer: String,
+    /// Authors, recorded as the `authors` revision property (one per line);
+    /// distinct from the committer.
+    pub authors: Vec<String>,
+    /// Commit timestamp (seconds since the epoch).
+    pub timestamp: u64,
+    /// Timezone offset in seconds east of UTC.
+    pub timezone: i32,
+    /// Extra revision properties. `\r` is rejected in values.
+    pub revprops: std::collections::HashMap<String, Vec<u8>>,
+    /// An explicit revision id; generated from the committer/timestamp when
+    /// `None`.
+    pub revision_id: Option<Vec<u8>>,
+    /// The branch nickname, recorded as the `branch-nick` revision property
+    /// when set and not already present in `revprops`.
+    pub branch_nick: Option<String>,
+}
+
+impl CommitOptions {
+    /// A new option set with the required `committer` and `message`.
+    pub fn new(committer: impl Into<String>, message: impl Into<String>) -> Self {
+        CommitOptions {
+            message: message.into(),
+            committer: committer.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn timestamp(mut self, timestamp: u64) -> Self {
+        self.timestamp = timestamp;
+        self
+    }
+
+    pub fn timezone(mut self, timezone: i32) -> Self {
+        self.timezone = timezone;
+        self
+    }
+
+    pub fn authors(mut self, authors: Vec<String>) -> Self {
+        self.authors = authors;
+        self
+    }
+
+    pub fn revprops(mut self, revprops: std::collections::HashMap<String, Vec<u8>>) -> Self {
+        self.revprops = revprops;
+        self
+    }
+
+    pub fn revision_id(mut self, revision_id: Vec<u8>) -> Self {
+        self.revision_id = Some(revision_id);
+        self
+    }
+
+    pub fn branch_nick(mut self, nick: impl Into<String>) -> Self {
+        self.branch_nick = Some(nick.into());
+        self
+    }
+
+    /// The full revision-property map: the caller's `revprops` plus the
+    /// derived `authors` and `branch-nick` properties. Validates that no
+    /// value contains a carriage return (which the XML/bencode serializers
+    /// cannot round-trip).
+    fn build_properties(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>, WorkingTreeError> {
+        let mut props = self.revprops.clone();
+        if !self.authors.is_empty() {
+            // breezy stores multiple authors under "authors" (newline
+            // separated) and a single author under "author".
+            let key = if self.authors.len() == 1 {
+                "author"
+            } else {
+                "authors"
+            };
+            props.insert(key.to_string(), self.authors.join("\n").into_bytes());
+        }
+        if let Some(nick) = &self.branch_nick {
+            props
+                .entry("branch-nick".to_string())
+                .or_insert_with(|| nick.clone().into_bytes());
+        }
+        for (k, v) in &props {
+            if v.contains(&b'\r') {
+                return Err(WorkingTreeError::Commit(format!(
+                    "revision property {k:?} contains a carriage return"
+                )));
+            }
+        }
+        Ok(props)
+    }
+}
+
 /// A dirstate-based working tree, accessed through a transport rooted at
 /// the tree root (the directory containing `.bzr`).
 pub struct WorkingTree {
@@ -529,10 +629,7 @@ impl WorkingTree {
         &mut self,
         repository: &mut dyn crate::repository::Repository,
         branch: &crate::branch::Branch,
-        committer: &str,
-        message: &str,
-        timestamp: u64,
-        timezone: i32,
+        options: &CommitOptions,
     ) -> Result<Vec<u8>, WorkingTreeError> {
         let parents: Vec<Vec<u8>> = self
             .dirstate
@@ -541,9 +638,13 @@ impl WorkingTree {
             .filter(|p| p.as_slice() != crate::branch::NULL_REVISION)
             .cloned()
             .collect();
-        let revid = crate::RevisionId::generate(committer, Some(timestamp))
-            .as_bytes()
-            .to_vec();
+        let revid = match &options.revision_id {
+            Some(id) => id.clone(),
+            None => crate::RevisionId::generate(&options.committer, Some(options.timestamp))
+                .as_bytes()
+                .to_vec(),
+        };
+        let properties = options.build_properties()?;
         let basis_revision_id = parents
             .first()
             .cloned()
@@ -560,13 +661,15 @@ impl WorkingTree {
             .start_write_group()
             .map_err(WorkingTreeError::Repository)?;
         {
-            let mut builder = repository.get_commit_builder(
-                parents.clone(),
-                revid.clone(),
-                committer.to_string(),
-                timestamp,
-                timezone,
-            );
+            let mut builder = repository
+                .get_commit_builder(
+                    parents.clone(),
+                    revid.clone(),
+                    options.committer.clone(),
+                    options.timestamp,
+                    options.timezone,
+                )
+                .with_properties(properties);
             builder
                 .record_iter_changes(&changes, |path| {
                     self.transport
@@ -578,7 +681,7 @@ impl WorkingTree {
                 .finish_inventory()
                 .map_err(WorkingTreeError::Repository)?;
             builder
-                .commit(message)
+                .commit(&options.message)
                 .map_err(WorkingTreeError::Repository)?;
         }
         repository
@@ -896,10 +999,7 @@ mod tests {
             .commit(
                 repo.as_mut(),
                 &branch,
-                "T <t@e>",
-                "empty commit",
-                1577880000,
-                0,
+                &CommitOptions::new("T <t@e>", "empty commit").timestamp(1577880000),
             )
             .unwrap();
 
@@ -1018,7 +1118,11 @@ mod tests {
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         let revid = wt
-            .commit(repo.as_mut(), &branch, "T <t@e>", "add a", 1577880000, 0)
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &crate::workingtree::CommitOptions::new("T <t@e>", "add a").timestamp(1577880000),
+            )
             .unwrap();
 
         let reopened = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
@@ -1047,10 +1151,7 @@ mod tests {
             .commit(
                 repo.as_mut(),
                 &branch,
-                "T <t@e>",
-                "two files",
-                1577880000,
-                0,
+                &CommitOptions::new("T <t@e>", "two files").timestamp(1577880000),
             )
             .unwrap();
 
@@ -1091,7 +1192,11 @@ mod tests {
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         let revid = wt
-            .commit(repo.as_mut(), &branch, "T <t@e>", "add a", 1577880000, 0)
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &crate::workingtree::CommitOptions::new("T <t@e>", "add a").timestamp(1577880000),
+            )
             .unwrap();
 
         let mut wt = WorkingTree::open(parent.clone()).unwrap();
@@ -1119,7 +1224,11 @@ mod tests {
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         let rev1 = wt
-            .commit(repo.as_mut(), &branch, "T <t@e>", "first", 1577880000, 0)
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &crate::workingtree::CommitOptions::new("T <t@e>", "first").timestamp(1577880000),
+            )
             .unwrap();
 
         // Second commit: change only a.txt.
@@ -1128,7 +1237,11 @@ mod tests {
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         let rev2 = wt
-            .commit(repo.as_mut(), &branch, "T <t@e>", "second", 1577890000, 0)
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &crate::workingtree::CommitOptions::new("T <t@e>", "second").timestamp(1577890000),
+            )
             .unwrap();
         assert_ne!(rev1, rev2);
 
@@ -1157,5 +1270,66 @@ mod tests {
         assert_eq!(repo.get_file_text(&a_id, &rev2).unwrap(), b"a two\n");
         assert!(repo.get_file_text(&b_id, &rev2).is_err());
         assert_eq!(repo.get_file_text(&b_id, &rev1).unwrap(), b"b one\n");
+    }
+
+    /// Revision properties, authors and an explicit revision id are recorded
+    /// on the committed revision.
+    #[test]
+    fn commit_records_revprops_authors_and_revid() {
+        use crate::repository::Repository as _;
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"hi\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+
+        let mut props = std::collections::HashMap::new();
+        props.insert("custom".to_string(), b"value".to_vec());
+        let options = CommitOptions::new("T <t@e>", "msg")
+            .timestamp(1577880000)
+            .revprops(props)
+            .authors(vec!["A <a@e>".to_string(), "B <b@e>".to_string()])
+            .branch_nick("trunk")
+            .revision_id(b"my-explicit-revid".to_vec());
+
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt.commit(repo.as_mut(), &branch, &options).unwrap();
+        assert_eq!(revid, b"my-explicit-revid".to_vec());
+
+        let repo = cd.open_repository().unwrap();
+        let rev = repo.get_revision(&revid).unwrap();
+        assert_eq!(
+            rev.properties.get("custom").map(|v| v.as_slice()),
+            Some(&b"value"[..])
+        );
+        // Multiple authors are stored under "authors", newline-separated.
+        assert_eq!(
+            rev.properties.get("authors").map(|v| v.as_slice()),
+            Some(&b"A <a@e>\nB <b@e>"[..])
+        );
+        assert_eq!(
+            rev.properties.get("branch-nick").map(|v| v.as_slice()),
+            Some(&b"trunk"[..])
+        );
+    }
+
+    /// A carriage return in a revision property is rejected.
+    #[test]
+    fn commit_rejects_cr_in_revprops() {
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"hi\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        let mut props = std::collections::HashMap::new();
+        props.insert("bad".to_string(), b"has\rcr".to_vec());
+        let options = CommitOptions::new("T <t@e>", "msg")
+            .timestamp(1577880000)
+            .revprops(props);
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        assert!(matches!(
+            wt.commit(repo.as_mut(), &branch, &options),
+            Err(WorkingTreeError::Commit(_))
+        ));
     }
 }

@@ -269,7 +269,12 @@ impl WorkingTree {
     }
 
     /// Commit the live tree state as a new revision and return its id.
-    #[pyo3(signature = (repository, branch, committer, message, timestamp, timezone))]
+    ///
+    /// `revprops` is an optional `{str: bytes}` dict of revision properties;
+    /// `authors` an optional list of author strings; `revision_id` an
+    /// optional explicit id (generated when omitted).
+    #[pyo3(signature = (repository, branch, committer, message, timestamp, timezone,
+        revprops=None, authors=None, revision_id=None, branch_nick=None))]
     #[allow(clippy::too_many_arguments)]
     fn commit<'py>(
         &mut self,
@@ -280,19 +285,36 @@ impl WorkingTree {
         message: &str,
         timestamp: u64,
         timezone: i32,
+        revprops: Option<&Bound<'py, PyDict>>,
+        authors: Option<Vec<String>>,
+        revision_id: Option<&[u8]>,
+        branch_nick: Option<String>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let mut repo = repository.borrow_mut();
         let branch = branch.borrow();
+        let mut options = bazaar::workingtree::CommitOptions::new(committer, message)
+            .timestamp(timestamp)
+            .timezone(timezone);
+        if let Some(props) = revprops {
+            let mut map: std::collections::HashMap<String, Vec<u8>> =
+                std::collections::HashMap::new();
+            for (k, v) in props.iter() {
+                map.insert(k.extract()?, v.extract()?);
+            }
+            options = options.revprops(map);
+        }
+        if let Some(authors) = authors {
+            options = options.authors(authors);
+        }
+        if let Some(id) = revision_id {
+            options = options.revision_id(id.to_vec());
+        }
+        if let Some(nick) = branch_nick {
+            options = options.branch_nick(nick);
+        }
         let revid = self
             .inner
-            .commit(
-                repo.inner.as_mut(),
-                &branch.inner,
-                committer,
-                message,
-                timestamp,
-                timezone,
-            )
+            .commit(repo.inner.as_mut(), &branch.inner, &options)
             .map_err(err)?;
         Ok(PyBytes::new(py, &revid))
     }
