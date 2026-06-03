@@ -7,6 +7,8 @@ declare_branch_format! {
         format_string: b"Bazaar-NG branch format 5\n",
         description: "Branch format 5 (full history)",
         supports_tags: false,
+        full_history: true,
+        supported: true,
         deprecated: true,
     }
 }

@@ -13,6 +13,11 @@ pub use format::{all_formats, find_format, BranchFormat};
 
 use std::collections::BTreeMap;
 
+/// The branch format assumed when the `format` marker is absent (the
+/// in-memory test transports don't write one). Format 7 is the modern
+/// `last-revision` layout.
+const DEFAULT_FORMAT: &BranchFormat = &formats::FORMAT_7;
+
 use crate::lockdir::{Lock, LockDir, LockError};
 use crate::transport::{SharedTransport, TransportError};
 
@@ -66,20 +71,37 @@ pub type RevisionInfo = (u64, Vec<u8>);
 /// outlives it.
 pub struct Branch {
     transport: SharedTransport,
+    format: &'static BranchFormat,
 }
 
 impl Branch {
     /// Open the branch reachable through `transport` (rooted at
-    /// `.bzr/branch`).
+    /// `.bzr/branch`), reading its `format` marker to learn how the tip is
+    /// stored. A missing marker is treated as the modern default format.
     pub fn new(transport: SharedTransport) -> Self {
-        Branch { transport }
+        let format = match transport.get_bytes("format") {
+            Ok(marker) => find_format(&marker).unwrap_or(DEFAULT_FORMAT),
+            Err(_) => DEFAULT_FORMAT,
+        };
+        Branch { transport, format }
+    }
+
+    /// The format this branch was opened as.
+    pub fn format(&self) -> &'static BranchFormat {
+        self.format
     }
 
     /// The tip of the branch as `(revno, revision_id)`.
     ///
-    /// Reads `last-revision`, whose single line is `<revno> <revision_id>`.
-    /// A missing file means an empty branch, reported as `(0, b"null:")`.
+    /// Format 5 stores the full mainline in `revision-history` (one revision
+    /// id per line); the revno is the line count and the tip is the last
+    /// line. Formats 6/7/8 store a single `last-revision` line
+    /// `<revno> <revision_id>`. A missing file means an empty branch,
+    /// reported as `(0, b"null:")`.
     pub fn last_revision_info(&self) -> Result<RevisionInfo, BranchError> {
+        if self.format.full_history {
+            return self.last_revision_info_full_history();
+        }
         let bytes = match self.transport.get_bytes("last-revision") {
             Ok(b) => b,
             Err(TransportError::NoSuchFile(_)) => return Ok((0, NULL_REVISION.to_vec())),
@@ -98,6 +120,37 @@ impl Branch {
             })?;
         let revision_id = line[space + 1..].to_vec();
         Ok((revno, revision_id))
+    }
+
+    /// Read the tip from a format-5 `revision-history` file.
+    fn last_revision_info_full_history(&self) -> Result<RevisionInfo, BranchError> {
+        let history = self.revision_history()?;
+        match history.last() {
+            Some(tip) => Ok((history.len() as u64, tip.clone())),
+            None => Ok((0, NULL_REVISION.to_vec())),
+        }
+    }
+
+    /// The full mainline as a list of revision ids, oldest first.
+    ///
+    /// Read from the format-5 `revision-history` file. For formats that store
+    /// only the tip (6/7/8), this returns just the tip (or empty), since the
+    /// full history is not recorded on the branch.
+    pub fn revision_history(&self) -> Result<Vec<Vec<u8>>, BranchError> {
+        if !self.format.full_history {
+            let (revno, tip) = self.last_revision_info()?;
+            return Ok(if revno == 0 { vec![] } else { vec![tip] });
+        }
+        let bytes = match self.transport.get_bytes("revision-history") {
+            Ok(b) => b,
+            Err(TransportError::NoSuchFile(_)) => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(bytes
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_vec())
+            .collect())
     }
 
     /// The tip revision id (`b"null:"` for an empty branch).
@@ -148,11 +201,19 @@ impl Branch {
     }
 
     /// Set the branch tip to `(revno, revision_id)`, under the branch lock.
+    ///
+    /// For a format-5 (full-history) branch the tip is appended to the
+    /// `revision-history` list, so the new revision must be a linear child of
+    /// the current tip; `revno` must equal the resulting line count. For 6/7/8
+    /// the single `last-revision` line is rewritten.
     pub fn set_last_revision_info(
         &self,
         revno: u64,
         revision_id: &[u8],
     ) -> Result<(), BranchError> {
+        if self.format.full_history {
+            return self.set_last_revision_info_full_history(revno, revision_id);
+        }
         self.with_write_lock(|| {
             let mut content = format!("{revno} ").into_bytes();
             content.extend_from_slice(revision_id);
@@ -160,6 +221,52 @@ impl Branch {
             self.transport.put_bytes("last-revision", &content, None)?;
             Ok(())
         })
+    }
+
+    fn set_last_revision_info_full_history(
+        &self,
+        revno: u64,
+        revision_id: &[u8],
+    ) -> Result<(), BranchError> {
+        self.with_write_lock(|| {
+            let mut history = self.revision_history()?;
+            if revision_id == NULL_REVISION {
+                history.clear();
+            } else {
+                // The common commit case extends the mainline by one. If revno
+                // points before the current tip, truncate to it (an uncommit);
+                // otherwise append.
+                let target_len = revno as usize;
+                if target_len <= history.len() {
+                    history.truncate(target_len.saturating_sub(1));
+                }
+                history.push(revision_id.to_vec());
+            }
+            if history.len() as u64 != revno {
+                return Err(BranchError::Corrupt(format!(
+                    "revno {revno} does not match history length {}",
+                    history.len()
+                )));
+            }
+            self.write_revision_history(&history)
+        })
+    }
+
+    /// Replace the full mainline (format 5), under the branch lock.
+    pub fn set_revision_history(&self, history: &[Vec<u8>]) -> Result<(), BranchError> {
+        self.with_write_lock(|| self.write_revision_history(history))
+    }
+
+    fn write_revision_history(&self, history: &[Vec<u8>]) -> Result<(), BranchError> {
+        let mut content = Vec::new();
+        for (i, revid) in history.iter().enumerate() {
+            if i > 0 {
+                content.push(b'\n');
+            }
+            content.extend_from_slice(revid);
+        }
+        self.transport.put_bytes("revision-history", &content)?;
+        Ok(())
     }
 
     /// Replace the branch tags, under the branch lock.
@@ -250,6 +357,17 @@ mod tests {
         (dir, Branch::new(shared), probe)
     }
 
+    /// A format-5 (full-history) branch over a temp dir.
+    fn branch_transport_format5() -> (tempfile::TempDir, Branch, Arc<LocalTransport>) {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Arc::new(LocalTransport::new(dir.path()));
+        probe
+            .put_bytes("format", b"Bazaar-NG branch format 5\n")
+            .unwrap();
+        let shared: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        (dir, Branch::new(shared), probe)
+    }
+
     #[test]
     fn empty_branch_is_null_revision() {
         let (_d, branch, _probe) = branch_transport();
@@ -276,6 +394,43 @@ mod tests {
         let (_d, branch, probe) = branch_transport();
         branch.set_last_revision_info(2, b"x").unwrap();
         assert_eq!(probe.get_bytes("last-revision").unwrap(), b"2 x\n");
+    }
+
+    #[test]
+    fn format5_empty_branch_is_null_revision() {
+        let (_d, branch, _probe) = branch_transport_format5();
+        assert!(branch.format().full_history);
+        assert_eq!(
+            branch.last_revision_info().unwrap(),
+            (0, NULL_REVISION.to_vec())
+        );
+        assert!(branch.revision_history().unwrap().is_empty());
+    }
+
+    #[test]
+    fn format5_appends_to_revision_history() {
+        let (_d, branch, probe) = branch_transport_format5();
+        branch.set_last_revision_info(1, b"rev-1").unwrap();
+        branch.set_last_revision_info(2, b"rev-2").unwrap();
+        assert_eq!(branch.last_revision_info().unwrap(), (2, b"rev-2".to_vec()));
+        assert_eq!(
+            branch.revision_history().unwrap(),
+            vec![b"rev-1".to_vec(), b"rev-2".to_vec()]
+        );
+        // Byte-for-byte the format brz writes: newline-separated, no trailer.
+        assert_eq!(
+            probe.get_bytes("revision-history").unwrap(),
+            b"rev-1\nrev-2".to_vec()
+        );
+    }
+
+    #[test]
+    fn format5_set_revision_history_replaces() {
+        let (_d, branch, _probe) = branch_transport_format5();
+        branch
+            .set_revision_history(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+            .unwrap();
+        assert_eq!(branch.last_revision_info().unwrap(), (3, b"c".to_vec()));
     }
 
     #[test]
