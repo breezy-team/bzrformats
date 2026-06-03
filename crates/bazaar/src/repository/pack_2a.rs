@@ -328,6 +328,7 @@ pub struct Pack2aRepository {
     revisions: Store,
     inventories: Store,
     texts: Store,
+    signatures: Store,
     /// The CHK byte store, shared with the `CHKInventory`s it materializes.
     chk_bytes: SharedChkStore,
     /// The in-progress write group, if one is open.
@@ -348,6 +349,7 @@ impl Pack2aRepository {
         let revisions = build_store(&transport, &packs, IndexKind::Revision)?;
         let inventories = build_store(&transport, &packs, IndexKind::Inventory)?;
         let texts = build_store(&transport, &packs, IndexKind::Text)?;
+        let signatures = build_store(&transport, &packs, IndexKind::Signature)?;
         let chk_bytes: SharedChkStore =
             std::sync::Arc::new(build_store(&transport, &packs, IndexKind::Chk)?);
         Ok(Pack2aRepository {
@@ -356,6 +358,7 @@ impl Pack2aRepository {
             revisions,
             inventories,
             texts,
+            signatures,
             chk_bytes,
             write_group: None,
         })
@@ -610,6 +613,36 @@ impl Pack2aRepository {
             .add_text(file_id, revision, parents, bytes)
     }
 
+    /// Add a signature text for `revision_id` to the open write group.
+    pub fn add_signature_text(
+        &mut self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        self.write_group_mut()?
+            .add_signature(revision_id, signature)
+    }
+
+    /// The signature text stored for `revision_id`, or `None` if the
+    /// revision is unsigned.
+    pub fn get_signature_text(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        let key = Key::fixed(vec![revision_id.to_vec()]);
+        let mut stream = self.signatures.get_record_stream(&[key], "unordered")?;
+        let record = match stream.pop() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if record.storage_kind() == "absent" {
+            return Ok(None);
+        }
+        Ok(Some(
+            record.to_lines().flat_map(|l| l.into_owned()).collect(),
+        ))
+    }
+
     /// Flush the open write group: write its pack, indices and an updated
     /// `pack-names`. After this, re-open the repository to read the newly
     /// committed data (the in-memory read stores are not refreshed).
@@ -700,6 +733,18 @@ impl super::Repository for Pack2aRepository {
         bytes: &[u8],
     ) -> Result<(), RepositoryError> {
         Pack2aRepository::add_text(self, file_id, revision, parents, bytes)
+    }
+
+    fn add_signature_text(
+        &mut self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        Pack2aRepository::add_signature_text(self, revision_id, signature)
+    }
+
+    fn get_signature_text(&self, revision_id: &[u8]) -> Result<Option<Vec<u8>>, RepositoryError> {
+        Pack2aRepository::get_signature_text(self, revision_id)
     }
 
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
@@ -838,6 +883,8 @@ mod tests {
         .unwrap();
         repo.add_text(b"file-1", b"rev-1", &[], b"hello world\n")
             .unwrap();
+        repo.add_signature_text(b"rev-1", b"-----SIG-----\nsigned rev-1\n")
+            .unwrap();
         repo.commit_write_group().unwrap();
 
         // Re-open to read the committed data.
@@ -850,6 +897,12 @@ mod tests {
             repo.get_file_text(b"file-1", b"rev-1").unwrap(),
             b"hello world\n"
         );
+        // The signature round-trips; an unsigned revision returns None.
+        assert_eq!(
+            repo.get_signature_text(b"rev-1").unwrap().as_deref(),
+            Some(&b"-----SIG-----\nsigned rev-1\n"[..])
+        );
+        assert_eq!(repo.get_signature_text(b"rev-2").unwrap(), None);
     }
 
     #[test]

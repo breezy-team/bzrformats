@@ -197,6 +197,7 @@ pub(super) struct WriteGroup {
     revisions: WriteStore,
     inventories: WriteStore,
     texts: WriteStore,
+    signatures: WriteStore,
     /// `Arc`-wrapped so it can be handed to `CHKInventory::from_inventory`,
     /// which writes CHK pages through it as the inventory is built.
     chk_bytes: Arc<WriteStore>,
@@ -227,12 +228,13 @@ impl WriteGroup {
             GroupCompressVersionedFiles::new(PackWritingIndex::new(has_graph), access, false)
         };
 
-        // Revisions, inventories and texts carry a parent graph; the chk
-        // store does not. Build all stores before moving `pack` into the
-        // struct, so the borrowing closure is done first.
+        // Revisions, inventories and texts carry a parent graph; the
+        // signatures and chk stores do not. Build all stores before moving
+        // `pack` into the struct, so the borrowing closure is done first.
         let revisions = make(true);
         let inventories = make(true);
         let texts = make(true);
+        let signatures = make(false);
         let mut chk_store = make(false);
         if let Some(fallback) = chk_fallback {
             chk_store.add_fallback_versioned_files(Box::new(fallback));
@@ -245,8 +247,21 @@ impl WriteGroup {
             revisions,
             inventories,
             texts,
+            signatures,
             chk_bytes,
         })
+    }
+
+    /// Add a signature text for `revision_id` (the clearsigned testament).
+    pub(super) fn add_signature(
+        &self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let key = Key::fixed(vec![revision_id.to_vec()]);
+        self.signatures
+            .add_lines(key, Some(Vec::new()), split_lines(signature))?;
+        Ok(())
     }
 
     /// Add a revision record (already serialised to bencode bytes).
@@ -390,7 +405,7 @@ impl WriteGroup {
         let rix = serialise_index(&self.revisions, 1)?;
         let iix = serialise_index(&self.inventories, 1)?;
         let tix = serialise_index(&self.texts, 2)?;
-        let six = empty_index(1);
+        let six = serialise_index(&self.signatures, 1)?;
         let cix = serialise_index(self.chk_bytes.as_ref(), 1)?;
 
         // Close the container and grab the pack bytes.
@@ -500,12 +515,4 @@ fn serialise_index(store: &WriteStore, key_elements: usize) -> Result<Vec<u8>, R
     builder
         .finish()
         .map_err(|e| RepositoryError::Corrupt(format!("index finish: {e:?}")))
-}
-
-/// An empty index of the given key arity (used for the unused signatures
-/// index, which carries one graph ref-list like revisions).
-fn empty_index(key_elements: usize) -> Vec<u8> {
-    BTreeBuilder::new(1, key_elements)
-        .finish()
-        .expect("empty index always serialises")
 }

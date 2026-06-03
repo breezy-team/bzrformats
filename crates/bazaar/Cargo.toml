@@ -57,6 +57,15 @@ winapi = { version = "0.3", features = [
 	"minwinbase",
 ] }
 
+[dependencies.sequoia-openpgp]
+version = "1"
+optional = true
+default-features = false
+features = ["crypto-openssl"]
+
 [features]
 default = ["pyo3"]
 pyo3 = ["dep:pyo3"]
+# In-process OpenPGP commit signing via Sequoia. Off by default because it
+# pulls a crypto backend (OpenSSL) into the build.
+gpg = ["dep:sequoia-openpgp"]

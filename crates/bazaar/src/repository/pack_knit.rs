@@ -295,6 +295,7 @@ pub struct KnitPackRepository {
     revisions: Store,
     inventories: Store,
     texts: Store,
+    signatures: Store,
     write_group: Option<WriteGroup>,
 }
 
@@ -309,6 +310,7 @@ impl KnitPackRepository {
             revisions: build_store(&transport, &packs, IndexKind::Revision)?,
             inventories: build_store(&transport, &packs, IndexKind::Inventory)?,
             texts: build_store(&transport, &packs, IndexKind::Text)?,
+            signatures: build_store(&transport, &packs, IndexKind::Signature)?,
             transport,
             write_group: None,
         })
@@ -638,6 +640,28 @@ impl super::Repository for KnitPackRepository {
         bytes: &[u8],
     ) -> Result<(), RepositoryError> {
         KnitPackRepository::add_text(self, file_id, revision, parents, bytes)
+    }
+
+    fn add_signature_text(
+        &mut self,
+        _revision_id: &[u8],
+        _signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        // TODO: knit-pack signature writing is not implemented. Commit from
+        // a working tree always runs against a 2a repository, so this path
+        // is not yet exercised; the read side below works for inspecting
+        // signatures in an existing knit-pack repository.
+        Err(RepositoryError::UnsupportedFormat(
+            "signature writing for knit-pack repositories",
+        ))
+    }
+
+    fn get_signature_text(&self, revision_id: &[u8]) -> Result<Option<Vec<u8>>, RepositoryError> {
+        let key: KnitKey = vec![revision_id.to_vec()];
+        match self.signatures.get_text(&key) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(_) => Ok(None),
+        }
     }
 
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {

@@ -112,6 +112,16 @@ pub trait Repository: Send + Sync {
         bytes: &[u8],
     ) -> Result<(), RepositoryError>;
 
+    /// Add a signature text for `revision_id` to the open write group.
+    fn add_signature_text(
+        &mut self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError>;
+
+    /// The signature text stored for `revision_id`, or `None` if unsigned.
+    fn get_signature_text(&self, revision_id: &[u8]) -> Result<Option<Vec<u8>>, RepositoryError>;
+
     /// Flush the open write group, committing its additions.
     fn commit_write_group(&mut self) -> Result<(), RepositoryError>;
 }
