@@ -279,6 +279,20 @@ impl WorkingTree {
         self.inner.unknowns().map_err(err)
     }
 
+    /// The tree's parent revision ids (basis first, then pending merges).
+    fn parent_ids<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyBytes>> {
+        self.inner
+            .parent_ids()
+            .iter()
+            .map(|p| PyBytes::new(py, p))
+            .collect()
+    }
+
+    /// Add `revision_id` as a pending-merge parent for the next commit.
+    fn add_pending_merge(&mut self, revision_id: &[u8]) -> PyResult<()> {
+        self.inner.add_pending_merge(revision_id).map_err(err)
+    }
+
     /// Commit the live tree state as a new revision and return its id.
     ///
     /// `revprops` is an optional `{str: bytes}` dict of revision properties;

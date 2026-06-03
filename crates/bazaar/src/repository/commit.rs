@@ -187,6 +187,13 @@ impl<'a> CommitBuilder<'a> {
                 .unwrap_or(crate::inventory::ROOT_ID),
         );
 
+        // The per-file text parents, as (file_id, parent_revision) keys.
+        let text_parents: Vec<(Vec<u8>, Vec<u8>)> = change
+            .text_parents
+            .iter()
+            .map(|rev| (change.file_id.clone(), rev.clone()))
+            .collect();
+
         match kind {
             EntryKind::File => {
                 let content = get_file_text(new_path)?;
@@ -196,7 +203,7 @@ impl<'a> CommitBuilder<'a> {
                     self.repository.add_text(
                         &change.file_id,
                         &self.new_revision_id,
-                        &[],
+                        &text_parents,
                         &content,
                     )?;
                 }
@@ -213,8 +220,12 @@ impl<'a> CommitBuilder<'a> {
             }
             EntryKind::Directory => {
                 if writes_text {
-                    self.repository
-                        .add_text(&change.file_id, &self.new_revision_id, &[], b"")?;
+                    self.repository.add_text(
+                        &change.file_id,
+                        &self.new_revision_id,
+                        &text_parents,
+                        b"",
+                    )?;
                 }
                 Ok(Entry::directory(
                     file_id,
@@ -225,8 +236,12 @@ impl<'a> CommitBuilder<'a> {
             }
             EntryKind::Symlink => {
                 if writes_text {
-                    self.repository
-                        .add_text(&change.file_id, &self.new_revision_id, &[], b"")?;
+                    self.repository.add_text(
+                        &change.file_id,
+                        &self.new_revision_id,
+                        &text_parents,
+                        b"",
+                    )?;
                 }
                 // The symlink target is read from the working tree's file
                 // content path; record it on the entry.

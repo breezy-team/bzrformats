@@ -166,6 +166,11 @@ pub struct WorkingTreeChange {
     pub new_executable: bool,
     /// The entry's last-changed revision in the basis, or `None` if new.
     pub basis_revision: Option<Vec<u8>>,
+    /// The per-file text parents: this file's last-changed revision in each
+    /// parent tree it appears in (deduplicated). When a new text is written
+    /// for the file, these become the text record's parents, giving the
+    /// per-file graph. Empty for a brand-new file.
+    pub text_parents: Vec<Vec<u8>>,
 }
 
 /// Options for [`WorkingTree::commit`], mirroring the parameters of
@@ -339,6 +344,58 @@ impl WorkingTree {
         self.dirstate.parents.first().cloned()
     }
 
+    /// The tree's parent revision ids (the basis first, then any pending
+    /// merges).
+    pub fn parent_ids(&self) -> Vec<Vec<u8>> {
+        self.dirstate
+            .parents
+            .iter()
+            .filter(|p| p.as_slice() != crate::branch::NULL_REVISION)
+            .cloned()
+            .collect()
+    }
+
+    /// Add `revision_id` as a pending-merge parent, so the next commit
+    /// records it as an additional parent. The basis (first parent) and its
+    /// tree are preserved; the merge parent is recorded by id only (its
+    /// per-entry tree is not stored, matching brz's dirstate). The dirstate
+    /// is rewritten to disk.
+    pub fn add_pending_merge(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError> {
+        let mut parents = self.parent_ids();
+        if parents.iter().any(|p| p == revision_id) {
+            return Ok(());
+        }
+        parents.push(revision_id.to_vec());
+
+        // Preserve the basis (tree-1) entries; the merge parents carry no
+        // per-entry tree data.
+        let basis_entries = self.basis_tree_entries();
+        let mut per_parent: Vec<Vec<(Vec<u8>, Vec<u8>, crate::dirstate::TreeData)>> =
+            vec![basis_entries];
+        for _ in 1..parents.len() {
+            per_parent.push(Vec::new());
+        }
+        self.dirstate
+            .set_parent_trees(parents, Vec::new(), per_parent)
+            .map_err(|e| WorkingTreeError::Commit(format!("set parents: {e:?}")))?;
+        self.save_dirstate()
+    }
+
+    /// The basis (tree-1) entries as `(path, file_id, TreeData)`, for
+    /// re-establishing the basis when changing the parent list.
+    fn basis_tree_entries(&self) -> Vec<(Vec<u8>, Vec<u8>, crate::dirstate::TreeData)> {
+        let mut out = Vec::new();
+        for entry in self.dirstate.iter_entries() {
+            let td = match entry.trees.get(1) {
+                Some(t) if !matches!(t.minikind, Kind::Absent | Kind::Relocated) => t.clone(),
+                _ => continue,
+            };
+            let path = join_path(&entry.key.dirname, &entry.key.basename);
+            out.push((path.into_bytes(), entry.key.file_id.clone(), td));
+        }
+        out
+    }
+
     /// List the tracked files and directories in the live working tree
     /// (dirstate tree 0), in dirstate (path) order. The synthetic root
     /// entry is omitted.
@@ -447,6 +504,18 @@ impl WorkingTree {
         &self,
         basis: &crate::repository::RevisionTree,
     ) -> Result<Vec<WorkingTreeChange>, WorkingTreeError> {
+        self.iter_changes_with_parents(basis, &[])
+    }
+
+    /// As [`iter_changes`](Self::iter_changes), but also considers the
+    /// `other_parents` trees (the non-basis merge parents) when computing
+    /// each changed file's per-file text parents, so a merge commit records
+    /// the full per-file graph.
+    pub fn iter_changes_with_parents(
+        &self,
+        basis: &crate::repository::RevisionTree,
+        other_parents: &[crate::repository::RevisionTree],
+    ) -> Result<Vec<WorkingTreeChange>, WorkingTreeError> {
         use crate::FileId;
 
         let live = self.collect_live_entries();
@@ -474,6 +543,7 @@ impl WorkingTree {
                 new_kind: Some(EntryKind::Directory),
                 new_executable: false,
                 basis_revision: None,
+                text_parents: Vec::new(),
             });
         }
 
@@ -506,6 +576,7 @@ impl WorkingTree {
                         new_kind: None,
                         new_executable: false,
                         basis_revision,
+                        text_parents: Vec::new(),
                     });
                 }
                 continue;
@@ -530,6 +601,7 @@ impl WorkingTree {
             let moved = old_path.as_deref() != Some(e.path.as_str());
 
             if content_change || meta_change || moved {
+                let text_parents = self.text_parents_for(&fid, basis, other_parents);
                 changes.push(WorkingTreeChange {
                     file_id: e.file_id.clone(),
                     old_path,
@@ -540,6 +612,7 @@ impl WorkingTree {
                     new_kind: Some(e.kind),
                     new_executable: e.executable,
                     basis_revision,
+                    text_parents,
                 });
             }
         }
@@ -570,10 +643,32 @@ impl WorkingTree {
                 new_kind: None,
                 new_executable: false,
                 basis_revision,
+                text_parents: Vec::new(),
             });
         }
 
         Ok(changes)
+    }
+
+    /// The per-file text parents for `file_id`: its last-changed revision in
+    /// the basis tree and in each other parent tree, deduplicated in
+    /// first-seen order. Empty when the file is new in every parent.
+    fn text_parents_for(
+        &self,
+        file_id: &crate::FileId,
+        basis: &crate::repository::RevisionTree,
+        other_parents: &[crate::repository::RevisionTree],
+    ) -> Vec<Vec<u8>> {
+        let mut parents = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for tree in std::iter::once(basis).chain(other_parents.iter()) {
+            if let Some(rev) = tree.get_file_revision(file_id) {
+                if seen.insert(rev.clone()) {
+                    parents.push(rev);
+                }
+            }
+        }
+        parents
     }
 
     /// Whether `entry`'s on-disk content differs from its basis entry. A new
@@ -758,7 +853,11 @@ impl WorkingTree {
     /// the new tip and updates the dirstate basis. Returns the new revision
     /// id.
     ///
-    /// Single-parent only: pending merges are not yet recorded.
+    /// Pending merges are supported: every dirstate parent is recorded on the
+    /// revision, and a changed file's text parents span all parents it
+    /// appears in. TODO: a file whose content reverts to the basis after a
+    /// merge (breezy's `unchanged_merged` case) is not yet re-recorded to
+    /// reflect the merge in its per-file graph.
     pub fn commit(
         &mut self,
         repository: &mut dyn crate::repository::Repository,
@@ -800,11 +899,19 @@ impl WorkingTree {
         }
 
         // Diff the live tree against its basis before opening the write
-        // group, so we know exactly which entries changed.
+        // group, so we know exactly which entries changed. The non-basis
+        // merge parents are loaded too, so each changed file's per-file text
+        // parents reflect the merge.
         let basis = repository
             .revision_tree(&basis_revision_id)
             .map_err(WorkingTreeError::Repository)?;
-        let mut changes = self.iter_changes(&basis)?;
+        let other_parents: Vec<crate::repository::RevisionTree> = parents
+            .iter()
+            .skip(1)
+            .map(|p| repository.revision_tree(p))
+            .collect::<Result<_, _>>()
+            .map_err(WorkingTreeError::Repository)?;
+        let mut changes = self.iter_changes_with_parents(&basis, &other_parents)?;
         if selective {
             changes.retain(|c| change_selected(c, &options.specific_files, &options.exclude));
         }
@@ -1906,5 +2013,68 @@ mod tests {
         assert!(sig.starts_with("-----BEGIN PGP SIGNED MESSAGE-----"));
         assert!(sig.contains("bazaar testament short form 3 strict"));
         assert!(sig.contains("-----BEGIN PGP SIGNATURE-----"));
+    }
+
+    /// A commit with a pending merge records every parent on the revision.
+    #[test]
+    fn merge_commit_records_multiple_parents() {
+        use crate::repository::Repository as _;
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"a1\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev1 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "c1").timestamp(1577880000),
+            )
+            .unwrap();
+
+        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"a2\n").unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev2 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "c2").timestamp(1577890000),
+            )
+            .unwrap();
+
+        // Add rev1 as a pending merge and commit rev3 with both parents.
+        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        wt.add_pending_merge(&rev1).unwrap();
+        assert_eq!(wt.parent_ids(), vec![rev2.clone(), rev1.clone()]);
+        parent.put_bytes("a.txt", b"a3\n").unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev3 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "merge").timestamp(1577900000),
+            )
+            .unwrap();
+
+        // rev3 records both rev2 (basis) and rev1 (merge) as parents.
+        let repo = cd.open_repository().unwrap();
+        let rev = repo.get_revision(&rev3).unwrap();
+        let parent_ids: Vec<Vec<u8>> = rev
+            .parent_ids
+            .iter()
+            .map(|p| p.as_bytes().to_vec())
+            .collect();
+        assert_eq!(parent_ids, vec![rev2.clone(), rev1.clone()]);
+        assert_eq!(
+            repo.get_file_text(&wt.path2id("a.txt").unwrap(), &rev3)
+                .unwrap(),
+            b"a3\n"
+        );
+        // The dirstate basis is the new revision, with no pending merges.
+        assert_eq!(wt.parent_ids(), vec![rev3]);
     }
 }
