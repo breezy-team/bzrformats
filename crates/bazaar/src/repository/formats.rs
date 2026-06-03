@@ -125,6 +125,7 @@ declare_repository_format! {
         inventory_serializer: &XMLInventorySerializer5,
         open: open_knit_pack,
         supports_external_lookups: true,
+        supported: true,
     }
 }
 
@@ -137,6 +138,7 @@ declare_repository_format! {
         open: open_knit_pack,
         rich_root_data: true,
         supports_external_lookups: true,
+        supported: true,
     }
 }
 

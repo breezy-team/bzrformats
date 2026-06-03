@@ -15,6 +15,7 @@ declare_workingtree_format! {
         format_string: b"Bazaar Working Tree Format 4 (bzr 0.15)\n",
         description: "Working tree format 4 (dirstate)",
         uses_dirstate: true,
+        supported: true,
     }
 }
 
@@ -24,6 +25,7 @@ declare_workingtree_format! {
         description: "Working tree format 5 (dirstate, content filtering)",
         uses_dirstate: true,
         supports_content_filtering: true,
+        supported: true,
     }
 }
 

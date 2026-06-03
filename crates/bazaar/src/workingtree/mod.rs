@@ -2103,4 +2103,44 @@ mod tests {
         // The dirstate basis is the new revision, with no pending merges.
         assert_eq!(wt.parent_ids(), vec![rev3]);
     }
+
+    /// A knit-pack control directory can be created, committed to, and read
+    /// back through the full standalone API (not just 2a).
+    #[test]
+    fn knit_pack_create_commit_read() {
+        use crate::repository::Repository as _;
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let fmt = crate::bzrdir::find_control_dir_format("1.9").unwrap();
+        let cd = BzrDir::create_with_format(&parent, fmt).unwrap();
+
+        parent.put_bytes("a.txt", b"hello\n").unwrap();
+        let mut wt = cd.open_workingtree().unwrap();
+        let file_id = wt.add("a.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "knit-pack commit").timestamp(1577880000),
+            )
+            .unwrap();
+
+        // Re-open and read the committed revision, inventory and file text.
+        let reopened = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let repo = reopened.open_repository().unwrap();
+        assert_eq!(
+            repo.get_revision(&revid).unwrap().message,
+            "knit-pack commit"
+        );
+        let inv = repo.get_inventory(&revid).unwrap();
+        let paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec!["a.txt".to_string()]);
+        assert_eq!(repo.get_file_text(&file_id, &revid).unwrap(), b"hello\n");
+        assert!(repo
+            .format()
+            .format_string()
+            .starts_with(b"Bazaar RepositoryFormatKnitPack6"));
+    }
 }

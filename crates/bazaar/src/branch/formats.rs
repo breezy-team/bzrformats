@@ -16,6 +16,7 @@ declare_branch_format! {
         format_string: b"Bazaar Branch Format 6 (bzr 0.15)\n",
         description: "Branch format 6",
         supports_tags: true,
+        supported: true,
     }
 }
 
@@ -36,6 +37,7 @@ declare_branch_format! {
         supports_tags: true,
         supports_stacking: true,
         supports_reference_locations: true,
+        supported: true,
     }
 }
 
