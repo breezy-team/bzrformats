@@ -392,6 +392,29 @@ impl WorkingTree {
                 .as_ref()
                 .and_then(|be| be.revision().map(|r| r.as_bytes().to_vec()));
 
+            // A versioned file or symlink that has vanished from disk is a
+            // deletion: record it as removed (and the tree unversions it
+            // after the commit). Only entries that were in the basis can be
+            // deleted; a never-committed missing add is simply dropped.
+            if matches!(e.kind, EntryKind::File | EntryKind::Symlink)
+                && !self.transport.has(&e.path)?
+            {
+                if old_path.is_some() {
+                    changes.push(WorkingTreeChange {
+                        file_id: e.file_id.clone(),
+                        old_path,
+                        new_path: None,
+                        content_change: false,
+                        new_name: None,
+                        new_parent_id: None,
+                        new_kind: None,
+                        new_executable: false,
+                        basis_revision,
+                    });
+                }
+                continue;
+            }
+
             let content_change = self.content_changed(e, basis_entry.as_ref())?;
             let new_parent_id = self.parent_id_of(&e.path, &live);
             let new_name = basename(&e.path).to_string();
@@ -718,6 +741,20 @@ impl WorkingTree {
         repository
             .commit_write_group()
             .map_err(WorkingTreeError::Repository)?;
+
+        // Unversion any files that were committed as deletions because they
+        // had vanished from disk, so they leave the working tree's tracked
+        // set (and the dirstate basis rebuilt below). Paths the user had
+        // already unversioned are no longer tracked, so this skips them.
+        let deleted_paths: Vec<String> = changes
+            .iter()
+            .filter(|c| c.new_path.is_none())
+            .filter_map(|c| c.old_path.clone())
+            .filter(|p| self.path2id(p).is_some())
+            .collect();
+        for path in &deleted_paths {
+            self.remove(path)?;
+        }
 
         // Advance the branch tip.
         let new_revno = self.dirstate_revno() + 1;
@@ -1406,5 +1443,47 @@ mod tests {
             )
             .unwrap();
         assert!(!revid.is_empty());
+    }
+
+    /// A versioned file deleted from disk is committed as a removal and
+    /// unversioned from the tree.
+    #[test]
+    fn commit_records_disk_deletion() {
+        use crate::repository::Repository as _;
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"a\n").unwrap();
+        parent.put_bytes("b.txt", b"b\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        wt.add("b.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        wt.commit(
+            repo.as_mut(),
+            &branch,
+            &CommitOptions::new("T <t@e>", "two").timestamp(1577880000),
+        )
+        .unwrap();
+
+        // Delete a.txt from disk (without calling remove) and commit.
+        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        parent.delete("a.txt").unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev2 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "del a").timestamp(1577890000),
+            )
+            .unwrap();
+
+        // a.txt is gone from the committed inventory and from the tree.
+        let repo = cd.open_repository().unwrap();
+        let inv = repo.get_inventory(&rev2).unwrap();
+        let paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec!["b.txt".to_string()]);
+        assert_eq!(wt.path2id("a.txt"), None);
+        assert!(wt.path2id("b.txt").is_some());
     }
 }
