@@ -13,7 +13,6 @@
 
 use std::collections::HashMap;
 
-use crate::btree_graph_index::BTreeGraphIndex;
 use crate::knit::{
     parse_knit_index_value, KnitAccess, KnitError, KnitIndex, KnitIndexMemo, KnitKey, KnitMethod,
     KnitPlainFactory, KnitRecordDetails, KnitVersionedFiles,
@@ -52,7 +51,7 @@ impl PackKnitIndex {
         let mut has_graph = false;
         for pack in packs {
             let name = format!("indices/{pack}{ext}");
-            let index = BTreeGraphIndex::open(transport, &name)?;
+            let index = super::pack_index::PackIndex::open(transport, &name)?;
             if index.node_ref_lists() > 0 {
                 has_graph = true;
             }
@@ -331,9 +330,9 @@ impl KnitPackRepository {
         transport.mkdir("indices")?;
         transport.mkdir("packs")?;
         transport.put_bytes("format", format.format_string(), None)?;
-        let empty = crate::btree_builder::BTreeBuilder::new(0, 1)
+        let empty = super::pack_index::IndexBuilder::new(format.uses_btree_index, 0, 1)
             .finish()
-            .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e:?}")))?;
+            .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e}")))?;
         transport.put_bytes("pack-names", &empty, None)?;
         Self::open(transport)
     }
@@ -345,7 +344,10 @@ impl KnitPackRepository {
                 "a write group is already open".to_string(),
             ));
         }
-        self.write_group = Some(WriteGroup::new(&new_pack_name())?);
+        self.write_group = Some(WriteGroup::new(
+            &new_pack_name(),
+            self.format.uses_btree_index,
+        )?);
         Ok(())
     }
 
@@ -698,7 +700,7 @@ fn new_pack_name() -> String {
 fn read_pack_names_with_values(
     transport: &dyn Transport,
 ) -> Result<Vec<(String, Vec<u8>)>, RepositoryError> {
-    let index = BTreeGraphIndex::open(transport, "pack-names")?;
+    let index = super::pack_index::PackIndex::open(transport, "pack-names")?;
     let mut out = Vec::new();
     for (key, value, _refs) in index.iter_all_entries() {
         if let Some(name) = key.first() {
@@ -710,7 +712,7 @@ fn read_pack_names_with_values(
 
 /// Read `pack-names` and return the pack names in it.
 fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, RepositoryError> {
-    let index = BTreeGraphIndex::open(transport, "pack-names")?;
+    let index = super::pack_index::PackIndex::open(transport, "pack-names")?;
     let mut names = Vec::new();
     for (key, _value, _refs) in index.iter_all_entries() {
         if let Some(name) = key.first() {
@@ -902,10 +904,13 @@ struct WriteGroup {
     revisions: WriteStore,
     inventories: WriteStore,
     texts: WriteStore,
+    /// Whether to write B+Tree indices (1.9+) or format-1 GraphIndex (0.92,
+    /// 1.6).
+    uses_btree: bool,
 }
 
 impl WriteGroup {
-    fn new(pack_name: &str) -> Result<Self, RepositoryError> {
+    fn new(pack_name: &str, uses_btree: bool) -> Result<Self, RepositoryError> {
         let mut writer = ContainerWriter::new(Vec::new());
         writer
             .begin()
@@ -929,6 +934,7 @@ impl WriteGroup {
             revisions,
             inventories,
             texts,
+            uses_btree,
         })
     }
 
@@ -944,12 +950,13 @@ impl WriteGroup {
             revisions,
             inventories,
             texts,
+            uses_btree,
         } = self;
-        let rix = serialise_index(revisions.index, 1)?;
-        let iix = serialise_index(inventories.index, 1)?;
-        let tix = serialise_index(texts.index, 2)?;
+        let rix = serialise_index(revisions.index, 1, uses_btree)?;
+        let iix = serialise_index(inventories.index, 1, uses_btree)?;
+        let tix = serialise_index(texts.index, 2, uses_btree)?;
         // Knit-pack has no chk index; the signatures index is empty.
-        let six = crate::btree_builder::BTreeBuilder::new(1, 1)
+        let six = super::pack_index::IndexBuilder::new(uses_btree, 1, 1)
             .finish()
             .map_err(|e| RepositoryError::Corrupt(format!("empty six: {e:?}")))?;
 
@@ -980,28 +987,33 @@ impl WriteGroup {
             .join(" ")
             .into_bytes();
 
-        let mut names = crate::btree_builder::BTreeBuilder::new(0, 1);
+        let mut names = super::pack_index::IndexBuilder::new(uses_btree, 0, 1);
         for (name, value) in existing {
             names
                 .add_node(vec![name.clone().into_bytes()], value.clone(), vec![])
-                .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e:?}")))?;
+                .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e}")))?;
         }
         names
             .add_node(vec![pack_name.clone().into_bytes()], new_value, vec![])
-            .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e:?}")))?;
+            .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e}")))?;
         let names_bytes = names
             .finish()
-            .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e:?}")))?;
+            .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e}")))?;
         transport.put_bytes("pack-names", &names_bytes, None)?;
         Ok(())
     }
 }
 
-/// Serialise a write index's collected records into a btree index.
-fn serialise_index(index: KnitWriteIndex, key_elements: usize) -> Result<Vec<u8>, RepositoryError> {
+/// Serialise a write index's collected records into a pack index of the
+/// format's index type (btree for 1.9+, format-1 GraphIndex for 0.92/1.6).
+fn serialise_index(
+    index: KnitWriteIndex,
+    key_elements: usize,
+    uses_btree: bool,
+) -> Result<Vec<u8>, RepositoryError> {
     let has_deltas = index.has_deltas;
     let ref_lists = if has_deltas { 2 } else { 1 };
-    let mut builder = crate::btree_builder::BTreeBuilder::new(ref_lists, key_elements);
+    let mut builder = super::pack_index::IndexBuilder::new(uses_btree, ref_lists, key_elements);
     for (key, options, memo, parents) in index.take_records() {
         let noeol = options.contains(&KM::NoEol);
         let method = if options.contains(&KM::LineDelta) {
@@ -1021,11 +1033,11 @@ fn serialise_index(index: KnitWriteIndex, key_elements: usize) -> Result<Vec<u8>
         .map_err(|e| RepositoryError::Corrupt(format!("encode index: {e}")))?;
         builder
             .add_node(key, value, node_refs)
-            .map_err(|e| RepositoryError::Corrupt(format!("index node: {e:?}")))?;
+            .map_err(|e| RepositoryError::Corrupt(format!("index node: {e}")))?;
     }
     builder
         .finish()
-        .map_err(|e| RepositoryError::Corrupt(format!("index finish: {e:?}")))
+        .map_err(|e| RepositoryError::Corrupt(format!("index finish: {e}")))
 }
 
 #[cfg(test)]

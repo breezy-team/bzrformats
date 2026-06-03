@@ -54,6 +54,10 @@ pub struct RepositoryFormat {
     pub supports_tree_reference: bool,
     /// Whether external (stacked) lookups are supported.
     pub supports_external_lookups: bool,
+    /// Whether the pack indices use the B+Tree format (`true`, used by 1.9+
+    /// and 2a) or the older format-1 `GraphIndex` (`false`, used by the
+    /// 0.92/1.6 pack formats). Ignored by non-pack storage families.
+    pub uses_btree_index: bool,
     /// Whether this crate can currently open repositories of this format.
     pub supported: bool,
     /// Whether the format is deprecated (still readable, upgrade advised).
@@ -74,6 +78,7 @@ impl RepositoryFormat {
         supports_chks: false,
         supports_tree_reference: false,
         supports_external_lookups: false,
+        uses_btree_index: true,
         supported: false,
         deprecated: false,
     };

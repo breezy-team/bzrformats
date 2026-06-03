@@ -55,6 +55,8 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer5,
         open: open_knit_pack,
+        supported: true,
+        uses_btree_index: false,
     }
 }
 
@@ -67,6 +69,8 @@ declare_repository_format! {
         open: open_knit_pack,
         rich_root_data: true,
         supports_tree_reference: true,
+        supported: true,
+        uses_btree_index: false,
     }
 }
 
@@ -78,6 +82,8 @@ declare_repository_format! {
         inventory_serializer: &XMLInventorySerializer6,
         open: open_knit_pack,
         rich_root_data: true,
+        supported: true,
+        uses_btree_index: false,
     }
 }
 
@@ -89,6 +95,8 @@ declare_repository_format! {
         inventory_serializer: &XMLInventorySerializer5,
         open: open_knit_pack,
         supports_external_lookups: true,
+        supported: true,
+        uses_btree_index: false,
     }
 }
 
@@ -101,6 +109,8 @@ declare_repository_format! {
         open: open_knit_pack,
         rich_root_data: true,
         supports_external_lookups: true,
+        supported: true,
+        uses_btree_index: false,
     }
 }
 
@@ -114,6 +124,7 @@ declare_repository_format! {
         rich_root_data: true,
         supports_external_lookups: true,
         deprecated: true,
+        uses_btree_index: false,
     }
 }
 

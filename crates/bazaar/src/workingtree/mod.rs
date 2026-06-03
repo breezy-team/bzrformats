@@ -2106,15 +2106,17 @@ mod tests {
 
     /// A knit-pack control directory can be created, committed to, and read
     /// back through the full standalone API (not just 2a).
-    #[test]
-    fn knit_pack_create_commit_read() {
+    ///
+    /// Runs the create -> add -> commit -> re-open -> read cycle for a named
+    /// control-directory format and asserts the round-trip.
+    fn create_commit_read(format_name: &str) {
         use crate::repository::Repository as _;
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
-        let fmt = crate::bzrdir::find_control_dir_format("1.9").unwrap();
+        let fmt = crate::bzrdir::find_control_dir_format(format_name).unwrap();
         let cd = BzrDir::create_with_format(&parent, fmt).unwrap();
 
-        parent.put_bytes("a.txt", b"hello\n").unwrap();
+        parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         let mut wt = cd.open_workingtree().unwrap();
         let file_id = wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
@@ -2123,24 +2125,34 @@ mod tests {
             .commit(
                 repo.as_mut(),
                 &branch,
-                &CommitOptions::new("T <t@e>", "knit-pack commit").timestamp(1577880000),
+                &CommitOptions::new("T <t@e>", "a commit").timestamp(1577880000),
             )
             .unwrap();
 
         // Re-open and read the committed revision, inventory and file text.
         let reopened = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
         let repo = reopened.open_repository().unwrap();
-        assert_eq!(
-            repo.get_revision(&revid).unwrap().message,
-            "knit-pack commit"
-        );
+        assert_eq!(repo.get_revision(&revid).unwrap().message, "a commit");
         let inv = repo.get_inventory(&revid).unwrap();
         let paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
         assert_eq!(paths, vec!["a.txt".to_string()]);
         assert_eq!(repo.get_file_text(&file_id, &revid).unwrap(), b"hello\n");
-        assert!(repo
-            .format()
-            .format_string()
-            .starts_with(b"Bazaar RepositoryFormatKnitPack6"));
+    }
+
+    #[test]
+    fn create_commit_read_btree_knit_pack() {
+        // 1.9 uses B+Tree pack indices.
+        create_commit_read("1.9");
+    }
+
+    #[test]
+    fn create_commit_read_graphindex_knit_pack() {
+        // pack-0.92 uses the older format-1 GraphIndex pack indices.
+        create_commit_read("pack-0.92");
+    }
+
+    #[test]
+    fn create_commit_read_rich_root_pack() {
+        create_commit_read("rich-root-pack");
     }
 }

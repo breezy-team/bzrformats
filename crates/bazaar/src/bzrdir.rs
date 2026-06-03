@@ -17,11 +17,11 @@
 //! This is not a cross-VCS prober: it only ever opens `.bzr`, and the
 //! only thing it "detects" is which bzr format string each present
 //! component carries, so the right decoder is used and an unsupported
-//! format is rejected loudly rather than mis-read. The btree-indexed pack
-//! formats are supported: 2a (groupcompress) and the knit-pack formats
-//! 1.9/1.14 (with their rich-root variants), paired with Branch 6/7/8 and
-//! Working Tree 4/5/6. The older GraphIndex-based pack formats (0.92, 1.6)
-//! and the pre-pack knit/weave formats are recognised but not yet
+//! format is rejected loudly rather than mis-read. All the pack repository
+//! formats are supported: 2a (groupcompress) and the knit-pack formats from
+//! 0.92 through 1.14 (both GraphIndex- and B+Tree-indexed, with rich-root
+//! and subtree variants), paired with Branch 6/7/8 and Working Tree 4/5/6.
+//! The pre-pack knit and weave formats are recognised but not yet
 //! supported, and are reported as [`BzrDirError::UnsupportedFormat`].
 
 use crate::transport::{SharedTransport, Transport, TransportError};
@@ -66,6 +66,7 @@ pub struct ControlDirFormat {
 /// The list pairs each repository with the branch and working-tree formats
 /// brz uses for that `--format` name, taken from breezy's format registry.
 pub fn control_dir_formats() -> &'static [ControlDirFormat] {
+    const B6: &[u8] = b"Bazaar Branch Format 6 (bzr 0.15)\n";
     const B7: &[u8] = BRANCH_FORMAT_7;
     const WT4: &[u8] = b"Bazaar Working Tree Format 4 (bzr 0.15)\n";
     const WT5: &[u8] = b"Bazaar Working Tree Format 5 (bzr 1.11)\n";
@@ -78,6 +79,43 @@ pub fn control_dir_formats() -> &'static [ControlDirFormat] {
             branch_marker: B7,
             wt_marker: WT6,
             wt_has_views: true,
+        },
+        ControlDirFormat {
+            name: "pack-0.92",
+            repo: KnitPack(b"Bazaar pack repository format 1 (needs bzr 0.92)\n"),
+            branch_marker: B6,
+            wt_marker: WT4,
+            wt_has_views: false,
+        },
+        ControlDirFormat {
+            name: "pack-0.92-subtree",
+            repo: KnitPack(
+                b"Bazaar pack repository format 1 with subtree support (needs bzr 0.92)\n",
+            ),
+            branch_marker: B6,
+            wt_marker: WT4,
+            wt_has_views: false,
+        },
+        ControlDirFormat {
+            name: "rich-root-pack",
+            repo: KnitPack(b"Bazaar pack repository format 1 with rich root (needs bzr 1.0)\n"),
+            branch_marker: B6,
+            wt_marker: WT4,
+            wt_has_views: false,
+        },
+        ControlDirFormat {
+            name: "1.6",
+            repo: KnitPack(b"Bazaar RepositoryFormatKnitPack5 (bzr 1.6)\n"),
+            branch_marker: B7,
+            wt_marker: WT4,
+            wt_has_views: false,
+        },
+        ControlDirFormat {
+            name: "1.6.1-rich-root",
+            repo: KnitPack(b"Bazaar RepositoryFormatKnitPack5RichRoot (bzr 1.6.1)\n"),
+            branch_marker: B7,
+            wt_marker: WT4,
+            wt_has_views: false,
         },
         ControlDirFormat {
             name: "1.9",
@@ -312,21 +350,21 @@ impl BzrDir {
         // Branch: format marker, null tip, empty config and tags.
         let branch = bzr.subtransport("branch")?;
         branch.mkdir("")?;
-        branch.put_bytes("format", format.branch_marker)?;
-        branch.put_bytes("last-revision", b"0 null:\n")?;
-        branch.put_bytes("branch.conf", b"")?;
-        branch.put_bytes("tags", b"")?;
+        branch.put_bytes("format", format.branch_marker, None)?;
+        branch.put_bytes("last-revision", b"0 null:\n", None)?;
+        branch.put_bytes("branch.conf", b"", None)?;
+        branch.put_bytes("tags", b"", None)?;
 
         // Working tree: format marker, empty dirstate, conflicts, and (for
         // formats 6+) an empty views file.
         let checkout = bzr.subtransport("checkout")?;
         checkout.mkdir("")?;
-        checkout.put_bytes("format", format.wt_marker)?;
-        checkout.put_bytes("conflicts", b"BZR conflict list format 1\n")?;
+        checkout.put_bytes("format", format.wt_marker, None)?;
+        checkout.put_bytes("conflicts", b"BZR conflict list format 1\n", None)?;
         if format.wt_has_views {
-            checkout.put_bytes("views", b"")?;
+            checkout.put_bytes("views", b"", None)?;
         }
-        checkout.put_bytes("dirstate", &empty_dirstate_bytes())?;
+        checkout.put_bytes("dirstate", &empty_dirstate_bytes(), None)?;
 
         Self::open(bzr)
     }

@@ -92,6 +92,12 @@ impl From<crate::btree_graph_index::IndexError> for RepositoryError {
     }
 }
 
+impl From<crate::index::IndexError> for RepositoryError {
+    fn from(e: crate::index::IndexError) -> Self {
+        RepositoryError::Corrupt(format!("index: {e}"))
+    }
+}
+
 /// Parse an index entry value (`b"start length [basis_end delta_end]"`)
 /// into the `(start, length, entry_start, entry_end)` a groupcompress
 /// record needs. When the basis/delta pair is absent the whole block is

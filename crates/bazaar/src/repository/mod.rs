@@ -12,6 +12,7 @@ pub mod format;
 mod formats;
 mod pack_2a;
 mod pack_2a_writer;
+mod pack_index;
 mod pack_knit;
 mod tree;
 
