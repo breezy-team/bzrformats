@@ -132,6 +132,35 @@ class TestControlDir(TestCaseInTempDir):
             strict=True,
         )
 
+    def test_selective_commit_records_named_file_only(self):
+        cd = controldir.create(self.test_dir)
+        for n, c in [("a.txt", b"a1\n"), ("b.txt", b"b1\n")]:
+            with open(os.path.join(self.test_dir, n), "wb") as f:
+                f.write(c)
+        wt = cd.open_workingtree()
+        a_id = wt.add("a.txt", "file")
+        b_id = wt.add("b.txt", "file")
+        rev1 = wt.commit(
+            cd.open_repository(), cd.open_branch(), "T <t@e>", "two", 1577880000, 0
+        )
+        for n, c in [("a.txt", b"a2\n"), ("b.txt", b"b2\n")]:
+            with open(os.path.join(self.test_dir, n), "wb") as f:
+                f.write(c)
+        wt2 = controldir.open(self.test_dir).open_workingtree()
+        rev2 = wt2.commit(
+            cd.open_repository(),
+            cd.open_branch(),
+            "T <t@e>",
+            "only a",
+            1577890000,
+            0,
+            specific_files=["a.txt"],
+        )
+        repo = controldir.open(self.test_dir).open_repository()
+        # a.txt has the new content in rev2; b.txt keeps the rev1 content.
+        self.assertEqual(repo.get_file_text(a_id, rev2), b"a2\n")
+        self.assertEqual(repo.get_file_text(b_id, rev1), b"b1\n")
+
     def test_add_versions_and_persists(self):
         cd = controldir.create(self.test_dir)
         with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:

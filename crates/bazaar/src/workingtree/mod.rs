@@ -39,6 +39,9 @@ pub enum WorkingTreeError {
     PointlessCommit,
     /// A strict commit found unversioned files in the tree.
     StrictCommitFailed(Vec<String>),
+    /// A selective commit (specific_files or exclude) was combined with a
+    /// commit that has pending merges, which is not allowed.
+    CannotCommitSelectedFileMerge,
     /// An error from the repository during commit.
     Repository(crate::repository::RepositoryError),
     /// An error from the branch during commit.
@@ -64,6 +67,9 @@ impl std::fmt::Display for WorkingTreeError {
                     "strict commit failed: {} unversioned file(s) present",
                     unknowns.len()
                 )
+            }
+            WorkingTreeError::CannotCommitSelectedFileMerge => {
+                write!(f, "cannot commit selected files with pending merges")
             }
             WorkingTreeError::Repository(e) => write!(f, "repository: {e}"),
             WorkingTreeError::Branch(e) => write!(f, "branch: {e}"),
@@ -194,6 +200,13 @@ pub struct CommitOptions {
     /// Strict mode: refuse the commit if the tree has unversioned files,
     /// failing with [`WorkingTreeError::StrictCommitFailed`].
     pub strict: bool,
+    /// When non-empty, commit only changes at these tree-relative paths and
+    /// their descendants; other changed entries are left at their basis
+    /// state. Cannot be combined with pending merges.
+    pub specific_files: Vec<String>,
+    /// Tree-relative paths (and their descendants) to exclude from the
+    /// commit. Cannot be combined with pending merges.
+    pub exclude: Vec<String>,
 }
 
 impl CommitOptions {
@@ -243,6 +256,16 @@ impl CommitOptions {
 
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    pub fn specific_files(mut self, files: Vec<String>) -> Self {
+        self.specific_files = files;
+        self
+    }
+
+    pub fn exclude(mut self, exclude: Vec<String>) -> Self {
+        self.exclude = exclude;
         self
     }
 
@@ -760,12 +783,22 @@ impl WorkingTree {
             .cloned()
             .unwrap_or_else(|| crate::branch::NULL_REVISION.to_vec());
 
+        // Selective commit cannot be combined with pending merges (the
+        // merge parents' per-file graphs would be lost for unselected files).
+        let selective = !options.specific_files.is_empty() || !options.exclude.is_empty();
+        if selective && parents.len() > 1 {
+            return Err(WorkingTreeError::CannotCommitSelectedFileMerge);
+        }
+
         // Diff the live tree against its basis before opening the write
         // group, so we know exactly which entries changed.
         let basis = repository
             .revision_tree(&basis_revision_id)
             .map_err(WorkingTreeError::Repository)?;
-        let changes = self.iter_changes(&basis)?;
+        let mut changes = self.iter_changes(&basis)?;
+        if selective {
+            changes.retain(|c| change_selected(c, &options.specific_files, &options.exclude));
+        }
 
         // Refuse a commit that records no change, unless pending merges make
         // it meaningful or the caller opts in. Each recorded change yields a
@@ -904,15 +937,37 @@ impl WorkingTree {
                     crate::inventory::Entry::directory(fid, basename, parent_fid, Some(entry_rev))
                 }
                 EntryKind::File => {
-                    let content = self.transport.get_bytes(&e.path)?;
-                    let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
+                    // For a file recorded at the new revision, hash the
+                    // current on-disk content. For a carried-over file, the
+                    // committed inventory still holds the basis sha/size (the
+                    // working copy on disk may differ -- e.g. an unselected
+                    // change), so reuse the basis entry's values to keep the
+                    // dirstate basis consistent with what was committed.
+                    let recorded_at_new = new_rev_ids.contains(&e.file_id);
+                    let (sha1, size) = if recorded_at_new {
+                        let content = self.transport.get_bytes(&e.path)?;
+                        let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
+                        (sha1, content.len() as u64)
+                    } else {
+                        match basis.get_entry(&fid) {
+                            Some(be) => (
+                                be.text_sha1().map(|s| s.to_vec()).unwrap_or_default(),
+                                be.text_size().unwrap_or(0),
+                            ),
+                            None => {
+                                let content = self.transport.get_bytes(&e.path)?;
+                                let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
+                                (sha1, content.len() as u64)
+                            }
+                        }
+                    };
                     crate::inventory::Entry::file(
                         fid,
                         basename,
                         parent_fid,
                         Some(entry_rev),
                         Some(sha1),
-                        Some(content.len() as u64),
+                        Some(size),
                         Some(e.executable),
                         None,
                     )
@@ -1096,6 +1151,41 @@ fn split_path(path: &str) -> (String, String) {
         Some((dir, base)) => (dir.to_string(), base.to_string()),
         None => (String::new(), path.to_string()),
     }
+}
+
+/// Whether `path` is equal to `prefix` or lies beneath it (i.e. `path` is
+/// `prefix` or starts with `prefix/`).
+fn path_is_within(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// Whether a change should be included in a selective commit. The tree root
+/// is always included. A change is included when its path is within one of
+/// `specific_files` (or `specific_files` is empty) and not within any of
+/// `exclude`. The change's path is taken from the working-tree side, falling
+/// back to the basis side for deletions.
+fn change_selected(
+    change: &WorkingTreeChange,
+    specific_files: &[String],
+    exclude: &[String],
+) -> bool {
+    let path = match change.new_path.as_deref().or(change.old_path.as_deref()) {
+        Some(p) => p,
+        None => return false,
+    };
+    if path.is_empty() {
+        return true; // the root is always recorded.
+    }
+    if exclude.iter().any(|e| path_is_within(path, e)) {
+        return false;
+    }
+    if specific_files.is_empty() {
+        return true;
+    }
+    specific_files.iter().any(|f| path_is_within(path, f))
 }
 
 /// The final component of a tree-relative path.
@@ -1594,5 +1684,63 @@ mod tests {
         parent.delete("loose.txt").unwrap();
         let revid = wt.commit(repo.as_mut(), &branch, &strict).unwrap();
         assert!(!revid.is_empty());
+    }
+
+    /// A commit limited to specific_files records only those files; other
+    /// changed files are carried over at their basis revision.
+    #[test]
+    fn selective_commit_records_only_named_files() {
+        use crate::repository::Repository as _;
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"a1\n").unwrap();
+        parent.put_bytes("b.txt", b"b1\n").unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        wt.add("b.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev1 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "two").timestamp(1577880000),
+            )
+            .unwrap();
+
+        // Modify both files but commit only a.txt.
+        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"a2\n").unwrap();
+        parent.put_bytes("b.txt", b"b2\n").unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev2 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "only a")
+                    .timestamp(1577890000)
+                    .specific_files(vec!["a.txt".to_string()]),
+            )
+            .unwrap();
+
+        // In rev2, a.txt is at rev2 with the new content; b.txt is carried
+        // over at rev1 with its old content.
+        let repo = cd.open_repository().unwrap();
+        let inv = repo.get_inventory(&rev2).unwrap();
+        let a_id = wt.path2id("a.txt").unwrap();
+        let b_id = wt.path2id("b.txt").unwrap();
+        let a_entry = inv
+            .get_entry(&crate::FileId::from(a_id.as_slice()))
+            .unwrap()
+            .unwrap();
+        let b_entry = inv
+            .get_entry(&crate::FileId::from(b_id.as_slice()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a_entry.revision().unwrap().as_bytes(), rev2.as_slice());
+        assert_eq!(b_entry.revision().unwrap().as_bytes(), rev1.as_slice());
+        assert_eq!(repo.get_file_text(&a_id, &rev2).unwrap(), b"a2\n");
+        // b.txt's recorded content is still the rev1 version.
+        assert_eq!(repo.get_file_text(&b_id, &rev1).unwrap(), b"b1\n");
     }
 }

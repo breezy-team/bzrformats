@@ -322,6 +322,14 @@ impl Entry {
         }
     }
 
+    /// The recorded size of a file entry's text, or `None` for non-files.
+    pub fn text_size(&self) -> Option<u64> {
+        match self {
+            Entry::File { text_size, .. } => *text_size,
+            _ => None,
+        }
+    }
+
     /// Whether a file entry is executable; `false` for non-files.
     pub fn executable(&self) -> bool {
         match self {

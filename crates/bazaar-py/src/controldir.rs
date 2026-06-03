@@ -286,7 +286,7 @@ impl WorkingTree {
     /// optional explicit id (generated when omitted).
     #[pyo3(signature = (repository, branch, committer, message, timestamp, timezone,
         revprops=None, authors=None, revision_id=None, branch_nick=None,
-        allow_pointless=false, strict=false))]
+        allow_pointless=false, strict=false, specific_files=None, exclude=None))]
     #[allow(clippy::too_many_arguments)]
     fn commit<'py>(
         &mut self,
@@ -303,6 +303,8 @@ impl WorkingTree {
         branch_nick: Option<String>,
         allow_pointless: bool,
         strict: bool,
+        specific_files: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let mut repo = repository.borrow_mut();
         let branch = branch.borrow();
@@ -327,6 +329,12 @@ impl WorkingTree {
         }
         if let Some(nick) = branch_nick {
             options = options.branch_nick(nick);
+        }
+        if let Some(files) = specific_files {
+            options = options.specific_files(files);
+        }
+        if let Some(exclude) = exclude {
+            options = options.exclude(exclude);
         }
         let revid = self
             .inner
