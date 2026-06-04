@@ -265,7 +265,7 @@ impl Branch {
             }
             content.extend_from_slice(revid);
         }
-        self.transport.put_bytes("revision-history", &content)?;
+        self.transport.put_bytes("revision-history", &content, None)?;
         Ok(())
     }
 
@@ -362,7 +362,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let probe = Arc::new(LocalTransport::new(dir.path()));
         probe
-            .put_bytes("format", b"Bazaar-NG branch format 5\n")
+            .put_bytes("format", b"Bazaar-NG branch format 5\n", None)
             .unwrap();
         let shared: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         (dir, Branch::new(shared), probe)

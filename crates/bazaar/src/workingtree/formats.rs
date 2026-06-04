@@ -7,6 +7,7 @@ declare_workingtree_format! {
         format_string: b"Bazaar-NG Working Tree format 3",
         description: "Working tree format 3 (pre-dirstate)",
         deprecated: true,
+        supported: true,
     }
 }
 
