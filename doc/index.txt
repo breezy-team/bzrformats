@@ -16,12 +16,19 @@ Contents
    dirstate
    btree_index_prefetch
    improved_chk_index
+   index-plain
    indices
    inventory
    packrepo
    repository
    repository-stream
    groupcompress-design
+   groupcompress
+   knit
+   weave
+   versionedfiles
+   chk-map
+   chk_map
 
 Overview
 --------
@@ -34,20 +41,33 @@ These documents describe the on-disk and network formats used by Bazaar/Breezy:
   - :doc:`bundle-format4` - Bundle format 4 and Merge Directive format 2
 
 * **Repository Formats**: Storage formats for revision data
-  
+
   - :doc:`repository` - Repository services and pack-based repositories
   - :doc:`packrepo` - KnitPack repository format
   - :doc:`groupcompress-design` - Groupcompress format design
+  - :doc:`groupcompress` - Groupcompress on-disk format
   - :doc:`repository-stream` - Repository streaming format
 
+* **Versioned File Formats**: Storage of versioned text content
+
+  - :doc:`versionedfiles` - VersionedFiles interface and storage
+  - :doc:`knit` - Knit format
+  - :doc:`weave` - Weave format
+
 * **Working Tree Formats**: Formats for working tree metadata
-  
+
   - :doc:`dirstate` - Dirstate format for working trees
   - :doc:`inventory` - Inventory formats and serialization
 
+* **CHK Formats**: Content-hash-keyed maps
+
+  - :doc:`chk-map` - CHK map implementation
+  - :doc:`chk_map` - CHK map file format specification
+
 * **Index Formats**: Indexing structures for efficient data access
-  
+
   - :doc:`indices` - Indexing facilities
+  - :doc:`index-plain` - GraphIndex plain index format
   - :doc:`btree_index_prefetch` - BTree index format and prefetching
   - :doc:`improved_chk_index` - CHK optimized index format
 
