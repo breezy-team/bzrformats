@@ -901,8 +901,15 @@ impl WorkingTree4 {
         // signature lands in the same pack as the revision.
         if let Some(key) = &options.signing_key {
             let (paths, inv_entries) = self.build_committed_entries(&revid, &basis, &changes)?;
-            let signature =
-                self.sign_commit(&revid, options, &properties, &paths, &inv_entries, key)?;
+            let signature = sign_commit(
+                &parents,
+                &revid,
+                options,
+                &properties,
+                &paths,
+                &inv_entries,
+                key,
+            )?;
             repository
                 .add_signature_text(&revid, &signature)
                 .map_err(WorkingTreeError::Repository)?;
@@ -964,210 +971,13 @@ impl WorkingTree4 {
         basis: &crate::repository::RevisionTree,
         changes: &[WorkingTreeChange],
     ) -> Result<(Vec<String>, Vec<crate::inventory::Entry>), WorkingTreeError> {
-        use crate::FileId;
-
-        // Map file_id -> last-changed revision for entries recorded at the
-        // new revision (changed or new); everything else keeps its basis
-        // revision.
-        let mut new_rev_ids: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        for c in changes {
-            if c.new_path.is_some() && (c.content_change || c.basis_revision.is_none()) {
-                new_rev_ids.insert(c.file_id.clone());
-            }
-        }
-
-        let live = self.collect_live_entries();
-        let mut path_to_id: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
-        path_to_id.insert(String::new(), live.root_id.clone());
-        for e in &live.entries {
-            path_to_id.insert(e.path.clone(), e.file_id.clone());
-        }
-
-        // The root keeps its basis revision unless this is the first commit
-        // (no basis root), in which case it is recorded at the new revision.
-        let root_fid = FileId::from(live.root_id.as_slice());
-        let root_rev = match basis
-            .get_file_revision(&root_fid)
-            .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
-        {
-            Some(r) => crate::RevisionId::from(r.as_slice()),
-            None => crate::RevisionId::from(revid),
-        };
-        let mut paths: Vec<String> = vec![String::new()];
-        let mut inv_entries = vec![crate::inventory::Entry::root(root_fid, Some(root_rev))];
-        for e in &live.entries {
-            let (parent_path, basename) = split_path(&e.path);
-            let parent_id = path_to_id
-                .get(&parent_path)
-                .ok_or_else(|| WorkingTreeError::Commit(format!("no parent for {}", e.path)))?;
-            let parent_fid = FileId::from(parent_id.as_slice());
-            let fid = FileId::from(e.file_id.as_slice());
-            // The entry's recorded revision: the new one if it changed,
-            // otherwise its revision in the basis.
-            let entry_rev = if new_rev_ids.contains(&e.file_id) {
-                crate::RevisionId::from(revid)
-            } else {
-                match basis.get_file_revision(&fid).map_err(|e| {
-                    WorkingTreeError::Commit(format!("reading basis inventory: {e:?}"))
-                })? {
-                    Some(r) => crate::RevisionId::from(r.as_slice()),
-                    None => crate::RevisionId::from(revid),
-                }
-            };
-            paths.push(e.path.clone());
-            inv_entries.push(match e.kind {
-                EntryKind::Directory => {
-                    crate::inventory::Entry::directory(fid, basename, parent_fid, Some(entry_rev))
-                }
-                EntryKind::File => {
-                    // For a file recorded at the new revision, hash the
-                    // current on-disk content. For a carried-over file, the
-                    // committed inventory still holds the basis sha/size (the
-                    // working copy on disk may differ -- e.g. an unselected
-                    // change), so reuse the basis entry's values to keep the
-                    // dirstate basis consistent with what was committed.
-                    let recorded_at_new = new_rev_ids.contains(&e.file_id);
-                    let (sha1, size) = if recorded_at_new {
-                        let content = self.transport.get_bytes(&e.path)?;
-                        let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
-                        (sha1, content.len() as u64)
-                    } else {
-                        match basis.get_entry(&fid).map_err(|e| {
-                            WorkingTreeError::Commit(format!("reading basis inventory: {e:?}"))
-                        })? {
-                            Some(be) => (
-                                be.text_sha1().map(|s| s.to_vec()).unwrap_or_default(),
-                                be.text_size().unwrap_or(0),
-                            ),
-                            None => {
-                                let content = self.transport.get_bytes(&e.path)?;
-                                let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
-                                (sha1, content.len() as u64)
-                            }
-                        }
-                    };
-                    crate::inventory::Entry::file(
-                        fid,
-                        basename,
-                        parent_fid,
-                        Some(entry_rev),
-                        Some(sha1),
-                        Some(size),
-                        Some(e.executable),
-                        None,
-                    )
-                }
-                EntryKind::Symlink => {
-                    let target = String::from_utf8_lossy(&e.symlink_target).into_owned();
-                    crate::inventory::Entry::link(
-                        fid,
-                        basename,
-                        parent_fid,
-                        Some(entry_rev),
-                        Some(target),
-                    )
-                }
-                EntryKind::TreeReference => {
-                    return Err(WorkingTreeError::Commit(
-                        "tree references are not supported".to_string(),
-                    ))
-                }
-            });
-        }
-        Ok((paths, inv_entries))
-    }
-
-    /// Build the strict-v3 testament for the commit and return its
-    /// clearsigned short text (the form brz stores in the signature store).
-    ///
-    /// Requires the `gpg` feature; without it, supplying a signing key is an
-    /// error.
-    #[allow(clippy::too_many_arguments)]
-    fn sign_commit(
-        &self,
-        revid: &[u8],
-        options: &CommitOptions,
-        properties: &std::collections::HashMap<String, Vec<u8>>,
-        paths: &[String],
-        inv_entries: &[crate::inventory::Entry],
-        signing_key: &[u8],
-    ) -> Result<Vec<u8>, WorkingTreeError> {
-        #[cfg(not(feature = "gpg"))]
-        {
-            let _ = (revid, options, properties, paths, inv_entries, signing_key);
-            Err(WorkingTreeError::Commit(
-                "commit signing requires the crate's `gpg` feature".to_string(),
-            ))
-        }
-
-        #[cfg(feature = "gpg")]
-        {
-            use crate::testament::{
-                EntryKind as TKind, Testament, TestamentEntry, TestamentFormat,
-            };
-
-            let revprops: std::collections::BTreeMap<String, String> = properties
-                .iter()
-                .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
-                .collect();
-
-            // Testament entries: every non-root inventory entry, paired with
-            // its tree-relative path.
-            let mut entries = Vec::new();
-            for (path, entry) in paths.iter().zip(inv_entries) {
-                if path.is_empty() {
-                    continue; // the root is not a testament entry.
-                }
-                let (kind, content) = match entry {
-                    crate::inventory::Entry::File { text_sha1, .. } => {
-                        (TKind::File, text_sha1.clone().unwrap_or_default())
-                    }
-                    crate::inventory::Entry::Directory { .. } => (TKind::Directory, Vec::new()),
-                    crate::inventory::Entry::Link { symlink_target, .. } => (
-                        TKind::Symlink,
-                        symlink_target.clone().unwrap_or_default().into_bytes(),
-                    ),
-                    crate::inventory::Entry::TreeReference { .. } => {
-                        (TKind::TreeReference, Vec::new())
-                    }
-                    crate::inventory::Entry::Root { .. } => continue,
-                };
-                entries.push(TestamentEntry {
-                    path: path.clone(),
-                    kind,
-                    file_id: entry.file_id().as_bytes().to_vec(),
-                    content,
-                    revision: entry
-                        .revision()
-                        .map(|r| r.as_bytes().to_vec())
-                        .unwrap_or_default(),
-                    executable: entry.executable(),
-                });
-            }
-
-            let testament = Testament {
-                revision_id: revid.to_vec(),
-                committer: options.committer.clone(),
-                timestamp: options.timestamp as i64,
-                timezone: options.timezone,
-                message: options.message.clone(),
-                parent_ids: self
-                    .dirstate
-                    .parents
-                    .iter()
-                    .filter(|p| p.as_slice() != crate::branch::NULL_REVISION)
-                    .cloned()
-                    .collect(),
-                revprops,
-                entries,
-            };
-            let short = testament
-                .as_short_text(TestamentFormat::Strict3)
-                .map_err(|e| WorkingTreeError::Commit(format!("testament: {e:?}")))?;
-            crate::gpg::clearsign(&short, signing_key)
-                .map_err(|e| WorkingTreeError::Commit(format!("sign: {e}")))
-        }
+        build_committed_entries(
+            &self.transport,
+            &self.collect_live_entries(),
+            revid,
+            basis,
+            changes,
+        )
     }
 
     /// Set the dirstate basis (tree 1) to the just-committed revision so
@@ -1654,18 +1464,145 @@ impl WorkingTree for WorkingTree3 {
 
     fn commit(
         &mut self,
-        _repository: &mut dyn crate::repository::Repository,
-        _branch: &crate::branch::Branch,
-        _options: &CommitOptions,
+        repository: &mut dyn crate::repository::Repository,
+        branch: &crate::branch::Branch,
+        options: &CommitOptions,
     ) -> Result<Vec<u8>, WorkingTreeError> {
-        // TODO: format-3 commit. The diff (compute_changes) and CommitBuilder
-        // path are already shared; what remains is the format-3 basis update
-        // (write last-revision, clear pending-merges) in place of the dirstate
-        // basis rewrite. Deferred so the read + inventory-mutation surface can
-        // land first.
-        Err(WorkingTreeError::UnsupportedFormat(
-            b"commit for working tree format 3".to_vec(),
-        ))
+        if options.strict {
+            let unknowns = self.unknowns()?;
+            if !unknowns.is_empty() {
+                return Err(WorkingTreeError::StrictCommitFailed(unknowns));
+            }
+        }
+
+        let parents = self.parent_ids();
+        let revid = match &options.revision_id {
+            Some(id) => id.clone(),
+            None => crate::RevisionId::generate(&options.committer, Some(options.timestamp))
+                .as_bytes()
+                .to_vec(),
+        };
+        let properties = options.build_properties()?;
+        let basis_revision_id = parents
+            .first()
+            .cloned()
+            .unwrap_or_else(|| crate::branch::NULL_REVISION.to_vec());
+
+        let selective = !options.specific_files.is_empty() || !options.exclude.is_empty();
+        if selective && parents.len() > 1 {
+            return Err(WorkingTreeError::CannotCommitSelectedFileMerge);
+        }
+
+        let basis = repository
+            .revision_tree(&basis_revision_id)
+            .map_err(WorkingTreeError::Repository)?;
+        let other_parents: Vec<crate::repository::RevisionTree> = parents
+            .iter()
+            .skip(1)
+            .map(|p| repository.revision_tree(p))
+            .collect::<Result<_, _>>()
+            .map_err(WorkingTreeError::Repository)?;
+        let live = self.collect_live_entries();
+        let mut changes = compute_changes(&self.transport, &live, &basis, &other_parents)?;
+        if selective {
+            changes.retain(|c| change_selected(c, &options.specific_files, &options.exclude));
+        }
+
+        if !options.allow_pointless && parents.len() <= 1 {
+            let basis_is_null = basis_revision_id == crate::branch::NULL_REVISION;
+            let pointless = if basis_is_null {
+                changes.len() <= 1
+            } else {
+                changes.is_empty()
+            };
+            if pointless {
+                return Err(WorkingTreeError::PointlessCommit);
+            }
+        }
+
+        repository
+            .start_write_group()
+            .map_err(WorkingTreeError::Repository)?;
+        {
+            let mut builder = repository
+                .get_commit_builder(
+                    parents.clone(),
+                    revid.clone(),
+                    options.committer.clone(),
+                    options.timestamp,
+                    options.timezone,
+                )
+                .with_properties(properties.clone());
+            builder
+                .record_iter_changes(&changes, |path| {
+                    self.transport
+                        .get_bytes(path)
+                        .map_err(crate::repository::RepositoryError::Transport)
+                })
+                .map_err(WorkingTreeError::Repository)?;
+            builder
+                .finish_inventory()
+                .map_err(WorkingTreeError::Repository)?;
+            builder
+                .commit(&options.message)
+                .map_err(WorkingTreeError::Repository)?;
+        }
+
+        if let Some(key) = &options.signing_key {
+            let (paths, inv_entries) =
+                build_committed_entries(&self.transport, &live, &revid, &basis, &changes)?;
+            let signature = sign_commit(
+                &parents,
+                &revid,
+                options,
+                &properties,
+                &paths,
+                &inv_entries,
+                key,
+            )?;
+            repository
+                .add_signature_text(&revid, &signature)
+                .map_err(WorkingTreeError::Repository)?;
+        }
+
+        repository
+            .commit_write_group()
+            .map_err(WorkingTreeError::Repository)?;
+
+        // Unversion files committed as deletions (they vanished from disk).
+        let deleted_paths: Vec<String> = changes
+            .iter()
+            .filter(|c| c.new_path.is_none())
+            .filter_map(|c| c.old_path.clone())
+            .filter(|p| self.path2id(p).is_some())
+            .collect();
+        for path in &deleted_paths {
+            self.remove(path)?;
+        }
+
+        // Advance the branch tip. The new revno is one past the branch's
+        // current tip (format 5's full history determines it).
+        let new_revno = branch
+            .last_revision_info()
+            .map_err(WorkingTreeError::Branch)?
+            .0
+            + 1;
+        branch
+            .set_last_revision_info(new_revno, &revid)
+            .map_err(WorkingTreeError::Branch)?;
+
+        // Update the format-3 basis: the new revision becomes last-revision
+        // and the only parent, so pending-merges is cleared. The working
+        // inventory stays revision-less (it now equals the basis).
+        //
+        // TODO: basis-inventory-cache is not written; it is an optimization
+        // brz keeps but is not required for correctness.
+        self.transport
+            .put_bytes(WT3_LAST_REVISION_PATH, &revid, None)?;
+        self.transport
+            .put_bytes(WT3_PENDING_MERGES_PATH, b"", None)?;
+
+        Ok(revid)
     }
 }
 
@@ -1994,6 +1931,218 @@ fn basename(path: &str) -> &str {
     match path.rsplit_once('/') {
         Some((_, base)) => base,
         None => path,
+    }
+}
+
+/// Build the full inventory entry list for the just-committed tree, deriving
+/// each entry's last-changed revision from the recorded changes (the new
+/// revision for changed/new entries, the basis revision otherwise). Returns
+/// the entries paired with their tree-relative paths (root first). Used both
+/// to update a backend's basis and to build the testament for signing.
+fn build_committed_entries(
+    transport: &SharedTransport,
+    live: &LiveEntries,
+    revid: &[u8],
+    basis: &crate::repository::RevisionTree,
+    changes: &[WorkingTreeChange],
+) -> Result<(Vec<String>, Vec<crate::inventory::Entry>), WorkingTreeError> {
+    use crate::FileId;
+
+    // file_id -> last-changed revision for entries recorded at the new
+    // revision (changed or new); everything else keeps its basis revision.
+    let mut new_rev_ids: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for c in changes {
+        if c.new_path.is_some() && (c.content_change || c.basis_revision.is_none()) {
+            new_rev_ids.insert(c.file_id.clone());
+        }
+    }
+
+    let mut path_to_id: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    path_to_id.insert(String::new(), live.root_id.clone());
+    for e in &live.entries {
+        path_to_id.insert(e.path.clone(), e.file_id.clone());
+    }
+
+    // The root keeps its basis revision unless this is the first commit
+    // (no basis root), in which case it is recorded at the new revision.
+    let root_fid = FileId::from(live.root_id.as_slice());
+    let root_rev = match basis
+        .get_file_revision(&root_fid)
+        .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
+    {
+        Some(r) => crate::RevisionId::from(r.as_slice()),
+        None => crate::RevisionId::from(revid),
+    };
+    let mut paths: Vec<String> = vec![String::new()];
+    let mut inv_entries = vec![crate::inventory::Entry::root(root_fid, Some(root_rev))];
+    for e in &live.entries {
+        let (parent_path, name) = split_path(&e.path);
+        let parent_id = path_to_id
+            .get(&parent_path)
+            .ok_or_else(|| WorkingTreeError::Commit(format!("no parent for {}", e.path)))?;
+        let parent_fid = FileId::from(parent_id.as_slice());
+        let fid = FileId::from(e.file_id.as_slice());
+        let entry_rev = if new_rev_ids.contains(&e.file_id) {
+            crate::RevisionId::from(revid)
+        } else {
+            match basis
+                .get_file_revision(&fid)
+                .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
+            {
+                Some(r) => crate::RevisionId::from(r.as_slice()),
+                None => crate::RevisionId::from(revid),
+            }
+        };
+        paths.push(e.path.clone());
+        inv_entries.push(match e.kind {
+            EntryKind::Directory => {
+                crate::inventory::Entry::directory(fid, name, parent_fid, Some(entry_rev))
+            }
+            EntryKind::File => {
+                // For a file recorded at the new revision, hash the current
+                // on-disk content. For a carried-over file, reuse the basis
+                // entry's sha/size (the working copy on disk may differ, e.g.
+                // an unselected change) so the basis stays consistent with
+                // what was committed.
+                let recorded_at_new = new_rev_ids.contains(&e.file_id);
+                let (sha1, size) = if recorded_at_new {
+                    let content = transport.get_bytes(&e.path)?;
+                    let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
+                    (sha1, content.len() as u64)
+                } else {
+                    match basis
+                        .get_entry(&fid)
+                        .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
+                    {
+                        Some(be) => (
+                            be.text_sha1().map(|s| s.to_vec()).unwrap_or_default(),
+                            be.text_size().unwrap_or(0),
+                        ),
+                        None => {
+                            let content = transport.get_bytes(&e.path)?;
+                            let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
+                            (sha1, content.len() as u64)
+                        }
+                    }
+                };
+                crate::inventory::Entry::file(
+                    fid,
+                    name,
+                    parent_fid,
+                    Some(entry_rev),
+                    Some(sha1),
+                    Some(size),
+                    Some(e.executable),
+                    None,
+                )
+            }
+            EntryKind::Symlink => {
+                let target = String::from_utf8_lossy(&e.symlink_target).into_owned();
+                crate::inventory::Entry::link(fid, name, parent_fid, Some(entry_rev), Some(target))
+            }
+            EntryKind::TreeReference => {
+                return Err(WorkingTreeError::Commit(
+                    "tree references are not supported".to_string(),
+                ))
+            }
+        });
+    }
+    Ok((paths, inv_entries))
+}
+
+/// Build the strict-v3 testament for the commit and return its clearsigned
+/// short text (the form brz stores in the signature store). `parents` are the
+/// revision's parents (basis first), recorded in the testament.
+///
+/// Requires the `gpg` feature; without it, supplying a signing key is an
+/// error.
+#[allow(clippy::too_many_arguments)]
+fn sign_commit(
+    parents: &[Vec<u8>],
+    revid: &[u8],
+    options: &CommitOptions,
+    properties: &std::collections::HashMap<String, Vec<u8>>,
+    paths: &[String],
+    inv_entries: &[crate::inventory::Entry],
+    signing_key: &[u8],
+) -> Result<Vec<u8>, WorkingTreeError> {
+    #[cfg(not(feature = "gpg"))]
+    {
+        let _ = (
+            parents,
+            revid,
+            options,
+            properties,
+            paths,
+            inv_entries,
+            signing_key,
+        );
+        Err(WorkingTreeError::Commit(
+            "commit signing requires the crate's `gpg` feature".to_string(),
+        ))
+    }
+
+    #[cfg(feature = "gpg")]
+    {
+        use crate::testament::{EntryKind as TKind, Testament, TestamentEntry, TestamentFormat};
+
+        let revprops: std::collections::BTreeMap<String, String> = properties
+            .iter()
+            .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
+            .collect();
+
+        // Testament entries: every non-root inventory entry, paired with its
+        // tree-relative path.
+        let mut entries = Vec::new();
+        for (path, entry) in paths.iter().zip(inv_entries) {
+            if path.is_empty() {
+                continue; // the root is not a testament entry.
+            }
+            let (kind, content) = match entry {
+                crate::inventory::Entry::File { text_sha1, .. } => {
+                    (TKind::File, text_sha1.clone().unwrap_or_default())
+                }
+                crate::inventory::Entry::Directory { .. } => (TKind::Directory, Vec::new()),
+                crate::inventory::Entry::Link { symlink_target, .. } => (
+                    TKind::Symlink,
+                    symlink_target.clone().unwrap_or_default().into_bytes(),
+                ),
+                crate::inventory::Entry::TreeReference { .. } => (TKind::TreeReference, Vec::new()),
+                crate::inventory::Entry::Root { .. } => continue,
+            };
+            entries.push(TestamentEntry {
+                path: path.clone(),
+                kind,
+                file_id: entry.file_id().as_bytes().to_vec(),
+                content,
+                revision: entry
+                    .revision()
+                    .map(|r| r.as_bytes().to_vec())
+                    .unwrap_or_default(),
+                executable: entry.executable(),
+            });
+        }
+
+        let testament = Testament {
+            revision_id: revid.to_vec(),
+            committer: options.committer.clone(),
+            timestamp: options.timestamp as i64,
+            timezone: options.timezone,
+            message: options.message.clone(),
+            parent_ids: parents
+                .iter()
+                .filter(|p| p.as_slice() != crate::branch::NULL_REVISION)
+                .cloned()
+                .collect(),
+            revprops,
+            entries,
+        };
+        let short = testament
+            .as_short_text(TestamentFormat::Strict3)
+            .map_err(|e| WorkingTreeError::Commit(format!("testament: {e:?}")))?;
+        crate::gpg::clearsign(&short, signing_key)
+            .map_err(|e| WorkingTreeError::Commit(format!("sign: {e}")))
     }
 }
 
@@ -2780,5 +2929,54 @@ mod tests {
             wt.parent_ids(),
             vec![b"rev-merge-1".to_vec(), b"rev-merge-2".to_vec()]
         );
+    }
+
+    /// End to end through a `knit`-format BzrDir: create it, add a file,
+    /// commit, then re-open and read the revision, inventory and file text
+    /// back. Exercises branch format 5, working tree format 3, and the
+    /// non-pack knit repository together.
+    #[test]
+    fn knit_format_create_commit_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let format = crate::bzrdir::find_control_dir_format("knit").unwrap();
+        let cd = BzrDir::create_with_format(&parent, format).unwrap();
+
+        parent.put_bytes("a.txt", b"hi\n", None).unwrap();
+        let mut wt = cd.open_workingtree().unwrap();
+        let file_id = wt.add("a.txt", EntryKind::File, None).unwrap();
+
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "first").timestamp(1577880000),
+            )
+            .unwrap();
+
+        // The format-3 basis advanced to the new revision, on disk too.
+        assert_eq!(wt.basis_revision().as_deref(), Some(revid.as_slice()));
+        let reopened = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let wt2 = reopened.open_workingtree().unwrap();
+        assert_eq!(wt2.basis_revision().as_deref(), Some(revid.as_slice()));
+
+        // Branch (format 5) advanced to revno 1.
+        let branch = reopened.open_branch().unwrap();
+        assert_eq!(branch.last_revision_info().unwrap(), (1, revid.clone()));
+
+        // The revision, inventory and file text read back.
+        let repo = reopened.open_repository().unwrap();
+        assert_eq!(repo.get_revision(&revid).unwrap().message, "first");
+        let inv = repo.get_inventory(&revid).unwrap();
+        let paths: Vec<String> = inv
+            .entries()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert_eq!(paths, vec!["a.txt".to_string()]);
+        assert_eq!(repo.get_file_text(&file_id, &revid).unwrap(), b"hi\n");
     }
 }

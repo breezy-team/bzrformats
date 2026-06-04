@@ -45,6 +45,8 @@ enum RepoKind {
     GroupCompress,
     /// A knit-pack repository (the marker selects the exact variant).
     KnitPack(&'static [u8]),
+    /// A non-pack knit repository (the marker selects the exact variant).
+    Knit(&'static [u8]),
 }
 
 /// A named control-directory format: the meta-directory layout plus the
@@ -68,10 +70,12 @@ pub struct ControlDirFormat {
 pub fn control_dir_formats() -> &'static [ControlDirFormat] {
     const B6: &[u8] = b"Bazaar Branch Format 6 (bzr 0.15)\n";
     const B7: &[u8] = BRANCH_FORMAT_7;
+    const B5: &[u8] = b"Bazaar-NG branch format 5\n";
+    const WT3: &[u8] = b"Bazaar-NG Working Tree format 3";
     const WT4: &[u8] = b"Bazaar Working Tree Format 4 (bzr 0.15)\n";
     const WT5: &[u8] = b"Bazaar Working Tree Format 5 (bzr 1.11)\n";
     const WT6: &[u8] = WORKINGTREE_FORMAT_6;
-    use RepoKind::{GroupCompress, KnitPack};
+    use RepoKind::{GroupCompress, Knit, KnitPack};
     static FORMATS: &[ControlDirFormat] = &[
         ControlDirFormat {
             name: "2a",
@@ -143,6 +147,13 @@ pub fn control_dir_formats() -> &'static [ControlDirFormat] {
             repo: KnitPack(b"Bazaar RepositoryFormatKnitPack6RichRoot (bzr 1.9)\n"),
             branch_marker: B7,
             wt_marker: WT5,
+            wt_has_views: false,
+        },
+        ControlDirFormat {
+            name: "knit",
+            repo: Knit(b"Bazaar-NG Knit Repository Format 1"),
+            branch_marker: B5,
+            wt_marker: WT3,
             wt_has_views: false,
         },
     ];
@@ -345,26 +356,55 @@ impl BzrDir {
                 crate::repository::KnitPackRepository::create(repo_t, repo_format)
                     .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
             }
+            RepoKind::Knit(marker) => {
+                let repo_format = crate::repository::find_format(marker).ok_or_else(|| {
+                    BzrDirError::Component(format!(
+                        "repository format not registered: {:?}",
+                        String::from_utf8_lossy(marker)
+                    ))
+                })?;
+                crate::repository::KnitRepository::create(repo_t, repo_format)
+                    .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
+            }
         }
 
-        // Branch: format marker, null tip, empty config and tags.
+        // Branch: format marker, null tip, empty config and tags. Format 5
+        // (full history) keeps the tip in revision-history rather than a
+        // last-revision line, and writes a branch-name file.
         let branch = bzr.subtransport("branch")?;
         branch.mkdir("")?;
         branch.put_bytes("format", format.branch_marker, None)?;
-        branch.put_bytes("last-revision", b"0 null:\n", None)?;
+        let branch_is_format5 = crate::branch::find_format(format.branch_marker)
+            .map(|f| f.full_history)
+            .unwrap_or(false);
+        if branch_is_format5 {
+            branch.put_bytes("revision-history", b"", None)?;
+            branch.put_bytes("branch-name", b"", None)?;
+        } else {
+            branch.put_bytes("last-revision", b"0 null:\n", None)?;
+        }
         branch.put_bytes("branch.conf", b"", None)?;
         branch.put_bytes("tags", b"", None)?;
 
-        // Working tree: format marker, empty dirstate, conflicts, and (for
-        // formats 6+) an empty views file.
+        // Working tree: format marker and conflicts. A dirstate format (4/5/6)
+        // writes an empty dirstate and (6+) a views file; the pre-dirstate
+        // format 3 writes an empty working inventory and pending-merges.
         let checkout = bzr.subtransport("checkout")?;
         checkout.mkdir("")?;
         checkout.put_bytes("format", format.wt_marker, None)?;
         checkout.put_bytes("conflicts", b"BZR conflict list format 1\n", None)?;
-        if format.wt_has_views {
-            checkout.put_bytes("views", b"", None)?;
+        let wt_uses_dirstate = crate::workingtree::find_format(format.wt_marker)
+            .map(|f| f.uses_dirstate)
+            .unwrap_or(true);
+        if wt_uses_dirstate {
+            if format.wt_has_views {
+                checkout.put_bytes("views", b"", None)?;
+            }
+            checkout.put_bytes("dirstate", &empty_dirstate_bytes(), None)?;
+        } else {
+            checkout.put_bytes("inventory", b"<inventory format=\"5\">\n</inventory>\n", None)?;
+            checkout.put_bytes("pending-merges", b"", None)?;
         }
-        checkout.put_bytes("dirstate", &empty_dirstate_bytes(), None)?;
 
         Self::open(bzr)
     }
