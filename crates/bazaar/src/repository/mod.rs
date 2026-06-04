@@ -16,6 +16,7 @@ mod pack_2a_writer;
 mod pack_index;
 mod pack_knit;
 mod tree;
+mod weave_repo;
 
 pub use commit::CommitBuilder;
 pub use format::{all_formats, find_format, RepositoryFormat};
@@ -23,6 +24,7 @@ pub use knit_repo::KnitRepository;
 pub use pack_2a::{Pack2aRepository, RepositoryError, SharedTransport};
 pub use pack_knit::KnitPackRepository;
 pub use tree::RevisionTree;
+pub use weave_repo::WeaveRepository;
 
 use crate::inventory::Inventory;
 

@@ -2149,7 +2149,7 @@ fn sign_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bzrdir::BzrDir;
+    use crate::bzrdir::{BzrDirMeta, ControlDir};
     use crate::transport::{LocalTransport, SharedTransport};
     use std::sync::Arc;
 
@@ -2169,7 +2169,7 @@ mod tests {
     fn create_and_commit_empty_tree() {
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
-        let cd = BzrDir::create(&parent).unwrap();
+        let cd = BzrDirMeta::create(&parent).unwrap();
 
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
@@ -2192,7 +2192,7 @@ mod tests {
         assert_eq!(reread.basis_revision().as_deref(), Some(revid.as_slice()));
 
         // Branch advanced to revno 1 at the new revision.
-        let reopened = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let reopened = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         let branch = reopened.open_branch().unwrap();
         assert_eq!(branch.last_revision_info().unwrap(), (1, revid.clone()));
 
@@ -2210,7 +2210,7 @@ mod tests {
     fn fresh_tree() -> (tempfile::TempDir, SharedTransport, WorkingTree4) {
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
-        let cd = BzrDir::create(&parent).unwrap();
+        let cd = BzrDirMeta::create(&parent).unwrap();
         let wt = WorkingTree4::open(parent.clone()).unwrap();
         let _ = cd;
         (dir, parent, wt)
@@ -2294,7 +2294,7 @@ mod tests {
     #[test]
     fn add_then_commit_records_the_files() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
 
@@ -2308,7 +2308,7 @@ mod tests {
             )
             .unwrap();
 
-        let reopened = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let reopened = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         let repo = reopened.open_repository().unwrap();
         let inv = repo.get_inventory(&revid).unwrap();
         let paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
@@ -2322,7 +2322,7 @@ mod tests {
     #[test]
     fn iter_changes_reports_only_differences() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         parent.put_bytes("b.txt", b"world\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
@@ -2367,7 +2367,7 @@ mod tests {
     #[test]
     fn iter_changes_reports_removals() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
@@ -2396,7 +2396,7 @@ mod tests {
     #[test]
     fn second_commit_is_incremental() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"a one\n", None).unwrap();
         parent.put_bytes("b.txt", b"b one\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
@@ -2457,7 +2457,7 @@ mod tests {
     #[test]
     fn commit_records_revprops_authors_and_revid() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
 
@@ -2496,7 +2496,7 @@ mod tests {
     #[test]
     fn commit_rejects_cr_in_revprops() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut props = std::collections::HashMap::new();
@@ -2516,7 +2516,7 @@ mod tests {
     #[test]
     fn pointless_commit_is_refused_then_allowed() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
@@ -2559,7 +2559,7 @@ mod tests {
     #[test]
     fn commit_records_disk_deletion() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"a\n", None).unwrap();
         parent.put_bytes("b.txt", b"b\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
@@ -2611,7 +2611,7 @@ mod tests {
     #[test]
     fn strict_commit_refuses_unknown_files() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"a\n", None).unwrap();
         parent.put_bytes("loose.txt", b"l\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
@@ -2637,7 +2637,7 @@ mod tests {
     #[test]
     fn selective_commit_records_only_named_files() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"a1\n", None).unwrap();
         parent.put_bytes("b.txt", b"b1\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
@@ -2702,7 +2702,7 @@ mod tests {
         cert.as_tsk().serialize(&mut tsk).unwrap();
 
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
@@ -2729,7 +2729,7 @@ mod tests {
     #[test]
     fn merge_commit_records_multiple_parents() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"a1\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
@@ -2796,7 +2796,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let fmt = crate::bzrdir::find_control_dir_format(format_name).unwrap();
-        let cd = BzrDir::create_with_format(&parent, fmt).unwrap();
+        let cd = BzrDirMeta::create_with_format(&parent, fmt).unwrap();
 
         parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         let mut wt = cd.open_workingtree().unwrap();
@@ -2812,7 +2812,7 @@ mod tests {
             .unwrap();
 
         // Re-open and read the committed revision, inventory and file text.
-        let reopened = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let reopened = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         let repo = reopened.open_repository().unwrap();
         assert_eq!(repo.get_revision(&revid).unwrap().message, "a commit");
         let inv = repo.get_inventory(&revid).unwrap();
@@ -2940,7 +2940,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let format = crate::bzrdir::find_control_dir_format("knit").unwrap();
-        let cd = BzrDir::create_with_format(&parent, format).unwrap();
+        let cd = BzrDirMeta::create_with_format(&parent, format).unwrap();
 
         parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         let mut wt = cd.open_workingtree().unwrap();
@@ -2958,7 +2958,7 @@ mod tests {
 
         // The format-3 basis advanced to the new revision, on disk too.
         assert_eq!(wt.basis_revision().as_deref(), Some(revid.as_slice()));
-        let reopened = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let reopened = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         let wt2 = reopened.open_workingtree().unwrap();
         assert_eq!(wt2.basis_revision().as_deref(), Some(revid.as_slice()));
 

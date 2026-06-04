@@ -17,6 +17,21 @@ use crate::xml_serializer::{
 };
 
 declare_repository_format! {
+    FORMAT_WEAVE_6 {
+        format_string: b"Bazaar-NG branch, format 6\n",
+        description: "Weave repository format 6 (all-in-one)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer5,
+        // No `open`: the all-in-one weave repository has no
+        // `.bzr/repository/format` marker, so it is opened through BzrDir's
+        // all-in-one path rather than the metadir `open` dispatcher.
+        all_in_one: true,
+        supported: true,
+        deprecated: true,
+    }
+}
+
+declare_repository_format! {
     FORMAT_KNIT_1 {
         format_string: b"Bazaar-NG Knit Repository Format 1",
         description: "Knit repository format 1",

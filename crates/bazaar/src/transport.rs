@@ -366,7 +366,11 @@ impl LocalTransport {
     }
 
     fn resolve(&self, path: &str) -> std::path::PathBuf {
-        self.root.join(path)
+        // Relative transport paths are URL-escaped (the key mappers emit
+        // percent-encoded relpaths, e.g. `%40` for `@`); the local transport
+        // decodes them to a filesystem path, mirroring breezy's
+        // `urlutils.local_path_from_url`. Plain ASCII paths are unaffected.
+        self.root.join(crate::key_mapper::url_unquote(path))
     }
 }
 
@@ -440,7 +444,12 @@ impl Transport for LocalTransport {
                 if p.is_dir() {
                     stack.push(p);
                 } else if let Ok(rel) = p.strip_prefix(&self.root) {
-                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                    // Return URL-escaped relpaths, symmetric with `resolve`
+                    // unquoting them (and with breezy's local transport), so
+                    // a listed path round-trips through the key mappers'
+                    // `unmap`. `/` separators stay literal.
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    out.push(crate::key_mapper::url_quote(&rel));
                 }
             }
         }

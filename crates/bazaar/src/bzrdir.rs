@@ -262,21 +262,53 @@ impl Component {
     }
 }
 
+/// An opened `.bzr` control directory.
+///
+/// Two layouts implement this: [`BzrDirMeta`] for the meta-directory
+/// format (each component in its own subdirectory) and [`BzrDirAllInOne`]
+/// for the older all-in-one weave format, whose stores live directly under
+/// `.bzr`. Use the free [`open`] function to open whichever is on disk.
+///
+/// The accessors return owned component objects that can outlive the
+/// control directory.
+pub trait ControlDir: Send + Sync {
+    /// The transport rooted at the `.bzr` directory.
+    fn transport(&self) -> &SharedTransport;
+
+    /// Whether this control directory contains a repository.
+    fn has_repository(&self) -> bool;
+
+    /// Whether this control directory contains a branch.
+    fn has_branch(&self) -> bool;
+
+    /// Whether this control directory contains a working-tree checkout.
+    fn has_workingtree(&self) -> bool;
+
+    /// Open the repository in this control directory.
+    fn open_repository(&self) -> Result<Box<dyn crate::repository::Repository>, BzrDirError>;
+
+    /// Open the branch in this control directory.
+    fn open_branch(&self) -> Result<crate::branch::Branch, BzrDirError>;
+
+    /// Open the working tree in this control directory.
+    fn open_workingtree(&self) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError>;
+}
+
 /// An opened `.bzr` meta directory.
 ///
 /// Owns the transport rooted *at* the `.bzr` directory (as a
 /// [`SharedTransport`], consistent with the other opener objects) and
 /// records which components are present and format-verified. The
 /// `open_*` accessors descend into each component's subdirectory and
-/// return owned objects that can outlive this `BzrDir`.
-pub struct BzrDir {
+/// return owned objects that can outlive this `BzrDirMeta`.
+pub struct BzrDirMeta {
     transport: SharedTransport,
     has_repository: bool,
     has_branch: bool,
     has_workingtree: bool,
 }
 
-impl BzrDir {
+impl BzrDirMeta {
     /// Open the `.bzr` directory reachable through `transport`.
     ///
     /// `transport` must be rooted at the `.bzr` directory itself (i.e.
@@ -297,7 +329,7 @@ impl BzrDir {
         let has_branch = Self::verify_component(transport.as_ref(), Component::Branch)?;
         let has_workingtree = Self::verify_component(transport.as_ref(), Component::WorkingTree)?;
 
-        Ok(BzrDir {
+        Ok(BzrDirMeta {
             transport,
             has_repository,
             has_branch,
@@ -432,24 +464,22 @@ impl BzrDir {
             Err(e) => Err(e.into()),
         }
     }
+}
 
-    /// The transport rooted at the `.bzr` directory.
-    pub fn transport(&self) -> &SharedTransport {
+impl ControlDir for BzrDirMeta {
+    fn transport(&self) -> &SharedTransport {
         &self.transport
     }
 
-    /// Whether this control directory contains a repository.
-    pub fn has_repository(&self) -> bool {
+    fn has_repository(&self) -> bool {
         self.has_repository
     }
 
-    /// Whether this control directory contains a branch.
-    pub fn has_branch(&self) -> bool {
+    fn has_branch(&self) -> bool {
         self.has_branch
     }
 
-    /// Whether this control directory contains a working-tree checkout.
-    pub fn has_workingtree(&self) -> bool {
+    fn has_workingtree(&self) -> bool {
         self.has_workingtree
     }
 
@@ -457,7 +487,7 @@ impl BzrDir {
     ///
     /// Errors with [`BzrDirError::NotABzrDir`] if there is no repository
     /// component (a branch- or checkout-only `.bzr`).
-    pub fn open_repository(&self) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+    fn open_repository(&self) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
         if !self.has_repository {
             return Err(BzrDirError::NotABzrDir);
         }
@@ -472,7 +502,7 @@ impl BzrDir {
     ///
     /// Errors with [`BzrDirError::NotABzrDir`] if there is no branch
     /// component.
-    pub fn open_branch(&self) -> Result<crate::branch::Branch, BzrDirError> {
+    fn open_branch(&self) -> Result<crate::branch::Branch, BzrDirError> {
         if !self.has_branch {
             return Err(BzrDirError::NotABzrDir);
         }
@@ -484,13 +514,11 @@ impl BzrDir {
     ///
     /// The working tree reads `.bzr/checkout/dirstate` and the files on
     /// disk, so it is rooted at the directory that *contains* `.bzr` (one
-    /// level up from this `BzrDir`'s transport).
+    /// level up from this `BzrDirMeta`'s transport).
     ///
     /// Errors with [`BzrDirError::NotABzrDir`] if there is no working-tree
     /// component.
-    pub fn open_workingtree(
-        &self,
-    ) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError> {
+    fn open_workingtree(&self) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError> {
         if !self.has_workingtree {
             return Err(BzrDirError::NotABzrDir);
         }
@@ -498,6 +526,107 @@ impl BzrDir {
         crate::workingtree::open(root)
             .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))
     }
+}
+
+/// An opened all-in-one weave control directory ("Bazaar-NG branch,
+/// format 6", bzr 0.8).
+///
+/// Unlike the meta-directory layout, the repository, branch and working
+/// tree all live directly under `.bzr` rather than in component
+/// subdirectories. The transport is rooted at `.bzr` itself.
+pub struct BzrDirAllInOne {
+    transport: SharedTransport,
+    format: &'static crate::repository::RepositoryFormat,
+}
+
+impl BzrDirAllInOne {
+    /// Open the all-in-one `.bzr` directory reachable through `transport`
+    /// (rooted at `.bzr` itself).
+    ///
+    /// Reads `.bzr/branch-format`; succeeds only if the marker names a
+    /// supported weave repository format. Other markers yield
+    /// [`BzrDirError::NotMetaDir`] (carrying the marker found).
+    pub fn open(transport: SharedTransport) -> Result<Self, BzrDirError> {
+        let marker = match transport.get_bytes("branch-format") {
+            Ok(b) => b,
+            Err(TransportError::NoSuchFile(_)) => return Err(BzrDirError::NotABzrDir),
+            Err(e) => return Err(e.into()),
+        };
+        let format = crate::repository::find_format(&marker)
+            .filter(|f| f.is_all_in_one() && f.is_supported());
+        match format {
+            Some(format) => Ok(BzrDirAllInOne { transport, format }),
+            None => Err(BzrDirError::NotMetaDir(marker)),
+        }
+    }
+}
+
+impl ControlDir for BzrDirAllInOne {
+    fn transport(&self) -> &SharedTransport {
+        &self.transport
+    }
+
+    fn has_repository(&self) -> bool {
+        true
+    }
+
+    fn has_branch(&self) -> bool {
+        true
+    }
+
+    fn has_workingtree(&self) -> bool {
+        true
+    }
+
+    fn open_repository(&self) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        let repo = crate::repository::WeaveRepository::open(self.transport.clone(), self.format)
+            .map_err(|e| BzrDirError::Component(format!("opening repository: {e}")))?;
+        Ok(Box::new(repo))
+    }
+
+    /// Open the all-in-one branch.
+    ///
+    /// The weave branch stores its full mainline in `.bzr/revision-history`
+    /// (like branch format 5) and has no `.bzr/branch/format` marker, so the
+    /// branch is opened with the full-history format directly rather than by
+    /// reading a marker.
+    fn open_branch(&self) -> Result<crate::branch::Branch, BzrDirError> {
+        let format = crate::branch::find_format(b"Bazaar-NG branch format 5\n")
+            .ok_or_else(|| BzrDirError::Component("branch format 5 not registered".to_string()))?;
+        Ok(crate::branch::Branch::with_format(
+            self.transport.clone(),
+            format,
+        ))
+    }
+
+    /// Open the all-in-one working tree.
+    ///
+    /// TODO: the weave working tree reads `.bzr/inventory`,
+    /// `.bzr/pending-merges` and `.bzr/revision-history` directly under
+    /// `.bzr` (no `checkout/` subdir and no dirstate), which the existing
+    /// WorkingTree3 backend does not handle. Not yet implemented.
+    fn open_workingtree(&self) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError> {
+        Err(BzrDirError::Component(
+            "weave working tree not yet supported".to_string(),
+        ))
+    }
+}
+
+/// Open the `.bzr` control directory reachable through `transport`.
+///
+/// `transport` must be rooted at the `.bzr` directory itself. Probes
+/// `.bzr/branch-format` and returns a [`BzrDirMeta`] for the meta-directory
+/// layout or a [`BzrDirAllInOne`] for a supported all-in-one weave format.
+pub fn open(transport: SharedTransport) -> Result<Box<dyn ControlDir>, BzrDirError> {
+    let marker = match transport.get_bytes("branch-format") {
+        Ok(b) => b,
+        Err(TransportError::NoSuchFile(_)) => return Err(BzrDirError::NotABzrDir),
+        Err(e) => return Err(e.into()),
+    };
+    if marker == METADIR_MARKER {
+        return Ok(Box::new(BzrDirMeta::open(transport)?));
+    }
+    Ok(Box::new(BzrDirAllInOne::open(transport)?))
 }
 
 /// Serialise an empty dirstate (one root entry, no parents).
@@ -570,7 +699,7 @@ mod tests {
             ],
         );
         let t = bzr_transport(dir.path());
-        let bd = BzrDir::open(t).unwrap();
+        let bd = BzrDirMeta::open(t).unwrap();
         assert!(bd.has_repository());
         assert!(bd.has_branch());
         assert!(bd.has_workingtree());
@@ -581,7 +710,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         make_bzrdir(dir.path(), &[Component::Repository]);
         let t = bzr_transport(dir.path());
-        let bd = BzrDir::open(t).unwrap();
+        let bd = BzrDirMeta::open(t).unwrap();
         assert!(bd.has_repository());
         assert!(!bd.has_branch());
         assert!(!bd.has_workingtree());
@@ -591,7 +720,7 @@ mod tests {
     fn missing_dir_is_not_a_bzrdir() {
         let dir = tempfile::tempdir().unwrap();
         let t = bzr_transport(dir.path());
-        match BzrDir::open(t) {
+        match BzrDirMeta::open(t) {
             Err(BzrDirError::NotABzrDir) => {}
             other => panic!("expected NotABzrDir, got {other:?}"),
         }
@@ -604,7 +733,7 @@ mod tests {
         std::fs::create_dir_all(&bzr).unwrap();
         std::fs::write(bzr.join("branch-format"), b"Bazaar-NG branch, format 6\n").unwrap();
         let t = bzr_transport(dir.path());
-        match BzrDir::open(t) {
+        match BzrDirMeta::open(t) {
             Err(BzrDirError::NotMetaDir(_)) => {}
             other => panic!("expected NotMetaDir, got {other:?}"),
         }
@@ -622,12 +751,83 @@ mod tests {
         )
         .unwrap();
         let t = bzr_transport(dir.path());
-        match BzrDir::open(t) {
+        match BzrDirMeta::open(t) {
             Err(BzrDirError::UnsupportedFormat {
                 component: Component::Repository,
                 ..
             }) => {}
             other => panic!("expected UnsupportedFormat(Repository), got {other:?}"),
         }
+    }
+
+    // A minimal all-in-one weave `.bzr` (one revision committing one file),
+    // captured byte-for-byte from a `brz init --format=weave` tree. The
+    // revision id is jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8 and the
+    // file is a.txt with content "hi\n".
+    const WEAVE_REVID: &[u8] = b"jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8";
+    const WEAVE_FILE_ID: &[u8] = b"a.txt-20260604015637-2c5ba92i40zw1mvp-1";
+
+    const WEAVE_INVENTORY: &[u8] = b"# bzr weave file v5\ni\n1 8a002a6377d9177f17c988d81dda2e0175a18398\nn jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8\n\nw\n{ 0\n. <inventory format=\"5\" revision_id=\"jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8\">\n. <file file_id=\"a.txt-20260604015637-2c5ba92i40zw1mvp-1\" name=\"a.txt\" revision=\"jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8\" text_sha1=\"55ca6286e3e4f4fba5d0448333fa99fc5a404a73\" text_size=\"3\" />\n. </inventory>\n}\nW\n";
+
+    const WEAVE_REVISION: &[u8] = b"<revision committer=\"Jelmer Vernooij &lt;jelmer@jelmer.uk&gt;\" format=\"5\" inventory_sha1=\"8a002a6377d9177f17c988d81dda2e0175a18398\" revision_id=\"jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8\" timestamp=\"1577880000.000\" timezone=\"0\">\n<message>one</message>\n<properties><property name=\"branch-nick\">wv</property>\n</properties>\n</revision>\n";
+
+    const WEAVE_FILE_WEAVE: &[u8] = b"# bzr weave file v5\ni\n1 55ca6286e3e4f4fba5d0448333fa99fc5a404a73\nn jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8\n\nw\n{ 0\n. hi\n}\nW\n";
+
+    fn make_weave_bzrdir(root: &std::path::Path) {
+        use crate::key_mapper::{hash_prefix_map, url_unquote};
+        let bzr = root.join(".bzr");
+        std::fs::create_dir_all(&bzr).unwrap();
+        std::fs::write(bzr.join("branch-format"), b"Bazaar-NG branch, format 6\n").unwrap();
+        std::fs::write(bzr.join("inventory.weave"), WEAVE_INVENTORY).unwrap();
+        let mut history = WEAVE_REVID.to_vec();
+        history.push(b'\n');
+        std::fs::write(bzr.join("revision-history"), &history).unwrap();
+
+        // hash_prefix_map url-quotes the name; the local transport unquotes it
+        // again when resolving, so the on-disk name is the unquoted form (e.g.
+        // a literal `@`, as brz writes it).
+        let rev_name = url_unquote(&hash_prefix_map(WEAVE_REVID));
+        let rev_path = bzr.join(format!("revision-store/{rev_name}"));
+        std::fs::create_dir_all(rev_path.parent().unwrap()).unwrap();
+        std::fs::write(rev_path, WEAVE_REVISION).unwrap();
+
+        let weave_name = url_unquote(&hash_prefix_map(WEAVE_FILE_ID));
+        let weave_path = bzr.join(format!("weaves/{weave_name}.weave"));
+        std::fs::create_dir_all(weave_path.parent().unwrap()).unwrap();
+        std::fs::write(weave_path, WEAVE_FILE_WEAVE).unwrap();
+    }
+
+    #[test]
+    fn opens_all_in_one_weave() {
+        let dir = tempfile::tempdir().unwrap();
+        make_weave_bzrdir(dir.path());
+        let cd = open(bzr_transport(dir.path())).unwrap();
+        assert!(cd.has_repository());
+        assert!(cd.has_branch());
+        assert!(cd.has_workingtree());
+
+        let repo = cd.open_repository().unwrap();
+        assert_eq!(repo.all_revision_ids().unwrap(), vec![WEAVE_REVID.to_vec()]);
+
+        let rev = repo.get_revision(WEAVE_REVID).unwrap();
+        assert_eq!(rev.message, "one");
+
+        let inv = repo.get_inventory(WEAVE_REVID).unwrap();
+        let a_txt = inv
+            .entries()
+            .unwrap()
+            .into_iter()
+            .find(|(path, _)| path == "a.txt")
+            .expect("a.txt in inventory");
+        assert_eq!(a_txt.1.file_id().as_bytes(), WEAVE_FILE_ID);
+
+        let text = repo.get_file_text(WEAVE_FILE_ID, WEAVE_REVID).unwrap();
+        assert_eq!(text, b"hi\n".to_vec());
+
+        let branch = cd.open_branch().unwrap();
+        assert_eq!(
+            branch.last_revision_info().unwrap(),
+            (1, WEAVE_REVID.to_vec())
+        );
     }
 }

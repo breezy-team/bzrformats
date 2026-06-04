@@ -86,6 +86,16 @@ impl Branch {
         Branch { transport, format }
     }
 
+    /// Open the branch reachable through `transport` as a specific `format`,
+    /// without reading a `format` marker file.
+    ///
+    /// The all-in-one weave layout has no `.bzr/branch/format` file -- the
+    /// branch lives at `.bzr` itself with its tip in `.bzr/revision-history`
+    /// -- so the format (full-history branch format 5) is supplied directly.
+    pub fn with_format(transport: SharedTransport, format: &'static BranchFormat) -> Self {
+        Branch { transport, format }
+    }
+
     /// The format this branch was opened as.
     pub fn format(&self) -> &'static BranchFormat {
         self.format

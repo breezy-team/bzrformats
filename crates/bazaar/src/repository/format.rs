@@ -62,6 +62,11 @@ pub struct RepositoryFormat {
     pub supported: bool,
     /// Whether the format is deprecated (still readable, upgrade advised).
     pub deprecated: bool,
+    /// Whether this is an all-in-one (pre-metadir) format whose stores live
+    /// directly under `.bzr` with no `.bzr/repository/format` marker. Such a
+    /// format is opened through the all-in-one control-dir path, not the
+    /// metadir `open` dispatcher (its `open` stays `open_unsupported`).
+    pub all_in_one: bool,
 }
 
 impl RepositoryFormat {
@@ -81,6 +86,7 @@ impl RepositoryFormat {
         uses_btree_index: true,
         supported: false,
         deprecated: false,
+        all_in_one: false,
     };
 
     /// The `.bzr/repository/format` marker for this format.
@@ -101,6 +107,12 @@ impl RepositoryFormat {
     /// Whether the format is deprecated.
     pub fn is_deprecated(&self) -> bool {
         self.deprecated
+    }
+
+    /// Whether this is an all-in-one (pre-metadir) format, opened through the
+    /// all-in-one control-dir path rather than the metadir dispatcher.
+    pub fn is_all_in_one(&self) -> bool {
+        self.all_in_one
     }
 
     /// The network name (metadir formats use their marker string).
