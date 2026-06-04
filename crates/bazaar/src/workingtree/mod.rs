@@ -1958,6 +1958,39 @@ mod tests {
         assert_eq!(id2, b"my-id".to_vec());
     }
 
+    /// Adding a path whose parent directory is not versioned is rejected;
+    /// callers must add the parent first. Mirrors breezy's MutableTree._add
+    /// (exercised throughout per_workingtree/test_add.py).
+    #[test]
+    fn add_unversioned_parent_is_rejected() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.mkdir("sub").unwrap();
+        parent.put_bytes("sub/a.txt", b"a\n", None).unwrap();
+        // `sub` was never added, so adding `sub/a.txt` is an error.
+        assert!(wt.add("sub/a.txt", EntryKind::File, None).is_err());
+    }
+
+    /// add_pending_merge appends parents (idempotently, preserving order) and
+    /// parent_ids reflects them. Ported from per_workingtree
+    /// test_get_parent_ids.test_pending_merges, for the dirstate tree.
+    #[test]
+    fn add_pending_merge_appends_and_is_idempotent() {
+        let (_d, _parent, mut wt) = fresh_tree();
+        assert!(wt.parent_ids().is_empty());
+
+        wt.add_pending_merge(b"foo@a-1").unwrap();
+        assert_eq!(wt.parent_ids(), vec![b"foo@a-1".to_vec()]);
+        // Re-adding the same merge is a no-op.
+        wt.add_pending_merge(b"foo@a-1").unwrap();
+        assert_eq!(wt.parent_ids(), vec![b"foo@a-1".to_vec()]);
+        // A distinct merge is appended, preserving order.
+        wt.add_pending_merge(b"wibble@b-2").unwrap();
+        assert_eq!(
+            wt.parent_ids(),
+            vec![b"foo@a-1".to_vec(), b"wibble@b-2".to_vec()]
+        );
+    }
+
     #[test]
     fn remove_unversions_directory_and_children() {
         let (_d, parent, mut wt) = fresh_tree();

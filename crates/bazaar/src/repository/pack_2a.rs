@@ -935,6 +935,30 @@ mod tests {
         (dir, t)
     }
 
+    /// Opening a second write group while one is already open is an error.
+    /// Ported from per_repository/test_write_group.test_start_write_group_twice.
+    #[test]
+    fn double_start_write_group_is_rejected() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t).unwrap();
+        repo.start_write_group().unwrap();
+        assert!(repo.start_write_group().is_err());
+    }
+
+    /// Adding to a repository with no open write group is an error (the write
+    /// must happen inside a write group). Ported from the write-group
+    /// lifecycle invariants in per_repository/test_write_group.
+    #[test]
+    fn add_without_write_group_is_rejected() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t).unwrap();
+        // No start_write_group() call.
+        assert!(repo
+            .add_revision(&make_revision(b"rev-1", vec![], "first", None), &[])
+            .is_err());
+        assert!(repo.add_text(b"file-1", b"rev-1", &[], b"hi\n").is_err());
+    }
+
     #[test]
     fn chk_inventory_write_round_trip() {
         use crate::inventory::Entry;
