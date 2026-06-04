@@ -17,12 +17,14 @@
 //! This is not a cross-VCS prober: it only ever opens `.bzr`, and the
 //! only thing it "detects" is which bzr format string each present
 //! component carries, so the right decoder is used and an unsupported
-//! format is rejected loudly rather than mis-read. All the pack repository
-//! formats are supported: 2a (groupcompress) and the knit-pack formats from
-//! 0.92 through 1.14 (both GraphIndex- and B+Tree-indexed, with rich-root
-//! and subtree variants), paired with Branch 6/7/8 and Working Tree 4/5/6.
-//! The pre-pack knit and weave formats are recognised but not yet
-//! supported, and are reported as [`BzrDirError::UnsupportedFormat`].
+//! format is rejected loudly rather than mis-read. The supported formats
+//! span the pack family -- 2a (groupcompress) and the knit-pack formats
+//! from 0.92 through 1.14 (both GraphIndex- and B+Tree-indexed, with
+//! rich-root and subtree variants), paired with Branch 6/7/8 and Working
+//! Tree 4/5/6 -- the non-pack knit format (Branch 5, Working Tree 3), and
+//! the all-in-one weave format ("Bazaar-NG branch, format 6"), which lives
+//! directly under `.bzr` and is opened as a [`BzrDirAllInOne`] rather than
+//! a meta-directory.
 
 use crate::transport::{SharedTransport, Transport, TransportError};
 
