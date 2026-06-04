@@ -1666,7 +1666,8 @@ impl WorkingTree for WorkingTree3 {
         if let Wt3Basis::LastRevisionFile(path) = self.layout.basis {
             self.transport.put_bytes(path, &revid, None)?;
         }
-        self.transport.put_bytes(self.layout.pending_merges, b"", None)?;
+        self.transport
+            .put_bytes(self.layout.pending_merges, b"", None)?;
 
         Ok(revid)
     }
@@ -2077,10 +2078,9 @@ fn build_committed_entries(
                     let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
                     (sha1, content.len() as u64)
                 } else {
-                    match basis
-                        .get_entry(&fid)
-                        .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
-                    {
+                    match basis.get_entry(&fid).map_err(|e| {
+                        WorkingTreeError::Commit(format!("reading basis inventory: {e:?}"))
+                    })? {
                         Some(be) => (
                             be.text_sha1().map(|s| s.to_vec()).unwrap_or_default(),
                             be.text_size().unwrap_or(0),
@@ -2956,7 +2956,11 @@ mod tests {
         probe.mkdir(".bzr").unwrap();
         probe.mkdir(".bzr/checkout").unwrap();
         probe
-            .put_bytes(".bzr/checkout/format", b"Bazaar-NG Working Tree format 3", None)
+            .put_bytes(
+                ".bzr/checkout/format",
+                b"Bazaar-NG Working Tree format 3",
+                None,
+            )
             .unwrap();
         let shared: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let wt = WorkingTree3::open(shared).unwrap();
@@ -2970,8 +2974,12 @@ mod tests {
         let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         t.mkdir(".bzr").unwrap();
         t.mkdir(".bzr/checkout").unwrap();
-        t.put_bytes(".bzr/checkout/format", b"Bazaar-NG Working Tree format 3", None)
-            .unwrap();
+        t.put_bytes(
+            ".bzr/checkout/format",
+            b"Bazaar-NG Working Tree format 3",
+            None,
+        )
+        .unwrap();
         let opened = open(Arc::new(LocalTransport::new(dir.path()))).unwrap();
         assert!(opened.list_files().is_empty());
     }

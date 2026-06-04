@@ -436,7 +436,11 @@ impl BzrDirMeta {
             }
             checkout.put_bytes("dirstate", &empty_dirstate_bytes(), None)?;
         } else {
-            checkout.put_bytes("inventory", b"<inventory format=\"5\">\n</inventory>\n", None)?;
+            checkout.put_bytes(
+                "inventory",
+                b"<inventory format=\"5\">\n</inventory>\n",
+                None,
+            )?;
             checkout.put_bytes("pending-merges", b"", None)?;
         }
 
@@ -581,7 +585,11 @@ impl BzrDirAllInOne {
         bzr.put_bytes("branch-format", marker, None)?;
         bzr.put_bytes("revision-history", b"", None)?;
         bzr.put_bytes("pending-merges", b"", None)?;
-        bzr.put_bytes("inventory", b"<inventory format=\"5\">\n</inventory>\n", None)?;
+        bzr.put_bytes(
+            "inventory",
+            b"<inventory format=\"5\">\n</inventory>\n",
+            None,
+        )?;
 
         crate::repository::WeaveRepository::create(bzr.clone(), format)
             .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
