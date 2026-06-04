@@ -178,12 +178,13 @@ impl BzrDir {
     pub fn create(parent: &SharedTransport) -> Result<Self, BzrDirError> {
         let bzr = parent.subtransport(".bzr")?;
         bzr.mkdir("")?;
-        bzr.put_bytes("branch-format", METADIR_MARKER)?;
+        bzr.put_bytes("branch-format", METADIR_MARKER, None)?;
         bzr.put_bytes(
             "README",
             b"This is a Bazaar control directory.\n\
               Do not change any files in this directory.\n\
               See http://bazaar.canonical.com/ for more information about Bazaar.\n",
+            None,
         )?;
 
         // Repository: empty 2a.
@@ -193,18 +194,18 @@ impl BzrDir {
         // Branch: format marker, null tip, empty config and tags.
         let branch = bzr.subtransport("branch")?;
         branch.mkdir("")?;
-        branch.put_bytes("format", BRANCH_FORMAT_7)?;
-        branch.put_bytes("last-revision", b"0 null:\n")?;
-        branch.put_bytes("branch.conf", b"")?;
-        branch.put_bytes("tags", b"")?;
+        branch.put_bytes("format", BRANCH_FORMAT_7, None)?;
+        branch.put_bytes("last-revision", b"0 null:\n", None)?;
+        branch.put_bytes("branch.conf", b"", None)?;
+        branch.put_bytes("tags", b"", None)?;
 
         // Working tree: format marker, empty dirstate, conflicts and views.
         let checkout = bzr.subtransport("checkout")?;
         checkout.mkdir("")?;
-        checkout.put_bytes("format", WORKINGTREE_FORMAT_6)?;
-        checkout.put_bytes("conflicts", b"BZR conflict list format 1\n")?;
-        checkout.put_bytes("views", b"")?;
-        checkout.put_bytes("dirstate", &empty_dirstate_bytes())?;
+        checkout.put_bytes("format", WORKINGTREE_FORMAT_6, None)?;
+        checkout.put_bytes("conflicts", b"BZR conflict list format 1\n", None)?;
+        checkout.put_bytes("views", b"", None)?;
+        checkout.put_bytes("dirstate", &empty_dirstate_bytes(), None)?;
 
         Self::open(bzr)
     }

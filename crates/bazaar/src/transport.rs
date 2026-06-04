@@ -181,14 +181,6 @@ pub trait Transport {
     /// return any stable string.
     fn abspath(&self, path: &str) -> Result<String, TransportError>;
 
-    /// Atomically write `bytes` to `path`, replacing any existing
-    /// content. The default delegates to [`Transport::put_file_non_atomic`],
-    /// which is *not* atomic; backends that can offer atomicity (e.g. via
-    /// write-to-temp-then-rename) should override this.
-    fn put_bytes(&self, path: &str, bytes: &[u8]) -> Result<(), TransportError> {
-        self.put_file_non_atomic(path, bytes, false)
-    }
-
     /// Rename `from` to `to`. For the lockdir protocol this must fail
     /// (rather than overwrite) when `to` already exists, so that the
     /// atomic "claim the lock by renaming into place" step is reliable.
@@ -325,8 +317,9 @@ impl Transport for LocalTransport {
         Ok(())
     }
 
-    fn put_bytes(&self, path: &str, bytes: &[u8]) -> Result<(), TransportError> {
+    fn put_bytes(&self, path: &str, bytes: &[u8], mode: Option<u32>) -> Result<(), TransportError> {
         // Atomic via write-to-temp-then-rename within the same directory.
+        let _ = mode;
         let full = self.resolve(path);
         let parent = full.parent().ok_or_else(|| {
             TransportError::Other(format!("path has no parent directory: {path}"))

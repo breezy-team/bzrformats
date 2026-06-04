@@ -105,7 +105,9 @@ impl Repository {
         d.set_item("timestamp", rev.timestamp)?;
         let parents = PyList::new(
             py,
-            rev.parent_ids.iter().map(|p| PyBytes::new(py, p.as_bytes())),
+            rev.parent_ids
+                .iter()
+                .map(|p| PyBytes::new(py, p.as_bytes())),
         )?;
         d.set_item("parent_ids", parents)?;
         Ok(d)
@@ -135,11 +137,7 @@ impl Repository {
         let out = PyList::empty(py);
         for (path, entry) in entries {
             let kind = format!("{:?}", entry.kind()).to_lowercase();
-            let tuple = (
-                path,
-                kind,
-                PyBytes::new(py, entry.file_id().as_bytes()),
-            );
+            let tuple = (path, kind, PyBytes::new(py, entry.file_id().as_bytes()));
             out.append(tuple)?;
         }
         Ok(out)
@@ -221,7 +219,10 @@ impl WorkingTree {
 
     /// The content of a versioned file, read from disk.
     fn get_file_text<'py>(&self, py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyBytes>> {
-        Ok(PyBytes::new(py, &self.inner.get_file_text(path).map_err(err)?))
+        Ok(PyBytes::new(
+            py,
+            &self.inner.get_file_text(path).map_err(err)?,
+        ))
     }
 
     /// Commit the live tree state as a new revision and return its id.

@@ -152,7 +152,7 @@ impl Branch {
             let mut content = format!("{revno} ").into_bytes();
             content.extend_from_slice(revision_id);
             content.push(b'\n');
-            self.transport.put_bytes("last-revision", &content)?;
+            self.transport.put_bytes("last-revision", &content, None)?;
             Ok(())
         })
     }
@@ -160,7 +160,7 @@ impl Branch {
     /// Replace the branch tags, under the branch lock.
     pub fn set_tags(&self, tags: &BTreeMap<String, Vec<u8>>) -> Result<(), BranchError> {
         self.with_write_lock(|| {
-            self.transport.put_bytes("tags", &encode_tags(tags))?;
+            self.transport.put_bytes("tags", &encode_tags(tags), None)?;
             Ok(())
         })
     }

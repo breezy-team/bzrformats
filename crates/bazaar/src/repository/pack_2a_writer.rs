@@ -315,10 +315,10 @@ impl WriteGroup {
             std::mem::take(pack.writer.get_mut())
         };
 
-        transport.put_bytes(&format!("packs/{}.pack", self.pack_name), &pack_bytes)?;
+        transport.put_bytes(&format!("packs/{}.pack", self.pack_name), &pack_bytes, None)?;
         let write_index = |ext: &str, bytes: &[u8]| -> Result<usize, RepositoryError> {
             let name = format!("indices/{}{ext}", self.pack_name);
-            transport.put_bytes(&name, bytes)?;
+            transport.put_bytes(&name, bytes, None)?;
             Ok(bytes.len())
         };
         // Order in pack-names value: rix iix tix six cix.
@@ -354,7 +354,7 @@ impl WriteGroup {
         let names_bytes = names
             .finish()
             .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e:?}")))?;
-        transport.put_bytes("pack-names", &names_bytes)?;
+        transport.put_bytes("pack-names", &names_bytes, None)?;
 
         Ok(Some((self.pack_name, new_value)))
     }

@@ -185,7 +185,7 @@ impl<'t> LockDir<'t> {
         let tmpname = format!("{}/{}.tmp", self.path, crate::osutils::rand_chars(10));
         self.transport.mkdir(&tmpname)?;
         self.transport
-            .put_bytes(&format!("{tmpname}{INFO_NAME}"), &info.to_bytes())?;
+            .put_bytes(&format!("{tmpname}{INFO_NAME}"), &info.to_bytes(), None)?;
         Ok(tmpname)
     }
 

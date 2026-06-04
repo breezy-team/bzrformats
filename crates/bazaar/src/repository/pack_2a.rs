@@ -353,12 +353,13 @@ impl Pack2aRepository {
         transport.put_bytes(
             "format",
             b"Bazaar repository format 2a (needs bzr 1.16 or later)\n",
+            None,
         )?;
         // An empty pack-names index: no packs yet.
         let empty = crate::btree_builder::BTreeBuilder::new(0, 1)
             .finish()
             .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e:?}")))?;
-        transport.put_bytes("pack-names", &empty)?;
+        transport.put_bytes("pack-names", &empty, None)?;
         Self::open(transport)
     }
 
