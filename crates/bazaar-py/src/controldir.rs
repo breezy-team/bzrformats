@@ -208,10 +208,10 @@ impl Branch {
     }
 }
 
-/// A dirstate-based working tree.
+/// A working tree, backed by whichever on-disk format was opened.
 #[pyclass(name = "WorkingTree")]
 struct WorkingTree {
-    inner: RsWorkingTree,
+    inner: Box<dyn RsWorkingTree>,
 }
 
 #[pymethods]

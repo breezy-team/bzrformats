@@ -448,12 +448,14 @@ impl BzrDir {
     ///
     /// Errors with [`BzrDirError::NotABzrDir`] if there is no working-tree
     /// component.
-    pub fn open_workingtree(&self) -> Result<crate::workingtree::WorkingTree, BzrDirError> {
+    pub fn open_workingtree(
+        &self,
+    ) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError> {
         if !self.has_workingtree {
             return Err(BzrDirError::NotABzrDir);
         }
         let root = self.transport.subtransport("..")?;
-        crate::workingtree::WorkingTree::open(root)
+        crate::workingtree::open(root)
             .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))
     }
 }

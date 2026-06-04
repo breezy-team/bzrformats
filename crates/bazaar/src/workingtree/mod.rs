@@ -1,15 +1,19 @@
-//! Reading a dirstate-based working tree (Working Tree Format 6).
+//! Working trees: the user's checkout on disk plus its tracked state.
 //!
-//! A working tree is the user's checkout: the files on disk plus
-//! `.bzr/checkout/dirstate`, which records the tracked state (tree 0) and
-//! the basis it was checked out from (tree 1). This module opens the
-//! dirstate through a [`Transport`] rooted at the tree root (the directory
-//! that contains `.bzr`) and exposes the live tracked files.
+//! A working tree is the user's checkout: the files on disk plus the
+//! control state recording the tracked set (tree 0) and the basis it was
+//! checked out from (tree 1). The shared surface is the [`WorkingTree`]
+//! trait; [`open`] reads the `.bzr/checkout/format` marker and dispatches to
+//! the right backend.
 //!
-//! It can read the tree (list the tracked files, map paths to file ids,
-//! read file contents), mutate the tracked set ([`add`](WorkingTree::add),
-//! [`remove`](WorkingTree::remove), [`rename`](WorkingTree::rename)), and
-//! [`commit`](WorkingTree::commit) the live state as a new revision.
+//! The only backend so far is [`WorkingTree4`], the dirstate-backed tree
+//! (formats 4/5/6), which stores its state in `.bzr/checkout/dirstate`.
+//!
+//! Through the trait a tree can be read (list the tracked files, map paths
+//! to file ids, read file contents), have its tracked set mutated
+//! ([`add`](WorkingTree::add), [`remove`](WorkingTree::remove),
+//! [`rename`](WorkingTree::rename)), and [`commit`](WorkingTree::commit) the
+//! live state as a new revision.
 
 pub mod format;
 mod formats;
@@ -48,6 +52,9 @@ pub enum WorkingTreeError {
     Branch(crate::branch::BranchError),
     /// An underlying transport error.
     Transport(TransportError),
+    /// The working-tree format (its `.bzr/checkout/format` marker) is not
+    /// supported by this crate.
+    UnsupportedFormat(Vec<u8>),
 }
 
 impl std::fmt::Display for WorkingTreeError {
@@ -74,6 +81,11 @@ impl std::fmt::Display for WorkingTreeError {
             WorkingTreeError::Repository(e) => write!(f, "repository: {e}"),
             WorkingTreeError::Branch(e) => write!(f, "branch: {e}"),
             WorkingTreeError::Transport(e) => write!(f, "transport error: {e}"),
+            WorkingTreeError::UnsupportedFormat(marker) => write!(
+                f,
+                "unsupported working-tree format: {}",
+                String::from_utf8_lossy(marker)
+            ),
         }
     }
 }
@@ -317,14 +329,112 @@ impl CommitOptions {
     }
 }
 
-/// A dirstate-based working tree, accessed through a transport rooted at
-/// the tree root (the directory containing `.bzr`).
-pub struct WorkingTree {
+/// The shared surface of a working tree, regardless of its on-disk format.
+///
+/// Object-safe so a tree can be held as `Box<dyn WorkingTree>`; [`open`]
+/// returns one. Construction is format-specific and stays on the concrete
+/// type (e.g. [`WorkingTree4::open`]).
+///
+/// `Send + Sync` so a boxed tree can be held by the pyo3 bindings.
+pub trait WorkingTree: Send + Sync {
+    /// The basis revision id this tree was checked out from, or `None` if
+    /// the tree has no parent (a fresh, never-committed tree).
+    fn basis_revision(&self) -> Option<Vec<u8>>;
+
+    /// The tree's parent revision ids (the basis first, then any pending
+    /// merges).
+    fn parent_ids(&self) -> Vec<Vec<u8>>;
+
+    /// Add `revision_id` as a pending-merge parent, so the next commit
+    /// records it as an additional parent.
+    fn add_pending_merge(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError>;
+
+    /// List the tracked files and directories in the live working tree.
+    fn list_files(&self) -> Vec<VersionedEntry>;
+
+    /// The file id of the entry at `path`, or `None` if `path` is not
+    /// versioned in the live tree.
+    fn path2id(&self, path: &str) -> Option<Vec<u8>>;
+
+    /// Read the content of a versioned file from disk.
+    fn get_file_text(&self, path: &str) -> Result<Vec<u8>, WorkingTreeError>;
+
+    /// The tree-relative paths of on-disk files and directories that are not
+    /// versioned, in sorted order.
+    fn unknowns(&self) -> Result<Vec<String>, WorkingTreeError>;
+
+    /// The changes between this working tree and `basis`.
+    fn iter_changes(
+        &self,
+        basis: &crate::repository::RevisionTree,
+    ) -> Result<Vec<WorkingTreeChange>, WorkingTreeError>;
+
+    /// As [`iter_changes`](Self::iter_changes), but also considering the
+    /// non-basis merge `other_parents` for per-file text parents.
+    fn iter_changes_with_parents(
+        &self,
+        basis: &crate::repository::RevisionTree,
+        other_parents: &[crate::repository::RevisionTree],
+    ) -> Result<Vec<WorkingTreeChange>, WorkingTreeError>;
+
+    /// Version `path` with `kind`, assigning `file_id` (a fresh id is
+    /// generated when `None`). Returns the file id of the (now) versioned
+    /// path.
+    fn add(
+        &mut self,
+        path: &str,
+        kind: EntryKind,
+        file_id: Option<&[u8]>,
+    ) -> Result<Vec<u8>, WorkingTreeError>;
+
+    /// Stop versioning `path` and (if it is a directory) everything beneath
+    /// it. The files are left on disk.
+    fn remove(&mut self, path: &str) -> Result<(), WorkingTreeError>;
+
+    /// Move a versioned entry from `from_path` to `to_path`, keeping its
+    /// file id, and move the file on disk.
+    fn rename(&mut self, from_path: &str, to_path: &str) -> Result<(), WorkingTreeError>;
+
+    /// Commit the live working tree as a new revision. Returns the new
+    /// revision id.
+    fn commit(
+        &mut self,
+        repository: &mut dyn crate::repository::Repository,
+        branch: &crate::branch::Branch,
+        options: &CommitOptions,
+    ) -> Result<Vec<u8>, WorkingTreeError>;
+}
+
+/// Open the working tree reachable through `transport` (rooted at the
+/// directory that contains `.bzr`), dispatching on the
+/// `.bzr/checkout/format` marker.
+///
+/// All currently supported formats are dirstate-backed and open as a
+/// [`WorkingTree4`]. Format 3 (pre-dirstate) is recognised but not yet
+/// implemented; opening it returns [`WorkingTreeError::UnsupportedFormat`].
+pub fn open(transport: SharedTransport) -> Result<Box<dyn WorkingTree>, WorkingTreeError> {
+    // A missing marker keeps the prior behaviour: assume the dirstate tree.
+    match transport.get_bytes(".bzr/checkout/format") {
+        Ok(marker) => match find_format(&marker) {
+            Some(fmt) if fmt.uses_dirstate => Ok(Box::new(WorkingTree4::open(transport)?)),
+            // A known non-dirstate format (format 3) or an unknown marker is
+            // not yet supported.
+            _ => Err(WorkingTreeError::UnsupportedFormat(marker)),
+        },
+        Err(TransportError::NoSuchFile(_)) => Ok(Box::new(WorkingTree4::open(transport)?)),
+        Err(e) => Err(WorkingTreeError::Transport(e)),
+    }
+}
+
+/// The dirstate-backed working tree (formats 4/5/6), accessed through a
+/// transport rooted at the tree root (the directory containing `.bzr`). Its
+/// state lives in `.bzr/checkout/dirstate`.
+pub struct WorkingTree4 {
     transport: SharedTransport,
     dirstate: DirState,
 }
 
-impl WorkingTree {
+impl WorkingTree4 {
     /// Open the working tree reachable through `transport` (rooted at the
     /// directory that contains `.bzr`).
     pub fn open(transport: SharedTransport) -> Result<Self, WorkingTreeError> {
@@ -332,7 +442,7 @@ impl WorkingTree {
         let mut dirstate =
             DirState::new(DIRSTATE_PATH, Box::new(DefaultSHA1Provider), 0, true, false);
         dirstate.load_bytes(&data)?;
-        Ok(WorkingTree {
+        Ok(WorkingTree4 {
             transport,
             dirstate,
         })
@@ -1379,6 +1489,77 @@ impl WorkingTree {
     }
 }
 
+impl WorkingTree for WorkingTree4 {
+    fn basis_revision(&self) -> Option<Vec<u8>> {
+        WorkingTree4::basis_revision(self)
+    }
+
+    fn parent_ids(&self) -> Vec<Vec<u8>> {
+        WorkingTree4::parent_ids(self)
+    }
+
+    fn add_pending_merge(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError> {
+        WorkingTree4::add_pending_merge(self, revision_id)
+    }
+
+    fn list_files(&self) -> Vec<VersionedEntry> {
+        WorkingTree4::list_files(self)
+    }
+
+    fn path2id(&self, path: &str) -> Option<Vec<u8>> {
+        WorkingTree4::path2id(self, path)
+    }
+
+    fn get_file_text(&self, path: &str) -> Result<Vec<u8>, WorkingTreeError> {
+        WorkingTree4::get_file_text(self, path)
+    }
+
+    fn unknowns(&self) -> Result<Vec<String>, WorkingTreeError> {
+        WorkingTree4::unknowns(self)
+    }
+
+    fn iter_changes(
+        &self,
+        basis: &crate::repository::RevisionTree,
+    ) -> Result<Vec<WorkingTreeChange>, WorkingTreeError> {
+        WorkingTree4::iter_changes(self, basis)
+    }
+
+    fn iter_changes_with_parents(
+        &self,
+        basis: &crate::repository::RevisionTree,
+        other_parents: &[crate::repository::RevisionTree],
+    ) -> Result<Vec<WorkingTreeChange>, WorkingTreeError> {
+        WorkingTree4::iter_changes_with_parents(self, basis, other_parents)
+    }
+
+    fn add(
+        &mut self,
+        path: &str,
+        kind: EntryKind,
+        file_id: Option<&[u8]>,
+    ) -> Result<Vec<u8>, WorkingTreeError> {
+        WorkingTree4::add(self, path, kind, file_id)
+    }
+
+    fn remove(&mut self, path: &str) -> Result<(), WorkingTreeError> {
+        WorkingTree4::remove(self, path)
+    }
+
+    fn rename(&mut self, from_path: &str, to_path: &str) -> Result<(), WorkingTreeError> {
+        WorkingTree4::rename(self, from_path, to_path)
+    }
+
+    fn commit(
+        &mut self,
+        repository: &mut dyn crate::repository::Repository,
+        branch: &crate::branch::Branch,
+        options: &CommitOptions,
+    ) -> Result<Vec<u8>, WorkingTreeError> {
+        WorkingTree4::commit(self, repository, branch, options)
+    }
+}
+
 /// A live working-tree entry gathered for commit.
 struct LiveEntry {
     path: String,
@@ -1498,7 +1679,7 @@ mod tests {
         // The dirstate basis was advanced to the new revision, in memory
         // and on disk (re-opening the tree reads the same basis).
         assert_eq!(wt.basis_revision().as_deref(), Some(revid.as_slice()));
-        let reread = WorkingTree::open(parent.clone()).unwrap();
+        let reread = WorkingTree4::open(parent.clone()).unwrap();
         assert_eq!(reread.basis_revision().as_deref(), Some(revid.as_slice()));
 
         // Branch advanced to revno 1 at the new revision.
@@ -1517,11 +1698,12 @@ mod tests {
 
     /// Build a fresh tree and return its root transport plus an open
     /// working tree.
-    fn fresh_tree() -> (tempfile::TempDir, SharedTransport, WorkingTree) {
+    fn fresh_tree() -> (tempfile::TempDir, SharedTransport, WorkingTree4) {
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let cd = BzrDir::create(&parent).unwrap();
-        let wt = cd.open_workingtree().unwrap();
+        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let _ = cd;
         (dir, parent, wt)
     }
 
@@ -1542,7 +1724,7 @@ mod tests {
         );
 
         // Re-opening the tree reads the same versioned set from disk.
-        let reread = WorkingTree::open(parent.clone()).unwrap();
+        let reread = WorkingTree4::open(parent.clone()).unwrap();
         assert_eq!(reread.path2id("a.txt"), Some(file_id));
     }
 
@@ -1630,7 +1812,6 @@ mod tests {
     /// only the entries that actually differ.
     #[test]
     fn iter_changes_reports_only_differences() {
-        use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hello\n", None).unwrap();
@@ -1649,9 +1830,9 @@ mod tests {
 
         // Re-open the tree (its basis is now the commit), modify a.txt,
         // add c.txt, leave b.txt untouched.
-        let mut wt = WorkingTree::open(parent.clone()).unwrap();
-        parent.put_bytes("a.txt", b"changed\n", None).unwrap();
-        parent.put_bytes("c.txt", b"new\n", None).unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"changed\n").unwrap();
+        parent.put_bytes("c.txt", b"new\n").unwrap();
         wt.add("c.txt", EntryKind::File, None).unwrap();
 
         let repo = cd.open_repository().unwrap();
@@ -1676,7 +1857,6 @@ mod tests {
     /// A removed file is reported with a new_path of None.
     #[test]
     fn iter_changes_reports_removals() {
-        use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hello\n", None).unwrap();
@@ -1691,7 +1871,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
         wt.remove("a.txt").unwrap();
         let repo = cd.open_repository().unwrap();
         let basis = repo.revision_tree(&revid).unwrap();
@@ -1706,7 +1886,6 @@ mod tests {
     /// revision -- the incremental property.
     #[test]
     fn second_commit_is_incremental() {
-        use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"a one\n", None).unwrap();
@@ -1724,8 +1903,8 @@ mod tests {
             .unwrap();
 
         // Second commit: change only a.txt.
-        let mut wt = WorkingTree::open(parent.clone()).unwrap();
-        parent.put_bytes("a.txt", b"a two\n", None).unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"a two\n").unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         let rev2 = wt
@@ -1768,7 +1947,6 @@ mod tests {
     /// on the committed revision.
     #[test]
     fn commit_records_revprops_authors_and_revid() {
-        use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hi\n", None).unwrap();
@@ -1842,7 +2020,7 @@ mod tests {
         .unwrap();
 
         // Re-open with no changes: a plain commit is pointless.
-        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         assert!(matches!(
@@ -1871,7 +2049,6 @@ mod tests {
     /// unversioned from the tree.
     #[test]
     fn commit_records_disk_deletion() {
-        use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"a\n", None).unwrap();
@@ -1888,7 +2065,7 @@ mod tests {
         .unwrap();
 
         // Delete a.txt from disk (without calling remove) and commit.
-        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
         parent.delete("a.txt").unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
@@ -1916,7 +2093,7 @@ mod tests {
         parent.put_bytes("tracked.txt", b"t\n", None).unwrap();
         parent.put_bytes("loose.txt", b"l\n", None).unwrap();
         wt.add("tracked.txt", EntryKind::File, None).unwrap();
-        let wt = WorkingTree::open(parent.clone()).unwrap();
+        let wt = WorkingTree4::open(parent.clone()).unwrap();
         assert_eq!(wt.unknowns().unwrap(), vec!["loose.txt".to_string()]);
     }
 
@@ -1950,7 +2127,6 @@ mod tests {
     /// changed files are carried over at their basis revision.
     #[test]
     fn selective_commit_records_only_named_files() {
-        use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"a1\n", None).unwrap();
@@ -1968,9 +2144,9 @@ mod tests {
             .unwrap();
 
         // Modify both files but commit only a.txt.
-        let mut wt = WorkingTree::open(parent.clone()).unwrap();
-        parent.put_bytes("a.txt", b"a2\n", None).unwrap();
-        parent.put_bytes("b.txt", b"b2\n", None).unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"a2\n").unwrap();
+        parent.put_bytes("b.txt", b"b2\n").unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         let rev2 = wt
@@ -2009,7 +2185,6 @@ mod tests {
     #[cfg(feature = "gpg")]
     #[test]
     fn commit_with_signing_key_stores_signature() {
-        use crate::repository::Repository as _;
         use sequoia_openpgp::cert::CertBuilder;
         use sequoia_openpgp::serialize::Serialize;
 
@@ -2044,7 +2219,6 @@ mod tests {
     /// A commit with a pending merge records every parent on the revision.
     #[test]
     fn merge_commit_records_multiple_parents() {
-        use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"a1\n", None).unwrap();
@@ -2059,8 +2233,8 @@ mod tests {
             )
             .unwrap();
 
-        let mut wt = WorkingTree::open(parent.clone()).unwrap();
-        parent.put_bytes("a.txt", b"a2\n", None).unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"a2\n").unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         let rev2 = wt
@@ -2072,7 +2246,7 @@ mod tests {
             .unwrap();
 
         // Add rev1 as a pending merge and commit rev3 with both parents.
-        let mut wt = WorkingTree::open(parent.clone()).unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
         wt.add_pending_merge(&rev1).unwrap();
         assert_eq!(wt.parent_ids(), vec![rev2.clone(), rev1.clone()]);
         parent.put_bytes("a.txt", b"a3\n", None).unwrap();
@@ -2110,7 +2284,6 @@ mod tests {
     /// Runs the create -> add -> commit -> re-open -> read cycle for a named
     /// control-directory format and asserts the round-trip.
     fn create_commit_read(format_name: &str) {
-        use crate::repository::Repository as _;
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let fmt = crate::bzrdir::find_control_dir_format(format_name).unwrap();
