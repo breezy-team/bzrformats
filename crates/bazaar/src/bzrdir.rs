@@ -601,14 +601,15 @@ impl ControlDir for BzrDirAllInOne {
 
     /// Open the all-in-one working tree.
     ///
-    /// TODO: the weave working tree reads `.bzr/inventory`,
-    /// `.bzr/pending-merges` and `.bzr/revision-history` directly under
-    /// `.bzr` (no `checkout/` subdir and no dirstate), which the existing
-    /// WorkingTree3 backend does not handle. Not yet implemented.
+    /// The weave working tree stores its inventory, pending-merges and basis
+    /// (the branch's revision-history) directly under `.bzr`, with no
+    /// `checkout/` subdir or dirstate. Like the metadir tree it is rooted at
+    /// the directory that *contains* `.bzr`.
     fn open_workingtree(&self) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError> {
-        Err(BzrDirError::Component(
-            "weave working tree not yet supported".to_string(),
-        ))
+        let root = self.transport.subtransport("..")?;
+        let wt = crate::workingtree::WorkingTree3::open_all_in_one(root)
+            .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))?;
+        Ok(Box::new(wt))
     }
 }
 
@@ -782,6 +783,18 @@ mod tests {
         let mut history = WEAVE_REVID.to_vec();
         history.push(b'\n');
         std::fs::write(bzr.join("revision-history"), &history).unwrap();
+        // The working inventory (revision-less) and an empty pending-merges,
+        // as brz keeps them directly under `.bzr` for the all-in-one tree.
+        std::fs::write(
+            bzr.join("inventory"),
+            format!(
+                "<inventory format=\"5\">\n<file file_id=\"{}\" name=\"a.txt\" />\n</inventory>\n",
+                std::str::from_utf8(WEAVE_FILE_ID).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(bzr.join("pending-merges"), b"").unwrap();
+        std::fs::write(root.join("a.txt"), b"hi\n").unwrap();
 
         // hash_prefix_map url-quotes the name; the local transport unquotes it
         // again when resolving, so the on-disk name is the unquoted form (e.g.
@@ -829,5 +842,15 @@ mod tests {
             branch.last_revision_info().unwrap(),
             (1, WEAVE_REVID.to_vec())
         );
+
+        // The all-in-one working tree reads its inventory and basis directly
+        // under `.bzr` (basis from the branch's revision-history).
+        let wt = cd.open_workingtree().unwrap();
+        assert_eq!(wt.basis_revision().as_deref(), Some(WEAVE_REVID));
+        let files = wt.list_files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.txt");
+        assert_eq!(files[0].file_id, WEAVE_FILE_ID.to_vec());
+        assert_eq!(wt.path2id("a.txt").as_deref(), Some(WEAVE_FILE_ID));
     }
 }

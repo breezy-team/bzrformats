@@ -1179,21 +1179,54 @@ impl WorkingTree for WorkingTree4 {
 }
 
 /// Path to the format-3 working inventory within the control directory.
-const WT3_INVENTORY_PATH: &str = ".bzr/checkout/inventory";
-/// Path to the format-3 basis revision marker.
-const WT3_LAST_REVISION_PATH: &str = ".bzr/checkout/last-revision";
-/// Path to the format-3 pending-merges list.
-const WT3_PENDING_MERGES_PATH: &str = ".bzr/checkout/pending-merges";
+/// How a pre-dirstate working tree records its basis revision.
+#[derive(Clone, Copy)]
+enum Wt3Basis {
+    /// A dedicated `last-revision` file holding the basis revid (knit format
+    /// 3); the path is the file. Cleared by writing an empty file.
+    LastRevisionFile(&'static str),
+    /// The branch's `revision-history` file, whose last line is the basis
+    /// (the weave all-in-one layout). The working tree does not write it --
+    /// the branch advances it -- so the tree only reads it.
+    RevisionHistory(&'static str),
+}
 
-/// The pre-dirstate working tree (format 3), accessed through a transport
-/// rooted at the tree root (the directory containing `.bzr`).
+/// The on-disk paths of a pre-dirstate working tree. The knit format-3 tree
+/// keeps its files under `.bzr/checkout/`; the weave all-in-one tree keeps
+/// them directly under `.bzr/`.
+#[derive(Clone, Copy)]
+struct Wt3Layout {
+    inventory: &'static str,
+    pending_merges: &'static str,
+    basis: Wt3Basis,
+}
+
+/// The knit format-3 layout: files under `.bzr/checkout/`, basis in a
+/// dedicated `last-revision` file.
+const WT3_CHECKOUT_LAYOUT: Wt3Layout = Wt3Layout {
+    inventory: ".bzr/checkout/inventory",
+    pending_merges: ".bzr/checkout/pending-merges",
+    basis: Wt3Basis::LastRevisionFile(".bzr/checkout/last-revision"),
+};
+
+/// The weave all-in-one layout: files directly under `.bzr/`, basis taken
+/// from the branch's `.bzr/revision-history`.
+const WT3_ALL_IN_ONE_LAYOUT: Wt3Layout = Wt3Layout {
+    inventory: ".bzr/inventory",
+    pending_merges: ".bzr/pending-merges",
+    basis: Wt3Basis::RevisionHistory(".bzr/revision-history"),
+};
+
+/// The pre-dirstate working tree, accessed through a transport rooted at the
+/// tree root (the directory containing `.bzr`).
 ///
 /// Unlike the dirstate tree, the tracked set lives in an XML (v5) working
-/// inventory at `.bzr/checkout/inventory` (whose entries carry no revision,
-/// matching the working state), the basis is the single revision id in
-/// `.bzr/checkout/last-revision`, and extra merge parents are the lines of
-/// `.bzr/checkout/pending-merges`. On-disk file content is read from the tree
-/// itself.
+/// inventory (whose entries carry no revision, matching the working state),
+/// the basis is a single revision id, and extra merge parents are lines of a
+/// pending-merges file. On-disk file content is read from the tree itself.
+/// The exact paths and basis storage come from the [`Wt3Layout`]: knit format
+/// 3 keeps them under `.bzr/checkout/`, the weave all-in-one format under
+/// `.bzr/` with the basis in the branch's `revision-history`.
 ///
 /// TODO: the `basis-inventory-cache` and `stat-cache` files brz also keeps
 /// are not read or maintained here; they are an optimization, not required
@@ -1201,24 +1234,41 @@ const WT3_PENDING_MERGES_PATH: &str = ".bzr/checkout/pending-merges";
 pub struct WorkingTree3 {
     transport: SharedTransport,
     inventory: crate::inventory::MutableInventory,
+    layout: Wt3Layout,
 }
 
 impl WorkingTree3 {
-    /// Open the format-3 working tree reachable through `transport` (rooted at
-    /// the directory that contains `.bzr`), parsing its working inventory.
+    /// Open the knit format-3 working tree reachable through `transport`
+    /// (rooted at the directory that contains `.bzr`), parsing its working
+    /// inventory.
     pub fn open(transport: SharedTransport) -> Result<Self, WorkingTreeError> {
-        let inventory = Self::read_inventory(&transport)?;
+        Self::open_with_layout(transport, WT3_CHECKOUT_LAYOUT)
+    }
+
+    /// Open the weave all-in-one working tree, whose files live directly under
+    /// `.bzr` and whose basis is the branch's `revision-history`.
+    pub fn open_all_in_one(transport: SharedTransport) -> Result<Self, WorkingTreeError> {
+        Self::open_with_layout(transport, WT3_ALL_IN_ONE_LAYOUT)
+    }
+
+    fn open_with_layout(
+        transport: SharedTransport,
+        layout: Wt3Layout,
+    ) -> Result<Self, WorkingTreeError> {
+        let inventory = Self::read_inventory(&transport, &layout)?;
         Ok(WorkingTree3 {
             transport,
             inventory,
+            layout,
         })
     }
 
     fn read_inventory(
         transport: &SharedTransport,
+        layout: &Wt3Layout,
     ) -> Result<crate::inventory::MutableInventory, WorkingTreeError> {
         use crate::serializer::InventorySerializer;
-        let bytes = match transport.get_bytes(WT3_INVENTORY_PATH) {
+        let bytes = match transport.get_bytes(layout.inventory) {
             Ok(b) => b,
             Err(TransportError::NoSuchFile(_)) => {
                 // No working inventory yet: an empty tree with just the root.
@@ -1250,7 +1300,8 @@ impl WorkingTree3 {
         for line in lines {
             content.extend_from_slice(&line);
         }
-        self.transport.put_bytes(WT3_INVENTORY_PATH, &content, None)?;
+        self.transport
+            .put_bytes(self.layout.inventory, &content, None)?;
         Ok(())
     }
 
@@ -1277,9 +1328,21 @@ impl WorkingTree3 {
 
 impl WorkingTree for WorkingTree3 {
     fn basis_revision(&self) -> Option<Vec<u8>> {
-        match self.transport.get_bytes(WT3_LAST_REVISION_PATH) {
-            Ok(b) if !b.is_empty() && b != crate::branch::NULL_REVISION => Some(b),
-            _ => None,
+        let bytes = match self.layout.basis {
+            Wt3Basis::LastRevisionFile(path) => self.transport.get_bytes(path).ok()?,
+            Wt3Basis::RevisionHistory(path) => {
+                // The basis is the last line of revision-history.
+                let history = self.transport.get_bytes(path).ok()?;
+                history
+                    .rsplit(|&b| b == b'\n')
+                    .find(|l| !l.is_empty())
+                    .map(|l| l.to_vec())?
+            }
+        };
+        if !bytes.is_empty() && bytes != crate::branch::NULL_REVISION {
+            Some(bytes)
+        } else {
+            None
         }
     }
 
@@ -1288,7 +1351,7 @@ impl WorkingTree for WorkingTree3 {
         if let Some(basis) = self.basis_revision() {
             parents.push(basis);
         }
-        if let Ok(bytes) = self.transport.get_bytes(WT3_PENDING_MERGES_PATH) {
+        if let Ok(bytes) = self.transport.get_bytes(self.layout.pending_merges) {
             for line in bytes.split(|&b| b == b'\n') {
                 if !line.is_empty() && line != crate::branch::NULL_REVISION {
                     parents.push(line.to_vec());
@@ -1299,7 +1362,7 @@ impl WorkingTree for WorkingTree3 {
     }
 
     fn add_pending_merge(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError> {
-        let mut existing = match self.transport.get_bytes(WT3_PENDING_MERGES_PATH) {
+        let mut existing = match self.transport.get_bytes(self.layout.pending_merges) {
             Ok(b) => b,
             Err(TransportError::NoSuchFile(_)) => Vec::new(),
             Err(e) => return Err(e.into()),
@@ -1316,7 +1379,7 @@ impl WorkingTree for WorkingTree3 {
         existing.extend_from_slice(revision_id);
         existing.push(b'\n');
         self.transport
-            .put_bytes(WT3_PENDING_MERGES_PATH, &existing, None)?;
+            .put_bytes(self.layout.pending_merges, &existing, None)?;
         Ok(())
     }
 
@@ -1591,16 +1654,19 @@ impl WorkingTree for WorkingTree3 {
             .set_last_revision_info(new_revno, &revid)
             .map_err(WorkingTreeError::Branch)?;
 
-        // Update the format-3 basis: the new revision becomes last-revision
-        // and the only parent, so pending-merges is cleared. The working
-        // inventory stays revision-less (it now equals the basis).
+        // Update the basis: the new revision becomes the basis and the only
+        // parent, so pending-merges is cleared. The working inventory stays
+        // revision-less (it now equals the basis). For the checkout layout the
+        // basis lives in a dedicated last-revision file; for the all-in-one
+        // layout it is the branch's revision-history, which the branch already
+        // advanced above, so nothing more to write there.
         //
         // TODO: basis-inventory-cache is not written; it is an optimization
         // brz keeps but is not required for correctness.
-        self.transport
-            .put_bytes(WT3_LAST_REVISION_PATH, &revid, None)?;
-        self.transport
-            .put_bytes(WT3_PENDING_MERGES_PATH, b"", None)?;
+        if let Wt3Basis::LastRevisionFile(path) = self.layout.basis {
+            self.transport.put_bytes(path, &revid, None)?;
+        }
+        self.transport.put_bytes(self.layout.pending_merges, b"", None)?;
 
         Ok(revid)
     }
