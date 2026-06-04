@@ -58,7 +58,7 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
         # Override HOME to prevent reading user configs
         import tempfile
 
-        self._test_home_dir = tempfile.mkdtemp(prefix="brz-test-home-")
+        self._test_home_dir = tempfile.mkdtemp(prefix="bzrformats-test-home-")
         self.addCleanup(__import__("shutil").rmtree, self._test_home_dir)
         self.overrideEnv("HOME", self._test_home_dir)
         self.overrideEnv("BRZ_HOME", self._test_home_dir)

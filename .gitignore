@@ -11,7 +11,6 @@ build/
 *_pyx.cpython-*.c
 *~
 /target
-/brz
 /Cargo.lock
 *.cpython-*.so
 .testrepository/

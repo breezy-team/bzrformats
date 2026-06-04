@@ -1,47 +1,36 @@
 [build-system]
-requires = [
-    "setuptools>=77",
-    "setuptools-rust",
-]
+requires = ["setuptools>=77", "setuptools-rust"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "bzrformats"
-maintainers = [{name = "Breezy Developers", email = "team@breezy-vcs.org"}]
+maintainers = [{ name = "Breezy Developers", email = "team@breezy-vcs.org" }]
 description = "Bazaar formats"
 readme = "README.md"
 license = "GPL-2.0-or-later"
 classifiers = [
-    "Development Status :: 6 - Mature",
-    "Environment :: Console",
-    "Intended Audience :: Developers",
-    "Intended Audience :: System Administrators",
-    "Operating System :: OS Independent",
-    "Operating System :: POSIX",
-    "Programming Language :: Python",
-    "Programming Language :: Rust",
-    "Programming Language :: C",
-    "Topic :: Software Development :: Version Control",
+	"Development Status :: 6 - Mature",
+	"Environment :: Console",
+	"Intended Audience :: Developers",
+	"Intended Audience :: System Administrators",
+	"Operating System :: OS Independent",
+	"Operating System :: POSIX",
+	"Programming Language :: Python",
+	"Programming Language :: Rust",
+	"Programming Language :: C",
+	"Topic :: Software Development :: Version Control",
 ]
 requires-python = ">=3.10,<3.15"
-dependencies = [
-    "catalogus",
-    "patiencediff",
-    "vcsgraph",
-]
+dependencies = ["catalogus", "patiencediff", "vcsgraph"]
 version = "3.4.4"
 
 [project.urls]
 Homepage = "https://www.breezy-vcs.org/"
-Download = "https://launchpad.net/brz/+download"
+Download = "https://github.com/breezy-team/bzrformats"
 Repository = "https://github.com/breezy-team/bzrformats"
 
 [project.optional-dependencies]
-dev = [
-    "testtools",
-    "testscenarios",
-    "python-subunit",
-]
+dev = ["testtools", "testscenarios", "python-subunit"]
 
 [tool.setuptools]
 zip-safe = false
@@ -52,9 +41,7 @@ include = ["bzrformats"]
 namespaces = false
 
 [tool.setuptools.package-data]
-bzrformats = [
-    "py.typed",
-]
+bzrformats = ["py.typed"]
 
 
 [tool.mypy]
@@ -65,66 +52,66 @@ extend-exclude = []
 
 [tool.ruff.lint]
 select = [
-    "ANN",  # annotations
-    "D",  # pydocstyle
-    "E",  # pycodestyle
-    "F",  # pyflakes
-    "N",  # naming
-    "B",  # bugbear
-    "I",  # isort
-    "S",  # bandit
-    "TCH", # typecheck
-    "INT", # gettext
-   "SIM", # simplify
-    "C4",  # comprehensions
-    "UP",  # pyupgrade
-    "RUF", # ruf-specific
+	"ANN", # annotations
+	"D",   # pydocstyle
+	"E",   # pycodestyle
+	"F",   # pyflakes
+	"N",   # naming
+	"B",   # bugbear
+	"I",   # isort
+	"S",   # bandit
+	"TCH", # typecheck
+	"INT", # gettext
+	"SIM", # simplify
+	"C4",  # comprehensions
+	"UP",  # pyupgrade
+	"RUF", # ruf-specific
 ]
 ignore = [
-    "ANN001",
-    "ANN002",
-    "ANN003",  # missing-type-arg
-    "ANN201",
-    "ANN202",
-    "ANN204",
-    "ANN205",
-    "ANN206",
-    "D205",  # 1 blank line required between summary line and description
-    "D417",  # Missing argument descriptions in the docstring
-    "F821",  # undefined-name
-    "E501",  # line too long
-    "D402",  # Missing blank line after last section
-    "E402",  # module level import not at top of file
-    "E741",  # ambiguous variable name
-    "F405",  # name may be undefined, or defined from star imports
-    "N801",  # Naming convention violation: invalid constant name
-    "N802",  # Naming convention violation: invalid variable name
-    "N804",  # Naming convention violation: invalid lowercase variable name
-    "N806",  # Naming convention violation: invalid lowercase function name
-    "N818",  # Naming convention violation: invalid argument name
-    "N999",  # Naming convention violation: invalid module name
+	"ANN001",
+	"ANN002",
+	"ANN003", # missing-type-arg
+	"ANN201",
+	"ANN202",
+	"ANN204",
+	"ANN205",
+	"ANN206",
+	"D205",   # 1 blank line required between summary line and description
+	"D417",   # Missing argument descriptions in the docstring
+	"F821",   # undefined-name
+	"E501",   # line too long
+	"D402",   # Missing blank line after last section
+	"E402",   # module level import not at top of file
+	"E741",   # ambiguous variable name
+	"F405",   # name may be undefined, or defined from star imports
+	"N801",   # Naming convention violation: invalid constant name
+	"N802",   # Naming convention violation: invalid variable name
+	"N804",   # Naming convention violation: invalid lowercase variable name
+	"N806",   # Naming convention violation: invalid lowercase function name
+	"N818",   # Naming convention violation: invalid argument name
+	"N999",   # Naming convention violation: invalid module name
 
-    "S110",  # "consider logging exception"
+	"S110", # "consider logging exception"
 
-    "S317",  # use defusedxml
+	"S317", # use defusedxml
 
-    # This triggers for docstrings that uses __doc__
-    "D104", # Missing docstring in public package
+	# This triggers for docstrings that uses __doc__
+	"D104", # Missing docstring in public package
 
-    "RUF012", # Mutable class attributes should be annotated with `typing.ClassVar`
-    "RUF005", # Consider iterable concatenation instead of list concatenation
-    "RUF015", # Prefer next() of single slice access
+	"RUF012", # Mutable class attributes should be annotated with `typing.ClassVar`
+	"RUF005", # Consider iterable concatenation instead of list concatenation
+	"RUF015", # Prefer next() of single slice access
 
-    "SIM102", # Use a single `if` statement instead of nested `if` statements
-    "SIM105", # Use `contextlib.suppress
-    "SIM108", # Use ternary operator
-    "SIM114", # Combine `if` branches using logical `or` operator
-    "SIM115", # Use context handler for opening files
+	"SIM102", # Use a single `if` statement instead of nested `if` statements
+	"SIM105", # Use `contextlib.suppress
+	"SIM108", # Use ternary operator
+	"SIM114", # Combine `if` branches using logical `or` operator
+	"SIM115", # Use context handler for opening files
 
-    # Some objects (e.g. VersionedFiles) have a keys() method but no __iter__
-    "SIM118", # Use `key in dict` instead of `key in dict.keys()`
-    "UP031",  # Use format-specifier instead of `str.format` call
-    "UP032",  # Use f-string instead of `format` call; f-strings break gettext
+	# Some objects (e.g. VersionedFiles) have a keys() method but no __iter__
+	"SIM118", # Use `key in dict` instead of `key in dict.keys()`
+	"UP031",  # Use format-specifier instead of `str.format` call
+	"UP032",  # Use f-string instead of `format` call; f-strings break gettext
 ]
 # These are actually fine, but they make mypy more strict and then it fails.
 unfixable = ["ANN204"]
@@ -142,9 +129,43 @@ archs = ["auto", "aarch64"]
 
 [tool.ruff.lint.extend-per-file-ignores]
 # Ignore docstring requirements for test files
-"bzrformats/tests/**/*.py" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
-"bzrformats/*/tests/**/*.py" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
-"bzrformats/**/test_*.py" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
-"bzrformats/**/*_test.py" = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
-
-
+"bzrformats/tests/**/*.py" = [
+	"D100",
+	"D101",
+	"D102",
+	"D103",
+	"D104",
+	"D105",
+	"D106",
+	"D107",
+]
+"bzrformats/*/tests/**/*.py" = [
+	"D100",
+	"D101",
+	"D102",
+	"D103",
+	"D104",
+	"D105",
+	"D106",
+	"D107",
+]
+"bzrformats/**/test_*.py" = [
+	"D100",
+	"D101",
+	"D102",
+	"D103",
+	"D104",
+	"D105",
+	"D106",
+	"D107",
+]
+"bzrformats/**/*_test.py" = [
+	"D100",
+	"D101",
+	"D102",
+	"D103",
+	"D104",
+	"D105",
+	"D106",
+	"D107",
+]
