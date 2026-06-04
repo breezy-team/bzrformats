@@ -1502,7 +1502,7 @@ mod tests {
     #[test]
     fn add_versions_a_path_and_persists() {
         let (_d, parent, mut wt) = fresh_tree();
-        parent.put_bytes("a.txt", b"hello\n").unwrap();
+        parent.put_bytes("a.txt", b"hello\n", None).unwrap();
 
         let file_id = wt.add("a.txt", EntryKind::File, None).unwrap();
         assert_eq!(wt.path2id("a.txt"), Some(file_id.clone()));
@@ -1523,7 +1523,7 @@ mod tests {
     #[test]
     fn add_is_idempotent_and_honours_explicit_id() {
         let (_d, parent, mut wt) = fresh_tree();
-        parent.put_bytes("a.txt", b"x\n").unwrap();
+        parent.put_bytes("a.txt", b"x\n", None).unwrap();
 
         let id = wt.add("a.txt", EntryKind::File, Some(b"my-id")).unwrap();
         assert_eq!(id, b"my-id".to_vec());
@@ -1536,8 +1536,8 @@ mod tests {
     fn remove_unversions_directory_and_children() {
         let (_d, parent, mut wt) = fresh_tree();
         parent.mkdir("sub").unwrap();
-        parent.put_bytes("sub/a.txt", b"a\n").unwrap();
-        parent.put_bytes("keep.txt", b"k\n").unwrap();
+        parent.put_bytes("sub/a.txt", b"a\n", None).unwrap();
+        parent.put_bytes("keep.txt", b"k\n", None).unwrap();
         wt.add("sub", EntryKind::Directory, None).unwrap();
         wt.add("sub/a.txt", EntryKind::File, None).unwrap();
         wt.add("keep.txt", EntryKind::File, None).unwrap();
@@ -1561,7 +1561,7 @@ mod tests {
     #[test]
     fn rename_moves_entry_and_keeps_file_id() {
         let (_d, parent, mut wt) = fresh_tree();
-        parent.put_bytes("a.txt", b"hello\n").unwrap();
+        parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         let id = wt.add("a.txt", EntryKind::File, None).unwrap();
 
         wt.rename("a.txt", "b.txt").unwrap();
@@ -1578,7 +1578,7 @@ mod tests {
     fn add_then_commit_records_the_files() {
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"hello\n").unwrap();
+        parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
 
         let mut repo = cd.open_repository().unwrap();
@@ -1607,8 +1607,8 @@ mod tests {
         use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"hello\n").unwrap();
-        parent.put_bytes("b.txt", b"world\n").unwrap();
+        parent.put_bytes("a.txt", b"hello\n", None).unwrap();
+        parent.put_bytes("b.txt", b"world\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         wt.add("b.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
@@ -1624,8 +1624,8 @@ mod tests {
         // Re-open the tree (its basis is now the commit), modify a.txt,
         // add c.txt, leave b.txt untouched.
         let mut wt = WorkingTree::open(parent.clone()).unwrap();
-        parent.put_bytes("a.txt", b"changed\n").unwrap();
-        parent.put_bytes("c.txt", b"new\n").unwrap();
+        parent.put_bytes("a.txt", b"changed\n", None).unwrap();
+        parent.put_bytes("c.txt", b"new\n", None).unwrap();
         wt.add("c.txt", EntryKind::File, None).unwrap();
 
         let repo = cd.open_repository().unwrap();
@@ -1653,7 +1653,7 @@ mod tests {
         use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"hello\n").unwrap();
+        parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
@@ -1683,8 +1683,8 @@ mod tests {
         use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"a one\n").unwrap();
-        parent.put_bytes("b.txt", b"b one\n").unwrap();
+        parent.put_bytes("a.txt", b"a one\n", None).unwrap();
+        parent.put_bytes("b.txt", b"b one\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         wt.add("b.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
@@ -1699,7 +1699,7 @@ mod tests {
 
         // Second commit: change only a.txt.
         let mut wt = WorkingTree::open(parent.clone()).unwrap();
-        parent.put_bytes("a.txt", b"a two\n").unwrap();
+        parent.put_bytes("a.txt", b"a two\n", None).unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         let rev2 = wt
@@ -1745,7 +1745,7 @@ mod tests {
         use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"hi\n").unwrap();
+        parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
 
         let mut props = std::collections::HashMap::new();
@@ -1784,7 +1784,7 @@ mod tests {
     fn commit_rejects_cr_in_revprops() {
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"hi\n").unwrap();
+        parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut props = std::collections::HashMap::new();
         props.insert("bad".to_string(), b"has\rcr".to_vec());
@@ -1804,7 +1804,7 @@ mod tests {
     fn pointless_commit_is_refused_then_allowed() {
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"hi\n").unwrap();
+        parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
@@ -1848,8 +1848,8 @@ mod tests {
         use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"a\n").unwrap();
-        parent.put_bytes("b.txt", b"b\n").unwrap();
+        parent.put_bytes("a.txt", b"a\n", None).unwrap();
+        parent.put_bytes("b.txt", b"b\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         wt.add("b.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
@@ -1887,8 +1887,8 @@ mod tests {
     #[test]
     fn unknowns_lists_unversioned_files() {
         let (_d, parent, mut wt) = fresh_tree();
-        parent.put_bytes("tracked.txt", b"t\n").unwrap();
-        parent.put_bytes("loose.txt", b"l\n").unwrap();
+        parent.put_bytes("tracked.txt", b"t\n", None).unwrap();
+        parent.put_bytes("loose.txt", b"l\n", None).unwrap();
         wt.add("tracked.txt", EntryKind::File, None).unwrap();
         let wt = WorkingTree::open(parent.clone()).unwrap();
         assert_eq!(wt.unknowns().unwrap(), vec!["loose.txt".to_string()]);
@@ -1900,8 +1900,8 @@ mod tests {
     fn strict_commit_refuses_unknown_files() {
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"a\n").unwrap();
-        parent.put_bytes("loose.txt", b"l\n").unwrap();
+        parent.put_bytes("a.txt", b"a\n", None).unwrap();
+        parent.put_bytes("loose.txt", b"l\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
 
         let mut repo = cd.open_repository().unwrap();
@@ -1927,8 +1927,8 @@ mod tests {
         use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"a1\n").unwrap();
-        parent.put_bytes("b.txt", b"b1\n").unwrap();
+        parent.put_bytes("a.txt", b"a1\n", None).unwrap();
+        parent.put_bytes("b.txt", b"b1\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         wt.add("b.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
@@ -1943,8 +1943,8 @@ mod tests {
 
         // Modify both files but commit only a.txt.
         let mut wt = WorkingTree::open(parent.clone()).unwrap();
-        parent.put_bytes("a.txt", b"a2\n").unwrap();
-        parent.put_bytes("b.txt", b"b2\n").unwrap();
+        parent.put_bytes("a.txt", b"a2\n", None).unwrap();
+        parent.put_bytes("b.txt", b"b2\n", None).unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         let rev2 = wt
@@ -1993,7 +1993,7 @@ mod tests {
 
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"hi\n").unwrap();
+        parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
@@ -2021,7 +2021,7 @@ mod tests {
         use crate::repository::Repository as _;
         let (_d, parent, mut wt) = fresh_tree();
         let cd = BzrDir::open(parent.subtransport(".bzr").unwrap()).unwrap();
-        parent.put_bytes("a.txt", b"a1\n").unwrap();
+        parent.put_bytes("a.txt", b"a1\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
@@ -2034,7 +2034,7 @@ mod tests {
             .unwrap();
 
         let mut wt = WorkingTree::open(parent.clone()).unwrap();
-        parent.put_bytes("a.txt", b"a2\n").unwrap();
+        parent.put_bytes("a.txt", b"a2\n", None).unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         let rev2 = wt
@@ -2049,7 +2049,7 @@ mod tests {
         let mut wt = WorkingTree::open(parent.clone()).unwrap();
         wt.add_pending_merge(&rev1).unwrap();
         assert_eq!(wt.parent_ids(), vec![rev2.clone(), rev1.clone()]);
-        parent.put_bytes("a.txt", b"a3\n").unwrap();
+        parent.put_bytes("a.txt", b"a3\n", None).unwrap();
         let mut repo = cd.open_repository().unwrap();
         let branch = cd.open_branch().unwrap();
         let rev3 = wt

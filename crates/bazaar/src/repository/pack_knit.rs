@@ -330,11 +330,11 @@ impl KnitPackRepository {
         transport.mkdir("")?;
         transport.mkdir("indices")?;
         transport.mkdir("packs")?;
-        transport.put_bytes("format", format.format_string())?;
+        transport.put_bytes("format", format.format_string(), None)?;
         let empty = crate::btree_builder::BTreeBuilder::new(0, 1)
             .finish()
             .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e:?}")))?;
-        transport.put_bytes("pack-names", &empty)?;
+        transport.put_bytes("pack-names", &empty, None)?;
         Self::open(transport)
     }
 
@@ -956,10 +956,10 @@ impl WriteGroup {
                 .map_err(|e| RepositoryError::Corrupt(format!("pack end: {e}")))?;
             std::mem::take(writer.get_mut())
         };
-        transport.put_bytes(&format!("packs/{}.pack", pack_name), &pack_bytes)?;
+        transport.put_bytes(&format!("packs/{}.pack", pack_name), &pack_bytes, None)?;
 
         let write_index = |ext: &str, bytes: &[u8]| -> Result<usize, RepositoryError> {
-            transport.put_bytes(&format!("indices/{}{ext}", pack_name), bytes)?;
+            transport.put_bytes(&format!("indices/{}{ext}", pack_name), bytes, None)?;
             Ok(bytes.len())
         };
         // Knit-pack pack-names order: rix iix tix six (no cix).
@@ -988,7 +988,7 @@ impl WriteGroup {
         let names_bytes = names
             .finish()
             .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e:?}")))?;
-        transport.put_bytes("pack-names", &names_bytes)?;
+        transport.put_bytes("pack-names", &names_bytes, None)?;
         Ok(())
     }
 }
