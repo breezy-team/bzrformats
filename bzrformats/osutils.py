@@ -16,18 +16,12 @@
 
 """OS utilities for bzrformats using only standard library."""
 
-import logging
 import os
 import shutil
 import sys
 import unicodedata
 
 from ._bzr_rs import osutils as _osutils_rs
-
-
-def isdir(path):
-    """Return True if the given path exists and is a directory."""
-    return os.path.isdir(path)
 
 
 def split(path):
@@ -104,21 +98,6 @@ def normalized_filename(filename):
         return normalized, True
 
 
-def failed_to_load_extension(exception):
-    """Log a message about a failed extension load."""
-    logging.debug("Failed to load extension: %s", exception)
-
-
-def fdatasync(fileno):
-    """Flush file contents to disk, not metadata."""
-    try:
-        os.fdatasync(fileno)
-    except AttributeError:
-        # fdatasync is not available on all platforms (e.g., Windows)
-        # Fall back to fsync which is more widely available
-        os.fsync(fileno)
-
-
 def splitpath(path):
     """Split a path into a list of components."""
     from ._bzr_rs import osutils as _osutils_rs
@@ -154,13 +133,6 @@ def sha_string(string):
     from ._bzr_rs import osutils as _osutils_rs
 
     return _osutils_rs.sha_string(string)
-
-
-def sha_file(file_obj):
-    """Return the sha1 of a file."""
-    from ._bzr_rs import osutils as _osutils_rs
-
-    return _osutils_rs.sha_file(file_obj)
 
 
 def dirname(path):
