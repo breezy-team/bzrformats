@@ -842,9 +842,10 @@ impl WorkingTree4 {
     ///
     /// Pending merges are supported: every dirstate parent is recorded on the
     /// revision, and a changed file's text parents span all parents it
-    /// appears in. TODO: a file whose content reverts to the basis after a
-    /// merge (breezy's `unchanged_merged` case) is not yet re-recorded to
-    /// reflect the merge in its per-file graph.
+    /// appears in. A file whose content reverts to the basis after a merge but
+    /// whose version differs across the parents (breezy's `unchanged_merged`
+    /// case) is still re-recorded at the new revision so its per-file graph
+    /// merges those versions.
     pub fn commit(
         &mut self,
         repository: &mut dyn crate::repository::Repository,
@@ -1401,8 +1402,16 @@ fn compute_changes(
         };
         let moved = old_path.as_deref() != Some(e.path.as_str());
 
-        if content_change || meta_change || moved {
-            let text_parents = text_parents_for(&fid, basis, other_parents)?;
+        // A file unchanged against the basis must still be re-recorded at the
+        // new revision when the merge parents disagree on its version (breezy's
+        // `unchanged_merged` case): the per-file graph has to merge those
+        // versions, even though the working content equals the basis. This is
+        // detected by the file having more than one distinct parent version
+        // across the basis and the merge parents.
+        let text_parents = text_parents_for(&fid, basis, other_parents)?;
+        let unchanged_merged = !other_parents.is_empty() && text_parents.len() > 1;
+
+        if content_change || meta_change || moved || unchanged_merged {
             changes.push(WorkingTreeChange {
                 file_id: e.file_id.clone(),
                 old_path,
@@ -1556,10 +1565,16 @@ fn build_committed_entries(
     use crate::FileId;
 
     // file_id -> last-changed revision for entries recorded at the new
-    // revision (changed or new); everything else keeps its basis revision.
+    // revision (changed, new, or unchanged-merged); everything else keeps its
+    // basis revision. An unchanged-merged entry (more than one parent version)
+    // is recorded at the new revision even though its content matches the
+    // basis, mirroring the commit builder.
     let mut new_rev_ids: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for c in changes {
-        if c.new_path.is_some() && (c.content_change || c.basis_revision.is_none()) {
+        let merges_parents = c.text_parents.len() > 1;
+        if c.new_path.is_some()
+            && (c.content_change || c.basis_revision.is_none() || merges_parents)
+        {
             new_rev_ids.insert(c.file_id.clone());
         }
     }
@@ -2555,6 +2570,79 @@ mod tests {
         );
         // The dirstate basis is the new revision, with no pending merges.
         assert_eq!(wt.parent_ids(), vec![rev3]);
+    }
+
+    /// A file that reverts to the basis content in a merge commit, but whose
+    /// version differs across the two parents, is still recorded at the new
+    /// revision so its per-file graph merges both versions (breezy's
+    /// `unchanged_merged` case).
+    #[test]
+    fn merge_commit_records_unchanged_merged_file() {
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"a1\n", None).unwrap();
+        let fid_bytes = wt.add("a.txt", EntryKind::File, None).unwrap();
+        let fid = crate::FileId::from(fid_bytes.as_slice());
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev1 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "c1").timestamp(1577880000),
+            )
+            .unwrap();
+
+        // rev2: a different version of a.txt (the basis branch).
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"a2\n", None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev2 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "c2").timestamp(1577890000),
+            )
+            .unwrap();
+
+        // The two parents disagree on a.txt's version.
+        let repo = cd.open_repository().unwrap();
+        assert_ne!(
+            repo.revision_tree(&rev1)
+                .unwrap()
+                .get_file_revision(&fid)
+                .unwrap(),
+            repo.revision_tree(&rev2)
+                .unwrap()
+                .get_file_revision(&fid)
+                .unwrap()
+        );
+
+        // Merge commit: a.txt content reverts to the basis (rev2) value, so it
+        // has no content change vs the basis -- but the merge parents differ.
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        wt.add_pending_merge(&rev1).unwrap();
+        parent.put_bytes("a.txt", b"a2\n", None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev3 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "merge").timestamp(1577900000),
+            )
+            .unwrap();
+
+        // a.txt is recorded at rev3 (not carried over from rev2), and the merge
+        // commit's per-file text at rev3 reads back as the reverted content.
+        let repo = cd.open_repository().unwrap();
+        let tree3 = repo.revision_tree(&rev3).unwrap();
+        assert_eq!(
+            tree3.get_file_revision(&fid).unwrap().as_deref(),
+            Some(rev3.as_slice())
+        );
+        assert_eq!(repo.get_file_text(&fid_bytes, &rev3).unwrap(), b"a2\n");
     }
 
     /// A knit-pack control directory can be created, committed to, and read
