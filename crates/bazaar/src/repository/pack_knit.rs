@@ -1192,6 +1192,7 @@ fn serialise_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::Repository as _;
     use crate::transport::LocalTransport;
     use std::sync::Arc;
 
@@ -1248,6 +1249,9 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec![b"rev-1".to_vec(), b"rev-2".to_vec()]);
         assert_eq!(repo.get_revision(b"rev-1").unwrap().message, "first");
+        // An unsigned revision reports no signature. (Signature writing for
+        // knit-pack is not implemented; see add_signature_text's TODO.)
+        assert_eq!(repo.get_signature_text(b"rev-1").unwrap(), None);
         let got2 = repo.get_revision(b"rev-2").unwrap();
         assert_eq!(got2.message, "second");
         assert_eq!(

@@ -1999,6 +1999,34 @@ mod tests {
         assert_eq!(wt.get_file_text("b.txt").unwrap(), b"hello\n");
     }
 
+    /// Renaming an unversioned source is rejected, as in breezy's
+    /// per_workingtree test_move.test_move_unversioned.
+    #[test]
+    fn rename_unversioned_source_is_rejected() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("a.txt", b"hello\n", None).unwrap();
+        // a.txt exists on disk but was never added.
+        assert!(matches!(
+            wt.rename("a.txt", "b.txt"),
+            Err(WorkingTreeError::NotVersioned(_))
+        ));
+    }
+
+    /// Renaming onto an already-versioned destination is rejected, as in
+    /// breezy's test_move target-conflict cases.
+    #[test]
+    fn rename_onto_versioned_destination_is_rejected() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("a.txt", b"a\n", None).unwrap();
+        parent.put_bytes("b.txt", b"b\n", None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        wt.add("b.txt", EntryKind::File, None).unwrap();
+        assert!(wt.rename("a.txt", "b.txt").is_err());
+        // Both entries are left versioned and unmoved.
+        assert!(wt.path2id("a.txt").is_some());
+        assert!(wt.path2id("b.txt").is_some());
+    }
+
     /// Add files, commit, and read the committed inventory back.
     #[test]
     fn add_then_commit_records_the_files() {
@@ -2565,6 +2593,74 @@ mod tests {
         // goes through the same create -> commit -> read path as the pack
         // formats, as another scenario over create_commit_read.
         create_commit_read("knit", false);
+    }
+
+    /// The revision attributes that go into a commit come back out of
+    /// get_revision unchanged. Ported from breezy's per_repository
+    /// test_revision.TestRevisionAttributes.test_revision_accessors (and
+    /// test_zero_timezone): message, committer, timestamp, timezone, an
+    /// explicit revision id, and revision properties -- including the awkward
+    /// values empty, multiline, and non-ASCII.
+    fn revision_attributes_round_trip(format_name: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let fmt = crate::bzrdir::find_control_dir_format(format_name).unwrap();
+        let cd = BzrDirMeta::create_with_format(&parent, fmt).unwrap();
+
+        let mut props = std::collections::HashMap::new();
+        props.insert("empty".to_string(), b"".to_vec());
+        props.insert("value".to_string(), b"one".to_vec());
+        props.insert("unicode".to_string(), "\u{b5}".as_bytes().to_vec());
+        props.insert("multiline".to_string(), b"foo\nbar\n\n".to_vec());
+
+        let mut wt = cd.open_workingtree().unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("jaq", "quux")
+                    .timestamp(1577880000)
+                    .timezone(0)
+                    .revprops(props.clone())
+                    .revision_id(b"rev-attrs-1".to_vec())
+                    .allow_pointless(true),
+            )
+            .unwrap();
+        assert_eq!(revid, b"rev-attrs-1".to_vec());
+
+        let reopened = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let rev = reopened
+            .open_repository()
+            .unwrap()
+            .get_revision(&revid)
+            .unwrap();
+        assert_eq!(rev.message, "quux");
+        assert_eq!(rev.committer.as_deref(), Some("jaq"));
+        assert_eq!(rev.timestamp, 1577880000.0);
+        assert_eq!(rev.timezone, Some(0));
+        assert_eq!(rev.revision_id.as_bytes(), b"rev-attrs-1");
+        for (name, value) in &props {
+            assert_eq!(rev.properties.get(name), Some(value), "revprop {name}");
+        }
+    }
+
+    #[test]
+    fn revision_attributes_round_trip_2a() {
+        // 2a serialises revisions with bencode.
+        revision_attributes_round_trip("2a");
+    }
+
+    #[test]
+    fn revision_attributes_round_trip_knit_pack() {
+        // The pack formats serialise revisions with XML.
+        revision_attributes_round_trip("1.9");
+    }
+
+    #[test]
+    fn revision_attributes_round_trip_knit() {
+        revision_attributes_round_trip("knit");
     }
 
     /// A format-3 working tree over a temp dir, with its checkout dir and

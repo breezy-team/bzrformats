@@ -463,3 +463,66 @@ fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
     flate2::read::GzDecoder::new(data).read_to_end(&mut out)?;
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::LocalTransport;
+    use std::sync::Arc;
+
+    fn weave6() -> &'static RepositoryFormat {
+        super::super::format::find_format(b"Bazaar-NG branch, format 6\n").unwrap()
+    }
+
+    fn temp_repo() -> (tempfile::TempDir, SharedTransport) {
+        let dir = tempfile::tempdir().unwrap();
+        let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        (dir, t)
+    }
+
+    fn make_revision(id: &[u8], message: &str) -> crate::revision::Revision {
+        crate::revision::Revision::new(
+            crate::RevisionId::from(id),
+            vec![],
+            Some("T <t@e>".to_string()),
+            message.to_string(),
+            std::collections::HashMap::new(),
+            None,
+            1577880000.0,
+            Some(0),
+        )
+    }
+
+    /// A revision, file text and signature written to a fresh weave repository
+    /// read back after re-opening; an unsigned revision reports no signature.
+    #[test]
+    fn revision_text_and_signature_round_trip() {
+        let (_d, t) = temp_repo();
+        let mut repo = WeaveRepository::create(t.clone(), weave6()).unwrap();
+        repo.add_revision(&make_revision(b"rev-1", "first"), &[])
+            .unwrap();
+        repo.add_text(b"file-1", b"rev-1", &[], b"hello\n").unwrap();
+        repo.add_signature_text(b"rev-1", b"-----SIG-----\nsigned rev-1\n")
+            .unwrap();
+
+        let repo = WeaveRepository::open(t, weave6()).unwrap();
+        assert_eq!(repo.all_revision_ids().unwrap(), vec![b"rev-1".to_vec()]);
+        assert_eq!(repo.get_revision(b"rev-1").unwrap().message, "first");
+        assert_eq!(repo.get_file_text(b"file-1", b"rev-1").unwrap(), b"hello\n");
+        assert_eq!(
+            repo.get_signature_text(b"rev-1").unwrap().as_deref(),
+            Some(&b"-----SIG-----\nsigned rev-1\n"[..])
+        );
+        assert_eq!(repo.get_signature_text(b"rev-2").unwrap(), None);
+    }
+
+    #[test]
+    fn create_rejects_non_weave_format() {
+        let (_d, t) = temp_repo();
+        let fmt = super::super::format::find_format(
+            b"Bazaar repository format 2a (needs bzr 1.16 or later)\n",
+        )
+        .unwrap();
+        assert!(WeaveRepository::create(t, fmt).is_err());
+    }
+}
