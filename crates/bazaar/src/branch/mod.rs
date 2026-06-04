@@ -498,6 +498,38 @@ mod tests {
         assert_eq!(branch.last_revision_info().unwrap(), (3, b"c".to_vec()));
     }
 
+    /// Setting the tip back to an earlier revno drops the later revisions
+    /// (the uncommit case). Ported from breezy's per_branch
+    /// `test_generate_revision_history`, which generates a shorter mainline.
+    #[test]
+    fn format5_set_last_revision_info_truncates() {
+        let (_d, branch, _probe) = branch_transport_format5();
+        branch
+            .set_revision_history(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+            .unwrap();
+        // Point the tip back at revno 2 ("b"); "c" is dropped.
+        branch.set_last_revision_info(2, b"b").unwrap();
+        assert_eq!(branch.last_revision_info().unwrap(), (2, b"b".to_vec()));
+        assert_eq!(
+            branch.revision_history().unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+    }
+
+    /// Setting the tip to the null revision empties the history. Ported from
+    /// breezy's `test_generate_revision_history_NULL_REVISION`.
+    #[test]
+    fn format5_set_last_revision_info_null_empties_history() {
+        let (_d, branch, _probe) = branch_transport_format5();
+        branch.set_last_revision_info(1, b"rev-1").unwrap();
+        branch.set_last_revision_info(0, NULL_REVISION).unwrap();
+        assert_eq!(
+            branch.last_revision_info().unwrap(),
+            (0, NULL_REVISION.to_vec())
+        );
+        assert!(branch.revision_history().unwrap().is_empty());
+    }
+
     #[test]
     fn tags_round_trip() {
         let (_d, branch, _probe) = branch_transport();

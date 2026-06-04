@@ -1856,6 +1856,64 @@ mod tests {
         assert_eq!(repo.get_file_text(&file_id, &revid).unwrap(), b"hi\n");
     }
 
+    /// The weave on-disk layout, ported from breezy's
+    /// `weave_fmt.test_repository.TestFormat7.test_disk_layout`: committing a
+    /// file whose id contains a `:` writes its per-file weave at the
+    /// URL-escaped relpath `weaves/74/Foo%3ABar.weave`, which the local
+    /// transport resolves to the literal `weaves/74/Foo:Bar.weave` on disk,
+    /// with the exact weave bytes brz writes. The inventory weave starts as
+    /// the empty-weave header.
+    #[test]
+    fn weave_disk_layout_escapes_file_id() {
+        use crate::bzrdir::BzrDirAllInOne;
+        use crate::transport::Transport;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirAllInOne::create(&parent).unwrap();
+
+        parent.put_bytes("foo", b"content\n", None).unwrap();
+        let mut wt = cd.open_workingtree().unwrap();
+        wt.add("foo", EntryKind::File, Some(b"Foo:Bar")).unwrap();
+
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        wt.commit(
+            repo.as_mut(),
+            &branch,
+            &CommitOptions::new("T <t@e>", "first post")
+                .timestamp(1577880000)
+                .revision_id(b"first".to_vec()),
+        )
+        .unwrap();
+
+        // The per-file weave is on disk under the unescaped (`:`) name, with
+        // exactly the bytes brz writes for this revision.
+        let weave = parent
+            .get_bytes(".bzr/weaves/74/Foo:Bar.weave")
+            .expect("weave at the unescaped path");
+        assert_eq!(
+            weave,
+            b"# bzr weave file v5\n\
+              i\n\
+              1 7fe70820e08a1aac0ef224d9c66ab66831cc4ab1\n\
+              n first\n\
+              \n\
+              w\n\
+              { 0\n\
+              . content\n\
+              }\n\
+              W\n"
+        );
+
+        // Reading the text back goes through the escaped mapper path, which
+        // resolves to the same on-disk file.
+        assert_eq!(
+            repo.get_file_text(b"Foo:Bar", b"first").unwrap(),
+            b"content\n"
+        );
+    }
+
     /// Build a fresh tree and return its root transport plus an open
     /// working tree.
     fn fresh_tree() -> (tempfile::TempDir, SharedTransport, WorkingTree4) {
@@ -2499,6 +2557,14 @@ mod tests {
     #[test]
     fn create_commit_read_rich_root_pack() {
         create_commit_read("rich-root-pack", true);
+    }
+
+    #[test]
+    fn create_commit_read_knit() {
+        // The non-pack knit format (branch 5 + working tree 3 + knit repo)
+        // goes through the same create -> commit -> read path as the pack
+        // formats, as another scenario over create_commit_read.
+        create_commit_read("knit", false);
     }
 
     /// A format-3 working tree over a temp dir, with its checkout dir and
