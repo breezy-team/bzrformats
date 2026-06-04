@@ -91,6 +91,22 @@ pub trait Repository: Send + Sync {
     /// Read the full text of a versioned file at a given revision.
     fn get_file_text(&self, file_id: &[u8], revision: &[u8]) -> Result<Vec<u8>, RepositoryError>;
 
+    /// Read the full text of the file at tree-relative `path` in `revision`,
+    /// resolving the path to a file id through that revision's inventory.
+    /// Errors with [`RepositoryError::NoSuchRevision`] if `path` is not in the
+    /// tree (reusing the closest variant for "not found").
+    fn get_file_text_at_path(
+        &self,
+        path: &str,
+        revision: &[u8],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        let tree = self.revision_tree(revision)?;
+        let file_id = tree
+            .path2id(path)
+            .ok_or_else(|| RepositoryError::NoSuchRevision(path.as_bytes().to_vec()))?;
+        self.get_file_text(file_id.as_bytes(), revision)
+    }
+
     /// Open a write group: a batch of additions flushed atomically by
     /// [`Repository::commit_write_group`].
     fn start_write_group(&mut self) -> Result<(), RepositoryError>;
@@ -391,6 +407,25 @@ mod tests {
             let inv = repo.get_inventory(b"rev-1").unwrap();
             let paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
             assert_eq!(paths, vec!["a.txt".to_string()], "{}", s.label);
+
+            // RevisionTree path lookups: path2id, iter_entries, and reading a
+            // file by path.
+            let tree = repo.revision_tree(b"rev-1").unwrap();
+            assert_eq!(
+                tree.path2id("a.txt").map(|f| f.as_bytes().to_vec()),
+                Some(b"file-1".to_vec()),
+                "{}",
+                s.label
+            );
+            assert!(tree.path2id("nope").is_none(), "{}", s.label);
+            let tree_paths: Vec<String> = tree.iter_entries().into_iter().map(|(p, _)| p).collect();
+            assert_eq!(tree_paths, vec!["a.txt".to_string()], "{}", s.label);
+            assert_eq!(
+                repo.get_file_text_at_path("a.txt", b"rev-1").unwrap(),
+                b"hello\n",
+                "{}",
+                s.label
+            );
 
             // A stored signature reads back; an unsigned revision returns None.
             let expected = if s.signs {

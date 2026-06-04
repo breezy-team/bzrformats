@@ -165,6 +165,20 @@ impl Repository {
         Ok(PyBytes::new(py, &text))
     }
 
+    /// The full text of the file at tree-relative `path` in `revision`.
+    fn get_file_text_at_path<'py>(
+        &self,
+        py: Python<'py>,
+        path: &str,
+        revision: &[u8],
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let text = self
+            .inner
+            .get_file_text_at_path(path, revision)
+            .map_err(err)?;
+        Ok(PyBytes::new(py, &text))
+    }
+
     /// The signature text stored for `revision_id`, or None if unsigned.
     fn get_signature_text<'py>(
         &self,
