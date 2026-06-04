@@ -905,7 +905,6 @@ fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, Repositor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serializer::RevisionSerializer;
     use crate::transport::LocalTransport;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -934,42 +933,6 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         let t: SharedTransport = Arc::new(LocalTransport::new(&path));
         (dir, t)
-    }
-
-    #[test]
-    fn revision_and_text_write_round_trip() {
-        let (_d, t) = temp_repo();
-        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
-        repo.start_write_group().unwrap();
-        repo.add_revision(&make_revision(b"rev-1", vec![], "first", None), &[])
-            .unwrap();
-        repo.add_revision(
-            &make_revision(b"rev-2", vec![b"rev-1"], "second", None),
-            &[b"rev-1".to_vec()],
-        )
-        .unwrap();
-        repo.add_text(b"file-1", b"rev-1", &[], b"hello world\n")
-            .unwrap();
-        repo.add_signature_text(b"rev-1", b"-----SIG-----\nsigned rev-1\n")
-            .unwrap();
-        repo.commit_write_group().unwrap();
-
-        // Re-open to read the committed data.
-        let repo = Pack2aRepository::open(t).unwrap();
-        let mut ids = repo.all_revision_ids().unwrap();
-        ids.sort();
-        assert_eq!(ids, vec![b"rev-1".to_vec(), b"rev-2".to_vec()]);
-        assert_eq!(repo.get_revision(b"rev-2").unwrap().message, "second");
-        assert_eq!(
-            repo.get_file_text(b"file-1", b"rev-1").unwrap(),
-            b"hello world\n"
-        );
-        // The signature round-trips; an unsigned revision returns None.
-        assert_eq!(
-            repo.get_signature_text(b"rev-1").unwrap().as_deref(),
-            Some(&b"-----SIG-----\nsigned rev-1\n"[..])
-        );
-        assert_eq!(repo.get_signature_text(b"rev-2").unwrap(), None);
     }
 
     #[test]

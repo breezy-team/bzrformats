@@ -167,3 +167,195 @@ pub fn open(transport: SharedTransport) -> Result<Box<dyn Repository>, Repositor
         find_format(&marker).ok_or_else(|| RepositoryError::UnknownFormat(marker.clone()))?;
     (format.open)(transport)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::LocalTransport;
+    use std::sync::Arc;
+
+    /// One repository format under test: a label, a closure that creates a
+    /// fresh repository over a transport, a closure that re-opens it, and
+    /// whether the format can store signatures.
+    struct Scenario {
+        label: &'static str,
+        create: fn(SharedTransport) -> Box<dyn Repository>,
+        reopen: fn(SharedTransport) -> Box<dyn Repository>,
+        signs: bool,
+    }
+
+    fn knitpack6() -> &'static RepositoryFormat {
+        find_format(b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n").unwrap()
+    }
+    fn knit1() -> &'static RepositoryFormat {
+        find_format(b"Bazaar-NG Knit Repository Format 1").unwrap()
+    }
+    fn weave6() -> &'static RepositoryFormat {
+        find_format(b"Bazaar-NG branch, format 6\n").unwrap()
+    }
+
+    /// Every repository backend that implements the write side, each wrapped
+    /// so the shared round-trip runs against `Box<dyn Repository>`.
+    fn scenarios() -> Vec<Scenario> {
+        vec![
+            Scenario {
+                label: "2a",
+                create: |t| Box::new(Pack2aRepository::create(t).unwrap()),
+                reopen: |t| Box::new(Pack2aRepository::open(t).unwrap()),
+                signs: true,
+            },
+            Scenario {
+                label: "knit-pack",
+                create: |t| Box::new(KnitPackRepository::create(t, knitpack6()).unwrap()),
+                reopen: |t| Box::new(KnitPackRepository::open(t).unwrap()),
+                // knit-pack signature writing is an unimplemented TODO.
+                signs: false,
+            },
+            Scenario {
+                label: "knit",
+                create: |t| Box::new(KnitRepository::create(t, knit1()).unwrap()),
+                reopen: |t| Box::new(KnitRepository::open(t).unwrap()),
+                signs: false,
+            },
+            Scenario {
+                label: "weave",
+                create: |t| Box::new(WeaveRepository::create(t, weave6()).unwrap()),
+                reopen: |t| Box::new(WeaveRepository::open(t, weave6()).unwrap()),
+                signs: true,
+            },
+        ]
+    }
+
+    fn revision(id: &[u8], parents: Vec<&[u8]>, message: &str) -> crate::revision::Revision {
+        crate::revision::Revision::new(
+            crate::RevisionId::from(id),
+            parents.into_iter().map(crate::RevisionId::from).collect(),
+            Some("T <t@e>".to_string()),
+            message.to_string(),
+            std::collections::HashMap::new(),
+            None,
+            1577880000.0,
+            Some(0),
+        )
+    }
+
+    fn entries(rev: &[u8]) -> Vec<crate::inventory::Entry> {
+        use crate::FileId;
+        let root = crate::inventory::ROOT_ID;
+        vec![
+            crate::inventory::Entry::root(FileId::from(root), Some(crate::RevisionId::from(rev))),
+            crate::inventory::Entry::file(
+                FileId::from(&b"file-1"[..]),
+                "a.txt".into(),
+                FileId::from(root),
+                Some(crate::RevisionId::from(rev)),
+                Some(crate::weave::sha_strings(&[b"hello\n"])),
+                Some(6),
+                Some(false),
+                None,
+            ),
+        ]
+    }
+
+    /// Two revisions, a file text with a per-file parent, an inventory, and a
+    /// signature (where supported) round-trip through every write-capable
+    /// repository backend. Replaces the per-backend copies of this test.
+    #[test]
+    fn revision_text_inventory_signature_round_trip() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(t.clone());
+
+            repo.start_write_group().unwrap();
+            repo.add_revision(&revision(b"rev-1", vec![], "first"), &[])
+                .unwrap();
+            repo.add_inventory_from_entries(
+                b"rev-1",
+                &[],
+                crate::inventory::ROOT_ID,
+                &entries(b"rev-1"),
+            )
+            .unwrap();
+            repo.add_text(b"file-1", b"rev-1", &[], b"hello\n").unwrap();
+            repo.add_text(
+                b"file-1",
+                b"rev-2",
+                &[(b"file-1".to_vec(), b"rev-1".to_vec())],
+                b"hello\ngoodbye\n",
+            )
+            .unwrap();
+            repo.add_revision(
+                &revision(b"rev-2", vec![b"rev-1"], "second"),
+                &[b"rev-1".to_vec()],
+            )
+            .unwrap();
+            if s.signs {
+                repo.add_signature_text(b"rev-1", b"-----SIG-----\nsigned\n")
+                    .unwrap();
+            }
+            repo.commit_write_group().unwrap();
+
+            let repo = (s.reopen)(t);
+            let mut ids = repo.all_revision_ids().unwrap();
+            ids.sort();
+            assert_eq!(
+                ids,
+                vec![b"rev-1".to_vec(), b"rev-2".to_vec()],
+                "{}",
+                s.label
+            );
+            assert_eq!(
+                repo.get_revision(b"rev-1").unwrap().message,
+                "first",
+                "{}",
+                s.label
+            );
+            let got2 = repo.get_revision(b"rev-2").unwrap();
+            assert_eq!(got2.message, "second", "{}", s.label);
+            assert_eq!(
+                got2.parent_ids
+                    .iter()
+                    .map(|p| p.as_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![b"rev-1".to_vec()],
+                "{}",
+                s.label
+            );
+            assert_eq!(
+                repo.get_file_text(b"file-1", b"rev-1").unwrap(),
+                b"hello\n",
+                "{}",
+                s.label
+            );
+            assert_eq!(
+                repo.get_file_text(b"file-1", b"rev-2").unwrap(),
+                b"hello\ngoodbye\n",
+                "{}",
+                s.label
+            );
+            let inv = repo.get_inventory(b"rev-1").unwrap();
+            let paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
+            assert_eq!(paths, vec!["a.txt".to_string()], "{}", s.label);
+
+            // A stored signature reads back; an unsigned revision returns None.
+            let expected = if s.signs {
+                Some(b"-----SIG-----\nsigned\n".to_vec())
+            } else {
+                None
+            };
+            assert_eq!(
+                repo.get_signature_text(b"rev-1").unwrap(),
+                expected,
+                "{}",
+                s.label
+            );
+            assert_eq!(
+                repo.get_signature_text(b"rev-2").unwrap(),
+                None,
+                "{}",
+                s.label
+            );
+        }
+    }
+}

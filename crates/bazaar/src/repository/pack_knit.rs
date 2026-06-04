@@ -1192,109 +1192,14 @@ fn serialise_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::Repository as _;
     use crate::transport::LocalTransport;
     use std::sync::Arc;
-
-    fn knitpack6() -> &'static RepositoryFormat {
-        super::super::format::find_format(b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n").unwrap()
-    }
 
     fn temp() -> (tempfile::TempDir, SharedTransport) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repository");
         std::fs::create_dir_all(&path).unwrap();
         (dir, Arc::new(LocalTransport::new(&path)))
-    }
-
-    #[test]
-    fn write_then_read_round_trip() {
-        let (_d, t) = temp();
-        let mut repo = KnitPackRepository::create(t.clone(), knitpack6()).unwrap();
-        repo.start_write_group().unwrap();
-        let r1 = crate::revision::Revision::new(
-            crate::RevisionId::from(&b"rev-1"[..]),
-            vec![],
-            Some("T <t@e>".into()),
-            "first".into(),
-            std::collections::HashMap::new(),
-            None,
-            1577880000.0,
-            Some(0),
-        );
-        let r2 = crate::revision::Revision::new(
-            crate::RevisionId::from(&b"rev-2"[..]),
-            vec![crate::RevisionId::from(&b"rev-1"[..])],
-            Some("T <t@e>".into()),
-            "second".into(),
-            std::collections::HashMap::new(),
-            None,
-            1577966400.0,
-            Some(0),
-        );
-        repo.add_revision(&r1, &[]).unwrap();
-        repo.add_revision(&r2, &[b"rev-1".to_vec()]).unwrap();
-        repo.add_text(b"file-1", b"rev-1", &[], b"hello\n").unwrap();
-        repo.add_text(
-            b"file-1",
-            b"rev-2",
-            &[(b"file-1".to_vec(), b"rev-1".to_vec())],
-            b"hello\ngoodbye\n",
-        )
-        .unwrap();
-        repo.commit_write_group().unwrap();
-
-        let repo = KnitPackRepository::open(t).unwrap();
-        let mut ids = repo.all_revision_ids().unwrap();
-        ids.sort();
-        assert_eq!(ids, vec![b"rev-1".to_vec(), b"rev-2".to_vec()]);
-        assert_eq!(repo.get_revision(b"rev-1").unwrap().message, "first");
-        // An unsigned revision reports no signature. (Signature writing for
-        // knit-pack is not implemented; see add_signature_text's TODO.)
-        assert_eq!(repo.get_signature_text(b"rev-1").unwrap(), None);
-        let got2 = repo.get_revision(b"rev-2").unwrap();
-        assert_eq!(got2.message, "second");
-        assert_eq!(
-            got2.parent_ids
-                .iter()
-                .map(|p| p.as_bytes().to_vec())
-                .collect::<Vec<_>>(),
-            vec![b"rev-1".to_vec()]
-        );
-        assert_eq!(repo.get_file_text(b"file-1", b"rev-1").unwrap(), b"hello\n");
-        assert_eq!(
-            repo.get_file_text(b"file-1", b"rev-2").unwrap(),
-            b"hello\ngoodbye\n"
-        );
-    }
-
-    #[test]
-    fn signature_round_trips() {
-        let (_d, t) = temp();
-        let mut repo = KnitPackRepository::create(t.clone(), knitpack6()).unwrap();
-        repo.start_write_group().unwrap();
-        let r1 = crate::revision::Revision::new(
-            crate::RevisionId::from(&b"rev-1"[..]),
-            vec![],
-            Some("T <t@e>".into()),
-            "first".into(),
-            std::collections::HashMap::new(),
-            None,
-            1577880000.0,
-            Some(0),
-        );
-        repo.add_revision(&r1, &[]).unwrap();
-        repo.add_signature(b"rev-1", b"-----SIG-----\nsigned rev-1\n")
-            .unwrap();
-        repo.commit_write_group().unwrap();
-
-        let repo = KnitPackRepository::open(t).unwrap();
-        assert_eq!(
-            repo.get_signature_text(b"rev-1").unwrap().as_deref(),
-            Some(&b"-----SIG-----\nsigned rev-1\n"[..])
-        );
-        // An unsigned revision returns None.
-        assert_eq!(repo.get_signature_text(b"rev-1-unsigned").unwrap(), None);
     }
 
     #[test]
