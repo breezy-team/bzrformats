@@ -1,12 +1,15 @@
 [package]
 name = "bazaar"
 version = { workspace = true }
-authors = [ "Martin Packman <gzlist@googlemail.com>", "Jelmer Vernooij <jelmer@jelmer.uk>"]
+authors = [
+	"Martin Packman <gzlist@googlemail.com>",
+	"Jelmer Vernooij <jelmer@jelmer.uk>",
+]
 edition = "2018"
 description = "Rust implementation of the Bazaar formats and protocols"
 license = "GPL-2.0+"
 homepage = "https://www.breezy-vcs.org/"
-repository = "https://github.com/breezy-team/bazaar-rs"
+repository = "https://github.com/breezy-team/bzrformats"
 
 [lib]
 
@@ -42,7 +45,13 @@ indexmap = "2"
 nix = { workspace = true, features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["fileapi", "minwindef", "winnt", "errhandlingapi", "minwinbase"] }
+winapi = { version = "0.3", features = [
+	"fileapi",
+	"minwindef",
+	"winnt",
+	"errhandlingapi",
+	"minwinbase",
+] }
 
 [features]
 default = ["pyo3"]
