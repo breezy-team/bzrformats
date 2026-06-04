@@ -11,12 +11,12 @@
 //!   for format 6), hash-prefixed. Signature texts share the store with a
 //!   `.sig` suffix.
 //!
-//! Revisions and inventories serialise with XML v5. This reader is read-only;
-//! the write methods return [`RepositoryError::UnsupportedFormat`].
+//! Revisions and inventories serialise with XML v5. Writes append to the
+//! weaves and the revision-store immediately, so there is no write group.
 
 use crate::key_mapper::{hash_prefix_map, hash_prefix_unmap};
 use crate::transport::{SharedTransport, Transport, TransportError};
-use crate::weave::{read_weave_v5, WeaveFile};
+use crate::weave::{read_weave_v5, write_weave_v5, WeaveFile};
 
 use super::format::RepositoryFormat;
 use super::pack_2a::RepositoryError;
@@ -41,6 +41,26 @@ impl WeaveRepository {
             ));
         }
         Ok(WeaveRepository { format, transport })
+    }
+
+    /// Create an empty all-in-one weave repository scaffold under `transport`
+    /// (rooted at `.bzr`) and open it. Writes the `weaves/` and
+    /// `revision-store/` directories and an empty `inventory.weave`. The
+    /// branch and working-tree files are the control directory's job, not the
+    /// repository's.
+    pub fn create(
+        transport: SharedTransport,
+        format: &'static RepositoryFormat,
+    ) -> Result<Self, RepositoryError> {
+        if format.storage != StorageKind::Weave {
+            return Err(RepositoryError::UnsupportedFormat(
+                format.get_format_description(),
+            ));
+        }
+        transport.mkdir("weaves")?;
+        transport.mkdir("revision-store")?;
+        transport.put_bytes("inventory.weave", &write_weave_v5(&WeaveFile::default()))?;
+        Self::open(transport, format)
     }
 
     /// The format this repository was opened as.
@@ -161,6 +181,145 @@ impl WeaveRepository {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Create the parent (bucket) directory of a hash-prefixed path before
+    /// writing to it. `hash_prefix_map` paths embed a `<bucket>/` subdir that
+    /// `put_bytes` won't create on its own. `mkdir` is idempotent.
+    fn ensure_parent_dir(&self, path: &str) -> Result<(), RepositoryError> {
+        if let Some((dir, _)) = path.rsplit_once('/') {
+            self.transport.mkdir(dir)?;
+        }
+        Ok(())
+    }
+
+    /// Read a weave file, returning an empty weave if it doesn't exist yet.
+    fn read_or_empty_weave(&self, path: &str) -> Result<WeaveFile, RepositoryError> {
+        match self.transport.get_bytes(path) {
+            Ok(data) => {
+                read_weave_v5(&data).map_err(|e| RepositoryError::Corrupt(format!("{path}: {e:?}")))
+            }
+            Err(TransportError::NoSuchFile(_)) => Ok(WeaveFile::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Append a version named `version_id` (parents named `parents`) holding
+    /// `lines` to the weave at `path`, writing it back.
+    fn weave_add_version(
+        &self,
+        path: &str,
+        version_id: &[u8],
+        parents: &[Vec<u8>],
+        lines: &[Vec<u8>],
+    ) -> Result<(), RepositoryError> {
+        let mut weave = self.read_or_empty_weave(path)?;
+        let parent_refs: Vec<&[u8]> = parents.iter().map(|p| p.as_slice()).collect();
+        weave
+            .add_lines(version_id, &parent_refs, lines, None, None)
+            .map_err(|e| RepositoryError::Corrupt(format!("{path}: add_lines: {e}")))?;
+        self.ensure_parent_dir(path)?;
+        self.transport.put_bytes(path, &write_weave_v5(&weave))?;
+        Ok(())
+    }
+
+    /// Add a revision, serialised to XML (v5), to the revision-store.
+    fn add_revision(
+        &mut self,
+        revision: &crate::revision::Revision,
+        _parents: &[Vec<u8>],
+    ) -> Result<(), RepositoryError> {
+        use crate::serializer::RevisionSerializer;
+        let bytes = crate::xml_serializer::XMLRevisionSerializer5
+            .write_revision_to_string(revision)
+            .map_err(|e| RepositoryError::Corrupt(format!("write revision: {e:?}")))?;
+        let path = Self::revision_store_path(revision.revision_id.as_bytes(), "");
+        self.ensure_parent_dir(&path)?;
+        self.transport.put_bytes(&path, &bytes)?;
+        Ok(())
+    }
+
+    /// Serialise `inv` (committed form, entries carry revisions) and add it as
+    /// a version to `inventory.weave` keyed by `revision_id`. Returns the
+    /// inventory text's sha1.
+    fn store_inventory(
+        &mut self,
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        inv: &crate::inventory::MutableInventory,
+    ) -> Result<Vec<u8>, RepositoryError> {
+        use crate::serializer::InventorySerializer;
+        let lines = crate::xml_serializer::XMLInventorySerializer5
+            .write_inventory_to_lines(inv, false)
+            .map_err(|e| RepositoryError::Corrupt(format!("serialise inventory: {e:?}")))?;
+        let line_refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
+        let sha1 = crate::weave::sha_strings(&line_refs);
+        self.weave_add_version("inventory.weave", revision_id, parents, &lines)?;
+        Ok(sha1)
+    }
+
+    /// Build the inventory from `entries`, serialise it, and store it.
+    fn add_inventory_from_entries(
+        &mut self,
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        _root_id: &[u8],
+        entries: &[crate::inventory::Entry],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        let mut inv = crate::inventory::MutableInventory::new();
+        inv.revision_id = Some(crate::RevisionId::from(revision_id));
+        for entry in entries {
+            inv.add(entry.clone())
+                .map_err(|e| RepositoryError::Corrupt(format!("build inventory: {e:?}")))?;
+        }
+        self.store_inventory(revision_id, parents, &inv)
+    }
+
+    /// Build the inventory for `new_revision_id` by applying `delta` to the
+    /// basis inventory, then serialise and store it.
+    fn add_inventory_by_delta(
+        &mut self,
+        basis_revision_id: &[u8],
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: &[u8],
+        parents: &[Vec<u8>],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        let basis = if basis_revision_id == crate::branch::NULL_REVISION {
+            crate::inventory::MutableInventory::new()
+        } else {
+            self.get_inventory(basis_revision_id)?
+        };
+        let new_inv = basis
+            .create_by_apply_delta(delta, crate::RevisionId::from(new_revision_id))
+            .map_err(|e| RepositoryError::Corrupt(format!("apply inventory delta: {e:?}")))?;
+        self.store_inventory(new_revision_id, parents, &new_inv)
+    }
+
+    /// Add a file text to the file's weave, keyed by the revision id. The
+    /// weave version parents are the revids from the `(file_id, revid)`
+    /// parent pairs.
+    fn add_text(
+        &mut self,
+        file_id: &[u8],
+        revision: &[u8],
+        parents: &[(Vec<u8>, Vec<u8>)],
+        bytes: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let path = format!("weaves/{}.weave", hash_prefix_map(file_id));
+        let parent_revids: Vec<Vec<u8>> = parents.iter().map(|(_, r)| r.clone()).collect();
+        self.weave_add_version(&path, revision, &parent_revids, &split_lines(bytes))
+    }
+
+    /// Store a signature text for `revision_id` in the revision-store.
+    fn add_signature_text(
+        &mut self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let path = Self::revision_store_path(revision_id, ".sig");
+        self.ensure_parent_dir(&path)?;
+        self.transport.put_bytes(&path, signature)?;
+        Ok(())
+    }
 }
 
 impl super::Repository for WeaveRepository {
@@ -191,65 +350,60 @@ impl super::Repository for WeaveRepository {
     }
 
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {
-        Err(RepositoryError::UnsupportedFormat(
-            "writing weave repositories",
-        ))
+        // Weave writes append immediately; there is no write group.
+        Ok(())
     }
 
     fn add_revision(
         &mut self,
-        _revision: &crate::revision::Revision,
-        _parents: &[Vec<u8>],
+        revision: &crate::revision::Revision,
+        parents: &[Vec<u8>],
     ) -> Result<(), RepositoryError> {
-        Err(RepositoryError::UnsupportedFormat(
-            "writing weave repositories",
-        ))
+        WeaveRepository::add_revision(self, revision, parents)
     }
 
     fn add_inventory_from_entries(
         &mut self,
-        _revision_id: &[u8],
-        _parents: &[Vec<u8>],
-        _root_id: &[u8],
-        _entries: &[crate::inventory::Entry],
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        root_id: &[u8],
+        entries: &[crate::inventory::Entry],
     ) -> Result<Vec<u8>, RepositoryError> {
-        Err(RepositoryError::UnsupportedFormat(
-            "writing weave repositories",
-        ))
+        WeaveRepository::add_inventory_from_entries(self, revision_id, parents, root_id, entries)
     }
 
     fn add_inventory_by_delta(
         &mut self,
-        _basis_revision_id: &[u8],
-        _delta: &crate::inventory_delta::InventoryDelta,
-        _new_revision_id: &[u8],
-        _parents: &[Vec<u8>],
+        basis_revision_id: &[u8],
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: &[u8],
+        parents: &[Vec<u8>],
     ) -> Result<Vec<u8>, RepositoryError> {
-        Err(RepositoryError::UnsupportedFormat(
-            "writing weave repositories",
-        ))
+        WeaveRepository::add_inventory_by_delta(
+            self,
+            basis_revision_id,
+            delta,
+            new_revision_id,
+            parents,
+        )
     }
 
     fn add_text(
         &mut self,
-        _file_id: &[u8],
-        _revision: &[u8],
-        _parents: &[(Vec<u8>, Vec<u8>)],
-        _bytes: &[u8],
+        file_id: &[u8],
+        revision: &[u8],
+        parents: &[(Vec<u8>, Vec<u8>)],
+        bytes: &[u8],
     ) -> Result<(), RepositoryError> {
-        Err(RepositoryError::UnsupportedFormat(
-            "writing weave repositories",
-        ))
+        WeaveRepository::add_text(self, file_id, revision, parents, bytes)
     }
 
     fn add_signature_text(
         &mut self,
-        _revision_id: &[u8],
-        _signature: &[u8],
+        revision_id: &[u8],
+        signature: &[u8],
     ) -> Result<(), RepositoryError> {
-        Err(RepositoryError::UnsupportedFormat(
-            "writing weave repositories",
-        ))
+        WeaveRepository::add_signature_text(self, revision_id, signature)
     }
 
     fn get_signature_text(&self, revision_id: &[u8]) -> Result<Option<Vec<u8>>, RepositoryError> {
@@ -257,10 +411,24 @@ impl super::Repository for WeaveRepository {
     }
 
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
-        Err(RepositoryError::UnsupportedFormat(
-            "writing weave repositories",
-        ))
+        Ok(())
     }
+}
+
+/// Split a byte buffer into lines, each keeping its trailing newline.
+fn split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            lines.push(bytes[start..=i].to_vec());
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        lines.push(bytes[start..].to_vec());
+    }
+    lines
 }
 
 /// Decompress a gzip stream. The revision-store is uncompressed for format 6

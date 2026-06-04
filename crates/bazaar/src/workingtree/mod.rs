@@ -2271,6 +2271,50 @@ mod tests {
         assert!(inv.entries().unwrap().is_empty());
     }
 
+    /// Create an all-in-one weave control dir, add a file, commit, then
+    /// reopen and read the revision, inventory and file text back -- a
+    /// self-contained create -> commit -> read loop with no fixtures.
+    /// Cross-compatibility with brz is verified separately.
+    #[test]
+    fn weave_all_in_one_create_commit_read() {
+        use crate::bzrdir::BzrDirAllInOne;
+        use crate::transport::Transport;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirAllInOne::create(&parent).unwrap();
+
+        parent.put_bytes("a.txt", b"hi\n").unwrap();
+        let mut wt = cd.open_workingtree().unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "one").timestamp(1577880000),
+            )
+            .unwrap();
+
+        // Reopen the control dir from scratch and read everything back.
+        let reopened = BzrDirAllInOne::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let branch = reopened.open_branch().unwrap();
+        assert_eq!(branch.last_revision_info().unwrap(), (1, revid.clone()));
+
+        let repo = reopened.open_repository().unwrap();
+        assert_eq!(repo.all_revision_ids().unwrap(), vec![revid.clone()]);
+        assert_eq!(repo.get_revision(&revid).unwrap().message, "one");
+
+        let inv = repo.get_inventory(&revid).unwrap();
+        let paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec!["a.txt".to_string()]);
+
+        let file_id = wt.path2id("a.txt").unwrap();
+        assert_eq!(repo.get_file_text(&file_id, &revid).unwrap(), b"hi\n");
+    }
+
     /// Build a fresh tree and return its root transport plus an open
     /// working tree.
     fn fresh_tree() -> (tempfile::TempDir, SharedTransport, WorkingTree4) {

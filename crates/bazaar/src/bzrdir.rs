@@ -559,6 +559,33 @@ impl BzrDirAllInOne {
             None => Err(BzrDirError::NotMetaDir(marker)),
         }
     }
+
+    /// Create a fresh all-in-one weave control directory ("Bazaar-NG branch,
+    /// format 6") under `parent` (the directory that will contain `.bzr`) and
+    /// open it.
+    ///
+    /// Writes the `.bzr` directory, the `branch-format` marker, an empty
+    /// `revision-history` and `pending-merges`, the revision-less working
+    /// `inventory`, and the empty weave repository scaffold (all directly
+    /// under `.bzr`).
+    pub fn create(parent: &SharedTransport) -> Result<Self, BzrDirError> {
+        let marker: &[u8] = b"Bazaar-NG branch, format 6\n";
+        let format = crate::repository::find_format(marker)
+            .filter(|f| f.storage == crate::repository::StorageKind::Weave)
+            .ok_or_else(|| BzrDirError::Component("weave format 6 not registered".to_string()))?;
+
+        let bzr = parent.subtransport(".bzr")?;
+        bzr.mkdir("")?;
+        bzr.put_bytes("branch-format", marker)?;
+        bzr.put_bytes("revision-history", b"")?;
+        bzr.put_bytes("pending-merges", b"")?;
+        bzr.put_bytes("inventory", b"<inventory format=\"5\">\n</inventory>\n")?;
+
+        crate::repository::WeaveRepository::create(bzr.clone(), format)
+            .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
+
+        Self::open(bzr)
+    }
 }
 
 impl ControlDir for BzrDirAllInOne {
