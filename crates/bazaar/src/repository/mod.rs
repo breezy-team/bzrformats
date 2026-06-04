@@ -262,14 +262,13 @@ mod tests {
                 label: "knit-pack",
                 create: |t| Box::new(KnitPackRepository::create(t, knitpack6()).unwrap()),
                 reopen: |t| Box::new(KnitPackRepository::open(t).unwrap()),
-                // knit-pack signature writing is an unimplemented TODO.
-                signs: false,
+                signs: true,
             },
             Scenario {
                 label: "knit",
                 create: |t| Box::new(KnitRepository::create(t, knit1()).unwrap()),
                 reopen: |t| Box::new(KnitRepository::open(t).unwrap()),
-                signs: false,
+                signs: true,
             },
             Scenario {
                 label: "weave",

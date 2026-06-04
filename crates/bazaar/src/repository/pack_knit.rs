@@ -1070,8 +1070,8 @@ struct WriteGroup {
     pack: Arc<Mutex<ContainerWriter<Vec<u8>>>>,
     revisions: WriteStore,
     inventories: WriteStore,
-    texts: WriteStore,
     signatures: WriteStore,
+    texts: WriteStore,
     /// Whether to write B+Tree indices (1.9+) or format-1 GraphIndex (0.92,
     /// 1.6).
     uses_btree: bool,
@@ -1095,16 +1095,16 @@ impl WriteGroup {
         };
         let revisions = make(false);
         let inventories = make(true);
-        let texts = make(true);
         // Signatures, like revisions, are keyed by revision id with no deltas.
         let signatures = make(false);
+        let texts = make(true);
         Ok(WriteGroup {
             pack_name: pack_name.to_string(),
             pack,
             revisions,
             inventories,
-            texts,
             signatures,
+            texts,
             uses_btree,
         })
     }
@@ -1120,8 +1120,8 @@ impl WriteGroup {
             pack,
             revisions,
             inventories,
-            texts,
             signatures,
+            texts,
             uses_btree,
         } = self;
         let rix = serialise_index(revisions.index, 1, uses_btree)?;
