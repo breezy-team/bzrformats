@@ -22,6 +22,7 @@ use crate::transport::{SharedTransport, Transport};
 
 use super::format::RepositoryFormat;
 use super::pack_2a::RepositoryError;
+use super::unkey_knit_parent_map;
 use crate::declare_repository_format;
 use crate::xml_serializer::{
     XMLInventorySerializer5, XMLInventorySerializer6, XMLInventorySerializer7,
@@ -581,6 +582,20 @@ impl KnitPackRepository {
         Ok(ids)
     }
 
+    /// The stored parent ids of each of `revision_ids` (present ones only),
+    /// read from the revision knit's index.
+    pub fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        let keys: Vec<KnitKey> = revision_ids.iter().map(|r| vec![r.clone()]).collect();
+        let raw = self
+            .revisions
+            .get_parent_map(&keys)
+            .map_err(RepositoryError::Knit)?;
+        Ok(unkey_knit_parent_map(raw))
+    }
+
     /// Read and parse a revision by id (XML, serializer v5).
     pub fn get_revision(
         &self,
@@ -713,6 +728,13 @@ impl super::Repository for KnitPackRepository {
 
     fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
         KnitPackRepository::all_revision_ids(self)
+    }
+
+    fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        KnitPackRepository::get_parent_map(self, revision_ids)
     }
 
     fn get_revision(

@@ -47,6 +47,24 @@ pub trait Repository: Send + Sync {
     /// All revision ids in this repository, sorted.
     fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError>;
 
+    /// The stored parent ids of each of `revision_ids`, as a map. Revision ids
+    /// not present in the repository are omitted from the result. The parents
+    /// come straight from the revision store's index (no body deserialisation),
+    /// which is the raw graph data callers build a revision graph from.
+    fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError>;
+
+    /// Whether `revision_id` is present in this repository. Defaults to a
+    /// single-key [`get_parent_map`](Repository::get_parent_map) lookup;
+    /// backends may override with a cheaper index probe.
+    fn has_revision(&self, revision_id: &[u8]) -> Result<bool, RepositoryError> {
+        Ok(self
+            .get_parent_map(std::slice::from_ref(&revision_id.to_vec()))?
+            .contains_key(revision_id))
+    }
+
     /// Read and parse a revision by id.
     fn get_revision(
         &self,
@@ -132,6 +150,26 @@ pub trait Repository: Send + Sync {
 
     /// Flush the open write group, committing its additions.
     fn commit_write_group(&mut self) -> Result<(), RepositoryError>;
+}
+
+/// Convert a knit-keyed parent map (`KnitKey -> [KnitKey]`, where each key's
+/// first element is the revision id) to the revision-id-keyed map the
+/// [`Repository::get_parent_map`] interface returns. Shared by the knit-pack
+/// and non-pack knit backends, which both key by `KnitKey`.
+pub(crate) fn unkey_knit_parent_map(
+    raw: std::collections::HashMap<crate::knit::KnitKey, Vec<crate::knit::KnitKey>>,
+) -> std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> {
+    let mut out = std::collections::HashMap::with_capacity(raw.len());
+    for (key, parents) in raw {
+        if let Some(revid) = key.into_iter().next() {
+            let parent_ids = parents
+                .into_iter()
+                .filter_map(|p| p.into_iter().next())
+                .collect();
+            out.insert(revid, parent_ids);
+        }
+    }
+    out
 }
 
 impl dyn Repository + '_ {
@@ -305,6 +343,22 @@ mod tests {
                 "{}",
                 s.label
             );
+
+            // get_parent_map returns the stored parents; a missing revision is
+            // omitted. has_revision reflects presence.
+            let pm = repo
+                .get_parent_map(&[b"rev-1".to_vec(), b"rev-2".to_vec(), b"nope".to_vec()])
+                .unwrap();
+            assert_eq!(pm.get(&b"rev-1".to_vec()), Some(&vec![]), "{}", s.label);
+            assert_eq!(
+                pm.get(&b"rev-2".to_vec()),
+                Some(&vec![b"rev-1".to_vec()]),
+                "{}",
+                s.label
+            );
+            assert!(!pm.contains_key(&b"nope".to_vec()), "{}", s.label);
+            assert!(repo.has_revision(b"rev-2").unwrap(), "{}", s.label);
+            assert!(!repo.has_revision(b"nope").unwrap(), "{}", s.label);
             assert_eq!(
                 repo.get_revision(b"rev-1").unwrap().message,
                 "first",

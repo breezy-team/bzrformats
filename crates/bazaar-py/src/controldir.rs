@@ -105,6 +105,27 @@ impl Repository {
         PyList::new(py, ids.iter().map(|i| PyBytes::new(py, i)))
     }
 
+    /// The stored parents of each of `revision_ids`, as a `{revid: [parent]}`
+    /// dict. Revision ids not present in the repository are omitted.
+    fn get_parent_map<'py>(
+        &self,
+        py: Python<'py>,
+        revision_ids: Vec<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let map = self.inner.get_parent_map(&revision_ids).map_err(err)?;
+        let d = PyDict::new(py);
+        for (revid, parents) in map {
+            let plist = PyList::new(py, parents.iter().map(|p| PyBytes::new(py, p)))?;
+            d.set_item(PyBytes::new(py, &revid), plist)?;
+        }
+        Ok(d)
+    }
+
+    /// Whether `revision_id` is present in this repository.
+    fn has_revision(&self, revision_id: &[u8]) -> PyResult<bool> {
+        self.inner.has_revision(revision_id).map_err(err)
+    }
+
     /// The committer, message and parents of a revision, as a dict.
     fn get_revision<'py>(
         &self,

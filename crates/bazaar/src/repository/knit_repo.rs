@@ -187,6 +187,21 @@ impl KnitRepository {
         Ok(ids)
     }
 
+    /// The stored parent ids of each of `revision_ids` (present ones only),
+    /// read from the revisions kndx index.
+    pub fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        let keys: Vec<crate::knit::KnitKey> =
+            revision_ids.iter().map(|r| vec![r.clone()]).collect();
+        let raw = self
+            .revisions
+            .get_parent_map(&keys)
+            .map_err(|e| RepositoryError::Corrupt(format!("parent map: {e}")))?;
+        Ok(super::unkey_knit_parent_map(raw))
+    }
+
     /// Read and parse a revision (XML, serializer v5).
     pub fn get_revision(
         &self,
@@ -371,6 +386,13 @@ impl super::Repository for KnitRepository {
 
     fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
         KnitRepository::all_revision_ids(self)
+    }
+
+    fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        KnitRepository::get_parent_map(self, revision_ids)
     }
 
     fn get_revision(

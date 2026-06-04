@@ -456,6 +456,30 @@ impl Pack2aRepository {
         Ok(ids)
     }
 
+    /// The stored parent ids of each of `revision_ids` (present ones only),
+    /// read from the revision store's index.
+    pub fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        let keys: Vec<Key> = revision_ids
+            .iter()
+            .map(|r| Key::fixed(vec![r.clone()]))
+            .collect();
+        let raw = self.revisions.get_parent_map(&keys)?;
+        let mut out = std::collections::HashMap::with_capacity(raw.len());
+        for (key, parents) in raw {
+            if let Some(revid) = key.segments().first() {
+                let parent_ids = parents
+                    .into_iter()
+                    .filter_map(|p| p.segments().first().cloned())
+                    .collect();
+                out.insert(revid.clone(), parent_ids);
+            }
+        }
+        Ok(out)
+    }
+
     /// Read and parse a revision by id.
     pub fn get_revision(
         &self,
@@ -709,6 +733,13 @@ impl super::Repository for Pack2aRepository {
 
     fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
         Pack2aRepository::all_revision_ids(self)
+    }
+
+    fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        Pack2aRepository::get_parent_map(self, revision_ids)
     }
 
     fn get_revision(
