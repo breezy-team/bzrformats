@@ -268,14 +268,11 @@ impl Branch {
     }
 
     fn write_revision_history(&self, history: &[Vec<u8>]) -> Result<(), BranchError> {
-        let mut content = Vec::new();
-        for (i, revid) in history.iter().enumerate() {
-            if i > 0 {
-                content.push(b'\n');
-            }
-            content.extend_from_slice(revid);
-        }
-        self.transport.put_bytes("revision-history", &content, None)?;
+        // Newline-separated revision ids, no trailing newline (the form brz
+        // writes).
+        let content = history.join(&b'\n');
+        self.transport
+            .put_bytes("revision-history", &content, None)?;
         Ok(())
     }
 

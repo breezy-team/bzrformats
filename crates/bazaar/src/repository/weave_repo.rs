@@ -52,14 +52,18 @@ impl WeaveRepository {
         transport: SharedTransport,
         format: &'static RepositoryFormat,
     ) -> Result<Self, RepositoryError> {
-        if format.storage != StorageKind::Weave {
+        if !format.is_all_in_one() {
             return Err(RepositoryError::UnsupportedFormat(
                 format.get_format_description(),
             ));
         }
         transport.mkdir("weaves")?;
         transport.mkdir("revision-store")?;
-        transport.put_bytes("inventory.weave", &write_weave_v5(&WeaveFile::default()))?;
+        transport.put_bytes(
+            "inventory.weave",
+            &write_weave_v5(&WeaveFile::default()),
+            None,
+        )?;
         Self::open(transport, format)
     }
 
@@ -209,16 +213,16 @@ impl WeaveRepository {
         &self,
         path: &str,
         version_id: &[u8],
-        parents: &[Vec<u8>],
+        parents: &[&[u8]],
         lines: &[Vec<u8>],
     ) -> Result<(), RepositoryError> {
         let mut weave = self.read_or_empty_weave(path)?;
-        let parent_refs: Vec<&[u8]> = parents.iter().map(|p| p.as_slice()).collect();
         weave
-            .add_lines(version_id, &parent_refs, lines, None, None)
+            .add_lines(version_id, parents, lines, None, None)
             .map_err(|e| RepositoryError::Corrupt(format!("{path}: add_lines: {e}")))?;
         self.ensure_parent_dir(path)?;
-        self.transport.put_bytes(path, &write_weave_v5(&weave))?;
+        self.transport
+            .put_bytes(path, &write_weave_v5(&weave), None)?;
         Ok(())
     }
 
@@ -234,7 +238,7 @@ impl WeaveRepository {
             .map_err(|e| RepositoryError::Corrupt(format!("write revision: {e:?}")))?;
         let path = Self::revision_store_path(revision.revision_id.as_bytes(), "");
         self.ensure_parent_dir(&path)?;
-        self.transport.put_bytes(&path, &bytes)?;
+        self.transport.put_bytes(&path, &bytes, None)?;
         Ok(())
     }
 
@@ -253,7 +257,8 @@ impl WeaveRepository {
             .map_err(|e| RepositoryError::Corrupt(format!("serialise inventory: {e:?}")))?;
         let line_refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
         let sha1 = crate::weave::sha_strings(&line_refs);
-        self.weave_add_version("inventory.weave", revision_id, parents, &lines)?;
+        let parent_refs: Vec<&[u8]> = parents.iter().map(|p| p.as_slice()).collect();
+        self.weave_add_version("inventory.weave", revision_id, &parent_refs, &lines)?;
         Ok(sha1)
     }
 
@@ -305,8 +310,10 @@ impl WeaveRepository {
         bytes: &[u8],
     ) -> Result<(), RepositoryError> {
         let path = format!("weaves/{}.weave", hash_prefix_map(file_id));
-        let parent_revids: Vec<Vec<u8>> = parents.iter().map(|(_, r)| r.clone()).collect();
-        self.weave_add_version(&path, revision, &parent_revids, &split_lines(bytes))
+        // The file weave's version parents are the parent revids; borrow them
+        // directly rather than cloning the (file_id, revid) pairs apart.
+        let parent_refs: Vec<&[u8]> = parents.iter().map(|(_, r)| r.as_slice()).collect();
+        self.weave_add_version(&path, revision, &parent_refs, &split_lines(bytes))
     }
 
     /// Store a signature text for `revision_id` in the revision-store.
@@ -317,7 +324,7 @@ impl WeaveRepository {
     ) -> Result<(), RepositoryError> {
         let path = Self::revision_store_path(revision_id, ".sig");
         self.ensure_parent_dir(&path)?;
-        self.transport.put_bytes(&path, signature)?;
+        self.transport.put_bytes(&path, signature, None)?;
         Ok(())
     }
 }

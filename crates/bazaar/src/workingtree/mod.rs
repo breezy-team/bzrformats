@@ -2284,7 +2284,7 @@ mod tests {
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let cd = BzrDirAllInOne::create(&parent).unwrap();
 
-        parent.put_bytes("a.txt", b"hi\n").unwrap();
+        parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         let mut wt = cd.open_workingtree().unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
 

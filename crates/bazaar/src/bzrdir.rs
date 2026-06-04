@@ -573,15 +573,15 @@ impl BzrDirAllInOne {
     pub fn create(parent: &SharedTransport) -> Result<Self, BzrDirError> {
         let marker: &[u8] = b"Bazaar-NG branch, format 6\n";
         let format = crate::repository::find_format(marker)
-            .filter(|f| f.storage == crate::repository::StorageKind::Weave)
+            .filter(|f| f.is_all_in_one())
             .ok_or_else(|| BzrDirError::Component("weave format 6 not registered".to_string()))?;
 
         let bzr = parent.subtransport(".bzr")?;
         bzr.mkdir("")?;
-        bzr.put_bytes("branch-format", marker)?;
-        bzr.put_bytes("revision-history", b"")?;
-        bzr.put_bytes("pending-merges", b"")?;
-        bzr.put_bytes("inventory", b"<inventory format=\"5\">\n</inventory>\n")?;
+        bzr.put_bytes("branch-format", marker, None)?;
+        bzr.put_bytes("revision-history", b"", None)?;
+        bzr.put_bytes("pending-merges", b"", None)?;
+        bzr.put_bytes("inventory", b"<inventory format=\"5\">\n</inventory>\n", None)?;
 
         crate::repository::WeaveRepository::create(bzr.clone(), format)
             .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
