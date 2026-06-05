@@ -16,7 +16,7 @@ mod pack_knit;
 mod tree;
 
 pub use commit::CommitBuilder;
-pub use format::{all_formats, find_format, RepositoryFormat, StorageKind};
+pub use format::{all_formats, find_format, RepositoryFormat};
 pub use pack_2a::{Pack2aRepository, RepositoryError, SharedTransport};
 pub use pack_knit::KnitPackRepository;
 pub use tree::RevisionTree;
@@ -148,17 +148,11 @@ impl dyn Repository + '_ {
 }
 
 /// Open the repository at `transport` (rooted at `.bzr/repository`),
-/// dispatching to the right reader based on the registered format's storage
-/// family. Returns an abstract [`Repository`].
+/// dispatching to the right reader through the registered format's `open`
+/// function. Returns an abstract [`Repository`].
 pub fn open(transport: SharedTransport) -> Result<Box<dyn Repository>, RepositoryError> {
     let marker = transport.get_bytes("format")?;
     let format =
         find_format(&marker).ok_or_else(|| RepositoryError::UnknownFormat(marker.clone()))?;
-    match format.storage {
-        StorageKind::GroupCompress => Ok(Box::new(Pack2aRepository::open(transport)?)),
-        StorageKind::KnitPack => Ok(Box::new(KnitPackRepository::open(transport)?)),
-        StorageKind::Knit => Err(RepositoryError::UnsupportedFormat(
-            format.get_format_description(),
-        )),
-    }
+    (format.open)(transport)
 }

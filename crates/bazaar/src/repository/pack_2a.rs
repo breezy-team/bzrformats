@@ -811,6 +811,15 @@ fn read_pack_names_with_values(
     Ok(out)
 }
 
+/// Open the repository at `transport` as a 2a (groupcompress) repository.
+/// The [`OpenFn`](super::format::OpenFn) carried by every 2a
+/// [`RepositoryFormat`].
+pub fn open_group_compress(
+    transport: SharedTransport,
+) -> Result<Box<dyn super::Repository>, RepositoryError> {
+    Ok(Box::new(Pack2aRepository::open(transport)?))
+}
+
 /// Verify the repository `format` marker is a supported groupcompress
 /// (2a) format, consulting the format registry, and return it.
 fn check_format(
@@ -819,7 +828,9 @@ fn check_format(
     let marker = transport.get_bytes("format")?;
     let format = super::format::find_format(&marker)
         .ok_or_else(|| RepositoryError::UnknownFormat(marker.clone()))?;
-    if !format.is_supported() || format.storage != super::format::StorageKind::GroupCompress {
+    if !format.is_supported()
+        || !std::ptr::fn_addr_eq(format.open, open_group_compress as super::format::OpenFn)
+    {
         return Err(RepositoryError::UnsupportedFormat(
             format.get_format_description(),
         ));

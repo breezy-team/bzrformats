@@ -9,21 +9,26 @@
 //! defines a `static RepositoryFormat` and submits it to the registry via
 //! the `inventory` crate (the same distributed-registration mechanism the
 //! knit adapters use). Looking a marker up tells you what the repository
-//! can do and which decoder family it belongs to; whether that decoder is
-//! actually implemented yet is a separate question ([`RepositoryFormat::is_supported`]).
+//! can do and gives the [`OpenFn`] that opens it; whether that opener is
+//! implemented yet is a separate question ([`RepositoryFormat::is_supported`]).
 
 use crate::serializer::{InventorySerializer, RevisionSerializer};
 
-/// Which storage family a repository format belongs to. This selects the
-/// record codec and on-disk layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StorageKind {
-    /// Old knit versioned-file format (not pack-based).
-    Knit,
-    /// Pack container with knit records and XML inventories.
-    KnitPack,
-    /// Pack container with groupcompress records and CHK inventories (2a).
-    GroupCompress,
+use super::pack_2a::{RepositoryError, SharedTransport};
+use super::Repository;
+
+/// Opens the repository rooted at `transport` (`.bzr/repository`) as a
+/// particular format, returning an abstract [`Repository`]. Each format
+/// carries one of these so opening dispatches through the format itself
+/// rather than a discriminant.
+pub type OpenFn = fn(SharedTransport) -> Result<Box<dyn Repository>, RepositoryError>;
+
+/// An [`OpenFn`] for formats this crate cannot open yet, reporting the
+/// format as unsupported.
+pub fn open_unsupported(
+    _transport: SharedTransport,
+) -> Result<Box<dyn Repository>, RepositoryError> {
+    Err(RepositoryError::UnsupportedFormat("unsupported format"))
 }
 
 /// Static description of one repository format.
@@ -35,8 +40,8 @@ pub struct RepositoryFormat {
     pub format_string: &'static [u8],
     /// A human-readable description.
     pub description: &'static str,
-    /// The storage family (record codec + layout).
-    pub storage: StorageKind,
+    /// Opens a repository of this format.
+    pub open: OpenFn,
     /// The revision serializer.
     pub revision_serializer: &'static dyn RevisionSerializer,
     /// The inventory serializer.
@@ -62,7 +67,7 @@ impl RepositoryFormat {
     pub const DEFAULT: RepositoryFormat = RepositoryFormat {
         format_string: b"",
         description: "",
-        storage: StorageKind::GroupCompress,
+        open: open_unsupported,
         revision_serializer: &crate::bencode_serializer::BEncodeRevisionSerializer1,
         inventory_serializer: &crate::xml_serializer::Chk255BigPageInventorySerializer,
         rich_root_data: false,
@@ -117,7 +122,6 @@ macro_rules! declare_repository_format {
         $name:ident {
             format_string: $fmt:expr,
             description: $desc:expr,
-            storage: $storage:expr,
             revision_serializer: $rev:expr,
             inventory_serializer: $inv:expr,
             $( $field:ident : $value:expr, )*
@@ -127,7 +131,6 @@ macro_rules! declare_repository_format {
             $crate::repository::format::RepositoryFormat {
                 format_string: $fmt,
                 description: $desc,
-                storage: $storage,
                 revision_serializer: $rev,
                 inventory_serializer: $inv,
                 $( $field: $value, )*
@@ -166,7 +169,10 @@ mod tests {
     fn the_2a_format_is_registered_and_supported() {
         let f = find_format(b"Bazaar repository format 2a (needs bzr 1.16 or later)\n")
             .expect("2a format registered");
-        assert_eq!(f.storage, StorageKind::GroupCompress);
+        assert!(std::ptr::fn_addr_eq(
+            f.open,
+            super::super::pack_2a::open_group_compress as OpenFn
+        ));
         assert!(f.supports_chks);
         assert!(f.rich_root_data);
         assert!(f.is_supported());
@@ -176,7 +182,10 @@ mod tests {
     fn knitpack_formats_are_registered() {
         let f = find_format(b"Bazaar pack repository format 1 (needs bzr 0.92)\n")
             .expect("knitpack 1 registered");
-        assert_eq!(f.storage, StorageKind::KnitPack);
+        assert!(std::ptr::fn_addr_eq(
+            f.open,
+            super::super::pack_knit::open_knit_pack as OpenFn
+        ));
         assert!(!f.rich_root_data);
         assert_eq!(f.inventory_serializer.format_num(), b"5");
     }

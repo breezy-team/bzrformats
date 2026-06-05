@@ -21,7 +21,7 @@ use crate::knit::{
 use crate::pack_repo::{index_extension, IndexKind};
 use crate::transport::{SharedTransport, Transport};
 
-use super::format::{RepositoryFormat, StorageKind};
+use super::format::RepositoryFormat;
 use super::pack_2a::RepositoryError;
 
 /// The pack name is used as the knit `FileRef`.
@@ -317,12 +317,12 @@ impl KnitPackRepository {
     }
 
     /// Create an empty knit-pack repository of `format` at `transport` and
-    /// open it. `format` must be a `KnitPack` storage format.
+    /// open it. `format` must be a knit-pack format.
     pub fn create(
         transport: SharedTransport,
         format: &'static RepositoryFormat,
     ) -> Result<Self, RepositoryError> {
-        if format.storage != StorageKind::KnitPack {
+        if !std::ptr::fn_addr_eq(format.open, open_knit_pack as super::format::OpenFn) {
             return Err(RepositoryError::UnsupportedFormat(
                 format.get_format_description(),
             ));
@@ -664,12 +664,21 @@ impl super::Repository for KnitPackRepository {
     }
 }
 
-/// Verify the `format` marker is a supported knit-pack format.
+/// Open the repository at `transport` as a knit-pack repository. The
+/// [`OpenFn`](super::format::OpenFn) carried by every knit-pack
+/// [`RepositoryFormat`].
+pub fn open_knit_pack(
+    transport: SharedTransport,
+) -> Result<Box<dyn super::Repository>, RepositoryError> {
+    Ok(Box::new(KnitPackRepository::open(transport)?))
+}
+
+/// Verify the `format` marker is a knit-pack format.
 fn check_format(transport: &dyn Transport) -> Result<&'static RepositoryFormat, RepositoryError> {
     let marker = transport.get_bytes("format")?;
     let format = super::format::find_format(&marker)
         .ok_or_else(|| RepositoryError::UnknownFormat(marker.clone()))?;
-    if format.storage != StorageKind::KnitPack {
+    if !std::ptr::fn_addr_eq(format.open, open_knit_pack as super::format::OpenFn) {
         return Err(RepositoryError::UnsupportedFormat(
             format.get_format_description(),
         ));
