@@ -83,8 +83,18 @@ pub struct LockHeldInfo {
 impl LockHeldInfo {
     /// Build holder info for the current process.
     pub fn for_this_process(extra_holder_info: HashMap<String, String>) -> Self {
+        let hostname = match crate::osutils::get_host_name() {
+            Ok(h) => Some(h),
+            // The hostname is informational holder metadata only (pid, nonce,
+            // user and start_time identify the holder), so a lookup failure
+            // is logged and recorded as absent rather than failing the lock.
+            Err(e) => {
+                log::warn!("could not determine hostname for lock holder info: {e}");
+                None
+            }
+        };
         LockHeldInfo {
-            hostname: crate::osutils::get_host_name().ok(),
+            hostname,
             pid: Some(std::process::id()),
             nonce: Some(crate::osutils::rand_chars(20)),
             start_time: Some(SystemTime::now()),
@@ -190,9 +200,16 @@ impl<'t> LockDir<'t> {
     }
 
     fn remove_pending_dir(&self, tmpname: &str) {
-        // Best effort cleanup; ignore errors as breezy does.
-        let _ = self.transport.delete(&format!("{tmpname}{INFO_NAME}"));
-        let _ = self.transport.rmdir(tmpname);
+        // Best-effort cleanup of a pending dir we are abandoning: a failure
+        // here only leaves a stray `.tmp` directory, so we log it and carry
+        // on rather than failing the caller (which breezy does too, via a
+        // note()).
+        if let Err(e) = self.transport.delete(&format!("{tmpname}{INFO_NAME}")) {
+            log::warn!("error removing pending lock info {tmpname}{INFO_NAME}: {e}");
+        }
+        if let Err(e) = self.transport.rmdir(tmpname) {
+            log::warn!("error removing pending lock dir {tmpname}: {e}");
+        }
     }
 
     fn read_info_at(&self, path: &str) -> Result<Option<LockHeldInfo>, LockError> {
@@ -218,11 +235,20 @@ impl Lock for LockDir<'_> {
 
         match self.transport.rename(&tmpname, &self.held_dir) {
             Ok(()) => {}
-            Err(_) => {
-                // Someone else holds it (or the rename otherwise failed);
-                // drop our pending dir and report contention.
+            // The target already existing means another contender holds the
+            // lock: drop our pending dir and report contention.
+            Err(TransportError::Io {
+                kind: std::io::ErrorKind::AlreadyExists,
+                ..
+            }) => {
                 self.remove_pending_dir(&tmpname);
                 return Err(LockError::AlreadyHeld);
+            }
+            // Any other failure (permission, I/O) is not contention; clean up
+            // and surface the real error rather than masking it as held.
+            Err(e) => {
+                self.remove_pending_dir(&tmpname);
+                return Err(e.into());
             }
         }
 
@@ -252,8 +278,15 @@ impl Lock for LockDir<'_> {
         self.transport.rename(&self.held_dir, &tmpname)?;
         self.lock_held = false;
         self.nonce = None;
-        let _ = self.transport.delete(&format!("{tmpname}{INFO_NAME}"));
-        let _ = self.transport.rmdir(&tmpname);
+        self.transport.delete(&format!("{tmpname}{INFO_NAME}"))?;
+        // Removing the now-empty holder dir can fail if a racing locker moved
+        // its own pending dir inside ours; breezy falls back to delete_tree
+        // there. We have no recursive-remove primitive on Transport yet, so we
+        // log and leave the stray dir rather than failing the unlock.
+        // TODO: add a Transport delete_tree and clean up the leftover dir.
+        if let Err(e) = self.transport.rmdir(&tmpname) {
+            log::warn!("error removing released lock dir {tmpname}: {e}");
+        }
         Ok(())
     }
 
@@ -371,5 +404,68 @@ mod tests {
         }
         let probe = LockDir::new(&t, "test_lock");
         assert_eq!(probe.peek().unwrap(), None);
+    }
+
+    /// A transport that delegates to an inner one but fails `rename` with a
+    /// non-contention error, to check that `attempt_lock` surfaces it rather
+    /// than masking it as `AlreadyHeld`.
+    struct RenameFails<'a>(&'a dyn Transport);
+
+    impl Transport for RenameFails<'_> {
+        fn get_bytes(&self, path: &str) -> Result<Vec<u8>, TransportError> {
+            self.0.get_bytes(path)
+        }
+        fn put_file_non_atomic(
+            &self,
+            path: &str,
+            bytes: &[u8],
+            create_parent_dir: bool,
+        ) -> Result<(), TransportError> {
+            self.0.put_file_non_atomic(path, bytes, create_parent_dir)
+        }
+        fn append_bytes(&self, path: &str, bytes: &[u8]) -> Result<u64, TransportError> {
+            self.0.append_bytes(path, bytes)
+        }
+        fn mkdir(&self, path: &str) -> Result<(), TransportError> {
+            self.0.mkdir(path)
+        }
+        fn has(&self, path: &str) -> Result<bool, TransportError> {
+            self.0.has(path)
+        }
+        fn iter_files_recursive(&self) -> Result<Vec<String>, TransportError> {
+            self.0.iter_files_recursive()
+        }
+        fn abspath(&self, path: &str) -> Result<String, TransportError> {
+            self.0.abspath(path)
+        }
+        fn delete(&self, path: &str) -> Result<(), TransportError> {
+            self.0.delete(path)
+        }
+        fn rmdir(&self, path: &str) -> Result<(), TransportError> {
+            self.0.rmdir(path)
+        }
+        fn rename(&self, _from: &str, _to: &str) -> Result<(), TransportError> {
+            Err(TransportError::Io {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: "denied".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn non_contention_rename_error_is_not_already_held() {
+        let (_dir, t) = temp_transport();
+        let probe = LockDir::new(&t, "test_lock");
+        probe.create().unwrap();
+
+        let failing = RenameFails(&t);
+        let mut lock = LockDir::new(&failing, "test_lock");
+        match lock.attempt_lock() {
+            Err(LockError::Transport(TransportError::Io { kind, .. })) => {
+                assert_eq!(kind, std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected the underlying transport error, got {other:?}"),
+        }
+        assert!(!lock.is_held());
     }
 }

@@ -405,8 +405,12 @@ impl Pack2aRepository {
             .revisions
             .keys()?
             .into_iter()
-            .filter_map(|k| k.segments().first().cloned())
-            .collect();
+            .map(|k| {
+                k.segments().first().cloned().ok_or_else(|| {
+                    RepositoryError::Corrupt("empty key in revisions index".to_string())
+                })
+            })
+            .collect::<Result<_, _>>()?;
         ids.sort();
         Ok(ids)
     }

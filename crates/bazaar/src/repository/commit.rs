@@ -166,7 +166,6 @@ impl<'a> CommitBuilder<'a> {
         F: FnMut(&str) -> Result<Vec<u8>, RepositoryError>,
     {
         let file_id = FileId::from(change.file_id.as_slice());
-        let name = change.new_name.clone().unwrap_or_default();
         let new_path = change.new_path.as_deref().unwrap_or("");
         let writes_text = change.content_change || change.basis_revision.is_none();
 
@@ -179,6 +178,12 @@ impl<'a> CommitBuilder<'a> {
             }
             return Ok(Entry::root(file_id, Some(revision.clone())));
         }
+
+        // A non-root entry must carry a name; a missing one is malformed
+        // input, not a default (mirroring the new_kind check above the call).
+        let name = change.new_name.clone().ok_or_else(|| {
+            RepositoryError::Corrupt(format!("change for {new_path} has no name"))
+        })?;
 
         let parent_id = FileId::from(
             change
