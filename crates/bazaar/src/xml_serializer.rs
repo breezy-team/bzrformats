@@ -1231,6 +1231,43 @@ impl InventorySerializer for CHKSerializer {
     }
 }
 
+/// The 2a (`hash-255-way` big-page) CHK inventory serializer as a zero-sized
+/// marker, so it can be named in a `const`/`static` context as a
+/// `&'static dyn InventorySerializer`. A [`CHKSerializer`] itself owns
+/// `Vec<u8>` fields and cannot be const-constructed; this delegates to a
+/// lazily built instance with the fixed 2a parameters.
+pub struct Chk255BigPageInventorySerializer;
+
+static CHK_255_BIG_PAGE: std::sync::LazyLock<CHKSerializer> = std::sync::LazyLock::new(|| {
+    CHKSerializer::new(b"10".to_vec(), 65536, b"hash-255-way".to_vec())
+});
+
+impl InventorySerializer for Chk255BigPageInventorySerializer {
+    fn format_num(&self) -> &[u8] {
+        CHK_255_BIG_PAGE.format_num()
+    }
+
+    fn support_altered_by_hack(&self) -> bool {
+        CHK_255_BIG_PAGE.support_altered_by_hack()
+    }
+
+    fn write_inventory_to_lines(
+        &self,
+        inv: &MutableInventory,
+        working: bool,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        CHK_255_BIG_PAGE.write_inventory_to_lines(inv, working)
+    }
+
+    fn read_inventory_from_lines(
+        &self,
+        lines: &[&[u8]],
+        revision_id: Option<RevisionId>,
+    ) -> Result<MutableInventory, Error> {
+        CHK_255_BIG_PAGE.read_inventory_from_lines(lines, revision_id)
+    }
+}
+
 /// File-id and revision-id tuples found in an inventory line.
 pub fn find_text_key_references<'a, I>(iter: I) -> Result<HashMap<(Vec<u8>, Vec<u8>), bool>, Error>
 where
@@ -1904,6 +1941,19 @@ mod tests {
 
         let s10 = CHKSerializer::new(b"10".to_vec(), 65536, b"hash-255-way".to_vec());
         assert_eq!(s10.format_num(), b"10");
+    }
+
+    #[test]
+    fn chk_255_big_page_marker_delegates_to_v10() {
+        let marker = Chk255BigPageInventorySerializer;
+        assert_eq!(marker.format_num(), b"10");
+        assert!(!marker.support_altered_by_hack());
+
+        let inv = chk_sample_inventory();
+        let out = marker.write_inventory_to_string(&inv, false).unwrap();
+        assert!(out.starts_with(b"<inventory format=\"10\" "));
+        let inv2 = marker.read_inventory_from_lines(&[&out], None).unwrap();
+        assert_eq!(inv, inv2);
     }
 
     #[test]

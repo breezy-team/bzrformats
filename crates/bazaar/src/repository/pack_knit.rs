@@ -21,7 +21,7 @@ use crate::knit::{
 use crate::pack_repo::{index_extension, IndexKind};
 use crate::transport::{SharedTransport, Transport};
 
-use super::format::{InventorySerializerKind, RepositoryFormat, StorageKind};
+use super::format::{RepositoryFormat, StorageKind};
 use super::pack_2a::RepositoryError;
 
 /// The pack name is used as the knit `FileRef`.
@@ -476,15 +476,7 @@ impl KnitPackRepository {
 
     /// The inventory serializer for this repository's format.
     fn inventory_serializer(&self) -> &'static dyn crate::serializer::InventorySerializer {
-        match self.format.inventory_serializer {
-            InventorySerializerKind::Xml5 => &crate::xml_serializer::XMLInventorySerializer5,
-            InventorySerializerKind::Xml6 => &crate::xml_serializer::XMLInventorySerializer6,
-            InventorySerializerKind::Xml7 => &crate::xml_serializer::XMLInventorySerializer7,
-            // Knit-pack never uses CHK; fall back to xml5 for completeness.
-            InventorySerializerKind::Chk255BigPage => {
-                &crate::xml_serializer::XMLInventorySerializer5
-            }
-        }
+        self.format.inventory_serializer
     }
 
     /// Read the inventory for a revision as an in-memory

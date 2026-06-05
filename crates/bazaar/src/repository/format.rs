@@ -12,6 +12,8 @@
 //! can do and which decoder family it belongs to; whether that decoder is
 //! actually implemented yet is a separate question ([`RepositoryFormat::is_supported`]).
 
+use crate::serializer::{InventorySerializer, RevisionSerializer};
+
 /// Which storage family a repository format belongs to. This selects the
 /// record codec and on-disk layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,33 +26,10 @@ pub enum StorageKind {
     GroupCompress,
 }
 
-/// Which revision serializer a format uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RevisionSerializerKind {
-    /// XML revision serializer, format 5.
-    Xml5,
-    /// Bencode revision serializer (2a).
-    Bencode,
-}
-
-/// Which inventory serializer a format uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InventorySerializerKind {
-    /// XML inventory serializer, format 5 (plain root).
-    Xml5,
-    /// XML inventory serializer, format 6 (rich root).
-    Xml6,
-    /// XML inventory serializer, format 7 (rich root + subtrees).
-    Xml7,
-    /// CHK inventory serializer (2a), `hash-255-way` big pages.
-    Chk255BigPage,
-}
-
 /// Static description of one repository format.
 ///
 /// Held by `&'static` reference everywhere; instances are created by
 /// [`declare_repository_format!`] and never mutated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepositoryFormat {
     /// The exact bytes of `.bzr/repository/format`.
     pub format_string: &'static [u8],
@@ -59,9 +38,9 @@ pub struct RepositoryFormat {
     /// The storage family (record codec + layout).
     pub storage: StorageKind,
     /// The revision serializer.
-    pub revision_serializer: RevisionSerializerKind,
+    pub revision_serializer: &'static dyn RevisionSerializer,
     /// The inventory serializer.
-    pub inventory_serializer: InventorySerializerKind,
+    pub inventory_serializer: &'static dyn InventorySerializer,
     /// Whether the root entry carries per-file version data (rich root).
     pub rich_root_data: bool,
     /// Whether content-hash-keyed (CHK) storage is used.
@@ -84,8 +63,8 @@ impl RepositoryFormat {
         format_string: b"",
         description: "",
         storage: StorageKind::GroupCompress,
-        revision_serializer: RevisionSerializerKind::Bencode,
-        inventory_serializer: InventorySerializerKind::Chk255BigPage,
+        revision_serializer: &crate::bencode_serializer::BEncodeRevisionSerializer1,
+        inventory_serializer: &crate::xml_serializer::Chk255BigPageInventorySerializer,
         rich_root_data: false,
         supports_chks: false,
         supports_tree_reference: false,
@@ -199,7 +178,7 @@ mod tests {
             .expect("knitpack 1 registered");
         assert_eq!(f.storage, StorageKind::KnitPack);
         assert!(!f.rich_root_data);
-        assert_eq!(f.inventory_serializer, InventorySerializerKind::Xml5);
+        assert_eq!(f.inventory_serializer.format_num(), b"5");
     }
 
     #[test]
@@ -207,7 +186,7 @@ mod tests {
         let f = find_format(b"Bazaar pack repository format 1 with rich root (needs bzr 1.0)\n")
             .expect("knitpack 4 registered");
         assert!(f.rich_root_data);
-        assert_eq!(f.inventory_serializer, InventorySerializerKind::Xml6);
+        assert_eq!(f.inventory_serializer.format_num(), b"6");
     }
 
     #[test]

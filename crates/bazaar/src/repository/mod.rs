@@ -16,10 +16,7 @@ mod pack_knit;
 mod tree;
 
 pub use commit::CommitBuilder;
-pub use format::{
-    all_formats, find_format, InventorySerializerKind, RepositoryFormat, RevisionSerializerKind,
-    StorageKind,
-};
+pub use format::{all_formats, find_format, RepositoryFormat, StorageKind};
 pub use pack_2a::{Pack2aRepository, RepositoryError, SharedTransport};
 pub use pack_knit::KnitPackRepository;
 pub use tree::RevisionTree;
