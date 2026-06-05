@@ -463,7 +463,11 @@ impl WorkingTree {
         while let Some(dir) = dirs.pop() {
             let names = match self.transport.list_dir(&dir) {
                 Ok(n) => n,
-                Err(_) => continue,
+                // A directory that vanished between being queued and listed
+                // (e.g. removed concurrently) is not an error; anything else
+                // (permission denied, I/O failure) must surface.
+                Err(TransportError::NoSuchFile(_)) => continue,
+                Err(e) => return Err(e.into()),
             };
             for name in names {
                 if dir.is_empty() && name == ".bzr" {
@@ -532,7 +536,11 @@ impl WorkingTree {
         // not yet exercised.
         let root_fid = FileId::from(live.root_id.as_slice());
         seen.insert(live.root_id.clone());
-        if basis.get_entry(&root_fid).is_none() {
+        if basis
+            .get_entry(&root_fid)
+            .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
+            .is_none()
+        {
             changes.push(WorkingTreeChange {
                 file_id: live.root_id.clone(),
                 old_path: None,
@@ -552,8 +560,12 @@ impl WorkingTree {
         for e in &live.entries {
             seen.insert(e.file_id.clone());
             let fid = FileId::from(e.file_id.as_slice());
-            let basis_entry = basis.get_entry(&fid);
-            let old_path = basis.id2path(&fid);
+            let basis_entry = basis
+                .get_entry(&fid)
+                .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?;
+            let old_path = basis
+                .id2path(&fid)
+                .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?;
             let basis_revision = basis_entry
                 .as_ref()
                 .and_then(|be| be.revision().map(|r| r.as_bytes().to_vec()));
@@ -601,7 +613,7 @@ impl WorkingTree {
             let moved = old_path.as_deref() != Some(e.path.as_str());
 
             if content_change || meta_change || moved {
-                let text_parents = self.text_parents_for(&fid, basis, other_parents);
+                let text_parents = self.text_parents_for(&fid, basis, other_parents)?;
                 changes.push(WorkingTreeChange {
                     file_id: e.file_id.clone(),
                     old_path,
@@ -626,12 +638,16 @@ impl WorkingTree {
             if seen.contains(fid.as_bytes()) {
                 continue;
             }
-            let old_path = match basis.id2path(&fid) {
+            let old_path = match basis
+                .id2path(&fid)
+                .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
+            {
                 Some(p) if !p.is_empty() => p, // skip the basis root
                 _ => continue,
             };
             let basis_revision = basis
                 .get_entry(&fid)
+                .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
                 .and_then(|be| be.revision().map(|r| r.as_bytes().to_vec()));
             changes.push(WorkingTreeChange {
                 file_id: fid.as_bytes().to_vec(),
@@ -658,17 +674,20 @@ impl WorkingTree {
         file_id: &crate::FileId,
         basis: &crate::repository::RevisionTree,
         other_parents: &[crate::repository::RevisionTree],
-    ) -> Vec<Vec<u8>> {
+    ) -> Result<Vec<Vec<u8>>, WorkingTreeError> {
         let mut parents = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for tree in std::iter::once(basis).chain(other_parents.iter()) {
-            if let Some(rev) = tree.get_file_revision(file_id) {
+            if let Some(rev) = tree
+                .get_file_revision(file_id)
+                .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
+            {
                 if seen.insert(rev.clone()) {
                     parents.push(rev);
                 }
             }
         }
-        parents
+        Ok(parents)
     }
 
     /// Whether `entry`'s on-disk content differs from its basis entry. A new
@@ -1050,7 +1069,10 @@ impl WorkingTree {
         // The root keeps its basis revision unless this is the first commit
         // (no basis root), in which case it is recorded at the new revision.
         let root_fid = FileId::from(live.root_id.as_slice());
-        let root_rev = match basis.get_file_revision(&root_fid) {
+        let root_rev = match basis
+            .get_file_revision(&root_fid)
+            .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
+        {
             Some(r) => crate::RevisionId::from(r.as_slice()),
             None => crate::RevisionId::from(revid),
         };
@@ -1068,7 +1090,9 @@ impl WorkingTree {
             let entry_rev = if new_rev_ids.contains(&e.file_id) {
                 crate::RevisionId::from(revid)
             } else {
-                match basis.get_file_revision(&fid) {
+                match basis.get_file_revision(&fid).map_err(|e| {
+                    WorkingTreeError::Commit(format!("reading basis inventory: {e:?}"))
+                })? {
                     Some(r) => crate::RevisionId::from(r.as_slice()),
                     None => crate::RevisionId::from(revid),
                 }
@@ -1091,7 +1115,9 @@ impl WorkingTree {
                         let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
                         (sha1, content.len() as u64)
                     } else {
-                        match basis.get_entry(&fid) {
+                        match basis.get_entry(&fid).map_err(|e| {
+                            WorkingTreeError::Commit(format!("reading basis inventory: {e:?}"))
+                        })? {
                             Some(be) => (
                                 be.text_sha1().map(|s| s.to_vec()).unwrap_or_default(),
                                 be.text_size().unwrap_or(0),

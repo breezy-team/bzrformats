@@ -313,6 +313,20 @@ mod tests {
     }
 
     #[test]
+    fn trait_id2path_absent_id_is_no_such_id_not_backend() {
+        // Through the read-only Inventory trait, a genuinely absent id must
+        // surface as NoSuchId so callers (e.g. RevisionTree) can treat it as
+        // "not in this tree" rather than a backend read failure.
+        let (inv, _store, _cache) = build_test_inv();
+        let err =
+            crate::inventory::Inventory::id2path(&inv, &FileId::from(&b"absent"[..])).unwrap_err();
+        match err {
+            crate::inventory::Error::NoSuchId(id) => assert_eq!(id.as_bytes(), b"absent"),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
     fn is_root_compares_against_root_id() {
         let (inv, _store, _cache) = build_test_inv();
         assert!(inv.is_root(&FileId::from(&b"root-id"[..])));
@@ -2105,8 +2119,8 @@ impl<S> crate::inventory::Inventory for CHKInventory<S>
 where
     S: crate::versionedfile::VersionedFiles + ?Sized,
 {
-    fn has_filename(&self, filename: &str) -> bool {
-        CHKInventory::has_filename(self, filename).unwrap_or(false)
+    fn has_filename(&self, filename: &str) -> Result<bool, crate::inventory::Error> {
+        CHKInventory::has_filename(self, filename).map_err(backend_err)
     }
 
     fn all_file_ids(&self) -> Result<Vec<crate::FileId>, crate::inventory::Error> {
@@ -2125,8 +2139,8 @@ where
         }
     }
 
-    fn has_id(&self, id: &crate::FileId) -> bool {
-        CHKInventory::has_id(self, id).unwrap_or(false)
+    fn has_id(&self, id: &crate::FileId) -> Result<bool, crate::inventory::Error> {
+        CHKInventory::has_id(self, id).map_err(backend_err)
     }
 
     fn entries(&self) -> Result<Vec<(String, Entry)>, crate::inventory::Error> {
@@ -2135,5 +2149,11 @@ where
 }
 
 fn backend_err(e: Error) -> crate::inventory::Error {
-    crate::inventory::Error::Backend(format!("{e:?}"))
+    match e {
+        // A genuinely absent id must stay distinguishable from a backend
+        // failure so callers can treat it as "not in this tree" rather than
+        // a read error.
+        Error::NoSuchId(id) => crate::inventory::Error::NoSuchId(id),
+        other => crate::inventory::Error::Backend(format!("{other:?}")),
+    }
 }

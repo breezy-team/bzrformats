@@ -440,10 +440,12 @@ impl KnitPackRepository {
     ) -> Result<crate::revision::Revision, RepositoryError> {
         use crate::serializer::RevisionSerializer;
         let key: KnitKey = vec![revision_id.to_vec()];
-        let bytes = self
-            .revisions
-            .get_text(&key)
-            .map_err(|_| RepositoryError::NoSuchRevision(revision_id.to_vec()))?;
+        let bytes = self.revisions.get_text(&key).map_err(|e| match e {
+            crate::knit::KnitError::RevisionNotPresent(_) => {
+                RepositoryError::NoSuchRevision(revision_id.to_vec())
+            }
+            other => RepositoryError::Corrupt(format!("revision {other}")),
+        })?;
         crate::xml_serializer::XMLRevisionSerializer5
             .read_revision_from_string(&bytes)
             .map_err(|e| RepositoryError::Corrupt(format!("revision parse: {e:?}")))
@@ -652,7 +654,8 @@ impl super::Repository for KnitPackRepository {
         let key: KnitKey = vec![revision_id.to_vec()];
         match self.signatures.get_text(&key) {
             Ok(bytes) => Ok(Some(bytes)),
-            Err(_) => Ok(None),
+            Err(crate::knit::KnitError::RevisionNotPresent(_)) => Ok(None),
+            Err(e) => Err(RepositoryError::Corrupt(format!("signature {e}"))),
         }
     }
 

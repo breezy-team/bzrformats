@@ -1187,8 +1187,10 @@ impl Inventory {
         Ok(self.0.is_root(file_id))
     }
 
-    fn has_filename(&self, name: &str) -> PyResult<bool> {
-        Ok(self.0.has_filename(name))
+    fn has_filename(&self, py: Python, name: &str) -> PyResult<bool> {
+        self.0
+            .has_filename(name)
+            .map_err(|e| inventory_err_to_py_err(e, py))
     }
 
     fn get_children<'py>(
@@ -1353,8 +1355,10 @@ impl Inventory {
         self.0.get_file_kind(&file_id).map(|kind| kind.as_str())
     }
 
-    fn has_id(&self, file_id: FileId) -> bool {
-        self.0.has_id(&file_id)
+    fn has_id(&self, py: Python, file_id: FileId) -> PyResult<bool> {
+        self.0
+            .has_id(&file_id)
+            .map_err(|e| inventory_err_to_py_err(e, py))
     }
 
     fn get_child<'py>(

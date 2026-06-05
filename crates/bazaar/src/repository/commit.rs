@@ -245,8 +245,7 @@ impl<'a> CommitBuilder<'a> {
                 }
                 // The symlink target is read from the working tree's file
                 // content path; record it on the entry.
-                let target = String::from_utf8_lossy(&get_file_text(new_path).unwrap_or_default())
-                    .into_owned();
+                let target = String::from_utf8_lossy(&get_file_text(new_path)?).into_owned();
                 Ok(Entry::link(
                     file_id,
                     name,

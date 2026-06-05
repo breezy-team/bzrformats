@@ -960,8 +960,11 @@ mod tests {
         let tree = repo.revision_tree(rev).unwrap();
         assert_eq!(tree.revision_id(), rev);
         let fid = crate::FileId::from(&b"file-1"[..]);
-        assert_eq!(tree.id2path(&fid).as_deref(), Some("a.txt"));
-        assert_eq!(tree.get_file_revision(&fid).as_deref(), Some(&rev[..]));
+        assert_eq!(tree.id2path(&fid).unwrap().as_deref(), Some("a.txt"));
+        assert_eq!(
+            tree.get_file_revision(&fid).unwrap().as_deref(),
+            Some(&rev[..])
+        );
 
         // The null revision is the empty tree.
         let empty = repo.revision_tree(crate::branch::NULL_REVISION).unwrap();

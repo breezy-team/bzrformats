@@ -543,8 +543,9 @@ pub fn find_interesting_parents<'a>(
 /// a lazy CHK inventory that reads entries from a store on demand. This is
 /// what a repository's `get_inventory` returns as `Box<dyn Inventory>`.
 pub trait Inventory {
-    /// Whether a path is versioned.
-    fn has_filename(&self, filename: &str) -> bool;
+    /// Whether a path is versioned. A backend read failure propagates rather
+    /// than reading as absent.
+    fn has_filename(&self, filename: &str) -> Result<bool, Error>;
 
     /// All file ids in the inventory.
     fn all_file_ids(&self) -> Result<Vec<FileId>, Error>;
@@ -555,8 +556,9 @@ pub trait Inventory {
     /// The entry for `file_id`, or `None` if absent.
     fn get_entry(&self, id: &FileId) -> Result<Option<Entry>, Error>;
 
-    /// Whether `file_id` is present.
-    fn has_id(&self, id: &FileId) -> bool;
+    /// Whether `file_id` is present. A backend read failure propagates rather
+    /// than reading as absent.
+    fn has_id(&self, id: &FileId) -> Result<bool, Error>;
 
     /// All entries as `(path, entry)` pairs in tree order, root omitted.
     fn entries(&self) -> Result<Vec<(String, Entry)>, Error>;
@@ -571,8 +573,8 @@ pub struct MutableInventory {
 }
 
 impl Inventory for MutableInventory {
-    fn has_filename(&self, filename: &str) -> bool {
-        self.path2id(filename).is_some()
+    fn has_filename(&self, filename: &str) -> Result<bool, Error> {
+        Ok(self.path2id(filename).is_some())
     }
 
     fn all_file_ids(&self) -> Result<Vec<FileId>, Error> {
@@ -593,8 +595,8 @@ impl Inventory for MutableInventory {
         Ok(self.by_id.get(id).cloned())
     }
 
-    fn has_id(&self, id: &FileId) -> bool {
-        self.by_id.contains_key(id)
+    fn has_id(&self, id: &FileId) -> Result<bool, Error> {
+        Ok(self.by_id.contains_key(id))
     }
 
     fn entries(&self) -> Result<Vec<(String, Entry)>, Error> {
