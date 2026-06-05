@@ -432,6 +432,8 @@ def load_tests(loader, basic_tests, pattern):
         "test_pack",
         "test_rio",
         "test_serializer",
+        "test_testament",
+        "test_textinv",
         "test_tuned_gzip",
         "test_versionedfile",
         "test_weave",
