@@ -401,6 +401,12 @@ impl<W: std::io::Write> ContainerWriter<W> {
     pub fn into_inner(self) -> W {
         self.out
     }
+
+    /// Mutable access to the underlying writer, for callers that hold the
+    /// `ContainerWriter` behind a lock and cannot consume it.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.out
+    }
 }
 
 /// Read one `\n`-terminated line from `reader`. Returns the bytes without
@@ -514,6 +520,26 @@ impl<'a, R: std::io::BufRead> BytesRecordReader<'a, R> {
         }
         self.drain()
     }
+}
+
+/// Read the body of a single Bytes record from `data`, which must begin
+/// at the record's `B` type byte (i.e. partway through a container, not at
+/// the format header).
+///
+/// This is the random-access read a pack repository does: an index gives
+/// the `(offset, length)` of one record inside a `.pack`, and the caller
+/// needs the record body (e.g. a groupcompress block) without streaming
+/// the whole container. Returns the body bytes; the record's names are
+/// discarded (groupcompress records are unnamed).
+pub fn read_bytes_record_body(data: &[u8]) -> Result<Vec<u8>, ReadError> {
+    let mut cursor = std::io::Cursor::new(data);
+    match read_byte(&mut cursor)? {
+        Some(b'B') => {}
+        Some(other) => return Err(PackError::UnknownRecordType(other).into()),
+        None => return Err(ReadError::UnexpectedEof),
+    }
+    let mut reader = BytesRecordReader::read_prelude(&mut cursor)?;
+    reader.read_content(None)
 }
 
 /// One entry from [`ContainerReader::iter_records`]: either a Bytes record

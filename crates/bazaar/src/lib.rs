@@ -6,9 +6,12 @@ pub const DEFAULT_CHUNK_SIZE: usize = 4096;
 
 pub mod bencode_serializer;
 pub mod bisect_multi;
+pub mod branch;
 pub mod btree_builder;
+pub mod btree_graph_index;
 pub mod btree_index;
 pub mod btree_serializer;
+pub mod bzrdir;
 pub mod chk_inventory;
 pub mod chk_map;
 pub mod chunk_writer;
@@ -24,6 +27,7 @@ pub mod inventory_delta;
 pub mod key_mapper;
 pub mod knit;
 pub mod lock;
+pub mod lockdir;
 pub mod lru_cache;
 pub mod multiparent;
 pub mod osutils;
@@ -43,6 +47,7 @@ pub mod transport;
 pub mod tuned_gzip;
 pub mod versionedfile;
 pub mod weave;
+pub mod workingtree;
 pub mod xml_serializer;
 
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

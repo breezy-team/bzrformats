@@ -15,6 +15,7 @@ mod btree_index;
 mod btree_serializer;
 mod chk_map;
 mod chunk_writer;
+mod controldir;
 mod dirstate;
 mod dirstate_helpers;
 mod errors;
@@ -1277,6 +1278,9 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let textinvm = textinv::_textinv_rs(py)?;
     m.add_submodule(&textinvm)?;
 
+    let controldirm = controldir::_controldir_rs(py)?;
+    m.add_submodule(&controldirm)?;
+
     let multiparentm = multiparent::_multiparent_rs(py)?;
     m.add_submodule(&multiparentm)?;
 
@@ -1349,6 +1353,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     modules.set_item(format!("{}.textmerge", module_name), &textmergem)?;
     modules.set_item(format!("{}.testament", module_name), &testamentm)?;
     modules.set_item(format!("{}.textinv", module_name), &textinvm)?;
+    modules.set_item(format!("{}.controldir", module_name), &controldirm)?;
     modules.set_item(format!("{}.multiparent", module_name), &multiparentm)?;
     modules.set_item(format!("{}.weave", module_name), &weavem)?;
     modules.set_item(format!("{}.weavefile", module_name), &weavefilem)?;

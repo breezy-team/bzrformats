@@ -164,6 +164,46 @@ pub fn rand_chars(num: usize) -> String {
     s
 }
 
+/// Return the local hostname.
+pub fn get_host_name() -> std::io::Result<String> {
+    hostname::get().map(|h| h.to_string_lossy().to_string())
+}
+
+/// Return the current user's login name.
+///
+/// Honours the usual environment overrides before falling back to the
+/// system account database.
+pub fn get_user_name() -> String {
+    for name in &["LOGNAME", "USER", "LNAME", "USERNAME"] {
+        if let Ok(user) = std::env::var(name) {
+            return user;
+        }
+    }
+    whoami::username()
+}
+
+/// Whether a local process is known to be dead.
+///
+/// Returns false when the process is alive or when we cannot tell (for
+/// example a process owned by another user, or any error other than a
+/// clear "no such process").
+#[cfg(unix)]
+pub fn is_local_pid_dead(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(_) => false,
+        Err(nix::errno::Errno::ESRCH) => true,
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+pub fn is_local_pid_dead(_pid: u32) -> bool {
+    false
+}
+
 pub fn contains_whitespace(s: &str) -> bool {
     let ws = " \t\n\r\u{000B}\u{000C}";
     for ch in ws.chars() {

@@ -290,6 +290,31 @@ impl std::fmt::Display for SplitRootError {
     }
 }
 
+/// Error returned by [`super::DirState::load_bytes`] when a dirstate file
+/// cannot be read: a bad header, malformed dirblock rows, or an
+/// unexpected root-block shape.
+#[derive(Debug)]
+pub enum LoadError {
+    /// The header (format line, parents, ghosts, entry count) was invalid.
+    Header(super::HeaderError),
+    /// The dirblock rows could not be parsed.
+    Dirblocks(super::DirblocksError),
+    /// The parsed dirblocks did not have the expected root-block shape.
+    SplitRoot(SplitRootError),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Header(e) => write!(f, "dirstate header: {e}"),
+            LoadError::Dirblocks(e) => write!(f, "dirstate dirblocks: {e}"),
+            LoadError::SplitRoot(e) => write!(f, "dirstate root block: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
 impl std::error::Error for SplitRootError {}
 
 /// Error returned by [`super::DirState::update_entry`].

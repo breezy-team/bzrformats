@@ -180,6 +180,252 @@ pub trait Transport {
     /// messages and reload-tracking; implementations are free to
     /// return any stable string.
     fn abspath(&self, path: &str) -> Result<String, TransportError>;
+
+    /// Rename `from` to `to`. For the lockdir protocol this must fail
+    /// (rather than overwrite) when `to` already exists, so that the
+    /// atomic "claim the lock by renaming into place" step is reliable.
+    ///
+    /// The default returns [`TransportError::Other`]; backends that
+    /// support renaming must override it.
+    fn rename(&self, from: &str, to: &str) -> Result<(), TransportError> {
+        let _ = (from, to);
+        Err(TransportError::Other(
+            "rename not supported by this transport".to_string(),
+        ))
+    }
+
+    /// Delete the file at `path`.
+    fn delete(&self, path: &str) -> Result<(), TransportError> {
+        let _ = path;
+        Err(TransportError::Other(
+            "delete not supported by this transport".to_string(),
+        ))
+    }
+
+    /// Remove the (empty) directory at `path`.
+    fn rmdir(&self, path: &str) -> Result<(), TransportError> {
+        let _ = path;
+        Err(TransportError::Other(
+            "rmdir not supported by this transport".to_string(),
+        ))
+    }
+
+    /// List the immediate entries of directory `path`, returning their
+    /// names (not full paths) in unspecified order.
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, TransportError> {
+        let _ = path;
+        Err(TransportError::Other(
+            "list_dir not supported by this transport".to_string(),
+        ))
+    }
+
+    /// Return metadata about `path`.
+    fn stat(&self, path: &str) -> Result<Stat, TransportError> {
+        let _ = path;
+        Err(TransportError::Other(
+            "stat not supported by this transport".to_string(),
+        ))
+    }
+
+    /// Return a new transport rooted at `path` relative to this one.
+    ///
+    /// Used to descend from a `.bzr` directory into its `repository`,
+    /// `branch` and `checkout` components. The default returns
+    /// [`TransportError::Other`]; backends that can be re-rooted (e.g.
+    /// [`LocalTransport`]) override it.
+    fn subtransport(&self, path: &str) -> Result<SharedTransport, TransportError> {
+        let _ = path;
+        Err(TransportError::Other(
+            "subtransport not supported by this transport".to_string(),
+        ))
+    }
+
+    /// The local filesystem path of `path` relative to this transport, when
+    /// the transport is backed by the local filesystem.
+    ///
+    /// Returns `None` for non-local backends. Used by operations that need
+    /// a real OS path (e.g. taking an fcntl lock to rewrite the dirstate).
+    fn local_path(&self, path: &str) -> Option<std::path::PathBuf> {
+        let _ = path;
+        None
+    }
+}
+
+/// A transport shared across the opener objects (`BzrDir`, `Branch`,
+/// `Repository`, `WorkingTree`).
+///
+/// They own their transport via this `Arc` rather than borrowing it, so a
+/// `BzrDir` can hand out sub-objects that outlive it, and the 2a
+/// repository's CHK store (which needs `Arc<S>` with `S: Send + Sync`) is
+/// satisfiable. `Send + Sync` is required because the groupcompress stores
+/// implement the `Send + Sync` `VersionedFiles` trait.
+pub type SharedTransport = std::sync::Arc<dyn Transport + Send + Sync>;
+
+/// Minimal file metadata returned by [`Transport::stat`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stat {
+    /// Size in bytes (0 for directories).
+    pub size: u64,
+    /// Whether the entry is a directory.
+    pub is_dir: bool,
+}
+
+/// A [`Transport`] rooted at a local filesystem directory.
+///
+/// All `path` arguments are interpreted relative to [`root`](LocalTransport::root)
+/// and joined onto it; the transport does not guard against `..`
+/// escaping the root, matching the trust model of the rest of the
+/// format code (callers pass paths they constructed themselves).
+pub struct LocalTransport {
+    root: std::path::PathBuf,
+}
+
+impl LocalTransport {
+    /// Create a transport rooted at `root`.
+    pub fn new<P: Into<std::path::PathBuf>>(root: P) -> Self {
+        LocalTransport { root: root.into() }
+    }
+
+    /// The directory this transport is rooted at.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    fn resolve(&self, path: &str) -> std::path::PathBuf {
+        self.root.join(path)
+    }
+}
+
+impl Transport for LocalTransport {
+    fn get_bytes(&self, path: &str) -> Result<Vec<u8>, TransportError> {
+        Ok(std::fs::read(self.resolve(path))?)
+    }
+
+    fn put_file_non_atomic(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        create_parent_dir: bool,
+    ) -> Result<(), TransportError> {
+        let full = self.resolve(path);
+        if create_parent_dir {
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(full, bytes)?;
+        Ok(())
+    }
+
+    fn put_bytes(&self, path: &str, bytes: &[u8], mode: Option<u32>) -> Result<(), TransportError> {
+        // Atomic via write-to-temp-then-rename within the same directory.
+        let _ = mode;
+        let full = self.resolve(path);
+        let parent = full.parent().ok_or_else(|| {
+            TransportError::Other(format!("path has no parent directory: {path}"))
+        })?;
+        let tmp = parent.join(format!(".{}.tmp", crate::osutils::rand_chars(16)));
+        std::fs::write(&tmp, bytes)?;
+        if let Err(e) = std::fs::rename(&tmp, &full) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    fn append_bytes(&self, path: &str, bytes: &[u8]) -> Result<u64, TransportError> {
+        use std::io::{Seek, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.resolve(path))?;
+        let offset = f.seek(std::io::SeekFrom::End(0))?;
+        f.write_all(bytes)?;
+        Ok(offset)
+    }
+
+    fn mkdir(&self, path: &str) -> Result<(), TransportError> {
+        match std::fs::create_dir(self.resolve(path)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn has(&self, path: &str) -> Result<bool, TransportError> {
+        Ok(self.resolve(path).exists())
+    }
+
+    fn iter_files_recursive(&self) -> Result<Vec<String>, TransportError> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if let Ok(rel) = p.strip_prefix(&self.root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn abspath(&self, path: &str) -> Result<String, TransportError> {
+        Ok(self.resolve(path).to_string_lossy().into_owned())
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), TransportError> {
+        let to_path = self.resolve(to);
+        // bzr's lockdir relies on rename failing when the target exists
+        // (so two contenders can't both "win" the lock). std::fs::rename
+        // would silently overwrite an empty target dir on some platforms,
+        // so reject an existing target explicitly.
+        if to_path.exists() {
+            return Err(TransportError::Io {
+                kind: std::io::ErrorKind::AlreadyExists,
+                message: format!("rename target already exists: {to}"),
+            });
+        }
+        std::fs::rename(self.resolve(from), to_path)?;
+        Ok(())
+    }
+
+    fn delete(&self, path: &str) -> Result<(), TransportError> {
+        std::fs::remove_file(self.resolve(path))?;
+        Ok(())
+    }
+
+    fn rmdir(&self, path: &str) -> Result<(), TransportError> {
+        std::fs::remove_dir(self.resolve(path))?;
+        Ok(())
+    }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, TransportError> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(self.resolve(path))? {
+            out.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        Ok(out)
+    }
+
+    fn stat(&self, path: &str) -> Result<Stat, TransportError> {
+        let meta = std::fs::metadata(self.resolve(path))?;
+        Ok(Stat {
+            size: meta.len(),
+            is_dir: meta.is_dir(),
+        })
+    }
+
+    fn subtransport(&self, path: &str) -> Result<SharedTransport, TransportError> {
+        Ok(std::sync::Arc::new(LocalTransport::new(self.resolve(path))))
+    }
+
+    fn local_path(&self, path: &str) -> Option<std::path::PathBuf> {
+        Some(self.resolve(path))
+    }
 }
 
 #[cfg(test)]

@@ -22,7 +22,10 @@ fn unescape(s: &str) -> PyResult<String> {
 /// files. `file_id`, `parent_id`, `text_id` and `text_sha1` are bytes;
 /// `name` and `kind` are str; `text_size` is an int.
 #[pyfunction]
-fn write_text_inventory<'py>(py: Python<'py>, entries: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+fn write_text_inventory<'py>(
+    py: Python<'py>,
+    entries: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyBytes>> {
     let mut parsed = Vec::new();
     for item in entries.try_iter()? {
         let t = item?;

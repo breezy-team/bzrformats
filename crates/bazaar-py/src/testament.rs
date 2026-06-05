@@ -96,7 +96,10 @@ impl Testament {
 
     /// The full testament text in the given format.
     fn as_text<'py>(&self, py: Python<'py>, format: &str) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self.inner.as_text(format_from_str(format)?).map_err(err_to_py)?;
+        let bytes = self
+            .inner
+            .as_text(format_from_str(format)?)
+            .map_err(err_to_py)?;
         Ok(PyBytes::new(py, &bytes))
     }
 
@@ -111,7 +114,10 @@ impl Testament {
 
     /// The hex sha1 of the full testament.
     fn as_sha1<'py>(&self, py: Python<'py>, format: &str) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self.inner.as_sha1(format_from_str(format)?).map_err(err_to_py)?;
+        let bytes = self
+            .inner
+            .as_sha1(format_from_str(format)?)
+            .map_err(err_to_py)?;
         Ok(PyBytes::new(py, &bytes))
     }
 }
