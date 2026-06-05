@@ -19,6 +19,7 @@
 import os
 
 from .. import controldir
+from ..errors import BzrFormatsError
 from . import TestCaseInTempDir
 
 
@@ -69,12 +70,10 @@ class TestControlDir(TestCaseInTempDir):
         branch = cd.open_branch()
         branch.set_tags({"v1.0": b"some-rev", "v2.0": b"other-rev"})
         reopened = controldir.open(self.test_dir).open_branch()
-        self.assertEqual(
-            reopened.tags(), {"v1.0": b"some-rev", "v2.0": b"other-rev"}
-        )
+        self.assertEqual(reopened.tags(), {"v1.0": b"some-rev", "v2.0": b"other-rev"})
 
     def test_open_missing_raises(self):
         # An empty directory is not a control directory.
         empty = os.path.join(self.test_dir, "empty")
         os.makedirs(empty)
-        self.assertRaises(Exception, controldir.open, empty)
+        self.assertRaises(BzrFormatsError, controldir.open, empty)
