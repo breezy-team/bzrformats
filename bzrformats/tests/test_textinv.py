@@ -36,7 +36,15 @@ class TestTextInv(TestCase):
         out = textinv.write_text_inventory(
             [
                 (b"dir-id", "a dir", "directory", b"TREE_ROOT"),
-                (b"file-id", "hello.txt", "file", b"dir-id", b"hello-text", b"deadbeef", 12),
+                (
+                    b"file-id",
+                    "hello.txt",
+                    "file",
+                    b"dir-id",
+                    b"hello-text",
+                    b"deadbeef",
+                    12,
+                ),
             ]
         )
         self.assertEqual(

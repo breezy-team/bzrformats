@@ -20,9 +20,23 @@ from ..testament import Testament
 from . import TestCase
 
 REV_2_ENTRIES = [
-    ("hello", "file", b"hello-id", b"34dd0ac19a24bf80c4d33b5c8960196e8d8d1f73", b"test@user-2", True),
+    (
+        "hello",
+        "file",
+        b"hello-id",
+        b"34dd0ac19a24bf80c4d33b5c8960196e8d8d1f73",
+        b"test@user-2",
+        True,
+    ),
     ("src", "directory", b"src-id", b"", b"test@user-2", False),
-    ("src/foo.c", "file", b"foo.c-id", b"a2a049c20f908ae31b231d98779eb63c66448f24", b"test@user-2", False),
+    (
+        "src/foo.c",
+        "file",
+        b"foo.c-id",
+        b"a2a049c20f908ae31b231d98779eb63c66448f24",
+        b"test@user-2",
+        False,
+    ),
 ]
 
 
