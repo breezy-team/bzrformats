@@ -97,11 +97,13 @@ class TestControlDir(TestCaseInTempDir):
             f.write(b"hi\n")
         wt = cd.open_workingtree()
         wt.add("a.txt", "file")
-        wt.commit(cd.open_repository(), cd.open_branch(), "T <t@e>", "first", 1577880000, 0)
+        wt.commit(
+            cd.open_repository(), cd.open_branch(), "T <t@e>", "first", 1577880000, 0
+        )
         # A second commit with nothing changed is refused.
         wt2 = controldir.open(self.test_dir).open_workingtree()
         self.assertRaises(
-            Exception,
+            BzrFormatsError,
             wt2.commit,
             cd.open_repository(),
             cd.open_branch(),
@@ -121,7 +123,7 @@ class TestControlDir(TestCaseInTempDir):
         wt.add("a.txt", "file")
         self.assertEqual(wt.unknowns(), ["loose.txt"])
         self.assertRaises(
-            Exception,
+            BzrFormatsError,
             wt.commit,
             cd.open_repository(),
             cd.open_branch(),
