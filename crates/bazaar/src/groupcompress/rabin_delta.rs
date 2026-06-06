@@ -177,37 +177,33 @@ impl RabinWindow {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DeltaIndex<'a> {
-    entries: HashMap<u32, Vec<IndexEntry<'a>>>,
+/// A persistent index over one or more source buffers.
+///
+/// The index keeps every indexed source byte in a single owned `buffer`
+/// laid out at its absolute offset in the logical concatenated chunk
+/// stream (mini-header bytes between sources become never-indexed gaps).
+/// Hash entries therefore only need to store that absolute offset: the
+/// content slice for an entry is `&buffer[offset..]`. This lets sources be
+/// added incrementally with `add_fulltext`/`add_delta` and keeps
+/// `make_delta` linear in the target size instead of rebuilding the whole
+/// index on every call.
+#[derive(Debug, Clone, Default)]
+pub struct DeltaIndex {
+    entries: HashMap<u32, Vec<IndexEntry>>,
+    /// Concatenated source bytes positioned at their absolute stream
+    /// offset. Always the same length as `last_offset`.
+    buffer: Vec<u8>,
     last_offset: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct IndexEntry<'a> {
-    /// Absolute offset
+pub struct IndexEntry {
+    /// Absolute offset into the logical chunk stream (and into `buffer`).
     pub offset: usize,
-
-    pub data: &'a [u8],
 }
 
-impl IndexEntry<'_> {
-    pub fn add(&self, offset: usize) -> Self {
-        Self {
-            offset: self.offset + offset,
-            data: &self.data[offset..],
-        }
-    }
-}
-
-impl Default for DeltaIndex<'_> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<'a> DeltaIndex<'a> {
-    pub fn iter_matches(&self, val: &RabinHash) -> impl Iterator<Item = &IndexEntry<'a>> + '_ {
+impl DeltaIndex {
+    fn iter_matches(&self, val: &RabinHash) -> impl Iterator<Item = &IndexEntry> + '_ {
         self.entries
             .get(&val.finish())
             .into_iter()
@@ -220,16 +216,16 @@ impl<'a> DeltaIndex<'a> {
         data: &[u8],
         mut min_size: usize,
         good_enough_size: Option<usize>,
-    ) -> Option<(IndexEntry<'a>, usize)> {
+    ) -> Option<(IndexEntry, usize)> {
         let mut msource = None;
 
         for entry in self.iter_matches(&hash) {
-            if entry.data.len() <= min_size {
+            let entry_data = &self.buffer[entry.offset..];
+            if entry_data.len() <= min_size {
                 // no point in checking this one
                 continue;
             }
-            let overlap = entry
-                .data
+            let overlap = entry_data
                 .iter()
                 .zip(data.iter())
                 .take_while(|(x, y)| x == y)
@@ -251,13 +247,18 @@ impl<'a> DeltaIndex<'a> {
     }
 
     pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            last_offset: 0,
-        }
+        Self::default()
     }
 
-    pub fn add_delta(&mut self, delta: &'a [u8], unused_bytes: usize) -> std::io::Result<()> {
+    /// Reserve `unused_bytes` of header gap then append `content` to the
+    /// owned buffer so it sits at its absolute stream offset.
+    fn append_to_buffer(&mut self, unused_bytes: usize, content: &[u8]) {
+        self.buffer.resize(self.buffer.len() + unused_bytes, 0);
+        self.buffer.extend_from_slice(content);
+    }
+
+    pub fn add_delta(&mut self, delta: &[u8], unused_bytes: usize) -> std::io::Result<()> {
+        self.append_to_buffer(unused_bytes, delta);
         self.last_offset += unused_bytes;
         let original_len = delta.len();
         let mut remaining = delta;
@@ -282,9 +283,8 @@ impl<'a> DeltaIndex<'a> {
                         self.entries
                             .entry(val.into())
                             .or_default()
-                            .push(IndexEntry::<'a> {
+                            .push(IndexEntry {
                                 offset: data_offset + i,
-                                data: &data[i..],
                             })
                     }
                 }
@@ -292,6 +292,7 @@ impl<'a> DeltaIndex<'a> {
             pos = newpos;
         }
         self.last_offset += original_len;
+        debug_assert_eq!(self.buffer.len(), self.last_offset);
         Ok(())
     }
 
@@ -305,10 +306,11 @@ impl<'a> DeltaIndex<'a> {
     //      and you are willing to trade match accuracy for peak memory.
     pub fn add_fulltext(
         &mut self,
-        src: &'a [u8],
+        src: &[u8],
         unused_bytes: usize,
         max_bytes_to_index: Option<usize>,
     ) {
+        self.append_to_buffer(unused_bytes, src);
         self.last_offset += unused_bytes;
 
         let stride = if let Some(max_bytes_to_index) = max_bytes_to_index {
@@ -327,19 +329,19 @@ impl<'a> DeltaIndex<'a> {
                 self.entries
                     .entry(val.into())
                     .or_default()
-                    .push(IndexEntry::<'a> {
+                    .push(IndexEntry {
                         offset: self.last_offset + i,
-                        data: &src[i..],
                     })
             }
         }
 
         self.last_offset += src.len();
+        debug_assert_eq!(self.buffer.len(), self.last_offset);
     }
 }
 
 pub fn iter_delta_instructions<'a>(
-    index: &'a DeltaIndex<'a>,
+    index: &'a DeltaIndex,
     target: &'a [u8],
 ) -> impl Iterator<Item = Instruction<&'a [u8]>> + 'a {
     // Position in target we're currently scanning
@@ -409,7 +411,7 @@ pub fn iter_delta_instructions<'a>(
 
 pub fn create_delta<'a, W: Write>(
     mut writer: W,
-    index: &DeltaIndex<'a>,
+    index: &'a DeltaIndex,
     target: &'a [u8],
     max_delta_size: Option<usize>,
 ) -> Result<(), DeltaError> {
@@ -449,25 +451,21 @@ pub fn make_delta(source_bytes: &[u8], target_bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-#[derive(Clone)]
-enum SourceKind {
-    Fulltext { unadded_bytes: usize },
-    Delta { unadded_bytes: usize },
-}
-
-/// A `DeltaIndex` that owns its source buffers across calls.
+/// A `DeltaIndex` that owns its source buffers and indexes them
+/// incrementally.
 ///
-/// The underlying `DeltaIndex<'a>` borrows from source slices, which makes it
-/// awkward to reuse an instance when new sources are added. `OwningDeltaIndex`
-/// sidesteps this by storing sources as owned `Vec<u8>` and rebuilding a fresh
-/// `DeltaIndex` for every `make_delta` call. No unsafe, no self-referential
-/// borrows — the name refers to retaining the source buffers, not to lifetime
-/// trickery.
+/// Each `add_source`/`add_delta_source` call folds the new source into a
+/// single persistent [`DeltaIndex`], so `make_delta` only has to scan the
+/// target against the already-built index. This is what keeps group
+/// compression linear in the total source size — rebuilding the index on
+/// every `make_delta` call made it quadratic. The retained source `Vec`s
+/// are kept only so callers can read them back (e.g. the PyO3 `_sources`
+/// accessor); the index itself owns the bytes it needs.
 pub struct OwningDeltaIndex {
     sources: Vec<Vec<u8>>,
     source_offset: usize,
     max_bytes_to_index: Option<usize>,
-    source_kinds: Vec<SourceKind>,
+    index: DeltaIndex,
 }
 
 impl OwningDeltaIndex {
@@ -476,7 +474,7 @@ impl OwningDeltaIndex {
             sources: Vec::new(),
             source_offset: 0,
             max_bytes_to_index,
-            source_kinds: Vec::new(),
+            index: DeltaIndex::new(),
         }
     }
 
@@ -511,15 +509,17 @@ impl OwningDeltaIndex {
     pub fn add_source(&mut self, source: Vec<u8>, unadded_bytes: usize) {
         self.source_offset += unadded_bytes;
         self.source_offset += source.len();
-        self.source_kinds
-            .push(SourceKind::Fulltext { unadded_bytes });
+        self.index
+            .add_fulltext(&source, unadded_bytes, self.max_bytes_to_index);
         self.sources.push(source);
     }
 
     pub fn add_delta_source(&mut self, delta: Vec<u8>, unadded_bytes: usize) -> Result<(), String> {
         self.source_offset += unadded_bytes;
         self.source_offset += delta.len();
-        self.source_kinds.push(SourceKind::Delta { unadded_bytes });
+        self.index
+            .add_delta(&delta, unadded_bytes)
+            .map_err(|e| e.to_string())?;
         self.sources.push(delta);
         Ok(())
     }
@@ -533,21 +533,6 @@ impl OwningDeltaIndex {
             return Ok(None);
         }
 
-        // Build a fresh index from all sources.
-        let mut index = DeltaIndex::new();
-        for (i, source) in self.sources.iter().enumerate() {
-            match &self.source_kinds[i] {
-                SourceKind::Fulltext { unadded_bytes } => {
-                    index.add_fulltext(source, *unadded_bytes, self.max_bytes_to_index);
-                }
-                SourceKind::Delta { unadded_bytes } => {
-                    index
-                        .add_delta(source, *unadded_bytes)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-        }
-
         let max_delta_size = if max_delta_size == 0 {
             None
         } else {
@@ -555,7 +540,7 @@ impl OwningDeltaIndex {
         };
 
         let mut out = Vec::new();
-        match create_delta(&mut out, &index, target, max_delta_size) {
+        match create_delta(&mut out, &self.index, target, max_delta_size) {
             Ok(()) => Ok(Some(out)),
             Err(DeltaError::DeltaTooLarge) => Ok(None),
             Err(e) => Err(e.to_string()),
