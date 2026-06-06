@@ -562,6 +562,10 @@ pub trait Inventory {
 
     /// All entries as `(path, entry)` pairs in tree order, root omitted.
     fn entries(&self) -> Result<Vec<(String, Entry)>, Error>;
+
+    /// The root entry, or `None` for an empty inventory. (`entries` omits the
+    /// root, so callers rebuilding a full inventory need this separately.)
+    fn root_entry(&self) -> Result<Option<Entry>, Error>;
 }
 
 #[derive(Clone)]
@@ -604,6 +608,10 @@ impl Inventory for MutableInventory {
             .into_iter()
             .map(|(p, e)| (p, e.clone()))
             .collect())
+    }
+
+    fn root_entry(&self) -> Result<Option<Entry>, Error> {
+        Ok(self.root().cloned())
     }
 }
 

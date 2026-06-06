@@ -9,17 +9,28 @@
 
 mod commit;
 pub mod format;
-mod formats;
+#[cfg(feature = "knit")]
+mod knit_repo;
 mod pack_2a;
 mod pack_2a_writer;
+#[cfg(feature = "knitpack")]
+mod pack_index;
+#[cfg(feature = "knitpack")]
 mod pack_knit;
 mod tree;
+#[cfg(feature = "weave")]
+mod weave_repo;
 
 pub use commit::CommitBuilder;
 pub use format::{all_formats, find_format, RepositoryFormat};
+#[cfg(feature = "knit")]
+pub use knit_repo::KnitRepository;
 pub use pack_2a::{Pack2aRepository, RepositoryError, SharedTransport};
+#[cfg(feature = "knitpack")]
 pub use pack_knit::KnitPackRepository;
 pub use tree::RevisionTree;
+#[cfg(feature = "weave")]
+pub use weave_repo::WeaveRepository;
 
 use crate::inventory::Inventory;
 

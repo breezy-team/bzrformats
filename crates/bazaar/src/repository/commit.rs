@@ -169,10 +169,13 @@ impl<'a> CommitBuilder<'a> {
         let new_path = change.new_path.as_deref().unwrap_or("");
         let writes_text = change.content_change || change.basis_revision.is_none();
 
-        // The tree root (empty path, no parent): record its empty text and a
-        // root inventory entry.
+        // The tree root (empty path, no parent): record the root inventory
+        // entry. Its empty per-file text is written only for a rich-root
+        // repository; non-rich-root formats do not version the root (breezy's
+        // record_iter_changes writes the root text only when the path is
+        // non-empty or the repository supports rich roots).
         if new_path.is_empty() && change.new_parent_id.is_none() {
-            if writes_text {
+            if writes_text && self.repository.format().rich_root_data {
                 self.repository
                     .add_text(&change.file_id, &self.new_revision_id, &[], b"")?;
             }

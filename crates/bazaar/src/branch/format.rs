@@ -17,6 +17,9 @@ pub struct BranchFormat {
     pub supports_stacking: bool,
     /// Whether the format records reference locations (format 8).
     pub supports_reference_locations: bool,
+    /// Whether the tip is stored as a full `revision-history` list (format 5)
+    /// rather than a `last-revision` `<revno> <revision_id>` line (6/7/8).
+    pub full_history: bool,
     /// Whether this crate can currently open branches of this format.
     pub supported: bool,
     /// Whether the format is deprecated.
@@ -34,6 +37,7 @@ impl BranchFormat {
         supports_tags: false,
         supports_stacking: false,
         supports_reference_locations: false,
+        full_history: false,
         supported: false,
         deprecated: false,
         is_reference: false,

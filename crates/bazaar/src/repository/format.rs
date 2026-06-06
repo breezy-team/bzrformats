@@ -31,6 +31,22 @@ pub fn open_unsupported(
     Err(RepositoryError::UnsupportedFormat("unsupported format"))
 }
 
+/// Creates an empty repository of `format` rooted at `transport`
+/// (`.bzr/repository`), returning an abstract [`Repository`]. Like [`OpenFn`],
+/// each format carries one so creation dispatches through the format itself;
+/// the format is passed in because creation writes its marker.
+pub type CreateFn =
+    fn(&'static RepositoryFormat, SharedTransport) -> Result<Box<dyn Repository>, RepositoryError>;
+
+/// A [`CreateFn`] for formats this crate cannot create yet, reporting the
+/// format as unsupported.
+pub fn create_unsupported(
+    _format: &'static RepositoryFormat,
+    _transport: SharedTransport,
+) -> Result<Box<dyn Repository>, RepositoryError> {
+    Err(RepositoryError::UnsupportedFormat("unsupported format"))
+}
+
 /// Static description of one repository format.
 ///
 /// Held by `&'static` reference everywhere; instances are created by
@@ -42,6 +58,8 @@ pub struct RepositoryFormat {
     pub description: &'static str,
     /// Opens a repository of this format.
     pub open: OpenFn,
+    /// Creates an empty repository of this format.
+    pub create: CreateFn,
     /// The revision serializer.
     pub revision_serializer: &'static dyn RevisionSerializer,
     /// The inventory serializer.
@@ -54,10 +72,19 @@ pub struct RepositoryFormat {
     pub supports_tree_reference: bool,
     /// Whether external (stacked) lookups are supported.
     pub supports_external_lookups: bool,
+    /// Whether the pack indices use the B+Tree format (`true`, used by 1.9+
+    /// and 2a) or the older format-1 `GraphIndex` (`false`, used by the
+    /// 0.92/1.6 pack formats). Ignored by non-pack storage families.
+    pub uses_btree_index: bool,
     /// Whether this crate can currently open repositories of this format.
     pub supported: bool,
     /// Whether the format is deprecated (still readable, upgrade advised).
     pub deprecated: bool,
+    /// Whether this is an all-in-one (pre-metadir) format whose stores live
+    /// directly under `.bzr` with no `.bzr/repository/format` marker. Such a
+    /// format is opened through the all-in-one control-dir path, not the
+    /// metadir `open` dispatcher (its `open` stays `open_unsupported`).
+    pub all_in_one: bool,
 }
 
 impl RepositoryFormat {
@@ -68,14 +95,17 @@ impl RepositoryFormat {
         format_string: b"",
         description: "",
         open: open_unsupported,
+        create: create_unsupported,
         revision_serializer: &crate::bencode_serializer::BEncodeRevisionSerializer1,
         inventory_serializer: &crate::xml_serializer::Chk255BigPageInventorySerializer,
         rich_root_data: false,
         supports_chks: false,
         supports_tree_reference: false,
         supports_external_lookups: false,
+        uses_btree_index: true,
         supported: false,
         deprecated: false,
+        all_in_one: false,
     };
 
     /// The `.bzr/repository/format` marker for this format.
@@ -96,6 +126,12 @@ impl RepositoryFormat {
     /// Whether the format is deprecated.
     pub fn is_deprecated(&self) -> bool {
         self.deprecated
+    }
+
+    /// Whether this is an all-in-one (pre-metadir) format, opened through the
+    /// all-in-one control-dir path rather than the metadir dispatcher.
+    pub fn is_all_in_one(&self) -> bool {
+        self.all_in_one
     }
 
     /// The network name (metadir formats use their marker string).
@@ -178,6 +214,7 @@ mod tests {
         assert!(f.is_supported());
     }
 
+    #[cfg(feature = "knitpack")]
     #[test]
     fn knitpack_formats_are_registered() {
         let f = find_format(b"Bazaar pack repository format 1 (needs bzr 0.92)\n")
@@ -190,6 +227,7 @@ mod tests {
         assert_eq!(f.inventory_serializer.format_num(), b"5");
     }
 
+    #[cfg(feature = "knitpack")]
     #[test]
     fn rich_root_knitpack_uses_xml6() {
         let f = find_format(b"Bazaar pack repository format 1 with rich root (needs bzr 1.0)\n")
@@ -204,7 +242,10 @@ mod tests {
     }
 
     #[test]
-    fn all_formats_are_nonempty() {
-        assert!(all_formats().len() >= 10);
+    fn the_always_on_2a_format_is_present() {
+        // 2a is built regardless of the older-format features, so the registry
+        // is never empty.
+        assert!(find_format(b"Bazaar repository format 2a (needs bzr 1.16 or later)\n").is_some());
+        assert!(!all_formats().is_empty());
     }
 }

@@ -13,7 +13,6 @@
 
 use std::collections::HashMap;
 
-use crate::btree_graph_index::BTreeGraphIndex;
 use crate::knit::{
     parse_knit_index_value, KnitAccess, KnitError, KnitIndex, KnitIndexMemo, KnitKey, KnitMethod,
     KnitPlainFactory, KnitRecordDetails, KnitVersionedFiles,
@@ -23,6 +22,124 @@ use crate::transport::{SharedTransport, Transport};
 
 use super::format::RepositoryFormat;
 use super::pack_2a::RepositoryError;
+use crate::declare_repository_format;
+use crate::xml_serializer::{
+    XMLInventorySerializer5, XMLInventorySerializer6, XMLInventorySerializer7,
+    XMLRevisionSerializer5,
+};
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_1 {
+        format_string: b"Bazaar pack repository format 1 (needs bzr 0.92)\n",
+        description: "Pack repository format 1",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer5,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        supported: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_3 {
+        format_string: b"Bazaar pack repository format 1 with subtree support (needs bzr 0.92)\n",
+        description: "Pack repository format 1 with subtree support",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer7,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        rich_root_data: true,
+        supports_tree_reference: true,
+        supported: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_4 {
+        format_string: b"Bazaar pack repository format 1 with rich root (needs bzr 1.0)\n",
+        description: "Pack repository format 1 with rich root",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer6,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        rich_root_data: true,
+        supported: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_5 {
+        format_string: b"Bazaar RepositoryFormatKnitPack5 (bzr 1.6)\n",
+        description: "Pack repository format 5 (stackable)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer5,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        supports_external_lookups: true,
+        supported: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_5_RICH_ROOT {
+        format_string: b"Bazaar RepositoryFormatKnitPack5RichRoot (bzr 1.6.1)\n",
+        description: "Pack repository format 5 with rich root (stackable)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer6,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        rich_root_data: true,
+        supports_external_lookups: true,
+        supported: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_5_RICH_ROOT_BROKEN {
+        format_string: b"Bazaar RepositoryFormatKnitPack5RichRoot (bzr 1.6)\n",
+        description: "Pack repository format 5 with rich root (broken)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer6,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        rich_root_data: true,
+        supports_external_lookups: true,
+        deprecated: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_6 {
+        format_string: b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n",
+        description: "Pack repository format 6 (btree indexes, stackable)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer5,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        supports_external_lookups: true,
+        supported: true,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_6_RICH_ROOT {
+        format_string: b"Bazaar RepositoryFormatKnitPack6RichRoot (bzr 1.9)\n",
+        description: "Pack repository format 6 with rich root (btree, stackable)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer6,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        rich_root_data: true,
+        supports_external_lookups: true,
+        supported: true,
+    }
+}
 
 /// The pack name is used as the knit `FileRef`.
 type PackName = String;
@@ -52,7 +169,7 @@ impl PackKnitIndex {
         let mut has_graph = false;
         for pack in packs {
             let name = format!("indices/{pack}{ext}");
-            let index = BTreeGraphIndex::open(transport, &name)?;
+            let index = super::pack_index::PackIndex::open(transport, &name)?;
             if index.node_ref_lists() > 0 {
                 has_graph = true;
             }
@@ -331,9 +448,9 @@ impl KnitPackRepository {
         transport.mkdir("indices")?;
         transport.mkdir("packs")?;
         transport.put_bytes("format", format.format_string(), None)?;
-        let empty = crate::btree_builder::BTreeBuilder::new(0, 1)
+        let empty = super::pack_index::IndexBuilder::new(format.uses_btree_index, 0, 1)
             .finish()
-            .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e:?}")))?;
+            .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e}")))?;
         transport.put_bytes("pack-names", &empty, None)?;
         Self::open(transport)
     }
@@ -345,7 +462,10 @@ impl KnitPackRepository {
                 "a write group is already open".to_string(),
             ));
         }
-        self.write_group = Some(WriteGroup::new(&new_pack_name())?);
+        self.write_group = Some(WriteGroup::new(
+            &new_pack_name(),
+            self.format.uses_btree_index,
+        )?);
         Ok(())
     }
 
@@ -408,6 +528,34 @@ impl KnitPackRepository {
             .add_lines(key, parent_keys, split_lines(bytes), false)
             .map_err(|e| RepositoryError::Corrupt(format!("add text: {e}")))?;
         Ok(())
+    }
+
+    /// Add a signature text for `revision_id` (the clearsigned testament) to
+    /// the open write group.
+    pub fn add_signature(
+        &mut self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let key: KnitKey = vec![revision_id.to_vec()];
+        self.group()?
+            .signatures
+            .add_lines(key, Vec::new(), split_lines(signature), false)
+            .map_err(|e| RepositoryError::Corrupt(format!("add signature: {e}")))?;
+        Ok(())
+    }
+
+    /// The signature text stored for `revision_id`, or `None` if unsigned.
+    pub fn get_signature_text(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        let key: KnitKey = vec![revision_id.to_vec()];
+        match self.signatures.get_text(&key) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(crate::knit::KnitError::RevisionNotPresent(_)) => Ok(None),
+            Err(e) => Err(RepositoryError::Corrupt(format!("signature {e}"))),
+        }
     }
 
     /// Flush the open write group.
@@ -638,25 +786,14 @@ impl super::Repository for KnitPackRepository {
 
     fn add_signature_text(
         &mut self,
-        _revision_id: &[u8],
-        _signature: &[u8],
+        revision_id: &[u8],
+        signature: &[u8],
     ) -> Result<(), RepositoryError> {
-        // TODO: knit-pack signature writing is not implemented. Commit from
-        // a working tree always runs against a 2a repository, so this path
-        // is not yet exercised; the read side below works for inspecting
-        // signatures in an existing knit-pack repository.
-        Err(RepositoryError::UnsupportedFormat(
-            "signature writing for knit-pack repositories",
-        ))
+        KnitPackRepository::add_signature(self, revision_id, signature)
     }
 
     fn get_signature_text(&self, revision_id: &[u8]) -> Result<Option<Vec<u8>>, RepositoryError> {
-        let key: KnitKey = vec![revision_id.to_vec()];
-        match self.signatures.get_text(&key) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(crate::knit::KnitError::RevisionNotPresent(_)) => Ok(None),
-            Err(e) => Err(RepositoryError::Corrupt(format!("signature {e}"))),
-        }
+        KnitPackRepository::get_signature_text(self, revision_id)
     }
 
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
@@ -671,6 +808,16 @@ pub fn open_knit_pack(
     transport: SharedTransport,
 ) -> Result<Box<dyn super::Repository>, RepositoryError> {
     Ok(Box::new(KnitPackRepository::open(transport)?))
+}
+
+/// Create an empty knit-pack repository of `format` at `transport`. The
+/// [`CreateFn`](super::format::CreateFn) carried by every knit-pack
+/// [`RepositoryFormat`].
+pub fn create_knit_pack(
+    format: &'static RepositoryFormat,
+    transport: SharedTransport,
+) -> Result<Box<dyn super::Repository>, RepositoryError> {
+    Ok(Box::new(KnitPackRepository::create(transport, format)?))
 }
 
 /// Verify the `format` marker is a knit-pack format.
@@ -698,7 +845,7 @@ fn new_pack_name() -> String {
 fn read_pack_names_with_values(
     transport: &dyn Transport,
 ) -> Result<Vec<(String, Vec<u8>)>, RepositoryError> {
-    let index = BTreeGraphIndex::open(transport, "pack-names")?;
+    let index = super::pack_index::PackIndex::open(transport, "pack-names")?;
     let mut out = Vec::new();
     for (key, value, _refs) in index.iter_all_entries() {
         if let Some(name) = key.first() {
@@ -710,7 +857,7 @@ fn read_pack_names_with_values(
 
 /// Read `pack-names` and return the pack names in it.
 fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, RepositoryError> {
-    let index = BTreeGraphIndex::open(transport, "pack-names")?;
+    let index = super::pack_index::PackIndex::open(transport, "pack-names")?;
     let mut names = Vec::new();
     for (key, _value, _refs) in index.iter_all_entries() {
         if let Some(name) = key.first() {
@@ -902,10 +1049,14 @@ struct WriteGroup {
     revisions: WriteStore,
     inventories: WriteStore,
     texts: WriteStore,
+    signatures: WriteStore,
+    /// Whether to write B+Tree indices (1.9+) or format-1 GraphIndex (0.92,
+    /// 1.6).
+    uses_btree: bool,
 }
 
 impl WriteGroup {
-    fn new(pack_name: &str) -> Result<Self, RepositoryError> {
+    fn new(pack_name: &str, uses_btree: bool) -> Result<Self, RepositoryError> {
         let mut writer = ContainerWriter::new(Vec::new());
         writer
             .begin()
@@ -923,12 +1074,16 @@ impl WriteGroup {
         let revisions = make(false);
         let inventories = make(true);
         let texts = make(true);
+        // Signatures, like revisions, are keyed by revision id with no deltas.
+        let signatures = make(false);
         Ok(WriteGroup {
             pack_name: pack_name.to_string(),
             pack,
             revisions,
             inventories,
             texts,
+            signatures,
+            uses_btree,
         })
     }
 
@@ -944,14 +1099,15 @@ impl WriteGroup {
             revisions,
             inventories,
             texts,
+            signatures,
+            uses_btree,
         } = self;
-        let rix = serialise_index(revisions.index, 1)?;
-        let iix = serialise_index(inventories.index, 1)?;
-        let tix = serialise_index(texts.index, 2)?;
-        // Knit-pack has no chk index; the signatures index is empty.
-        let six = crate::btree_builder::BTreeBuilder::new(1, 1)
-            .finish()
-            .map_err(|e| RepositoryError::Corrupt(format!("empty six: {e:?}")))?;
+        let rix = serialise_index(revisions.index, 1, uses_btree)?;
+        let iix = serialise_index(inventories.index, 1, uses_btree)?;
+        let tix = serialise_index(texts.index, 2, uses_btree)?;
+        // Signatures are keyed by revision id (1 element); knit-pack has no
+        // chk index.
+        let six = serialise_index(signatures.index, 1, uses_btree)?;
 
         let pack_bytes = {
             let mut writer = pack.lock().unwrap();
@@ -980,28 +1136,33 @@ impl WriteGroup {
             .join(" ")
             .into_bytes();
 
-        let mut names = crate::btree_builder::BTreeBuilder::new(0, 1);
+        let mut names = super::pack_index::IndexBuilder::new(uses_btree, 0, 1);
         for (name, value) in existing {
             names
                 .add_node(vec![name.clone().into_bytes()], value.clone(), vec![])
-                .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e:?}")))?;
+                .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e}")))?;
         }
         names
             .add_node(vec![pack_name.clone().into_bytes()], new_value, vec![])
-            .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e:?}")))?;
+            .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e}")))?;
         let names_bytes = names
             .finish()
-            .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e:?}")))?;
+            .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e}")))?;
         transport.put_bytes("pack-names", &names_bytes, None)?;
         Ok(())
     }
 }
 
-/// Serialise a write index's collected records into a btree index.
-fn serialise_index(index: KnitWriteIndex, key_elements: usize) -> Result<Vec<u8>, RepositoryError> {
+/// Serialise a write index's collected records into a pack index of the
+/// format's index type (btree for 1.9+, format-1 GraphIndex for 0.92/1.6).
+fn serialise_index(
+    index: KnitWriteIndex,
+    key_elements: usize,
+    uses_btree: bool,
+) -> Result<Vec<u8>, RepositoryError> {
     let has_deltas = index.has_deltas;
     let ref_lists = if has_deltas { 2 } else { 1 };
-    let mut builder = crate::btree_builder::BTreeBuilder::new(ref_lists, key_elements);
+    let mut builder = super::pack_index::IndexBuilder::new(uses_btree, ref_lists, key_elements);
     for (key, options, memo, parents) in index.take_records() {
         let noeol = options.contains(&KM::NoEol);
         let method = if options.contains(&KM::LineDelta) {
@@ -1021,11 +1182,11 @@ fn serialise_index(index: KnitWriteIndex, key_elements: usize) -> Result<Vec<u8>
         .map_err(|e| RepositoryError::Corrupt(format!("encode index: {e}")))?;
         builder
             .add_node(key, value, node_refs)
-            .map_err(|e| RepositoryError::Corrupt(format!("index node: {e:?}")))?;
+            .map_err(|e| RepositoryError::Corrupt(format!("index node: {e}")))?;
     }
     builder
         .finish()
-        .map_err(|e| RepositoryError::Corrupt(format!("index finish: {e:?}")))
+        .map_err(|e| RepositoryError::Corrupt(format!("index finish: {e}")))
 }
 
 #[cfg(test)]
@@ -1101,6 +1262,35 @@ mod tests {
             repo.get_file_text(b"file-1", b"rev-2").unwrap(),
             b"hello\ngoodbye\n"
         );
+    }
+
+    #[test]
+    fn signature_round_trips() {
+        let (_d, t) = temp();
+        let mut repo = KnitPackRepository::create(t.clone(), knitpack6()).unwrap();
+        repo.start_write_group().unwrap();
+        let r1 = crate::revision::Revision::new(
+            crate::RevisionId::from(&b"rev-1"[..]),
+            vec![],
+            Some("T <t@e>".into()),
+            "first".into(),
+            std::collections::HashMap::new(),
+            None,
+            1577880000.0,
+            Some(0),
+        );
+        repo.add_revision(&r1, &[]).unwrap();
+        repo.add_signature(b"rev-1", b"-----SIG-----\nsigned rev-1\n")
+            .unwrap();
+        repo.commit_write_group().unwrap();
+
+        let repo = KnitPackRepository::open(t).unwrap();
+        assert_eq!(
+            repo.get_signature_text(b"rev-1").unwrap().as_deref(),
+            Some(&b"-----SIG-----\nsigned rev-1\n"[..])
+        );
+        // An unsigned revision returns None.
+        assert_eq!(repo.get_signature_text(b"rev-1-unsigned").unwrap(), None);
     }
 
     #[test]

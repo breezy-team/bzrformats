@@ -29,6 +29,7 @@ pub trait Mapper: Send + Sync {
 /// A `Mapper` that always returns the same path regardless of the key.
 ///
 /// Mirrors `bzrformats.versionedfile.ConstantMapper`.
+#[derive(Clone)]
 pub struct ConstantMapper {
     pub result: String,
 }
@@ -65,6 +66,7 @@ impl Mapper for PrefixMapper {
 /// A `Mapper` that prefixes the path with a two-hex adler32 bucket.
 ///
 /// Mirrors `bzrformats.versionedfile.HashPrefixMapper`.
+#[derive(Clone)]
 pub struct HashPrefixMapper;
 
 impl Mapper for HashPrefixMapper {
@@ -95,7 +97,7 @@ impl Mapper for HashEscapedPrefixMapper {
 /// Percent-encode `s` matching Python's `urllib.parse.quote(s, safe='/')`.
 ///
 /// Safe characters are ASCII letters, digits, `_.-~` and `/`.
-fn url_quote(s: &str) -> String {
+pub(crate) fn url_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         if is_url_safe(*b) {
@@ -116,7 +118,7 @@ fn is_url_safe(b: u8) -> bool {
 ///
 /// `%xx` sequences are decoded as raw bytes; the resulting byte sequence is
 /// interpreted as UTF-8. A malformed `%xx` sequence is left as-is, like Python.
-fn url_unquote(s: &str) -> String {
+pub(crate) fn url_unquote(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;

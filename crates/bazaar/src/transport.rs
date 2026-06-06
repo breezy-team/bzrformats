@@ -251,6 +251,80 @@ pub trait Transport {
     }
 }
 
+/// Forward [`Transport`] through the shared `Arc`, so a `SharedTransport`
+/// can be used wherever a `T: Transport` is needed (e.g. the knit
+/// `KndxIndex<T, M>` / `KnitKeyAccess<T, M>` stores).
+impl Transport for std::sync::Arc<dyn Transport + Send + Sync> {
+    fn get_bytes(&self, path: &str) -> Result<Vec<u8>, TransportError> {
+        (**self).get_bytes(path)
+    }
+
+    fn put_file_non_atomic(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        create_parent_dir: bool,
+    ) -> Result<(), TransportError> {
+        (**self).put_file_non_atomic(path, bytes, create_parent_dir)
+    }
+
+    fn append_bytes(&self, path: &str, bytes: &[u8]) -> Result<u64, TransportError> {
+        (**self).append_bytes(path, bytes)
+    }
+
+    fn mkdir(&self, path: &str) -> Result<(), TransportError> {
+        (**self).mkdir(path)
+    }
+
+    fn has(&self, path: &str) -> Result<bool, TransportError> {
+        (**self).has(path)
+    }
+
+    fn iter_files_recursive(&self) -> Result<Vec<String>, TransportError> {
+        (**self).iter_files_recursive()
+    }
+
+    fn abspath(&self, path: &str) -> Result<String, TransportError> {
+        (**self).abspath(path)
+    }
+
+    fn readv(&self, path: &str, ranges: &[ReadRange]) -> Result<Vec<ReadResult>, TransportError> {
+        (**self).readv(path, ranges)
+    }
+
+    fn put_bytes(&self, path: &str, bytes: &[u8], mode: Option<u32>) -> Result<(), TransportError> {
+        (**self).put_bytes(path, bytes, mode)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), TransportError> {
+        (**self).rename(from, to)
+    }
+
+    fn delete(&self, path: &str) -> Result<(), TransportError> {
+        (**self).delete(path)
+    }
+
+    fn rmdir(&self, path: &str) -> Result<(), TransportError> {
+        (**self).rmdir(path)
+    }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, TransportError> {
+        (**self).list_dir(path)
+    }
+
+    fn stat(&self, path: &str) -> Result<Stat, TransportError> {
+        (**self).stat(path)
+    }
+
+    fn subtransport(&self, path: &str) -> Result<SharedTransport, TransportError> {
+        (**self).subtransport(path)
+    }
+
+    fn local_path(&self, path: &str) -> Option<std::path::PathBuf> {
+        (**self).local_path(path)
+    }
+}
+
 /// A transport shared across the opener objects (`BzrDir`, `Branch`,
 /// `Repository`, `WorkingTree`).
 ///
@@ -292,7 +366,11 @@ impl LocalTransport {
     }
 
     fn resolve(&self, path: &str) -> std::path::PathBuf {
-        self.root.join(path)
+        // Relative transport paths are URL-escaped (the key mappers emit
+        // percent-encoded relpaths, e.g. `%40` for `@`); the local transport
+        // decodes them to a filesystem path, mirroring breezy's
+        // `urlutils.local_path_from_url`. Plain ASCII paths are unaffected.
+        self.root.join(crate::key_mapper::url_unquote(path))
     }
 }
 
@@ -366,7 +444,12 @@ impl Transport for LocalTransport {
                 if p.is_dir() {
                     stack.push(p);
                 } else if let Ok(rel) = p.strip_prefix(&self.root) {
-                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                    // Return URL-escaped relpaths, symmetric with `resolve`
+                    // unquoting them (and with breezy's local transport), so
+                    // a listed path round-trips through the key mappers'
+                    // `unmap`. `/` separators stay literal.
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    out.push(crate::key_mapper::url_quote(&rel));
                 }
             }
         }

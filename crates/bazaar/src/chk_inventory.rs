@@ -2146,6 +2146,18 @@ where
     fn entries(&self) -> Result<Vec<(String, Entry)>, crate::inventory::Error> {
         CHKInventory::entries(self).map_err(backend_err)
     }
+
+    fn root_entry(&self) -> Result<Option<Entry>, crate::inventory::Error> {
+        let root_id = match &self.root_id {
+            Some(id) => id.clone(),
+            None => return Ok(None),
+        };
+        match CHKInventory::get_entry(self, &root_id) {
+            Ok(e) => Ok(Some(e)),
+            Err(Error::NoSuchId(_)) => Ok(None),
+            Err(e) => Err(backend_err(e)),
+        }
+    }
 }
 
 fn backend_err(e: Error) -> crate::inventory::Error {

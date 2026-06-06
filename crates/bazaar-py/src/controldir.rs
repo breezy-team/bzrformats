@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bazaar::branch::Branch as RsBranch;
-use bazaar::bzrdir::BzrDir as RsBzrDir;
+use bazaar::bzrdir::{BzrDirMeta, ControlDir as RsControlDir};
 use bazaar::repository::Repository as RsRepository;
 use bazaar::transport::{LocalTransport, SharedTransport};
 use bazaar::workingtree::{EntryKind, WorkingTree as RsWorkingTree};
@@ -47,7 +47,7 @@ fn kind_from_str(kind: &str) -> PyResult<EntryKind> {
 /// A `.bzr` control directory.
 #[pyclass(name = "BzrDir")]
 struct BzrDir {
-    inner: RsBzrDir,
+    inner: Box<dyn RsControlDir>,
 }
 
 #[pymethods]
@@ -208,10 +208,10 @@ impl Branch {
     }
 }
 
-/// A dirstate-based working tree.
+/// A working tree, backed by whichever on-disk format was opened.
 #[pyclass(name = "WorkingTree")]
 struct WorkingTree {
-    inner: RsWorkingTree,
+    inner: Box<dyn RsWorkingTree>,
 }
 
 #[pymethods]
@@ -375,7 +375,7 @@ fn open(path: &str) -> PyResult<BzrDir> {
     let root = local(path);
     let bzr = root.subtransport(".bzr").map_err(err)?;
     Ok(BzrDir {
-        inner: RsBzrDir::open(bzr).map_err(err)?,
+        inner: bazaar::bzrdir::open(bzr).map_err(err)?,
     })
 }
 
@@ -384,7 +384,7 @@ fn open(path: &str) -> PyResult<BzrDir> {
 fn create(path: &str) -> PyResult<BzrDir> {
     let parent = local(path);
     Ok(BzrDir {
-        inner: RsBzrDir::create(&parent).map_err(err)?,
+        inner: Box::new(BzrDirMeta::create(&parent).map_err(err)?),
     })
 }
 

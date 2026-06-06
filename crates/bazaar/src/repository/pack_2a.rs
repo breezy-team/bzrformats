@@ -26,6 +26,41 @@ use crate::transport::{Transport, TransportError};
 use crate::versionedfile::Key;
 
 use super::format::RepositoryFormat;
+use crate::bencode_serializer::BEncodeRevisionSerializer1;
+use crate::declare_repository_format;
+use crate::xml_serializer::Chk255BigPageInventorySerializer;
+
+declare_repository_format! {
+    FORMAT_2A {
+        format_string: b"Bazaar repository format 2a (needs bzr 1.16 or later)\n",
+        description: "Repository format 2a (groupcompress, CHK)",
+        revision_serializer: &BEncodeRevisionSerializer1,
+        inventory_serializer: &Chk255BigPageInventorySerializer,
+        open: open_group_compress,
+        create: create_group_compress,
+        rich_root_data: true,
+        supports_chks: true,
+        supports_tree_reference: true,
+        supports_external_lookups: true,
+        supported: true,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_2A_SUBTREE {
+        format_string: b"Bazaar development format 8\n",
+        description: "Repository format 2a with subtree support",
+        revision_serializer: &BEncodeRevisionSerializer1,
+        inventory_serializer: &Chk255BigPageInventorySerializer,
+        open: open_group_compress,
+        create: create_group_compress,
+        rich_root_data: true,
+        supports_chks: true,
+        supports_tree_reference: true,
+        supports_external_lookups: true,
+        supported: true,
+    }
+}
 
 /// The pack name is used as the groupcompress `FileRef`, identifying which
 /// `.pack` file a block lives in.
@@ -89,6 +124,12 @@ impl From<KnitError> for RepositoryError {
 impl From<crate::btree_graph_index::IndexError> for RepositoryError {
     fn from(e: crate::btree_graph_index::IndexError) -> Self {
         RepositoryError::Index(e)
+    }
+}
+
+impl From<crate::index::IndexError> for RepositoryError {
+    fn from(e: crate::index::IndexError) -> Self {
+        RepositoryError::Corrupt(format!("index: {e}"))
     }
 }
 
@@ -818,6 +859,17 @@ pub fn open_group_compress(
     transport: SharedTransport,
 ) -> Result<Box<dyn super::Repository>, RepositoryError> {
     Ok(Box::new(Pack2aRepository::open(transport)?))
+}
+
+/// Create an empty groupcompress (2a) repository at `transport`. The
+/// [`CreateFn`](super::format::CreateFn) carried by the 2a
+/// [`RepositoryFormat`](super::format::RepositoryFormat); 2a writes a fixed
+/// marker, so the `format` argument is unused.
+pub fn create_group_compress(
+    _format: &'static super::format::RepositoryFormat,
+    transport: SharedTransport,
+) -> Result<Box<dyn super::Repository>, RepositoryError> {
+    Ok(Box::new(Pack2aRepository::create(transport)?))
 }
 
 /// Verify the repository `format` marker is a supported groupcompress

@@ -3897,9 +3897,19 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitIndex for
             self.load_prefix_shared(prefix.clone())
                 .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
             let path = self.prefix_path(&prefix);
+            // A brand-new kndx file needs its header written before the first
+            // entry. load_prefix_shared creates the file (with header) only for
+            // constant mappers; for per-file texts the file may not exist yet.
+            let needs_header = !self
+                .transport
+                .has(&path)
+                .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
             let mut cache = self.kndx_cache.lock().unwrap();
             let pc = cache.entry(prefix.clone()).or_default();
             let mut append_buf: Vec<u8> = Vec::new();
+            if needs_header {
+                append_buf.extend_from_slice(KNDX_HEADER);
+            }
             for (key, methods, memo, parents) in entries {
                 let suffix = Self::suffix_of(key);
                 let options: Vec<Vec<u8>> = methods
@@ -3908,6 +3918,22 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitIndex for
                     .collect();
                 let parent_suffixes: Vec<Vec<u8>> =
                     parents.iter().map(|p| Self::suffix_of(p)).collect();
+                // Encode each parent as its numeric history index when it is
+                // already in this prefix's kndx, else as a `.`-prefixed
+                // version id (breezy's `_dictionary_compress`). Compute this
+                // against the current cache, before inserting the new entry,
+                // so a parent never resolves to the entry itself.
+                let encoded_parents: Vec<Vec<u8>> = parent_suffixes
+                    .iter()
+                    .map(|p| match pc.cache.get(p) {
+                        Some(e) => e.index.to_string().into_bytes(),
+                        None => {
+                            let mut v = vec![b'.'];
+                            v.extend_from_slice(p);
+                            v
+                        }
+                    })
+                    .collect();
                 let idx = pc.history.len();
                 pc.history.push(suffix.clone());
                 pc.cache.insert(
@@ -3931,18 +3957,40 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitIndex for
                 append_buf.extend_from_slice(memo.offset.to_string().as_bytes());
                 append_buf.push(b' ');
                 append_buf.extend_from_slice(memo.length.to_string().as_bytes());
-                for p in &parent_suffixes {
+                for p in &encoded_parents {
                     append_buf.push(b' ');
                     append_buf.extend_from_slice(p);
                 }
                 append_buf.extend_from_slice(b" :");
             }
             drop(cache);
-            self.transport
-                .append_bytes(&path, &append_buf)
+            append_creating_parent(&self.transport, &path, &append_buf)
                 .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
         }
         Ok(())
+    }
+}
+
+/// Append `data` to `path`, creating the parent directory and retrying once
+/// if the first attempt fails because the directory does not yet exist.
+///
+/// Per-file knits live under `knits/<hash>/<file>.{knit,kndx}`, so the
+/// bucket directory may be absent on the first write to a file id. For paths
+/// without a separator, `mkdir("")` creates the transport root, mirroring the
+/// Python implementation's `osutils.dirname(path)`.
+fn append_creating_parent<T: crate::transport::Transport>(
+    transport: &T,
+    path: &str,
+    data: &[u8],
+) -> Result<u64, crate::transport::TransportError> {
+    match transport.append_bytes(path, data) {
+        Ok(off) => Ok(off),
+        Err(crate::transport::TransportError::NoSuchFile(_)) => {
+            let parent = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
+            transport.mkdir(parent)?;
+            transport.append_bytes(path, data)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -3983,19 +4031,7 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitKeyAccess
         data: &[u8],
     ) -> Result<(KnitKey, u64, usize), crate::transport::TransportError> {
         let path = self.key_path(&key);
-        let offset = match self.transport.append_bytes(&path, data) {
-            Ok(off) => off,
-            Err(crate::transport::TransportError::NoSuchFile(_)) => {
-                // Parent directory doesn't exist yet; create it and retry.
-                // For paths without a separator, mkdir("") creates the
-                // transport root, which is what the Python implementation
-                // does via osutils.dirname(path).
-                let parent = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
-                self.transport.mkdir(parent)?;
-                self.transport.append_bytes(&path, data)?
-            }
-            Err(e) => return Err(e),
-        };
+        let offset = append_creating_parent(&self.transport, &path, data)?;
         Ok((key, offset, data.len()))
     }
 }
@@ -4059,9 +4095,7 @@ impl<T: crate::transport::Transport, M: crate::key_mapper::Mapper> KnitAccess
         let path = self.key_path(key);
         let flat: Vec<u8> = data.into_iter().flatten().collect();
         let length = flat.len();
-        let offset = self
-            .transport
-            .append_bytes(&path, &flat)
+        let offset = append_creating_parent(self.transport(), &path, &flat)
             .map_err(|e| KnitError::BadIndexValue(e.to_string().into_bytes()))?;
         Ok(KnitIndexMemo {
             file_ref: path,
@@ -4107,6 +4141,11 @@ where
             factory,
             max_delta_chain,
         }
+    }
+
+    /// The backing index, e.g. to pre-load a `KndxIndex` prefix.
+    pub fn index(&self) -> &I {
+        &self.index
     }
 
     /// Run `op`, retrying it if it fails with [`KnitError::Retry`].

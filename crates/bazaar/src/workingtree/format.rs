@@ -112,6 +112,7 @@ mod tests {
         assert!(f.is_supported());
     }
 
+    #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn format_3_is_not_dirstate() {
         let f = find_format(b"Bazaar-NG Working Tree format 3")
