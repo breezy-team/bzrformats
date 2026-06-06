@@ -26,6 +26,11 @@
 //! directly under `.bzr` and is opened as a [`BzrDirAllInOne`] rather than
 //! a meta-directory.
 
+pub mod format;
+mod formats;
+
+pub use format::{control_dir_formats, find_control_dir_format, ControlDirFormat};
+
 use crate::transport::{SharedTransport, Transport, TransportError};
 
 /// Top-level marker in `.bzr/branch-format` for the meta directory layout.
@@ -39,133 +44,6 @@ pub const BRANCH_FORMAT_7: &[u8] = b"Bazaar Branch Format 7 (needs bzr 1.6)\n";
 
 /// Supported working-tree format marker (Format 6).
 pub const WORKINGTREE_FORMAT_6: &[u8] = b"Bazaar Working Tree Format 6 (bzr 1.14)\n";
-
-/// The repository storage family a control-directory format creates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RepoKind {
-    /// 2a (groupcompress + CHK).
-    GroupCompress,
-    /// A knit-pack repository (the marker selects the exact variant).
-    KnitPack(&'static [u8]),
-    /// A non-pack knit repository (the marker selects the exact variant).
-    Knit(&'static [u8]),
-}
-
-/// A named control-directory format: the meta-directory layout plus the
-/// markers for each component it creates. Mirrors an entry in breezy's
-/// `controldir.format_registry` (e.g. "2a", "pack-0.92", "1.9").
-#[derive(Debug, Clone)]
-pub struct ControlDirFormat {
-    /// The registry name (`brz init --format=<name>`).
-    pub name: &'static str,
-    repo: RepoKind,
-    branch_marker: &'static [u8],
-    wt_marker: &'static [u8],
-    /// Whether the working tree writes a `views` file (formats 6+).
-    wt_has_views: bool,
-}
-
-/// All control-directory formats this crate can create, keyed by name.
-///
-/// The list pairs each repository with the branch and working-tree formats
-/// brz uses for that `--format` name, taken from breezy's format registry.
-pub fn control_dir_formats() -> &'static [ControlDirFormat] {
-    const B6: &[u8] = b"Bazaar Branch Format 6 (bzr 0.15)\n";
-    const B7: &[u8] = BRANCH_FORMAT_7;
-    const B5: &[u8] = b"Bazaar-NG branch format 5\n";
-    const WT3: &[u8] = b"Bazaar-NG Working Tree format 3";
-    const WT4: &[u8] = b"Bazaar Working Tree Format 4 (bzr 0.15)\n";
-    const WT5: &[u8] = b"Bazaar Working Tree Format 5 (bzr 1.11)\n";
-    const WT6: &[u8] = WORKINGTREE_FORMAT_6;
-    use RepoKind::{GroupCompress, Knit, KnitPack};
-    static FORMATS: &[ControlDirFormat] = &[
-        ControlDirFormat {
-            name: "2a",
-            repo: GroupCompress,
-            branch_marker: B7,
-            wt_marker: WT6,
-            wt_has_views: true,
-        },
-        ControlDirFormat {
-            name: "pack-0.92",
-            repo: KnitPack(b"Bazaar pack repository format 1 (needs bzr 0.92)\n"),
-            branch_marker: B6,
-            wt_marker: WT4,
-            wt_has_views: false,
-        },
-        ControlDirFormat {
-            name: "pack-0.92-subtree",
-            repo: KnitPack(
-                b"Bazaar pack repository format 1 with subtree support (needs bzr 0.92)\n",
-            ),
-            branch_marker: B6,
-            wt_marker: WT4,
-            wt_has_views: false,
-        },
-        ControlDirFormat {
-            name: "rich-root-pack",
-            repo: KnitPack(b"Bazaar pack repository format 1 with rich root (needs bzr 1.0)\n"),
-            branch_marker: B6,
-            wt_marker: WT4,
-            wt_has_views: false,
-        },
-        ControlDirFormat {
-            name: "1.6",
-            repo: KnitPack(b"Bazaar RepositoryFormatKnitPack5 (bzr 1.6)\n"),
-            branch_marker: B7,
-            wt_marker: WT4,
-            wt_has_views: false,
-        },
-        ControlDirFormat {
-            name: "1.6.1-rich-root",
-            repo: KnitPack(b"Bazaar RepositoryFormatKnitPack5RichRoot (bzr 1.6.1)\n"),
-            branch_marker: B7,
-            wt_marker: WT4,
-            wt_has_views: false,
-        },
-        ControlDirFormat {
-            name: "1.9",
-            repo: KnitPack(b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n"),
-            branch_marker: B7,
-            wt_marker: WT4,
-            wt_has_views: false,
-        },
-        ControlDirFormat {
-            name: "1.9-rich-root",
-            repo: KnitPack(b"Bazaar RepositoryFormatKnitPack6RichRoot (bzr 1.9)\n"),
-            branch_marker: B7,
-            wt_marker: WT4,
-            wt_has_views: false,
-        },
-        ControlDirFormat {
-            name: "1.14",
-            repo: KnitPack(b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n"),
-            branch_marker: B7,
-            wt_marker: WT5,
-            wt_has_views: false,
-        },
-        ControlDirFormat {
-            name: "1.14-rich-root",
-            repo: KnitPack(b"Bazaar RepositoryFormatKnitPack6RichRoot (bzr 1.9)\n"),
-            branch_marker: B7,
-            wt_marker: WT5,
-            wt_has_views: false,
-        },
-        ControlDirFormat {
-            name: "knit",
-            repo: Knit(b"Bazaar-NG Knit Repository Format 1"),
-            branch_marker: B5,
-            wt_marker: WT3,
-            wt_has_views: false,
-        },
-    ];
-    FORMATS
-}
-
-/// Look up a control-directory format by its `brz init --format=` name.
-pub fn find_control_dir_format(name: &str) -> Option<&'static ControlDirFormat> {
-    control_dir_formats().iter().find(|f| f.name == name)
-}
 
 /// Errors from opening a `.bzr` directory.
 #[derive(Debug)]
@@ -373,34 +251,17 @@ impl BzrDirMeta {
             None,
         )?;
 
-        // Repository: empty store of the chosen storage family.
+        // Repository: empty store, created through the format's own `create`
+        // function (looked up by the combo's repository marker).
         let repo_t = bzr.subtransport("repository")?;
-        match format.repo {
-            RepoKind::GroupCompress => {
-                crate::repository::Pack2aRepository::create(repo_t)
-                    .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
-            }
-            RepoKind::KnitPack(marker) => {
-                let repo_format = crate::repository::find_format(marker).ok_or_else(|| {
-                    BzrDirError::Component(format!(
-                        "repository format not registered: {:?}",
-                        String::from_utf8_lossy(marker)
-                    ))
-                })?;
-                crate::repository::KnitPackRepository::create(repo_t, repo_format)
-                    .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
-            }
-            RepoKind::Knit(marker) => {
-                let repo_format = crate::repository::find_format(marker).ok_or_else(|| {
-                    BzrDirError::Component(format!(
-                        "repository format not registered: {:?}",
-                        String::from_utf8_lossy(marker)
-                    ))
-                })?;
-                crate::repository::KnitRepository::create(repo_t, repo_format)
-                    .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
-            }
-        }
+        let repo_format = crate::repository::find_format(format.repo_marker).ok_or_else(|| {
+            BzrDirError::Component(format!(
+                "repository format not registered: {:?}",
+                String::from_utf8_lossy(format.repo_marker)
+            ))
+        })?;
+        (repo_format.create)(repo_format, repo_t)
+            .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
 
         // Branch: format marker, null tip, empty config and tags. Format 5
         // (full history) keeps the tip in revision-history rather than a

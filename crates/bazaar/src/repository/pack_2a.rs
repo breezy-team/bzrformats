@@ -826,6 +826,17 @@ pub fn open_group_compress(
     Ok(Box::new(Pack2aRepository::open(transport)?))
 }
 
+/// Create an empty groupcompress (2a) repository at `transport`. The
+/// [`CreateFn`](super::format::CreateFn) carried by the 2a
+/// [`RepositoryFormat`](super::format::RepositoryFormat); 2a writes a fixed
+/// marker, so the `format` argument is unused.
+pub fn create_group_compress(
+    _format: &'static super::format::RepositoryFormat,
+    transport: SharedTransport,
+) -> Result<Box<dyn super::Repository>, RepositoryError> {
+    Ok(Box::new(Pack2aRepository::create(transport)?))
+}
+
 /// Verify the repository `format` marker is a supported groupcompress
 /// (2a) format, consulting the format registry, and return it.
 fn check_format(

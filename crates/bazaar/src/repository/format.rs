@@ -31,6 +31,22 @@ pub fn open_unsupported(
     Err(RepositoryError::UnsupportedFormat("unsupported format"))
 }
 
+/// Creates an empty repository of `format` rooted at `transport`
+/// (`.bzr/repository`), returning an abstract [`Repository`]. Like [`OpenFn`],
+/// each format carries one so creation dispatches through the format itself;
+/// the format is passed in because creation writes its marker.
+pub type CreateFn =
+    fn(&'static RepositoryFormat, SharedTransport) -> Result<Box<dyn Repository>, RepositoryError>;
+
+/// A [`CreateFn`] for formats this crate cannot create yet, reporting the
+/// format as unsupported.
+pub fn create_unsupported(
+    _format: &'static RepositoryFormat,
+    _transport: SharedTransport,
+) -> Result<Box<dyn Repository>, RepositoryError> {
+    Err(RepositoryError::UnsupportedFormat("unsupported format"))
+}
+
 /// Static description of one repository format.
 ///
 /// Held by `&'static` reference everywhere; instances are created by
@@ -42,6 +58,8 @@ pub struct RepositoryFormat {
     pub description: &'static str,
     /// Opens a repository of this format.
     pub open: OpenFn,
+    /// Creates an empty repository of this format.
+    pub create: CreateFn,
     /// The revision serializer.
     pub revision_serializer: &'static dyn RevisionSerializer,
     /// The inventory serializer.
@@ -77,6 +95,7 @@ impl RepositoryFormat {
         format_string: b"",
         description: "",
         open: open_unsupported,
+        create: create_unsupported,
         revision_serializer: &crate::bencode_serializer::BEncodeRevisionSerializer1,
         inventory_serializer: &crate::xml_serializer::Chk255BigPageInventorySerializer,
         rich_root_data: false,

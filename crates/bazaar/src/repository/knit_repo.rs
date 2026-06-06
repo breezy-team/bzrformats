@@ -399,6 +399,16 @@ pub fn open_knit(
     Ok(Box::new(KnitRepository::open(transport)?))
 }
 
+/// Create an empty non-pack knit repository of `format` at `transport`. The
+/// [`CreateFn`](super::format::CreateFn) carried by every knit
+/// [`RepositoryFormat`].
+pub fn create_knit(
+    format: &'static RepositoryFormat,
+    transport: SharedTransport,
+) -> Result<Box<dyn super::Repository>, RepositoryError> {
+    Ok(Box::new(KnitRepository::create(transport, format)?))
+}
+
 /// Split a byte buffer into lines, each keeping its trailing newline.
 fn split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
     let mut lines = Vec::new();

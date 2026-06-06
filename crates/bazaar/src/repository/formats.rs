@@ -2,13 +2,13 @@
 //!
 //! Each [`declare_repository_format!`](crate::declare_repository_format)
 //! both defines a `static` format and registers it with the format
-//! [`registry`](super::format). Knit-pack and 2a formats carry an `open`
-//! function that dispatches to their reader; the plain knit formats fall
-//! back to the unsupported opener pending a decoder.
+//! [`registry`](super::format). Each format carries `open` and `create`
+//! functions that dispatch to its reader and writer; the all-in-one weave
+//! format has neither (it is reached through the control-dir path).
 
-use super::knit_repo::open_knit;
-use super::pack_2a::open_group_compress;
-use super::pack_knit::open_knit_pack;
+use super::knit_repo::{create_knit, open_knit};
+use super::pack_2a::{create_group_compress, open_group_compress};
+use super::pack_knit::{create_knit_pack, open_knit_pack};
 use crate::bencode_serializer::BEncodeRevisionSerializer1;
 use crate::declare_repository_format;
 use crate::xml_serializer::{
@@ -38,6 +38,7 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer5,
         open: open_knit,
+        create: create_knit,
         supported: true,
         deprecated: true,
     }
@@ -50,6 +51,7 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer7,
         open: open_knit,
+        create: create_knit,
         rich_root_data: true,
         supports_tree_reference: true,
         supported: true,
@@ -64,6 +66,7 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer6,
         open: open_knit,
+        create: create_knit,
         rich_root_data: true,
         supported: true,
         deprecated: true,
@@ -77,6 +80,7 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer5,
         open: open_knit_pack,
+        create: create_knit_pack,
         supported: true,
         uses_btree_index: false,
     }
@@ -89,6 +93,7 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer7,
         open: open_knit_pack,
+        create: create_knit_pack,
         rich_root_data: true,
         supports_tree_reference: true,
         supported: true,
@@ -103,6 +108,7 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer6,
         open: open_knit_pack,
+        create: create_knit_pack,
         rich_root_data: true,
         supported: true,
         uses_btree_index: false,
@@ -116,6 +122,7 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer5,
         open: open_knit_pack,
+        create: create_knit_pack,
         supports_external_lookups: true,
         supported: true,
         uses_btree_index: false,
@@ -129,6 +136,7 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer6,
         open: open_knit_pack,
+        create: create_knit_pack,
         rich_root_data: true,
         supports_external_lookups: true,
         supported: true,
@@ -143,6 +151,7 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer6,
         open: open_knit_pack,
+        create: create_knit_pack,
         rich_root_data: true,
         supports_external_lookups: true,
         deprecated: true,
@@ -157,6 +166,7 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer5,
         open: open_knit_pack,
+        create: create_knit_pack,
         supports_external_lookups: true,
         supported: true,
     }
@@ -169,6 +179,7 @@ declare_repository_format! {
         revision_serializer: &XMLRevisionSerializer5,
         inventory_serializer: &XMLInventorySerializer6,
         open: open_knit_pack,
+        create: create_knit_pack,
         rich_root_data: true,
         supports_external_lookups: true,
         supported: true,
@@ -182,6 +193,7 @@ declare_repository_format! {
         revision_serializer: &BEncodeRevisionSerializer1,
         inventory_serializer: &Chk255BigPageInventorySerializer,
         open: open_group_compress,
+        create: create_group_compress,
         rich_root_data: true,
         supports_chks: true,
         supports_tree_reference: true,
@@ -197,6 +209,7 @@ declare_repository_format! {
         revision_serializer: &BEncodeRevisionSerializer1,
         inventory_serializer: &Chk255BigPageInventorySerializer,
         open: open_group_compress,
+        create: create_group_compress,
         rich_root_data: true,
         supports_chks: true,
         supports_tree_reference: true,

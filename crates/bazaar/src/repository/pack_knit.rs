@@ -675,6 +675,16 @@ pub fn open_knit_pack(
     Ok(Box::new(KnitPackRepository::open(transport)?))
 }
 
+/// Create an empty knit-pack repository of `format` at `transport`. The
+/// [`CreateFn`](super::format::CreateFn) carried by every knit-pack
+/// [`RepositoryFormat`].
+pub fn create_knit_pack(
+    format: &'static RepositoryFormat,
+    transport: SharedTransport,
+) -> Result<Box<dyn super::Repository>, RepositoryError> {
+    Ok(Box::new(KnitPackRepository::create(transport, format)?))
+}
+
 /// Verify the `format` marker is a knit-pack format.
 fn check_format(transport: &dyn Transport) -> Result<&'static RepositoryFormat, RepositoryError> {
     let marker = transport.get_bytes("format")?;
