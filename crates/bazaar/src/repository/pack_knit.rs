@@ -530,6 +530,34 @@ impl KnitPackRepository {
         Ok(())
     }
 
+    /// Add a signature text for `revision_id` (the clearsigned testament) to
+    /// the open write group.
+    pub fn add_signature(
+        &mut self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let key: KnitKey = vec![revision_id.to_vec()];
+        self.group()?
+            .signatures
+            .add_lines(key, Vec::new(), split_lines(signature), false)
+            .map_err(|e| RepositoryError::Corrupt(format!("add signature: {e}")))?;
+        Ok(())
+    }
+
+    /// The signature text stored for `revision_id`, or `None` if unsigned.
+    pub fn get_signature_text(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        let key: KnitKey = vec![revision_id.to_vec()];
+        match self.signatures.get_text(&key) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(crate::knit::KnitError::RevisionNotPresent(_)) => Ok(None),
+            Err(e) => Err(RepositoryError::Corrupt(format!("signature {e}"))),
+        }
+    }
+
     /// Flush the open write group.
     pub fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
         let group = self
@@ -758,25 +786,14 @@ impl super::Repository for KnitPackRepository {
 
     fn add_signature_text(
         &mut self,
-        _revision_id: &[u8],
-        _signature: &[u8],
+        revision_id: &[u8],
+        signature: &[u8],
     ) -> Result<(), RepositoryError> {
-        // TODO: knit-pack signature writing is not implemented. Commit from
-        // a working tree always runs against a 2a repository, so this path
-        // is not yet exercised; the read side below works for inspecting
-        // signatures in an existing knit-pack repository.
-        Err(RepositoryError::UnsupportedFormat(
-            "signature writing for knit-pack repositories",
-        ))
+        KnitPackRepository::add_signature(self, revision_id, signature)
     }
 
     fn get_signature_text(&self, revision_id: &[u8]) -> Result<Option<Vec<u8>>, RepositoryError> {
-        let key: KnitKey = vec![revision_id.to_vec()];
-        match self.signatures.get_text(&key) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(crate::knit::KnitError::RevisionNotPresent(_)) => Ok(None),
-            Err(e) => Err(RepositoryError::Corrupt(format!("signature {e}"))),
-        }
+        KnitPackRepository::get_signature_text(self, revision_id)
     }
 
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
@@ -1032,6 +1049,7 @@ struct WriteGroup {
     revisions: WriteStore,
     inventories: WriteStore,
     texts: WriteStore,
+    signatures: WriteStore,
     /// Whether to write B+Tree indices (1.9+) or format-1 GraphIndex (0.92,
     /// 1.6).
     uses_btree: bool,
@@ -1056,12 +1074,15 @@ impl WriteGroup {
         let revisions = make(false);
         let inventories = make(true);
         let texts = make(true);
+        // Signatures, like revisions, are keyed by revision id with no deltas.
+        let signatures = make(false);
         Ok(WriteGroup {
             pack_name: pack_name.to_string(),
             pack,
             revisions,
             inventories,
             texts,
+            signatures,
             uses_btree,
         })
     }
@@ -1078,15 +1099,15 @@ impl WriteGroup {
             revisions,
             inventories,
             texts,
+            signatures,
             uses_btree,
         } = self;
         let rix = serialise_index(revisions.index, 1, uses_btree)?;
         let iix = serialise_index(inventories.index, 1, uses_btree)?;
         let tix = serialise_index(texts.index, 2, uses_btree)?;
-        // Knit-pack has no chk index; the signatures index is empty.
-        let six = super::pack_index::IndexBuilder::new(uses_btree, 1, 1)
-            .finish()
-            .map_err(|e| RepositoryError::Corrupt(format!("empty six: {e:?}")))?;
+        // Signatures are keyed by revision id (1 element); knit-pack has no
+        // chk index.
+        let six = serialise_index(signatures.index, 1, uses_btree)?;
 
         let pack_bytes = {
             let mut writer = pack.lock().unwrap();
@@ -1241,6 +1262,35 @@ mod tests {
             repo.get_file_text(b"file-1", b"rev-2").unwrap(),
             b"hello\ngoodbye\n"
         );
+    }
+
+    #[test]
+    fn signature_round_trips() {
+        let (_d, t) = temp();
+        let mut repo = KnitPackRepository::create(t.clone(), knitpack6()).unwrap();
+        repo.start_write_group().unwrap();
+        let r1 = crate::revision::Revision::new(
+            crate::RevisionId::from(&b"rev-1"[..]),
+            vec![],
+            Some("T <t@e>".into()),
+            "first".into(),
+            std::collections::HashMap::new(),
+            None,
+            1577880000.0,
+            Some(0),
+        );
+        repo.add_revision(&r1, &[]).unwrap();
+        repo.add_signature(b"rev-1", b"-----SIG-----\nsigned rev-1\n")
+            .unwrap();
+        repo.commit_write_group().unwrap();
+
+        let repo = KnitPackRepository::open(t).unwrap();
+        assert_eq!(
+            repo.get_signature_text(b"rev-1").unwrap().as_deref(),
+            Some(&b"-----SIG-----\nsigned rev-1\n"[..])
+        );
+        // An unsigned revision returns None.
+        assert_eq!(repo.get_signature_text(b"rev-1-unsigned").unwrap(), None);
     }
 
     #[test]

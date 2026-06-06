@@ -690,6 +690,7 @@ impl WorkingTree4 {
     ) -> Result<Vec<WorkingTreeChange>, WorkingTreeError> {
         compute_changes(
             &self.transport,
+            &read_and_hash(&self.transport),
             &self.collect_live_entries(),
             basis,
             other_parents,
@@ -1308,6 +1309,7 @@ fn change_selected(
 /// metadata-identical to the basis are omitted.
 fn compute_changes(
     transport: &SharedTransport,
+    file_sha: &FileSha<'_>,
     live: &LiveEntries,
     basis: &crate::repository::RevisionTree,
     other_parents: &[crate::repository::RevisionTree],
@@ -1318,12 +1320,11 @@ fn compute_changes(
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
 
     // The tree root: record it when the basis has no root (a first commit),
-    // so its empty text and inventory entry are written at the new revision.
-    // On later commits an unchanged root is carried over. This is the
-    // rich-root behaviour, which the only writable format here (2a) requires.
-    // TODO: for a non-rich-root format the empty root change must be
-    // suppressed (breezy's `_require_root_change`); commit currently always
-    // runs against a 2a tree, so that path is not yet exercised.
+    // so its inventory entry is written at the new revision; on later commits
+    // an unchanged root is carried over. The root entry is always reported
+    // here; whether an empty per-file text is also recorded for it is decided
+    // by the commit builder, which writes the root text only for a rich-root
+    // repository (mirroring breezy's record_iter_changes).
     let root_fid = FileId::from(live.root_id.as_slice());
     seen.insert(live.root_id.clone());
     if basis
@@ -1382,7 +1383,7 @@ fn compute_changes(
             continue;
         }
 
-        let content_change = content_changed(transport, e, basis_entry.as_ref())?;
+        let content_change = content_changed(file_sha, e, basis_entry.as_ref())?;
         let new_parent_id = parent_id_of(&e.path, live);
         let new_name = basename(&e.path).to_string();
         let meta_change = match &basis_entry {
@@ -1480,7 +1481,7 @@ fn text_parents_for(
 /// Whether `entry`'s on-disk content (read through `transport`) differs from
 /// its basis entry. A new entry (no basis) always counts as changed.
 fn content_changed(
-    transport: &SharedTransport,
+    file_sha: &FileSha<'_>,
     entry: &LiveEntry,
     basis_entry: Option<&crate::inventory::Entry>,
 ) -> Result<bool, WorkingTreeError> {
@@ -1490,8 +1491,7 @@ fn content_changed(
     };
     match entry.kind {
         EntryKind::File => {
-            let content = transport.get_bytes(&entry.path)?;
-            let sha1 = crate::weave::sha_strings(&[content.as_slice()]);
+            let sha1 = file_sha(&entry.path)?;
             Ok(basis_entry.text_sha1() != Some(sha1.as_slice()))
         }
         EntryKind::Symlink => Ok(basis_entry.symlink_target().map(|s| s.as_bytes())
@@ -1499,6 +1499,23 @@ fn content_changed(
         // Directories and tree references have no content; only metadata
         // (handled by the caller) can change.
         EntryKind::Directory | EntryKind::TreeReference => Ok(false),
+    }
+}
+
+/// Computes the sha1 (raw bytes) of a working-tree file by tree-relative
+/// path. The dirstate backend reads and hashes directly; the format-3 backend
+/// consults its stat cache so unchanged files are not re-hashed.
+type FileSha<'a> = dyn Fn(&str) -> Result<Vec<u8>, WorkingTreeError> + 'a;
+
+/// A [`FileSha`] that reads the file through `transport` and hashes it (no
+/// caching). Used by the dirstate backend, whose stat caching lives in the
+/// dirstate itself.
+fn read_and_hash<'a>(
+    transport: &'a SharedTransport,
+) -> impl Fn(&str) -> Result<Vec<u8>, WorkingTreeError> + 'a {
+    move |path| {
+        let content = transport.get_bytes(path)?;
+        Ok(crate::weave::sha_strings(&[content.as_slice()]))
     }
 }
 
@@ -2425,8 +2442,12 @@ mod tests {
     /// back through the full standalone API (not just 2a).
     ///
     /// Runs the create -> add -> commit -> re-open -> read cycle for a named
-    /// control-directory format and asserts the round-trip.
-    fn create_commit_read(format_name: &str) {
+    /// control-directory format and asserts the round-trip. `rich_root` is
+    /// the format's rich-root flag: a rich-root repository records an empty
+    /// per-file text for the tree root, a non-rich-root one must not (this is
+    /// what brz's record_iter_changes does, and writing a root text produces
+    /// a repository brz never would).
+    fn create_commit_read(format_name: &str, rich_root: bool) {
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let fmt = crate::bzrdir::find_control_dir_format(format_name).unwrap();
@@ -2453,26 +2474,31 @@ mod tests {
         let paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
         assert_eq!(paths, vec!["a.txt".to_string()]);
         assert_eq!(repo.get_file_text(&file_id, &revid).unwrap(), b"hello\n");
+
+        // The tree root is versioned (an empty text exists) only for a
+        // rich-root format.
+        let root_text = repo.get_file_text(crate::inventory::ROOT_ID, &revid);
+        assert_eq!(root_text.is_ok(), rich_root, "root text for {format_name}");
     }
 
     #[cfg(feature = "knitpack")]
     #[test]
     fn create_commit_read_btree_knit_pack() {
         // 1.9 uses B+Tree pack indices.
-        create_commit_read("1.9");
+        create_commit_read("1.9", false);
     }
 
     #[cfg(feature = "knitpack")]
     #[test]
     fn create_commit_read_graphindex_knit_pack() {
         // pack-0.92 uses the older format-1 GraphIndex pack indices.
-        create_commit_read("pack-0.92");
+        create_commit_read("pack-0.92", false);
     }
 
     #[cfg(feature = "knitpack")]
     #[test]
     fn create_commit_read_rich_root_pack() {
-        create_commit_read("rich-root-pack");
+        create_commit_read("rich-root-pack", true);
     }
 
     /// A format-3 working tree over a temp dir, with its checkout dir and
@@ -2631,5 +2657,45 @@ mod tests {
             .collect();
         assert_eq!(paths, vec!["a.txt".to_string()]);
         assert_eq!(repo.get_file_text(&file_id, &revid).unwrap(), b"hi\n");
+    }
+
+    /// A format-3 commit writes the basis-inventory cache (xml7) and a diff
+    /// against the basis writes the stat cache, both in the form brz keeps
+    /// (cross-checked against `brz check`/`status` separately).
+    #[cfg(feature = "knit")]
+    #[test]
+    fn knit_format_writes_basis_and_stat_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let format = crate::bzrdir::find_control_dir_format("knit").unwrap();
+        let cd = BzrDirMeta::create_with_format(&parent, format).unwrap();
+        parent.put_bytes("a.txt", b"hi\n", None).unwrap();
+        let mut wt = cd.open_workingtree().unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        wt.commit(
+            repo.as_mut(),
+            &branch,
+            &CommitOptions::new("T <t@e>", "first").timestamp(1577880000),
+        )
+        .unwrap();
+
+        // The basis inventory is cached as xml7.
+        let cache = parent
+            .get_bytes(".bzr/checkout/basis-inventory-cache")
+            .unwrap();
+        assert!(cache.starts_with(b"<inventory format=\"7\""));
+
+        // A diff against the basis writes the stat (hash) cache.
+        let reopened = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let wt2 = reopened.open_workingtree().unwrap();
+        let repo2 = reopened.open_repository().unwrap();
+        let basis = repo2
+            .revision_tree(wt2.basis_revision().unwrap().as_slice())
+            .unwrap();
+        wt2.iter_changes(&basis).unwrap();
+        let stat_cache = parent.get_bytes(".bzr/checkout/stat-cache").unwrap();
+        assert!(stat_cache.starts_with(b"### bzr hashcache v5\n"));
     }
 }

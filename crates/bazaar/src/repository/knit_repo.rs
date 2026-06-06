@@ -93,6 +93,7 @@ pub struct KnitRepository {
     format: &'static RepositoryFormat,
     revisions: KnitStore<ConstantMapper, KnitPlainFactory>,
     inventories: KnitStore<ConstantMapper, KnitPlainFactory>,
+    signatures: KnitStore<ConstantMapper, KnitPlainFactory>,
     texts: KnitStore<HashPrefixMapper, KnitAnnotateFactory>,
 }
 
@@ -115,8 +116,18 @@ impl KnitRepository {
             },
             KnitPlainFactory,
         );
-        // The constant (single-file) stores must have their one prefix loaded
-        // before keys/reads see anything; the kndx index is otherwise lazy.
+        let signatures = make_store(
+            &transport,
+            ConstantMapper {
+                result: "signatures".into(),
+            },
+            KnitPlainFactory,
+        );
+        // The revisions and inventory stores must have their one prefix loaded
+        // before keys/reads see anything (the kndx index is otherwise lazy).
+        // The signatures store is loaded lazily on first access: most repos
+        // are unsigned, and eager-loading would create an empty signatures.kndx
+        // that brz never writes.
         for store in [&revisions, &inventories] {
             store
                 .index()
@@ -131,6 +142,7 @@ impl KnitRepository {
             format,
             revisions,
             inventories,
+            signatures,
             texts: make_store(&knits, HashPrefixMapper, KnitAnnotateFactory),
         })
     }
@@ -242,6 +254,33 @@ impl KnitRepository {
             .add_lines(key, parent_keys, split_lines(&bytes), false)
             .map_err(|e| RepositoryError::Corrupt(format!("add revision: {e}")))?;
         Ok(())
+    }
+
+    /// Add a signature text for `revision_id` (the clearsigned testament) to
+    /// the `signatures` knit.
+    pub fn add_signature(
+        &mut self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let key: KnitKey = vec![revision_id.to_vec()];
+        self.signatures
+            .add_lines(key, Vec::new(), split_lines(signature), false)
+            .map_err(|e| RepositoryError::Corrupt(format!("add signature: {e}")))?;
+        Ok(())
+    }
+
+    /// The signature text stored for `revision_id`, or `None` if unsigned.
+    pub fn get_signature_text(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        let key: KnitKey = vec![revision_id.to_vec()];
+        match self.signatures.get_text(&key) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(crate::knit::KnitError::RevisionNotPresent(_)) => Ok(None),
+            Err(e) => Err(RepositoryError::Corrupt(format!("signature: {e}"))),
+        }
     }
 
     /// Build the inventory from `entries`, serialise it to XML, and add it.
@@ -403,18 +442,14 @@ impl super::Repository for KnitRepository {
 
     fn add_signature_text(
         &mut self,
-        _revision_id: &[u8],
-        _signature: &[u8],
+        revision_id: &[u8],
+        signature: &[u8],
     ) -> Result<(), RepositoryError> {
-        // TODO: knit signature writing (signatures.kndx) is not implemented;
-        // commit always targets a pack format.
-        Err(RepositoryError::UnsupportedFormat(
-            "signature writing for knit repositories",
-        ))
+        KnitRepository::add_signature(self, revision_id, signature)
     }
 
-    fn get_signature_text(&self, _revision_id: &[u8]) -> Result<Option<Vec<u8>>, RepositoryError> {
-        Ok(None)
+    fn get_signature_text(&self, revision_id: &[u8]) -> Result<Option<Vec<u8>>, RepositoryError> {
+        KnitRepository::get_signature_text(self, revision_id)
     }
 
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
@@ -570,6 +605,23 @@ mod tests {
         let inv = repo.get_inventory(b"rev-1").unwrap();
         let paths: Vec<String> = inv.entries().iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(paths, vec!["a.txt".to_string()]);
+    }
+
+    #[test]
+    fn signature_round_trips() {
+        let (_d, t) = temp();
+        let mut repo = KnitRepository::create(t.clone(), knit1()).unwrap();
+        repo.add_revision(&rev(b"rev-1", vec![], "first"), &[])
+            .unwrap();
+        repo.add_signature(b"rev-1", b"-----SIG-----\nsigned rev-1\n")
+            .unwrap();
+
+        let repo = KnitRepository::open(t).unwrap();
+        assert_eq!(
+            repo.get_signature_text(b"rev-1").unwrap().as_deref(),
+            Some(&b"-----SIG-----\nsigned rev-1\n"[..])
+        );
+        assert_eq!(repo.get_signature_text(b"rev-unsigned").unwrap(), None);
     }
 
     #[test]

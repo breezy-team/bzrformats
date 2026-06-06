@@ -9,12 +9,15 @@
 //! Built only with the `weave` or `knit` feature (see the gate on this module
 //! in the parent).
 
+use std::sync::Mutex;
+
+use crate::hashcache::HashCache;
 use crate::transport::{SharedTransport, TransportError};
 
 use super::{
-    basename, build_committed_entries, change_selected, compute_changes, sign_commit,
-    CommitOptions, EntryKind, LiveEntries, LiveEntry, VersionedEntry, WorkingTree,
-    WorkingTreeChange, WorkingTreeError,
+    basename, build_committed_entries, change_selected, compute_changes, read_and_hash,
+    sign_commit, CommitOptions, EntryKind, FileSha, LiveEntries, LiveEntry, VersionedEntry,
+    WorkingTree, WorkingTreeChange, WorkingTreeError,
 };
 
 /// How a pre-dirstate working tree records its basis revision.
@@ -37,6 +40,12 @@ struct Wt3Layout {
     inventory: &'static str,
     pending_merges: &'static str,
     basis: Wt3Basis,
+    /// The basis-inventory cache file (the basis inventory serialised as
+    /// xml7), kept so the basis tree need not be reconstructed from the
+    /// repository on every status/diff.
+    basis_inventory_cache: &'static str,
+    /// The stat (hash) cache file, keyed by stat fingerprint.
+    stat_cache: &'static str,
 }
 
 /// The knit format-3 layout: files under `.bzr/checkout/`, basis in a
@@ -45,6 +54,8 @@ const WT3_CHECKOUT_LAYOUT: Wt3Layout = Wt3Layout {
     inventory: ".bzr/checkout/inventory",
     pending_merges: ".bzr/checkout/pending-merges",
     basis: Wt3Basis::LastRevisionFile(".bzr/checkout/last-revision"),
+    basis_inventory_cache: ".bzr/checkout/basis-inventory-cache",
+    stat_cache: ".bzr/checkout/stat-cache",
 };
 
 /// The weave all-in-one layout: files directly under `.bzr/`, basis taken
@@ -54,6 +65,8 @@ const WT3_ALL_IN_ONE_LAYOUT: Wt3Layout = Wt3Layout {
     inventory: ".bzr/inventory",
     pending_merges: ".bzr/pending-merges",
     basis: Wt3Basis::RevisionHistory(".bzr/revision-history"),
+    basis_inventory_cache: ".bzr/basis-inventory-cache",
+    stat_cache: ".bzr/stat-cache",
 };
 
 /// The pre-dirstate working tree, accessed through a transport rooted at the
@@ -67,13 +80,18 @@ const WT3_ALL_IN_ONE_LAYOUT: Wt3Layout = Wt3Layout {
 /// 3 keeps them under `.bzr/checkout/`, the weave all-in-one format under
 /// `.bzr/` with the basis in the branch's `revision-history`.
 ///
-/// TODO: the `basis-inventory-cache` and `stat-cache` files brz also keeps
-/// are not read or maintained here; they are an optimization, not required
-/// for correctness.
+/// On a local-filesystem tree the [`HashCache`] (`stat-cache`) caches each
+/// file's sha1 keyed by stat fingerprint, so the diff against the basis does
+/// not re-hash unchanged files; it is `None` for a non-local transport. The
+/// basis inventory is cached as xml7 in `basis-inventory-cache` when the
+/// basis advances.
 pub struct WorkingTree3 {
     transport: SharedTransport,
     inventory: crate::inventory::MutableInventory,
     layout: Wt3Layout,
+    /// The stat (hash) cache, or `None` when the tree is not on the local
+    /// filesystem (the hashcache works through `std::fs`, not the transport).
+    hashcache: Option<Mutex<HashCache>>,
 }
 
 impl WorkingTree3 {
@@ -96,11 +114,26 @@ impl WorkingTree3 {
         layout: Wt3Layout,
     ) -> Result<Self, WorkingTreeError> {
         let inventory = Self::read_inventory(&transport, &layout)?;
+        let hashcache = Self::open_hashcache(&transport, &layout);
         Ok(WorkingTree3 {
             transport,
             inventory,
             layout,
+            hashcache,
         })
+    }
+
+    /// Open the stat (hash) cache for a local-filesystem tree, reading any
+    /// existing entries. Returns `None` when the transport is not local (the
+    /// cache works through `std::fs`); a cache that fails to read starts
+    /// empty rather than failing the open.
+    fn open_hashcache(transport: &SharedTransport, layout: &Wt3Layout) -> Option<Mutex<HashCache>> {
+        let root = transport.local_path("")?;
+        let cache_file = transport.local_path(layout.stat_cache)?;
+        let mut hc = HashCache::new(&root, &cache_file, None, None);
+        // A missing or unreadable cache simply starts empty.
+        let _ = hc.read();
+        Some(Mutex::new(hc))
     }
 
     fn read_inventory(
@@ -283,12 +316,12 @@ impl WorkingTree for WorkingTree3 {
         basis: &crate::repository::RevisionTree,
         other_parents: &[crate::repository::RevisionTree],
     ) -> Result<Vec<WorkingTreeChange>, WorkingTreeError> {
-        compute_changes(
-            &self.transport,
-            &self.collect_live_entries(),
-            basis,
-            other_parents,
-        )
+        let live = self.collect_live_entries();
+        let changes = self.with_file_sha(|file_sha| {
+            compute_changes(&self.transport, file_sha, &live, basis, other_parents)
+        })?;
+        self.flush_hashcache();
+        Ok(changes)
     }
 
     fn add(
@@ -406,7 +439,9 @@ impl WorkingTree for WorkingTree3 {
             .collect::<Result<_, _>>()
             .map_err(WorkingTreeError::Repository)?;
         let live = self.collect_live_entries();
-        let mut changes = compute_changes(&self.transport, &live, &basis, &other_parents)?;
+        let mut changes = self.with_file_sha(|file_sha| {
+            compute_changes(&self.transport, file_sha, &live, &basis, &other_parents)
+        })?;
         if selective {
             changes.retain(|c| change_selected(c, &options.specific_files, &options.exclude));
         }
@@ -452,6 +487,8 @@ impl WorkingTree for WorkingTree3 {
         }
 
         if let Some(key) = &options.signing_key {
+            // The committed inventory entries (root first), needed only to
+            // build the testament for signing.
             let (paths, inv_entries) =
                 build_committed_entries(&self.transport, &live, &revid, &basis, &changes)?;
             let signature = sign_commit(
@@ -500,20 +537,104 @@ impl WorkingTree for WorkingTree3 {
         // basis lives in a dedicated last-revision file; for the all-in-one
         // layout it is the branch's revision-history, which the branch already
         // advanced above, so nothing more to write there.
-        //
-        // TODO: basis-inventory-cache is not written; it is an optimization
-        // brz keeps but is not required for correctness.
         if let Wt3Basis::LastRevisionFile(path) = self.layout.basis {
             self.transport.put_bytes(path, &revid, None)?;
         }
         self.transport
             .put_bytes(self.layout.pending_merges, b"", None)?;
 
+        // Cache the new basis inventory (as xml7), reading it back from the
+        // now-committed repository so no working-tree file is re-hashed.
+        self.write_basis_inventory_cache(repository, &revid)?;
+
+        // Persist any stat-cache entries the diff computed.
+        self.flush_hashcache();
+
         Ok(revid)
     }
 }
 
 impl WorkingTree3 {
+    /// Write the basis-inventory cache: the new basis revision's inventory,
+    /// serialised as xml7 with its `revision_id` recorded (the form brz keeps
+    /// in `basis-inventory-cache`), so the basis tree can be read back without
+    /// reconstructing it from the repository.
+    ///
+    /// The inventory is read back from the repository (a single inventory
+    /// record, just written by the commit) rather than re-derived from the
+    /// working tree, so no working-tree file is read or hashed again.
+    fn write_basis_inventory_cache(
+        &self,
+        repository: &dyn crate::repository::Repository,
+        revid: &[u8],
+    ) -> Result<(), WorkingTreeError> {
+        use crate::serializer::InventorySerializer;
+        let basis_inv = repository
+            .get_inventory(revid)
+            .map_err(WorkingTreeError::Repository)?;
+        // Rebuild a MutableInventory (root first, then parent-before-child as
+        // `entries` yields) so it can be re-serialised as xml7.
+        let mut inv = crate::inventory::MutableInventory::new();
+        inv.revision_id = Some(crate::RevisionId::from(revid));
+        if let Some(root) = basis_inv
+            .root_entry()
+            .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?
+        {
+            inv.add(root)
+                .map_err(|e| WorkingTreeError::Commit(format!("build basis inventory: {e:?}")))?;
+        }
+        let entries = basis_inv
+            .entries()
+            .map_err(|e| WorkingTreeError::Commit(format!("reading basis inventory: {e:?}")))?;
+        for (_path, entry) in entries {
+            inv.add(entry)
+                .map_err(|e| WorkingTreeError::Commit(format!("build basis inventory: {e:?}")))?;
+        }
+        let lines = crate::xml_serializer::XMLInventorySerializer7
+            .write_inventory_to_lines(&inv, false)
+            .map_err(|e| WorkingTreeError::Commit(format!("serialise basis inventory: {e:?}")))?;
+        let bytes: Vec<u8> = lines.concat();
+        self.transport
+            .put_bytes(self.layout.basis_inventory_cache, &bytes, None)?;
+        Ok(())
+    }
+
+    /// Run `f` with a [`FileSha`] that resolves a working-tree file's sha1.
+    /// When a stat cache is present it answers from the cache (re-hashing only
+    /// files whose stat fingerprint changed); otherwise it reads and hashes.
+    fn with_file_sha<R>(&self, f: impl FnOnce(&FileSha<'_>) -> R) -> R {
+        match &self.hashcache {
+            Some(hc) => {
+                let fallback = read_and_hash(&self.transport);
+                let provider = move |path: &str| -> Result<Vec<u8>, WorkingTreeError> {
+                    let mut hc = hc.lock().unwrap();
+                    match hc.get_sha1(std::path::Path::new(path), None) {
+                        // The cache yields a hex sha string; the diff compares
+                        // raw bytes, so return its bytes.
+                        Ok(Some(sha)) => Ok(sha.into_bytes()),
+                        // Not a regular file (or vanished): fall back, which
+                        // matches reading the working copy directly.
+                        Ok(None) => fallback(path),
+                        Err(_) => fallback(path),
+                    }
+                };
+                f(&provider)
+            }
+            None => f(&read_and_hash(&self.transport)),
+        }
+    }
+
+    /// Write the stat cache back to disk if the last diff dirtied it.
+    fn flush_hashcache(&self) {
+        if let Some(hc) = &self.hashcache {
+            let mut hc = hc.lock().unwrap();
+            if hc.needs_write() {
+                // A best-effort cache: a write failure is not fatal.
+                let _ = hc.write();
+            }
+        }
+    }
+
     /// Collect the live tree entries from the working inventory, pairing each
     /// with its on-disk symlink target (read lazily) for the diff.
     fn collect_live_entries(&self) -> LiveEntries {
