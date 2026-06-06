@@ -7,19 +7,73 @@
 //! for mutations.
 
 pub mod format;
-mod formats;
 
 pub use format::{all_formats, find_format, BranchFormat};
 
 use std::collections::BTreeMap;
 
+use crate::declare_branch_format;
+use crate::lockdir::{Lock, LockDir, LockError};
+use crate::transport::{SharedTransport, TransportError};
+
+// Branch format 5 (full history) is the weave/knit-era layout: it keeps the
+// whole mainline in `revision-history` rather than a single `last-revision`
+// line, so it is only built when an older repository backend that pairs with
+// it is enabled.
+#[cfg(any(feature = "weave", feature = "knit"))]
+declare_branch_format! {
+    FORMAT_5 {
+        format_string: b"Bazaar-NG branch format 5\n",
+        description: "Branch format 5 (full history)",
+        supports_tags: false,
+        full_history: true,
+        supported: true,
+        deprecated: true,
+    }
+}
+
+declare_branch_format! {
+    FORMAT_6 {
+        format_string: b"Bazaar Branch Format 6 (bzr 0.15)\n",
+        description: "Branch format 6",
+        supports_tags: true,
+        supported: true,
+    }
+}
+
+declare_branch_format! {
+    FORMAT_7 {
+        format_string: b"Bazaar Branch Format 7 (needs bzr 1.6)\n",
+        description: "Branch format 7 (stackable)",
+        supports_tags: true,
+        supports_stacking: true,
+        supported: true,
+    }
+}
+
+declare_branch_format! {
+    FORMAT_8 {
+        format_string: b"Bazaar Branch Format 8 (needs bzr 1.15)\n",
+        description: "Branch format 8 (reference locations)",
+        supports_tags: true,
+        supports_stacking: true,
+        supports_reference_locations: true,
+        supported: true,
+    }
+}
+
+declare_branch_format! {
+    REFERENCE_FORMAT_1 {
+        format_string: b"Bazaar-NG Branch Reference Format 1\n",
+        description: "Branch reference format 1",
+        is_reference: true,
+    }
+}
+
 /// The branch format assumed when the `format` marker is absent (the
 /// in-memory test transports don't write one). Format 7 is the modern
 /// `last-revision` layout.
-const DEFAULT_FORMAT: &BranchFormat = &formats::FORMAT_7;
-
-use crate::lockdir::{Lock, LockDir, LockError};
-use crate::transport::{SharedTransport, TransportError};
+const DEFAULT_FORMAT: &BranchFormat = &FORMAT_7;
 
 /// The null revision id, used when a branch has no commits.
 pub const NULL_REVISION: &[u8] = b"null:";
@@ -365,6 +419,7 @@ mod tests {
     }
 
     /// A format-5 (full-history) branch over a temp dir.
+    #[cfg(any(feature = "weave", feature = "knit"))]
     fn branch_transport_format5() -> (tempfile::TempDir, Branch, Arc<LocalTransport>) {
         let dir = tempfile::tempdir().unwrap();
         let probe = Arc::new(LocalTransport::new(dir.path()));
@@ -403,6 +458,7 @@ mod tests {
         assert_eq!(probe.get_bytes("last-revision").unwrap(), b"2 x\n");
     }
 
+    #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn format5_empty_branch_is_null_revision() {
         let (_d, branch, _probe) = branch_transport_format5();
@@ -414,6 +470,7 @@ mod tests {
         assert!(branch.revision_history().unwrap().is_empty());
     }
 
+    #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn format5_appends_to_revision_history() {
         let (_d, branch, probe) = branch_transport_format5();
@@ -431,6 +488,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn format5_set_revision_history_replaces() {
         let (_d, branch, _probe) = branch_transport_format5();

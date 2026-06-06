@@ -21,6 +21,53 @@ use crate::transport::SharedTransport;
 
 use super::format::RepositoryFormat;
 use super::pack_2a::RepositoryError;
+use crate::declare_repository_format;
+use crate::xml_serializer::{
+    XMLInventorySerializer5, XMLInventorySerializer6, XMLInventorySerializer7,
+    XMLRevisionSerializer5,
+};
+
+declare_repository_format! {
+    FORMAT_KNIT_1 {
+        format_string: b"Bazaar-NG Knit Repository Format 1",
+        description: "Knit repository format 1",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer5,
+        open: open_knit,
+        create: create_knit,
+        supported: true,
+        deprecated: true,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_3 {
+        format_string: b"Bazaar Knit Repository Format 3 (bzr 0.15)\n",
+        description: "Knit repository format 3 (rich root, subtrees)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer7,
+        open: open_knit,
+        create: create_knit,
+        rich_root_data: true,
+        supports_tree_reference: true,
+        supported: true,
+        deprecated: true,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_4 {
+        format_string: b"Bazaar Knit Repository Format 4 (bzr 1.0)\n",
+        description: "Knit repository format 4 (rich root)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer6,
+        open: open_knit,
+        create: create_knit,
+        rich_root_data: true,
+        supported: true,
+        deprecated: true,
+    }
+}
 
 /// A knit store of one object kind, keyed by a mapper and parsed by a
 /// factory. Revisions and inventories use the plain factory; file texts use

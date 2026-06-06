@@ -27,10 +27,10 @@
 //! a meta-directory.
 
 pub mod format;
-mod formats;
 
 pub use format::{control_dir_formats, find_control_dir_format, ControlDirFormat};
 
+use crate::declare_bzrdir_format;
 use crate::transport::{SharedTransport, Transport, TransportError};
 
 /// Top-level marker in `.bzr/branch-format` for the meta directory layout.
@@ -44,6 +44,128 @@ pub const BRANCH_FORMAT_7: &[u8] = b"Bazaar Branch Format 7 (needs bzr 1.6)\n";
 
 /// Supported working-tree format marker (Format 6).
 pub const WORKINGTREE_FORMAT_6: &[u8] = b"Bazaar Working Tree Format 6 (bzr 1.14)\n";
+
+// The `brz init --format=` combos this crate can create, each pairing a
+// repository, branch and working-tree marker. A combo is gated behind the
+// same feature as the older repository backend it creates, so it is only
+// registered when that backend is built.
+const B5: &[u8] = b"Bazaar-NG branch format 5\n";
+const B6: &[u8] = b"Bazaar Branch Format 6 (bzr 0.15)\n";
+const B7: &[u8] = BRANCH_FORMAT_7;
+const WT3: &[u8] = b"Bazaar-NG Working Tree format 3";
+const WT4: &[u8] = b"Bazaar Working Tree Format 4 (bzr 0.15)\n";
+const WT5: &[u8] = b"Bazaar Working Tree Format 5 (bzr 1.11)\n";
+const WT6: &[u8] = WORKINGTREE_FORMAT_6;
+
+declare_bzrdir_format! {
+    FORMAT_2A {
+        name: "2a",
+        repo_marker: REPOSITORY_FORMAT_2A,
+        branch_marker: B7,
+        wt_marker: WT6,
+        wt_has_views: true,
+    }
+}
+
+#[cfg(feature = "knitpack")]
+declare_bzrdir_format! {
+    FORMAT_PACK_0_92 {
+        name: "pack-0.92",
+        repo_marker: b"Bazaar pack repository format 1 (needs bzr 0.92)\n",
+        branch_marker: B6,
+        wt_marker: WT4,
+    }
+}
+
+#[cfg(feature = "knitpack")]
+declare_bzrdir_format! {
+    FORMAT_PACK_0_92_SUBTREE {
+        name: "pack-0.92-subtree",
+        repo_marker: b"Bazaar pack repository format 1 with subtree support (needs bzr 0.92)\n",
+        branch_marker: B6,
+        wt_marker: WT4,
+    }
+}
+
+#[cfg(feature = "knitpack")]
+declare_bzrdir_format! {
+    FORMAT_RICH_ROOT_PACK {
+        name: "rich-root-pack",
+        repo_marker: b"Bazaar pack repository format 1 with rich root (needs bzr 1.0)\n",
+        branch_marker: B6,
+        wt_marker: WT4,
+    }
+}
+
+#[cfg(feature = "knitpack")]
+declare_bzrdir_format! {
+    FORMAT_1_6 {
+        name: "1.6",
+        repo_marker: b"Bazaar RepositoryFormatKnitPack5 (bzr 1.6)\n",
+        branch_marker: B7,
+        wt_marker: WT4,
+    }
+}
+
+#[cfg(feature = "knitpack")]
+declare_bzrdir_format! {
+    FORMAT_1_6_1_RICH_ROOT {
+        name: "1.6.1-rich-root",
+        repo_marker: b"Bazaar RepositoryFormatKnitPack5RichRoot (bzr 1.6.1)\n",
+        branch_marker: B7,
+        wt_marker: WT4,
+    }
+}
+
+#[cfg(feature = "knitpack")]
+declare_bzrdir_format! {
+    FORMAT_1_9 {
+        name: "1.9",
+        repo_marker: b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n",
+        branch_marker: B7,
+        wt_marker: WT4,
+    }
+}
+
+#[cfg(feature = "knitpack")]
+declare_bzrdir_format! {
+    FORMAT_1_9_RICH_ROOT {
+        name: "1.9-rich-root",
+        repo_marker: b"Bazaar RepositoryFormatKnitPack6RichRoot (bzr 1.9)\n",
+        branch_marker: B7,
+        wt_marker: WT4,
+    }
+}
+
+#[cfg(feature = "knitpack")]
+declare_bzrdir_format! {
+    FORMAT_1_14 {
+        name: "1.14",
+        repo_marker: b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n",
+        branch_marker: B7,
+        wt_marker: WT5,
+    }
+}
+
+#[cfg(feature = "knitpack")]
+declare_bzrdir_format! {
+    FORMAT_1_14_RICH_ROOT {
+        name: "1.14-rich-root",
+        repo_marker: b"Bazaar RepositoryFormatKnitPack6RichRoot (bzr 1.9)\n",
+        branch_marker: B7,
+        wt_marker: WT5,
+    }
+}
+
+#[cfg(feature = "knit")]
+declare_bzrdir_format! {
+    FORMAT_KNIT {
+        name: "knit",
+        repo_marker: b"Bazaar-NG Knit Repository Format 1",
+        branch_marker: B5,
+        wt_marker: WT3,
+    }
+}
 
 /// Errors from opening a `.bzr` directory.
 #[derive(Debug)]
@@ -401,11 +523,13 @@ impl ControlDir for BzrDirMeta {
 /// Unlike the meta-directory layout, the repository, branch and working
 /// tree all live directly under `.bzr` rather than in component
 /// subdirectories. The transport is rooted at `.bzr` itself.
+#[cfg(feature = "weave")]
 pub struct BzrDirAllInOne {
     transport: SharedTransport,
     format: &'static crate::repository::RepositoryFormat,
 }
 
+#[cfg(feature = "weave")]
 impl BzrDirAllInOne {
     /// Open the all-in-one `.bzr` directory reachable through `transport`
     /// (rooted at `.bzr` itself).
@@ -459,6 +583,7 @@ impl BzrDirAllInOne {
     }
 }
 
+#[cfg(feature = "weave")]
 impl ControlDir for BzrDirAllInOne {
     fn transport(&self) -> &SharedTransport {
         &self.transport
@@ -525,7 +650,14 @@ pub fn open(transport: SharedTransport) -> Result<Box<dyn ControlDir>, BzrDirErr
     if marker == METADIR_MARKER {
         return Ok(Box::new(BzrDirMeta::open(transport)?));
     }
-    Ok(Box::new(BzrDirAllInOne::open(transport)?))
+    #[cfg(feature = "weave")]
+    {
+        Ok(Box::new(BzrDirAllInOne::open(transport)?))
+    }
+    #[cfg(not(feature = "weave"))]
+    {
+        Err(BzrDirError::NotMetaDir(marker))
+    }
 }
 
 /// Serialise an empty dirstate (one root entry, no parents).
@@ -663,15 +795,21 @@ mod tests {
     // captured byte-for-byte from a `brz init --format=weave` tree. The
     // revision id is jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8 and the
     // file is a.txt with content "hi\n".
+    #[cfg(feature = "weave")]
     const WEAVE_REVID: &[u8] = b"jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8";
+    #[cfg(feature = "weave")]
     const WEAVE_FILE_ID: &[u8] = b"a.txt-20260604015637-2c5ba92i40zw1mvp-1";
 
+    #[cfg(feature = "weave")]
     const WEAVE_INVENTORY: &[u8] = b"# bzr weave file v5\ni\n1 8a002a6377d9177f17c988d81dda2e0175a18398\nn jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8\n\nw\n{ 0\n. <inventory format=\"5\" revision_id=\"jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8\">\n. <file file_id=\"a.txt-20260604015637-2c5ba92i40zw1mvp-1\" name=\"a.txt\" revision=\"jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8\" text_sha1=\"55ca6286e3e4f4fba5d0448333fa99fc5a404a73\" text_size=\"3\" />\n. </inventory>\n}\nW\n";
 
+    #[cfg(feature = "weave")]
     const WEAVE_REVISION: &[u8] = b"<revision committer=\"Jelmer Vernooij &lt;jelmer@jelmer.uk&gt;\" format=\"5\" inventory_sha1=\"8a002a6377d9177f17c988d81dda2e0175a18398\" revision_id=\"jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8\" timestamp=\"1577880000.000\" timezone=\"0\">\n<message>one</message>\n<properties><property name=\"branch-nick\">wv</property>\n</properties>\n</revision>\n";
 
+    #[cfg(feature = "weave")]
     const WEAVE_FILE_WEAVE: &[u8] = b"# bzr weave file v5\ni\n1 55ca6286e3e4f4fba5d0448333fa99fc5a404a73\nn jelmer@jelmer.uk-20200101120000-jebv9gxg8ubhzbj8\n\nw\n{ 0\n. hi\n}\nW\n";
 
+    #[cfg(feature = "weave")]
     fn make_weave_bzrdir(root: &std::path::Path) {
         use crate::key_mapper::{hash_prefix_map, url_unquote};
         let bzr = root.join(".bzr");
@@ -708,6 +846,7 @@ mod tests {
         std::fs::write(weave_path, WEAVE_FILE_WEAVE).unwrap();
     }
 
+    #[cfg(feature = "weave")]
     #[test]
     fn opens_all_in_one_weave() {
         let dir = tempfile::tempdir().unwrap();

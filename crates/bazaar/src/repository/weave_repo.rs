@@ -20,6 +20,23 @@ use crate::weave::{read_weave_v5, write_weave_v5, WeaveFile};
 
 use super::format::RepositoryFormat;
 use super::pack_2a::RepositoryError;
+use crate::declare_repository_format;
+use crate::xml_serializer::{XMLInventorySerializer5, XMLRevisionSerializer5};
+
+declare_repository_format! {
+    FORMAT_WEAVE_6 {
+        format_string: b"Bazaar-NG branch, format 6\n",
+        description: "Weave repository format 6 (all-in-one)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer5,
+        // No `open`/`create`: the all-in-one weave repository has no
+        // `.bzr/repository/format` marker, so it is reached through BzrDir's
+        // all-in-one path rather than the metadir dispatcher.
+        all_in_one: true,
+        supported: true,
+        deprecated: true,
+    }
+}
 
 /// An all-in-one weave repository, accessed through a transport rooted at
 /// `.bzr` (the control directory itself).

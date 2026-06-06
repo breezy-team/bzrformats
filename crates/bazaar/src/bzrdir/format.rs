@@ -92,6 +92,7 @@ mod tests {
         assert!(f.wt_has_views);
     }
 
+    #[cfg(feature = "knit")]
     #[test]
     fn the_knit_combo_pairs_branch_5_and_wt_3() {
         let f = find_control_dir_format("knit").expect("knit combo registered");

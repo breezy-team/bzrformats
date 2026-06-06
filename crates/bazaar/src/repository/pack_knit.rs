@@ -22,6 +22,124 @@ use crate::transport::{SharedTransport, Transport};
 
 use super::format::RepositoryFormat;
 use super::pack_2a::RepositoryError;
+use crate::declare_repository_format;
+use crate::xml_serializer::{
+    XMLInventorySerializer5, XMLInventorySerializer6, XMLInventorySerializer7,
+    XMLRevisionSerializer5,
+};
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_1 {
+        format_string: b"Bazaar pack repository format 1 (needs bzr 0.92)\n",
+        description: "Pack repository format 1",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer5,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        supported: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_3 {
+        format_string: b"Bazaar pack repository format 1 with subtree support (needs bzr 0.92)\n",
+        description: "Pack repository format 1 with subtree support",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer7,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        rich_root_data: true,
+        supports_tree_reference: true,
+        supported: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_4 {
+        format_string: b"Bazaar pack repository format 1 with rich root (needs bzr 1.0)\n",
+        description: "Pack repository format 1 with rich root",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer6,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        rich_root_data: true,
+        supported: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_5 {
+        format_string: b"Bazaar RepositoryFormatKnitPack5 (bzr 1.6)\n",
+        description: "Pack repository format 5 (stackable)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer5,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        supports_external_lookups: true,
+        supported: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_5_RICH_ROOT {
+        format_string: b"Bazaar RepositoryFormatKnitPack5RichRoot (bzr 1.6.1)\n",
+        description: "Pack repository format 5 with rich root (stackable)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer6,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        rich_root_data: true,
+        supports_external_lookups: true,
+        supported: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_5_RICH_ROOT_BROKEN {
+        format_string: b"Bazaar RepositoryFormatKnitPack5RichRoot (bzr 1.6)\n",
+        description: "Pack repository format 5 with rich root (broken)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer6,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        rich_root_data: true,
+        supports_external_lookups: true,
+        deprecated: true,
+        uses_btree_index: false,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_6 {
+        format_string: b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n",
+        description: "Pack repository format 6 (btree indexes, stackable)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer5,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        supports_external_lookups: true,
+        supported: true,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_KNIT_PACK_6_RICH_ROOT {
+        format_string: b"Bazaar RepositoryFormatKnitPack6RichRoot (bzr 1.9)\n",
+        description: "Pack repository format 6 with rich root (btree, stackable)",
+        revision_serializer: &XMLRevisionSerializer5,
+        inventory_serializer: &XMLInventorySerializer6,
+        open: open_knit_pack,
+        create: create_knit_pack,
+        rich_root_data: true,
+        supports_external_lookups: true,
+        supported: true,
+    }
+}
 
 /// The pack name is used as the knit `FileRef`.
 type PackName = String;

@@ -214,6 +214,7 @@ mod tests {
         assert!(f.is_supported());
     }
 
+    #[cfg(feature = "knitpack")]
     #[test]
     fn knitpack_formats_are_registered() {
         let f = find_format(b"Bazaar pack repository format 1 (needs bzr 0.92)\n")
@@ -226,6 +227,7 @@ mod tests {
         assert_eq!(f.inventory_serializer.format_num(), b"5");
     }
 
+    #[cfg(feature = "knitpack")]
     #[test]
     fn rich_root_knitpack_uses_xml6() {
         let f = find_format(b"Bazaar pack repository format 1 with rich root (needs bzr 1.0)\n")
@@ -240,7 +242,10 @@ mod tests {
     }
 
     #[test]
-    fn all_formats_are_nonempty() {
-        assert!(all_formats().len() >= 10);
+    fn the_always_on_2a_format_is_present() {
+        // 2a is built regardless of the older-format features, so the registry
+        // is never empty.
+        assert!(find_format(b"Bazaar repository format 2a (needs bzr 1.16 or later)\n").is_some());
+        assert!(!all_formats().is_empty());
     }
 }

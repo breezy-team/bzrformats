@@ -64,8 +64,13 @@ default-features = false
 features = ["crypto-openssl"]
 
 [features]
-default = ["pyo3"]
+default = ["pyo3", "weave", "knit", "knitpack"]
 pyo3 = ["dep:pyo3"]
 # In-process OpenPGP commit signing via Sequoia. Off by default because it
 # pulls a crypto backend (OpenSSL) into the build.
 gpg = ["dep:sequoia-openpgp"]
+# Older-generation repository backends, each gating its reader/writer and
+# format declarations. The current 2a (groupcompress) format is always built.
+weave = []     # all-in-one weave repository (bzr 0.8)
+knit = []      # non-pack knit repository (Bazaar-NG Knit Format 1)
+knitpack = []  # knit-pack repositories (0.92 through 1.14)

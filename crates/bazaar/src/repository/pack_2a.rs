@@ -26,6 +26,41 @@ use crate::transport::{Transport, TransportError};
 use crate::versionedfile::Key;
 
 use super::format::RepositoryFormat;
+use crate::bencode_serializer::BEncodeRevisionSerializer1;
+use crate::declare_repository_format;
+use crate::xml_serializer::Chk255BigPageInventorySerializer;
+
+declare_repository_format! {
+    FORMAT_2A {
+        format_string: b"Bazaar repository format 2a (needs bzr 1.16 or later)\n",
+        description: "Repository format 2a (groupcompress, CHK)",
+        revision_serializer: &BEncodeRevisionSerializer1,
+        inventory_serializer: &Chk255BigPageInventorySerializer,
+        open: open_group_compress,
+        create: create_group_compress,
+        rich_root_data: true,
+        supports_chks: true,
+        supports_tree_reference: true,
+        supports_external_lookups: true,
+        supported: true,
+    }
+}
+
+declare_repository_format! {
+    FORMAT_2A_SUBTREE {
+        format_string: b"Bazaar development format 8\n",
+        description: "Repository format 2a with subtree support",
+        revision_serializer: &BEncodeRevisionSerializer1,
+        inventory_serializer: &Chk255BigPageInventorySerializer,
+        open: open_group_compress,
+        create: create_group_compress,
+        rich_root_data: true,
+        supports_chks: true,
+        supports_tree_reference: true,
+        supports_external_lookups: true,
+        supported: true,
+    }
+}
 
 /// The pack name is used as the groupcompress `FileRef`, identifying which
 /// `.pack` file a block lives in.
