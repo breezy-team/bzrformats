@@ -16,9 +16,9 @@
 
 """Standalone access to bazaar control directories.
 
-``open(path)`` and ``create(path)`` return a :class:`BzrDir`, from which
-:class:`Repository`, :class:`Branch` and :class:`WorkingTree` objects can be
-obtained.
+``open(path)`` and ``create(path, format=...)`` return a :class:`BzrDir`, from
+which :class:`Repository`, :class:`Branch` and :class:`WorkingTree` objects can
+be obtained. ``format_names()`` lists the format names ``create`` accepts.
 """
 
 from ._bzr_rs.controldir import (
@@ -27,6 +27,7 @@ from ._bzr_rs.controldir import (
     Repository,
     WorkingTree,
     create,
+    format_names,
     open,
 )
 
@@ -36,5 +37,6 @@ __all__ = [
     "Repository",
     "WorkingTree",
     "create",
+    "format_names",
     "open",
 ]

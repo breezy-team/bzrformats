@@ -8212,6 +8212,78 @@ mod tests {
     }
 
     #[test]
+    fn kndx_index_add_records_writes_ghost_parent_dotted() {
+        // Mirrors LowLevelKnitIndexTests.test_write_utf8_parents: a parent
+        // that is not in this index's history is written `.`-prefixed (the
+        // _dictionary_compress fallback), not as a numeric back-reference.
+        let idx = make_kndx_index("filename", &[]);
+        let memo = KnitIndexMemo {
+            file_ref: "filename.knit".to_string(),
+            offset: 0,
+            length: 1,
+        };
+        idx.add_records(
+            &[(
+                vec![b"version".to_vec()],
+                vec![KnitMethod::Fulltext],
+                memo,
+                vec![vec![b"ghost".to_vec()]],
+            )],
+            false,
+            false,
+        )
+        .unwrap();
+        let written = idx.transport().get_bytes("filename.kndx").unwrap();
+        assert!(
+            written.ends_with(b"\nversion fulltext 0 1 .ghost :"),
+            "kndx tail mismatch: {:?}",
+            String::from_utf8_lossy(&written)
+        );
+    }
+
+    #[test]
+    fn kndx_index_add_records_writes_known_parent_as_index() {
+        // The complement of the ghost case: a parent already present in the
+        // index is written as its numeric history index (the compressed form
+        // parse_kndx_data reads back). Here `a` is written first (history
+        // index 0), then `b` records `a` as its parent and must encode it `0`.
+        let idx = make_kndx_index("filename", &[]);
+        let memo = |off| KnitIndexMemo {
+            file_ref: "filename.knit".to_string(),
+            offset: off,
+            length: 1,
+        };
+        idx.add_records(
+            &[(
+                vec![b"a".to_vec()],
+                vec![KnitMethod::Fulltext],
+                memo(0),
+                vec![],
+            )],
+            false,
+            false,
+        )
+        .unwrap();
+        idx.add_records(
+            &[(
+                vec![b"b".to_vec()],
+                vec![KnitMethod::Fulltext],
+                memo(1),
+                vec![vec![b"a".to_vec()]],
+            )],
+            false,
+            false,
+        )
+        .unwrap();
+        let written = idx.transport().get_bytes("filename.kndx").unwrap();
+        assert!(
+            written.ends_with(b"\nb fulltext 1 1 0 :"),
+            "kndx tail mismatch: {:?}",
+            String::from_utf8_lossy(&written)
+        );
+    }
+
+    #[test]
     fn kndx_index_load_prefix_typed_reports_bad_header() {
         // Mirrors LowLevelKnitIndexTests.test_read_corrupted_header at the
         // KndxIndex layer: the typed loader surfaces BadKnitHeader rather

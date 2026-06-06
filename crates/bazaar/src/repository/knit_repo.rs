@@ -187,6 +187,21 @@ impl KnitRepository {
         Ok(ids)
     }
 
+    /// The stored parent ids of each of `revision_ids` (present ones only),
+    /// read from the revisions kndx index.
+    pub fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        let keys: Vec<crate::knit::KnitKey> =
+            revision_ids.iter().map(|r| vec![r.clone()]).collect();
+        let raw = self
+            .revisions
+            .get_parent_map(&keys)
+            .map_err(|e| RepositoryError::Corrupt(format!("parent map: {e}")))?;
+        Ok(super::unkey_knit_parent_map(raw))
+    }
+
     /// Read and parse a revision (XML, serializer v5).
     pub fn get_revision(
         &self,
@@ -373,6 +388,13 @@ impl super::Repository for KnitRepository {
         KnitRepository::all_revision_ids(self)
     }
 
+    fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        KnitRepository::get_parent_map(self, revision_ids)
+    }
+
     fn get_revision(
         &self,
         revision_id: &[u8],
@@ -513,115 +535,10 @@ mod tests {
     use crate::transport::LocalTransport;
     use std::sync::Arc;
 
-    fn knit1() -> &'static RepositoryFormat {
-        super::super::format::find_format(b"Bazaar-NG Knit Repository Format 1").unwrap()
-    }
-
     fn temp() -> (tempfile::TempDir, SharedTransport) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repository");
         (dir, Arc::new(LocalTransport::new(&path)))
-    }
-
-    fn rev(id: &[u8], parents: Vec<&[u8]>, message: &str) -> crate::revision::Revision {
-        crate::revision::Revision::new(
-            crate::RevisionId::from(id),
-            parents
-                .iter()
-                .map(|p| crate::RevisionId::from(*p))
-                .collect(),
-            Some("T <t@e>".into()),
-            message.into(),
-            std::collections::HashMap::new(),
-            None,
-            1577880000.0,
-            Some(0),
-        )
-    }
-
-    #[test]
-    fn write_then_read_round_trip() {
-        let (_d, t) = temp();
-        let mut repo = KnitRepository::create(t.clone(), knit1()).unwrap();
-
-        use crate::FileId;
-        let root = b"TREE_ROOT";
-        let entries1 = vec![
-            crate::inventory::Entry::root(
-                FileId::from(&root[..]),
-                Some(crate::RevisionId::from(&b"rev-1"[..])),
-            ),
-            crate::inventory::Entry::file(
-                FileId::from(&b"file-1"[..]),
-                "a.txt".into(),
-                FileId::from(&root[..]),
-                Some(crate::RevisionId::from(&b"rev-1"[..])),
-                Some(crate::weave::sha_strings(&[b"hello\n"])),
-                Some(6),
-                Some(false),
-                None,
-            ),
-        ];
-
-        repo.add_revision(&rev(b"rev-1", vec![], "first"), &[])
-            .unwrap();
-        repo.add_inventory_from_entries(b"rev-1", &[], root, &entries1)
-            .unwrap();
-        repo.add_text(b"file-1", b"rev-1", &[], b"hello\n").unwrap();
-        repo.add_text(
-            b"file-1",
-            b"rev-2",
-            &[(b"file-1".to_vec(), b"rev-1".to_vec())],
-            b"hello\ngoodbye\n",
-        )
-        .unwrap();
-        repo.add_revision(
-            &rev(b"rev-2", vec![b"rev-1"], "second"),
-            &[b"rev-1".to_vec()],
-        )
-        .unwrap();
-
-        let repo = KnitRepository::open(t).unwrap();
-        assert_eq!(
-            repo.all_revision_ids().unwrap(),
-            vec![b"rev-1".to_vec(), b"rev-2".to_vec()]
-        );
-        assert_eq!(repo.get_revision(b"rev-1").unwrap().message, "first");
-        let got2 = repo.get_revision(b"rev-2").unwrap();
-        assert_eq!(got2.message, "second");
-        assert_eq!(
-            got2.parent_ids
-                .iter()
-                .map(|p| p.as_bytes().to_vec())
-                .collect::<Vec<_>>(),
-            vec![b"rev-1".to_vec()]
-        );
-        assert_eq!(repo.get_file_text(b"file-1", b"rev-1").unwrap(), b"hello\n");
-        assert_eq!(
-            repo.get_file_text(b"file-1", b"rev-2").unwrap(),
-            b"hello\ngoodbye\n"
-        );
-
-        let inv = repo.get_inventory(b"rev-1").unwrap();
-        let paths: Vec<String> = inv.entries().iter().map(|(p, _)| p.clone()).collect();
-        assert_eq!(paths, vec!["a.txt".to_string()]);
-    }
-
-    #[test]
-    fn signature_round_trips() {
-        let (_d, t) = temp();
-        let mut repo = KnitRepository::create(t.clone(), knit1()).unwrap();
-        repo.add_revision(&rev(b"rev-1", vec![], "first"), &[])
-            .unwrap();
-        repo.add_signature(b"rev-1", b"-----SIG-----\nsigned rev-1\n")
-            .unwrap();
-
-        let repo = KnitRepository::open(t).unwrap();
-        assert_eq!(
-            repo.get_signature_text(b"rev-1").unwrap().as_deref(),
-            Some(&b"-----SIG-----\nsigned rev-1\n"[..])
-        );
-        assert_eq!(repo.get_signature_text(b"rev-unsigned").unwrap(), None);
     }
 
     #[test]

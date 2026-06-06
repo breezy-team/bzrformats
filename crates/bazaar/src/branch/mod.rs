@@ -498,6 +498,38 @@ mod tests {
         assert_eq!(branch.last_revision_info().unwrap(), (3, b"c".to_vec()));
     }
 
+    /// Setting the tip back to an earlier revno drops the later revisions
+    /// (the uncommit case). Ported from breezy's per_branch
+    /// `test_generate_revision_history`, which generates a shorter mainline.
+    #[test]
+    fn format5_set_last_revision_info_truncates() {
+        let (_d, branch, _probe) = branch_transport_format5();
+        branch
+            .set_revision_history(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+            .unwrap();
+        // Point the tip back at revno 2 ("b"); "c" is dropped.
+        branch.set_last_revision_info(2, b"b").unwrap();
+        assert_eq!(branch.last_revision_info().unwrap(), (2, b"b".to_vec()));
+        assert_eq!(
+            branch.revision_history().unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+    }
+
+    /// Setting the tip to the null revision empties the history. Ported from
+    /// breezy's `test_generate_revision_history_NULL_REVISION`.
+    #[test]
+    fn format5_set_last_revision_info_null_empties_history() {
+        let (_d, branch, _probe) = branch_transport_format5();
+        branch.set_last_revision_info(1, b"rev-1").unwrap();
+        branch.set_last_revision_info(0, NULL_REVISION).unwrap();
+        assert_eq!(
+            branch.last_revision_info().unwrap(),
+            (0, NULL_REVISION.to_vec())
+        );
+        assert!(branch.revision_history().unwrap().is_empty());
+    }
+
     #[test]
     fn tags_round_trip() {
         let (_d, branch, _probe) = branch_transport();
@@ -522,5 +554,64 @@ mod tests {
             probe.get_bytes("tags").unwrap(),
             b"d4:v1.033:test@example.com-20200101120000-xe".to_vec()
         );
+    }
+
+    /// A non-ASCII tag name round-trips. Ported from breezy's per_branch
+    /// test_tags.test_delete_tag, which uses a Greek alpha tag name.
+    #[test]
+    fn tags_unicode_name_round_trips() {
+        let (_d, branch, _probe) = branch_transport();
+        let mut tags = BTreeMap::new();
+        tags.insert("\u{3b1}".to_string(), b"rev-1".to_vec());
+        branch.set_tags(&tags).unwrap();
+        // Re-open the branch from the same transport and read the tag back.
+        let reopened = Branch::new(branch.transport.clone());
+        assert_eq!(reopened.tags().unwrap(), tags);
+    }
+
+    /// Removing a tag means re-writing the map without it; the deleted tag is
+    /// then absent on disk. Ported from test_tags.test_delete_tag (adapted to
+    /// our whole-map tag API).
+    #[test]
+    fn tags_delete_removes_from_map() {
+        let (_d, branch, _probe) = branch_transport();
+        let mut tags = BTreeMap::new();
+        tags.insert("keep".to_string(), b"rev-1".to_vec());
+        tags.insert("drop".to_string(), b"rev-2".to_vec());
+        branch.set_tags(&tags).unwrap();
+
+        tags.remove("drop");
+        branch.set_tags(&tags).unwrap();
+        assert_eq!(branch.tags().unwrap(), tags);
+        assert!(!branch.tags().unwrap().contains_key("drop"));
+    }
+
+    /// A tag whose target revision does not exist still stores and reads back;
+    /// the branch performs no existence check. Ported from
+    /// test_tags.test_ghost_tag.
+    #[test]
+    fn tags_ghost_target_is_stored() {
+        let (_d, branch, _probe) = branch_transport();
+        let mut tags = BTreeMap::new();
+        tags.insert("ghost".to_string(), b"idontexist".to_vec());
+        branch.set_tags(&tags).unwrap();
+        assert_eq!(
+            branch.tags().unwrap().get("ghost").map(|v| v.as_slice()),
+            Some(&b"idontexist"[..])
+        );
+    }
+
+    /// get_config_bytes returns branch.conf verbatim, and an empty vec when
+    /// the file is absent. Ported from per_branch/test_config.py's basic
+    /// get/set config round-trip.
+    #[test]
+    fn get_config_bytes_reads_branch_conf() {
+        let (_d, branch, probe) = branch_transport();
+        // No branch.conf yet -> empty.
+        assert!(branch.get_config_bytes().unwrap().is_empty());
+
+        let body = b"[DEFAULT]\nnickname = trunk\n";
+        probe.put_bytes("branch.conf", body, None).unwrap();
+        assert_eq!(branch.get_config_bytes().unwrap(), body);
     }
 }

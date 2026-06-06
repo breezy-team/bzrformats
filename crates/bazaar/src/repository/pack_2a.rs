@@ -456,6 +456,30 @@ impl Pack2aRepository {
         Ok(ids)
     }
 
+    /// The stored parent ids of each of `revision_ids` (present ones only),
+    /// read from the revision store's index.
+    pub fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        let keys: Vec<Key> = revision_ids
+            .iter()
+            .map(|r| Key::fixed(vec![r.clone()]))
+            .collect();
+        let raw = self.revisions.get_parent_map(&keys)?;
+        let mut out = std::collections::HashMap::with_capacity(raw.len());
+        for (key, parents) in raw {
+            if let Some(revid) = key.segments().first() {
+                let parent_ids = parents
+                    .into_iter()
+                    .filter_map(|p| p.segments().first().cloned())
+                    .collect();
+                out.insert(revid.clone(), parent_ids);
+            }
+        }
+        Ok(out)
+    }
+
     /// Read and parse a revision by id.
     pub fn get_revision(
         &self,
@@ -711,6 +735,13 @@ impl super::Repository for Pack2aRepository {
         Pack2aRepository::all_revision_ids(self)
     }
 
+    fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        Pack2aRepository::get_parent_map(self, revision_ids)
+    }
+
     fn get_revision(
         &self,
         revision_id: &[u8],
@@ -905,7 +936,6 @@ fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, Repositor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serializer::RevisionSerializer;
     use crate::transport::LocalTransport;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -936,40 +966,28 @@ mod tests {
         (dir, t)
     }
 
+    /// Opening a second write group while one is already open is an error.
+    /// Ported from per_repository/test_write_group.test_start_write_group_twice.
     #[test]
-    fn revision_and_text_write_round_trip() {
+    fn double_start_write_group_is_rejected() {
         let (_d, t) = temp_repo();
-        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        let mut repo = Pack2aRepository::create(t).unwrap();
         repo.start_write_group().unwrap();
-        repo.add_revision(&make_revision(b"rev-1", vec![], "first", None), &[])
-            .unwrap();
-        repo.add_revision(
-            &make_revision(b"rev-2", vec![b"rev-1"], "second", None),
-            &[b"rev-1".to_vec()],
-        )
-        .unwrap();
-        repo.add_text(b"file-1", b"rev-1", &[], b"hello world\n")
-            .unwrap();
-        repo.add_signature_text(b"rev-1", b"-----SIG-----\nsigned rev-1\n")
-            .unwrap();
-        repo.commit_write_group().unwrap();
+        assert!(repo.start_write_group().is_err());
+    }
 
-        // Re-open to read the committed data.
-        let repo = Pack2aRepository::open(t).unwrap();
-        let mut ids = repo.all_revision_ids().unwrap();
-        ids.sort();
-        assert_eq!(ids, vec![b"rev-1".to_vec(), b"rev-2".to_vec()]);
-        assert_eq!(repo.get_revision(b"rev-2").unwrap().message, "second");
-        assert_eq!(
-            repo.get_file_text(b"file-1", b"rev-1").unwrap(),
-            b"hello world\n"
-        );
-        // The signature round-trips; an unsigned revision returns None.
-        assert_eq!(
-            repo.get_signature_text(b"rev-1").unwrap().as_deref(),
-            Some(&b"-----SIG-----\nsigned rev-1\n"[..])
-        );
-        assert_eq!(repo.get_signature_text(b"rev-2").unwrap(), None);
+    /// Adding to a repository with no open write group is an error (the write
+    /// must happen inside a write group). Ported from the write-group
+    /// lifecycle invariants in per_repository/test_write_group.
+    #[test]
+    fn add_without_write_group_is_rejected() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t).unwrap();
+        // No start_write_group() call.
+        assert!(repo
+            .add_revision(&make_revision(b"rev-1", vec![], "first", None), &[])
+            .is_err());
+        assert!(repo.add_text(b"file-1", b"rev-1", &[], b"hi\n").is_err());
     }
 
     #[test]

@@ -230,12 +230,12 @@ impl Merge2 {
     }
 
     /// Filter empty groups out of a structured merge iterator.
-    fn iter_useful<'py>(
+    fn iter_useful(
         &self,
-        py: Python<'py>,
-        struct_iter: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        iter_useful_impl(py, struct_iter)
+        py: Python<'_>,
+        struct_iter: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<UsefulGroupsIterator>> {
+        UsefulGroupsIterator::new(py, struct_iter)
     }
 
     /// Render structured merge info to a flat line list using this instance's
@@ -513,12 +513,12 @@ impl TextMerge {
     }
 
     /// Filter empty groups out of a structured merge iterator.
-    fn iter_useful<'py>(
+    fn iter_useful(
         &self,
-        py: Python<'py>,
-        struct_iter: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        iter_useful_impl(py, struct_iter)
+        py: Python<'_>,
+        struct_iter: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<UsefulGroupsIterator>> {
+        UsefulGroupsIterator::new(py, struct_iter)
     }
 
     /// Produce `(merged_lines, had_conflicts)`. Dispatches through
@@ -593,6 +593,54 @@ fn markers<'py>(
 
 /// Shared `iter_useful` body: keep groups whose first list is non-empty, or
 /// (for conflicts) whose second list is non-empty.
+/// Lazy iterator returned by `iter_useful`. Pulls one group from the
+/// source iterator per step and skips groups whose first (and, for
+/// two-way groups, second) line list is empty. Mirrors the filtering
+/// in `iter_useful_impl` without materialising the result.
+#[pyclass]
+struct UsefulGroupsIterator {
+    source: Py<PyAny>,
+}
+
+impl UsefulGroupsIterator {
+    fn new(py: Python<'_>, struct_iter: &Bound<'_, PyAny>) -> PyResult<Py<Self>> {
+        Py::new(
+            py,
+            UsefulGroupsIterator {
+                source: struct_iter.try_iter()?.into_any().unbind(),
+            },
+        )
+    }
+}
+
+#[pymethods]
+impl UsefulGroupsIterator {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        let source = self.source.bind(py);
+        loop {
+            let Some(item) = source.try_iter()?.next() else {
+                return Ok(None);
+            };
+            let group = item?.cast_into::<PyTuple>()?;
+            let len = group.len();
+            let first = group.get_item(0)?;
+            if first.try_iter()?.next().is_some() {
+                return Ok(Some(group));
+            }
+            if len > 1 {
+                let second = group.get_item(1)?;
+                if second.try_iter()?.next().is_some() {
+                    return Ok(Some(group));
+                }
+            }
+        }
+    }
+}
+
 fn iter_useful_impl<'py>(
     py: Python<'py>,
     struct_iter: &Bound<'py, PyAny>,

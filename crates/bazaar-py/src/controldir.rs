@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bazaar::branch::Branch as RsBranch;
-use bazaar::bzrdir::{BzrDirMeta, ControlDir as RsControlDir};
+use bazaar::bzrdir::{
+    find_control_dir_format, BzrDirAllInOne, BzrDirMeta, ControlDir as RsControlDir,
+};
 use bazaar::repository::Repository as RsRepository;
 use bazaar::transport::{LocalTransport, SharedTransport};
 use bazaar::workingtree::{EntryKind, WorkingTree as RsWorkingTree};
@@ -29,6 +31,35 @@ fn kind_str(kind: EntryKind) -> &'static str {
         EntryKind::Directory => "directory",
         EntryKind::Symlink => "symlink",
         EntryKind::TreeReference => "tree-reference",
+    }
+}
+
+/// Iterator returned by `WorkingTree.iter_changes`, yielding one
+/// change dict per step. The tree-vs-basis diff is computed eagerly
+/// (it is a whole-tree comparison); only the dict construction is lazy.
+#[pyclass]
+struct TreeChangesIter {
+    changes: std::collections::VecDeque<bazaar::workingtree::WorkingTreeChange>,
+}
+
+#[pymethods]
+impl TreeChangesIter {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(c) = self.changes.pop_front() else {
+            return Ok(None);
+        };
+        let d = PyDict::new(py);
+        d.set_item("file_id", PyBytes::new(py, &c.file_id))?;
+        d.set_item("old_path", c.old_path)?;
+        d.set_item("new_path", c.new_path)?;
+        d.set_item("content_change", c.content_change)?;
+        d.set_item("kind", c.new_kind.map(kind_str))?;
+        d.set_item("executable", c.new_executable)?;
+        Ok(Some(d))
     }
 }
 
@@ -103,6 +134,27 @@ impl Repository {
         PyList::new(py, ids.iter().map(|i| PyBytes::new(py, i)))
     }
 
+    /// The stored parents of each of `revision_ids`, as a `{revid: [parent]}`
+    /// dict. Revision ids not present in the repository are omitted.
+    fn get_parent_map<'py>(
+        &self,
+        py: Python<'py>,
+        revision_ids: Vec<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let map = self.inner.get_parent_map(&revision_ids).map_err(err)?;
+        let d = PyDict::new(py);
+        for (revid, parents) in map {
+            let plist = PyList::new(py, parents.iter().map(|p| PyBytes::new(py, p)))?;
+            d.set_item(PyBytes::new(py, &revid), plist)?;
+        }
+        Ok(d)
+    }
+
+    /// Whether `revision_id` is present in this repository.
+    fn has_revision(&self, revision_id: &[u8]) -> PyResult<bool> {
+        self.inner.has_revision(revision_id).map_err(err)
+    }
+
     /// The committer, message and parents of a revision, as a dict.
     fn get_revision<'py>(
         &self,
@@ -140,6 +192,66 @@ impl Repository {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let text = self.inner.get_file_text(file_id, revision).map_err(err)?;
         Ok(PyBytes::new(py, &text))
+    }
+
+    /// The full text of the file at tree-relative `path` in `revision`.
+    fn get_file_text_at_path<'py>(
+        &self,
+        py: Python<'py>,
+        path: &str,
+        revision: &[u8],
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let text = self
+            .inner
+            .get_file_text_at_path(path, revision)
+            .map_err(err)?;
+        Ok(PyBytes::new(py, &text))
+    }
+
+    /// The signature text stored for `revision_id`, or None if unsigned.
+    fn get_signature_text<'py>(
+        &self,
+        py: Python<'py>,
+        revision_id: &[u8],
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        Ok(self
+            .inner
+            .get_signature_text(revision_id)
+            .map_err(err)?
+            .map(|s| PyBytes::new(py, &s)))
+    }
+
+    /// Open a write group: a batch of additions flushed by
+    /// `commit_write_group`. Writing requires an open write group.
+    fn start_write_group(&mut self) -> PyResult<()> {
+        self.inner.start_write_group().map_err(err)
+    }
+
+    /// Flush the open write group, committing its additions.
+    fn commit_write_group(&mut self) -> PyResult<()> {
+        self.inner.commit_write_group().map_err(err)
+    }
+
+    /// Add a file text keyed by `(file_id, revision)` to the open write group.
+    /// `parents` is a list of `(file_id, revision)` tuples.
+    #[pyo3(signature = (file_id, revision, bytes, parents=None))]
+    fn add_text(
+        &mut self,
+        file_id: &[u8],
+        revision: &[u8],
+        bytes: &[u8],
+        parents: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    ) -> PyResult<()> {
+        self.inner
+            .add_text(file_id, revision, &parents.unwrap_or_default(), bytes)
+            .map_err(err)
+    }
+
+    /// Add a signature text for `revision_id` to the open write group.
+    fn add_signature_text(&mut self, revision_id: &[u8], signature: &[u8]) -> PyResult<()> {
+        self.inner
+            .add_signature_text(revision_id, signature)
+            .map_err(err)
     }
 
     /// The inventory of a revision, as a list of `(path, kind, file_id)`.
@@ -189,6 +301,26 @@ impl Branch {
             d.set_item(name, PyBytes::new(py, &target))?;
         }
         Ok(d)
+    }
+
+    /// The mainline revision ids, oldest first. For a format-5 branch this is
+    /// the full `revision-history`; for 6/7/8 it is the tip alone (or empty).
+    fn revision_history<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let history = self.inner.revision_history().map_err(err)?;
+        PyList::new(py, history.iter().map(|r| PyBytes::new(py, r)))
+    }
+
+    /// Replace the full mainline (format 5) from a list of revision ids.
+    fn set_revision_history(&self, history: Vec<Vec<u8>>) -> PyResult<()> {
+        self.inner.set_revision_history(&history).map_err(err)
+    }
+
+    /// The raw bytes of `branch.conf` (empty if the file is absent).
+    fn get_config_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        Ok(PyBytes::new(
+            py,
+            &self.inner.get_config_bytes().map_err(err)?,
+        ))
     }
 
     /// Set the tip to `(revno, revision_id)`.
@@ -293,6 +425,26 @@ impl WorkingTree {
         self.inner.add_pending_merge(revision_id).map_err(err)
     }
 
+    /// The changes between this working tree and the basis `basis_revision_id`
+    /// (resolved against `repository`), as a list of dicts with keys
+    /// `file_id`, `old_path`, `new_path`, `content_change`, `kind`,
+    /// `executable`. A `None` path means the entry is added (`old_path`) or
+    /// removed (`new_path`).
+    fn iter_changes(
+        &self,
+        repository: &Bound<'_, Repository>,
+        basis_revision_id: &[u8],
+    ) -> PyResult<TreeChangesIter> {
+        let repo = repository.borrow();
+        let basis = repo.inner.revision_tree(basis_revision_id).map_err(err)?;
+        // The tree-vs-basis diff is a whole-tree comparison, so it runs
+        // here; the per-change dicts are built on demand during iteration.
+        let changes = self.inner.iter_changes(&basis).map_err(err)?;
+        Ok(TreeChangesIter {
+            changes: changes.into(),
+        })
+    }
+
     /// Commit the live tree state as a new revision and return its id.
     ///
     /// `revprops` is an optional `{str: bytes}` dict of revision properties;
@@ -379,13 +531,36 @@ fn open(path: &str) -> PyResult<BzrDir> {
     })
 }
 
-/// Create a fresh 2a control directory at `path` and open it.
+/// Create a fresh control directory at `path` in `format` and open it.
+///
+/// `format` is a registry name as accepted by `brz init --format=` -- "2a"
+/// (the default), the knit-pack variants ("pack-0.92", "1.9", "rich-root-pack",
+/// ...), "knit", or "weave" (the all-in-one bzr 0.8 format). See
+/// [`format_names`] for the full list.
 #[pyfunction]
-fn create(path: &str) -> PyResult<BzrDir> {
+#[pyo3(signature = (path, format="2a"))]
+fn create(path: &str, format: &str) -> PyResult<BzrDir> {
     let parent = local(path);
-    Ok(BzrDir {
-        inner: Box::new(BzrDirMeta::create(&parent).map_err(err)?),
-    })
+    let inner: Box<dyn RsControlDir> = if format == "weave" {
+        Box::new(BzrDirAllInOne::create(&parent).map_err(err)?)
+    } else {
+        let fmt = find_control_dir_format(format).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("unknown control dir format: {format}"))
+        })?;
+        Box::new(BzrDirMeta::create_with_format(&parent, fmt).map_err(err)?)
+    };
+    Ok(BzrDir { inner })
+}
+
+/// The control-directory format names accepted by [`create`].
+#[pyfunction]
+fn format_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = bazaar::bzrdir::control_dir_formats()
+        .iter()
+        .map(|f| f.name)
+        .collect();
+    names.push("weave");
+    names
 }
 
 pub(crate) fn _controldir_rs(py: Python) -> PyResult<Bound<PyModule>> {
@@ -396,5 +571,6 @@ pub(crate) fn _controldir_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<WorkingTree>()?;
     m.add_function(wrap_pyfunction!(open, &m)?)?;
     m.add_function(wrap_pyfunction!(create, &m)?)?;
+    m.add_function(wrap_pyfunction!(format_names, &m)?)?;
     Ok(m)
 }

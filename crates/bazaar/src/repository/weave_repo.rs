@@ -129,6 +129,34 @@ impl WeaveRepository {
         Ok(ids)
     }
 
+    /// The stored parent ids of each of `revision_ids` (present ones only).
+    ///
+    /// The weave format has no separate revision-graph index; the parents are
+    /// recorded in each revision's XML in the revision-store, so reading them
+    /// means parsing that (small) record. Revision ids with no record are
+    /// omitted.
+    pub fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        let mut out = std::collections::HashMap::with_capacity(revision_ids.len());
+        for revid in revision_ids {
+            match self.get_revision(revid) {
+                Ok(rev) => {
+                    let parents = rev
+                        .parent_ids
+                        .iter()
+                        .map(|p| p.as_bytes().to_vec())
+                        .collect();
+                    out.insert(revid.clone(), parents);
+                }
+                Err(RepositoryError::NoSuchRevision(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
     /// Read and parse a revision (XML, serializer v5) from the revision-store.
     pub fn get_revision(
         &self,
@@ -355,6 +383,13 @@ impl super::Repository for WeaveRepository {
         WeaveRepository::all_revision_ids(self)
     }
 
+    fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        WeaveRepository::get_parent_map(self, revision_ids)
+    }
+
     fn get_revision(
         &self,
         revision_id: &[u8],
@@ -462,4 +497,27 @@ fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     flate2::read::GzDecoder::new(data).read_to_end(&mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::LocalTransport;
+    use std::sync::Arc;
+
+    fn temp_repo() -> (tempfile::TempDir, SharedTransport) {
+        let dir = tempfile::tempdir().unwrap();
+        let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        (dir, t)
+    }
+
+    #[test]
+    fn create_rejects_non_weave_format() {
+        let (_d, t) = temp_repo();
+        let fmt = super::super::format::find_format(
+            b"Bazaar repository format 2a (needs bzr 1.16 or later)\n",
+        )
+        .unwrap();
+        assert!(WeaveRepository::create(t, fmt).is_err());
+    }
 }

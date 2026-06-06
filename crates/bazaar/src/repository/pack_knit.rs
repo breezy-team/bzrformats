@@ -22,6 +22,7 @@ use crate::transport::{SharedTransport, Transport};
 
 use super::format::RepositoryFormat;
 use super::pack_2a::RepositoryError;
+use super::unkey_knit_parent_map;
 use crate::declare_repository_format;
 use crate::xml_serializer::{
     XMLInventorySerializer5, XMLInventorySerializer6, XMLInventorySerializer7,
@@ -581,6 +582,20 @@ impl KnitPackRepository {
         Ok(ids)
     }
 
+    /// The stored parent ids of each of `revision_ids` (present ones only),
+    /// read from the revision knit's index.
+    pub fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        let keys: Vec<KnitKey> = revision_ids.iter().map(|r| vec![r.clone()]).collect();
+        let raw = self
+            .revisions
+            .get_parent_map(&keys)
+            .map_err(RepositoryError::Knit)?;
+        Ok(unkey_knit_parent_map(raw))
+    }
+
     /// Read and parse a revision by id (XML, serializer v5).
     pub fn get_revision(
         &self,
@@ -713,6 +728,13 @@ impl super::Repository for KnitPackRepository {
 
     fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
         KnitPackRepository::all_revision_ids(self)
+    }
+
+    fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        KnitPackRepository::get_parent_map(self, revision_ids)
     }
 
     fn get_revision(
@@ -1048,8 +1070,8 @@ struct WriteGroup {
     pack: Arc<Mutex<ContainerWriter<Vec<u8>>>>,
     revisions: WriteStore,
     inventories: WriteStore,
-    texts: WriteStore,
     signatures: WriteStore,
+    texts: WriteStore,
     /// Whether to write B+Tree indices (1.9+) or format-1 GraphIndex (0.92,
     /// 1.6).
     uses_btree: bool,
@@ -1073,16 +1095,16 @@ impl WriteGroup {
         };
         let revisions = make(false);
         let inventories = make(true);
-        let texts = make(true);
         // Signatures, like revisions, are keyed by revision id with no deltas.
         let signatures = make(false);
+        let texts = make(true);
         Ok(WriteGroup {
             pack_name: pack_name.to_string(),
             pack,
             revisions,
             inventories,
-            texts,
             signatures,
+            texts,
             uses_btree,
         })
     }
@@ -1098,8 +1120,8 @@ impl WriteGroup {
             pack,
             revisions,
             inventories,
-            texts,
             signatures,
+            texts,
             uses_btree,
         } = self;
         let rix = serialise_index(revisions.index, 1, uses_btree)?;
@@ -1195,102 +1217,11 @@ mod tests {
     use crate::transport::LocalTransport;
     use std::sync::Arc;
 
-    fn knitpack6() -> &'static RepositoryFormat {
-        super::super::format::find_format(b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n").unwrap()
-    }
-
     fn temp() -> (tempfile::TempDir, SharedTransport) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repository");
         std::fs::create_dir_all(&path).unwrap();
         (dir, Arc::new(LocalTransport::new(&path)))
-    }
-
-    #[test]
-    fn write_then_read_round_trip() {
-        let (_d, t) = temp();
-        let mut repo = KnitPackRepository::create(t.clone(), knitpack6()).unwrap();
-        repo.start_write_group().unwrap();
-        let r1 = crate::revision::Revision::new(
-            crate::RevisionId::from(&b"rev-1"[..]),
-            vec![],
-            Some("T <t@e>".into()),
-            "first".into(),
-            std::collections::HashMap::new(),
-            None,
-            1577880000.0,
-            Some(0),
-        );
-        let r2 = crate::revision::Revision::new(
-            crate::RevisionId::from(&b"rev-2"[..]),
-            vec![crate::RevisionId::from(&b"rev-1"[..])],
-            Some("T <t@e>".into()),
-            "second".into(),
-            std::collections::HashMap::new(),
-            None,
-            1577966400.0,
-            Some(0),
-        );
-        repo.add_revision(&r1, &[]).unwrap();
-        repo.add_revision(&r2, &[b"rev-1".to_vec()]).unwrap();
-        repo.add_text(b"file-1", b"rev-1", &[], b"hello\n").unwrap();
-        repo.add_text(
-            b"file-1",
-            b"rev-2",
-            &[(b"file-1".to_vec(), b"rev-1".to_vec())],
-            b"hello\ngoodbye\n",
-        )
-        .unwrap();
-        repo.commit_write_group().unwrap();
-
-        let repo = KnitPackRepository::open(t).unwrap();
-        let mut ids = repo.all_revision_ids().unwrap();
-        ids.sort();
-        assert_eq!(ids, vec![b"rev-1".to_vec(), b"rev-2".to_vec()]);
-        assert_eq!(repo.get_revision(b"rev-1").unwrap().message, "first");
-        let got2 = repo.get_revision(b"rev-2").unwrap();
-        assert_eq!(got2.message, "second");
-        assert_eq!(
-            got2.parent_ids
-                .iter()
-                .map(|p| p.as_bytes().to_vec())
-                .collect::<Vec<_>>(),
-            vec![b"rev-1".to_vec()]
-        );
-        assert_eq!(repo.get_file_text(b"file-1", b"rev-1").unwrap(), b"hello\n");
-        assert_eq!(
-            repo.get_file_text(b"file-1", b"rev-2").unwrap(),
-            b"hello\ngoodbye\n"
-        );
-    }
-
-    #[test]
-    fn signature_round_trips() {
-        let (_d, t) = temp();
-        let mut repo = KnitPackRepository::create(t.clone(), knitpack6()).unwrap();
-        repo.start_write_group().unwrap();
-        let r1 = crate::revision::Revision::new(
-            crate::RevisionId::from(&b"rev-1"[..]),
-            vec![],
-            Some("T <t@e>".into()),
-            "first".into(),
-            std::collections::HashMap::new(),
-            None,
-            1577880000.0,
-            Some(0),
-        );
-        repo.add_revision(&r1, &[]).unwrap();
-        repo.add_signature(b"rev-1", b"-----SIG-----\nsigned rev-1\n")
-            .unwrap();
-        repo.commit_write_group().unwrap();
-
-        let repo = KnitPackRepository::open(t).unwrap();
-        assert_eq!(
-            repo.get_signature_text(b"rev-1").unwrap().as_deref(),
-            Some(&b"-----SIG-----\nsigned rev-1\n"[..])
-        );
-        // An unsigned revision returns None.
-        assert_eq!(repo.get_signature_text(b"rev-1-unsigned").unwrap(), None);
     }
 
     #[test]

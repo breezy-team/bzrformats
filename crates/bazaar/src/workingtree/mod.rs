@@ -842,9 +842,10 @@ impl WorkingTree4 {
     ///
     /// Pending merges are supported: every dirstate parent is recorded on the
     /// revision, and a changed file's text parents span all parents it
-    /// appears in. TODO: a file whose content reverts to the basis after a
-    /// merge (breezy's `unchanged_merged` case) is not yet re-recorded to
-    /// reflect the merge in its per-file graph.
+    /// appears in. A file whose content reverts to the basis after a merge but
+    /// whose version differs across the parents (breezy's `unchanged_merged`
+    /// case) is still re-recorded at the new revision so its per-file graph
+    /// merges those versions.
     pub fn commit(
         &mut self,
         repository: &mut dyn crate::repository::Repository,
@@ -1401,8 +1402,16 @@ fn compute_changes(
         };
         let moved = old_path.as_deref() != Some(e.path.as_str());
 
-        if content_change || meta_change || moved {
-            let text_parents = text_parents_for(&fid, basis, other_parents)?;
+        // A file unchanged against the basis must still be re-recorded at the
+        // new revision when the merge parents disagree on its version (breezy's
+        // `unchanged_merged` case): the per-file graph has to merge those
+        // versions, even though the working content equals the basis. This is
+        // detected by the file having more than one distinct parent version
+        // across the basis and the merge parents.
+        let text_parents = text_parents_for(&fid, basis, other_parents)?;
+        let unchanged_merged = !other_parents.is_empty() && text_parents.len() > 1;
+
+        if content_change || meta_change || moved || unchanged_merged {
             changes.push(WorkingTreeChange {
                 file_id: e.file_id.clone(),
                 old_path,
@@ -1556,10 +1565,16 @@ fn build_committed_entries(
     use crate::FileId;
 
     // file_id -> last-changed revision for entries recorded at the new
-    // revision (changed or new); everything else keeps its basis revision.
+    // revision (changed, new, or unchanged-merged); everything else keeps its
+    // basis revision. An unchanged-merged entry (more than one parent version)
+    // is recorded at the new revision even though its content matches the
+    // basis, mirroring the commit builder.
     let mut new_rev_ids: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for c in changes {
-        if c.new_path.is_some() && (c.content_change || c.basis_revision.is_none()) {
+        let merges_parents = c.text_parents.len() > 1;
+        if c.new_path.is_some()
+            && (c.content_change || c.basis_revision.is_none() || merges_parents)
+        {
             new_rev_ids.insert(c.file_id.clone());
         }
     }
@@ -1856,6 +1871,64 @@ mod tests {
         assert_eq!(repo.get_file_text(&file_id, &revid).unwrap(), b"hi\n");
     }
 
+    /// The weave on-disk layout, ported from breezy's
+    /// `weave_fmt.test_repository.TestFormat7.test_disk_layout`: committing a
+    /// file whose id contains a `:` writes its per-file weave at the
+    /// URL-escaped relpath `weaves/74/Foo%3ABar.weave`, which the local
+    /// transport resolves to the literal `weaves/74/Foo:Bar.weave` on disk,
+    /// with the exact weave bytes brz writes. The inventory weave starts as
+    /// the empty-weave header.
+    #[test]
+    fn weave_disk_layout_escapes_file_id() {
+        use crate::bzrdir::BzrDirAllInOne;
+        use crate::transport::Transport;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirAllInOne::create(&parent).unwrap();
+
+        parent.put_bytes("foo", b"content\n", None).unwrap();
+        let mut wt = cd.open_workingtree().unwrap();
+        wt.add("foo", EntryKind::File, Some(b"Foo:Bar")).unwrap();
+
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        wt.commit(
+            repo.as_mut(),
+            &branch,
+            &CommitOptions::new("T <t@e>", "first post")
+                .timestamp(1577880000)
+                .revision_id(b"first".to_vec()),
+        )
+        .unwrap();
+
+        // The per-file weave is on disk under the unescaped (`:`) name, with
+        // exactly the bytes brz writes for this revision.
+        let weave = parent
+            .get_bytes(".bzr/weaves/74/Foo:Bar.weave")
+            .expect("weave at the unescaped path");
+        assert_eq!(
+            weave,
+            b"# bzr weave file v5\n\
+              i\n\
+              1 7fe70820e08a1aac0ef224d9c66ab66831cc4ab1\n\
+              n first\n\
+              \n\
+              w\n\
+              { 0\n\
+              . content\n\
+              }\n\
+              W\n"
+        );
+
+        // Reading the text back goes through the escaped mapper path, which
+        // resolves to the same on-disk file.
+        assert_eq!(
+            repo.get_file_text(b"Foo:Bar", b"first").unwrap(),
+            b"content\n"
+        );
+    }
+
     /// Build a fresh tree and return its root transport plus an open
     /// working tree.
     fn fresh_tree() -> (tempfile::TempDir, SharedTransport, WorkingTree4) {
@@ -1900,6 +1973,39 @@ mod tests {
         assert_eq!(id2, b"my-id".to_vec());
     }
 
+    /// Adding a path whose parent directory is not versioned is rejected;
+    /// callers must add the parent first. Mirrors breezy's MutableTree._add
+    /// (exercised throughout per_workingtree/test_add.py).
+    #[test]
+    fn add_unversioned_parent_is_rejected() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.mkdir("sub").unwrap();
+        parent.put_bytes("sub/a.txt", b"a\n", None).unwrap();
+        // `sub` was never added, so adding `sub/a.txt` is an error.
+        assert!(wt.add("sub/a.txt", EntryKind::File, None).is_err());
+    }
+
+    /// add_pending_merge appends parents (idempotently, preserving order) and
+    /// parent_ids reflects them. Ported from per_workingtree
+    /// test_get_parent_ids.test_pending_merges, for the dirstate tree.
+    #[test]
+    fn add_pending_merge_appends_and_is_idempotent() {
+        let (_d, _parent, mut wt) = fresh_tree();
+        assert!(wt.parent_ids().is_empty());
+
+        wt.add_pending_merge(b"foo@a-1").unwrap();
+        assert_eq!(wt.parent_ids(), vec![b"foo@a-1".to_vec()]);
+        // Re-adding the same merge is a no-op.
+        wt.add_pending_merge(b"foo@a-1").unwrap();
+        assert_eq!(wt.parent_ids(), vec![b"foo@a-1".to_vec()]);
+        // A distinct merge is appended, preserving order.
+        wt.add_pending_merge(b"wibble@b-2").unwrap();
+        assert_eq!(
+            wt.parent_ids(),
+            vec![b"foo@a-1".to_vec(), b"wibble@b-2".to_vec()]
+        );
+    }
+
     #[test]
     fn remove_unversions_directory_and_children() {
         let (_d, parent, mut wt) = fresh_tree();
@@ -1939,6 +2045,34 @@ mod tests {
         // The file moved on disk.
         assert!(!parent.has("a.txt").unwrap());
         assert_eq!(wt.get_file_text("b.txt").unwrap(), b"hello\n");
+    }
+
+    /// Renaming an unversioned source is rejected, as in breezy's
+    /// per_workingtree test_move.test_move_unversioned.
+    #[test]
+    fn rename_unversioned_source_is_rejected() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("a.txt", b"hello\n", None).unwrap();
+        // a.txt exists on disk but was never added.
+        assert!(matches!(
+            wt.rename("a.txt", "b.txt"),
+            Err(WorkingTreeError::NotVersioned(_))
+        ));
+    }
+
+    /// Renaming onto an already-versioned destination is rejected, as in
+    /// breezy's test_move target-conflict cases.
+    #[test]
+    fn rename_onto_versioned_destination_is_rejected() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("a.txt", b"a\n", None).unwrap();
+        parent.put_bytes("b.txt", b"b\n", None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        wt.add("b.txt", EntryKind::File, None).unwrap();
+        assert!(wt.rename("a.txt", "b.txt").is_err());
+        // Both entries are left versioned and unmoved.
+        assert!(wt.path2id("a.txt").is_some());
+        assert!(wt.path2id("b.txt").is_some());
     }
 
     /// Add files, commit, and read the committed inventory back.
@@ -2438,6 +2572,79 @@ mod tests {
         assert_eq!(wt.parent_ids(), vec![rev3]);
     }
 
+    /// A file that reverts to the basis content in a merge commit, but whose
+    /// version differs across the two parents, is still recorded at the new
+    /// revision so its per-file graph merges both versions (breezy's
+    /// `unchanged_merged` case).
+    #[test]
+    fn merge_commit_records_unchanged_merged_file() {
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"a1\n", None).unwrap();
+        let fid_bytes = wt.add("a.txt", EntryKind::File, None).unwrap();
+        let fid = crate::FileId::from(fid_bytes.as_slice());
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev1 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "c1").timestamp(1577880000),
+            )
+            .unwrap();
+
+        // rev2: a different version of a.txt (the basis branch).
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"a2\n", None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev2 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "c2").timestamp(1577890000),
+            )
+            .unwrap();
+
+        // The two parents disagree on a.txt's version.
+        let repo = cd.open_repository().unwrap();
+        assert_ne!(
+            repo.revision_tree(&rev1)
+                .unwrap()
+                .get_file_revision(&fid)
+                .unwrap(),
+            repo.revision_tree(&rev2)
+                .unwrap()
+                .get_file_revision(&fid)
+                .unwrap()
+        );
+
+        // Merge commit: a.txt content reverts to the basis (rev2) value, so it
+        // has no content change vs the basis -- but the merge parents differ.
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        wt.add_pending_merge(&rev1).unwrap();
+        parent.put_bytes("a.txt", b"a2\n", None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let rev3 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "merge").timestamp(1577900000),
+            )
+            .unwrap();
+
+        // a.txt is recorded at rev3 (not carried over from rev2), and the merge
+        // commit's per-file text at rev3 reads back as the reverted content.
+        let repo = cd.open_repository().unwrap();
+        let tree3 = repo.revision_tree(&rev3).unwrap();
+        assert_eq!(
+            tree3.get_file_revision(&fid).unwrap().as_deref(),
+            Some(rev3.as_slice())
+        );
+        assert_eq!(repo.get_file_text(&fid_bytes, &rev3).unwrap(), b"a2\n");
+    }
+
     /// A knit-pack control directory can be created, committed to, and read
     /// back through the full standalone API (not just 2a).
     ///
@@ -2499,6 +2706,82 @@ mod tests {
     #[test]
     fn create_commit_read_rich_root_pack() {
         create_commit_read("rich-root-pack", true);
+    }
+
+    #[test]
+    fn create_commit_read_knit() {
+        // The non-pack knit format (branch 5 + working tree 3 + knit repo)
+        // goes through the same create -> commit -> read path as the pack
+        // formats, as another scenario over create_commit_read.
+        create_commit_read("knit", false);
+    }
+
+    /// The revision attributes that go into a commit come back out of
+    /// get_revision unchanged. Ported from breezy's per_repository
+    /// test_revision.TestRevisionAttributes.test_revision_accessors (and
+    /// test_zero_timezone): message, committer, timestamp, timezone, an
+    /// explicit revision id, and revision properties -- including the awkward
+    /// values empty, multiline, and non-ASCII.
+    fn revision_attributes_round_trip(format_name: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let fmt = crate::bzrdir::find_control_dir_format(format_name).unwrap();
+        let cd = BzrDirMeta::create_with_format(&parent, fmt).unwrap();
+
+        let mut props = std::collections::HashMap::new();
+        props.insert("empty".to_string(), b"".to_vec());
+        props.insert("value".to_string(), b"one".to_vec());
+        props.insert("unicode".to_string(), "\u{b5}".as_bytes().to_vec());
+        props.insert("multiline".to_string(), b"foo\nbar\n\n".to_vec());
+
+        let mut wt = cd.open_workingtree().unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("jaq", "quux")
+                    .timestamp(1577880000)
+                    .timezone(0)
+                    .revprops(props.clone())
+                    .revision_id(b"rev-attrs-1".to_vec())
+                    .allow_pointless(true),
+            )
+            .unwrap();
+        assert_eq!(revid, b"rev-attrs-1".to_vec());
+
+        let reopened = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let rev = reopened
+            .open_repository()
+            .unwrap()
+            .get_revision(&revid)
+            .unwrap();
+        assert_eq!(rev.message, "quux");
+        assert_eq!(rev.committer.as_deref(), Some("jaq"));
+        assert_eq!(rev.timestamp, 1577880000.0);
+        assert_eq!(rev.timezone, Some(0));
+        assert_eq!(rev.revision_id.as_bytes(), b"rev-attrs-1");
+        for (name, value) in &props {
+            assert_eq!(rev.properties.get(name), Some(value), "revprop {name}");
+        }
+    }
+
+    #[test]
+    fn revision_attributes_round_trip_2a() {
+        // 2a serialises revisions with bencode.
+        revision_attributes_round_trip("2a");
+    }
+
+    #[test]
+    fn revision_attributes_round_trip_knit_pack() {
+        // The pack formats serialise revisions with XML.
+        revision_attributes_round_trip("1.9");
+    }
+
+    #[test]
+    fn revision_attributes_round_trip_knit() {
+        revision_attributes_round_trip("knit");
     }
 
     /// A format-3 working tree over a temp dir, with its checkout dir and

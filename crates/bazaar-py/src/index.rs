@@ -652,6 +652,41 @@ fn entries_to_pylist<'py>(
     Ok(out)
 }
 
+/// Generic iterator over a pre-built Python list, yielding one element
+/// per step. Backs the `iter_*` builder-node functions, whose work is
+/// done up front but whose contract is an iterator.
+#[pyclass]
+struct ListIterator {
+    list: Py<PyList>,
+    index: usize,
+}
+
+impl ListIterator {
+    fn new(list: Bound<'_, PyList>) -> Self {
+        ListIterator {
+            list: list.unbind(),
+            index: 0,
+        }
+    }
+}
+
+#[pymethods]
+impl ListIterator {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let list = self.list.bind(py);
+        if self.index >= list.len() {
+            return Ok(None);
+        }
+        let item = list.get_item(self.index)?;
+        self.index += 1;
+        Ok(Some(item))
+    }
+}
+
 /// pyo3-exposed builder. Owns a Rust `GraphIndexBuilder`; subclassable
 /// so Python subclasses (BTreeBuilder, InMemoryGraphIndex) can extend
 /// it.
@@ -3037,7 +3072,21 @@ fn py_strip_prefix_entries<'py>(
 /// backing indices.
 #[pyfunction]
 #[pyo3(name = "iter_btree_builder_nodes_for_keys")]
-pub(crate) fn py_iter_btree_builder_nodes_for_keys<'py>(
+fn py_iter_btree_builder_nodes_for_keys(
+    py: Python<'_>,
+    nodes: Bound<'_, PyDict>,
+    keys: Bound<'_, PyAny>,
+    has_refs: bool,
+) -> PyResult<(ListIterator, Py<PyList>)> {
+    let (entries, found) = btree_builder_nodes_for_keys(py, nodes, keys, has_refs)?;
+    Ok((ListIterator::new(entries), found.unbind()))
+}
+
+/// Internal form returning the matched `(key, value[, refs])` entries
+/// alongside the list of keys that were actually found. The Python
+/// binding wraps `entries` in an iterator; Rust callers consume both
+/// lists directly.
+pub(crate) fn btree_builder_nodes_for_keys<'py>(
     py: Python<'py>,
     nodes: Bound<'py, PyDict>,
     keys: Bound<'py, PyAny>,
@@ -3066,12 +3115,24 @@ pub(crate) fn py_iter_btree_builder_nodes_for_keys<'py>(
 }
 
 /// Sort and emit a `BTreeBuilder`-shaped `_nodes` dict
-/// (`{key: (refs, value)}`). Returns a list of `(key, value)` or
-/// `(key, value, refs)` tuples sorted by key — the caller prepends
-/// `self`.
+/// (`{key: (refs, value)}`), yielding one `(key, value)` /
+/// `(key, value, refs)` tuple per step in key order. The caller
+/// prepends `self`.
 #[pyfunction]
 #[pyo3(name = "iter_btree_builder_nodes_sorted")]
-pub(crate) fn py_iter_btree_builder_nodes_sorted<'py>(
+fn py_iter_btree_builder_nodes_sorted(
+    py: Python<'_>,
+    nodes: Bound<'_, PyDict>,
+    has_refs: bool,
+) -> PyResult<ListIterator> {
+    Ok(ListIterator::new(btree_builder_nodes_sorted_list(
+        py, nodes, has_refs,
+    )?))
+}
+
+/// List form of [`py_iter_btree_builder_nodes_sorted`] for Rust callers
+/// that need random access; the binding wraps it in an iterator.
+pub(crate) fn btree_builder_nodes_sorted_list<'py>(
     py: Python<'py>,
     nodes: Bound<'py, PyDict>,
     has_refs: bool,
@@ -3104,12 +3165,24 @@ pub(crate) fn py_iter_btree_builder_nodes_sorted<'py>(
 }
 
 /// Iterate all present entries in a `GraphIndexBuilder`-shaped
-/// `_nodes` dict (`{key: (absent, refs, value)}`). Skips absent
-/// entries. Returns a list of `(key, value)` or `(key, value, refs)`
-/// tuples; the caller prepends `self`.
+/// `_nodes` dict (`{key: (absent, refs, value)}`), yielding one
+/// `(key, value)` / `(key, value, refs)` tuple per step.
 #[pyfunction]
 #[pyo3(name = "iter_builder_nodes")]
-fn py_iter_builder_nodes<'py>(
+fn py_iter_builder_nodes(
+    py: Python<'_>,
+    nodes: Bound<'_, PyDict>,
+    has_refs: bool,
+) -> PyResult<ListIterator> {
+    Ok(ListIterator::new(iter_builder_nodes_list(
+        py, nodes, has_refs,
+    )?))
+}
+
+/// Build the list of present `(key, value[, refs])` tuples for a
+/// `GraphIndexBuilder`-shaped `_nodes` dict. Skips absent entries; the
+/// caller prepends `self`.
+fn iter_builder_nodes_list<'py>(
     py: Python<'py>,
     nodes: Bound<'py, PyDict>,
     has_refs: bool,
@@ -3138,11 +3211,22 @@ fn py_iter_builder_nodes<'py>(
 }
 
 /// Iterate present entries in a builder-shaped `_nodes` dict that
-/// match one of the requested `keys`. Same return shape as
-/// `iter_builder_nodes`.
+/// match one of the requested `keys`, yielding one tuple per step.
+/// Same shape as `iter_builder_nodes`.
 #[pyfunction]
 #[pyo3(name = "iter_builder_nodes_for_keys")]
-fn py_iter_builder_nodes_for_keys<'py>(
+fn py_iter_builder_nodes_for_keys(
+    py: Python<'_>,
+    nodes: Bound<'_, PyDict>,
+    keys: Bound<'_, PyAny>,
+    has_refs: bool,
+) -> PyResult<ListIterator> {
+    Ok(ListIterator::new(iter_builder_nodes_for_keys_list(
+        py, nodes, keys, has_refs,
+    )?))
+}
+
+fn iter_builder_nodes_for_keys_list<'py>(
     py: Python<'py>,
     nodes: Bound<'py, PyDict>,
     keys: Bound<'py, PyAny>,

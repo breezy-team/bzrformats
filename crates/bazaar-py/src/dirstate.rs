@@ -3538,35 +3538,29 @@ impl PyDirState {
     /// in-place mutation must go through the (not-yet-exposed) Rust
     /// mutation methods.
     #[pyo3(name = "_iter_child_entries")]
-    fn iter_child_entries<'py>(
-        &mut self,
-        py: Python<'py>,
+    fn iter_child_entries(
+        slf: Py<Self>,
+        py: Python<'_>,
         tree_index: usize,
         path_utf8: &[u8],
-    ) -> PyResult<Bound<'py, PyList>> {
-        let entries = self.inner.iter_child_entries(tree_index, path_utf8);
-        let out = PyList::empty(py);
-        for entry in &entries {
-            out.append(entry_to_py_tuple(py, entry)?)?;
-        }
-        Ok(out)
+    ) -> PyResult<ChildEntriesIter> {
+        Ok(ChildEntriesIter {
+            dirstate: slf.clone_ref(py),
+            cursor: bazaar::dirstate::IterChildEntriesCursor::new(tree_index, path_utf8),
+        })
     }
 
-    /// Materialise every entry across every dirblock as a list of
+    /// Iterate every entry across every dirblock as
     /// `((dirname, basename, file_id), [tree_tuple, ...])` tuples in
-    /// dirblock order.  Mirrors Python's `_iter_entries`, but does the
-    /// marshalling once instead of once per dirblock access — call
-    /// once and iterate the returned list, do not re-call inside a
-    /// loop.
+    /// dirblock order.  Mirrors Python's `_iter_entries` generator.
     #[pyo3(name = "_iter_entries")]
-    fn entries<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+    fn entries(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<AllEntriesIter> {
         read_dirblocks_if_needed(py, &slf)?;
-        let me = slf.borrow();
-        let out = PyList::empty(py);
-        for entry in me.inner.iter_entries() {
-            out.append(entry_to_py_tuple(py, entry)?)?;
-        }
-        Ok(out)
+        Ok(AllEntriesIter {
+            dirstate: slf.unbind(),
+            block_index: 0,
+            entry_index: 0,
+        })
     }
 
     /// Build a lazy `IterChanges` iterator.  Wraps the pure-crate
@@ -4111,6 +4105,67 @@ impl IterChanges {
             out.add(PyBytes::new(py, p))?;
         }
         Ok(out.into_any())
+    }
+}
+
+/// Iterator returned by `DirState._iter_child_entries`. Drives the
+/// pure-crate [`IterChildEntriesCursor`] one entry at a time, building
+/// the `(key, [tree, ...])` tuple on demand.
+#[pyclass]
+struct ChildEntriesIter {
+    dirstate: Py<PyDirState>,
+    cursor: bazaar::dirstate::IterChildEntriesCursor,
+}
+
+#[pymethods]
+impl ChildEntriesIter {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        let state = self.dirstate.borrow(py);
+        match self.cursor.next_entry(&state.inner) {
+            Some(entry) => Ok(Some(entry_to_py_tuple(py, entry)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Iterator returned by `DirState._iter_entries`. Walks every entry in
+/// dirblock order via an index cursor, building each `(key, [tree, ...])`
+/// tuple on demand.
+#[pyclass]
+struct AllEntriesIter {
+    dirstate: Py<PyDirState>,
+    block_index: usize,
+    entry_index: usize,
+}
+
+#[pymethods]
+impl AllEntriesIter {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        let state = self.dirstate.borrow(py);
+        loop {
+            if self.block_index >= state.inner.dirblock_count() {
+                return Ok(None);
+            }
+            if self.entry_index >= state.inner.dirblock_entry_count(self.block_index) {
+                self.block_index += 1;
+                self.entry_index = 0;
+                continue;
+            }
+            let entry = state
+                .inner
+                .entry_at(self.block_index, self.entry_index)
+                .expect("index checked above");
+            self.entry_index += 1;
+            return Ok(Some(entry_to_py_tuple(py, entry)?));
+        }
     }
 }
 

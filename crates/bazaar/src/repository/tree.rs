@@ -54,6 +54,24 @@ impl RevisionTree {
         }
     }
 
+    /// The file id at tree-relative `path`, or `None` if no entry is at that
+    /// path. (The synthetic tree root has no path-keyed entry here.)
+    pub fn path2id(&self, path: &str) -> Option<FileId> {
+        let path = path.trim_matches('/');
+        for (entry_path, entry) in self.inventory.entries().ok()? {
+            if entry_path == path {
+                return Some(entry.file_id().clone());
+            }
+        }
+        None
+    }
+
+    /// The entries in this tree as `(path, entry)` pairs, in path order. The
+    /// synthetic root is not included.
+    pub fn iter_entries(&self) -> Vec<(String, Entry)> {
+        self.inventory.entries().unwrap_or_default()
+    }
+
     /// The inventory entry for `file_id`, or `None` if it is not in this
     /// tree. A backend read failure propagates rather than reading as absent.
     pub fn get_entry(&self, file_id: &FileId) -> Result<Option<Entry>, crate::inventory::Error> {

@@ -440,6 +440,35 @@ fn weave_name_for_err(py: Python<'_>, name: Option<&Py<PyAny>>) -> Py<PyAny> {
     }
 }
 
+/// Iterator returned by `Weave.iter_lines_added_or_present_in_versions`.
+/// The structural walk is done eagerly in the bazaar crate (it is
+/// fallible and one-pass), but each `(line, name)` pair becomes a
+/// Python `bytes` tuple on demand.
+#[pyclass]
+struct WeaveLinesIter {
+    pairs: std::collections::VecDeque<(Vec<u8>, Vec<u8>)>,
+}
+
+#[pymethods]
+impl WeaveLinesIter {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        match self.pairs.pop_front() {
+            Some((line, name)) => Ok(Some(PyTuple::new(
+                py,
+                [
+                    PyBytes::new(py, &line).into_any(),
+                    PyBytes::new(py, &name).into_any(),
+                ],
+            )?)),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Rust-backed `Weave` — holds the entire weave state and exposes the
 /// same surface the previous Python class did. The Python `bzrformats.weave`
 /// module subclasses this to add transport-backed `WeaveFile` (which
@@ -1055,7 +1084,7 @@ impl PyWeave {
         py: Python<'py>,
         version_ids: Option<Bound<'py, PyAny>>,
         pb: Option<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyList>> {
+    ) -> PyResult<WeaveLinesIter> {
         let _ = pb;
         let names_owned: Option<Vec<Vec<u8>>> = match version_ids {
             None => None,
@@ -1073,31 +1102,25 @@ impl PyWeave {
                 Some(v)
             }
         };
-        let pairs = match &names_owned {
+        // The structural walk in the bazaar crate is fallible and runs
+        // over the whole weave, so it happens here; the resulting Rust
+        // byte buffers are handed to the iterator, which constructs the
+        // Python objects one pair at a time.
+        let pairs: std::collections::VecDeque<(Vec<u8>, Vec<u8>)> = match &names_owned {
             None => self
                 .inner
                 .iter_lines_added_or_present_in_versions::<std::iter::Empty<&[u8]>>(None)
-                .map_err(|e| weave_op_err_to_py(py, e))?,
+                .map_err(|e| weave_op_err_to_py(py, e))?
+                .collect(),
             Some(v) => {
                 let refs: Vec<&[u8]> = v.iter().map(|x| x.as_slice()).collect();
                 self.inner
                     .iter_lines_added_or_present_in_versions(Some(refs))
                     .map_err(|e| weave_op_err_to_py(py, e))?
+                    .collect()
             }
         };
-        let items: Vec<Bound<PyTuple>> = pairs
-            .into_iter()
-            .map(|(line, name)| {
-                PyTuple::new(
-                    py,
-                    [
-                        PyBytes::new(py, &line).into_any(),
-                        PyBytes::new(py, &name).into_any(),
-                    ],
-                )
-            })
-            .collect::<PyResult<_>>()?;
-        PyList::new(py, items)
+        Ok(WeaveLinesIter { pairs })
     }
 
     /// Three-way merge plan. Yields `(state_str, line_bytes)` tuples

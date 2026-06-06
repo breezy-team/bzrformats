@@ -131,7 +131,14 @@ impl<'a> CommitBuilder<'a> {
                             "change for {new_path} has a new path but no kind"
                         ))
                     })?;
-                    let carried_over = !change.content_change && change.basis_revision.is_some();
+                    // A file unchanged against the basis but merging more than
+                    // one parent version (breezy's `unchanged_merged`) is
+                    // recorded at the new revision, not carried over: its
+                    // per-file graph has to merge those versions.
+                    let merges_parents = change.text_parents.len() > 1;
+                    let carried_over = !change.content_change
+                        && !merges_parents
+                        && change.basis_revision.is_some();
                     let entry_revision = if carried_over {
                         RevisionId::from(change.basis_revision.as_deref().unwrap())
                     } else {
@@ -167,7 +174,13 @@ impl<'a> CommitBuilder<'a> {
     {
         let file_id = FileId::from(change.file_id.as_slice());
         let new_path = change.new_path.as_deref().unwrap_or("");
-        let writes_text = change.content_change || change.basis_revision.is_none();
+        // Write a new text when the content changed, when the entry is new, or
+        // when this is an unchanged-merged file (more than one parent version):
+        // in all three cases a new per-file record is created at the new
+        // revision.
+        let merges_parents = change.text_parents.len() > 1;
+        let writes_text =
+            change.content_change || change.basis_revision.is_none() || merges_parents;
 
         // The tree root (empty path, no parent): record the root inventory
         // entry. Its empty per-file text is written only for a rich-root

@@ -1734,11 +1734,20 @@ impl BTreeBuilder {
     }
 
     /// `_iter_mem_nodes`: sorted iterator over the in-memory dict,
-    /// each entry prefixed with `self`.
-    fn _iter_mem_nodes<'py>(
-        slf: Bound<'py, Self>,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyList>> {
+    /// each entry prefixed with `self`. The sort runs up front; the
+    /// `(self, key, value[, refs])` tuples are yielded one at a time.
+    fn _iter_mem_nodes<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<EntryIterator> {
+        let list = Self::mem_nodes_list(slf, py)?;
+        Ok(EntryIterator {
+            entries: list.unbind(),
+            pos: Mutex::new(0),
+        })
+    }
+
+    /// Build the sorted `(self, key, value[, refs])` tuples for the
+    /// in-memory nodes. Shared by `_iter_mem_nodes` and the merge-sort
+    /// entry walks.
+    fn mem_nodes_list<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let me = slf.borrow();
         let nodes = me.nodes.lock().unwrap().bind(py).clone();
         let has_refs = slf
@@ -1750,7 +1759,7 @@ impl BTreeBuilder {
             .reference_lists()
             > 0;
         let sorted: Bound<'py, PyList> =
-            crate::index::py_iter_btree_builder_nodes_sorted(py, nodes, has_refs)?;
+            crate::index::btree_builder_nodes_sorted_list(py, nodes, has_refs)?;
         let out = PyList::empty(py);
         let self_any: Bound<'py, PyAny> = slf.into_any();
         for entry in sorted.iter() {
@@ -1772,7 +1781,7 @@ impl BTreeBuilder {
         slf: Bound<'py, Self>,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mem = Self::_iter_mem_nodes(slf.clone(), py)?;
+        let mem = Self::mem_nodes_list(slf.clone(), py)?;
         let mem_iter = mem.try_iter()?;
         let mut iterators: Vec<Bound<'py, PyAny>> = vec![mem_iter.into_any()];
         let backings: Vec<Py<PyAny>> = {
@@ -1814,7 +1823,7 @@ impl BTreeBuilder {
             .unwrap()
             .reference_lists()
             > 0;
-        let (entries, local_keys) = crate::index::py_iter_btree_builder_nodes_for_keys(
+        let (entries, local_keys) = crate::index::btree_builder_nodes_for_keys(
             py,
             nodes,
             key_set.clone().into_any(),
@@ -2195,7 +2204,7 @@ impl BTreeBuilder {
             };
             let slot = spill_landing_slot(&occupancy);
             // Combine mem with every leading non-None backing (slots 0..slot).
-            let mem_entries = Self::_iter_mem_nodes(slf.clone(), py)?;
+            let mem_entries = Self::mem_nodes_list(slf.clone(), py)?;
             let mut iterators: Vec<Bound<'_, PyAny>> = vec![mem_entries.try_iter()?.into_any()];
             let leading: Vec<Py<PyAny>> = {
                 let me = slf.borrow();
@@ -2216,7 +2225,7 @@ impl BTreeBuilder {
             // Plain spill: just write the mem nodes; new backing goes
             // at the end of the list.
             let slot = slf.borrow().backing_indices.lock().unwrap().len();
-            let mem_entries = Self::_iter_mem_nodes(slf.clone(), py)?;
+            let mem_entries = Self::mem_nodes_list(slf.clone(), py)?;
             let (file, size) = Self::write_nodes(slf.clone(), py, mem_entries.into_any(), false)?;
             (file, size, slot)
         };

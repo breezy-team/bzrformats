@@ -391,7 +391,7 @@ impl WeaveFile {
     pub fn iter_lines_added_or_present_in_versions<'a, I>(
         &self,
         version_names: Option<I>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WeaveError>
+    ) -> Result<impl Iterator<Item = (Vec<u8>, Vec<u8>)> + '_, WeaveError>
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
@@ -412,19 +412,23 @@ impl WeaveFile {
             }
         };
 
+        // walk_internal is a fallible single-pass scan over the whole
+        // weave (shared with plan_merge/annotate), so the structural
+        // walk happens up front. Line construction — copying the text,
+        // appending the trailing newline, cloning the version name — is
+        // deferred to iteration, which is the per-item cost callers care
+        // about.
         let walked = walk_internal(&self.weave)?;
-        let mut out = Vec::new();
-        for w in walked {
+        Ok(walked.into_iter().filter_map(move |w| {
             if !included.contains(&w.insert) {
-                continue;
+                return None;
             }
             let mut line = w.text.to_vec();
             if !line.ends_with(b"\n") {
                 line.push(b'\n');
             }
-            out.push((line, self.names[w.insert].clone()));
-        }
-        Ok(out)
+            Some((line, self.names[w.insert].clone()))
+        }))
     }
 
     /// Three-way merge plan between `ver_a` and `ver_b`. Each yielded
@@ -2083,7 +2087,8 @@ mod tests {
         let names: Vec<&[u8]> = vec![b"v0"];
         let got = wf
             .iter_lines_added_or_present_in_versions(Some(names))
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(got, vec![(b"no-eol\n".to_vec(), b"v0".to_vec())]);
     }
 
@@ -2105,7 +2110,8 @@ mod tests {
         let names: Vec<&[u8]> = vec![b"v1"];
         let got = wf
             .iter_lines_added_or_present_in_versions(Some(names))
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(got, vec![(b"c\n".to_vec(), b"v1".to_vec())]);
     }
 
@@ -2119,7 +2125,8 @@ mod tests {
             .unwrap();
         let got = wf
             .iter_lines_added_or_present_in_versions::<std::iter::Empty<&[u8]>>(None)
-            .unwrap();
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(
             got,
             vec![
