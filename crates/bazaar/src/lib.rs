@@ -19,6 +19,8 @@ pub mod dirstate;
 pub mod filters;
 pub mod gen_ids;
 pub mod globbing;
+#[cfg(feature = "gpg")]
+pub mod gpg;
 pub mod groupcompress;
 pub mod hashcache;
 pub mod index;

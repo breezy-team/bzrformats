@@ -55,8 +55,26 @@ struct PackWritingAccess {
 impl GcAccess for PackWritingAccess {
     type F = PackName;
 
-    fn get_raw_records(&self, _memos: &[ReadMemo<Self::F>]) -> Result<Vec<Vec<u8>>, KnitError> {
-        Err(KnitError::Corrupt("write-only access".to_string()))
+    fn get_raw_records(&self, memos: &[ReadMemo<Self::F>]) -> Result<Vec<Vec<u8>>, KnitError> {
+        // Read records back from the in-memory pack buffer being written, so
+        // a delta-based inventory build can read CHK pages it just wrote.
+        let pack = self.pack.lock().unwrap();
+        let bytes = pack.writer.get_ref();
+        let mut out = Vec::with_capacity(memos.len());
+        for memo in memos {
+            let start = memo.start as usize;
+            let stop = memo.stop as usize;
+            if stop > bytes.len() || start > stop {
+                return Err(KnitError::Corrupt(format!(
+                    "record range {start}..{stop} outside pack buffer (len {})",
+                    bytes.len()
+                )));
+            }
+            let body = crate::pack::read_bytes_record_body(&bytes[start..stop])
+                .map_err(|e| KnitError::Corrupt(format!("reading pack record: {e}")))?;
+            out.push(body);
+        }
+        Ok(out)
     }
 
     fn add_raw_record(
@@ -106,17 +124,38 @@ impl GcIndex for PackWritingIndex {
 
     fn get_build_details(
         &self,
-        _keys: &[Key],
+        keys: &[Key],
     ) -> Result<std::collections::HashMap<Key, GcBuildDetails<Self::F>>, KnitError> {
-        // A fresh pack starts empty; nothing is present to look up.
-        Ok(std::collections::HashMap::new())
+        // Records written earlier in this write group are readable: a
+        // delta-based inventory build reads back CHK pages it just wrote.
+        let records = self.records.lock().unwrap();
+        let mut out = std::collections::HashMap::new();
+        for key in keys {
+            if let Some((_, memo, parents)) = records.iter().rev().find(|(k, _, _)| k == key) {
+                out.insert(
+                    key.clone(),
+                    GcBuildDetails {
+                        index_memo: memo.clone(),
+                        parents: parents.clone(),
+                    },
+                );
+            }
+        }
+        Ok(out)
     }
 
     fn get_parent_map(
         &self,
-        _keys: &[Key],
+        keys: &[Key],
     ) -> Result<std::collections::HashMap<Key, Vec<Key>>, KnitError> {
-        Ok(std::collections::HashMap::new())
+        let records = self.records.lock().unwrap();
+        let mut out = std::collections::HashMap::new();
+        for key in keys {
+            if let Some((_, _, Some(parents))) = records.iter().rev().find(|(k, _, _)| k == key) {
+                out.insert(key.clone(), parents.clone());
+            }
+        }
+        Ok(out)
     }
 
     fn keys(&self) -> Result<Vec<Key>, KnitError> {
@@ -158,6 +197,7 @@ pub(super) struct WriteGroup {
     revisions: WriteStore,
     inventories: WriteStore,
     texts: WriteStore,
+    signatures: WriteStore,
     /// `Arc`-wrapped so it can be handed to `CHKInventory::from_inventory`,
     /// which writes CHK pages through it as the inventory is built.
     chk_bytes: Arc<WriteStore>,
@@ -165,7 +205,15 @@ pub(super) struct WriteGroup {
 
 impl WriteGroup {
     /// Start writing a new pack named `pack_name` (a 32-char hex string).
-    pub(super) fn new(pack_name: &str) -> Result<Self, RepositoryError> {
+    ///
+    /// `chk_fallback` is the repository's existing CHK store: registering it
+    /// as a fallback on the new pack's CHK store lets a delta-based
+    /// inventory write (`create_by_apply_delta`) read unchanged pages from
+    /// the old packs while writing only the changed pages into the new one.
+    pub(super) fn new(
+        pack_name: &str,
+        chk_fallback: Option<Arc<dyn crate::versionedfile::VersionedFiles + Send + Sync>>,
+    ) -> Result<Self, RepositoryError> {
         let mut writer = ContainerWriter::new(Vec::new());
         writer
             .begin()
@@ -180,13 +228,18 @@ impl WriteGroup {
             GroupCompressVersionedFiles::new(PackWritingIndex::new(has_graph), access, false)
         };
 
-        // Revisions, inventories and texts carry a parent graph; the chk
-        // store does not. Build all stores before moving `pack` into the
-        // struct, so the borrowing closure is done first.
+        // Revisions, inventories and texts carry a parent graph; the
+        // signatures and chk stores do not. Build all stores before moving
+        // `pack` into the struct, so the borrowing closure is done first.
         let revisions = make(true);
         let inventories = make(true);
         let texts = make(true);
-        let chk_bytes = Arc::new(make(false));
+        let signatures = make(false);
+        let mut chk_store = make(false);
+        if let Some(fallback) = chk_fallback {
+            chk_store.add_fallback_versioned_files(Box::new(fallback));
+        }
+        let chk_bytes = Arc::new(chk_store);
 
         Ok(WriteGroup {
             pack_name: pack_name.to_string(),
@@ -194,8 +247,21 @@ impl WriteGroup {
             revisions,
             inventories,
             texts,
+            signatures,
             chk_bytes,
         })
+    }
+
+    /// Add a signature text for `revision_id` (the clearsigned testament).
+    pub(super) fn add_signature(
+        &self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let key = Key::fixed(vec![revision_id.to_vec()]);
+        self.signatures
+            .add_lines(key, Some(Vec::new()), split_lines(signature))?;
+        Ok(())
     }
 
     /// Add a revision record (already serialised to bencode bytes).
@@ -269,6 +335,42 @@ impl WriteGroup {
         Ok(sha1)
     }
 
+    /// Build the new inventory by applying `delta` to the basis inventory
+    /// (whose serialised header is `basis_lines`), writing only the changed
+    /// CHK pages into this write group and referencing unchanged pages in
+    /// the existing packs via the fallback store. Adds the new inventory's
+    /// header for `new_revision_id` and returns its sha1.
+    pub(super) fn add_inventory_by_delta(
+        &self,
+        basis_revision_id: &[u8],
+        basis_lines: &[Vec<u8>],
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: &[u8],
+        parents: &[Vec<u8>],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        let cache: std::sync::Arc<dyn crate::chk_map::PageCache> =
+            std::sync::Arc::new(crate::chk_map::InMemoryPageCache::new());
+        // Deserialise the basis against this write group's CHK store, which
+        // falls back to the existing packs for pages it does not hold.
+        let basis = crate::chk_inventory::CHKInventory::deserialise(
+            self.chk_bytes.clone(),
+            cache,
+            basis_lines,
+            &crate::RevisionId::from(basis_revision_id),
+        )
+        .map_err(|e| RepositoryError::Corrupt(format!("basis inventory deserialise: {e:?}")))?;
+        let new_inv = basis
+            .create_by_apply_delta(delta, crate::RevisionId::from(new_revision_id), true)
+            .map_err(|e| RepositoryError::Corrupt(format!("apply inventory delta: {e:?}")))?;
+        let lines = new_inv
+            .to_lines()
+            .map_err(|e| RepositoryError::Corrupt(format!("serialising chk inventory: {e:?}")))?;
+        let inv_bytes: Vec<u8> = lines.concat();
+        let sha1 = crate::weave::sha_strings(&lines);
+        self.add_inventory(new_revision_id, parents, &inv_bytes)?;
+        Ok(sha1)
+    }
+
     /// Add a file text, keyed by `(file_id, revision)`.
     pub(super) fn add_text(
         &self,
@@ -303,7 +405,7 @@ impl WriteGroup {
         let rix = serialise_index(&self.revisions, 1)?;
         let iix = serialise_index(&self.inventories, 1)?;
         let tix = serialise_index(&self.texts, 2)?;
-        let six = empty_index(1);
+        let six = serialise_index(&self.signatures, 1)?;
         let cix = serialise_index(self.chk_bytes.as_ref(), 1)?;
 
         // Close the container and grab the pack bytes.
@@ -413,12 +515,4 @@ fn serialise_index(store: &WriteStore, key_elements: usize) -> Result<Vec<u8>, R
     builder
         .finish()
         .map_err(|e| RepositoryError::Corrupt(format!("index finish: {e:?}")))
-}
-
-/// An empty index of the given key arity (used for the unused signatures
-/// index, which carries one graph ref-list like revisions).
-fn empty_index(key_elements: usize) -> Vec<u8> {
-    BTreeBuilder::new(1, key_elements)
-        .finish()
-        .expect("empty index always serialises")
 }

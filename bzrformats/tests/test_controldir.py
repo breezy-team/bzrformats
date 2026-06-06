@@ -40,7 +40,9 @@ class TestControlDir(TestCaseInTempDir):
         repo = cd.open_repository()
         branch = cd.open_branch()
         wt = cd.open_workingtree()
-        revid = wt.commit(repo, branch, "T <t@e>", "empty", 1577880000, 0)
+        revid = wt.commit(
+            repo, branch, "T <t@e>", "empty", 1577880000, 0, allow_pointless=True
+        )
 
         reopened = controldir.open(self.test_dir)
         self.assertEqual(reopened.open_branch().last_revision_info(), (1, revid))
@@ -54,16 +56,147 @@ class TestControlDir(TestCaseInTempDir):
 
     def test_commit_files_round_trip(self):
         cd = controldir.create(self.test_dir)
-        # The empty working tree records only the root; write files and
-        # commit them via a freshly built inventory is out of scope here
-        # (adding to the dirstate is a separate API). This test confirms
-        # the read path of a committed empty tree instead.
-        repo = cd.open_repository()
-        branch = cd.open_branch()
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"hello\n")
         wt = cd.open_workingtree()
-        wt.commit(repo, branch, "T <t@e>", "first", 1577880000, 0)
-        revids = controldir.open(self.test_dir).open_repository().all_revision_ids()
-        self.assertEqual(len(revids), 1)
+        file_id = wt.add("a.txt", "file")
+        revid = wt.commit(
+            cd.open_repository(), cd.open_branch(), "T <t@e>", "add a", 1577880000, 0
+        )
+
+        reopened = controldir.open(self.test_dir)
+        repo = reopened.open_repository()
+        self.assertEqual(repo.all_revision_ids(), [revid])
+        inv = repo.get_inventory(revid)
+        self.assertEqual([entry[0] for entry in inv], ["a.txt"])
+        self.assertEqual(repo.get_file_text(file_id, revid), b"hello\n")
+
+    def test_commit_records_revprops_and_authors(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"hi\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        revid = wt.commit(
+            cd.open_repository(),
+            cd.open_branch(),
+            "T <t@e>",
+            "msg",
+            1577880000,
+            0,
+            revprops={"custom": b"val"},
+            authors=["A <a@e>", "B <b@e>"],
+        )
+        rev = controldir.open(self.test_dir).open_repository().get_revision(revid)
+        self.assertEqual(rev["properties"]["custom"], b"val")
+        self.assertEqual(rev["properties"]["authors"], b"A <a@e>\nB <b@e>")
+
+    def test_pointless_commit_refused(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"hi\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        wt.commit(
+            cd.open_repository(), cd.open_branch(), "T <t@e>", "first", 1577880000, 0
+        )
+        # A second commit with nothing changed is refused.
+        wt2 = controldir.open(self.test_dir).open_workingtree()
+        self.assertRaises(
+            BzrFormatsError,
+            wt2.commit,
+            cd.open_repository(),
+            cd.open_branch(),
+            "T <t@e>",
+            "empty",
+            1577890000,
+            0,
+        )
+
+    def test_strict_commit_refuses_unknown_files(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"a\n")
+        with open(os.path.join(self.test_dir, "loose.txt"), "wb") as f:
+            f.write(b"l\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        self.assertEqual(wt.unknowns(), ["loose.txt"])
+        self.assertRaises(
+            BzrFormatsError,
+            wt.commit,
+            cd.open_repository(),
+            cd.open_branch(),
+            "T <t@e>",
+            "c",
+            1577880000,
+            0,
+            strict=True,
+        )
+
+    def test_selective_commit_records_named_file_only(self):
+        cd = controldir.create(self.test_dir)
+        for n, c in [("a.txt", b"a1\n"), ("b.txt", b"b1\n")]:
+            with open(os.path.join(self.test_dir, n), "wb") as f:
+                f.write(c)
+        wt = cd.open_workingtree()
+        a_id = wt.add("a.txt", "file")
+        b_id = wt.add("b.txt", "file")
+        rev1 = wt.commit(
+            cd.open_repository(), cd.open_branch(), "T <t@e>", "two", 1577880000, 0
+        )
+        for n, c in [("a.txt", b"a2\n"), ("b.txt", b"b2\n")]:
+            with open(os.path.join(self.test_dir, n), "wb") as f:
+                f.write(c)
+        wt2 = controldir.open(self.test_dir).open_workingtree()
+        rev2 = wt2.commit(
+            cd.open_repository(),
+            cd.open_branch(),
+            "T <t@e>",
+            "only a",
+            1577890000,
+            0,
+            specific_files=["a.txt"],
+        )
+        repo = controldir.open(self.test_dir).open_repository()
+        # a.txt has the new content in rev2; b.txt keeps the rev1 content.
+        self.assertEqual(repo.get_file_text(a_id, rev2), b"a2\n")
+        self.assertEqual(repo.get_file_text(b_id, rev1), b"b1\n")
+
+    def test_add_versions_and_persists(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"x\n")
+        wt = cd.open_workingtree()
+        file_id = wt.add("a.txt", "file")
+        self.assertEqual(wt.path2id("a.txt"), file_id)
+        self.assertEqual(wt.list_files(), [("a.txt", "file", file_id)])
+        # Re-opening reads the same versioned set from disk.
+        reread = controldir.open(self.test_dir).open_workingtree()
+        self.assertEqual(reread.path2id("a.txt"), file_id)
+
+    def test_remove_unversions_without_deleting(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"x\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        wt.remove("a.txt")
+        self.assertIs(wt.path2id("a.txt"), None)
+        # The file is left on disk.
+        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "a.txt")))
+
+    def test_rename_keeps_file_id(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"x\n")
+        wt = cd.open_workingtree()
+        file_id = wt.add("a.txt", "file")
+        wt.rename("a.txt", "b.txt")
+        self.assertIs(wt.path2id("a.txt"), None)
+        self.assertEqual(wt.path2id("b.txt"), file_id)
+        self.assertFalse(os.path.exists(os.path.join(self.test_dir, "a.txt")))
+        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "b.txt")))
 
     def test_branch_tags_round_trip(self):
         cd = controldir.create(self.test_dir)

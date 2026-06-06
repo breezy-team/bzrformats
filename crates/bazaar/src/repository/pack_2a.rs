@@ -25,6 +25,8 @@ use crate::pack_repo::{index_extension, IndexKind};
 use crate::transport::{Transport, TransportError};
 use crate::versionedfile::Key;
 
+use super::format::RepositoryFormat;
+
 /// The pack name is used as the groupcompress `FileRef`, identifying which
 /// `.pack` file a block lives in.
 type PackName = String;
@@ -42,6 +44,10 @@ pub enum RepositoryError {
     Knit(KnitError),
     /// An index file could not be read.
     Index(crate::btree_graph_index::IndexError),
+    /// The `.bzr/repository/format` marker is not a recognised format.
+    UnknownFormat(Vec<u8>),
+    /// The format is recognised but this crate cannot open it yet.
+    UnsupportedFormat(&'static str),
 }
 
 impl std::fmt::Display for RepositoryError {
@@ -54,6 +60,14 @@ impl std::fmt::Display for RepositoryError {
             RepositoryError::Transport(e) => write!(f, "transport error: {e}"),
             RepositoryError::Knit(e) => write!(f, "groupcompress error: {e}"),
             RepositoryError::Index(e) => write!(f, "index error: {e}"),
+            RepositoryError::UnknownFormat(m) => write!(
+                f,
+                "unknown repository format: {:?}",
+                String::from_utf8_lossy(m)
+            ),
+            RepositoryError::UnsupportedFormat(desc) => {
+                write!(f, "unsupported repository format: {desc}")
+            }
         }
     }
 }
@@ -309,10 +323,12 @@ type SharedChkStore = std::sync::Arc<dyn crate::versionedfile::VersionedFiles + 
 /// [`commit_write_group`](Self::commit_write_group). The new-pack machinery
 /// is private (the [`WriteGroup`]); there is no separate writer type.
 pub struct Pack2aRepository {
+    format: &'static RepositoryFormat,
     transport: SharedTransport,
     revisions: Store,
     inventories: Store,
     texts: Store,
+    signatures: Store,
     /// The CHK byte store, shared with the `CHKInventory`s it materializes.
     chk_bytes: SharedChkStore,
     /// The in-progress write group, if one is open.
@@ -322,21 +338,35 @@ pub struct Pack2aRepository {
 impl Pack2aRepository {
     /// Open the repository whose `.bzr/repository` directory is rooted at
     /// `transport`.
+    ///
+    /// The `format` marker is checked against the format registry: an
+    /// unrecognised marker is [`RepositoryError::UnknownFormat`], and a
+    /// recognised but non-groupcompress (or otherwise unsupported) format
+    /// is [`RepositoryError::UnsupportedFormat`].
     pub fn open(transport: SharedTransport) -> Result<Self, RepositoryError> {
+        let format = check_format(transport.as_ref())?;
         let packs = read_pack_names(transport.as_ref())?;
         let revisions = build_store(&transport, &packs, IndexKind::Revision)?;
         let inventories = build_store(&transport, &packs, IndexKind::Inventory)?;
         let texts = build_store(&transport, &packs, IndexKind::Text)?;
+        let signatures = build_store(&transport, &packs, IndexKind::Signature)?;
         let chk_bytes: SharedChkStore =
             std::sync::Arc::new(build_store(&transport, &packs, IndexKind::Chk)?);
         Ok(Pack2aRepository {
+            format,
             transport,
             revisions,
             inventories,
             texts,
+            signatures,
             chk_bytes,
             write_group: None,
         })
+    }
+
+    /// The format this repository was opened as.
+    pub fn format(&self) -> &'static RepositoryFormat {
+        self.format
     }
 
     /// Create an empty 2a repository at `transport` (rooted at the
@@ -375,8 +405,12 @@ impl Pack2aRepository {
             .revisions
             .keys()?
             .into_iter()
-            .filter_map(|k| k.segments().first().cloned())
-            .collect();
+            .map(|k| {
+                k.segments().first().cloned().ok_or_else(|| {
+                    RepositoryError::Corrupt("empty key in revisions index".to_string())
+                })
+            })
+            .collect::<Result<_, _>>()?;
         ids.sort();
         Ok(ids)
     }
@@ -408,6 +442,8 @@ impl Pack2aRepository {
     /// Reads the serialised `CHKInventory` header from the inventories
     /// store, then materializes it by walking the CHK maps through the
     /// shared chk-bytes store.
+    /// Read the inventory for a revision as a (lazy, read-only) CHK
+    /// inventory — this repository's natural inventory type.
     pub fn get_inventory(
         &self,
         revision_id: &[u8],
@@ -475,7 +511,10 @@ impl Pack2aRepository {
             ));
         }
         let pack_name = new_pack_name();
-        self.write_group = Some(super::pack_2a_writer::WriteGroup::new(&pack_name)?);
+        self.write_group = Some(super::pack_2a_writer::WriteGroup::new(
+            &pack_name,
+            Some(self.chk_bytes.clone()),
+        )?);
         Ok(())
     }
 
@@ -485,16 +524,20 @@ impl Pack2aRepository {
             .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))
     }
 
-    /// Add a revision (already serialised to bencode bytes) to the open
-    /// write group.
+    /// Add a revision to the open write group, serialising it to bencode
+    /// (the 2a revision serializer).
     pub fn add_revision(
         &mut self,
-        revision_id: &[u8],
+        revision: &crate::revision::Revision,
         parents: &[Vec<u8>],
-        bytes: &[u8],
     ) -> Result<(), RepositoryError> {
+        use crate::serializer::RevisionSerializer;
+        let bytes = crate::bencode_serializer::BEncodeRevisionSerializer1
+            .write_revision_to_string(revision)
+            .map_err(|e| RepositoryError::Corrupt(format!("serialise revision: {e:?}")))?;
+        let revision_id = revision.revision_id.as_bytes();
         self.write_group_mut()?
-            .add_revision(revision_id, parents, bytes)
+            .add_revision(revision_id, parents, &bytes)
     }
 
     /// Build a CHK inventory from `entries` and add it to the open write
@@ -510,6 +553,57 @@ impl Pack2aRepository {
             .add_inventory_from_entries(revision_id, parents, root_id, entries)
     }
 
+    /// The serialised CHKInventory header lines for `revision_id`, read from
+    /// the inventories store.
+    fn read_inventory_lines(&self, revision_id: &[u8]) -> Result<Vec<Vec<u8>>, RepositoryError> {
+        let key = Key::fixed(vec![revision_id.to_vec()]);
+        let mut stream = self.inventories.get_record_stream(&[key], "unordered")?;
+        let record = stream
+            .pop()
+            .ok_or_else(|| RepositoryError::NoSuchRevision(revision_id.to_vec()))?;
+        if record.storage_kind() == "absent" {
+            return Err(RepositoryError::NoSuchRevision(revision_id.to_vec()));
+        }
+        Ok(record.to_lines().map(|l| l.into_owned()).collect())
+    }
+
+    /// Add the inventory for `new_revision_id` by applying `delta` to the
+    /// `basis_revision_id` inventory, writing only the changed CHK pages
+    /// into the open write group. Returns the new inventory's sha1.
+    ///
+    /// The basis must already be committed (its inventory is read from the
+    /// existing packs); a first commit uses an empty delta against the null
+    /// revision via [`add_inventory_from_entries`](Self::add_inventory_from_entries)
+    /// instead.
+    pub fn add_inventory_by_delta(
+        &mut self,
+        basis_revision_id: &[u8],
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: &[u8],
+        parents: &[Vec<u8>],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        if basis_revision_id == crate::branch::NULL_REVISION {
+            // First commit: there is no basis inventory to share pages with,
+            // so build the inventory from the delta's added entries plus a
+            // fresh root.
+            let entries = entries_from_null_delta(delta, new_revision_id)?;
+            return self.add_inventory_from_entries(
+                new_revision_id,
+                parents,
+                crate::inventory::ROOT_ID,
+                &entries,
+            );
+        }
+        let basis_lines = self.read_inventory_lines(basis_revision_id)?;
+        self.write_group_mut()?.add_inventory_by_delta(
+            basis_revision_id,
+            &basis_lines,
+            delta,
+            new_revision_id,
+            parents,
+        )
+    }
+
     /// Add a file text (keyed by `(file_id, revision)`) to the open write
     /// group.
     pub fn add_text(
@@ -521,6 +615,36 @@ impl Pack2aRepository {
     ) -> Result<(), RepositoryError> {
         self.write_group_mut()?
             .add_text(file_id, revision, parents, bytes)
+    }
+
+    /// Add a signature text for `revision_id` to the open write group.
+    pub fn add_signature_text(
+        &mut self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        self.write_group_mut()?
+            .add_signature(revision_id, signature)
+    }
+
+    /// The signature text stored for `revision_id`, or `None` if the
+    /// revision is unsigned.
+    pub fn get_signature_text(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        let key = Key::fixed(vec![revision_id.to_vec()]);
+        let mut stream = self.signatures.get_record_stream(&[key], "unordered")?;
+        let record = match stream.pop() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if record.storage_kind() == "absent" {
+            return Ok(None);
+        }
+        Ok(Some(
+            record.to_lines().flat_map(|l| l.into_owned()).collect(),
+        ))
     }
 
     /// Flush the open write group: write its pack, indices and an updated
@@ -535,6 +659,131 @@ impl Pack2aRepository {
         group.finish(self.transport.as_ref(), &existing)?;
         Ok(())
     }
+}
+
+impl super::Repository for Pack2aRepository {
+    fn format(&self) -> &'static RepositoryFormat {
+        Pack2aRepository::format(self)
+    }
+
+    fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
+        Pack2aRepository::all_revision_ids(self)
+    }
+
+    fn get_revision(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<crate::revision::Revision, RepositoryError> {
+        Pack2aRepository::get_revision(self, revision_id)
+    }
+
+    fn get_inventory(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<Box<dyn crate::inventory::Inventory>, RepositoryError> {
+        Ok(Box::new(Pack2aRepository::get_inventory(
+            self,
+            revision_id,
+        )?))
+    }
+
+    fn get_file_text(&self, file_id: &[u8], revision: &[u8]) -> Result<Vec<u8>, RepositoryError> {
+        Pack2aRepository::get_file_text(self, file_id, revision)
+    }
+
+    fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        Pack2aRepository::start_write_group(self)
+    }
+
+    fn add_revision(
+        &mut self,
+        revision: &crate::revision::Revision,
+        parents: &[Vec<u8>],
+    ) -> Result<(), RepositoryError> {
+        Pack2aRepository::add_revision(self, revision, parents)
+    }
+
+    fn add_inventory_from_entries(
+        &mut self,
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        root_id: &[u8],
+        entries: &[crate::inventory::Entry],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        Pack2aRepository::add_inventory_from_entries(self, revision_id, parents, root_id, entries)
+    }
+
+    fn add_inventory_by_delta(
+        &mut self,
+        basis_revision_id: &[u8],
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: &[u8],
+        parents: &[Vec<u8>],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        Pack2aRepository::add_inventory_by_delta(
+            self,
+            basis_revision_id,
+            delta,
+            new_revision_id,
+            parents,
+        )
+    }
+
+    fn add_text(
+        &mut self,
+        file_id: &[u8],
+        revision: &[u8],
+        parents: &[(Vec<u8>, Vec<u8>)],
+        bytes: &[u8],
+    ) -> Result<(), RepositoryError> {
+        Pack2aRepository::add_text(self, file_id, revision, parents, bytes)
+    }
+
+    fn add_signature_text(
+        &mut self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        Pack2aRepository::add_signature_text(self, revision_id, signature)
+    }
+
+    fn get_signature_text(&self, revision_id: &[u8]) -> Result<Option<Vec<u8>>, RepositoryError> {
+        Pack2aRepository::get_signature_text(self, revision_id)
+    }
+
+    fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+        Pack2aRepository::commit_write_group(self)
+    }
+}
+
+/// Build the full inventory entry list for a first commit (null basis) from
+/// the all-adds `delta`. The delta includes the tree root (path "") as its
+/// root entry; the entries are reordered so the root comes first, as
+/// [`Pack2aRepository::add_inventory_from_entries`] expects.
+fn entries_from_null_delta(
+    delta: &crate::inventory_delta::InventoryDelta,
+    _new_revision_id: &[u8],
+) -> Result<Vec<crate::inventory::Entry>, RepositoryError> {
+    let mut root = None;
+    let mut rest = Vec::new();
+    for d in delta.iter() {
+        match (&d.old_path, &d.new_entry, d.new_path.as_deref()) {
+            (None, Some(entry), Some("")) => root = Some(entry.clone()),
+            (None, Some(entry), Some(_)) => rest.push(entry.clone()),
+            (Some(_), _, _) => {
+                return Err(RepositoryError::Corrupt(
+                    "first-commit delta contains a non-add entry".to_string(),
+                ))
+            }
+            (None, _, _) => {}
+        }
+    }
+    let root = root.ok_or_else(|| {
+        RepositoryError::Corrupt("first-commit delta has no root entry".to_string())
+    })?;
+    let mut entries = vec![root];
+    entries.extend(rest);
+    Ok(entries)
 }
 
 /// Generate a fresh 32-hex-character pack name.
@@ -560,6 +809,33 @@ fn read_pack_names_with_values(
         }
     }
     Ok(out)
+}
+
+/// Open the repository at `transport` as a 2a (groupcompress) repository.
+/// The [`OpenFn`](super::format::OpenFn) carried by every 2a
+/// [`RepositoryFormat`].
+pub fn open_group_compress(
+    transport: SharedTransport,
+) -> Result<Box<dyn super::Repository>, RepositoryError> {
+    Ok(Box::new(Pack2aRepository::open(transport)?))
+}
+
+/// Verify the repository `format` marker is a supported groupcompress
+/// (2a) format, consulting the format registry, and return it.
+fn check_format(
+    transport: &dyn Transport,
+) -> Result<&'static super::format::RepositoryFormat, RepositoryError> {
+    let marker = transport.get_bytes("format")?;
+    let format = super::format::find_format(&marker)
+        .ok_or_else(|| RepositoryError::UnknownFormat(marker.clone()))?;
+    if !format.is_supported()
+        || !std::ptr::fn_addr_eq(format.open, open_group_compress as super::format::OpenFn)
+    {
+        return Err(RepositoryError::UnsupportedFormat(
+            format.get_format_description(),
+        ));
+    }
+    Ok(format)
 }
 
 /// Read `pack-names` and return the pack names in it.
@@ -610,20 +886,19 @@ mod tests {
 
     #[test]
     fn revision_and_text_write_round_trip() {
-        let ser = crate::bencode_serializer::BEncodeRevisionSerializer1;
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
         repo.start_write_group().unwrap();
-        let r1 = ser
-            .write_revision_to_string(&make_revision(b"rev-1", vec![], "first", None))
+        repo.add_revision(&make_revision(b"rev-1", vec![], "first", None), &[])
             .unwrap();
-        let r2 = ser
-            .write_revision_to_string(&make_revision(b"rev-2", vec![b"rev-1"], "second", None))
-            .unwrap();
-        repo.add_revision(b"rev-1", &[], &r1).unwrap();
-        repo.add_revision(b"rev-2", &[b"rev-1".to_vec()], &r2)
-            .unwrap();
+        repo.add_revision(
+            &make_revision(b"rev-2", vec![b"rev-1"], "second", None),
+            &[b"rev-1".to_vec()],
+        )
+        .unwrap();
         repo.add_text(b"file-1", b"rev-1", &[], b"hello world\n")
+            .unwrap();
+        repo.add_signature_text(b"rev-1", b"-----SIG-----\nsigned rev-1\n")
             .unwrap();
         repo.commit_write_group().unwrap();
 
@@ -637,13 +912,18 @@ mod tests {
             repo.get_file_text(b"file-1", b"rev-1").unwrap(),
             b"hello world\n"
         );
+        // The signature round-trips; an unsigned revision returns None.
+        assert_eq!(
+            repo.get_signature_text(b"rev-1").unwrap().as_deref(),
+            Some(&b"-----SIG-----\nsigned rev-1\n"[..])
+        );
+        assert_eq!(repo.get_signature_text(b"rev-2").unwrap(), None);
     }
 
     #[test]
     fn chk_inventory_write_round_trip() {
         use crate::inventory::Entry;
         use crate::FileId;
-        let ser = crate::bencode_serializer::BEncodeRevisionSerializer1;
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
         repo.start_write_group().unwrap();
@@ -674,21 +954,137 @@ mod tests {
         let inv_sha1 = repo
             .add_inventory_from_entries(rev, &[], root_id, &entries)
             .unwrap();
-        let rbytes = ser
-            .write_revision_to_string(&make_revision(rev, vec![], "commit", Some(inv_sha1)))
+        repo.add_revision(&make_revision(rev, vec![], "commit", Some(inv_sha1)), &[])
             .unwrap();
-        repo.add_revision(rev, &[], &rbytes).unwrap();
         repo.commit_write_group().unwrap();
 
         // Re-open and materialize the inventory.
         let repo = Pack2aRepository::open(t).unwrap();
         let inv = repo.get_inventory(rev).unwrap();
-        let entries: Vec<_> = inv.entries().unwrap();
+        let entries = inv.entries().unwrap();
         let paths: Vec<String> = entries.iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(paths, vec!["a.txt".to_string()]);
         assert_eq!(
             repo.get_file_text(b"file-1", rev).unwrap(),
             b"hello\n".to_vec()
         );
+
+        // revision_tree exposes the same inventory and the per-file
+        // last-changed revision.
+        use crate::repository::Repository as _;
+        let tree = repo.revision_tree(rev).unwrap();
+        assert_eq!(tree.revision_id(), rev);
+        let fid = crate::FileId::from(&b"file-1"[..]);
+        assert_eq!(tree.id2path(&fid).unwrap().as_deref(), Some("a.txt"));
+        assert_eq!(
+            tree.get_file_revision(&fid).unwrap().as_deref(),
+            Some(&rev[..])
+        );
+
+        // The null revision is the empty tree.
+        let empty = repo.revision_tree(crate::branch::NULL_REVISION).unwrap();
+        assert!(empty.inventory().entries().unwrap().is_empty());
+    }
+
+    /// Commit a base inventory, then a second revision built by applying an
+    /// inventory delta (modify one file, add another) to it. The delta path
+    /// writes only the changed CHK pages; the result must read back as the
+    /// full inventory.
+    #[test]
+    fn add_inventory_by_delta_round_trip() {
+        use crate::inventory::Entry;
+        use crate::inventory_delta::{InventoryDelta, InventoryDeltaEntry};
+        use crate::FileId;
+        let (_d, t) = temp_repo();
+        let root_id = crate::inventory::ROOT_ID;
+
+        // rev-1: a.txt under the root.
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        repo.start_write_group().unwrap();
+        let text1 = b"hello\n";
+        repo.add_text(b"file-a", b"rev-1", &[], text1).unwrap();
+        let entries = vec![
+            Entry::root(
+                FileId::from(root_id),
+                Some(crate::RevisionId::from(&b"rev-1"[..])),
+            ),
+            Entry::file(
+                FileId::from(&b"file-a"[..]),
+                "a.txt".to_string(),
+                FileId::from(root_id),
+                Some(crate::RevisionId::from(&b"rev-1"[..])),
+                Some(crate::weave::sha_strings(&[&text1[..]])),
+                Some(text1.len() as u64),
+                Some(false),
+                None,
+            ),
+        ];
+        let sha1 = repo
+            .add_inventory_from_entries(b"rev-1", &[], root_id, &entries)
+            .unwrap();
+        repo.add_revision(&make_revision(b"rev-1", vec![], "one", Some(sha1)), &[])
+            .unwrap();
+        repo.commit_write_group().unwrap();
+
+        // rev-2: change a.txt, add b.txt -- expressed as an inventory delta.
+        let mut repo = Pack2aRepository::open(t.clone()).unwrap();
+        repo.start_write_group().unwrap();
+        let text1b = b"hello again\n";
+        let text2 = b"world\n";
+        repo.add_text(b"file-a", b"rev-2", &[], text1b).unwrap();
+        repo.add_text(b"file-b", b"rev-2", &[], text2).unwrap();
+        let delta = InventoryDelta(vec![
+            InventoryDeltaEntry {
+                old_path: Some("a.txt".to_string()),
+                new_path: Some("a.txt".to_string()),
+                file_id: FileId::from(&b"file-a"[..]),
+                new_entry: Some(Entry::file(
+                    FileId::from(&b"file-a"[..]),
+                    "a.txt".to_string(),
+                    FileId::from(root_id),
+                    Some(crate::RevisionId::from(&b"rev-2"[..])),
+                    Some(crate::weave::sha_strings(&[&text1b[..]])),
+                    Some(text1b.len() as u64),
+                    Some(false),
+                    None,
+                )),
+            },
+            InventoryDeltaEntry {
+                old_path: None,
+                new_path: Some("b.txt".to_string()),
+                file_id: FileId::from(&b"file-b"[..]),
+                new_entry: Some(Entry::file(
+                    FileId::from(&b"file-b"[..]),
+                    "b.txt".to_string(),
+                    FileId::from(root_id),
+                    Some(crate::RevisionId::from(&b"rev-2"[..])),
+                    Some(crate::weave::sha_strings(&[&text2[..]])),
+                    Some(text2.len() as u64),
+                    Some(false),
+                    None,
+                )),
+            },
+        ]);
+        let sha2 = repo
+            .add_inventory_by_delta(b"rev-1", &delta, b"rev-2", &[b"rev-1".to_vec()])
+            .unwrap();
+        repo.add_revision(
+            &make_revision(b"rev-2", vec![b"rev-1"], "two", Some(sha2)),
+            &[b"rev-1".to_vec()],
+        )
+        .unwrap();
+        repo.commit_write_group().unwrap();
+
+        // rev-2 reads back as the full inventory with both files.
+        let repo = Pack2aRepository::open(t).unwrap();
+        let inv = repo.get_inventory(b"rev-2").unwrap();
+        let mut paths: Vec<String> = inv.entries().unwrap().into_iter().map(|(p, _)| p).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        assert_eq!(repo.get_file_text(b"file-a", b"rev-2").unwrap(), text1b);
+        assert_eq!(repo.get_file_text(b"file-b", b"rev-2").unwrap(), text2);
+        // a.txt's unchanged sibling (the root) is still resolvable, i.e. the
+        // fallback-referenced pages read back.
+        assert_eq!(inv.id2path(&FileId::from(&b"file-a"[..])).unwrap(), "a.txt");
     }
 }

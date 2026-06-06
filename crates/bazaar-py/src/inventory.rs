@@ -1026,6 +1026,7 @@ fn inventory_err_to_py_err(e: Error, py: Python) -> PyErr {
         Error::ParentNotVersioned(path) => {
             NotVersionedError::new_err(format!("parent not versioned: {}", path))
         }
+        Error::Backend(msg) => BzrFormatsError::new_err(msg),
     }
 }
 
@@ -1186,8 +1187,10 @@ impl Inventory {
         Ok(self.0.is_root(file_id))
     }
 
-    fn has_filename(&self, name: &str) -> PyResult<bool> {
-        Ok(self.0.has_filename(name))
+    fn has_filename(&self, py: Python, name: &str) -> PyResult<bool> {
+        self.0
+            .has_filename(name)
+            .map_err(|e| inventory_err_to_py_err(e, py))
     }
 
     fn get_children<'py>(
@@ -1352,8 +1355,10 @@ impl Inventory {
         self.0.get_file_kind(&file_id).map(|kind| kind.as_str())
     }
 
-    fn has_id(&self, file_id: FileId) -> bool {
-        self.0.has_id(&file_id)
+    fn has_id(&self, py: Python, file_id: FileId) -> PyResult<bool> {
+        self.0
+            .has_id(&file_id)
+            .map_err(|e| inventory_err_to_py_err(e, py))
     }
 
     fn get_child<'py>(
@@ -1430,7 +1435,11 @@ impl Inventory {
     }
 
     fn iter_all_ids<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
-        let ids = self.0.iter_all_ids();
+        use bazaar::inventory::Inventory;
+        let ids = self
+            .0
+            .all_file_ids()
+            .map_err(|e| inventory_err_to_py_err(e, py))?;
         ids.into_iter()
             .collect::<Vec<_>>()
             .into_pyobject(py)?

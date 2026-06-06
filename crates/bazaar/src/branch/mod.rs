@@ -6,6 +6,11 @@
 //! through a [`Transport`] rooted at `.bzr/branch`, taking the branch lock
 //! for mutations.
 
+pub mod format;
+mod formats;
+
+pub use format::{all_formats, find_format, BranchFormat};
+
 use std::collections::BTreeMap;
 
 use crate::lockdir::{Lock, LockDir, LockError};

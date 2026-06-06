@@ -87,6 +87,12 @@ impl BTreeGraphIndex {
                 // Page 0 carries the plaintext header before the compressed
                 // root node; every other page is entirely the compressed node.
                 let payload = if page == 0 {
+                    // A header that does not fit before the end of the first
+                    // page is malformed; without this guard the slice below
+                    // would panic on header_end > end.
+                    if header.header_end > end {
+                        return Err(IndexError::Parse(BTreeIndexError::BadOptions));
+                    }
                     &data[header.header_end..end]
                 } else {
                     &data[start..end]
@@ -158,6 +164,32 @@ mod tests {
         match BTreeGraphIndex::from_bytes(b"not an index") {
             Err(IndexError::Parse(BTreeIndexError::BadSignature)) => {}
             other => panic!("expected BadSignature, got {other:?}"),
+        }
+    }
+
+    /// A header whose options span more than one page (e.g. an absurdly long
+    /// `row_lengths` line) must be rejected as a parse error, not panic when
+    /// the page-0 payload slice is taken.
+    #[test]
+    fn header_spanning_more_than_one_page_is_a_parse_error() {
+        let mut data = Vec::new();
+        data.extend_from_slice(crate::btree_index::BTREE_SIGNATURE);
+        data.extend_from_slice(b"node_ref_lists=0\n");
+        data.extend_from_slice(b"key_elements=1\n");
+        data.extend_from_slice(b"len=1\n");
+        // A valid but very long row_lengths line (many small comma-separated
+        // numbers) pushes header_end past one page (4096 bytes).
+        data.extend_from_slice(b"row_lengths=1");
+        for _ in 0..3000 {
+            data.extend_from_slice(b",1");
+        }
+        data.push(b'\n');
+        // Pad so the total exceeds one page and a page-0 payload is attempted.
+        data.resize(data.len() + 4096, 0);
+
+        match BTreeGraphIndex::from_bytes(&data) {
+            Err(IndexError::Parse(_)) => {}
+            other => panic!("expected a parse error, got {other:?}"),
         }
     }
 }

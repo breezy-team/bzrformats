@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bazaar::branch::Branch as RsBranch;
 use bazaar::bzrdir::BzrDir as RsBzrDir;
-use bazaar::repository::Pack2aRepository as RsRepository;
+use bazaar::repository::Repository as RsRepository;
 use bazaar::transport::{LocalTransport, SharedTransport};
 use bazaar::workingtree::{EntryKind, WorkingTree as RsWorkingTree};
 use pyo3::prelude::*;
@@ -29,6 +29,18 @@ fn kind_str(kind: EntryKind) -> &'static str {
         EntryKind::Directory => "directory",
         EntryKind::Symlink => "symlink",
         EntryKind::TreeReference => "tree-reference",
+    }
+}
+
+fn kind_from_str(kind: &str) -> PyResult<EntryKind> {
+    match kind {
+        "file" => Ok(EntryKind::File),
+        "directory" => Ok(EntryKind::Directory),
+        "symlink" => Ok(EntryKind::Symlink),
+        "tree-reference" => Ok(EntryKind::TreeReference),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown kind: {other}"
+        ))),
     }
 }
 
@@ -80,7 +92,7 @@ impl BzrDir {
 /// A bzr repository.
 #[pyclass(name = "Repository")]
 struct Repository {
-    inner: RsRepository,
+    inner: Box<dyn RsRepository>,
 }
 
 #[pymethods]
@@ -110,6 +122,12 @@ impl Repository {
                 .map(|p| PyBytes::new(py, p.as_bytes())),
         )?;
         d.set_item("parent_ids", parents)?;
+        d.set_item("timezone", rev.timezone)?;
+        let props = PyDict::new(py);
+        for (k, v) in &rev.properties {
+            props.set_item(k, PyBytes::new(py, v))?;
+        }
+        d.set_item("properties", props)?;
         Ok(d)
     }
 
@@ -225,8 +243,65 @@ impl WorkingTree {
         ))
     }
 
+    /// Version `path` with `kind` ("file"/"directory"/"symlink"/
+    /// "tree-reference"), optionally with an explicit `file_id` (a fresh id
+    /// is generated when omitted). Returns the file id. Already-versioned
+    /// paths are left unchanged.
+    #[pyo3(signature = (path, kind, file_id=None))]
+    fn add<'py>(
+        &mut self,
+        py: Python<'py>,
+        path: &str,
+        kind: &str,
+        file_id: Option<&[u8]>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let id = self
+            .inner
+            .add(path, kind_from_str(kind)?, file_id)
+            .map_err(err)?;
+        Ok(PyBytes::new(py, &id))
+    }
+
+    /// Stop versioning `path` (and its children, if a directory). The files
+    /// are left on disk.
+    fn remove(&mut self, path: &str) -> PyResult<()> {
+        self.inner.remove(path).map_err(err)
+    }
+
+    /// Move a versioned entry from `from_path` to `to_path`, keeping its
+    /// file id, and move the file on disk.
+    fn rename(&mut self, from_path: &str, to_path: &str) -> PyResult<()> {
+        self.inner.rename(from_path, to_path).map_err(err)
+    }
+
+    /// The tree-relative paths of on-disk files that are not versioned.
+    fn unknowns(&self) -> PyResult<Vec<String>> {
+        self.inner.unknowns().map_err(err)
+    }
+
+    /// The tree's parent revision ids (basis first, then pending merges).
+    fn parent_ids<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyBytes>> {
+        self.inner
+            .parent_ids()
+            .iter()
+            .map(|p| PyBytes::new(py, p))
+            .collect()
+    }
+
+    /// Add `revision_id` as a pending-merge parent for the next commit.
+    fn add_pending_merge(&mut self, revision_id: &[u8]) -> PyResult<()> {
+        self.inner.add_pending_merge(revision_id).map_err(err)
+    }
+
     /// Commit the live tree state as a new revision and return its id.
-    #[pyo3(signature = (repository, branch, committer, message, timestamp, timezone))]
+    ///
+    /// `revprops` is an optional `{str: bytes}` dict of revision properties;
+    /// `authors` an optional list of author strings; `revision_id` an
+    /// optional explicit id (generated when omitted).
+    #[pyo3(signature = (repository, branch, committer, message, timestamp, timezone,
+        revprops=None, authors=None, revision_id=None, branch_nick=None,
+        allow_pointless=false, strict=false, specific_files=None, exclude=None,
+        signing_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn commit<'py>(
         &mut self,
@@ -237,19 +312,52 @@ impl WorkingTree {
         message: &str,
         timestamp: u64,
         timezone: i32,
+        revprops: Option<&Bound<'py, PyDict>>,
+        authors: Option<Vec<String>>,
+        revision_id: Option<&[u8]>,
+        branch_nick: Option<String>,
+        allow_pointless: bool,
+        strict: bool,
+        specific_files: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        signing_key: Option<&[u8]>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let mut repo = repository.borrow_mut();
         let branch = branch.borrow();
+        let mut options = bazaar::workingtree::CommitOptions::new(committer, message)
+            .timestamp(timestamp)
+            .timezone(timezone)
+            .allow_pointless(allow_pointless)
+            .strict(strict);
+        if let Some(props) = revprops {
+            let mut map: std::collections::HashMap<String, Vec<u8>> =
+                std::collections::HashMap::new();
+            for (k, v) in props.iter() {
+                map.insert(k.extract()?, v.extract()?);
+            }
+            options = options.revprops(map);
+        }
+        if let Some(authors) = authors {
+            options = options.authors(authors);
+        }
+        if let Some(id) = revision_id {
+            options = options.revision_id(id.to_vec());
+        }
+        if let Some(nick) = branch_nick {
+            options = options.branch_nick(nick);
+        }
+        if let Some(files) = specific_files {
+            options = options.specific_files(files);
+        }
+        if let Some(exclude) = exclude {
+            options = options.exclude(exclude);
+        }
+        if let Some(key) = signing_key {
+            options = options.signing_key(key.to_vec());
+        }
         let revid = self
             .inner
-            .commit(
-                &mut repo.inner,
-                &branch.inner,
-                committer,
-                message,
-                timestamp,
-                timezone,
-            )
+            .commit(repo.inner.as_mut(), &branch.inner, &options)
             .map_err(err)?;
         Ok(PyBytes::new(py, &revid))
     }

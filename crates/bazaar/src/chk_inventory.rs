@@ -313,6 +313,20 @@ mod tests {
     }
 
     #[test]
+    fn trait_id2path_absent_id_is_no_such_id_not_backend() {
+        // Through the read-only Inventory trait, a genuinely absent id must
+        // surface as NoSuchId so callers (e.g. RevisionTree) can treat it as
+        // "not in this tree" rather than a backend read failure.
+        let (inv, _store, _cache) = build_test_inv();
+        let err =
+            crate::inventory::Inventory::id2path(&inv, &FileId::from(&b"absent"[..])).unwrap_err();
+        match err {
+            crate::inventory::Error::NoSuchId(id) => assert_eq!(id.as_bytes(), b"absent"),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
     fn is_root_compares_against_root_id() {
         let (inv, _store, _cache) = build_test_inv();
         assert!(inv.is_root(&FileId::from(&b"root-id"[..])));
@@ -2094,5 +2108,52 @@ where
             root_id: Some(root_id),
             ..result
         })
+    }
+}
+
+/// CHKInventory satisfies the read-only [`Inventory`](crate::inventory::Inventory)
+/// trait so a repository can hand it back as `Box<dyn Inventory>` without
+/// materialising it into an in-memory inventory. Failures from the backing
+/// CHK store are mapped to [`inventory::Error::Backend`](crate::inventory::Error::Backend).
+impl<S> crate::inventory::Inventory for CHKInventory<S>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    fn has_filename(&self, filename: &str) -> Result<bool, crate::inventory::Error> {
+        CHKInventory::has_filename(self, filename).map_err(backend_err)
+    }
+
+    fn all_file_ids(&self) -> Result<Vec<crate::FileId>, crate::inventory::Error> {
+        self.iter_all_ids().map_err(backend_err)
+    }
+
+    fn id2path(&self, file_id: &crate::FileId) -> Result<String, crate::inventory::Error> {
+        CHKInventory::id2path(self, file_id).map_err(backend_err)
+    }
+
+    fn get_entry(&self, id: &crate::FileId) -> Result<Option<Entry>, crate::inventory::Error> {
+        match CHKInventory::get_entry(self, id) {
+            Ok(e) => Ok(Some(e)),
+            Err(Error::NoSuchId(_)) => Ok(None),
+            Err(e) => Err(backend_err(e)),
+        }
+    }
+
+    fn has_id(&self, id: &crate::FileId) -> Result<bool, crate::inventory::Error> {
+        CHKInventory::has_id(self, id).map_err(backend_err)
+    }
+
+    fn entries(&self) -> Result<Vec<(String, Entry)>, crate::inventory::Error> {
+        CHKInventory::entries(self).map_err(backend_err)
+    }
+}
+
+fn backend_err(e: Error) -> crate::inventory::Error {
+    match e {
+        // A genuinely absent id must stay distinguishable from a backend
+        // failure so callers can treat it as "not in this tree" rather than
+        // a read error.
+        Error::NoSuchId(id) => crate::inventory::Error::NoSuchId(id),
+        other => crate::inventory::Error::Backend(format!("{other:?}")),
     }
 }

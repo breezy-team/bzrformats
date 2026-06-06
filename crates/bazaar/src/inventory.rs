@@ -67,6 +67,9 @@ pub enum Error {
     PathAlreadyVersioned(String, String),
     ParentNotVersioned(String),
     InvalidNormalization(std::path::PathBuf, String),
+    /// A backend failure surfaced through the read-only [`Inventory`]
+    /// trait — e.g. a CHK inventory failing to read pages from its store.
+    Backend(String),
 }
 
 /// Description of a versioned file.
@@ -311,6 +314,30 @@ impl Entry {
         }
     }
 
+    /// The recorded sha1 of a file entry's text, or `None` for non-files.
+    pub fn text_sha1(&self) -> Option<&[u8]> {
+        match self {
+            Entry::File { text_sha1, .. } => text_sha1.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The recorded size of a file entry's text, or `None` for non-files.
+    pub fn text_size(&self) -> Option<u64> {
+        match self {
+            Entry::File { text_size, .. } => *text_size,
+            _ => None,
+        }
+    }
+
+    /// Whether a file entry is executable; `false` for non-files.
+    pub fn executable(&self) -> bool {
+        match self {
+            Entry::File { executable, .. } => *executable,
+            _ => false,
+        }
+    }
+
     pub fn is_unmodified(&self, other: &Entry) -> bool {
         let other_revision = other.revision();
 
@@ -509,16 +536,32 @@ pub fn find_interesting_parents<'a>(
     parents
 }
 
+/// A read-only inventory: the set of versioned files at a revision.
+///
+/// The methods are owned and (where they can fail) fallible, so the trait
+/// is object-safe and can be satisfied by both an in-memory inventory and
+/// a lazy CHK inventory that reads entries from a store on demand. This is
+/// what a repository's `get_inventory` returns as `Box<dyn Inventory>`.
 pub trait Inventory {
-    fn has_filename(&self, filename: &str) -> bool;
+    /// Whether a path is versioned. A backend read failure propagates rather
+    /// than reading as absent.
+    fn has_filename(&self, filename: &str) -> Result<bool, Error>;
 
-    fn iter_all_ids<'a>(&'a self) -> Box<dyn Iterator<Item = &'a FileId> + 'a>;
+    /// All file ids in the inventory.
+    fn all_file_ids(&self) -> Result<Vec<FileId>, Error>;
 
+    /// The tree-relative path of `file_id`.
     fn id2path(&self, file_id: &FileId) -> Result<String, Error>;
 
-    fn get_entry(&self, id: &FileId) -> Option<&Entry>;
+    /// The entry for `file_id`, or `None` if absent.
+    fn get_entry(&self, id: &FileId) -> Result<Option<Entry>, Error>;
 
-    fn has_id(&self, id: &FileId) -> bool;
+    /// Whether `file_id` is present. A backend read failure propagates rather
+    /// than reading as absent.
+    fn has_id(&self, id: &FileId) -> Result<bool, Error>;
+
+    /// All entries as `(path, entry)` pairs in tree order, root omitted.
+    fn entries(&self) -> Result<Vec<(String, Entry)>, Error>;
 }
 
 #[derive(Clone)]
@@ -530,12 +573,12 @@ pub struct MutableInventory {
 }
 
 impl Inventory for MutableInventory {
-    fn has_filename(&self, filename: &str) -> bool {
-        self.path2id(filename).is_some()
+    fn has_filename(&self, filename: &str) -> Result<bool, Error> {
+        Ok(self.path2id(filename).is_some())
     }
 
-    fn iter_all_ids<'a>(&'a self) -> Box<dyn Iterator<Item = &'a FileId> + 'a> {
-        Box::new(self.by_id.keys())
+    fn all_file_ids(&self) -> Result<Vec<FileId>, Error> {
+        Ok(self.by_id.keys().cloned().collect())
     }
 
     fn id2path(&self, file_id: &FileId) -> Result<String, Error> {
@@ -548,11 +591,19 @@ impl Inventory for MutableInventory {
         Ok(segments.join("/"))
     }
 
-    fn get_entry(&self, id: &FileId) -> Option<&Entry> {
-        self.by_id.get(id)
+    fn get_entry(&self, id: &FileId) -> Result<Option<Entry>, Error> {
+        Ok(self.by_id.get(id).cloned())
     }
-    fn has_id(&self, id: &FileId) -> bool {
-        self.by_id.contains_key(id)
+
+    fn has_id(&self, id: &FileId) -> Result<bool, Error> {
+        Ok(self.by_id.contains_key(id))
+    }
+
+    fn entries(&self) -> Result<Vec<(String, Entry)>, Error> {
+        Ok(MutableInventory::entries(self)
+            .into_iter()
+            .map(|(p, e)| (p, e.clone()))
+            .collect())
     }
 }
 
@@ -1067,6 +1118,9 @@ impl MutableInventory {
                     unreachable!();
                 }
                 Error::InvalidNormalization(_path, _msg) => unreachable!(),
+                // `add` never produces a backend error (that variant comes
+                // only from the read-only trait over lazy inventories).
+                Error::Backend(_) => unreachable!(),
             })?;
             if &self.id2path(new_entry.file_id()).unwrap() != new_path {
                 return Err(InventoryDeltaInconsistency::PathMismatch(
@@ -1146,6 +1200,14 @@ impl MutableInventory {
                 None
             }
         }))
+    }
+
+    /// The entry for `id`, borrowed (in-memory only). The trait
+    /// [`Inventory::get_entry`] returns an owned, fallible result for
+    /// uniformity with lazy inventories; this is the cheap borrowing form
+    /// used internally.
+    pub fn get_entry(&self, id: &FileId) -> Option<&Entry> {
+        self.by_id.get(id)
     }
 
     pub fn root(&self) -> Option<&Entry> {
@@ -1290,24 +1352,24 @@ impl MutableInventory {
     }
 
     pub fn make_delta(&self, old: &dyn Inventory) -> InventoryDelta {
-        let old_ids = old.iter_all_ids().collect::<HashSet<_>>();
-        let new_ids = self.iter_all_ids().collect::<HashSet<_>>();
+        // The trait methods are fallible to accommodate lazy (CHK)
+        // inventories, but make_delta is only used on in-memory ones, where
+        // these never fail.
+        let old_ids: HashSet<FileId> = old.all_file_ids().unwrap().into_iter().collect();
+        let new_ids: HashSet<FileId> = Inventory::all_file_ids(self).unwrap().into_iter().collect();
         let adds = new_ids.difference(&old_ids).collect::<HashSet<_>>();
         let deletes = old_ids.difference(&new_ids).collect::<HashSet<_>>();
         let common = if adds.is_empty() && deletes.is_empty() {
-            new_ids.clone()
+            new_ids.iter().collect::<HashSet<_>>()
         } else {
-            old_ids
-                .intersection(&new_ids)
-                .cloned()
-                .collect::<HashSet<_>>()
+            old_ids.intersection(&new_ids).collect::<HashSet<_>>()
         };
         let mut delta = Vec::new();
         for file_id in deletes {
             delta.push(InventoryDeltaEntry {
                 old_path: Some(old.id2path(file_id).unwrap()),
                 new_path: None,
-                file_id: (*file_id).clone(),
+                file_id: file_id.clone(),
                 new_entry: None,
             });
         }
@@ -1315,18 +1377,14 @@ impl MutableInventory {
             delta.push(InventoryDeltaEntry {
                 old_path: None,
                 new_path: Some(self.id2path(file_id).unwrap()),
-                file_id: (*file_id).clone(),
-                new_entry: self.get_entry(file_id).cloned(),
+                file_id: file_id.clone(),
+                new_entry: Inventory::get_entry(self, file_id).unwrap(),
             });
         }
         for file_id in common {
-            let new_ie = self.get_entry(file_id);
-            let old_ie = old.get_entry(file_id);
+            let new_ie = Inventory::get_entry(self, file_id).unwrap();
+            let old_ie = old.get_entry(file_id).unwrap();
 
-            // If xml_serializer returns the cached InventoryEntries (rather
-            // than always doing .copy()), inlining the 'is' check saves 2.7M
-            // calls to __eq__.  Under lsprof this saves 20s => 6s.
-            // It is a minor improvement without lsprof.
             if old_ie == new_ie {
                 continue;
             }
@@ -1334,7 +1392,7 @@ impl MutableInventory {
                 old_path: Some(old.id2path(file_id).unwrap()),
                 new_path: Some(self.id2path(file_id).unwrap()),
                 file_id: file_id.clone(),
-                new_entry: new_ie.cloned(),
+                new_entry: new_ie,
             });
         }
 
