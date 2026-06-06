@@ -34,6 +34,35 @@ fn kind_str(kind: EntryKind) -> &'static str {
     }
 }
 
+/// Iterator returned by `WorkingTree.iter_changes`, yielding one
+/// change dict per step. The tree-vs-basis diff is computed eagerly
+/// (it is a whole-tree comparison); only the dict construction is lazy.
+#[pyclass]
+struct TreeChangesIter {
+    changes: std::collections::VecDeque<bazaar::workingtree::WorkingTreeChange>,
+}
+
+#[pymethods]
+impl TreeChangesIter {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(c) = self.changes.pop_front() else {
+            return Ok(None);
+        };
+        let d = PyDict::new(py);
+        d.set_item("file_id", PyBytes::new(py, &c.file_id))?;
+        d.set_item("old_path", c.old_path)?;
+        d.set_item("new_path", c.new_path)?;
+        d.set_item("content_change", c.content_change)?;
+        d.set_item("kind", c.new_kind.map(kind_str))?;
+        d.set_item("executable", c.new_executable)?;
+        Ok(Some(d))
+    }
+}
+
 fn kind_from_str(kind: &str) -> PyResult<EntryKind> {
     match kind {
         "file" => Ok(EntryKind::File),
@@ -401,27 +430,19 @@ impl WorkingTree {
     /// `file_id`, `old_path`, `new_path`, `content_change`, `kind`,
     /// `executable`. A `None` path means the entry is added (`old_path`) or
     /// removed (`new_path`).
-    fn iter_changes<'py>(
+    fn iter_changes(
         &self,
-        py: Python<'py>,
-        repository: &Bound<'py, Repository>,
+        repository: &Bound<'_, Repository>,
         basis_revision_id: &[u8],
-    ) -> PyResult<Bound<'py, PyList>> {
+    ) -> PyResult<TreeChangesIter> {
         let repo = repository.borrow();
         let basis = repo.inner.revision_tree(basis_revision_id).map_err(err)?;
+        // The tree-vs-basis diff is a whole-tree comparison, so it runs
+        // here; the per-change dicts are built on demand during iteration.
         let changes = self.inner.iter_changes(&basis).map_err(err)?;
-        let out = PyList::empty(py);
-        for c in changes {
-            let d = PyDict::new(py);
-            d.set_item("file_id", PyBytes::new(py, &c.file_id))?;
-            d.set_item("old_path", c.old_path)?;
-            d.set_item("new_path", c.new_path)?;
-            d.set_item("content_change", c.content_change)?;
-            d.set_item("kind", c.new_kind.map(kind_str))?;
-            d.set_item("executable", c.new_executable)?;
-            out.append(d)?;
-        }
-        Ok(out)
+        Ok(TreeChangesIter {
+            changes: changes.into(),
+        })
     }
 
     /// Commit the live tree state as a new revision and return its id.

@@ -456,6 +456,27 @@ impl DirState {
         self.dirblocks.iter().flat_map(|b| b.entries.iter())
     }
 
+    /// Look up the entry at `(block_index, entry_index)` in dirblock
+    /// order, if any. Used by resumable iterators that hold an index
+    /// cursor rather than a borrow of the dirblocks.
+    pub fn entry_at(&self, block_index: usize, entry_index: usize) -> Option<&Entry> {
+        self.dirblocks.get(block_index)?.entries.get(entry_index)
+    }
+
+    /// Number of dirblocks. Paired with [`DirState::entry_at`] to drive
+    /// an index cursor over [`DirState::iter_entries`].
+    pub fn dirblock_count(&self) -> usize {
+        self.dirblocks.len()
+    }
+
+    /// Number of entries in dirblock `block_index`, or 0 if out of range.
+    pub fn dirblock_entry_count(&self, block_index: usize) -> usize {
+        self.dirblocks
+            .get(block_index)
+            .map(|b| b.entries.len())
+            .unwrap_or(0)
+    }
+
     /// Build an [`IdIndex`] from the current dirblocks. Pure — no
     /// cache interaction; callers that want Python's cached behaviour
     /// should use [`DirState::get_or_build_id_index`] instead.
@@ -4517,7 +4538,8 @@ impl DirState {
                     // Walk children of old_path in tree 1 in
                     // reverse (Python does `reversed(list(...))`)
                     // so deeper paths come out first.
-                    let mut children = self.iter_child_entries(1, &op);
+                    let mut children: Vec<Entry> =
+                        self.iter_child_entries(1, &op).cloned().collect();
                     children.reverse();
                     for child in children {
                         let child_dirname = child.key.dirname.clone();
@@ -5257,62 +5279,14 @@ impl DirState {
     /// suppress the recursion into other entries.
     ///
     /// An empty `path_utf8` walks the top of the tree. Asking for the
-    /// children of a non-directory returns an empty vector.
-    pub fn iter_child_entries(&self, tree_index: usize, path_utf8: &[u8]) -> Vec<Entry> {
-        let mut out: Vec<Entry> = Vec::new();
-        let mut next_pending: Vec<Vec<u8>> = vec![path_utf8.to_vec()];
-        while !next_pending.is_empty() {
-            let pending = std::mem::take(&mut next_pending);
-            for path in pending {
-                let lookup_key = EntryKey {
-                    dirname: path.clone(),
-                    basename: Vec::new(),
-                    file_id: Vec::new(),
-                };
-                let (mut block_index, present) =
-                    find_block_index_from_key(&self.dirblocks, &lookup_key);
-                // Python treats block_index 0 as a special case: the
-                // caller asked for the root, and the first real block
-                // with root entries lives at index 1. If there are no
-                // other blocks we're done.
-                if block_index == 0 {
-                    block_index = 1;
-                    if self.dirblocks.len() == 1 {
-                        return out;
-                    }
-                } else if !present {
-                    // children of a non-directory asked for.
-                    continue;
-                }
-                if block_index >= self.dirblocks.len() {
-                    continue;
-                }
-                let block = &self.dirblocks[block_index];
-                for entry in &block.entries {
-                    let kind = entry
-                        .trees
-                        .get(tree_index)
-                        .map(|t| t.minikind)
-                        .unwrap_or(Kind::Absent);
-                    if !kind.is_absent_or_relocated() {
-                        out.push(entry.clone());
-                    }
-                    if kind == Kind::Directory {
-                        // Build `dirname/basename` for the recursion.
-                        let next_path = if entry.key.dirname.is_empty() {
-                            entry.key.basename.clone()
-                        } else {
-                            let mut p = entry.key.dirname.clone();
-                            p.push(b'/');
-                            p.extend_from_slice(&entry.key.basename);
-                            p
-                        };
-                        next_pending.push(next_path);
-                    }
-                }
-            }
-        }
-        out
+    /// children of a non-directory yields nothing.
+    pub fn iter_child_entries(
+        &self,
+        tree_index: usize,
+        path_utf8: &[u8],
+    ) -> impl Iterator<Item = &Entry> {
+        let mut cursor = IterChildEntriesCursor::new(tree_index, path_utf8);
+        std::iter::from_fn(move || cursor.next_entry(self))
     }
 
     /// Bisect the on-disk dirstate for rows at the given paths.
@@ -5606,6 +5580,104 @@ pub fn find_block_index_from_key(dirblocks: &[Dirblock], key: &EntryKey) -> (usi
     let block_index = bisect_dirblock(dirblocks, &key.dirname, 1, dirblocks.len());
     let present = block_index < dirblocks.len() && dirblocks[block_index].dirname == key.dirname;
     (block_index, present)
+}
+
+/// Resumable cursor for [`DirState::iter_child_entries`]. Holds the
+/// breadth-first walk state so each [`Self::next_entry`] call yields a
+/// single entry without materialising the whole subtree. Directory
+/// entries are enqueued for later expansion in discovery order, exactly
+/// as the eager walk did.
+pub struct IterChildEntriesCursor {
+    tree_index: usize,
+    /// Paths still to expand, in breadth-first order.
+    queue: std::collections::VecDeque<Vec<u8>>,
+    /// Block currently being walked and the next entry index within it.
+    current: Option<(usize, usize)>,
+}
+
+impl IterChildEntriesCursor {
+    pub fn new(tree_index: usize, path_utf8: &[u8]) -> Self {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(path_utf8.to_vec());
+        IterChildEntriesCursor {
+            tree_index,
+            queue,
+            current: None,
+        }
+    }
+
+    /// Advance to the block for the next pending path, or return false
+    /// when the queue is exhausted. Mirrors the per-path setup in the
+    /// original eager walk, including the block-0/root special case.
+    fn open_next_block(&mut self, state: &DirState) -> bool {
+        while let Some(path) = self.queue.pop_front() {
+            let lookup_key = EntryKey {
+                dirname: path,
+                basename: Vec::new(),
+                file_id: Vec::new(),
+            };
+            let (mut block_index, present) =
+                find_block_index_from_key(&state.dirblocks, &lookup_key);
+            // Block index 0 is the root sentinel; the first block with
+            // real root entries lives at index 1.
+            if block_index == 0 {
+                block_index = 1;
+                if state.dirblocks.len() == 1 {
+                    continue;
+                }
+            } else if !present {
+                // Children of a non-directory asked for.
+                continue;
+            }
+            if block_index >= state.dirblocks.len() {
+                continue;
+            }
+            self.current = Some((block_index, 0));
+            return true;
+        }
+        false
+    }
+
+    /// Yield the next child entry, or `None` once the walk is done.
+    pub fn next_entry<'a>(&mut self, state: &'a DirState) -> Option<&'a Entry> {
+        loop {
+            let (block_index, entry_index) = match self.current {
+                Some(c) => c,
+                None => {
+                    if !self.open_next_block(state) {
+                        return None;
+                    }
+                    self.current.unwrap()
+                }
+            };
+            let block = &state.dirblocks[block_index];
+            if entry_index >= block.entries.len() {
+                self.current = None;
+                continue;
+            }
+            self.current = Some((block_index, entry_index + 1));
+            let entry = &block.entries[entry_index];
+            let kind = entry
+                .trees
+                .get(self.tree_index)
+                .map(|t| t.minikind)
+                .unwrap_or(Kind::Absent);
+            if kind == Kind::Directory {
+                let next_path = if entry.key.dirname.is_empty() {
+                    entry.key.basename.clone()
+                } else {
+                    let mut p = entry.key.dirname.clone();
+                    p.push(b'/');
+                    p.extend_from_slice(&entry.key.basename);
+                    p
+                };
+                self.queue.push_back(next_path);
+            }
+            if !kind.is_absent_or_relocated() {
+                return Some(entry);
+            }
+        }
+    }
 }
 
 /// Compare `(dirname, basename, file_id)` keys in the tuple order Python

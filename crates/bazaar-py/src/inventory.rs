@@ -1419,31 +1419,26 @@ impl Inventory {
             .map_err(|e| inventory_err_to_py_err(e, py))
     }
 
-    fn iter_sorted_children<'a>(
+    fn iter_sorted_children(
         &self,
-        py: Python<'a>,
+        py: Python<'_>,
         file_id: FileId,
-    ) -> PyResult<Vec<Bound<'a, PyAny>>> {
+    ) -> PyResult<Py<SortedChildrenIterator>> {
         let children = self.0.iter_sorted_children(&file_id);
         if children.is_none() {
             return Err(NoSuchId::new_err((py.None(), file_id)));
         }
-        children
-            .unwrap()
-            .map(|(_n, e)| Ok(entry_to_py(py, e.clone())?.into_any()))
-            .collect::<PyResult<Vec<_>>>()
+        let entries = children.unwrap().map(|(_n, e)| e.clone()).collect();
+        Py::new(py, SortedChildrenIterator { entries })
     }
 
-    fn iter_all_ids<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+    fn iter_all_ids(&self, py: Python<'_>) -> PyResult<Py<FileIdIterator>> {
         use bazaar::inventory::Inventory;
         let ids = self
             .0
             .all_file_ids()
             .map_err(|e| inventory_err_to_py_err(e, py))?;
-        ids.into_iter()
-            .collect::<Vec<_>>()
-            .into_pyobject(py)?
-            .call_method0("__iter__")
+        Py::new(py, FileIdIterator { ids: ids.into() })
     }
 
     #[pyo3(signature = (from_dir=None, recursive=true))]
@@ -1743,6 +1738,179 @@ impl IterEntriesIterator {
                 return Ok(None);
             }
         }
+    }
+}
+
+/// Iterator returned by `Inventory.iter_sorted_children`. Holds the
+/// sorted entries and constructs the Python `InventoryEntry` objects
+/// one at a time.
+#[pyclass]
+struct SortedChildrenIterator {
+    entries: VecDeque<Entry>,
+}
+
+#[pymethods]
+impl SortedChildrenIterator {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        match self.entries.pop_front() {
+            Some(e) => Ok(Some(entry_to_py(py, e)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Iterator returned by `Inventory.iter_all_ids`, yielding file-ids.
+#[pyclass]
+struct FileIdIterator {
+    ids: VecDeque<FileId>,
+}
+
+#[pymethods]
+impl FileIdIterator {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        match self.ids.pop_front() {
+            Some(id) => Ok(Some(id.into_pyobject(py)?.into_any().unbind())),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Iterator returned by `CHKInventory._iter_file_id_parents`. Walks
+/// one entry up the parent chain per step, from `file_id` to the root.
+#[pyclass]
+struct FileIdParentsIter {
+    inv: Py<CHKInventory>,
+    cur: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl FileIdParentsIter {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let Some(id) = self.cur.take() else {
+            return Ok(None);
+        };
+        let id_bound = id.bind(py).clone();
+        if id_bound.is_none() {
+            return Ok(None);
+        }
+        let entry = self.inv.borrow(py).get_entry(py, id_bound)?;
+        let parent = entry.getattr("parent_id")?;
+        self.cur = if parent.is_none() {
+            None
+        } else {
+            Some(parent.unbind())
+        };
+        Ok(Some(entry))
+    }
+}
+
+/// Generic iterator over a pre-built Python list, yielding one element
+/// per step. Used where the backing data is already materialised but
+/// the public contract is an iterator.
+#[pyclass]
+struct ListIterator {
+    list: Py<PyList>,
+    index: usize,
+}
+
+impl ListIterator {
+    fn new(list: Bound<'_, PyList>) -> Self {
+        ListIterator {
+            list: list.unbind(),
+            index: 0,
+        }
+    }
+}
+
+#[pymethods]
+impl ListIterator {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let list = self.list.bind(py);
+        if self.index >= list.len() {
+            return Ok(None);
+        }
+        let item = list.get_item(self.index)?;
+        self.index += 1;
+        Ok(Some(item))
+    }
+}
+
+/// Iterator returned by `UnversionedInventory.iter_all_ids`. Pulls one
+/// `(key, value)` pair from the backing `id_to_entry.iteritems()` per
+/// step and yields `key[-1]`.
+#[pyclass]
+struct AllIdsIterator {
+    items: Py<PyAny>,
+}
+
+#[pymethods]
+impl AllIdsIterator {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let items = self.items.bind(py);
+        let Some(pair) = items.try_iter()?.next() else {
+            return Ok(None);
+        };
+        let tup = pair?.cast_into::<PyTuple>()?;
+        let key_tup = tup.get_item(0)?.cast_into::<PyTuple>()?;
+        Ok(Some(key_tup.get_item(key_tup.len() - 1)?))
+    }
+}
+
+/// Iterator returned by `UnversionedInventory.iter_just_entries`. Pulls
+/// one `(key, value)` pair from `id_to_entry.iteritems()` per step,
+/// decoding the entry (and caching it) on demand.
+#[pyclass]
+struct JustEntriesIterator {
+    items: Py<PyAny>,
+    cache: Py<pyo3::types::PyDict>,
+}
+
+#[pymethods]
+impl JustEntriesIterator {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let items = self.items.bind(py);
+        let Some(pair) = items.try_iter()?.next() else {
+            return Ok(None);
+        };
+        let tup = pair?.cast_into::<PyTuple>()?;
+        let key = tup.get_item(0)?;
+        let value = tup.get_item(1)?;
+        let file_id = key.cast_into::<PyTuple>()?.get_item(0)?;
+        let cache = self.cache.bind(py);
+        let entry = match cache.get_item(&file_id)? {
+            Some(e) => e,
+            None => {
+                let bytes = value.cast_into::<PyBytes>()?;
+                let e = chk_inventory_bytes_to_entry(py, bytes.as_bytes())?;
+                cache.set_item(&file_id, &e)?;
+                e
+            }
+        };
+        Ok(Some(entry))
     }
 }
 
@@ -2223,10 +2391,25 @@ impl CHKInventory {
     }
 
     /// Yield the parents of `file_id` up to the root. Mirrors
-    /// Python's `_iter_file_id_parents`. Returns a list rather than
-    /// a generator (no streaming benefit for the typical short chain
-    /// up to the root).
-    fn _iter_file_id_parents<'py>(
+    /// Python's `_iter_file_id_parents` generator, walking one entry up
+    /// the chain per step.
+    fn _iter_file_id_parents(
+        slf: Bound<'_, Self>,
+        py: Python<'_>,
+        file_id: Bound<'_, PyBytes>,
+    ) -> PyResult<Py<FileIdParentsIter>> {
+        Py::new(
+            py,
+            FileIdParentsIter {
+                inv: slf.unbind(),
+                cur: Some(file_id.into_any().unbind()),
+            },
+        )
+    }
+
+    /// Collect the parent chain of `file_id` up to the root as a list.
+    /// Used by `id2path`, which needs random access and a length.
+    fn file_id_parents_list<'py>(
         &self,
         py: Python<'py>,
         file_id: Bound<'_, PyBytes>,
@@ -2253,55 +2436,36 @@ impl CHKInventory {
     }
 
     /// Yield every file id stored in id_to_entry. Mirrors Python's
-    /// `iter_all_ids` (which is a generator); we return a list.
-    fn iter_all_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let out = PyList::empty(py);
+    /// `iter_all_ids` generator.
+    fn iter_all_ids(&self, py: Python<'_>) -> PyResult<Py<AllIdsIterator>> {
         let map = self
             .id_to_entry
             .as_ref()
             .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set"))?;
-        let items_iter = map.bind(py).call_method0("iteritems")?;
-        for pair in items_iter.try_iter()? {
-            let pair = pair?;
-            let tup = pair.cast_into::<PyTuple>()?;
-            let key = tup.get_item(0)?;
-            // key[-1] in Python — the last element of the key tuple.
-            let key_tup = key.cast_into::<PyTuple>()?;
-            let last = key_tup.get_item(key_tup.len() - 1)?;
-            out.append(last)?;
-        }
-        Ok(out)
+        let items_iter = map.bind(py).call_method0("iteritems")?.try_iter()?;
+        Py::new(
+            py,
+            AllIdsIterator {
+                items: items_iter.into_any().unbind(),
+            },
+        )
     }
 
     /// Yield every entry in the inventory. Mirrors Python's
     /// `iter_just_entries`; populates the cache as it walks.
-    fn iter_just_entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let out = PyList::empty(py);
+    fn iter_just_entries(&self, py: Python<'_>) -> PyResult<Py<JustEntriesIterator>> {
         let map = self
             .id_to_entry
             .as_ref()
             .ok_or_else(|| BzrFormatsError::new_err("id_to_entry not set"))?;
-        let cache = self.fileid_to_entry_cache.bind(py);
-        let items_iter = map.bind(py).call_method0("iteritems")?;
-        for pair in items_iter.try_iter()? {
-            let pair = pair?;
-            let tup = pair.cast_into::<PyTuple>()?;
-            let key = tup.get_item(0)?;
-            let value = tup.get_item(1)?;
-            let key_tup = key.cast_into::<PyTuple>()?;
-            let file_id = key_tup.get_item(0)?;
-            let entry = match cache.get_item(&file_id)? {
-                Some(e) => e,
-                None => {
-                    let bytes = value.cast_into::<PyBytes>()?;
-                    let e = chk_inventory_bytes_to_entry(py, bytes.as_bytes())?;
-                    cache.set_item(&file_id, &e)?;
-                    e
-                }
-            };
-            out.append(entry)?;
-        }
-        Ok(out)
+        let items_iter = map.bind(py).call_method0("iteritems")?.try_iter()?;
+        Py::new(
+            py,
+            JustEntriesIterator {
+                items: items_iter.into_any().unbind(),
+                cache: self.fileid_to_entry_cache.clone_ref(py),
+            },
+        )
     }
 
     /// Look up an inventory entry by file id. Mirrors Python's
@@ -2511,7 +2675,7 @@ impl CHKInventory {
     /// Return the slash-separated path to `file_id`. Mirrors
     /// Python's `id2path`. Raises NoSuchId if absent.
     fn id2path(&self, py: Python<'_>, file_id: Bound<'_, PyBytes>) -> PyResult<String> {
-        let parents = self._iter_file_id_parents(py, file_id)?;
+        let parents = self.file_id_parents_list(py, file_id)?;
         // Walk parents (child-to-root order), drop the root, reverse,
         // join with '/'.
         let mut segments: Vec<String> = Vec::with_capacity(parents.len());
@@ -2696,25 +2860,14 @@ impl CHKInventory {
     }
 
     /// Iterate children of `file_id` in lexicographic-name order.
-    /// Mirrors Python's `iter_sorted_children`. Returns a list rather
-    /// than a generator.
+    /// Mirrors Python's `iter_sorted_children` generator.
     fn iter_sorted_children<'py>(
         &self,
         py: Python<'py>,
         file_id: Bound<'py, PyBytes>,
-    ) -> PyResult<Bound<'py, PyList>> {
-        let children = self.get_children(py, file_id)?;
-        // Sort by key (name).
-        let mut pairs: Vec<(String, Py<PyAny>)> = Vec::new();
-        for (k, v) in children.iter() {
-            pairs.push((k.extract::<String>()?, v.unbind()));
-        }
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        let out = PyList::empty(py);
-        for (_, v) in pairs {
-            out.append(v)?;
-        }
-        Ok(out)
+    ) -> PyResult<Py<ListIterator>> {
+        let list = self.sorted_children_list(py, file_id)?;
+        Py::new(py, ListIterator::new(list))
     }
 
     /// Walk the inventory in lexicographic order. Mirrors Python's
@@ -2756,7 +2909,7 @@ impl CHKInventory {
             }
         };
         let start_bytes = start_file_id.bind(py).clone().cast_into::<PyBytes>()?;
-        let direct = slf.borrow().iter_sorted_children(py, start_bytes)?;
+        let direct = slf.borrow().sorted_children_list(py, start_bytes)?;
         let mut queue: std::collections::VecDeque<Py<PyAny>> = std::collections::VecDeque::new();
         for c in direct.iter() {
             queue.push_back(c.unbind());
@@ -2791,7 +2944,7 @@ impl CHKInventory {
         while let Some((dir_path, dir_ie_py)) = stack.pop() {
             let dir_ie = dir_ie_py.bind(py);
             let fid = dir_ie.getattr("file_id")?.cast_into::<PyBytes>()?;
-            let children = slf.borrow().iter_sorted_children(py, fid)?;
+            let children = slf.borrow().sorted_children_list(py, fid)?;
             // Push child directories in reverse so they pop in order.
             let mut child_dirs: Vec<(String, Py<PyAny>)> = Vec::new();
             for ie in children.iter() {
@@ -3717,7 +3870,7 @@ impl CHKInventory {
         slf: Bound<'py, CHKInventory>,
         py: Python<'py>,
         basis: Bound<'py, CHKInventory>,
-    ) -> PyResult<Bound<'py, PyList>> {
+    ) -> PyResult<Py<CHKIterChangesIterator>> {
         // Walk the CHKMap iter_changes generator on self.id_to_entry
         // vs basis.id_to_entry. We borrow both pyclass instances
         // immutably for attribute access.
@@ -3733,134 +3886,22 @@ impl CHKInventory {
             .as_ref()
             .ok_or_else(|| BzrFormatsError::new_err("basis.id_to_entry not set"))?
             .clone_ref(py);
+        // CHKMap.iter_changes yields the raw changes (currently as a
+        // list); take an iterator over it once so __next__ advances a
+        // single cursor rather than restarting from the beginning.
         let changes_iter = self_id_map
             .bind(py)
-            .call_method1("iter_changes", (basis_id_map,))?;
-        let out = PyList::empty(py);
-        for change in changes_iter.try_iter()? {
-            let change = change?;
-            let tup = change.cast_into::<PyTuple>()?;
-            let key = tup.get_item(0)?;
-            let basis_value = tup.get_item(1)?;
-            let self_value = tup.get_item(2)?;
-            let file_id = key.cast_into::<PyTuple>()?.get_item(0)?;
-            let (basis_entry, path_in_source, basis_parent, basis_name, basis_executable) =
-                if basis_value.is_none() {
-                    (py.None(), py.None(), py.None(), py.None(), py.None())
-                } else {
-                    let bytes = basis_value.cast_into::<PyBytes>()?;
-                    let entry = basis
-                        .borrow()
-                        ._bytes_to_entry(py, bytes)?
-                        .into_pyobject(py)?;
-                    let path: Py<PyAny> =
-                        basis.call_method1("id2path", (file_id.clone(),))?.unbind();
-                    let parent = entry.getattr("parent_id")?.unbind();
-                    let name = entry.getattr("name")?.unbind();
-                    let executable = entry.getattr("executable").ok().map_or(py.None(), |v| {
-                        if v.is_none() {
-                            py.None()
-                        } else {
-                            v.unbind()
-                        }
-                    });
-                    (entry.unbind(), path, parent, name, executable)
-                };
-            let (self_entry, path_in_target, self_parent, self_name, self_executable) =
-                if self_value.is_none() {
-                    (py.None(), py.None(), py.None(), py.None(), py.None())
-                } else {
-                    let bytes = self_value.cast_into::<PyBytes>()?;
-                    let entry = slf.borrow()._bytes_to_entry(py, bytes)?.into_pyobject(py)?;
-                    let path: Py<PyAny> = slf.call_method1("id2path", (file_id.clone(),))?.unbind();
-                    let parent = entry.getattr("parent_id")?.unbind();
-                    let name = entry.getattr("name")?.unbind();
-                    let executable = entry.getattr("executable").ok().map_or(py.None(), |v| {
-                        if v.is_none() {
-                            py.None()
-                        } else {
-                            v.unbind()
-                        }
-                    });
-                    (entry.unbind(), path, parent, name, executable)
-                };
-            let (basis_kind, self_kind) = (
-                if basis_entry.is_none(py) {
-                    py.None()
-                } else {
-                    basis_entry.getattr(py, "kind")?
-                },
-                if self_entry.is_none(py) {
-                    py.None()
-                } else {
-                    self_entry.getattr(py, "kind")?
-                },
-            );
-            let versioned = (!basis_entry.is_none(py), !self_entry.is_none(py));
-            let mut changed_content = !basis_kind.bind(py).eq(self_kind.bind(py))?;
-            if !changed_content && !basis_entry.is_none(py) && !self_entry.is_none(py) {
-                let kind_str: Option<String> = basis_kind.extract(py).ok();
-                match kind_str.as_deref() {
-                    Some("file") => {
-                        let bs = basis_entry.getattr(py, "text_size")?;
-                        let ss = self_entry.getattr(py, "text_size")?;
-                        let bsha = basis_entry.getattr(py, "text_sha1")?;
-                        let ssha = self_entry.getattr(py, "text_sha1")?;
-                        if !bs.bind(py).eq(ss.bind(py))? || !bsha.bind(py).eq(ssha.bind(py))? {
-                            changed_content = true;
-                        }
-                    }
-                    Some("symlink") => {
-                        let bt = basis_entry.getattr(py, "symlink_target")?;
-                        let st = self_entry.getattr(py, "symlink_target")?;
-                        if !bt.bind(py).eq(st.bind(py))? {
-                            changed_content = true;
-                        }
-                    }
-                    Some("tree-reference") => {
-                        let br = basis_entry.getattr(py, "reference_revision")?;
-                        let sr = self_entry.getattr(py, "reference_revision")?;
-                        if !br.bind(py).eq(sr.bind(py))? {
-                            changed_content = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let parent_eq = basis_parent.bind(py).eq(self_parent.bind(py))?;
-            let name_eq = basis_name.bind(py).eq(self_name.bind(py))?;
-            let executable_eq = basis_executable.bind(py).eq(self_executable.bind(py))?;
-            if !changed_content && parent_eq && name_eq && executable_eq {
-                continue;
-            }
-            let paths_tup = PyTuple::new(py, [path_in_source, path_in_target])?;
-            let versioned_tup = (versioned.0, versioned.1).into_pyobject(py)?;
-            let parent_tup = PyTuple::new(py, [basis_parent, self_parent])?;
-            let name_tup = PyTuple::new(py, [basis_name, self_name])?;
-            let kind_tup = PyTuple::new(py, [basis_kind, self_kind])?;
-            let executable_tup = PyTuple::new(py, [basis_executable, self_executable])?;
-            let row = PyTuple::new(
-                py,
-                [
-                    file_id.unbind(),
-                    paths_tup.into_any().unbind(),
-                    changed_content
-                        .into_pyobject(py)?
-                        .to_owned()
-                        .into_any()
-                        .unbind(),
-                    versioned_tup.into_any().unbind(),
-                    parent_tup.into_any().unbind(),
-                    name_tup.into_any().unbind(),
-                    kind_tup.into_any().unbind(),
-                    executable_tup.into_any().unbind(),
-                ],
-            )?;
-            out.append(row)?;
-        }
-        Ok(out)
+            .call_method1("iter_changes", (basis_id_map,))?
+            .try_iter()?;
+        Py::new(
+            py,
+            CHKIterChangesIterator {
+                slf: slf.unbind(),
+                basis: basis.unbind(),
+                changes: changes_iter.into_any().unbind(),
+            },
+        )
     }
-
     /// Apply `inventory_delta` to `self`, producing a new
     /// CHKInventory at `new_revision_id`. Mirrors Python's
     /// `CHKInventory.create_by_apply_delta`.
@@ -4170,6 +4211,154 @@ impl CHKInventory {
     }
 }
 
+/// Iterator returned by `CHKInventory.iter_changes`. Pulls one raw
+/// change from the underlying CHKMap `iter_changes` per step, builds
+/// the `tree.iter_changes`-shaped tuple, and skips entries that did
+/// not actually change. Mirrors the Python generator.
+#[pyclass]
+struct CHKIterChangesIterator {
+    slf: Py<CHKInventory>,
+    basis: Py<CHKInventory>,
+    changes: Py<PyAny>,
+}
+
+#[pymethods]
+impl CHKIterChangesIterator {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        let slf = self.slf.bind(py);
+        let basis = self.basis.bind(py);
+        let mut changes = self.changes.bind(py).try_iter()?;
+        loop {
+            let Some(change) = changes.next() else {
+                return Ok(None);
+            };
+            let change = change?;
+            let tup = change.cast_into::<PyTuple>()?;
+            let key = tup.get_item(0)?;
+            let basis_value = tup.get_item(1)?;
+            let self_value = tup.get_item(2)?;
+            let file_id = key.cast_into::<PyTuple>()?.get_item(0)?;
+            let (basis_entry, path_in_source, basis_parent, basis_name, basis_executable) =
+                if basis_value.is_none() {
+                    (py.None(), py.None(), py.None(), py.None(), py.None())
+                } else {
+                    let bytes = basis_value.cast_into::<PyBytes>()?;
+                    let entry = basis
+                        .borrow()
+                        ._bytes_to_entry(py, bytes)?
+                        .into_pyobject(py)?;
+                    let path: Py<PyAny> =
+                        basis.call_method1("id2path", (file_id.clone(),))?.unbind();
+                    let parent = entry.getattr("parent_id")?.unbind();
+                    let name = entry.getattr("name")?.unbind();
+                    let executable = entry.getattr("executable").ok().map_or(py.None(), |v| {
+                        if v.is_none() {
+                            py.None()
+                        } else {
+                            v.unbind()
+                        }
+                    });
+                    (entry.unbind(), path, parent, name, executable)
+                };
+            let (self_entry, path_in_target, self_parent, self_name, self_executable) =
+                if self_value.is_none() {
+                    (py.None(), py.None(), py.None(), py.None(), py.None())
+                } else {
+                    let bytes = self_value.cast_into::<PyBytes>()?;
+                    let entry = slf.borrow()._bytes_to_entry(py, bytes)?.into_pyobject(py)?;
+                    let path: Py<PyAny> = slf.call_method1("id2path", (file_id.clone(),))?.unbind();
+                    let parent = entry.getattr("parent_id")?.unbind();
+                    let name = entry.getattr("name")?.unbind();
+                    let executable = entry.getattr("executable").ok().map_or(py.None(), |v| {
+                        if v.is_none() {
+                            py.None()
+                        } else {
+                            v.unbind()
+                        }
+                    });
+                    (entry.unbind(), path, parent, name, executable)
+                };
+            let (basis_kind, self_kind) = (
+                if basis_entry.is_none(py) {
+                    py.None()
+                } else {
+                    basis_entry.getattr(py, "kind")?
+                },
+                if self_entry.is_none(py) {
+                    py.None()
+                } else {
+                    self_entry.getattr(py, "kind")?
+                },
+            );
+            let versioned = (!basis_entry.is_none(py), !self_entry.is_none(py));
+            let mut changed_content = !basis_kind.bind(py).eq(self_kind.bind(py))?;
+            if !changed_content && !basis_entry.is_none(py) && !self_entry.is_none(py) {
+                let kind_str: Option<String> = basis_kind.extract(py).ok();
+                match kind_str.as_deref() {
+                    Some("file") => {
+                        let bs = basis_entry.getattr(py, "text_size")?;
+                        let ss = self_entry.getattr(py, "text_size")?;
+                        let bsha = basis_entry.getattr(py, "text_sha1")?;
+                        let ssha = self_entry.getattr(py, "text_sha1")?;
+                        if !bs.bind(py).eq(ss.bind(py))? || !bsha.bind(py).eq(ssha.bind(py))? {
+                            changed_content = true;
+                        }
+                    }
+                    Some("symlink") => {
+                        let bt = basis_entry.getattr(py, "symlink_target")?;
+                        let st = self_entry.getattr(py, "symlink_target")?;
+                        if !bt.bind(py).eq(st.bind(py))? {
+                            changed_content = true;
+                        }
+                    }
+                    Some("tree-reference") => {
+                        let br = basis_entry.getattr(py, "reference_revision")?;
+                        let sr = self_entry.getattr(py, "reference_revision")?;
+                        if !br.bind(py).eq(sr.bind(py))? {
+                            changed_content = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let parent_eq = basis_parent.bind(py).eq(self_parent.bind(py))?;
+            let name_eq = basis_name.bind(py).eq(self_name.bind(py))?;
+            let executable_eq = basis_executable.bind(py).eq(self_executable.bind(py))?;
+            if !changed_content && parent_eq && name_eq && executable_eq {
+                continue;
+            }
+            let paths_tup = PyTuple::new(py, [path_in_source, path_in_target])?;
+            let versioned_tup = (versioned.0, versioned.1).into_pyobject(py)?;
+            let parent_tup = PyTuple::new(py, [basis_parent, self_parent])?;
+            let name_tup = PyTuple::new(py, [basis_name, self_name])?;
+            let kind_tup = PyTuple::new(py, [basis_kind, self_kind])?;
+            let executable_tup = PyTuple::new(py, [basis_executable, self_executable])?;
+            let row = PyTuple::new(
+                py,
+                [
+                    file_id.unbind(),
+                    paths_tup.into_any().unbind(),
+                    changed_content
+                        .into_pyobject(py)?
+                        .to_owned()
+                        .into_any()
+                        .unbind(),
+                    versioned_tup.into_any().unbind(),
+                    parent_tup.into_any().unbind(),
+                    name_tup.into_any().unbind(),
+                    kind_tup.into_any().unbind(),
+                    executable_tup.into_any().unbind(),
+                ],
+            )?;
+            return Ok(Some(row));
+        }
+    }
+}
+
 /// Construct a `_chk_map_rs.CHKMap` pyclass instance directly,
 /// without going through the Python module attribute lookup.
 fn make_chkmap_pyinstance<'py>(
@@ -4227,7 +4416,7 @@ impl CHKIterEntriesIterator {
             let kind: String = ie.getattr("kind")?.extract()?;
             if self.recursive && kind == "directory" {
                 let fid = ie.getattr("file_id")?.cast_into::<PyBytes>()?;
-                let new_children = self.inv.bind(py).borrow().iter_sorted_children(py, fid)?;
+                let new_children = self.inv.bind(py).borrow().sorted_children_list(py, fid)?;
                 let mut q: std::collections::VecDeque<Py<PyAny>> =
                     std::collections::VecDeque::new();
                 for c in new_children.iter() {
@@ -4272,7 +4461,7 @@ impl CHKIterEntriesByDirIterator {
                 .inv
                 .bind(py)
                 .borrow()
-                .iter_sorted_children(py, cur_fid)?;
+                .sorted_children_list(py, cur_fid)?;
             let mut child_dirs: Vec<(String, Py<PyAny>)> = Vec::new();
             for child in children.iter() {
                 let child_name: String = child.getattr("name")?.extract()?;
@@ -4309,6 +4498,27 @@ impl CHKIterEntriesByDirIterator {
 }
 
 impl CHKInventory {
+    /// Build the lexicographically-sorted list of a directory's
+    /// children. Shared by the public `iter_sorted_children` iterator
+    /// and the entry-walking iterators.
+    fn sorted_children_list<'py>(
+        &self,
+        py: Python<'py>,
+        file_id: Bound<'py, PyBytes>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let children = self.get_children(py, file_id)?;
+        let mut pairs: Vec<(String, Py<PyAny>)> = Vec::new();
+        for (k, v) in children.iter() {
+            pairs.push((k.extract::<String>()?, v.unbind()));
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let out = PyList::empty(py);
+        for (_, v) in pairs {
+            out.append(v)?;
+        }
+        Ok(out)
+    }
+
     /// Internal helper called by `from_inventory` and the public
     /// `_populate_from_dicts` method.
     fn populate_from_dicts<'py>(

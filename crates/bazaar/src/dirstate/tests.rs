@@ -1023,7 +1023,7 @@ fn create_dirstate_with_two_trees() -> DirState {
 #[test]
 fn iter_child_entries_children_b_tree_one() {
     let state = create_dirstate_with_two_trees();
-    let children = state.iter_child_entries(1, b"b");
+    let children: Vec<_> = state.iter_child_entries(1, b"b").collect();
     let basenames: Vec<&[u8]> = children.iter().map(|e| e.key.basename.as_slice()).collect();
     let file_ids: Vec<&[u8]> = children.iter().map(|e| e.key.file_id.as_slice()).collect();
     // h2 and i share the basename "h\xc3\xa5" and "i"; distinguish
@@ -1043,8 +1043,10 @@ fn iter_child_entries_children_b_tree_one() {
 #[test]
 fn iter_child_entries_root_tree_one() {
     let state = create_dirstate_with_two_trees();
-    let children = state.iter_child_entries(1, b"");
-    let basenames: Vec<&[u8]> = children.iter().map(|e| e.key.basename.as_slice()).collect();
+    let basenames: Vec<&[u8]> = state
+        .iter_child_entries(1, b"")
+        .map(|e| e.key.basename.as_slice())
+        .collect();
     let expected: Vec<&[u8]> = vec![b"a", b"b", b"d", b"e", b"f", b"h\xc3\xa5", b"i", b"j"];
     assert_eq!(basenames, expected);
 }
@@ -1054,8 +1056,8 @@ fn iter_child_entries_non_directory_returns_empty() {
     let state = create_complex_dirstate();
     // "c" is a file, not a directory — iter_child_entries of a
     // non-directory path yields nothing.
-    let children = state.iter_child_entries(0, b"c");
-    assert!(children.is_empty());
+    let mut children = state.iter_child_entries(0, b"c");
+    assert!(children.next().is_none());
 }
 
 #[test]

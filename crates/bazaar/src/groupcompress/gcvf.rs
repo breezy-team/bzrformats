@@ -964,31 +964,36 @@ where
     /// Mirrors `iter_lines_added_or_present_in_keys`: each key's text is
     /// read and split into lines, returned as `(line, key)` pairs. A key
     /// absent from every store is an error.
+    /// Yield `(line, key)` for every line added by or present in
+    /// `keys`. The record stream is fetched up front (the index lookup
+    /// is inherently batched), but each record is only decoded into
+    /// lines when the iterator reaches it. Yields `Err` for an absent
+    /// key or a line that fails to decode.
     pub fn iter_lines_added_or_present_in_keys(
         &self,
         keys: &[GcKey],
-    ) -> Result<Vec<(Vec<u8>, GcKey)>, crate::knit::KnitError> {
+    ) -> Result<
+        impl Iterator<Item = Result<(Vec<u8>, GcKey), crate::knit::KnitError>>,
+        crate::knit::KnitError,
+    > {
         use crate::versionedfile::ContentFactory;
-        let mut out = Vec::new();
-        for record in self.get_record_stream(keys, "unordered")? {
+        let records = self.get_record_stream(keys, "unordered")?;
+        Ok(records.into_iter().flat_map(|record| {
             if record.storage_kind() == "absent" {
-                return Err(crate::knit::KnitError::RevisionNotPresent(
-                    record.key().segments().to_vec(),
-                ));
+                let err =
+                    crate::knit::KnitError::RevisionNotPresent(record.key().segments().to_vec());
+                return vec![Err(err)].into_iter();
             }
             let key = record.key();
             let chunks: Vec<Vec<u8>> = record.to_chunks().map(|c| c.into_owned()).collect();
-            let lines =
-                crate::osutils::chunks_to_lines(chunks.into_iter().map(Ok::<_, std::io::Error>));
-            for line in lines {
-                out.push((
-                    line.map_err(|e| crate::knit::KnitError::Corrupt(e.to_string()))?
-                        .into_owned(),
-                    key.clone(),
-                ));
-            }
-        }
-        Ok(out)
+            crate::osutils::chunks_to_lines(chunks.into_iter().map(Ok::<_, std::io::Error>))
+                .map(|line| {
+                    line.map(|l| (l.into_owned(), key.clone()))
+                        .map_err(|e| crate::knit::KnitError::Corrupt(e.to_string()))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+        }))
     }
 
     /// Check the store reads back: every key's text is fetched and decoded.
@@ -1085,7 +1090,8 @@ where
         &self,
         keys: &[GcKey],
     ) -> Result<Vec<(Vec<u8>, GcKey)>, crate::knit::KnitError> {
-        GroupCompressVersionedFiles::iter_lines_added_or_present_in_keys(self, keys)
+        GroupCompressVersionedFiles::iter_lines_added_or_present_in_keys(self, keys)?
+            .collect::<Result<Vec<_>, _>>()
     }
 
     fn annotate(&self, _key: &GcKey) -> Result<Vec<(GcKey, Vec<u8>)>, crate::knit::KnitError> {
@@ -1757,6 +1763,8 @@ mod tests {
         // iter_lines yields each line paired with the key.
         let iter_lines = vf
             .iter_lines_added_or_present_in_keys(&[key.clone()])
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(
             iter_lines,

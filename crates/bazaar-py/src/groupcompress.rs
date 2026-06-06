@@ -3215,6 +3215,37 @@ impl BatchingBlockFetcher {
 type PureGcvf =
     bazaar::groupcompress::gcvf::GroupCompressVersionedFiles<PyGcIndex, PyGcAccess, PyBlockCache>;
 
+/// Iterator returned by
+/// `GroupCompressVersionedFiles.iter_lines_added_or_present_in_keys`.
+/// The bazaar iterator's records hold `dyn ContentFactory` trait
+/// objects, which are neither `Send` nor `Sync`, so they cannot live in
+/// a pyclass field; the lines are drained into a queue up front and the
+/// `(bytes, key)` tuples are built one at a time.
+#[pyclass]
+struct GcLinesIter {
+    pairs: std::collections::VecDeque<(Vec<u8>, bazaar::groupcompress::gcvf::GcKey)>,
+}
+
+#[pymethods]
+impl GcLinesIter {
+    fn __iter__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        match self.pairs.pop_front() {
+            Some((line, key)) => Ok(Some(PyTuple::new(
+                py,
+                [
+                    PyBytes::new(py, &line).into_any(),
+                    key.into_pyobject(py)?.into_any(),
+                ],
+            )?)),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Python binding for `GroupCompressVersionedFiles`.
 ///
 /// Holds the pure-Rust store plus the Python-visible state the test surface
@@ -4073,30 +4104,25 @@ impl GroupCompressVersionedFiles {
     #[pyo3(signature = (keys, pb=None))]
     fn iter_lines_added_or_present_in_keys<'py>(
         &self,
-        py: Python<'py>,
+        _py: Python<'py>,
         keys: Bound<'py, PyAny>,
         pb: Option<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyList>> {
+    ) -> PyResult<GcLinesIter> {
         let _ = pb;
         let mut key_vec: Vec<bazaar::groupcompress::gcvf::GcKey> = Vec::new();
         for k in keys.try_iter()? {
             key_vec.push(k?.extract()?);
         }
+        // The record decode happens here (the records carry non-Send
+        // trait objects that can't live in a pyclass), but the Python
+        // objects are built one pair at a time from the queue.
         let pairs = self
             .pure
             .iter_lines_added_or_present_in_keys(&key_vec)
+            .map_err(crate::knit::knit_err_to_py)?
+            .collect::<Result<std::collections::VecDeque<_>, _>>()
             .map_err(crate::knit::knit_err_to_py)?;
-        let out = PyList::empty(py);
-        for (line, key) in pairs {
-            out.append(PyTuple::new(
-                py,
-                [
-                    PyBytes::new(py, &line).into_any(),
-                    key.into_pyobject(py)?.into_any(),
-                ],
-            )?)?;
-        }
-        Ok(out)
+        Ok(GcLinesIter { pairs })
     }
 
     /// This controls how the GroupCompress DeltaIndex works: the default
