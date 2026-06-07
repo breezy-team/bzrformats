@@ -7,10 +7,12 @@
 //! rebuilding each revision through the neutral `add_*` API. Each backend then
 //! stores the data in its own representation.
 //!
-//! This object-level rebuild is the universal path. A same-format fast path
-//! that streams raw records without re-encoding is a future optimisation
-//! (it would downcast the concrete pack repositories and copy their stores
-//! directly, the way [`super::Pack2aRepository::pack`] does).
+//! This object-level rebuild is the universal path. A backend may also provide
+//! a same-format fast path through [`Repository::try_fetch_from`](super::Repository::try_fetch_from):
+//! the 2a and knit-pack repositories override it to stream raw records between
+//! two repositories of the same format without decoding and re-encoding. The
+//! generic fetcher here stays free of any per-format knowledge -- it just
+//! offers the target the chance and falls back to the rebuild.
 
 use std::collections::{HashMap, HashSet};
 
@@ -516,6 +518,125 @@ mod tests {
             assert_eq!(
                 target.get_file_text(b"file-1", rev).unwrap(),
                 format!("hello {}\n", i + 1).into_bytes()
+            );
+        }
+    }
+
+    /// Build a chain of `n` revisions in a fresh knit-pack (1.9) repository,
+    /// each adding/updating one file.
+    #[cfg(feature = "knitpack")]
+    fn make_knitpack_chain(t: &SharedTransport, n: usize) -> Vec<Vec<u8>> {
+        use crate::repository::KnitPackRepository;
+        let knitpack6 =
+            crate::repository::find_format(b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n")
+                .unwrap();
+        let mut repo = KnitPackRepository::create(t.clone(), knitpack6).unwrap();
+        let root = crate::inventory::ROOT_ID;
+        let mut ids: Vec<Vec<u8>> = Vec::new();
+        for i in 1..=n {
+            let rev = format!("rev-{i}").into_bytes();
+            let parents: Vec<&[u8]> = if i == 1 {
+                vec![]
+            } else {
+                vec![ids[i - 2].as_slice()]
+            };
+            let parent_vecs: Vec<Vec<u8>> = parents.iter().map(|p| p.to_vec()).collect();
+            repo.start_write_group().unwrap();
+            let text = format!("hello {i}\n").into_bytes();
+            repo.add_text(b"file-1", &rev, &[], &text).unwrap();
+            let entries = vec![
+                crate::inventory::Entry::root(
+                    crate::FileId::from(root),
+                    Some(crate::RevisionId::from(rev.as_slice())),
+                ),
+                crate::inventory::Entry::file(
+                    crate::FileId::from(&b"file-1"[..]),
+                    "a.txt".into(),
+                    crate::FileId::from(root),
+                    Some(crate::RevisionId::from(rev.as_slice())),
+                    Some(crate::weave::sha_strings(&[text.as_slice()])),
+                    Some(text.len() as u64),
+                    Some(false),
+                    None,
+                ),
+            ];
+            repo.add_inventory_from_entries(&rev, &parent_vecs, root, &entries)
+                .unwrap();
+            repo.add_revision(&revision(&rev, parents), &parent_vecs)
+                .unwrap();
+            repo.commit_write_group().unwrap();
+            ids.push(rev);
+        }
+        ids
+    }
+
+    /// Knit-pack to knit-pack fetch uses the streaming fast path and copies the
+    /// whole ancestry; all data reads back.
+    #[cfg(feature = "knitpack")]
+    #[test]
+    fn fetch_knitpack_to_knitpack_streams() {
+        use crate::repository::KnitPackRepository;
+        let knitpack6 =
+            crate::repository::find_format(b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n")
+                .unwrap();
+
+        let (_sd, st) = temp_repo();
+        let ids = make_knitpack_chain(&st, 3);
+        let source = KnitPackRepository::open(st).unwrap();
+
+        let (_td, tt) = temp_repo();
+        let mut target = KnitPackRepository::create(tt.clone(), knitpack6).unwrap();
+        assert_eq!(fetch(&source, &mut target, Some(&ids[2])).unwrap(), 3);
+
+        let target = KnitPackRepository::open(tt).unwrap();
+        let mut got = target.all_revision_ids().unwrap();
+        got.sort();
+        assert_eq!(got, ids);
+        for (i, rev) in ids.iter().enumerate() {
+            assert_eq!(
+                target.get_file_text(b"file-1", rev).unwrap(),
+                format!("hello {}\n", i + 1).into_bytes()
+            );
+        }
+    }
+
+    /// The knit-pack streaming fast path matches the generic rebuild.
+    #[cfg(feature = "knitpack")]
+    #[test]
+    fn knitpack_streaming_matches_generic() {
+        use crate::repository::KnitPackRepository;
+        let knitpack6 =
+            crate::repository::find_format(b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n")
+                .unwrap();
+
+        let (_sd, st) = temp_repo();
+        let ids = make_knitpack_chain(&st, 3);
+        let source = KnitPackRepository::open(st).unwrap();
+
+        // Fast path (knit-pack -> knit-pack streams).
+        let (_fd, ft) = temp_repo();
+        let mut fast = KnitPackRepository::create(ft.clone(), knitpack6).unwrap();
+        fetch(&source, &mut fast, Some(&ids[2])).unwrap();
+        let fast = KnitPackRepository::open(ft).unwrap();
+
+        // Generic path: drive copy_revision directly.
+        let (_gd, gt) = temp_repo();
+        let mut generic = KnitPackRepository::create(gt.clone(), knitpack6).unwrap();
+        generic.start_write_group().unwrap();
+        for rev in &ids {
+            copy_revision(&source, &mut generic, rev).unwrap();
+        }
+        generic.commit_write_group().unwrap();
+        let generic = KnitPackRepository::open(gt).unwrap();
+
+        for rev in &ids {
+            assert_eq!(
+                fast.get_revision(rev).unwrap().message,
+                generic.get_revision(rev).unwrap().message
+            );
+            assert_eq!(
+                fast.get_file_text(b"file-1", rev).unwrap(),
+                generic.get_file_text(b"file-1", rev).unwrap()
             );
         }
     }

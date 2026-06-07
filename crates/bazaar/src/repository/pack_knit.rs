@@ -583,6 +583,55 @@ impl KnitPackRepository {
         Ok(())
     }
 
+    /// Stream the `missing` revisions from another knit-pack repository into
+    /// this one, copying raw records (revisions, inventories, texts,
+    /// signatures) without decoding and re-encoding them.
+    ///
+    /// This is the same-format fast path for [`crate::repository::fetch`]:
+    /// both sides store knit records and XML inventories, so records copy
+    /// through verbatim. Unlike 2a there is no CHK page store. `missing` must
+    /// be in topological order and already filtered to revisions absent here.
+    ///
+    /// Requires no open write group.
+    pub fn stream_fetch_from(
+        &mut self,
+        source: &KnitPackRepository,
+        missing: &[Vec<u8>],
+    ) -> Result<(), RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::Corrupt(
+                "cannot fetch with an open write group".to_string(),
+            ));
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        // Per-revision stores key by [revid].
+        let rev_keys: Vec<KnitKey> = missing.iter().map(|r| vec![r.clone()]).collect();
+
+        // Texts key by [file_id, revid]; collect the keys each fetched
+        // revision introduces from its inventory.
+        let mut text_keys: Vec<KnitKey> = Vec::new();
+        for rev in missing {
+            let inv = source.get_inventory(rev)?;
+            for (_, entry) in inv.entries() {
+                if entry.revision().map(|r| r.as_bytes()) == Some(rev.as_slice()) {
+                    text_keys.push(vec![entry.file_id().as_bytes().to_vec(), rev.clone()]);
+                }
+            }
+        }
+
+        self.start_write_group()?;
+        let group = self.write_group.as_ref().expect("just opened");
+        group.copy_store_keys(&source.revisions, RepackTarget::Revisions, &rev_keys)?;
+        group.copy_store_keys(&source.inventories, RepackTarget::Inventories, &rev_keys)?;
+        group.copy_store_keys(&source.signatures, RepackTarget::Signatures, &rev_keys)?;
+        group.copy_store_keys(&source.texts, RepackTarget::Texts, &text_keys)?;
+        self.commit_write_group()?;
+        Ok(())
+    }
+
     /// Combine all packs in this repository into a single new pack.
     ///
     /// Re-streams every record (revisions, inventories, texts, signatures) into
@@ -853,6 +902,31 @@ impl super::Repository for KnitPackRepository {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// Fast path for knit-pack-to-knit-pack fetch: if `source` is also a
+    /// knit-pack repository, stream raw records; otherwise decline so the
+    /// generic rebuild runs.
+    fn try_fetch_from(
+        &mut self,
+        source: &dyn super::Repository,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<bool, RepositoryError> {
+        match source.as_any().downcast_ref::<KnitPackRepository>() {
+            // Only stream when the two knit-pack formats share an inventory
+            // serializer (xml5/6/7) and rich-root setting; otherwise the copied
+            // XML inventories would not match the target format, so fall back to
+            // the generic rebuild.
+            Some(src)
+                if src.format().inventory_serializer.format_num()
+                    == self.format().inventory_serializer.format_num()
+                    && src.format().rich_root_data == self.format().rich_root_data =>
+            {
+                self.stream_fetch_from(src, revision_ids)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
@@ -1250,16 +1324,28 @@ impl WriteGroup {
     /// stores, preserving keys and parents. The source records are pulled as
     /// fulltext and re-added, recompressing them into the new pack.
     fn copy_store(&self, source: &Store, target: RepackTarget) -> Result<(), RepositoryError> {
-        use crate::versionedfile::ContentFactory;
         let mut keys = source.keys()?;
         keys.sort();
+        self.copy_store_keys(source, target, &keys)
+    }
+
+    /// Copy just `keys` from a source store into one of this write group's
+    /// stores, preserving keys and parents. Used by the same-format streaming
+    /// fetch to copy exactly the records belonging to the fetched revisions.
+    fn copy_store_keys(
+        &self,
+        source: &Store,
+        target: RepackTarget,
+        keys: &[KnitKey],
+    ) -> Result<(), RepositoryError> {
+        use crate::versionedfile::ContentFactory;
         let store = match target {
             RepackTarget::Revisions => &self.revisions,
             RepackTarget::Inventories => &self.inventories,
             RepackTarget::Texts => &self.texts,
             RepackTarget::Signatures => &self.signatures,
         };
-        for record in source.get_record_stream(&keys, "unordered", true)? {
+        for record in source.get_record_stream(keys, "unordered", true)? {
             if record.storage_kind() == "absent" {
                 continue;
             }
