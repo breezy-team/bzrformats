@@ -279,12 +279,11 @@ impl Lock for LockDir<'_> {
         self.lock_held = false;
         self.nonce = None;
         self.transport.delete(&format!("{tmpname}{INFO_NAME}"))?;
-        // Removing the now-empty holder dir can fail if a racing locker moved
-        // its own pending dir inside ours; breezy falls back to delete_tree
-        // there. We have no recursive-remove primitive on Transport yet, so we
-        // log and leave the stray dir rather than failing the unlock.
-        // TODO: add a Transport delete_tree and clean up the leftover dir.
-        if let Err(e) = self.transport.rmdir(&tmpname) {
+        // Removing the holder dir usually leaves an empty directory, but a
+        // racing locker may have moved its own pending dir inside ours; breezy
+        // falls back to delete_tree there. Recursively remove so the stray dir
+        // does not leak; failure is logged, not fatal to the unlock.
+        if let Err(e) = delete_tree(self.transport, &tmpname) {
             log::warn!("error removing released lock dir {tmpname}: {e}");
         }
         Ok(())
@@ -305,6 +304,26 @@ impl Drop for LockDir<'_> {
             let _ = self.unlock();
         }
     }
+}
+
+/// Recursively remove the directory at `path` through `transport`, deleting its
+/// contents first (a directory cannot be removed while non-empty). A missing
+/// entry is not an error.
+fn delete_tree(transport: &dyn Transport, path: &str) -> Result<(), TransportError> {
+    let entries = match transport.list_dir(path) {
+        Ok(e) => e,
+        Err(TransportError::NoSuchFile(_)) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let child = format!("{path}/{entry}");
+        // Try as a file; if that fails, treat it as a subdirectory and recurse.
+        match transport.delete(&child) {
+            Ok(()) | Err(TransportError::NoSuchFile(_)) => {}
+            Err(_) => delete_tree(transport, &child)?,
+        }
+    }
+    transport.rmdir(path)
 }
 
 #[cfg(test)]

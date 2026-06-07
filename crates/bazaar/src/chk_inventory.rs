@@ -1255,11 +1255,36 @@ where
         Ok(result)
     }
 
-    /// Return a specific child of `dir_id` by name. Mirrors `get_child`.
+    /// Return a specific child of `dir_id` by name.
+    ///
+    /// Looks the child up directly through the `parent_id_basename_to_file_id`
+    /// map with the exact `(dir_id, name)` key, rather than loading every child
+    /// of the directory. (breezy's `get_child` still loads all children; this
+    /// is a behaviour-preserving speed-up.) Falls back to the children cache
+    /// when it is already populated.
     pub fn get_child(&self, dir_id: &crate::FileId, name: &str) -> Result<Option<Entry>, Error> {
-        // TODO(jelmer): implement a version that doesn't load all children.
-        let children = self.get_children(dir_id)?;
-        Ok(children.get(name).cloned())
+        // If we have already loaded this directory's children, use them.
+        if let Some(c) = self.children_cache.borrow().get(dir_id) {
+            return Ok(c.get(name).cloned());
+        }
+        // Exact lookup in the parent-id/basename map: (dir_id, name) -> file_id.
+        let file_id = {
+            let mut parent_map = self.parent_id_basename_to_file_id.borrow_mut();
+            let map = parent_map.as_mut().ok_or_else(|| {
+                Error::InvalidFormat(
+                    "Inventories without parent_id_basename_to_file_id are no longer supported"
+                        .into(),
+                )
+            })?;
+            let key = vec![dir_id.as_bytes().to_vec(), name.as_bytes().to_vec()];
+            let mut pairs = map.iteritems(Some(std::slice::from_ref(&key)))?;
+            match pairs.pop() {
+                Some((_k, v)) => crate::FileId::from(v.as_slice()),
+                None => return Ok(None),
+            }
+        };
+        // Dereference the file_id to its entry via id_to_entry.
+        Ok(self.get_items(&[file_id])?.into_iter().next())
     }
 
     /// Return children of `dir_id` sorted by name. Mirrors
