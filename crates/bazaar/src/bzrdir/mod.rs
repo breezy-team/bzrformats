@@ -946,6 +946,107 @@ pub fn open(transport: SharedTransport) -> Result<Box<dyn ControlDir>, BzrDirErr
     }
 }
 
+/// Upgrade the control directory under `parent` (the directory containing
+/// `.bzr`) to `target_format`.
+///
+/// This is a sprout-style conversion: a fresh control directory in the target
+/// format is built alongside the existing one, every revision is fetched into
+/// its repository, the branch tip and tags are copied over, and then the old
+/// `.bzr` is moved aside to `backup.bzr` and the new one swapped into place.
+/// The old data is preserved in `backup.bzr` (not deleted).
+///
+/// Errors with [`BzrDirError::Component`] if the source has no branch or
+/// repository to carry over, or if it is already in the target format.
+pub fn upgrade(
+    parent: &SharedTransport,
+    target_format: &ControlDirFormat,
+) -> Result<(), BzrDirError> {
+    let source_bzr = parent.subtransport(".bzr")?;
+    let source = BzrDirMeta::open(source_bzr)?;
+    if !source.has_repository || !source.has_branch {
+        return Err(BzrDirError::Component(
+            "can only upgrade a control directory with a branch and repository".to_string(),
+        ));
+    }
+
+    // Already at the target repository format? Nothing to do.
+    let source_repo = source.open_repository()?;
+    if source_repo.format().format_string == target_format.repo_marker {
+        return Err(BzrDirError::Component(
+            "already in the target format".to_string(),
+        ));
+    }
+    let source_branch = source.open_branch()?;
+    let (revno, tip) = source_branch
+        .last_revision_info()
+        .map_err(|e| BzrDirError::Component(format!("reading branch tip: {e}")))?;
+    let tags = source_branch
+        .tags()
+        .map_err(|e| BzrDirError::Component(format!("reading tags: {e}")))?;
+
+    // Build the new-format control directory in a temporary sibling dir.
+    let tmp_name = "upgrade.tmp";
+    // Start from a clean temp dir.
+    let _ = parent.subtransport(tmp_name).and_then(|t| {
+        let _ = t.subtransport(".bzr").map(|b| delete_tree(b.as_ref()));
+        Ok(())
+    });
+    parent.mkdir(tmp_name)?;
+    let tmp = parent.subtransport(tmp_name)?;
+    let new = BzrDirMeta::create_with_format(&tmp, target_format)?;
+
+    // Fetch every revision into the new repository.
+    {
+        let mut new_repo = new.open_repository()?;
+        crate::repository::fetch(source_repo.as_ref(), new_repo.as_mut(), None)
+            .map_err(|e| BzrDirError::Component(format!("fetching revisions: {e}")))?;
+    }
+
+    // Carry over the branch tip and tags.
+    let new_branch = new.open_branch()?;
+    new_branch
+        .set_last_revision_info(revno, &tip)
+        .map_err(|e| BzrDirError::Component(format!("setting branch tip: {e}")))?;
+    if !tags.is_empty() {
+        new_branch
+            .set_tags(&tags)
+            .map_err(|e| BzrDirError::Component(format!("setting tags: {e}")))?;
+    }
+
+    // Swap: move the old .bzr aside to backup.bzr, the new one into place.
+    if parent.has("backup.bzr")? {
+        return Err(BzrDirError::Component(
+            "backup.bzr already exists; remove it before upgrading".to_string(),
+        ));
+    }
+    parent.rename(".bzr", "backup.bzr")?;
+    parent.rename(&format!("{tmp_name}/.bzr"), ".bzr")?;
+    parent.rmdir(tmp_name)?;
+    Ok(())
+}
+
+/// Recursively delete a directory tree reached through `transport` (rooted at
+/// the directory to remove). Best-effort: missing entries are ignored.
+fn delete_tree(transport: &dyn Transport) -> Result<(), BzrDirError> {
+    let entries = match transport.list_dir("") {
+        Ok(e) => e,
+        Err(TransportError::NoSuchFile(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        // Try as a file first; if that fails as a directory, recurse.
+        match transport.delete(&entry) {
+            Ok(()) => {}
+            Err(_) => {
+                let sub = transport.subtransport(&entry)?;
+                delete_tree(sub.as_ref())?;
+                let _ = transport.rmdir(&entry);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Serialise an empty dirstate (one root entry, no parents).
 fn empty_dirstate_bytes() -> Vec<u8> {
     use crate::dirstate::{DefaultSHA1Provider, DirState};
@@ -1396,5 +1497,83 @@ mod tests {
             cd.find_repository(),
             Err(BzrDirError::NoRepositoryPresent)
         ));
+    }
+
+    /// Upgrade a knit-pack control directory to 2a: a fresh 2a `.bzr` is built,
+    /// the revision fetched, the branch tip carried over, and the old `.bzr`
+    /// kept in `backup.bzr`.
+    #[cfg(feature = "knitpack")]
+    #[test]
+    fn upgrade_knitpack_to_2a() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(dir.path()));
+
+        // Build a knit-pack (1.9) control dir with one commit and a tag.
+        let knitpack = find_control_dir_format("1.9").expect("1.9 format registered");
+        let cd = BzrDirMeta::create_with_format(&parent, knitpack).unwrap();
+        let revid;
+        {
+            let mut repo = cd.open_repository().unwrap();
+            let root = crate::inventory::ROOT_ID;
+            revid = b"rev-1".to_vec();
+            repo.start_write_group().unwrap();
+            repo.add_text(b"file-1", &revid, &[], b"hi\n").unwrap();
+            let entries = vec![
+                crate::inventory::Entry::root(
+                    crate::FileId::from(root),
+                    Some(crate::RevisionId::from(revid.as_slice())),
+                ),
+                crate::inventory::Entry::file(
+                    crate::FileId::from(&b"file-1"[..]),
+                    "a.txt".into(),
+                    crate::FileId::from(root),
+                    Some(crate::RevisionId::from(revid.as_slice())),
+                    Some(crate::weave::sha_strings(&[b"hi\n"])),
+                    Some(3),
+                    Some(false),
+                    None,
+                ),
+            ];
+            repo.add_inventory_from_entries(&revid, &[], root, &entries)
+                .unwrap();
+            let rev = crate::revision::Revision::new(
+                crate::RevisionId::from(revid.as_slice()),
+                vec![],
+                Some("T <t@e>".to_string()),
+                "msg".to_string(),
+                std::collections::HashMap::new(),
+                None,
+                1577880000.0,
+                Some(0),
+            );
+            repo.add_revision(&rev, &[]).unwrap();
+            repo.commit_write_group().unwrap();
+        }
+        cd.open_branch()
+            .unwrap()
+            .set_last_revision_info(1, &revid)
+            .unwrap();
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert("v1".to_string(), revid.clone());
+        cd.open_branch().unwrap().set_tags(&tags).unwrap();
+
+        // Upgrade to 2a.
+        let target = find_control_dir_format("2a").unwrap();
+        upgrade(&parent, target).unwrap();
+
+        // The live .bzr is now 2a, and the old one is preserved.
+        assert!(parent.has("backup.bzr").unwrap());
+        let upgraded = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        assert_eq!(
+            upgraded.open_repository().unwrap().format().format_string,
+            target.repo_marker
+        );
+        // The revision, its file text and the branch tip and tags survived.
+        let repo = upgraded.open_repository().unwrap();
+        assert!(repo.has_revision(&revid).unwrap());
+        assert_eq!(repo.get_file_text(b"file-1", &revid).unwrap(), b"hi\n");
+        let branch = upgraded.open_branch().unwrap();
+        assert_eq!(branch.last_revision_info().unwrap(), (1, revid.clone()));
+        assert_eq!(branch.tags().unwrap().get("v1"), Some(&revid));
     }
 }

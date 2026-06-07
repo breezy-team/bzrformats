@@ -352,3 +352,46 @@ class TestControlDir(TestCaseInTempDir):
         self.assertEqual(repo.get_revision(r1)["message"], "one")
         # autopack on a small repository does nothing.
         self.assertFalse(controldir.open(self.test_dir).open_repository().autopack())
+
+    def test_fetch_copies_revisions(self):
+        src = os.path.join(self.test_dir, "src")
+        os.makedirs(src)
+        scd = controldir.create(src)
+        revid = scd.open_workingtree().commit(
+            scd.open_repository(),
+            scd.open_branch(),
+            "T <t@e>",
+            "one",
+            1577880000,
+            0,
+            allow_pointless=True,
+        )
+        tgt = os.path.join(self.test_dir, "tgt")
+        os.makedirs(tgt)
+        tcd = controldir.create(tgt)
+        copied = tcd.open_repository().fetch(
+            controldir.open(src).open_repository(), revid
+        )
+        self.assertEqual(copied, 1)
+        self.assertTrue(controldir.open(tgt).open_repository().has_revision(revid))
+
+    def test_upgrade_knitpack_to_2a(self):
+        path = os.path.join(self.test_dir, "repo")
+        os.makedirs(path)
+        cd = controldir.create(path, "1.9")
+        revid = cd.open_workingtree().commit(
+            cd.open_repository(),
+            cd.open_branch(),
+            "T <t@e>",
+            "one",
+            1577880000,
+            0,
+            allow_pointless=True,
+        )
+        controldir.upgrade(path, "2a")
+        self.assertTrue(os.path.exists(os.path.join(path, "backup.bzr")))
+        repo = controldir.open(path).open_repository()
+        self.assertTrue(repo.has_revision(revid))
+        self.assertEqual(
+            controldir.open(path).open_branch().last_revision_info(), (1, revid)
+        )
