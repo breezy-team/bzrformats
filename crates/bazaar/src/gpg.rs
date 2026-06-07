@@ -165,6 +165,16 @@ fn summarize(
     best
 }
 
+/// Parse a keyring given as raw public-key blobs (each ASCII-armored or
+/// binary) into [`Cert`]s. Used by callers that pass keys as bytes rather than
+/// depending on the OpenPGP crate directly.
+pub fn parse_keyring(keyring: &[Vec<u8>]) -> Result<Vec<Cert>, String> {
+    keyring
+        .iter()
+        .map(|b| Cert::from_bytes(b).map_err(|e| e.to_string()))
+        .collect()
+}
+
 /// Verify a clearsigned message against a keyring.
 ///
 /// Returns the verification status and the extracted plaintext. `certs` is the

@@ -148,6 +148,29 @@ impl BzrDir {
             inner: self.inner.open_workingtree().map_err(err)?,
         })
     }
+
+    /// Whether this control directory's repository is shared.
+    fn is_shared(&self) -> PyResult<bool> {
+        self.inner.is_shared().map_err(err)
+    }
+
+    /// Whether this repository creates working trees for branches it serves.
+    fn make_working_trees(&self) -> PyResult<bool> {
+        self.inner.make_working_trees().map_err(err)
+    }
+
+    /// Set whether this repository creates working trees.
+    fn set_make_working_trees(&self, value: bool) -> PyResult<()> {
+        self.inner.set_make_working_trees(value).map_err(err)
+    }
+
+    /// Find the repository serving this control directory, walking up to an
+    /// enclosing shared repository when this one has none of its own.
+    fn find_repository(&self) -> PyResult<Repository> {
+        Ok(Repository {
+            inner: self.inner.find_repository().map_err(err)?,
+        })
+    }
 }
 
 /// A bzr repository.
@@ -254,6 +277,20 @@ impl Repository {
             .get_signature_text(revision_id)
             .map_err(err)?
             .map(|s| PyBytes::new(py, &s)))
+    }
+
+    /// Verify the stored GPG signature of `revision_id` against `keyring`
+    /// (a list of public-key blobs, ASCII-armored or binary).
+    ///
+    /// Returns an integer status matching breezy's `gpg` constants:
+    /// 0 valid, 1 key missing, 2 not valid, 3 not signed, 4 expired.
+    #[cfg(feature = "gpg")]
+    fn verify_revision_signature(&self, revision_id: &[u8], keyring: Vec<Vec<u8>>) -> PyResult<u8> {
+        let result = self
+            .inner
+            .verify_revision_signature_bytes(revision_id, &keyring)
+            .map_err(err)?;
+        Ok(result as u8)
     }
 
     /// Open a write group: a batch of additions flushed by
@@ -727,6 +764,26 @@ fn create(path: &str, format: &str) -> PyResult<BzrDir> {
     Ok(BzrDir { inner })
 }
 
+/// Create a shared repository (no branch or working tree) at `path` in
+/// `format` and open it. The repository serves branches in sibling control
+/// directories that resolve to it via `find_repository`.
+///
+/// `format` is a metadir format name as accepted by [`create`] (the all-in-one
+/// "weave" format cannot be a shared repository).
+#[pyfunction]
+#[pyo3(signature = (path, format="2a"))]
+fn create_shared_repository(path: &str, format: &str) -> PyResult<BzrDir> {
+    let parent = local(path);
+    let fmt = find_control_dir_format(format).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("unknown control dir format: {format}"))
+    })?;
+    Ok(BzrDir {
+        inner: Box::new(
+            BzrDirMeta::create_shared_repository_with_format(&parent, fmt).map_err(err)?,
+        ),
+    })
+}
+
 /// The control-directory format names accepted by [`create`].
 #[pyfunction]
 fn format_names() -> Vec<&'static str> {
@@ -746,6 +803,7 @@ pub(crate) fn _controldir_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_class::<WorkingTree>()?;
     m.add_function(wrap_pyfunction!(open, &m)?)?;
     m.add_function(wrap_pyfunction!(create, &m)?)?;
+    m.add_function(wrap_pyfunction!(create_shared_repository, &m)?)?;
     m.add_function(wrap_pyfunction!(format_names, &m)?)?;
     Ok(m)
 }

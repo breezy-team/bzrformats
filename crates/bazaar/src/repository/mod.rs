@@ -209,6 +209,21 @@ pub trait Repository: Send + Sync {
         }
         Ok(verification.result)
     }
+
+    /// Like [`verify_revision_signature`](Repository::verify_revision_signature)
+    /// but taking a keyring as raw public-key blobs (ASCII-armored or binary),
+    /// so callers that do not depend on the OpenPGP crate (e.g. the Python
+    /// bindings) can pass keys through as bytes.
+    #[cfg(feature = "gpg")]
+    fn verify_revision_signature_bytes(
+        &self,
+        revision_id: &[u8],
+        keyring: &[Vec<u8>],
+    ) -> Result<crate::gpg::VerificationResult, RepositoryError> {
+        let certs = crate::gpg::parse_keyring(keyring)
+            .map_err(|e| RepositoryError::Corrupt(format!("keyring: {e}")))?;
+        self.verify_revision_signature(revision_id, &certs)
+    }
 }
 
 /// Build the V1 testament short text for a stored revision, the plaintext a
