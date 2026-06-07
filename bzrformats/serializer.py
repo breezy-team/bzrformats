@@ -25,6 +25,9 @@ from . import registry
 from ._bzr_rs import (  # noqa: F401
     InventorySerializer,
     RevisionSerializer,
+    revision_bencode_serializer,
+    revision_serializer_v5,
+    revision_serializer_v8,
 )
 from .errors import (  # noqa: F401
     BadInventoryFormat,
