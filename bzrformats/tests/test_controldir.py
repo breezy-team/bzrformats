@@ -19,7 +19,11 @@
 import os
 
 from .. import controldir
-from ..errors import BzrFormatsError
+from ..errors import (
+    BzrFormatsError,
+    NotStacked,
+    UnsupportedOperation,
+)
 from . import TestCaseInTempDir
 
 
@@ -239,3 +243,60 @@ class TestControlDir(TestCaseInTempDir):
         empty = os.path.join(self.test_dir, "empty")
         os.makedirs(empty)
         self.assertRaises(BzrFormatsError, controldir.open, empty)
+
+    def test_stacked_on_url_not_stacked_raises(self):
+        branch = controldir.create(self.test_dir).open_branch()
+        self.assertRaises(NotStacked, branch.get_stacked_on_url)
+
+    def test_stacked_on_url_round_trip(self):
+        base = os.path.join(self.test_dir, "base")
+        os.makedirs(base)
+        controldir.create(base)
+        top = os.path.join(self.test_dir, "top")
+        os.makedirs(top)
+        controldir.create(top).open_branch().set_stacked_on_url(base)
+        self.assertEqual(controldir.open(top).open_branch().get_stacked_on_url(), base)
+
+    def test_open_repository_stacked_reads_through_base(self):
+        base = os.path.join(self.test_dir, "base")
+        os.makedirs(base)
+        base_cd = controldir.create(base)
+        wt = base_cd.open_workingtree()
+        revid = wt.commit(
+            base_cd.open_repository(),
+            base_cd.open_branch(),
+            "T <t@e>",
+            "base",
+            1577880000,
+            0,
+            allow_pointless=True,
+        )
+
+        top = os.path.join(self.test_dir, "top")
+        os.makedirs(top)
+        top_cd = controldir.create(top)
+        top_cd.open_branch().set_stacked_on_url(base)
+
+        # The plain repository lacks the base revision; the stacked one has it.
+        self.assertFalse(top_cd.open_repository().has_revision(revid))
+        self.assertTrue(top_cd.open_repository_stacked().has_revision(revid))
+
+    def test_bind_unbind_round_trip(self):
+        branch = controldir.create(self.test_dir).open_branch()
+        self.assertIsNone(branch.get_bound_location())
+        branch.bind("file:///srv/master")
+        self.assertEqual(branch.get_bound_location(), "file:///srv/master")
+        branch.unbind()
+        self.assertIsNone(branch.get_bound_location())
+        self.assertEqual(branch.get_old_bound_location(), "file:///srv/master")
+
+    def test_reference_info_round_trip(self):
+        branch = controldir.create(self.test_dir).open_branch()
+        self.assertEqual(branch.get_reference_info(b"fid"), (None, None))
+        branch.set_reference_info(b"fid", "../subtree", "sub/dir")
+        self.assertEqual(branch.get_reference_info(b"fid"), ("../subtree", "sub/dir"))
+
+    def test_get_reference_none_on_normal_branch(self):
+        branch = controldir.create(self.test_dir).open_branch()
+        self.assertIsNone(branch.get_reference())
+        self.assertRaises(UnsupportedOperation, branch.set_reference, "x")
