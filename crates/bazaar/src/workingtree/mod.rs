@@ -106,6 +106,11 @@ pub enum WorkingTreeError {
     /// The working-tree format (its `.bzr/checkout/format` marker) is not
     /// supported by this crate.
     UnsupportedFormat(Vec<u8>),
+    /// A control file (views, conflicts) was malformed.
+    Corrupt(String),
+    /// An operation is not supported by this working-tree format (e.g. views
+    /// on a format that does not store them).
+    Unsupported(String),
 }
 
 impl std::fmt::Display for WorkingTreeError {
@@ -137,6 +142,8 @@ impl std::fmt::Display for WorkingTreeError {
                 "unsupported working-tree format: {}",
                 String::from_utf8_lossy(marker)
             ),
+            WorkingTreeError::Corrupt(m) => write!(f, "corrupt working-tree control file: {m}"),
+            WorkingTreeError::Unsupported(m) => write!(f, "unsupported operation: {m}"),
         }
     }
 }
@@ -454,6 +461,99 @@ pub trait WorkingTree: Send + Sync {
         branch: &crate::branch::Branch,
         options: &CommitOptions,
     ) -> Result<Vec<u8>, WorkingTreeError>;
+
+    /// The transport rooted at the directory containing `.bzr`, used to read
+    /// and write the tree's control files (`.bzr/checkout/...`).
+    fn control_transport(&self) -> &SharedTransport;
+
+    /// Whether this working-tree format stores views (the `views` file). Only
+    /// format 6 does; the default is `false`.
+    fn supports_views(&self) -> bool {
+        false
+    }
+
+    /// The defined views as `(current_view, {name: [paths]})`.
+    ///
+    /// `current_view` is the name of the enabled view, or `None`. Reads the
+    /// `.bzr/checkout/views` file; an absent or empty file means no views.
+    fn views(&self) -> Result<ViewInfo, WorkingTreeError> {
+        let bytes = match self.control_transport().get_bytes(VIEWS_PATH) {
+            Ok(b) => b,
+            Err(TransportError::NoSuchFile(_)) => return Ok(ViewInfo::default()),
+            Err(e) => return Err(e.into()),
+        };
+        views::deserialize(&bytes).map_err(WorkingTreeError::Corrupt)
+    }
+
+    /// Replace the defined views and the current-view selection.
+    ///
+    /// Errors with [`WorkingTreeError::Unsupported`] on a format that does not
+    /// store views, or if `current` names a view not in `views`.
+    fn set_views(&self, info: &ViewInfo) -> Result<(), WorkingTreeError> {
+        if !self.supports_views() {
+            return Err(WorkingTreeError::Unsupported(
+                "this working-tree format does not support views".to_string(),
+            ));
+        }
+        if let Some(current) = &info.current {
+            if !info.views.contains_key(current) {
+                return Err(WorkingTreeError::Corrupt(format!(
+                    "current view {current:?} is not a defined view"
+                )));
+            }
+        }
+        self.control_transport()
+            .put_bytes(VIEWS_PATH, &views::serialize(info), None)?;
+        Ok(())
+    }
+
+    /// The recorded conflicts (read from `.bzr/checkout/conflicts`); an empty
+    /// list when the file is absent.
+    fn conflicts(&self) -> Result<Vec<Conflict>, WorkingTreeError> {
+        let bytes = match self.control_transport().get_bytes(CONFLICTS_PATH) {
+            Ok(b) => b,
+            Err(TransportError::NoSuchFile(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        conflicts_io::deserialize(&bytes).map_err(WorkingTreeError::Corrupt)
+    }
+
+    /// Replace the recorded conflicts, writing `.bzr/checkout/conflicts`.
+    fn set_conflicts(&self, conflicts: &[Conflict]) -> Result<(), WorkingTreeError> {
+        self.control_transport().put_bytes(
+            CONFLICTS_PATH,
+            &conflicts_io::serialize(conflicts),
+            None,
+        )?;
+        Ok(())
+    }
+}
+
+/// The `views` control file path (relative to the tree's control transport).
+const VIEWS_PATH: &str = ".bzr/checkout/views";
+/// The `conflicts` control file path.
+const CONFLICTS_PATH: &str = ".bzr/checkout/conflicts";
+
+/// The views defined in a working tree: the current (enabled) view, if any,
+/// and a map from view name to the list of tree-relative paths it scopes to.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ViewInfo {
+    /// The name of the currently enabled view, or `None`.
+    pub current: Option<String>,
+    /// Each defined view's name and its list of paths.
+    pub views: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// One recorded conflict, mirroring a stanza in the `conflicts` file: a
+/// conflict type, the tree path it affects, and (optionally) the file id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    /// The conflict type string (e.g. `"text conflict"`, `"path conflict"`).
+    pub typestring: String,
+    /// The tree-relative path of the conflicted entry.
+    pub path: String,
+    /// The file id of the conflicted entry, if recorded.
+    pub file_id: Option<Vec<u8>>,
 }
 
 /// Open the working tree reachable through `transport` (rooted at the
@@ -1227,6 +1327,20 @@ impl WorkingTree for WorkingTree4 {
     ) -> Result<Vec<u8>, WorkingTreeError> {
         WorkingTree4::commit(self, repository, branch, options)
     }
+
+    fn control_transport(&self) -> &SharedTransport {
+        &self.transport
+    }
+
+    /// Format 6 supports views; 4 and 5 do not. The marker distinguishes them.
+    fn supports_views(&self) -> bool {
+        match self.transport.get_bytes(".bzr/checkout/format") {
+            Ok(marker) => find_format(&marker)
+                .map(|f| f.supports_views)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
 }
 
 /// A live working-tree entry gathered for commit.
@@ -1764,6 +1878,133 @@ fn sign_commit(
             .map_err(|e| WorkingTreeError::Commit(format!("testament: {e:?}")))?;
         crate::gpg::clearsign(&short, signing_key)
             .map_err(|e| WorkingTreeError::Commit(format!("sign: {e}")))
+    }
+}
+
+/// Serialise and parse the `views` file (`Bazaar views format 1`).
+mod views {
+    use super::ViewInfo;
+
+    const MARKER: &[u8] = b"Bazaar views format 1\n";
+
+    /// Serialise `info` to the `views` file bytes. An empty definition (no
+    /// current view, no views) serialises to an empty file, matching breezy.
+    pub(super) fn serialize(info: &ViewInfo) -> Vec<u8> {
+        if info.current.is_none() && info.views.is_empty() {
+            return Vec::new();
+        }
+        let mut out = MARKER.to_vec();
+        // The current-view selection is stored as a `current=<name>` keyword.
+        if let Some(current) = &info.current {
+            out.extend_from_slice(format!("current={current}\n").as_bytes());
+        }
+        if !info.views.is_empty() {
+            out.extend_from_slice(b"views:\n");
+            // BTreeMap iterates sorted by name, matching breezy's sorted().
+            for (name, paths) in &info.views {
+                let mut line = name.clone();
+                for p in paths {
+                    line.push('\0');
+                    line.push_str(p);
+                }
+                line.push('\n');
+                out.extend_from_slice(line.as_bytes());
+            }
+        }
+        out
+    }
+
+    /// Parse `views` file bytes into a [`ViewInfo`]. An empty file is no views.
+    pub(super) fn deserialize(bytes: &[u8]) -> Result<ViewInfo, String> {
+        if bytes.is_empty() {
+            return Ok(ViewInfo::default());
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| "views file not utf-8".to_string())?;
+        let mut lines = text.split_inclusive('\n');
+        let first = lines.next().unwrap_or("");
+        if first.as_bytes() != MARKER {
+            return Err("missing 'Bazaar views format 1' marker".to_string());
+        }
+        let mut info = ViewInfo::default();
+        let mut in_views = false;
+        for raw in lines {
+            let line = raw.strip_suffix('\n').unwrap_or(raw);
+            if in_views {
+                let mut parts = line.split('\0');
+                let name = parts.next().unwrap_or("").to_string();
+                let paths: Vec<String> = parts.map(|s| s.to_string()).collect();
+                info.views.insert(name, paths);
+            } else if line == "views:" {
+                in_views = true;
+            } else if let Some((k, v)) = line.split_once('=') {
+                if k == "current" {
+                    info.current = Some(v.to_string());
+                }
+                // Other keywords are accepted and ignored (forward-compatible).
+            } else if !line.is_empty() {
+                return Err(format!("unparsable views line: {line:?}"));
+            }
+        }
+        Ok(info)
+    }
+}
+
+/// Serialise and parse the `conflicts` file (RIO stanzas under the
+/// `BZR conflict list format 1` header).
+mod conflicts_io {
+    use super::Conflict;
+    use crate::rio::{read_stanzas, rio_iter, Stanza, StanzaValue};
+
+    // The header (without trailing newline; rio_iter appends one).
+    const HEADER: &[u8] = b"BZR conflict list format 1";
+    // The header as written to disk (with newline), for parsing.
+    const HEADER_LINE: &[u8] = b"BZR conflict list format 1\n";
+
+    pub(super) fn serialize(conflicts: &[Conflict]) -> Vec<u8> {
+        let stanzas = conflicts.iter().map(|c| {
+            let mut s = Stanza::new();
+            // `add` only fails on an invalid tag; these tags are constant.
+            let _ = s.add(
+                "type".to_string(),
+                StanzaValue::String(c.typestring.clone()),
+            );
+            let _ = s.add("path".to_string(), StanzaValue::String(c.path.clone()));
+            if let Some(fid) = &c.file_id {
+                let _ = s.add(
+                    "file_id".to_string(),
+                    StanzaValue::String(String::from_utf8_lossy(fid).into_owned()),
+                );
+            }
+            s
+        });
+        // rio_iter writes the header line and separates stanzas with a blank
+        // line, matching what read_stanzas expects.
+        rio_iter(stanzas, Some(HEADER.to_vec())).flatten().collect()
+    }
+
+    pub(super) fn deserialize(bytes: &[u8]) -> Result<Vec<Conflict>, String> {
+        let rest = bytes
+            .strip_prefix(HEADER_LINE)
+            .ok_or_else(|| "missing 'BZR conflict list format 1' header".to_string())?;
+        let mut reader = std::io::BufReader::new(rest);
+        let stanzas = read_stanzas(&mut reader).map_err(|e| format!("conflicts rio: {e:?}"))?;
+        let mut out = Vec::new();
+        for stanza in stanzas {
+            let get = |tag: &str| match stanza.get(tag) {
+                Some(StanzaValue::String(s)) => Some(s.clone()),
+                _ => None,
+            };
+            let typestring =
+                get("type").ok_or_else(|| "conflict stanza missing 'type'".to_string())?;
+            let path = get("path").ok_or_else(|| "conflict stanza missing 'path'".to_string())?;
+            let file_id = get("file_id").map(|s| s.into_bytes());
+            out.push(Conflict {
+                typestring,
+                path,
+                file_id,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -2980,5 +3221,84 @@ mod tests {
         wt2.iter_changes(&basis).unwrap();
         let stat_cache = parent.get_bytes(".bzr/checkout/stat-cache").unwrap();
         assert!(stat_cache.starts_with(b"### bzr hashcache v5\n"));
+    }
+
+    /// Views round-trip through the `views` file on a format-6 tree, and the
+    /// on-disk bytes match the breezy format.
+    #[test]
+    fn views_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        let wt = cd.open_workingtree().unwrap();
+        assert!(wt.supports_views());
+        // No views initially.
+        assert_eq!(wt.views().unwrap(), ViewInfo::default());
+
+        let mut info = ViewInfo::default();
+        info.views
+            .insert("my".to_string(), vec!["src".to_string(), "doc".to_string()]);
+        info.views
+            .insert("other".to_string(), vec!["lib".to_string()]);
+        info.current = Some("my".to_string());
+        wt.set_views(&info).unwrap();
+
+        // On-disk format matches breezy: marker, current keyword, views, sorted.
+        let on_disk = parent.get_bytes(".bzr/checkout/views").unwrap();
+        assert_eq!(
+            on_disk,
+            b"Bazaar views format 1\ncurrent=my\nviews:\nmy\0src\0doc\nother\0lib\n".to_vec()
+        );
+
+        // Re-open and read back.
+        let reread = WorkingTree4::open(parent.clone()).unwrap();
+        assert_eq!(reread.views().unwrap(), info);
+    }
+
+    /// set_views rejects a current view that is not defined.
+    #[test]
+    fn set_views_rejects_unknown_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        let wt = cd.open_workingtree().unwrap();
+        let mut info = ViewInfo::default();
+        info.current = Some("nope".to_string());
+        assert!(matches!(
+            wt.set_views(&info),
+            Err(WorkingTreeError::Corrupt(_))
+        ));
+    }
+
+    /// Conflicts round-trip through the `conflicts` file.
+    #[test]
+    fn conflicts_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        let wt = cd.open_workingtree().unwrap();
+        // None initially (the create path writes a header-only file).
+        assert!(wt.conflicts().unwrap().is_empty());
+
+        let conflicts = vec![
+            Conflict {
+                typestring: "text conflict".to_string(),
+                path: "a.txt".to_string(),
+                file_id: Some(b"a-id".to_vec()),
+            },
+            Conflict {
+                typestring: "path conflict".to_string(),
+                path: "dir/b".to_string(),
+                file_id: None,
+            },
+        ];
+        wt.set_conflicts(&conflicts).unwrap();
+
+        // The file starts with the breezy header.
+        let on_disk = parent.get_bytes(".bzr/checkout/conflicts").unwrap();
+        assert!(on_disk.starts_with(b"BZR conflict list format 1\n"));
+
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.conflicts().unwrap(), conflicts);
     }
 }
