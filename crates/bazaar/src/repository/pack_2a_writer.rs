@@ -412,6 +412,18 @@ impl WriteGroup {
         let mut keys = source.keys()?;
         // Stable order so repacked packs are reproducible.
         keys.sort_by(|a, b| a.segments().cmp(b.segments()));
+        self.copy_store_keys(source, target, &keys)
+    }
+
+    /// Copy just `keys` from a source store into one of this write group's
+    /// stores, preserving keys and parents. Used by the same-format streaming
+    /// fetch to copy exactly the records belonging to the fetched revisions.
+    pub(super) fn copy_store_keys(
+        &self,
+        source: &dyn crate::versionedfile::VersionedFiles,
+        target: RepackTarget,
+        keys: &[crate::versionedfile::Key],
+    ) -> Result<(), RepositoryError> {
         let store = match target {
             RepackTarget::Revisions => &self.revisions,
             RepackTarget::Inventories => &self.inventories,
@@ -419,7 +431,7 @@ impl WriteGroup {
             RepackTarget::Signatures => &self.signatures,
             RepackTarget::Chk => self.chk_bytes.as_ref(),
         };
-        for record in source.get_record_stream(&keys, "unordered", false)? {
+        for record in source.get_record_stream(keys, "unordered", false)? {
             let record = record?;
             if record.storage_kind() == "absent" {
                 continue;
@@ -429,6 +441,20 @@ impl WriteGroup {
             let lines: Vec<Vec<u8>> = record.to_lines().map(|l| l.into_owned()).collect();
             store.add_lines(key, parents, lines)?;
         }
+        Ok(())
+    }
+
+    /// Add raw CHK page bytes under their content key into the chk store. The
+    /// streaming fetch hands pages straight through (already content-addressed),
+    /// rather than rebuilding the CHK maps.
+    pub(super) fn add_chk_page(
+        &self,
+        page_key: &[u8],
+        page_bytes: Vec<u8>,
+    ) -> Result<(), RepositoryError> {
+        let key = Key::fixed(vec![page_key.to_vec()]);
+        let lines = split_lines(&page_bytes);
+        self.chk_bytes.add_lines(key, None, lines)?;
         Ok(())
     }
 

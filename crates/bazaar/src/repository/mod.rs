@@ -47,6 +47,31 @@ pub trait Repository: Send + Sync {
     /// The format this repository was opened as.
     fn format(&self) -> &'static RepositoryFormat;
 
+    /// Downcast support, so a backend's format-specific fast path can recover a
+    /// same-format `source` (e.g. another `Pack2aRepository`). Each backend
+    /// returns `self`; a downcast to a different concrete type fails and the
+    /// caller uses the generic path. Used by [`try_fetch_from`](Repository::try_fetch_from)
+    /// implementations, not by the generic fetcher.
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Try to copy `revision_ids` (topologically ordered, already filtered to
+    /// revisions absent here) from `source` into this repository using a
+    /// format-specific fast path, opening and committing the write group
+    /// itself.
+    ///
+    /// Returns `Ok(true)` if the fast path applied and the revisions were
+    /// copied, `Ok(false)` if no fast path is available for this
+    /// source/target pair (the caller then uses the generic rebuild). The
+    /// default has no fast path. This is where per-format streaming lives, so
+    /// [`crate::repository::fetch`] needs no knowledge of concrete formats.
+    fn try_fetch_from(
+        &mut self,
+        _source: &dyn Repository,
+        _revision_ids: &[Vec<u8>],
+    ) -> Result<bool, RepositoryError> {
+        Ok(false)
+    }
+
     /// All revision ids in this repository, sorted.
     fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError>;
 
@@ -377,6 +402,10 @@ impl StackedRepository {
 impl Repository for StackedRepository {
     fn format(&self) -> &'static RepositoryFormat {
         self.primary.format()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {

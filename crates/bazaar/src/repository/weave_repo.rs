@@ -379,6 +379,10 @@ impl super::Repository for WeaveRepository {
         WeaveRepository::format(self)
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
         WeaveRepository::all_revision_ids(self)
     }

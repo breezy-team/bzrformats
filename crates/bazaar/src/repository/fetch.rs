@@ -35,9 +35,18 @@ pub fn fetch(
         return Ok(0);
     }
     let ordered = toposort(source, &missing)?;
+    let copied = ordered.len();
+
+    // Give the target a chance to copy these revisions with a format-specific
+    // fast path (e.g. two 2a repositories streaming raw records). The target
+    // decides whether it can; `false` means "no fast path applies", so fall
+    // back to the generic per-revision rebuild. The generic fetcher stays free
+    // of any per-format knowledge.
+    if target.try_fetch_from(source, &ordered)? {
+        return Ok(copied);
+    }
 
     target.start_write_group()?;
-    let copied = ordered.len();
     for rev_id in &ordered {
         copy_revision(source, target, rev_id)?;
     }
@@ -417,5 +426,97 @@ mod tests {
             target.get_file_text_at_path("a.txt", rev).unwrap(),
             b"hello\n"
         );
+    }
+
+    /// The same-format streaming fast path produces a target identical to the
+    /// generic per-revision rebuild: same revisions, inventory entries and
+    /// file texts. Uses a multi-revision chain so CHK pages branch across
+    /// revisions and the reachability walk is exercised.
+    #[test]
+    fn streaming_matches_generic() {
+        let (_sd, st) = temp_repo();
+        let ids = make_chain(&st, 4);
+        let source = Pack2aRepository::open(st).unwrap();
+
+        // Fast path: the normal fetch (2a -> 2a uses streaming).
+        let (_fd, ft) = temp_repo();
+        let mut fast = Pack2aRepository::create(ft.clone()).unwrap();
+        fetch(&source, &mut fast, Some(&ids[3])).unwrap();
+        let fast = Pack2aRepository::open(ft).unwrap();
+
+        // Generic path: drive copy_revision directly into a second target.
+        let (_gd, gt) = temp_repo();
+        let mut generic = Pack2aRepository::create(gt.clone()).unwrap();
+        generic.start_write_group().unwrap();
+        for rev in &ids {
+            copy_revision(&source, &mut generic, rev).unwrap();
+        }
+        generic.commit_write_group().unwrap();
+        let generic = Pack2aRepository::open(gt).unwrap();
+
+        // Both targets hold the same revisions and read identically.
+        let mut a = fast.all_revision_ids().unwrap();
+        let mut b = generic.all_revision_ids().unwrap();
+        a.sort();
+        b.sort();
+        assert_eq!(a, ids);
+        assert_eq!(b, ids);
+        for rev in &ids {
+            assert_eq!(
+                fast.get_revision(rev).unwrap().message,
+                generic.get_revision(rev).unwrap().message
+            );
+            assert_eq!(
+                fast.get_file_text(b"file-1", rev).unwrap(),
+                generic.get_file_text(b"file-1", rev).unwrap()
+            );
+            let fp: Vec<String> = fast
+                .get_inventory(rev)
+                .unwrap()
+                .entries()
+                .unwrap()
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            let gp: Vec<String> = generic
+                .get_inventory(rev)
+                .unwrap()
+                .entries()
+                .unwrap()
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            assert_eq!(fp, gp);
+        }
+    }
+
+    /// Incremental streaming fetch into a non-empty 2a target: the second fetch
+    /// copies only the new tail and the CHK reachability walk skips pages
+    /// already present (the `uninteresting_roots` path).
+    #[test]
+    fn streaming_incremental_into_nonempty() {
+        let (_sd, st) = temp_repo();
+        let ids = make_chain(&st, 4);
+        let source = Pack2aRepository::open(st).unwrap();
+
+        let (_td, tt) = temp_repo();
+        let mut target = Pack2aRepository::create(tt.clone()).unwrap();
+        // First fetch up to rev-2.
+        assert_eq!(fetch(&source, &mut target, Some(&ids[1])).unwrap(), 2);
+        // Then the tip: only rev-3 and rev-4 are missing.
+        let mut target = Pack2aRepository::open(tt.clone()).unwrap();
+        assert_eq!(fetch(&source, &mut target, Some(&ids[3])).unwrap(), 2);
+
+        // Everything reads back.
+        let target = Pack2aRepository::open(tt).unwrap();
+        let mut got = target.all_revision_ids().unwrap();
+        got.sort();
+        assert_eq!(got, ids);
+        for (i, rev) in ids.iter().enumerate() {
+            assert_eq!(
+                target.get_file_text(b"file-1", rev).unwrap(),
+                format!("hello {}\n", i + 1).into_bytes()
+            );
+        }
     }
 }
