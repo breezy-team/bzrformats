@@ -186,6 +186,15 @@ struct Repository {
 
 #[pymethods]
 impl Repository {
+    /// This repository's format as `{format_string: bytes, description: str}`.
+    fn format<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let fmt = self.inner.format();
+        let d = PyDict::new(py);
+        d.set_item("format_string", PyBytes::new(py, fmt.format_string()))?;
+        d.set_item("description", fmt.get_format_description())?;
+        Ok(d)
+    }
+
     /// All revision ids in this repository, sorted.
     fn all_revision_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let ids = self.inner.all_revision_ids().map_err(err)?;
@@ -381,6 +390,51 @@ impl Repository {
             .map_err(err)
     }
 
+    /// Add a revision to the open write group.
+    ///
+    /// `revision_id`, `committer` (or None), `message`, `timestamp` (float) and
+    /// `timezone` (int seconds east of UTC, or None) describe the revision;
+    /// `parents` is its parent revision ids; `revprops` an optional
+    /// `{str: bytes}` of revision properties; `inventory_sha1` the optional
+    /// recorded inventory sha1. Mirrors the dict shape `get_revision` returns.
+    #[pyo3(signature = (revision_id, message, committer, timestamp, timezone,
+        parents=None, revprops=None, inventory_sha1=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_revision(
+        &mut self,
+        revision_id: &[u8],
+        message: &str,
+        committer: Option<String>,
+        timestamp: f64,
+        timezone: Option<i32>,
+        parents: Option<Vec<Vec<u8>>>,
+        revprops: Option<&Bound<'_, PyDict>>,
+        inventory_sha1: Option<Vec<u8>>,
+    ) -> PyResult<()> {
+        let parents = parents.unwrap_or_default();
+        let mut properties: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        if let Some(props) = revprops {
+            for (k, v) in props.iter() {
+                properties.insert(k.extract()?, v.extract()?);
+            }
+        }
+        let revision = bazaar::revision::Revision::new(
+            bazaar::RevisionId::from(revision_id),
+            parents
+                .iter()
+                .map(|p| bazaar::RevisionId::from(p.as_slice()))
+                .collect(),
+            committer,
+            message.to_string(),
+            properties,
+            inventory_sha1,
+            timestamp,
+            timezone,
+        );
+        self.inner.add_revision(&revision, &parents).map_err(err)
+    }
+
     /// The inventory of a revision, as a list of `(path, kind, file_id)`.
     fn get_inventory<'py>(
         &self,
@@ -409,6 +463,15 @@ struct Branch {
 
 #[pymethods]
 impl Branch {
+    /// This branch's format as `{format_string: bytes, description: str}`.
+    fn format<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let fmt = self.inner.format();
+        let d = PyDict::new(py);
+        d.set_item("format_string", PyBytes::new(py, fmt.format_string()))?;
+        d.set_item("description", fmt.get_format_description())?;
+        Ok(d)
+    }
+
     /// The tip as `(revno, revision_id)`.
     fn last_revision_info<'py>(&self, py: Python<'py>) -> PyResult<(u64, Bound<'py, PyBytes>)> {
         let (revno, revid) = self.inner.last_revision_info().map_err(err)?;
@@ -707,6 +770,29 @@ impl WorkingTree {
         // The tree-vs-basis diff is a whole-tree comparison, so it runs
         // here; the per-change dicts are built on demand during iteration.
         let changes = self.inner.iter_changes(&basis).map_err(err)?;
+        Ok(TreeChangesIter {
+            changes: changes.into(),
+        })
+    }
+
+    /// As `iter_changes`, but also considering the non-basis merge parents in
+    /// `other_revision_ids` for per-file text parents.
+    fn iter_changes_with_parents(
+        &self,
+        repository: &Bound<'_, Repository>,
+        basis_revision_id: &[u8],
+        other_revision_ids: Vec<Vec<u8>>,
+    ) -> PyResult<TreeChangesIter> {
+        let repo = repository.borrow();
+        let basis = repo.inner.revision_tree(basis_revision_id).map_err(err)?;
+        let others: Vec<_> = other_revision_ids
+            .iter()
+            .map(|r| repo.inner.revision_tree(r).map_err(err))
+            .collect::<Result<_, _>>()?;
+        let changes = self
+            .inner
+            .iter_changes_with_parents(&basis, &others)
+            .map_err(err)?;
         Ok(TreeChangesIter {
             changes: changes.into(),
         })
