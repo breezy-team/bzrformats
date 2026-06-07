@@ -549,7 +549,15 @@ fn serialise_index(store: &WriteStore, key_elements: usize) -> Result<Vec<u8>, R
     let ref_lists = if has_graph { 1 } else { 0 };
     let mut builder = BTreeBuilder::new(ref_lists, key_elements);
     let records = store.index().take_records();
+    // Collapse duplicate keys (keeping the first). Content-addressed CHK pages
+    // are commonly added more than once within a write group -- e.g. a fetch
+    // copying several revisions whose inventories share pages -- and a page
+    // added twice is byte-identical, so the first index entry is correct.
+    let mut seen: std::collections::HashSet<Vec<Vec<u8>>> = std::collections::HashSet::new();
     for (key, memo, parents) in records {
+        if !seen.insert(key.segments().to_vec()) {
+            continue;
+        }
         let value = format!(
             "{} {} {} {}",
             memo.read_memo.start,

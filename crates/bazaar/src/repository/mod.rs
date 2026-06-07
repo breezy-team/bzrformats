@@ -8,6 +8,7 @@
 //! in-memory one — behind the box, without converting one into the other.
 
 mod commit;
+mod fetch;
 pub mod format;
 #[cfg(feature = "knit")]
 mod knit_repo;
@@ -23,6 +24,7 @@ mod tree;
 mod weave_repo;
 
 pub use commit::CommitBuilder;
+pub use fetch::fetch;
 pub use format::{all_formats, find_format, RepositoryFormat};
 #[cfg(feature = "knit")]
 pub use knit_repo::KnitRepository;
