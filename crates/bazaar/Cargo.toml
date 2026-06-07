@@ -58,7 +58,7 @@ winapi = { version = "0.3", features = [
 ] }
 
 [dependencies.sequoia-openpgp]
-version = "1"
+version = "2"
 optional = true
 default-features = false
 features = ["crypto-openssl"]
