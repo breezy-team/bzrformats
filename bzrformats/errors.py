@@ -74,6 +74,9 @@ InternalBzrFormatsError = _errors.InternalBzrFormatsError
 BzrCheckError = _errors.BzrCheckError
 DirstateCorrupt = _errors.DirstateCorrupt
 NoSuchRevision = _errors.NoSuchRevision
+NotStacked = _errors.NotStacked
+UnstackableBranchFormat = _errors.UnstackableBranchFormat
+UnsupportedOperation = _errors.UnsupportedOperation
 ContainerError = _errors.ContainerError
 UnknownContainerFormatError = _errors.UnknownContainerFormatError
 UnexpectedEndOfContainerError = _errors.UnexpectedEndOfContainerError
@@ -130,6 +133,7 @@ __all__ = [
     "NoSuchFile",
     "NoSuchId",
     "NoSuchRevision",
+    "NotStacked",
     "NotVersionedError",
     "ObjectNotLocked",
     "OutSideTransaction",
@@ -145,7 +149,9 @@ __all__ = [
     "UnexpectedInventoryFormat",
     "UnknownContainerFormatError",
     "UnknownRecordTypeError",
+    "UnstackableBranchFormat",
     "UnsupportedInventoryKind",
+    "UnsupportedOperation",
     "VersionedFileError",
     "VersionedFileInvalidChecksum",
     "WeaveError",

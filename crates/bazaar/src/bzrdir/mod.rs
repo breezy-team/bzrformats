@@ -292,6 +292,17 @@ pub trait ControlDir: Send + Sync {
     /// Open the repository in this control directory.
     fn open_repository(&self) -> Result<Box<dyn crate::repository::Repository>, BzrDirError>;
 
+    /// Open the repository with any stacked-on fallback activated.
+    ///
+    /// The default returns the plain repository (correct for formats that
+    /// cannot stack); [`BzrDirMeta`] overrides it to follow the branch's
+    /// `stacked_on_location`.
+    fn open_repository_stacked(
+        &self,
+    ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        self.open_repository()
+    }
+
     /// Open the branch in this control directory.
     fn open_branch(&self) -> Result<crate::branch::Branch, BzrDirError>;
 
@@ -450,42 +461,6 @@ impl BzrDirMeta {
         target.open_branch()
     }
 
-    /// Open this control directory's repository, activating any stacked-on
-    /// fallback so reads resolve objects held only in the base repository.
-    ///
-    /// If the branch is stacked, its `stacked_on_location` is followed to the
-    /// base branch's repository, which is wired in as a fallback through a
-    /// [`StackedRepository`](crate::repository::StackedRepository). A
-    /// non-stacked (or branchless) control directory returns its plain
-    /// repository unchanged.
-    pub fn open_repository_stacked(
-        &self,
-    ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
-        let repo = self.open_repository()?;
-        if !self.has_branch {
-            return Ok(repo);
-        }
-        let branch = self.open_branch()?;
-        let stacked_on = match branch.get_stacked_on_url() {
-            Ok(url) => url,
-            // Not stacked, or a format that cannot stack: plain repository.
-            Err(crate::branch::BranchError::NotStacked)
-            | Err(crate::branch::BranchError::Unstackable) => return Ok(repo),
-            Err(e) => {
-                return Err(BzrDirError::Component(format!(
-                    "reading stacked-on location: {e}"
-                )))
-            }
-        };
-        use crate::repository::Repository as _;
-        let base = self.open_stacked_on_repository(&stacked_on)?;
-        let mut stacked = crate::repository::StackedRepository::new(repo);
-        stacked
-            .add_fallback_repository(base)
-            .map_err(|e| BzrDirError::Component(format!("wiring fallback repository: {e}")))?;
-        Ok(Box::new(stacked))
-    }
-
     /// Open the repository of the branch this one is stacked on, following the
     /// stacked-on chain so a multiply-stacked branch picks up every base.
     fn open_stacked_on_repository(
@@ -555,6 +530,42 @@ impl ControlDir for BzrDirMeta {
             .subtransport(Component::Repository.subdir())?;
         crate::repository::open(sub)
             .map_err(|e| BzrDirError::Component(format!("opening repository: {e}")))
+    }
+
+    /// Open the repository, activating any stacked-on fallback so reads resolve
+    /// objects held only in the base repository.
+    ///
+    /// If the branch is stacked, its `stacked_on_location` is followed to the
+    /// base branch's repository, which is wired in as a fallback through a
+    /// [`StackedRepository`](crate::repository::StackedRepository). A
+    /// non-stacked (or branchless) control directory returns its plain
+    /// repository unchanged.
+    fn open_repository_stacked(
+        &self,
+    ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        let repo = self.open_repository()?;
+        if !self.has_branch {
+            return Ok(repo);
+        }
+        let branch = self.open_branch()?;
+        let stacked_on = match branch.get_stacked_on_url() {
+            Ok(url) => url,
+            // Not stacked, or a format that cannot stack: plain repository.
+            Err(crate::branch::BranchError::NotStacked)
+            | Err(crate::branch::BranchError::Unstackable) => return Ok(repo),
+            Err(e) => {
+                return Err(BzrDirError::Component(format!(
+                    "reading stacked-on location: {e}"
+                )))
+            }
+        };
+        use crate::repository::Repository as _;
+        let base = self.open_stacked_on_repository(&stacked_on)?;
+        let mut stacked = crate::repository::StackedRepository::new(repo);
+        stacked
+            .add_fallback_repository(base)
+            .map_err(|e| BzrDirError::Component(format!("wiring fallback repository: {e}")))?;
+        Ok(Box::new(stacked))
     }
 
     /// Open the branch in this control directory.
