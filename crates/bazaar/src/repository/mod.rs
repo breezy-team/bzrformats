@@ -168,6 +168,22 @@ pub trait Repository: Send + Sync {
     /// Flush the open write group, committing its additions.
     fn commit_write_group(&mut self) -> Result<(), RepositoryError>;
 
+    /// Combine the repository's packs into a single pack.
+    ///
+    /// The default is a no-op (formats without packs have nothing to combine);
+    /// the pack backends override it.
+    fn pack(&mut self) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+
+    /// Repack the smallest packs if the repository has accumulated too many,
+    /// per the pack-distribution heuristic. Returns whether a repack happened.
+    ///
+    /// The default is a no-op returning `false`; the pack backends override it.
+    fn autopack(&mut self) -> Result<bool, RepositoryError> {
+        Ok(false)
+    }
+
     /// Add a fallback repository consulted for objects this one lacks.
     ///
     /// This is how a stacked branch wires its base repository in: reads that
