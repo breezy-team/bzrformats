@@ -333,6 +333,18 @@ impl Repository {
         Ok(d)
     }
 
+    /// Reconcile (garbage-collect) the repository: regenerate its storage
+    /// keeping only data reachable from its revisions and discarding garbage.
+    /// Returns a dict with `garbage_inventories` (count of unreachable
+    /// inventories dropped) and `repacked` (whether storage was regenerated).
+    fn reconcile<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let result = self.inner.reconcile().map_err(err)?;
+        let d = PyDict::new(py);
+        d.set_item("garbage_inventories", result.garbage_inventories)?;
+        d.set_item("repacked", result.repacked)?;
+        Ok(d)
+    }
+
     /// Copy revisions from `source` into this repository, returning the number
     /// copied. `revision_id` selects the revision (and its ancestry) to copy;
     /// `None` copies everything the source has. Works across formats.
