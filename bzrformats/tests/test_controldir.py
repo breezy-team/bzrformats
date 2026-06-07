@@ -410,3 +410,19 @@ class TestControlDir(TestCaseInTempDir):
         self.assertEqual(result["ghosts"], [])
         self.assertEqual(result["checked_revisions"], 1)
         self.assertEqual(result["checked_texts"], 1)
+
+    def test_reconcile_clean_repository(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"hi\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        revid = wt.commit(
+            cd.open_repository(), cd.open_branch(), "T <t@e>", "add a", 1577880000, 0
+        )
+        result = controldir.open(self.test_dir).open_repository().reconcile()
+        self.assertEqual(result["garbage_inventories"], 0)
+        # Data still present and consistent after reconcile.
+        repo = controldir.open(self.test_dir).open_repository()
+        self.assertTrue(repo.has_revision(revid))
+        self.assertEqual(repo.check()["problems"], [])
