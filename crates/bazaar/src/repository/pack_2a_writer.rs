@@ -39,6 +39,16 @@ use super::pack_2a::RepositoryError;
 /// The pack name (used as the groupcompress `FileRef`).
 type PackName = String;
 
+/// Which of a write group's stores a repack copy targets.
+#[derive(Clone, Copy)]
+pub(super) enum RepackTarget {
+    Revisions,
+    Inventories,
+    Texts,
+    Signatures,
+    Chk,
+}
+
 /// The growing `.pack` container, shared by every object kind's store.
 struct SharedPack {
     writer: ContainerWriter<Vec<u8>>,
@@ -384,6 +394,41 @@ impl WriteGroup {
             .collect();
         self.texts
             .add_lines(key, Some(parent_keys), split_lines(bytes))?;
+        Ok(())
+    }
+
+    /// Copy every record from a source store into one of this write group's
+    /// stores, preserving keys and parents.
+    ///
+    /// This is the per-kind copy step of a repack: source records are pulled as
+    /// fulltext (via `get_record_stream`) and re-added, which recompresses them
+    /// into the new pack's groupcompress blocks (the `reuse_blocks=False`
+    /// behaviour brz's packer uses). `target` selects which store to add to.
+    pub(super) fn copy_store(
+        &self,
+        source: &dyn crate::versionedfile::VersionedFiles,
+        target: RepackTarget,
+    ) -> Result<(), RepositoryError> {
+        let mut keys = source.keys()?;
+        // Stable order so repacked packs are reproducible.
+        keys.sort_by(|a, b| a.segments().cmp(b.segments()));
+        let store = match target {
+            RepackTarget::Revisions => &self.revisions,
+            RepackTarget::Inventories => &self.inventories,
+            RepackTarget::Texts => &self.texts,
+            RepackTarget::Signatures => &self.signatures,
+            RepackTarget::Chk => self.chk_bytes.as_ref(),
+        };
+        for record in source.get_record_stream(&keys, "unordered", false)? {
+            let record = record?;
+            if record.storage_kind() == "absent" {
+                continue;
+            }
+            let key = record.key();
+            let parents = record.parents();
+            let lines: Vec<Vec<u8>> = record.to_lines().map(|l| l.into_owned()).collect();
+            store.add_lines(key, parents, lines)?;
+        }
         Ok(())
     }
 
