@@ -7,6 +7,7 @@
 //! inventory representation — 2a a lazy CHK inventory, knit-pack an
 //! in-memory one — behind the box, without converting one into the other.
 
+mod check;
 mod commit;
 mod fetch;
 pub mod format;
@@ -23,6 +24,7 @@ mod tree;
 #[cfg(feature = "weave")]
 mod weave_repo;
 
+pub use check::{check, CheckResult};
 pub use commit::CommitBuilder;
 pub use fetch::fetch;
 pub use format::{all_formats, find_format, RepositoryFormat};
@@ -209,6 +211,13 @@ pub trait Repository: Send + Sync {
     /// The default is a no-op returning `false`; the pack backends override it.
     fn autopack(&mut self) -> Result<bool, RepositoryError> {
         Ok(false)
+    }
+
+    /// Check the integrity of this repository, returning a report of any
+    /// inconsistencies (see [`CheckResult`]). Format-neutral: it cross-checks
+    /// the data every format exposes through this trait.
+    fn check(&self) -> Result<CheckResult, RepositoryError> {
+        check::check(self)
     }
 
     /// Add a fallback repository consulted for objects this one lacks.

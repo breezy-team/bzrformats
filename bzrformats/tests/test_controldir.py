@@ -395,3 +395,18 @@ class TestControlDir(TestCaseInTempDir):
         self.assertEqual(
             controldir.open(path).open_branch().last_revision_info(), (1, revid)
         )
+
+    def test_check_clean_repository(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"hi\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        wt.commit(
+            cd.open_repository(), cd.open_branch(), "T <t@e>", "add a", 1577880000, 0
+        )
+        result = controldir.open(self.test_dir).open_repository().check()
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(result["ghosts"], [])
+        self.assertEqual(result["checked_revisions"], 1)
+        self.assertEqual(result["checked_texts"], 1)

@@ -316,6 +316,23 @@ impl Repository {
         self.inner.autopack().map_err(err)
     }
 
+    /// Check repository integrity. Returns a dict with `checked_revisions`,
+    /// `checked_texts`, `ghosts` (a list of revision-id bytes), and `problems`
+    /// (a list of description strings). An empty `problems` list means the
+    /// repository is consistent.
+    fn check<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let result = self.inner.check().map_err(err)?;
+        let d = PyDict::new(py);
+        d.set_item("checked_revisions", result.checked_revisions)?;
+        d.set_item("checked_texts", result.checked_texts)?;
+        d.set_item(
+            "ghosts",
+            PyList::new(py, result.ghosts.iter().map(|g| PyBytes::new(py, g)))?,
+        )?;
+        d.set_item("problems", result.problems)?;
+        Ok(d)
+    }
+
     /// Copy revisions from `source` into this repository, returning the number
     /// copied. `revision_id` selects the revision (and its ancestry) to copy;
     /// `None` copies everything the source has. Works across formats.
