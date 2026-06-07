@@ -15,7 +15,9 @@ pub struct BranchFormat {
     pub supports_tags: bool,
     /// Whether the format supports stacking on another branch.
     pub supports_stacking: bool,
-    /// Whether the format records reference locations (format 8).
+    /// Whether the format records reference locations (the `references` RIO
+    /// file). True for formats 6, 7 and 8; setting a reference on a format-7
+    /// branch upgrades its marker to format 8.
     pub supports_reference_locations: bool,
     /// Whether the tip is stored as a full `revision-history` list (format 5)
     /// rather than a `last-revision` `<revno> <revision_id>` line (6/7/8).
@@ -116,7 +118,8 @@ mod tests {
             .expect("branch format 7 registered");
         assert!(f.supports_tags);
         assert!(f.supports_stacking);
-        assert!(!f.supports_reference_locations);
+        // Format 7 also supports reference locations (it upgrades to 8 on set).
+        assert!(f.supports_reference_locations);
         assert!(f.is_supported());
     }
 

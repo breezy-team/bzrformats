@@ -15,6 +15,7 @@ pub mod bzrdir;
 pub mod chk_inventory;
 pub mod chk_map;
 pub mod chunk_writer;
+pub mod config;
 pub mod dirstate;
 pub mod filters;
 pub mod gen_ids;
