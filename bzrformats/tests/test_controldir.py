@@ -198,6 +198,35 @@ class TestControlDir(TestCaseInTempDir):
         self.assertFalse(os.path.exists(os.path.join(self.test_dir, "a.txt")))
         self.assertTrue(os.path.exists(os.path.join(self.test_dir, "b.txt")))
 
+    def test_views_round_trip(self):
+        cd = controldir.create(self.test_dir)
+        wt = cd.open_workingtree()
+        self.assertTrue(wt.supports_views())
+        self.assertEqual(wt.views(), (None, {}))
+        wt.set_views({"my": ["src", "doc"], "other": ["lib"]}, current="my")
+        current, views = controldir.open(self.test_dir).open_workingtree().views()
+        self.assertEqual(current, "my")
+        self.assertEqual(views, {"my": ["src", "doc"], "other": ["lib"]})
+
+    def test_conflicts_round_trip(self):
+        cd = controldir.create(self.test_dir)
+        wt = cd.open_workingtree()
+        self.assertEqual(wt.conflicts(), [])
+        wt.set_conflicts(
+            [
+                {"type": "text conflict", "path": "a.txt", "file_id": b"a-id"},
+                {"type": "path conflict", "path": "dir/b"},
+            ]
+        )
+        got = controldir.open(self.test_dir).open_workingtree().conflicts()
+        self.assertEqual(
+            got,
+            [
+                {"type": "text conflict", "path": "a.txt", "file_id": b"a-id"},
+                {"type": "path conflict", "path": "dir/b"},
+            ],
+        )
+
     def test_branch_tags_round_trip(self):
         cd = controldir.create(self.test_dir)
         branch = cd.open_branch()

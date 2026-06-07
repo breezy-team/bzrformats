@@ -425,6 +425,81 @@ impl WorkingTree {
         self.inner.add_pending_merge(revision_id).map_err(err)
     }
 
+    /// Whether this working-tree format stores views (format 6 only).
+    fn supports_views(&self) -> bool {
+        self.inner.supports_views()
+    }
+
+    /// The defined views as `(current_view, {name: [paths]})`. `current_view`
+    /// is the enabled view's name or None.
+    fn views<'py>(&self, py: Python<'py>) -> PyResult<(Option<String>, Bound<'py, PyDict>)> {
+        let info = self.inner.views().map_err(err)?;
+        let d = PyDict::new(py);
+        for (name, paths) in &info.views {
+            d.set_item(name, paths.clone())?;
+        }
+        Ok((info.current, d))
+    }
+
+    /// Set the defined views and current-view selection. `views` is a
+    /// `{name: [paths]}` dict; `current` names an enabled view (or None).
+    #[pyo3(signature = (views, current=None))]
+    fn set_views(&self, views: &Bound<'_, PyDict>, current: Option<String>) -> PyResult<()> {
+        let mut info = bazaar::workingtree::ViewInfo {
+            current,
+            views: std::collections::BTreeMap::new(),
+        };
+        for (k, v) in views.iter() {
+            info.views.insert(k.extract()?, v.extract()?);
+        }
+        self.inner.set_views(&info).map_err(err)
+    }
+
+    /// The recorded conflicts, each a dict with `type`, `path`, and optional
+    /// `file_id`.
+    fn conflicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let conflicts = self.inner.conflicts().map_err(err)?;
+        let items: Vec<Bound<'py, PyDict>> = conflicts
+            .iter()
+            .map(|c| {
+                let d = PyDict::new(py);
+                d.set_item("type", &c.typestring)?;
+                d.set_item("path", &c.path)?;
+                if let Some(fid) = &c.file_id {
+                    d.set_item("file_id", PyBytes::new(py, fid))?;
+                }
+                Ok::<_, PyErr>(d)
+            })
+            .collect::<Result<_, _>>()?;
+        PyList::new(py, items)
+    }
+
+    /// Replace the recorded conflicts. `conflicts` is a list of dicts with
+    /// `type`, `path`, and optional `file_id`.
+    fn set_conflicts(&self, conflicts: Vec<Bound<'_, PyDict>>) -> PyResult<()> {
+        let mut out = Vec::with_capacity(conflicts.len());
+        for d in &conflicts {
+            let typestring: String = d
+                .get_item("type")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("conflict missing 'type'"))?
+                .extract()?;
+            let path: String = d
+                .get_item("path")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("conflict missing 'path'"))?
+                .extract()?;
+            let file_id: Option<Vec<u8>> = match d.get_item("file_id")? {
+                Some(v) if !v.is_none() => Some(v.extract()?),
+                _ => None,
+            };
+            out.push(bazaar::workingtree::Conflict {
+                typestring,
+                path,
+                file_id,
+            });
+        }
+        self.inner.set_conflicts(&out).map_err(err)
+    }
+
     /// The changes between this working tree and the basis `basis_revision_id`
     /// (resolved against `repository`), as a list of dicts with keys
     /// `file_id`, `old_path`, `new_path`, `content_change`, `kind`,

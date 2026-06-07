@@ -46,6 +46,8 @@ struct Wt3Layout {
     basis_inventory_cache: &'static str,
     /// The stat (hash) cache file, keyed by stat fingerprint.
     stat_cache: &'static str,
+    /// The conflicts file.
+    conflicts: &'static str,
 }
 
 /// The knit format-3 layout: files under `.bzr/checkout/`, basis in a
@@ -56,6 +58,7 @@ const WT3_CHECKOUT_LAYOUT: Wt3Layout = Wt3Layout {
     basis: Wt3Basis::LastRevisionFile(".bzr/checkout/last-revision"),
     basis_inventory_cache: ".bzr/checkout/basis-inventory-cache",
     stat_cache: ".bzr/checkout/stat-cache",
+    conflicts: ".bzr/checkout/conflicts",
 };
 
 /// The weave all-in-one layout: files directly under `.bzr/`, basis taken
@@ -67,6 +70,7 @@ const WT3_ALL_IN_ONE_LAYOUT: Wt3Layout = Wt3Layout {
     basis: Wt3Basis::RevisionHistory(".bzr/revision-history"),
     basis_inventory_cache: ".bzr/basis-inventory-cache",
     stat_cache: ".bzr/stat-cache",
+    conflicts: ".bzr/conflicts",
 };
 
 /// The pre-dirstate working tree, accessed through a transport rooted at the
@@ -551,6 +555,31 @@ impl WorkingTree for WorkingTree3 {
         self.flush_hashcache();
 
         Ok(revid)
+    }
+
+    fn control_transport(&self) -> &SharedTransport {
+        &self.transport
+    }
+
+    /// WT3 keeps its conflicts file at a layout-specific path (under
+    /// `.bzr/checkout/` for knit format 3, directly under `.bzr/` for the weave
+    /// all-in-one tree), so it overrides the default `.bzr/checkout/conflicts`.
+    fn conflicts(&self) -> Result<Vec<super::Conflict>, WorkingTreeError> {
+        let bytes = match self.transport.get_bytes(self.layout.conflicts) {
+            Ok(b) => b,
+            Err(TransportError::NoSuchFile(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        super::conflicts_io::deserialize(&bytes).map_err(WorkingTreeError::Corrupt)
+    }
+
+    fn set_conflicts(&self, conflicts: &[super::Conflict]) -> Result<(), WorkingTreeError> {
+        self.transport.put_bytes(
+            self.layout.conflicts,
+            &super::conflicts_io::serialize(conflicts),
+            None,
+        )?;
+        Ok(())
     }
 }
 
