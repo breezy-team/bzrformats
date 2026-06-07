@@ -632,6 +632,67 @@ impl KnitPackRepository {
         Ok(())
     }
 
+    /// Reconcile: regenerate storage keeping only data reachable from this
+    /// repository's revisions, discarding garbage. Returns the number of
+    /// unreachable inventories dropped. Requires no open write group.
+    pub fn reconcile(&mut self) -> Result<super::ReconcileResult, RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::Corrupt(
+                "cannot reconcile with an open write group".to_string(),
+            ));
+        }
+        let old_packs = read_pack_names(self.transport.as_ref())?;
+        let reachable = self.all_revision_ids()?;
+        let stored_inventories = self.inventories.keys()?.len();
+        let garbage_inventories = stored_inventories.saturating_sub(reachable.len());
+
+        if old_packs.is_empty() || reachable.is_empty() {
+            if !old_packs.is_empty() {
+                self.write_empty_pack_names()?;
+                self.obsolete_packs(&old_packs)?;
+            }
+            return Ok(super::ReconcileResult {
+                garbage_inventories,
+                repacked: !old_packs.is_empty(),
+            });
+        }
+
+        let rev_keys: Vec<KnitKey> = reachable.iter().map(|r| vec![r.clone()]).collect();
+        let mut text_keys: Vec<KnitKey> = Vec::new();
+        for rev in &reachable {
+            let inv = self.get_inventory(rev)?;
+            for (_, entry) in inv.entries() {
+                if entry.revision().map(|r| r.as_bytes()) == Some(rev.as_slice()) {
+                    text_keys.push(vec![entry.file_id().as_bytes().to_vec(), rev.clone()]);
+                }
+            }
+        }
+
+        let group = WriteGroup::new(&new_pack_name(), self.format.uses_btree_index)?;
+        group.copy_store_keys(&self.revisions, RepackTarget::Revisions, &rev_keys)?;
+        group.copy_store_keys(&self.inventories, RepackTarget::Inventories, &rev_keys)?;
+        group.copy_store_keys(&self.signatures, RepackTarget::Signatures, &rev_keys)?;
+        group.copy_store_keys(&self.texts, RepackTarget::Texts, &text_keys)?;
+        // The reconciled pack is the only survivor.
+        group.finish(self.transport.as_ref(), &[])?;
+        self.obsolete_packs(&old_packs)?;
+
+        Ok(super::ReconcileResult {
+            garbage_inventories,
+            repacked: true,
+        })
+    }
+
+    /// Write a `pack-names` index referencing no packs (reconcile discarded all).
+    fn write_empty_pack_names(&self) -> Result<(), RepositoryError> {
+        let names = super::pack_index::IndexBuilder::new(self.format.uses_btree_index, 0, 1);
+        let bytes = names
+            .finish()
+            .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e}")))?;
+        self.transport.put_bytes("pack-names", &bytes, None)?;
+        Ok(())
+    }
+
     /// Combine all packs in this repository into a single new pack.
     ///
     /// Re-streams every record (revisions, inventories, texts, signatures) into
@@ -1031,6 +1092,10 @@ impl super::Repository for KnitPackRepository {
 
     fn autopack(&mut self) -> Result<bool, RepositoryError> {
         KnitPackRepository::autopack(self)
+    }
+
+    fn reconcile(&mut self) -> Result<super::ReconcileResult, RepositoryError> {
+        KnitPackRepository::reconcile(self)
     }
 }
 
@@ -1618,5 +1683,40 @@ mod tests {
                 b"hello\n"
             );
         }
+    }
+
+    /// knit-pack reconcile() drops a garbage inventory (one with no revision)
+    /// while keeping reachable data readable.
+    #[test]
+    fn reconcile_drops_garbage_inventory() {
+        let (_d, t) = temp();
+        let mut repo = KnitPackRepository::create(t.clone(), knitpack6()).unwrap();
+        commit_one(&mut repo, b"rev-good");
+        // An inventory + text with no revision -> unreachable garbage.
+        let root = crate::inventory::ROOT_ID;
+        repo.start_write_group().unwrap();
+        repo.add_inventory_from_entries(
+            b"rev-garbage",
+            &[],
+            root,
+            &[crate::inventory::Entry::root(
+                crate::FileId::from(root),
+                Some(crate::RevisionId::from(&b"rev-garbage"[..])),
+            )],
+        )
+        .unwrap();
+        repo.commit_write_group().unwrap();
+
+        let mut repo = KnitPackRepository::open(t.clone()).unwrap();
+        let result = repo.reconcile().unwrap();
+        assert_eq!(result.garbage_inventories, 1);
+        assert!(result.repacked);
+
+        let repo = KnitPackRepository::open(t).unwrap();
+        assert_eq!(repo.all_revision_ids().unwrap(), vec![b"rev-good".to_vec()]);
+        assert_eq!(
+            repo.get_file_text(b"file-1", b"rev-good").unwrap(),
+            b"hello\n"
+        );
     }
 }
