@@ -18,7 +18,7 @@ use crate::knit::{
     KnitPlainFactory, KnitRecordDetails, KnitVersionedFiles,
 };
 use crate::pack_repo::{index_extension, IndexKind};
-use crate::transport::{SharedTransport, Transport};
+use crate::transport::{SharedTransport, Transport, TransportError};
 
 use super::format::RepositoryFormat;
 use super::pack_2a::RepositoryError;
@@ -144,6 +144,16 @@ declare_repository_format! {
 
 /// The pack name is used as the knit `FileRef`.
 type PackName = String;
+
+/// Which of a write group's stores a repack copy targets. Knit-pack has no
+/// chk store (unlike 2a).
+#[derive(Clone, Copy)]
+enum RepackTarget {
+    Revisions,
+    Inventories,
+    Texts,
+    Signatures,
+}
 
 /// A [`KnitIndex`] built from the per-pack btree indices of one kind,
 /// merged across all packs.
@@ -567,7 +577,122 @@ impl KnitPackRepository {
             .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))?;
         let existing = read_pack_names_with_values(self.transport.as_ref())?;
         group.finish(self.transport.as_ref(), &existing)?;
+        // Autopack if the repository has accumulated too many packs, as brz
+        // does on commit_write_group.
+        self.autopack()?;
         Ok(())
+    }
+
+    /// Combine all packs in this repository into a single new pack.
+    ///
+    /// Re-streams every record (revisions, inventories, texts, signatures) into
+    /// one fresh pack, rewrites `pack-names` to reference only it, and moves the
+    /// old packs and their indices into `obsolete_packs/`. A single-pack
+    /// repository is left untouched. Requires no open write group.
+    pub fn pack(&mut self) -> Result<(), RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::Corrupt(
+                "cannot pack with an open write group".to_string(),
+            ));
+        }
+        let old_packs = read_pack_names(self.transport.as_ref())?;
+        if old_packs.len() <= 1 {
+            return Ok(());
+        }
+        self.repack(&old_packs, &[])
+    }
+
+    /// Repack the smallest packs when the repository has too many, per the
+    /// pack-distribution heuristic. Returns whether a repack happened.
+    pub fn autopack(&mut self) -> Result<bool, RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::Corrupt(
+                "cannot autopack with an open write group".to_string(),
+            ));
+        }
+        let all_packs = read_pack_names(self.transport.as_ref())?;
+        if all_packs.len() <= 1 {
+            return Ok(false);
+        }
+        // Revision count per pack, from each pack's revision index.
+        let mut counts = Vec::with_capacity(all_packs.len());
+        for name in &all_packs {
+            let ext = index_extension(IndexKind::Revision);
+            let index = super::pack_index::PackIndex::open(
+                self.transport.as_ref(),
+                &format!("indices/{name}{ext}"),
+            )?;
+            counts.push(index.iter_all_entries().count() as u64);
+        }
+        let selected = super::pack_collection::plan_autopack_combinations(&counts);
+        if selected.is_empty() {
+            return Ok(false);
+        }
+        let to_combine: Vec<PackName> = selected.iter().map(|&i| all_packs[i].clone()).collect();
+        let survivors: Vec<(PackName, Vec<u8>)> = {
+            let with_values = read_pack_names_with_values(self.transport.as_ref())?;
+            let combine: std::collections::HashSet<&PackName> = to_combine.iter().collect();
+            with_values
+                .into_iter()
+                .filter(|(n, _)| !combine.contains(n))
+                .collect()
+        };
+        self.repack(&to_combine, &survivors)?;
+        Ok(true)
+    }
+
+    /// Combine `to_combine` into one new pack, rewrite `pack-names` to list
+    /// `survivors` plus the new pack, and obsolete the combined packs.
+    fn repack(
+        &mut self,
+        to_combine: &[PackName],
+        survivors: &[(PackName, Vec<u8>)],
+    ) -> Result<(), RepositoryError> {
+        let revisions = build_store(&self.transport, to_combine, IndexKind::Revision)?;
+        let inventories = build_store(&self.transport, to_combine, IndexKind::Inventory)?;
+        let texts = build_store(&self.transport, to_combine, IndexKind::Text)?;
+        let signatures = build_store(&self.transport, to_combine, IndexKind::Signature)?;
+
+        let group = WriteGroup::new(&new_pack_name(), self.format.uses_btree_index)?;
+        // Copy order matches brz's KnitPacker: revisions, inventories, texts,
+        // signatures (knit-pack has no chk store).
+        group.copy_store(&revisions, RepackTarget::Revisions)?;
+        group.copy_store(&inventories, RepackTarget::Inventories)?;
+        group.copy_store(&texts, RepackTarget::Texts)?;
+        group.copy_store(&signatures, RepackTarget::Signatures)?;
+        group.finish(self.transport.as_ref(), survivors)?;
+
+        self.obsolete_packs(to_combine)?;
+        Ok(())
+    }
+
+    /// Move `packs` (their `.pack` files and the four index suffixes) into
+    /// `obsolete_packs/`, creating it if needed.
+    fn obsolete_packs(&self, packs: &[PackName]) -> Result<(), RepositoryError> {
+        let _ = self.transport.mkdir("obsolete_packs");
+        for name in packs {
+            self.move_to_obsolete(&format!("packs/{name}.pack"), &format!("{name}.pack"))?;
+            for kind in [
+                IndexKind::Revision,
+                IndexKind::Inventory,
+                IndexKind::Text,
+                IndexKind::Signature,
+            ] {
+                let ext = index_extension(kind);
+                self.move_to_obsolete(&format!("indices/{name}{ext}"), &format!("{name}{ext}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn move_to_obsolete(&self, from: &str, basename: &str) -> Result<(), RepositoryError> {
+        match self
+            .transport
+            .rename(from, &format!("obsolete_packs/{basename}"))
+        {
+            Ok(()) | Err(TransportError::NoSuchFile(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// All revision ids in this repository, sorted.
@@ -820,6 +945,14 @@ impl super::Repository for KnitPackRepository {
 
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
         KnitPackRepository::commit_write_group(self)
+    }
+
+    fn pack(&mut self) -> Result<(), RepositoryError> {
+        KnitPackRepository::pack(self)
+    }
+
+    fn autopack(&mut self) -> Result<bool, RepositoryError> {
+        KnitPackRepository::autopack(self)
     }
 }
 
@@ -1109,14 +1242,40 @@ impl WriteGroup {
         })
     }
 
-    /// Flush the pack, its four indices and an updated `pack-names`.
+    /// Copy every record from a source store into one of this write group's
+    /// stores, preserving keys and parents. The source records are pulled as
+    /// fulltext and re-added, recompressing them into the new pack.
+    fn copy_store(&self, source: &Store, target: RepackTarget) -> Result<(), RepositoryError> {
+        use crate::versionedfile::ContentFactory;
+        let mut keys = source.keys()?;
+        keys.sort();
+        let store = match target {
+            RepackTarget::Revisions => &self.revisions,
+            RepackTarget::Inventories => &self.inventories,
+            RepackTarget::Texts => &self.texts,
+            RepackTarget::Signatures => &self.signatures,
+        };
+        for record in source.get_record_stream(&keys, "unordered", true)? {
+            if record.storage_kind() == "absent" {
+                continue;
+            }
+            let key = record.key.clone();
+            let parents = record.parents.clone().unwrap_or_default();
+            let lines: Vec<Vec<u8>> = record.to_lines().map(|l| l.into_owned()).collect();
+            store.add_lines(key, parents, lines, true)?;
+        }
+        Ok(())
+    }
+
+    /// Flush the pack, its four indices and an updated `pack-names`. Returns
+    /// the new pack's name (its content md5).
     fn finish(
         self,
         transport: &dyn Transport,
         existing: &[(String, Vec<u8>)],
-    ) -> Result<(), RepositoryError> {
+    ) -> Result<String, RepositoryError> {
         let WriteGroup {
-            pack_name,
+            pack_name: _,
             pack,
             revisions,
             inventories,
@@ -1138,10 +1297,14 @@ impl WriteGroup {
                 .map_err(|e| RepositoryError::Corrupt(format!("pack end: {e}")))?;
             std::mem::take(writer.get_mut())
         };
-        transport.put_bytes(&format!("packs/{}.pack", pack_name), &pack_bytes, None)?;
+        // Name the finished pack by the md5 of its content, as brz does (the
+        // write group's token was only used while collecting records; index
+        // values store offsets, not the pack name).
+        let pack_name = md5_hex(&pack_bytes);
+        transport.put_bytes(&format!("packs/{pack_name}.pack"), &pack_bytes, None)?;
 
         let write_index = |ext: &str, bytes: &[u8]| -> Result<usize, RepositoryError> {
-            transport.put_bytes(&format!("indices/{}{ext}", pack_name), bytes, None)?;
+            transport.put_bytes(&format!("indices/{pack_name}{ext}"), bytes, None)?;
             Ok(bytes.len())
         };
         // Knit-pack pack-names order: rix iix tix six (no cix).
@@ -1171,8 +1334,17 @@ impl WriteGroup {
             .finish()
             .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e}")))?;
         transport.put_bytes("pack-names", &names_bytes, None)?;
-        Ok(())
+        Ok(pack_name)
     }
+}
+
+/// The lowercase-hex md5 digest of `bytes`, the form brz names a pack by.
+fn md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    Md5::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Serialise a write index's collected records into a pack index of the
@@ -1232,5 +1404,129 @@ mod tests {
         )
         .unwrap();
         assert!(KnitPackRepository::create(t, fmt).is_err());
+    }
+
+    fn knitpack6() -> &'static RepositoryFormat {
+        super::super::format::find_format(b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n").unwrap()
+    }
+
+    fn make_revision(id: &[u8]) -> crate::revision::Revision {
+        crate::revision::Revision::new(
+            crate::RevisionId::from(id),
+            vec![],
+            Some("T <t@e>".to_string()),
+            "m".to_string(),
+            std::collections::HashMap::new(),
+            None,
+            1577880000.0,
+            Some(0),
+        )
+    }
+
+    /// Commit one revision (root-only inventory + one file text) in its own
+    /// write group, producing one pack.
+    fn commit_one(repo: &mut KnitPackRepository, rev: &[u8]) {
+        repo.start_write_group().unwrap();
+        let root = crate::inventory::ROOT_ID;
+        let entries = vec![
+            crate::inventory::Entry::root(
+                crate::FileId::from(root),
+                Some(crate::RevisionId::from(rev)),
+            ),
+            crate::inventory::Entry::file(
+                crate::FileId::from(&b"file-1"[..]),
+                "a.txt".into(),
+                crate::FileId::from(root),
+                Some(crate::RevisionId::from(rev)),
+                Some(crate::weave::sha_strings(&[b"hello\n"])),
+                Some(6),
+                Some(false),
+                None,
+            ),
+        ];
+        let inv_sha = repo
+            .add_inventory_from_entries(rev, &[], root, &entries)
+            .unwrap();
+        let mut r = make_revision(rev);
+        r.inventory_sha1 = Some(inv_sha);
+        repo.add_revision(&r, &[]).unwrap();
+        repo.add_text(b"file-1", rev, &[], b"hello\n").unwrap();
+        repo.commit_write_group().unwrap();
+    }
+
+    /// pack() combines knit-pack packs into one, obsoletes the old packs, and
+    /// keeps all data readable.
+    #[test]
+    fn pack_combines_packs() {
+        let (_d, t) = temp();
+        let mut repo = KnitPackRepository::create(t.clone(), knitpack6()).unwrap();
+        commit_one(&mut repo, b"rev-1");
+        commit_one(&mut repo, b"rev-2");
+        commit_one(&mut repo, b"rev-3");
+
+        let before = read_pack_names(t.as_ref()).unwrap();
+        assert_eq!(before.len(), 3);
+
+        repo.pack().unwrap();
+
+        let after = read_pack_names(t.as_ref()).unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(!before.contains(&after[0]));
+        for name in &before {
+            assert!(t.has(&format!("obsolete_packs/{name}.pack")).unwrap());
+            assert!(!t.has(&format!("packs/{name}.pack")).unwrap());
+        }
+
+        // Everything reads back through the new pack.
+        let repo = KnitPackRepository::open(t).unwrap();
+        let mut ids = repo.all_revision_ids().unwrap();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![b"rev-1".to_vec(), b"rev-2".to_vec(), b"rev-3".to_vec()]
+        );
+        for rev in [&b"rev-1"[..], b"rev-2", b"rev-3"] {
+            assert_eq!(repo.get_revision(rev).unwrap().message, "m");
+            assert_eq!(repo.get_file_text(b"file-1", rev).unwrap(), b"hello\n");
+        }
+    }
+
+    /// A committed knit-pack pack is named by the md5 of its content.
+    #[test]
+    fn pack_name_is_content_md5() {
+        let (_d, t) = temp();
+        let mut repo = KnitPackRepository::create(t.clone(), knitpack6()).unwrap();
+        commit_one(&mut repo, b"rev-1");
+        let names = read_pack_names(t.as_ref()).unwrap();
+        assert_eq!(names.len(), 1);
+        let pack_bytes = t.get_bytes(&format!("packs/{}.pack", names[0])).unwrap();
+        assert_eq!(names[0], md5_hex(&pack_bytes));
+    }
+
+    /// Committing many packs triggers autopack, bounding the pack count.
+    #[test]
+    fn autopack_bounds_pack_count_on_commit() {
+        let (_d, t) = temp();
+        let mut repo = KnitPackRepository::create(t.clone(), knitpack6()).unwrap();
+        for i in 0..12u32 {
+            let rev = format!("rev-{i}");
+            commit_one(&mut repo, rev.as_bytes());
+        }
+        let names = read_pack_names(t.as_ref()).unwrap();
+        assert!(
+            names.len() < 12,
+            "autopack should consolidate, got {}",
+            names.len()
+        );
+
+        let repo = KnitPackRepository::open(t).unwrap();
+        assert_eq!(repo.all_revision_ids().unwrap().len(), 12);
+        for i in 0..12u32 {
+            let rev = format!("rev-{i}");
+            assert_eq!(
+                repo.get_file_text(b"file-1", rev.as_bytes()).unwrap(),
+                b"hello\n"
+            );
+        }
     }
 }
