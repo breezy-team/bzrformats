@@ -450,6 +450,56 @@ impl BzrDirMeta {
         target.open_branch()
     }
 
+    /// Open this control directory's repository, activating any stacked-on
+    /// fallback so reads resolve objects held only in the base repository.
+    ///
+    /// If the branch is stacked, its `stacked_on_location` is followed to the
+    /// base branch's repository, which is wired in as a fallback through a
+    /// [`StackedRepository`](crate::repository::StackedRepository). A
+    /// non-stacked (or branchless) control directory returns its plain
+    /// repository unchanged.
+    pub fn open_repository_stacked(
+        &self,
+    ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        let repo = self.open_repository()?;
+        if !self.has_branch {
+            return Ok(repo);
+        }
+        let branch = self.open_branch()?;
+        let stacked_on = match branch.get_stacked_on_url() {
+            Ok(url) => url,
+            // Not stacked, or a format that cannot stack: plain repository.
+            Err(crate::branch::BranchError::NotStacked)
+            | Err(crate::branch::BranchError::Unstackable) => return Ok(repo),
+            Err(e) => {
+                return Err(BzrDirError::Component(format!(
+                    "reading stacked-on location: {e}"
+                )))
+            }
+        };
+        use crate::repository::Repository as _;
+        let base = self.open_stacked_on_repository(&stacked_on)?;
+        let mut stacked = crate::repository::StackedRepository::new(repo);
+        stacked
+            .add_fallback_repository(base)
+            .map_err(|e| BzrDirError::Component(format!("wiring fallback repository: {e}")))?;
+        Ok(Box::new(stacked))
+    }
+
+    /// Open the repository of the branch this one is stacked on, following the
+    /// stacked-on chain so a multiply-stacked branch picks up every base.
+    fn open_stacked_on_repository(
+        &self,
+        location: &str,
+    ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        let path = location.strip_prefix("file://").unwrap_or(location);
+        let containing = self.transport.subtransport(path)?;
+        let base_bzr = containing.subtransport(".bzr")?;
+        let base = BzrDirMeta::open(base_bzr)?;
+        // Recurse so the base's own stacking (if any) is activated too.
+        base.open_repository_stacked()
+    }
+
     /// Verify a component's format if it is present.
     ///
     /// Returns `Ok(true)` if the component exists and is a supported
@@ -961,6 +1011,68 @@ mod tests {
         assert_eq!(
             branch.last_revision_info().unwrap(),
             (3, b"rev-real".to_vec())
+        );
+    }
+
+    /// A stacked branch's open_repository_stacked resolves revisions held only
+    /// in the base repository it is stacked on.
+    #[test]
+    fn open_repository_stacked_resolves_from_base() {
+        use crate::inventory::ROOT_ID;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // The base lives under `base/`: a 2a control directory with one commit.
+        let base_root = dir.path().join("base");
+        std::fs::create_dir_all(&base_root).unwrap();
+        let base_parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(&base_root));
+        let base = BzrDirMeta::create(&base_parent).unwrap();
+        {
+            let mut repo = base.open_repository().unwrap();
+            repo.start_write_group().unwrap();
+            let rev = crate::revision::Revision::new(
+                crate::RevisionId::from(&b"rev-base"[..]),
+                vec![],
+                Some("T <t@e>".to_string()),
+                "base commit".to_string(),
+                std::collections::HashMap::new(),
+                None,
+                1577880000.0,
+                Some(0),
+            );
+            repo.add_revision(&rev, &[]).unwrap();
+            let entries = vec![crate::inventory::Entry::root(
+                crate::FileId::from(ROOT_ID),
+                Some(crate::RevisionId::from(&b"rev-base"[..])),
+            )];
+            repo.add_inventory_from_entries(b"rev-base", &[], ROOT_ID, &entries)
+                .unwrap();
+            repo.commit_write_group().unwrap();
+        }
+
+        // The stacked branch lives under `top/`: its own (empty) 2a repository,
+        // with branch.conf pointing stacked_on_location at the base.
+        let top_root = dir.path().join("top");
+        std::fs::create_dir_all(&top_root).unwrap();
+        let top_parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(&top_root));
+        let top = BzrDirMeta::create(&top_parent).unwrap();
+        top.open_branch()
+            .unwrap()
+            .set_stacked_on_url(Some(base_root.to_str().unwrap()))
+            .unwrap();
+
+        // The plain repository does not have the base's revision...
+        assert!(!top
+            .open_repository()
+            .unwrap()
+            .has_revision(b"rev-base")
+            .unwrap());
+        // ...but the stacked one resolves it through the fallback.
+        let stacked = top.open_repository_stacked().unwrap();
+        assert!(stacked.has_revision(b"rev-base").unwrap());
+        assert_eq!(
+            stacked.get_revision(b"rev-base").unwrap().message,
+            "base commit"
         );
     }
 }
