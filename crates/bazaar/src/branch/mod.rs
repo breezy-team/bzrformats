@@ -643,6 +643,43 @@ impl Branch {
         self.transport.put_bytes("references", &out, None)?;
         Ok(())
     }
+
+    // --- Branch reference format (lightweight checkouts) ---
+
+    /// The URL a branch-reference points at, or `None` if this is not a branch
+    /// reference.
+    ///
+    /// A branch of `REFERENCE_FORMAT_1` stores the referenced branch's URL in a
+    /// `location` file (UTF-8, no trailing newline). For any other format this
+    /// returns `None`, matching breezy's `BranchFormat.get_reference` default.
+    pub fn get_reference(&self) -> Result<Option<String>, BranchError> {
+        if !self.format.is_reference {
+            return Ok(None);
+        }
+        match self.transport.get_bytes("location") {
+            Ok(b) => {
+                let url = String::from_utf8(b)
+                    .map_err(|_| BranchError::Corrupt("location file not utf-8".to_string()))?;
+                Ok(Some(url))
+            }
+            Err(TransportError::NoSuchFile(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Point this branch reference at `to_url` (written verbatim as UTF-8).
+    ///
+    /// Errors with [`BranchError::Unsupported`] on a non-reference format,
+    /// matching breezy where only `BranchReferenceFormat` implements
+    /// `set_reference`.
+    pub fn set_reference(&self, to_url: &str) -> Result<(), BranchError> {
+        if !self.format.is_reference {
+            return Err(BranchError::Unsupported("branch reference".to_string()));
+        }
+        self.transport
+            .put_bytes("location", to_url.as_bytes(), None)?;
+        Ok(())
+    }
 }
 
 /// Pull a single string value out of a RIO stanza by tag.
@@ -1081,5 +1118,30 @@ mod tests {
             branch.get_reference_info(b"file-1"),
             Err(BranchError::Unsupported(_))
         ));
+    }
+
+    // --- Branch reference format ---
+
+    #[test]
+    fn get_reference_is_none_on_normal_branch() {
+        let (_d, branch, _p) = branch_transport();
+        assert_eq!(branch.get_reference().unwrap(), None);
+        assert!(matches!(
+            branch.set_reference("x"),
+            Err(BranchError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn reference_round_trips() {
+        let (_d, branch, probe) = branch_transport_format(&REFERENCE_FORMAT_1);
+        assert_eq!(branch.get_reference().unwrap(), None);
+        branch.set_reference("file:///srv/real").unwrap();
+        assert_eq!(
+            branch.get_reference().unwrap().as_deref(),
+            Some("file:///srv/real")
+        );
+        // Stored verbatim in the `location` file, no trailing newline.
+        assert_eq!(probe.get_bytes("location").unwrap(), b"file:///srv/real");
     }
 }
