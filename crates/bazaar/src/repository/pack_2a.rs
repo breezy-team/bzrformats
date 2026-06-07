@@ -867,10 +867,13 @@ fn entries_from_null_delta(
     Ok(entries)
 }
 
-/// Generate a fresh 32-hex-character pack name.
+/// Generate a fresh 32-hex-character token to identify an in-progress write
+/// group's pack.
 ///
-/// brz derives the name from a hash of the pack contents; on disk any
-/// unique 32-hex token is valid, so a random one suffices.
+/// This is only the working identifier while records are collected; the
+/// finished pack is renamed to the md5 of its content in
+/// [`WriteGroup::finish`](super::pack_2a_writer), matching brz, so the token
+/// just needs to be unique within the process.
 fn new_pack_name() -> String {
     crate::osutils::rand_chars(32)
         .chars()
@@ -1165,5 +1168,38 @@ mod tests {
         // a.txt's unchanged sibling (the root) is still resolvable, i.e. the
         // fallback-referenced pages read back.
         assert_eq!(inv.id2path(&FileId::from(&b"file-a"[..])).unwrap(), "a.txt");
+    }
+
+    /// A committed pack is named by the md5 of its content (matching brz), so
+    /// the `packs/<name>.pack` file's md5 hex digest equals its name.
+    #[test]
+    fn pack_name_is_content_md5() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        repo.start_write_group().unwrap();
+        repo.add_revision(&make_revision(b"rev-1", vec![], "m", None), &[])
+            .unwrap();
+        repo.add_inventory_from_entries(
+            b"rev-1",
+            &[],
+            crate::inventory::ROOT_ID,
+            &[crate::inventory::Entry::root(
+                crate::FileId::from(crate::inventory::ROOT_ID),
+                Some(crate::RevisionId::from(&b"rev-1"[..])),
+            )],
+        )
+        .unwrap();
+        repo.commit_write_group().unwrap();
+
+        let names = read_pack_names(t.as_ref()).unwrap();
+        assert_eq!(names.len(), 1);
+        let name = &names[0];
+        let pack_bytes = t.get_bytes(&format!("packs/{name}.pack")).unwrap();
+        use md5::{Digest, Md5};
+        let expected: String = Md5::digest(&pack_bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(name, &expected);
     }
 }

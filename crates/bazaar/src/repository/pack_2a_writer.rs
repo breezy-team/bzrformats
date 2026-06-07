@@ -192,7 +192,6 @@ type WriteStore = GroupCompressVersionedFiles<PackWritingIndex, PackWritingAcces
 /// Construct with [`new`](Self::new), add objects through the per-kind
 /// `add_*` helpers, then call [`finish`](Self::finish).
 pub(super) struct WriteGroup {
-    pack_name: PackName,
     pack: Arc<Mutex<SharedPack>>,
     revisions: WriteStore,
     inventories: WriteStore,
@@ -242,7 +241,6 @@ impl WriteGroup {
         let chk_bytes = Arc::new(chk_store);
 
         Ok(WriteGroup {
-            pack_name: pack_name.to_string(),
             pack,
             revisions,
             inventories,
@@ -417,9 +415,14 @@ impl WriteGroup {
             std::mem::take(pack.writer.get_mut())
         };
 
-        transport.put_bytes(&format!("packs/{}.pack", self.pack_name), &pack_bytes, None)?;
+        // Name the finished pack by the md5 of its content, as brz does. The
+        // write group's internal `pack_name` was only a token used while
+        // collecting records (the index values store offsets, not the name).
+        let pack_name = md5_hex(&pack_bytes);
+
+        transport.put_bytes(&format!("packs/{pack_name}.pack"), &pack_bytes, None)?;
         let write_index = |ext: &str, bytes: &[u8]| -> Result<usize, RepositoryError> {
-            let name = format!("indices/{}{ext}", self.pack_name);
+            let name = format!("indices/{pack_name}{ext}");
             transport.put_bytes(&name, bytes, None)?;
             Ok(bytes.len())
         };
@@ -448,7 +451,7 @@ impl WriteGroup {
         }
         names
             .add_node(
-                vec![self.pack_name.clone().into_bytes()],
+                vec![pack_name.clone().into_bytes()],
                 new_value.clone(),
                 vec![],
             )
@@ -458,8 +461,19 @@ impl WriteGroup {
             .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e:?}")))?;
         transport.put_bytes("pack-names", &names_bytes, None)?;
 
-        Ok(Some((self.pack_name, new_value)))
+        Ok(Some((pack_name, new_value)))
     }
+}
+
+/// The lowercase-hex md5 digest of `bytes`, the form brz names a pack by.
+fn md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    let digest = Md5::digest(bytes);
+    let mut s = String::with_capacity(32);
+    for b in digest {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// Split a byte buffer into lines the way the versioned-file layer
