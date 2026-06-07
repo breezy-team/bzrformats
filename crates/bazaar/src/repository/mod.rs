@@ -182,6 +182,106 @@ pub trait Repository: Send + Sync {
             "repository does not support fallbacks",
         ))
     }
+
+    /// Verify the stored GPG signature of `revision_id` against `certs`.
+    ///
+    /// Mirrors breezy's `verify_revision_signature`: an unsigned revision is
+    /// [`VerificationResult::NotSigned`](crate::gpg::VerificationResult::NotSigned);
+    /// otherwise the stored clearsigned text is verified and its plaintext is
+    /// compared byte-for-byte against the revision's V1 testament short text.
+    /// A plaintext that does not match the testament forces
+    /// [`VerificationResult::NotValid`](crate::gpg::VerificationResult::NotValid),
+    /// even for a cryptographically good signature.
+    #[cfg(feature = "gpg")]
+    fn verify_revision_signature(
+        &self,
+        revision_id: &[u8],
+        certs: &[sequoia_openpgp::Cert],
+    ) -> Result<crate::gpg::VerificationResult, RepositoryError> {
+        use crate::gpg::VerificationResult;
+        let Some(signature) = self.get_signature_text(revision_id)? else {
+            return Ok(VerificationResult::NotSigned);
+        };
+        let expected = testament_short_text_for_revision(self, revision_id)?;
+        let verification = crate::gpg::verify_clearsigned(&signature, certs);
+        if verification.plaintext.as_deref() != Some(expected.as_slice()) {
+            return Ok(VerificationResult::NotValid);
+        }
+        Ok(verification.result)
+    }
+}
+
+/// Build the V1 testament short text for a stored revision, the plaintext a
+/// valid signature must reproduce.
+///
+/// Assembles the V1 testament from the revision and its tree (the inventory
+/// entries, root excluded, in `iter_entries` order) and returns
+/// `as_short_text(V1)`.
+#[cfg(feature = "gpg")]
+fn testament_short_text_for_revision(
+    repo: &(impl Repository + ?Sized),
+    revision_id: &[u8],
+) -> Result<Vec<u8>, RepositoryError> {
+    use crate::testament::{EntryKind as TKind, Testament, TestamentEntry, TestamentFormat};
+
+    let revision = repo.get_revision(revision_id)?;
+    let tree = repo.revision_tree(revision_id)?;
+
+    let mut entries = Vec::new();
+    for (path, entry) in tree.iter_entries() {
+        // The V1 testament omits the root entry.
+        if path.is_empty() || path == "." {
+            continue;
+        }
+        let (kind, content) = match entry.kind() {
+            crate::osutils::Kind::File => (
+                TKind::File,
+                entry.text_sha1().map(|s| s.to_vec()).unwrap_or_default(),
+            ),
+            crate::osutils::Kind::Directory => (TKind::Directory, Vec::new()),
+            crate::osutils::Kind::Symlink => (
+                TKind::Symlink,
+                entry
+                    .symlink_target()
+                    .map(|t| t.as_bytes().to_vec())
+                    .unwrap_or_default(),
+            ),
+            crate::osutils::Kind::TreeReference => (TKind::TreeReference, Vec::new()),
+        };
+        entries.push(TestamentEntry {
+            path,
+            kind,
+            file_id: entry.file_id().as_bytes().to_vec(),
+            content,
+            revision: entry
+                .revision()
+                .map(|r| r.as_bytes().to_vec())
+                .unwrap_or_default(),
+            executable: entry.executable(),
+        });
+    }
+
+    let testament = Testament {
+        revision_id: revision_id.to_vec(),
+        committer: revision.committer.clone().unwrap_or_default(),
+        timestamp: revision.timestamp as i64,
+        timezone: revision.timezone.unwrap_or(0),
+        message: revision.message.clone(),
+        parent_ids: revision
+            .parent_ids
+            .iter()
+            .map(|p| p.as_bytes().to_vec())
+            .collect(),
+        revprops: revision
+            .properties
+            .iter()
+            .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
+            .collect(),
+        entries,
+    };
+    testament
+        .as_short_text(TestamentFormat::V1)
+        .map_err(|e| RepositoryError::Corrupt(format!("testament: {e}")))
 }
 
 /// A repository that consults a chain of fallback repositories for objects its
@@ -721,5 +821,92 @@ mod tests {
             repo.add_fallback_repository(other),
             Err(RepositoryError::UnsupportedFormat(_))
         ));
+    }
+
+    #[cfg(feature = "gpg")]
+    fn gen_signing_cert() -> (sequoia_openpgp::Cert, Vec<u8>) {
+        use sequoia_openpgp::cert::CertBuilder;
+        use sequoia_openpgp::serialize::Serialize;
+        let (cert, _) = CertBuilder::new().add_signing_subkey().generate().unwrap();
+        let mut tsk = Vec::new();
+        cert.as_tsk().serialize(&mut tsk).unwrap();
+        (cert, tsk)
+    }
+
+    /// A revision signed over its own V1 testament verifies as valid, and an
+    /// unsigned revision reports NotSigned.
+    #[cfg(feature = "gpg")]
+    #[test]
+    fn verify_revision_signature_valid_and_unsigned() {
+        use crate::gpg::VerificationResult;
+
+        let dir = tempfile::tempdir().unwrap();
+        let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let repo = make_2a_with_rev_at(&t, b"rev-1");
+
+        // No signature yet.
+        assert_eq!(
+            repo.verify_revision_signature(b"rev-1", &[]).unwrap(),
+            VerificationResult::NotSigned
+        );
+
+        // Sign the revision's own testament short text and store it.
+        let (cert, tsk) = gen_signing_cert();
+        let testament = testament_short_text_for_revision(repo.as_ref(), b"rev-1").unwrap();
+        let signature = crate::gpg::clearsign(&testament, &tsk).unwrap();
+        let mut repo = repo;
+        repo.start_write_group().unwrap();
+        repo.add_signature_text(b"rev-1", &signature).unwrap();
+        repo.commit_write_group().unwrap();
+        // Reopen so the freshly written signature pack is visible to reads.
+        let repo = Box::new(Pack2aRepository::open(t.clone()).unwrap()) as Box<dyn Repository>;
+
+        assert_eq!(
+            repo.verify_revision_signature(b"rev-1", std::slice::from_ref(&cert))
+                .unwrap(),
+            VerificationResult::Valid
+        );
+    }
+
+    /// A signature over the wrong content fails the testament byte-compare even
+    /// though it is cryptographically good.
+    #[cfg(feature = "gpg")]
+    #[test]
+    fn verify_revision_signature_wrong_testament_is_not_valid() {
+        use crate::gpg::VerificationResult;
+
+        let dir = tempfile::tempdir().unwrap();
+        let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let mut repo = make_2a_with_rev_at(&t, b"rev-1");
+
+        let (cert, tsk) = gen_signing_cert();
+        // Sign something that is NOT the revision's testament.
+        let signature = crate::gpg::clearsign(b"not the testament\n", &tsk).unwrap();
+        repo.start_write_group().unwrap();
+        repo.add_signature_text(b"rev-1", &signature).unwrap();
+        repo.commit_write_group().unwrap();
+        let repo = Box::new(Pack2aRepository::open(t.clone()).unwrap()) as Box<dyn Repository>;
+
+        assert_eq!(
+            repo.verify_revision_signature(b"rev-1", std::slice::from_ref(&cert))
+                .unwrap(),
+            VerificationResult::NotValid
+        );
+    }
+
+    /// Build a 2a repository with a single committed revision at `t`, returned
+    /// open for read/write (so a signature can be added).
+    #[cfg(feature = "gpg")]
+    fn make_2a_with_rev_at(t: &SharedTransport, rev: &[u8]) -> Box<dyn Repository> {
+        let mut repo =
+            Box::new(Pack2aRepository::create(t.clone()).unwrap()) as Box<dyn Repository>;
+        repo.start_write_group().unwrap();
+        repo.add_revision(&revision(rev, vec![], "msg"), &[])
+            .unwrap();
+        repo.add_inventory_from_entries(rev, &[], crate::inventory::ROOT_ID, &entries(rev))
+            .unwrap();
+        repo.add_text(b"file-1", rev, &[], b"hello\n").unwrap();
+        repo.commit_write_group().unwrap();
+        Box::new(Pack2aRepository::open(t.clone()).unwrap())
     }
 }
