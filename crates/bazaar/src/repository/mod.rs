@@ -13,6 +13,7 @@ pub mod format;
 mod knit_repo;
 mod pack_2a;
 mod pack_2a_writer;
+mod pack_collection;
 #[cfg(feature = "knitpack")]
 mod pack_index;
 #[cfg(feature = "knitpack")]
