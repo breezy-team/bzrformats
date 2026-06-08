@@ -322,3 +322,33 @@ class TestControlDir(TestCaseInTempDir):
         self.assertFalse(cd.make_working_trees())
         cd.set_make_working_trees(True)
         self.assertTrue(cd.make_working_trees())
+
+    def test_pack_keeps_data_readable(self):
+        cd = controldir.create(self.test_dir)
+        r1 = cd.open_workingtree().commit(
+            cd.open_repository(),
+            cd.open_branch(),
+            "T <t@e>",
+            "one",
+            1577880000,
+            0,
+            allow_pointless=True,
+        )
+        reopened = controldir.open(self.test_dir)
+        r2 = reopened.open_workingtree().commit(
+            reopened.open_repository(),
+            reopened.open_branch(),
+            "T <t@e>",
+            "two",
+            1577890000,
+            0,
+            allow_pointless=True,
+        )
+        # pack() then both revisions still read back.
+        controldir.open(self.test_dir).open_repository().pack()
+        repo = controldir.open(self.test_dir).open_repository()
+        self.assertTrue(repo.has_revision(r1))
+        self.assertTrue(repo.has_revision(r2))
+        self.assertEqual(repo.get_revision(r1)["message"], "one")
+        # autopack on a small repository does nothing.
+        self.assertFalse(controldir.open(self.test_dir).open_repository().autopack())

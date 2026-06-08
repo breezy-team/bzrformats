@@ -730,8 +730,152 @@ impl Pack2aRepository {
             .take()
             .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))?;
         let existing = read_pack_names_with_values(self.transport.as_ref())?;
-        group.finish(self.transport.as_ref(), &existing)?;
+        let new_pack = group.finish(self.transport.as_ref(), &existing)?;
+        // After inserting new content, autopack if the repository has
+        // accumulated too many packs (as brz does on commit_write_group).
+        if new_pack.is_some() {
+            self.autopack()?;
+        }
         Ok(())
+    }
+
+    /// Combine all packs in this repository into a single new pack.
+    ///
+    /// Every record (revisions, inventories, CHK pages, texts, signatures) is
+    /// re-streamed into one fresh pack, `pack-names` is rewritten to reference
+    /// only the new pack, and the old packs and their indices are moved into
+    /// `obsolete_packs/` (not deleted). A repository that already holds a
+    /// single pack is left untouched (it is already optimal).
+    ///
+    /// Requires no open write group. After packing, re-open the repository to
+    /// read through the new pack.
+    pub fn pack(&mut self) -> Result<(), RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::Corrupt(
+                "cannot pack with an open write group".to_string(),
+            ));
+        }
+        let old_packs = read_pack_names(self.transport.as_ref())?;
+        if old_packs.len() <= 1 {
+            // Zero or one pack: already as packed as it gets.
+            return Ok(());
+        }
+        // Combine every pack; no survivors.
+        self.repack(&old_packs, &[])
+    }
+
+    /// Repack the smallest packs when the repository has accumulated too many,
+    /// according to the pack-distribution heuristic.
+    ///
+    /// Computes each pack's revision count (its `.rix` index key count), runs
+    /// [`plan_autopack_combinations`](super::pack_collection::plan_autopack_combinations),
+    /// and if it selects packs to combine, repacks just those into one new
+    /// pack, leaving the rest in place. Returns `true` if a repack happened.
+    ///
+    /// Requires no open write group.
+    pub fn autopack(&mut self) -> Result<bool, RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::Corrupt(
+                "cannot autopack with an open write group".to_string(),
+            ));
+        }
+        let all_packs = read_pack_names(self.transport.as_ref())?;
+        if all_packs.len() <= 1 {
+            return Ok(false);
+        }
+        // Revision count per pack, from each pack's revision index.
+        let mut counts = Vec::with_capacity(all_packs.len());
+        for name in &all_packs {
+            let ext = index_extension(IndexKind::Revision);
+            let index =
+                BTreeGraphIndex::open(self.transport.as_ref(), &format!("indices/{name}{ext}"))?;
+            counts.push(index.key_count() as u64);
+        }
+        let selected = super::pack_collection::plan_autopack_combinations(&counts);
+        if selected.is_empty() {
+            return Ok(false);
+        }
+        let to_combine: Vec<PackName> = selected.iter().map(|&i| all_packs[i].clone()).collect();
+        let survivors: Vec<(PackName, Vec<u8>)> = {
+            let with_values = read_pack_names_with_values(self.transport.as_ref())?;
+            let combine: std::collections::HashSet<&PackName> = to_combine.iter().collect();
+            with_values
+                .into_iter()
+                .filter(|(n, _)| !combine.contains(n))
+                .collect()
+        };
+        self.repack(&to_combine, &survivors)?;
+        Ok(true)
+    }
+
+    /// Combine `to_combine` into a single new pack, rewrite `pack-names` to list
+    /// `survivors` plus the new pack, and move the combined packs into
+    /// `obsolete_packs/`.
+    fn repack(
+        &mut self,
+        to_combine: &[PackName],
+        survivors: &[(PackName, Vec<u8>)],
+    ) -> Result<(), RepositoryError> {
+        // Read-side stores over the packs being combined, one per object kind.
+        let revisions = build_store(&self.transport, to_combine, IndexKind::Revision)?;
+        let inventories = build_store(&self.transport, to_combine, IndexKind::Inventory)?;
+        let texts = build_store(&self.transport, to_combine, IndexKind::Text)?;
+        let signatures = build_store(&self.transport, to_combine, IndexKind::Signature)?;
+        let chk = build_store(&self.transport, to_combine, IndexKind::Chk)?;
+
+        // A fresh write group with no chk fallback: the new pack is
+        // self-contained, holding every page it needs rather than referencing
+        // the packs about to become obsolete.
+        use super::pack_2a_writer::{RepackTarget, WriteGroup};
+        let group = WriteGroup::new(&new_pack_name(), None)?;
+        // Copy order matches brz's GCCHKPacker: revisions, inventories, chk,
+        // texts, signatures.
+        group.copy_store(&revisions, RepackTarget::Revisions)?;
+        group.copy_store(&inventories, RepackTarget::Inventories)?;
+        group.copy_store(&chk, RepackTarget::Chk)?;
+        group.copy_store(&texts, RepackTarget::Texts)?;
+        group.copy_store(&signatures, RepackTarget::Signatures)?;
+
+        // Write the combined pack; pack-names now lists the survivors plus it.
+        group.finish(self.transport.as_ref(), survivors)?;
+
+        // Move the now-superseded packs and their indices into obsolete_packs/.
+        self.obsolete_packs(to_combine)?;
+        Ok(())
+    }
+
+    /// Move `packs` (their `.pack` files and every index suffix) into the
+    /// `obsolete_packs/` directory, creating it if needed. Old packs are moved
+    /// rather than deleted, matching brz, so a mistaken pack can be recovered.
+    fn obsolete_packs(&self, packs: &[PackName]) -> Result<(), RepositoryError> {
+        let t = self.transport.as_ref();
+        // Best-effort directory creation (ignore "already exists").
+        let _ = t.mkdir("obsolete_packs");
+        for name in packs {
+            self.move_to_obsolete(&format!("packs/{name}.pack"), &format!("{name}.pack"))?;
+            for kind in [
+                IndexKind::Revision,
+                IndexKind::Inventory,
+                IndexKind::Text,
+                IndexKind::Signature,
+                IndexKind::Chk,
+            ] {
+                let ext = index_extension(kind);
+                self.move_to_obsolete(&format!("indices/{name}{ext}"), &format!("{name}{ext}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Move one file into `obsolete_packs/`, tolerating a missing source (a
+    /// pack with no chk index has no `.cix`, for instance).
+    fn move_to_obsolete(&self, from: &str, basename: &str) -> Result<(), RepositoryError> {
+        let to = format!("obsolete_packs/{basename}");
+        match self.transport.rename(from, &to) {
+            Ok(()) => Ok(()),
+            Err(TransportError::NoSuchFile(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -835,6 +979,14 @@ impl super::Repository for Pack2aRepository {
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
         Pack2aRepository::commit_write_group(self)
     }
+
+    fn pack(&mut self) -> Result<(), RepositoryError> {
+        Pack2aRepository::pack(self)
+    }
+
+    fn autopack(&mut self) -> Result<bool, RepositoryError> {
+        Pack2aRepository::autopack(self)
+    }
 }
 
 /// Build the full inventory entry list for a first commit (null basis) from
@@ -867,10 +1019,13 @@ fn entries_from_null_delta(
     Ok(entries)
 }
 
-/// Generate a fresh 32-hex-character pack name.
+/// Generate a fresh 32-hex-character token to identify an in-progress write
+/// group's pack.
 ///
-/// brz derives the name from a hash of the pack contents; on disk any
-/// unique 32-hex token is valid, so a random one suffices.
+/// This is only the working identifier while records are collected; the
+/// finished pack is renamed to the md5 of its content in
+/// [`WriteGroup::finish`](super::pack_2a_writer), matching brz, so the token
+/// just needs to be unique within the process.
 fn new_pack_name() -> String {
     crate::osutils::rand_chars(32)
         .chars()
@@ -1165,5 +1320,171 @@ mod tests {
         // a.txt's unchanged sibling (the root) is still resolvable, i.e. the
         // fallback-referenced pages read back.
         assert_eq!(inv.id2path(&FileId::from(&b"file-a"[..])).unwrap(), "a.txt");
+    }
+
+    /// Commit one revision (with a root-only inventory) in its own write group,
+    /// producing one pack.
+    fn commit_one(repo: &mut Pack2aRepository, rev: &[u8]) {
+        repo.start_write_group().unwrap();
+        repo.add_revision(&make_revision(rev, vec![], "m", None), &[])
+            .unwrap();
+        repo.add_inventory_from_entries(
+            rev,
+            &[],
+            crate::inventory::ROOT_ID,
+            &[crate::inventory::Entry::root(
+                crate::FileId::from(crate::inventory::ROOT_ID),
+                Some(crate::RevisionId::from(rev)),
+            )],
+        )
+        .unwrap();
+        repo.add_text(b"file-1", rev, &[], b"hello\n").unwrap();
+        repo.commit_write_group().unwrap();
+    }
+
+    /// pack() combines several packs into one, moves the old packs to
+    /// obsolete_packs/, and keeps all data readable.
+    #[test]
+    fn pack_combines_packs() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        commit_one(&mut repo, b"rev-1");
+        commit_one(&mut repo, b"rev-2");
+        commit_one(&mut repo, b"rev-3");
+
+        // Three separate commits -> three packs.
+        let before = read_pack_names(t.as_ref()).unwrap();
+        assert_eq!(before.len(), 3);
+
+        repo.pack().unwrap();
+
+        // Now a single pack.
+        let after = read_pack_names(t.as_ref()).unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(!before.contains(&after[0]), "new pack is freshly named");
+
+        // The old packs were moved to obsolete_packs/, not deleted.
+        for name in &before {
+            assert!(
+                t.has(&format!("obsolete_packs/{name}.pack")).unwrap(),
+                "old pack {name} should be obsoleted"
+            );
+            assert!(
+                !t.has(&format!("packs/{name}.pack")).unwrap(),
+                "old pack {name} should be gone from packs/"
+            );
+        }
+
+        // All three revisions and their data still read back through the new
+        // pack.
+        let repo = Pack2aRepository::open(t).unwrap();
+        let mut ids = repo.all_revision_ids().unwrap();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![b"rev-1".to_vec(), b"rev-2".to_vec(), b"rev-3".to_vec()]
+        );
+        for rev in [&b"rev-1"[..], b"rev-2", b"rev-3"] {
+            assert_eq!(repo.get_revision(rev).unwrap().message, "m");
+            assert_eq!(repo.get_file_text(b"file-1", rev).unwrap(), b"hello\n");
+            // The inventory is readable (CHK pages were copied into the pack).
+            assert!(repo.get_inventory(rev).is_ok());
+        }
+    }
+
+    /// Committing many single-revision packs triggers autopack, keeping the
+    /// pack count bounded well below the number of commits, and all data stays
+    /// readable.
+    #[test]
+    fn autopack_bounds_pack_count_on_commit() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        for i in 0..12u32 {
+            let rev = format!("rev-{i}");
+            commit_one(&mut repo, rev.as_bytes());
+        }
+        // Without autopack there would be 12 packs; the distribution for ~12
+        // revisions allows far fewer, so autopack must have fired.
+        let names = read_pack_names(t.as_ref()).unwrap();
+        assert!(
+            names.len() < 12,
+            "autopack should have consolidated packs, got {}",
+            names.len()
+        );
+
+        // Every revision still reads back.
+        let repo = Pack2aRepository::open(t).unwrap();
+        let ids = repo.all_revision_ids().unwrap();
+        assert_eq!(ids.len(), 12);
+        for i in 0..12u32 {
+            let rev = format!("rev-{i}");
+            assert_eq!(repo.get_revision(rev.as_bytes()).unwrap().message, "m");
+            assert_eq!(
+                repo.get_file_text(b"file-1", rev.as_bytes()).unwrap(),
+                b"hello\n"
+            );
+        }
+    }
+
+    /// autopack() directly: many small packs are consolidated, a few are not.
+    #[test]
+    fn autopack_direct_combines_when_over_distribution() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        // Three commits -> three packs; distribution(3) = [1,1,1], 3 <= 3, so a
+        // direct autopack does nothing.
+        commit_one(&mut repo, b"rev-1");
+        commit_one(&mut repo, b"rev-2");
+        commit_one(&mut repo, b"rev-3");
+        assert!(!repo.autopack().unwrap(), "3 packs within distribution");
+        assert_eq!(read_pack_names(t.as_ref()).unwrap().len(), 3);
+    }
+
+    /// pack() on a single-pack repository is a no-op (already optimal).
+    #[test]
+    fn pack_single_pack_is_noop() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        commit_one(&mut repo, b"rev-1");
+        let before = read_pack_names(t.as_ref()).unwrap();
+        assert_eq!(before.len(), 1);
+        repo.pack().unwrap();
+        let after = read_pack_names(t.as_ref()).unwrap();
+        assert_eq!(after, before, "single pack untouched");
+        // Nothing was obsoleted.
+        assert!(!t.has("obsolete_packs").unwrap_or(false));
+    }
+
+    /// A committed pack is named by the md5 of its content (matching brz), so
+    /// the `packs/<name>.pack` file's md5 hex digest equals its name.
+    #[test]
+    fn pack_name_is_content_md5() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        repo.start_write_group().unwrap();
+        repo.add_revision(&make_revision(b"rev-1", vec![], "m", None), &[])
+            .unwrap();
+        repo.add_inventory_from_entries(
+            b"rev-1",
+            &[],
+            crate::inventory::ROOT_ID,
+            &[crate::inventory::Entry::root(
+                crate::FileId::from(crate::inventory::ROOT_ID),
+                Some(crate::RevisionId::from(&b"rev-1"[..])),
+            )],
+        )
+        .unwrap();
+        repo.commit_write_group().unwrap();
+
+        let names = read_pack_names(t.as_ref()).unwrap();
+        assert_eq!(names.len(), 1);
+        let name = &names[0];
+        let pack_bytes = t.get_bytes(&format!("packs/{name}.pack")).unwrap();
+        use md5::{Digest, Md5};
+        let expected: String = Md5::digest(&pack_bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(name, &expected);
     }
 }

@@ -39,6 +39,16 @@ use super::pack_2a::RepositoryError;
 /// The pack name (used as the groupcompress `FileRef`).
 type PackName = String;
 
+/// Which of a write group's stores a repack copy targets.
+#[derive(Clone, Copy)]
+pub(super) enum RepackTarget {
+    Revisions,
+    Inventories,
+    Texts,
+    Signatures,
+    Chk,
+}
+
 /// The growing `.pack` container, shared by every object kind's store.
 struct SharedPack {
     writer: ContainerWriter<Vec<u8>>,
@@ -192,7 +202,6 @@ type WriteStore = GroupCompressVersionedFiles<PackWritingIndex, PackWritingAcces
 /// Construct with [`new`](Self::new), add objects through the per-kind
 /// `add_*` helpers, then call [`finish`](Self::finish).
 pub(super) struct WriteGroup {
-    pack_name: PackName,
     pack: Arc<Mutex<SharedPack>>,
     revisions: WriteStore,
     inventories: WriteStore,
@@ -242,7 +251,6 @@ impl WriteGroup {
         let chk_bytes = Arc::new(chk_store);
 
         Ok(WriteGroup {
-            pack_name: pack_name.to_string(),
             pack,
             revisions,
             inventories,
@@ -389,6 +397,41 @@ impl WriteGroup {
         Ok(())
     }
 
+    /// Copy every record from a source store into one of this write group's
+    /// stores, preserving keys and parents.
+    ///
+    /// This is the per-kind copy step of a repack: source records are pulled as
+    /// fulltext (via `get_record_stream`) and re-added, which recompresses them
+    /// into the new pack's groupcompress blocks (the `reuse_blocks=False`
+    /// behaviour brz's packer uses). `target` selects which store to add to.
+    pub(super) fn copy_store(
+        &self,
+        source: &dyn crate::versionedfile::VersionedFiles,
+        target: RepackTarget,
+    ) -> Result<(), RepositoryError> {
+        let mut keys = source.keys()?;
+        // Stable order so repacked packs are reproducible.
+        keys.sort_by(|a, b| a.segments().cmp(b.segments()));
+        let store = match target {
+            RepackTarget::Revisions => &self.revisions,
+            RepackTarget::Inventories => &self.inventories,
+            RepackTarget::Texts => &self.texts,
+            RepackTarget::Signatures => &self.signatures,
+            RepackTarget::Chk => self.chk_bytes.as_ref(),
+        };
+        for record in source.get_record_stream(&keys, "unordered", false)? {
+            let record = record?;
+            if record.storage_kind() == "absent" {
+                continue;
+            }
+            let key = record.key();
+            let parents = record.parents();
+            let lines: Vec<Vec<u8>> = record.to_lines().map(|l| l.into_owned()).collect();
+            store.add_lines(key, parents, lines)?;
+        }
+        Ok(())
+    }
+
     /// Flush this write group to `transport` (rooted at `.bzr/repository`):
     /// write the new `.pack`, its five indices, and an updated `pack-names`
     /// that lists `existing_packs` plus the new one.
@@ -417,9 +460,14 @@ impl WriteGroup {
             std::mem::take(pack.writer.get_mut())
         };
 
-        transport.put_bytes(&format!("packs/{}.pack", self.pack_name), &pack_bytes, None)?;
+        // Name the finished pack by the md5 of its content, as brz does. The
+        // write group's internal `pack_name` was only a token used while
+        // collecting records (the index values store offsets, not the name).
+        let pack_name = md5_hex(&pack_bytes);
+
+        transport.put_bytes(&format!("packs/{pack_name}.pack"), &pack_bytes, None)?;
         let write_index = |ext: &str, bytes: &[u8]| -> Result<usize, RepositoryError> {
-            let name = format!("indices/{}{ext}", self.pack_name);
+            let name = format!("indices/{pack_name}{ext}");
             transport.put_bytes(&name, bytes, None)?;
             Ok(bytes.len())
         };
@@ -448,7 +496,7 @@ impl WriteGroup {
         }
         names
             .add_node(
-                vec![self.pack_name.clone().into_bytes()],
+                vec![pack_name.clone().into_bytes()],
                 new_value.clone(),
                 vec![],
             )
@@ -458,8 +506,19 @@ impl WriteGroup {
             .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e:?}")))?;
         transport.put_bytes("pack-names", &names_bytes, None)?;
 
-        Ok(Some((self.pack_name, new_value)))
+        Ok(Some((pack_name, new_value)))
     }
+}
+
+/// The lowercase-hex md5 digest of `bytes`, the form brz names a pack by.
+fn md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    let digest = Md5::digest(bytes);
+    let mut s = String::with_capacity(32);
+    for b in digest {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// Split a byte buffer into lines the way the versioned-file layer

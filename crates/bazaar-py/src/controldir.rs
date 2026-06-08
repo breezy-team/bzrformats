@@ -304,6 +304,18 @@ impl Repository {
         self.inner.commit_write_group().map_err(err)
     }
 
+    /// Combine the repository's packs into a single pack. A no-op for formats
+    /// without packs, or a repository already holding one pack.
+    fn pack(&mut self) -> PyResult<()> {
+        self.inner.pack().map_err(err)
+    }
+
+    /// Repack the smallest packs if the repository has accumulated too many.
+    /// Returns whether a repack happened.
+    fn autopack(&mut self) -> PyResult<bool> {
+        self.inner.autopack().map_err(err)
+    }
+
     /// Add a file text keyed by `(file_id, revision)` to the open write group.
     /// `parents` is a list of `(file_id, revision)` tuples.
     #[pyo3(signature = (file_id, revision, bytes, parents=None))]
