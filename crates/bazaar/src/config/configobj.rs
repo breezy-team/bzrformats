@@ -428,6 +428,50 @@ mod tests {
     }
 
     #[test]
+    fn set_value_appends_after_last_entry_of_section() {
+        // A section that already has two entries, followed by a later section.
+        // A new key must land directly after the section's last entry, not
+        // after its header and not after the following section.
+        let mut c = ConfigObj::parse(b"[s1]\nx = 1\ny = 2\n[s2]\nz = 3\n").unwrap();
+        c.set_value(Some("s1"), "w", "4");
+        assert_eq!(c.to_bytes(), b"[s1]\nx = 1\ny = 2\nw = 4\n[s2]\nz = 3\n");
+    }
+
+    #[test]
+    fn set_value_skips_foreign_entries_when_appending() {
+        // configobj keeps physical line order, so a [s1] entry can appear after
+        // an [s2] header only via interleaving; here we just confirm the append
+        // stops at the next header and ignores entries of other sections.
+        let mut c = ConfigObj::parse(b"[s1]\nx = 1\n# note\n[s2]\nz = 3\n").unwrap();
+        c.set_value(Some("s1"), "y", "2");
+        assert_eq!(c.to_bytes(), b"[s1]\nx = 1\ny = 2\n# note\n[s2]\nz = 3\n");
+    }
+
+    #[test]
+    fn set_value_appends_into_empty_header_section() {
+        // A header with no entries of its own, immediately followed by another
+        // header. The new key must land right after the [s1] header (insert_at
+        // = header_pos + 1), before [s2], not before the [s1] header.
+        let mut c = ConfigObj::parse(b"[s1]\n[s2]\nz = 3\n").unwrap();
+        c.set_value(Some("s1"), "k", "v");
+        assert_eq!(c.to_bytes(), b"[s1]\nk = v\n[s2]\nz = 3\n");
+    }
+
+    #[test]
+    fn set_value_appends_after_first_block_of_interleaved_section() {
+        // The same section name appears twice with another section between.
+        // set_value targets the FIRST [s1] block: scanning stops at the [s2]
+        // header (the break arm), so the new key lands after the first block's
+        // entry, not after the second [s1] block far below.
+        let mut c = ConfigObj::parse(b"[s1]\nx = 1\n[s2]\nz = 3\n[s1]\nw = 4\n").unwrap();
+        c.set_value(Some("s1"), "y", "2");
+        assert_eq!(
+            c.to_bytes(),
+            b"[s1]\nx = 1\ny = 2\n[s2]\nz = 3\n[s1]\nw = 4\n"
+        );
+    }
+
+    #[test]
     fn remove_value_drops_line() {
         let mut c = ConfigObj::parse(b"a = 1\nb = 2\n").unwrap();
         c.remove_value(None, "a");
@@ -460,6 +504,53 @@ mod tests {
         let c = ConfigObj::parse(input).unwrap();
         assert_eq!(c.section(None).unwrap().get("a"), Some("1"));
         assert_eq!(c.to_bytes(), input);
+    }
+
+    #[test]
+    fn quoted_value_keeps_quotes_and_trailing_comment() {
+        // With list_values=False the value keeps its surrounding quotes, and a
+        // comment after the closing quote is captured verbatim so it round-trips.
+        let input = b"a = \"v a l\" # tail\n";
+        let c = ConfigObj::parse(input).unwrap();
+        assert_eq!(c.section(None).unwrap().get("a"), Some("\"v a l\""));
+        assert_eq!(c.to_bytes(), input);
+    }
+
+    #[test]
+    fn quoted_value_without_comment_round_trips() {
+        let input = b"a = 'q'\n";
+        let c = ConfigObj::parse(input).unwrap();
+        assert_eq!(c.section(None).unwrap().get("a"), Some("'q'"));
+        assert_eq!(c.to_bytes(), input);
+    }
+
+    #[test]
+    fn single_quoted_value_with_hash_is_not_a_comment() {
+        // A single-quoted value containing `#` keeps the whole quoted run as the
+        // value; the `#` must not start a comment because it is inside quotes.
+        let input = b"a = '#x'\n";
+        let c = ConfigObj::parse(input).unwrap();
+        assert_eq!(c.section(None).unwrap().get("a"), Some("'#x'"));
+        assert_eq!(c.to_bytes(), input);
+    }
+
+    #[test]
+    fn unterminated_quote_is_whole_value() {
+        let c = ConfigObj::parse(b"a = \"oops\n").unwrap();
+        assert_eq!(c.section(None).unwrap().get("a"), Some("\"oops"));
+    }
+
+    #[test]
+    fn unquote_name_only_strips_real_quote_pairs() {
+        // A doubled non-quote char (first == last but not a quote) is left alone.
+        let c = ConfigObj::parse(b"aa = 1\n").unwrap();
+        assert_eq!(c.section(None).unwrap().get("aa"), Some("1"));
+        // A genuine quote pair around a key is stripped.
+        let c = ConfigObj::parse(b"\"k\" = 1\n").unwrap();
+        assert_eq!(c.section(None).unwrap().get("k"), Some("1"));
+        // Mismatched edge chars (a...z) are not a pair.
+        let c = ConfigObj::parse(b"az = 1\n").unwrap();
+        assert_eq!(c.section(None).unwrap().get("az"), Some("1"));
     }
 
     #[test]

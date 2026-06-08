@@ -176,4 +176,55 @@ mod tests {
         // (5 buckets); 5 packs <= 5 -> still nothing.
         assert!(plan_autopack_combinations(&[1000, 1, 1, 1, 1]).is_empty());
     }
+
+    #[test]
+    fn plan_gathers_small_packs_around_a_medium_one() {
+        // A medium pack (5 revs) and six 1-packs: total 11, distribution(11) =
+        // [10, 1] (2 buckets); 7 packs > 2 -> repack. Largest first, the 5-pack
+        // (index 0) and the next five 1-packs accumulate to fill the 10-bucket;
+        // the sixth 1-pack fills the trailing 1-bucket on its own (consume
+        // branch) and is left out. So indices 0..=5 are combined.
+        assert_eq!(
+            plan_autopack_combinations(&[5, 1, 1, 1, 1, 1, 1]),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn plan_partially_consumes_a_bucket_for_an_oversized_pack() {
+        // A 15-revision pack against a distribution whose first two buckets are
+        // tens exercises the partial-bucket consume: 15 fills the first 10
+        // bucket and leaves the second 10 bucket holding 5. total = 15 + 11 =
+        // 26, distribution(26) = [10,10,1,1,1,1,1,1] (8 buckets); 12 packs > 8.
+        // The oversized pack (index 0) is consumed against the buckets, not
+        // selected; the first five 1-packs gather to fill the dented 5-bucket.
+        let mut counts = vec![15];
+        counts.extend(std::iter::repeat_n(1, 11));
+        assert_eq!(plan_autopack_combinations(&counts), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn plan_combines_exactly_two_packs() {
+        // Two 5-packs and two 1-packs: total 12, distribution(12) = [10, 1, 1]
+        // (3 buckets); 4 packs > 3 -> repack. The two 5-packs sum to 10 and fill
+        // the 10-bucket together; the 1-packs are consumed. Exactly two packs
+        // are combined -- the boundary where the single-pack suppression must
+        // NOT fire.
+        assert_eq!(plan_autopack_combinations(&[5, 5, 1, 1]), vec![0, 1]);
+    }
+
+    #[test]
+    fn plan_suppresses_single_pack_combine() {
+        // 1000-rev pack plus eleven 1-packs: total 1011, distribution(1011) =
+        // [1000, 10, 1] (3 buckets); 12 packs > 3 -> consider a repack. The big
+        // pack consumes the 1000-bucket; the eleven 1-packs gather to fill the
+        // 10-bucket, and the last is left for the 1-bucket. The plan combines
+        // the ten gathered small packs (indices 1..=10), never the lone big one.
+        let mut counts = vec![1000];
+        counts.extend(std::iter::repeat_n(1, 11));
+        assert_eq!(
+            plan_autopack_combinations(&counts),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        );
+    }
 }

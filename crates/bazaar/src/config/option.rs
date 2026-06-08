@@ -239,4 +239,30 @@ mod tests {
         assert_eq!(o.convert_from_unicode("0").as_deref(), Some("False"));
         assert_eq!(o.convert_from_unicode("bogus"), None);
     }
+
+    #[test]
+    fn name_and_default_round_trip() {
+        let o = Option::string("push_location", Some("../trunk"));
+        assert_eq!(o.name(), "push_location");
+        assert_eq!(o.default(), Some("../trunk"));
+        let o = Option::string("nickname", None);
+        assert_eq!(o.name(), "nickname");
+        assert_eq!(o.default(), None);
+    }
+
+    #[test]
+    fn int_from_store_parses_and_rejects() {
+        assert_eq!(int_from_store("42"), Some(42));
+        assert_eq!(int_from_store(" -7 "), Some(-7));
+        assert_eq!(int_from_store("0"), Some(0));
+        assert_eq!(int_from_store("not a number"), None);
+        assert_eq!(int_from_store(""), None);
+    }
+
+    #[test]
+    fn convert_int_uses_int_from_store() {
+        let o = Option::with_converter("n", None, Converter::Int);
+        assert_eq!(o.convert_from_unicode("42").as_deref(), Some("42"));
+        assert_eq!(o.convert_from_unicode("nope"), None);
+    }
 }
