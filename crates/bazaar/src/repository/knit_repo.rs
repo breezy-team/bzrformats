@@ -384,6 +384,10 @@ impl super::Repository for KnitRepository {
         KnitRepository::format(self)
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
         KnitRepository::all_revision_ids(self)
     }

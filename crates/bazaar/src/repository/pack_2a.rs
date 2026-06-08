@@ -739,6 +739,115 @@ impl Pack2aRepository {
         Ok(())
     }
 
+    /// Stream the `missing` revisions from another 2a repository into this one,
+    /// copying raw records (revisions, inventories, texts, CHK pages,
+    /// signatures) without decoding and re-encoding them.
+    ///
+    /// This is the same-format fast path for [`crate::repository::fetch`]: both
+    /// sides speak groupcompress + CHK, so records copy through verbatim. The
+    /// CHK pages reachable from the fetched inventories (but not already in this
+    /// repository) are found with [`crate::chk_map::iter_interesting_nodes`].
+    /// `missing` must be in topological order (parents before children) and
+    /// already filtered to revisions absent here.
+    ///
+    /// Requires no open write group.
+    pub fn stream_fetch_from(
+        &mut self,
+        source: &Pack2aRepository,
+        missing: &[Vec<u8>],
+    ) -> Result<(), RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::Corrupt(
+                "cannot fetch with an open write group".to_string(),
+            ));
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        // Keys for the per-revision stores.
+        let rev_keys: Vec<Key> = missing
+            .iter()
+            .map(|r| Key::fixed(vec![r.clone()]))
+            .collect();
+
+        // The interesting CHK roots (from the inventories being copied) and the
+        // text keys those inventories introduce.
+        let mut interesting_roots: Vec<Vec<u8>> = Vec::new();
+        let mut text_keys: Vec<Key> = Vec::new();
+        let mut search_key_name: Option<Vec<u8>> = None;
+        for rev in missing {
+            let inv = source.get_inventory(rev)?;
+            if search_key_name.is_none() {
+                search_key_name = Some(inv.search_key_name.clone());
+            }
+            interesting_roots.extend(chk_root_keys(&inv));
+            // A text record exists per entry at the revision that introduced it.
+            for (_, entry) in inv
+                .entries()
+                .map_err(|e| RepositoryError::Corrupt(format!("inventory entries: {e:?}")))?
+            {
+                if entry.revision().map(|r| r.as_bytes()) == Some(rev.as_slice()) {
+                    text_keys.push(Key::fixed(vec![
+                        entry.file_id().as_bytes().to_vec(),
+                        rev.clone(),
+                    ]));
+                }
+            }
+        }
+
+        // The uninteresting CHK roots: the inventories already present here, so
+        // their pages are not re-copied. Reading them all is the price of an
+        // exact difference; for a fetch into an empty repository this is empty.
+        let mut uninteresting_roots: Vec<Vec<u8>> = Vec::new();
+        for rev in self.all_revision_ids()? {
+            let inv = self.get_inventory(&rev)?;
+            uninteresting_roots.extend(chk_root_keys(&inv));
+        }
+
+        let search_key_func = {
+            let name = search_key_name.unwrap_or_else(|| b"hash-255-way".to_vec());
+            crate::chk_map::SearchKeyFunc::from_name(&name)
+                .map_err(|raw| RepositoryError::Corrupt(format!("search_key_name: {raw:?}")))?
+        };
+
+        self.start_write_group()?;
+        let group = self.write_group.as_ref().expect("just opened");
+
+        // Per-revision stores and texts copy by key, verbatim.
+        use super::pack_2a_writer::RepackTarget;
+        group.copy_store_keys(&source.revisions, RepackTarget::Revisions, &rev_keys)?;
+        group.copy_store_keys(&source.inventories, RepackTarget::Inventories, &rev_keys)?;
+        group.copy_store_keys(&source.signatures, RepackTarget::Signatures, &rev_keys)?;
+        group.copy_store_keys(source.texts_store(), RepackTarget::Texts, &text_keys)?;
+
+        // CHK pages: every page reachable from the new inventory roots that is
+        // not already reachable from the existing ones.
+        let cache: std::sync::Arc<dyn crate::chk_map::PageCache> =
+            std::sync::Arc::new(crate::chk_map::InMemoryPageCache::new());
+        let records = crate::chk_map::iter_interesting_nodes(
+            source.chk_bytes.as_ref(),
+            cache.as_ref(),
+            &interesting_roots,
+            &uninteresting_roots,
+            search_key_func,
+        )
+        .map_err(|e| RepositoryError::Corrupt(format!("chk difference walk: {e:?}")))?;
+        for record in records {
+            if let (Some(page_key), Some(page_bytes)) = (record.page_key, record.page_bytes) {
+                group.add_chk_page(&page_key, page_bytes)?;
+            }
+        }
+
+        self.commit_write_group()?;
+        Ok(())
+    }
+
+    /// The texts store, for the streaming fetch fast path.
+    fn texts_store(&self) -> &Store {
+        &self.texts
+    }
+
     /// Combine all packs in this repository into a single new pack.
     ///
     /// Every record (revisions, inventories, CHK pages, texts, signatures) is
@@ -884,6 +993,27 @@ impl super::Repository for Pack2aRepository {
         Pack2aRepository::format(self)
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    /// Fast path for 2a-to-2a fetch: if `source` is also a 2a repository, copy
+    /// raw records (no decode/re-encode); otherwise decline so the generic
+    /// rebuild runs.
+    fn try_fetch_from(
+        &mut self,
+        source: &dyn super::Repository,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<bool, RepositoryError> {
+        match source.as_any().downcast_ref::<Pack2aRepository>() {
+            Some(src) => {
+                self.stream_fetch_from(src, revision_ids)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
         Pack2aRepository::all_revision_ids(self)
     }
@@ -1017,6 +1147,28 @@ fn entries_from_null_delta(
     let mut entries = vec![root];
     entries.extend(rest);
     Ok(entries)
+}
+
+/// The two CHK root page keys of an inventory (the `id_to_entry` map root and
+/// the `parent_id_basename_to_file_id` map root), used as the roots to walk
+/// when finding the CHK pages a fetch must copy.
+fn chk_root_keys(
+    inv: &crate::chk_inventory::CHKInventory<
+        dyn crate::versionedfile::VersionedFiles + Send + Sync,
+    >,
+) -> Vec<Vec<u8>> {
+    let mut roots = Vec::new();
+    if let Some(map) = inv.id_to_entry.borrow().as_ref() {
+        if let Some(k) = map.key() {
+            roots.push(k);
+        }
+    }
+    if let Some(map) = inv.parent_id_basename_to_file_id.borrow().as_ref() {
+        if let Some(k) = map.key() {
+            roots.push(k);
+        }
+    }
+    roots
 }
 
 /// Generate a fresh 32-hex-character token to identify an in-progress write

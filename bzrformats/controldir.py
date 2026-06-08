@@ -30,6 +30,7 @@ from ._bzr_rs.controldir import (
     create_shared_repository,
     format_names,
     open,
+    upgrade,
 )
 
 __all__ = [
@@ -41,4 +42,5 @@ __all__ = [
     "create_shared_repository",
     "format_names",
     "open",
+    "upgrade",
 ]

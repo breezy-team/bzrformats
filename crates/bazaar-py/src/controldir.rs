@@ -316,6 +316,20 @@ impl Repository {
         self.inner.autopack().map_err(err)
     }
 
+    /// Copy revisions from `source` into this repository, returning the number
+    /// copied. `revision_id` selects the revision (and its ancestry) to copy;
+    /// `None` copies everything the source has. Works across formats.
+    #[pyo3(signature = (source, revision_id=None))]
+    fn fetch(
+        &mut self,
+        source: &Bound<'_, Repository>,
+        revision_id: Option<&[u8]>,
+    ) -> PyResult<usize> {
+        let source = source.borrow();
+        bazaar::repository::fetch(source.inner.as_ref(), self.inner.as_mut(), revision_id)
+            .map_err(err)
+    }
+
     /// Add a file text keyed by `(file_id, revision)` to the open write group.
     /// `parents` is a list of `(file_id, revision)` tuples.
     #[pyo3(signature = (file_id, revision, bytes, parents=None))]
@@ -796,6 +810,21 @@ fn create_shared_repository(path: &str, format: &str) -> PyResult<BzrDir> {
     })
 }
 
+/// Upgrade the control directory at `path` to `format`.
+///
+/// Builds a fresh control directory in the target format, fetches every
+/// revision, carries over the branch tip and tags, and moves the old `.bzr`
+/// aside to `backup.bzr`. `format` is a metadir format name as accepted by
+/// [`create`].
+#[pyfunction]
+fn upgrade(path: &str, format: &str) -> PyResult<()> {
+    let parent = local(path);
+    let fmt = find_control_dir_format(format).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("unknown control dir format: {format}"))
+    })?;
+    bazaar::bzrdir::upgrade(&parent, fmt).map_err(err)
+}
+
 /// The control-directory format names accepted by [`create`].
 #[pyfunction]
 fn format_names() -> Vec<&'static str> {
@@ -816,6 +845,7 @@ pub(crate) fn _controldir_rs(py: Python) -> PyResult<Bound<PyModule>> {
     m.add_function(wrap_pyfunction!(open, &m)?)?;
     m.add_function(wrap_pyfunction!(create, &m)?)?;
     m.add_function(wrap_pyfunction!(create_shared_repository, &m)?)?;
+    m.add_function(wrap_pyfunction!(upgrade, &m)?)?;
     m.add_function(wrap_pyfunction!(format_names, &m)?)?;
     Ok(m)
 }
