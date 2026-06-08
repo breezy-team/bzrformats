@@ -71,6 +71,15 @@ type PackName = String;
 pub enum RepositoryError {
     /// A required object was not found in the repository.
     NoSuchRevision(Vec<u8>),
+    /// A file text keyed by `(file_id, revision)` is not present. Distinct from
+    /// [`RepositoryError::Corrupt`] so a stacked repository can tell "absent
+    /// here, try a fallback" apart from genuine corruption.
+    NoSuchFileText {
+        /// The file id whose text is missing.
+        file_id: Vec<u8>,
+        /// The revision the text was requested at.
+        revision: Vec<u8>,
+    },
     /// An index value or record could not be parsed.
     Corrupt(String),
     /// An underlying transport error.
@@ -91,6 +100,12 @@ impl std::fmt::Display for RepositoryError {
             RepositoryError::NoSuchRevision(r) => {
                 write!(f, "no such revision: {}", String::from_utf8_lossy(r))
             }
+            RepositoryError::NoSuchFileText { file_id, revision } => write!(
+                f,
+                "no text for ({}, {})",
+                String::from_utf8_lossy(file_id),
+                String::from_utf8_lossy(revision)
+            ),
             RepositoryError::Corrupt(m) => write!(f, "corrupt repository data: {m}"),
             RepositoryError::Transport(e) => write!(f, "transport error: {e}"),
             RepositoryError::Knit(e) => write!(f, "groupcompress error: {e}"),
@@ -549,19 +564,13 @@ impl Pack2aRepository {
     ) -> Result<Vec<u8>, RepositoryError> {
         let key = Key::fixed(vec![file_id.to_vec(), revision.to_vec()]);
         let mut stream = self.texts.get_record_stream(&[key], "unordered")?;
-        let record = stream.pop().ok_or_else(|| {
-            RepositoryError::Corrupt(format!(
-                "no text for ({}, {})",
-                String::from_utf8_lossy(file_id),
-                String::from_utf8_lossy(revision)
-            ))
-        })?;
+        let not_present = || RepositoryError::NoSuchFileText {
+            file_id: file_id.to_vec(),
+            revision: revision.to_vec(),
+        };
+        let record = stream.pop().ok_or_else(not_present)?;
         if record.storage_kind() == "absent" {
-            return Err(RepositoryError::Corrupt(format!(
-                "no text for ({}, {})",
-                String::from_utf8_lossy(file_id),
-                String::from_utf8_lossy(revision)
-            )));
+            return Err(not_present());
         }
         Ok(record.to_fulltext().into_owned())
     }

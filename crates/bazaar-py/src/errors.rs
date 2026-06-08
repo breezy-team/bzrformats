@@ -434,6 +434,13 @@ simple_error!(BzrCheckError: InternalBzrFormatsError, "Internal check failed: %(
 simple_error!(DirstateCorrupt: BzrFormatsError, "The dirstate file (%(state)s) appears to be corrupt: %(msg)s"; state, msg);
 simple_error!(NoSuchRevision: InternalBzrFormatsError, "%(branch)s has no revision %(revision)s"; branch, revision);
 
+// Branch errors, modelled on the breezy exceptions of the same names so
+// downstream except-clauses match. The Rust BranchError variants map onto
+// these in the controldir bindings.
+simple_error!(NotStacked: BzrFormatsError, "The branch '%(branch)s' is not stacked."; branch);
+simple_error!(UnstackableBranchFormat: BzrFormatsError, "The branch '%(url)s'(%(format)s) is not a stackable format. You will need to upgrade the branch to permit branch stacking."; format, url);
+simple_error!(UnsupportedOperation: BzrFormatsError, "The method %(mname)s is not supported on %(tname)s."; mname, tname);
+
 // Container (pack) format errors, ported from bzrformats.pack.
 simple_error!(ContainerError: BzrFormatsError, "Container error");
 simple_error!(UnknownContainerFormatError: ContainerError, "Unrecognised container format: %(container_format)r"; container_format);
@@ -843,6 +850,9 @@ pub(crate) fn errors_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_class::<BzrCheckError>()?;
     m.add_class::<DirstateCorrupt>()?;
     m.add_class::<NoSuchRevision>()?;
+    m.add_class::<NotStacked>()?;
+    m.add_class::<UnstackableBranchFormat>()?;
+    m.add_class::<UnsupportedOperation>()?;
     m.add_class::<ContainerError>()?;
     m.add_class::<UnknownContainerFormatError>()?;
     m.add_class::<UnexpectedEndOfContainerError>()?;

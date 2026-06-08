@@ -20,9 +20,30 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
+pyo3::import_exception!(bzrformats.errors, NotStacked);
+pyo3::import_exception!(bzrformats.errors, UnstackableBranchFormat);
+pyo3::import_exception!(bzrformats.errors, UnsupportedOperation);
 
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     BzrFormatsError::new_err(e.to_string())
+}
+
+/// Map a branch error onto the matching breezy-style exception, so downstream
+/// `except NotStacked`/`UnstackableBranchFormat`/`UnsupportedOperation` clauses
+/// catch the right thing. Other variants fall back to the generic error.
+fn branch_err(e: bazaar::branch::BranchError) -> PyErr {
+    use bazaar::branch::BranchError;
+    match e {
+        // The Rust BranchError variants do not carry the branch/format objects
+        // the breezy exceptions name, so pass the bzrformats branch identity we
+        // have. The exception type is what downstream except-clauses match on.
+        BranchError::NotStacked => NotStacked::new_err(("bzrformats branch",)),
+        BranchError::Unstackable => {
+            UnstackableBranchFormat::new_err(("branch", "bzrformats branch"))
+        }
+        BranchError::Unsupported(op) => UnsupportedOperation::new_err((op, "bzrformats branch")),
+        other => BzrFormatsError::new_err(other.to_string()),
+    }
 }
 
 fn kind_str(kind: EntryKind) -> &'static str {
@@ -105,6 +126,15 @@ impl BzrDir {
         })
     }
 
+    /// Open the repository with any stacked-on fallback activated, so reads
+    /// resolve objects held only in the base repository this branch is stacked
+    /// on.
+    fn open_repository_stacked(&self) -> PyResult<Repository> {
+        Ok(Repository {
+            inner: self.inner.open_repository_stacked().map_err(err)?,
+        })
+    }
+
     /// Open the branch in this control directory.
     fn open_branch(&self) -> PyResult<Branch> {
         Ok(Branch {
@@ -121,6 +151,11 @@ impl BzrDir {
 }
 
 /// A bzr repository.
+///
+// TODO: expose Repository.add_fallback_repository directly. It takes ownership
+// of the fallback (Box<dyn Repository>), which cannot be moved out of a live
+// Python Repository object; for now stacked repositories are obtained through
+// BzrDir.open_repository_stacked, which covers the branch-stacking use case.
 #[pyclass(name = "Repository")]
 struct Repository {
     inner: Box<dyn RsRepository>,
@@ -337,6 +372,71 @@ impl Branch {
             map.insert(k.extract()?, v.extract()?);
         }
         self.inner.set_tags(&map).map_err(err)
+    }
+
+    /// The URL this branch is stacked on. Raises `NotStacked` when a stackable
+    /// branch has no stacked-on location, and `UnstackableBranchFormat` for a
+    /// format that does not support stacking.
+    fn get_stacked_on_url(&self) -> PyResult<String> {
+        self.inner.get_stacked_on_url().map_err(branch_err)
+    }
+
+    /// Set (or clear, with `None`) the URL this branch is stacked on.
+    #[pyo3(signature = (url=None))]
+    fn set_stacked_on_url(&self, url: Option<&str>) -> PyResult<()> {
+        self.inner.set_stacked_on_url(url).map_err(branch_err)
+    }
+
+    /// The master branch URL this branch is bound to, or `None` if unbound.
+    fn get_bound_location(&self) -> PyResult<Option<String>> {
+        self.inner.get_bound_location().map_err(branch_err)
+    }
+
+    /// The previous master URL after an unbind, or `None`.
+    fn get_old_bound_location(&self) -> PyResult<Option<String>> {
+        self.inner.get_old_bound_location().map_err(branch_err)
+    }
+
+    /// Bind this branch to `location` (its new master).
+    fn bind(&self, location: &str) -> PyResult<()> {
+        self.inner.bind(location).map_err(branch_err)
+    }
+
+    /// Unbind this branch.
+    fn unbind(&self) -> PyResult<()> {
+        self.inner.unbind().map_err(branch_err)
+    }
+
+    /// The `(branch_location, tree_path)` recorded for a tree-reference
+    /// `file_id`, or `(None, None)` if none. Raises `UnsupportedOperation` on a
+    /// format without reference locations.
+    fn get_reference_info(&self, file_id: &[u8]) -> PyResult<(Option<String>, Option<String>)> {
+        self.inner.get_reference_info(file_id).map_err(branch_err)
+    }
+
+    /// Record (or, with `branch_location=None`, delete) the reference location
+    /// for a tree-reference `file_id`.
+    #[pyo3(signature = (file_id, branch_location=None, tree_path=None))]
+    fn set_reference_info(
+        &self,
+        file_id: &[u8],
+        branch_location: Option<&str>,
+        tree_path: Option<&str>,
+    ) -> PyResult<()> {
+        self.inner
+            .set_reference_info(file_id, branch_location, tree_path)
+            .map_err(branch_err)
+    }
+
+    /// The URL a branch-reference points at, or `None` if this is not a branch
+    /// reference.
+    fn get_reference(&self) -> PyResult<Option<String>> {
+        self.inner.get_reference().map_err(branch_err)
+    }
+
+    /// Point this branch reference at `to_url`.
+    fn set_reference(&self, to_url: &str) -> PyResult<()> {
+        self.inner.set_reference(to_url).map_err(branch_err)
     }
 }
 

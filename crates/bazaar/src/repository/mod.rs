@@ -166,6 +166,217 @@ pub trait Repository: Send + Sync {
 
     /// Flush the open write group, committing its additions.
     fn commit_write_group(&mut self) -> Result<(), RepositoryError>;
+
+    /// Add a fallback repository consulted for objects this one lacks.
+    ///
+    /// This is how a stacked branch wires its base repository in: reads that
+    /// miss in this repository are retried against the fallback chain, in
+    /// order. The default returns [`RepositoryError::UnsupportedFormat`]; only
+    /// [`StackedRepository`] (which a stacked-branch open wraps the primary in)
+    /// supports it.
+    fn add_fallback_repository(
+        &mut self,
+        _fallback: Box<dyn Repository>,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::UnsupportedFormat(
+            "repository does not support fallbacks",
+        ))
+    }
+}
+
+/// A repository that consults a chain of fallback repositories for objects its
+/// primary store lacks.
+///
+/// This is the data-path half of branch stacking: the primary is the stacked
+/// branch's own (thin) repository, and the fallbacks are the repositories of
+/// the branches it is stacked on. Reads try the primary first, then each
+/// fallback in order; writes go only to the primary. Mirrors breezy, where a
+/// `Repository` keeps a list of `_fallback_repositories` and
+/// `add_fallback_repository` appends to it.
+pub struct StackedRepository {
+    primary: Box<dyn Repository>,
+    fallbacks: Vec<Box<dyn Repository>>,
+}
+
+/// Whether `e` signals that an object is simply absent (so a fallback should be
+/// consulted) rather than a hard error.
+fn is_not_present(e: &RepositoryError) -> bool {
+    matches!(
+        e,
+        RepositoryError::NoSuchRevision(_) | RepositoryError::NoSuchFileText { .. }
+    )
+}
+
+impl StackedRepository {
+    /// Wrap `primary`, with no fallbacks yet.
+    pub fn new(primary: Box<dyn Repository>) -> Self {
+        StackedRepository {
+            primary,
+            fallbacks: Vec::new(),
+        }
+    }
+
+    /// Try `f` on the primary, then each fallback in order, returning the first
+    /// success. A "not present" error ([`RepositoryError::NoSuchRevision`] or
+    /// [`RepositoryError::NoSuchFileText`]) is treated as "not here, try the
+    /// next"; any other error propagates immediately. If every repository
+    /// misses, the primary's not-present error is returned.
+    fn first_present<T>(
+        &self,
+        mut f: impl FnMut(&dyn Repository) -> Result<T, RepositoryError>,
+    ) -> Result<T, RepositoryError> {
+        match f(self.primary.as_ref()) {
+            Err(e) if is_not_present(&e) => {
+                for fallback in &self.fallbacks {
+                    match f(fallback.as_ref()) {
+                        Err(e) if is_not_present(&e) => continue,
+                        other => return other,
+                    }
+                }
+                Err(e)
+            }
+            other => other,
+        }
+    }
+}
+
+impl Repository for StackedRepository {
+    fn format(&self) -> &'static RepositoryFormat {
+        self.primary.format()
+    }
+
+    fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
+        // breezy's all_revision_ids is the repository's own revisions only; a
+        // stacked repository does not enumerate its fallbacks' revisions.
+        self.primary.all_revision_ids()
+    }
+
+    fn get_parent_map(
+        &self,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+        let mut map = self.primary.get_parent_map(revision_ids)?;
+        // Fill in any ids the primary did not know from the fallbacks.
+        let mut missing: Vec<Vec<u8>> = revision_ids
+            .iter()
+            .filter(|id| !map.contains_key(*id))
+            .cloned()
+            .collect();
+        for fallback in &self.fallbacks {
+            if missing.is_empty() {
+                break;
+            }
+            let found = fallback.get_parent_map(&missing)?;
+            missing.retain(|id| !found.contains_key(id));
+            map.extend(found);
+        }
+        Ok(map)
+    }
+
+    fn has_revision(&self, revision_id: &[u8]) -> Result<bool, RepositoryError> {
+        if self.primary.has_revision(revision_id)? {
+            return Ok(true);
+        }
+        for fallback in &self.fallbacks {
+            if fallback.has_revision(revision_id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn get_revision(
+        &self,
+        revision_id: &[u8],
+    ) -> Result<crate::revision::Revision, RepositoryError> {
+        self.first_present(|r| r.get_revision(revision_id))
+    }
+
+    fn get_inventory(&self, revision_id: &[u8]) -> Result<Box<dyn Inventory>, RepositoryError> {
+        self.first_present(|r| r.get_inventory(revision_id))
+    }
+
+    fn get_file_text(&self, file_id: &[u8], revision: &[u8]) -> Result<Vec<u8>, RepositoryError> {
+        self.first_present(|r| r.get_file_text(file_id, revision))
+    }
+
+    fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        self.primary.start_write_group()
+    }
+
+    fn add_revision(
+        &mut self,
+        revision: &crate::revision::Revision,
+        parents: &[Vec<u8>],
+    ) -> Result<(), RepositoryError> {
+        self.primary.add_revision(revision, parents)
+    }
+
+    fn add_inventory_from_entries(
+        &mut self,
+        revision_id: &[u8],
+        parents: &[Vec<u8>],
+        root_id: &[u8],
+        entries: &[crate::inventory::Entry],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        self.primary
+            .add_inventory_from_entries(revision_id, parents, root_id, entries)
+    }
+
+    fn add_inventory_by_delta(
+        &mut self,
+        basis_revision_id: &[u8],
+        delta: &crate::inventory_delta::InventoryDelta,
+        new_revision_id: &[u8],
+        parents: &[Vec<u8>],
+    ) -> Result<Vec<u8>, RepositoryError> {
+        self.primary
+            .add_inventory_by_delta(basis_revision_id, delta, new_revision_id, parents)
+    }
+
+    fn add_text(
+        &mut self,
+        file_id: &[u8],
+        revision: &[u8],
+        parents: &[(Vec<u8>, Vec<u8>)],
+        bytes: &[u8],
+    ) -> Result<(), RepositoryError> {
+        self.primary.add_text(file_id, revision, parents, bytes)
+    }
+
+    fn add_signature_text(
+        &mut self,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> Result<(), RepositoryError> {
+        self.primary.add_signature_text(revision_id, signature)
+    }
+
+    fn get_signature_text(&self, revision_id: &[u8]) -> Result<Option<Vec<u8>>, RepositoryError> {
+        match self.primary.get_signature_text(revision_id)? {
+            Some(sig) => Ok(Some(sig)),
+            None => {
+                for fallback in &self.fallbacks {
+                    if let Some(sig) = fallback.get_signature_text(revision_id)? {
+                        return Ok(Some(sig));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+        self.primary.commit_write_group()
+    }
+
+    fn add_fallback_repository(
+        &mut self,
+        fallback: Box<dyn Repository>,
+    ) -> Result<(), RepositoryError> {
+        self.fallbacks.push(fallback);
+        Ok(())
+    }
 }
 
 /// Convert a knit-keyed parent map (`KnitKey -> [KnitKey]`, where each key's
@@ -445,5 +656,70 @@ mod tests {
                 s.label
             );
         }
+    }
+
+    /// Build a 2a repository with a single revision, file text and inventory.
+    fn make_2a_with_rev(dir: &std::path::Path, rev: &[u8]) -> Box<dyn Repository> {
+        let t: SharedTransport = Arc::new(LocalTransport::new(dir));
+        let mut repo =
+            Box::new(Pack2aRepository::create(t.clone()).unwrap()) as Box<dyn Repository>;
+        repo.start_write_group().unwrap();
+        repo.add_revision(&revision(rev, vec![], "msg"), &[])
+            .unwrap();
+        repo.add_inventory_from_entries(rev, &[], crate::inventory::ROOT_ID, &entries(rev))
+            .unwrap();
+        repo.add_text(b"file-1", rev, &[], b"hello\n").unwrap();
+        repo.commit_write_group().unwrap();
+        Box::new(Pack2aRepository::open(t).unwrap())
+    }
+
+    /// A stacked repository resolves revisions, inventories and file texts that
+    /// live only in a fallback, while its own all_revision_ids stays primary.
+    #[test]
+    fn stacked_repository_reads_through_fallback() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let base = make_2a_with_rev(base_dir.path(), b"rev-base");
+
+        // An empty primary repository.
+        let top_dir = tempfile::tempdir().unwrap();
+        let top_t: SharedTransport = Arc::new(LocalTransport::new(top_dir.path()));
+        let primary = Box::new(Pack2aRepository::create(top_t).unwrap()) as Box<dyn Repository>;
+
+        let mut stacked = StackedRepository::new(primary);
+        assert!(!stacked.has_revision(b"rev-base").unwrap());
+        stacked.add_fallback_repository(base).unwrap();
+
+        // The fallback's revision is now visible through the stack.
+        assert!(stacked.has_revision(b"rev-base").unwrap());
+        assert_eq!(stacked.get_revision(b"rev-base").unwrap().message, "msg");
+        assert_eq!(
+            stacked.get_file_text(b"file-1", b"rev-base").unwrap(),
+            b"hello\n"
+        );
+        let pm = stacked.get_parent_map(&[b"rev-base".to_vec()]).unwrap();
+        assert_eq!(pm.get(&b"rev-base".to_vec()), Some(&vec![]));
+
+        // all_revision_ids reflects only the (empty) primary, not the fallback.
+        assert!(stacked.all_revision_ids().unwrap().is_empty());
+
+        // A genuinely absent revision still errors.
+        assert!(matches!(
+            stacked.get_revision(b"rev-missing"),
+            Err(RepositoryError::NoSuchRevision(_))
+        ));
+    }
+
+    /// A plain backend reports that it does not support fallbacks.
+    #[test]
+    fn plain_repository_rejects_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let mut repo = Pack2aRepository::create(t).unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = make_2a_with_rev(other_dir.path(), b"rev-x");
+        assert!(matches!(
+            repo.add_fallback_repository(other),
+            Err(RepositoryError::UnsupportedFormat(_))
+        ));
     }
 }
