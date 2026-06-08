@@ -260,4 +260,82 @@ mod tests {
             Err(BugError::InvalidLine("http://example.com/1".to_string()))
         );
     }
+
+    #[test]
+    fn iter_bugs_rejects_line_with_extra_token() {
+        assert_eq!(
+            make(
+                "",
+                Some("A"),
+                &[("bugs", "http://example.com/1 fixed extra")]
+            )
+            .iter_bugs(),
+            Err(BugError::InvalidLine(
+                "http://example.com/1 fixed extra".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn iter_bugs_skips_blank_lines() {
+        assert_eq!(
+            make("", Some("A"), &[("bugs", "\nhttp://example.com/1 fixed\n")]).iter_bugs(),
+            Ok(vec![(
+                "http://example.com/1".to_string(),
+                "fixed".to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn bug_urls_splits_on_newlines() {
+        let rev = make(
+            "",
+            Some("A"),
+            &[("bugs", "http://a fixed\nhttp://b related")],
+        );
+        assert_eq!(
+            rev.bug_urls(),
+            vec!["http://a fixed".to_string(), "http://b related".to_string()]
+        );
+    }
+
+    #[test]
+    fn bug_urls_empty_when_property_absent() {
+        assert_eq!(make("", Some("A"), &[]).bug_urls(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn check_properties_rejects_whitespace_in_keys() {
+        assert!(make("", Some("A"), &[("good-key", "v")]).check_properties());
+        assert!(!make("", Some("A"), &[("bad key", "v")]).check_properties());
+    }
+
+    #[test]
+    fn datetime_reflects_timestamp() {
+        let mut rev = make("", Some("A"), &[]);
+        rev.timestamp = 1_000_000_000.0;
+        // 2001-09-09 01:46:40 UTC.
+        assert_eq!(
+            rev.datetime(),
+            DateTime::from_timestamp(1_000_000_000, 0)
+                .unwrap()
+                .naive_utc()
+        );
+    }
+
+    #[test]
+    fn timezone_maps_to_fixed_offset() {
+        let mut rev = make("", Some("A"), &[]);
+        rev.timezone = Some(3600);
+        assert_eq!(rev.timezone(), chrono::FixedOffset::east_opt(3600));
+        rev.timezone = None;
+        assert_eq!(rev.timezone(), None);
+    }
+
+    #[test]
+    fn display_shows_revision_id() {
+        let rev = make("msg", Some("A"), &[]);
+        assert_eq!(format!("{}", rev), "Revision(1)");
+    }
 }

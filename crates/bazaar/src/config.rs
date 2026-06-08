@@ -434,4 +434,74 @@ mod tests {
         // stacked_on_location has no default -> None.
         assert_eq!(stack.get("stacked_on_location"), None);
     }
+
+    #[test]
+    fn config_error_display_wraps_source() {
+        let parse: ConfigError = ConfigObjError::MissingEquals("bad line".to_string()).into();
+        assert_eq!(
+            parse.to_string(),
+            "config parse error: line is not key = value: \"bad line\""
+        );
+    }
+
+    #[test]
+    fn named_section_reports_id_and_ordered_names() {
+        let mut store = IniFileStore::new();
+        store
+            .load_from_bytes(b"[/srv/trunk]\nnickname = trunk\nbound = True\n")
+            .unwrap();
+        let sections = store.get_sections();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].id(), Some("/srv/trunk"));
+        // iter_option_names yields the keys in file order.
+        let names: Vec<&str> = sections[0].iter_option_names().collect();
+        assert_eq!(names, vec!["nickname", "bound"]);
+    }
+
+    #[test]
+    fn mutable_section_tracks_id_and_dirtiness() {
+        let mut store = IniFileStore::new();
+        store.load_from_bytes(b"[loc]\nnickname = trunk\n").unwrap();
+        let mut sec = store.get_mutable_section(Some("loc"));
+        assert_eq!(sec.id(), Some("loc"));
+        assert!(!sec.is_dirty());
+        sec.set("bound", "True");
+        assert!(sec.is_dirty());
+        assert_eq!(sec.get("bound"), Some("True"));
+    }
+
+    #[test]
+    fn mutable_section_remove_only_clears_present_keys() {
+        let mut store = IniFileStore::new();
+        store.load_from_bytes(b"nickname = trunk\n").unwrap();
+        let mut sec = store.get_mutable_section(None);
+        // Removing an absent key leaves the section clean.
+        sec.remove("absent");
+        assert!(!sec.is_dirty());
+        // Removing a present key marks it dirty and drops the value.
+        sec.remove("nickname");
+        assert!(sec.is_dirty());
+        assert_eq!(sec.get("nickname"), None);
+    }
+
+    #[test]
+    fn ini_file_store_tracks_loaded_state() {
+        let mut store = IniFileStore::new();
+        assert!(!store.is_loaded());
+        store.load_from_bytes(b"a = 1\n").unwrap();
+        assert!(store.is_loaded());
+    }
+
+    #[test]
+    fn transport_store_load_reads_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("branch.conf"), b"nickname = trunk\n").unwrap();
+        let transport: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let mut store = TransportIniFileStore::new(transport, "branch.conf");
+        store.load().unwrap();
+        // load() must actually populate the store, not just return Ok.
+        let sections = store.store().get_sections();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].get("nickname"), Some("trunk"));
+    }
 }
