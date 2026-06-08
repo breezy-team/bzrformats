@@ -231,6 +231,51 @@ class TestControlDir(TestCaseInTempDir):
             ],
         )
 
+    def test_format_introspection(self):
+        cd = controldir.create(self.test_dir)
+        rf = cd.open_repository().format()
+        self.assertTrue(rf["format_string"].startswith(b"Bazaar repository format 2a"))
+        self.assertIn("2a", rf["description"])
+        bf = cd.open_branch().format()
+        self.assertTrue(bf["format_string"].startswith(b"Bazaar Branch Format 7"))
+
+    def test_add_revision_round_trip(self):
+        cd = controldir.create(self.test_dir)
+        repo = cd.open_repository()
+        repo.start_write_group()
+        repo.add_revision(
+            b"rev-x",
+            "hello",
+            "T <t@e>",
+            1577880000.0,
+            0,
+            parents=[],
+            revprops={"k": b"v"},
+        )
+        repo.commit_write_group()
+        got = controldir.open(self.test_dir).open_repository().get_revision(b"rev-x")
+        self.assertEqual(got["message"], "hello")
+        self.assertEqual(got["committer"], "T <t@e>")
+        self.assertEqual(got["properties"]["k"], b"v")
+
+    def test_iter_changes_with_parents(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"x\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        rev = wt.commit(
+            cd.open_repository(), cd.open_branch(), "T <t@e>", "c", 1577880000, 0
+        )
+        # With no extra parents it matches iter_changes (no pending changes).
+        reopened = controldir.open(self.test_dir)
+        changes = list(
+            reopened.open_workingtree().iter_changes_with_parents(
+                reopened.open_repository(), rev, []
+            )
+        )
+        self.assertEqual(changes, [])
+
     def test_branch_tags_round_trip(self):
         cd = controldir.create(self.test_dir)
         branch = cd.open_branch()
@@ -395,3 +440,34 @@ class TestControlDir(TestCaseInTempDir):
         self.assertEqual(
             controldir.open(path).open_branch().last_revision_info(), (1, revid)
         )
+
+    def test_check_clean_repository(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"hi\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        wt.commit(
+            cd.open_repository(), cd.open_branch(), "T <t@e>", "add a", 1577880000, 0
+        )
+        result = controldir.open(self.test_dir).open_repository().check()
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(result["ghosts"], [])
+        self.assertEqual(result["checked_revisions"], 1)
+        self.assertEqual(result["checked_texts"], 1)
+
+    def test_reconcile_clean_repository(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"hi\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        revid = wt.commit(
+            cd.open_repository(), cd.open_branch(), "T <t@e>", "add a", 1577880000, 0
+        )
+        result = controldir.open(self.test_dir).open_repository().reconcile()
+        self.assertEqual(result["garbage_inventories"], 0)
+        # Data still present and consistent after reconcile.
+        repo = controldir.open(self.test_dir).open_repository()
+        self.assertTrue(repo.has_revision(revid))
+        self.assertEqual(repo.check()["problems"], [])

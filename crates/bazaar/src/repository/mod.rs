@@ -7,6 +7,7 @@
 //! inventory representation — 2a a lazy CHK inventory, knit-pack an
 //! in-memory one — behind the box, without converting one into the other.
 
+mod check;
 mod commit;
 mod fetch;
 pub mod format;
@@ -23,8 +24,18 @@ mod tree;
 #[cfg(feature = "weave")]
 mod weave_repo;
 
+pub use check::{check, CheckResult};
 pub use commit::CommitBuilder;
 pub use fetch::fetch;
+
+/// The outcome of [`Repository::reconcile`]: what the reconcile dropped.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReconcileResult {
+    /// Number of stored inventories that were unreachable and discarded.
+    pub garbage_inventories: usize,
+    /// Whether the repository's storage was regenerated (a new pack written).
+    pub repacked: bool,
+}
 pub use format::{all_formats, find_format, RepositoryFormat};
 #[cfg(feature = "knit")]
 pub use knit_repo::KnitRepository;
@@ -209,6 +220,24 @@ pub trait Repository: Send + Sync {
     /// The default is a no-op returning `false`; the pack backends override it.
     fn autopack(&mut self) -> Result<bool, RepositoryError> {
         Ok(false)
+    }
+
+    /// Check the integrity of this repository, returning a report of any
+    /// inconsistencies (see [`CheckResult`]). Format-neutral: it cross-checks
+    /// the data every format exposes through this trait.
+    fn check(&self) -> Result<CheckResult, RepositoryError> {
+        check::check(self)
+    }
+
+    /// Reconcile this repository: regenerate its storage keeping only the data
+    /// reachable from its revisions, discarding garbage (e.g. inventories or
+    /// texts left behind by an interrupted operation), and report what was
+    /// dropped (see [`ReconcileResult`]).
+    ///
+    /// The default does nothing (formats without packs have no garbage to
+    /// collect); the pack backends override it.
+    fn reconcile(&mut self) -> Result<ReconcileResult, RepositoryError> {
+        Ok(ReconcileResult::default())
     }
 
     /// Add a fallback repository consulted for objects this one lacks.

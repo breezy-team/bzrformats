@@ -848,6 +848,125 @@ impl Pack2aRepository {
         &self.texts
     }
 
+    /// Reconcile: regenerate the repository's storage keeping only the data
+    /// reachable from its revisions, discarding any garbage (unreachable
+    /// inventories, texts or CHK pages left behind by an interrupted
+    /// operation).
+    ///
+    /// Streams just the reachable revisions' records into one fresh pack,
+    /// rewrites `pack-names` to reference only it, and moves the old packs to
+    /// `obsolete_packs/`. Returns the number of unreachable inventories that
+    /// were dropped.
+    ///
+    /// Requires no open write group.
+    pub fn reconcile(&mut self) -> Result<super::ReconcileResult, RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::Corrupt(
+                "cannot reconcile with an open write group".to_string(),
+            ));
+        }
+        let old_packs = read_pack_names(self.transport.as_ref())?;
+        let reachable = self.all_revision_ids()?;
+
+        // Garbage = inventories stored but not reachable from any revision.
+        let stored_inventories = self.inventories.keys()?.len();
+        let garbage_inventories = stored_inventories.saturating_sub(reachable.len());
+
+        if old_packs.is_empty() || reachable.is_empty() {
+            // Nothing to keep; just discard any stray packs.
+            if !old_packs.is_empty() {
+                self.write_empty_pack_names()?;
+                self.obsolete_packs(&old_packs)?;
+            }
+            return Ok(super::ReconcileResult {
+                garbage_inventories,
+                repacked: !old_packs.is_empty(),
+            });
+        }
+
+        // Keys for the reachable revisions' per-revision stores and texts.
+        let rev_keys: Vec<Key> = reachable
+            .iter()
+            .map(|r| Key::fixed(vec![r.clone()]))
+            .collect();
+        let mut interesting_roots: Vec<Vec<u8>> = Vec::new();
+        let mut text_keys: Vec<Key> = Vec::new();
+        let mut search_key_name: Option<Vec<u8>> = None;
+        for rev in &reachable {
+            let inv = self.get_inventory(rev)?;
+            if search_key_name.is_none() {
+                search_key_name = Some(inv.search_key_name.clone());
+            }
+            interesting_roots.extend(chk_root_keys(&inv));
+            for (_, entry) in inv
+                .entries()
+                .map_err(|e| RepositoryError::Corrupt(format!("inventory entries: {e:?}")))?
+            {
+                if entry.revision().map(|r| r.as_bytes()) == Some(rev.as_slice()) {
+                    text_keys.push(Key::fixed(vec![
+                        entry.file_id().as_bytes().to_vec(),
+                        rev.clone(),
+                    ]));
+                }
+            }
+        }
+        let search_key_func = {
+            let name = search_key_name.unwrap_or_else(|| b"hash-255-way".to_vec());
+            crate::chk_map::SearchKeyFunc::from_name(&name)
+                .map_err(|raw| RepositoryError::Corrupt(format!("search_key_name: {raw:?}")))?
+        };
+
+        self.start_write_group()?;
+        let group = self.write_group.as_ref().expect("just opened");
+        use super::pack_2a_writer::RepackTarget;
+        group.copy_store_keys(&self.revisions, RepackTarget::Revisions, &rev_keys)?;
+        group.copy_store_keys(&self.inventories, RepackTarget::Inventories, &rev_keys)?;
+        group.copy_store_keys(&self.signatures, RepackTarget::Signatures, &rev_keys)?;
+        group.copy_store_keys(&self.texts, RepackTarget::Texts, &text_keys)?;
+
+        // Every CHK page reachable from the reachable inventories. The old packs
+        // are being discarded, so there are no uninteresting roots to subtract.
+        let cache: std::sync::Arc<dyn crate::chk_map::PageCache> =
+            std::sync::Arc::new(crate::chk_map::InMemoryPageCache::new());
+        let records = crate::chk_map::iter_interesting_nodes(
+            self.chk_bytes.as_ref(),
+            cache.as_ref(),
+            &interesting_roots,
+            &[],
+            search_key_func,
+        )
+        .map_err(|e| RepositoryError::Corrupt(format!("chk difference walk: {e:?}")))?;
+        for record in records {
+            if let (Some(page_key), Some(page_bytes)) = (record.page_key, record.page_bytes) {
+                group.add_chk_page(&page_key, page_bytes)?;
+            }
+        }
+
+        // The reconciled pack is the only survivor; finish with no others, then
+        // obsolete the old packs. `commit_write_group` (called by finish-via-
+        // start/commit) would re-list existing packs, so finish directly here.
+        let group = self.write_group.take().expect("write group open");
+        group.finish(self.transport.as_ref(), &[])?;
+        self.obsolete_packs(&old_packs)?;
+
+        Ok(super::ReconcileResult {
+            garbage_inventories,
+            repacked: true,
+        })
+    }
+
+    /// Write a `pack-names` index that references no packs (used when reconcile
+    /// discards everything).
+    fn write_empty_pack_names(&self) -> Result<(), RepositoryError> {
+        use crate::btree_builder::BTreeBuilder;
+        let names = BTreeBuilder::new(0, 1);
+        let bytes = names
+            .finish()
+            .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e:?}")))?;
+        self.transport.put_bytes("pack-names", &bytes, None)?;
+        Ok(())
+    }
+
     /// Combine all packs in this repository into a single new pack.
     ///
     /// Every record (revisions, inventories, CHK pages, texts, signatures) is
@@ -1116,6 +1235,10 @@ impl super::Repository for Pack2aRepository {
 
     fn autopack(&mut self) -> Result<bool, RepositoryError> {
         Pack2aRepository::autopack(self)
+    }
+
+    fn reconcile(&mut self) -> Result<super::ReconcileResult, RepositoryError> {
+        Pack2aRepository::reconcile(self)
     }
 }
 
@@ -1605,6 +1728,93 @@ mod tests {
         assert_eq!(after, before, "single pack untouched");
         // Nothing was obsoleted.
         assert!(!t.has("obsolete_packs").unwrap_or(false));
+    }
+
+    /// Commit a revision whose inventory actually references the file (so the
+    /// file text is reachable), unlike `commit_one` which adds an orphan text.
+    fn commit_with_file(repo: &mut Pack2aRepository, rev: &[u8], text: &[u8]) {
+        let root = crate::inventory::ROOT_ID;
+        repo.start_write_group().unwrap();
+        repo.add_text(b"file-1", rev, &[], text).unwrap();
+        let entries = vec![
+            crate::inventory::Entry::root(
+                crate::FileId::from(root),
+                Some(crate::RevisionId::from(rev)),
+            ),
+            crate::inventory::Entry::file(
+                crate::FileId::from(&b"file-1"[..]),
+                "a.txt".into(),
+                crate::FileId::from(root),
+                Some(crate::RevisionId::from(rev)),
+                Some(crate::weave::sha_strings(&[text])),
+                Some(text.len() as u64),
+                Some(false),
+                None,
+            ),
+        ];
+        repo.add_inventory_from_entries(rev, &[], root, &entries)
+            .unwrap();
+        repo.add_revision(&make_revision(rev, vec![], "m", None), &[])
+            .unwrap();
+        repo.commit_write_group().unwrap();
+    }
+
+    /// reconcile() drops a garbage inventory (one with no revision) while
+    /// keeping the reachable revision's data readable.
+    #[test]
+    fn reconcile_drops_garbage_inventory() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        // A good revision whose inventory references file-1.
+        commit_with_file(&mut repo, b"rev-good", b"hello\n");
+        // A second write group that writes an inventory + text but no revision:
+        // its inventory is unreachable garbage.
+        repo.start_write_group().unwrap();
+        repo.add_inventory_from_entries(
+            b"rev-garbage",
+            &[],
+            crate::inventory::ROOT_ID,
+            &[crate::inventory::Entry::root(
+                crate::FileId::from(crate::inventory::ROOT_ID),
+                Some(crate::RevisionId::from(&b"rev-garbage"[..])),
+            )],
+        )
+        .unwrap();
+        repo.commit_write_group().unwrap();
+
+        // Reopen and reconcile.
+        let mut repo = Pack2aRepository::open(t.clone()).unwrap();
+        // Two stored inventories, one reachable revision -> one garbage.
+        let result = repo.reconcile().unwrap();
+        assert_eq!(result.garbage_inventories, 1);
+        assert!(result.repacked);
+
+        // The good revision and its data survive; the garbage inventory is gone.
+        let repo = Pack2aRepository::open(t).unwrap();
+        assert_eq!(repo.all_revision_ids().unwrap(), vec![b"rev-good".to_vec()]);
+        assert_eq!(
+            repo.get_file_text(b"file-1", b"rev-good").unwrap(),
+            b"hello\n"
+        );
+        assert!(repo.get_inventory(b"rev-good").is_ok());
+        // The reconciled repository is clean and consistent.
+        assert!(crate::repository::check(&repo).unwrap().is_clean());
+    }
+
+    /// reconcile() on a clean repository keeps everything and reports no garbage.
+    #[test]
+    fn reconcile_clean_repository() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        commit_one(&mut repo, b"rev-1");
+        commit_one(&mut repo, b"rev-2");
+        let mut repo = Pack2aRepository::open(t.clone()).unwrap();
+        let result = repo.reconcile().unwrap();
+        assert_eq!(result.garbage_inventories, 0);
+        let repo = Pack2aRepository::open(t).unwrap();
+        let mut ids = repo.all_revision_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![b"rev-1".to_vec(), b"rev-2".to_vec()]);
     }
 
     /// A committed pack is named by the md5 of its content (matching brz), so
