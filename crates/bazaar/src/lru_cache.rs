@@ -282,4 +282,117 @@ mod tests {
         assert_eq!(o.drain_lru(), vec![1, 2, 3]);
         assert!(o.is_empty());
     }
+
+    #[test]
+    fn mru_tracks_most_recent_insert() {
+        let mut o = LruOrder::new();
+        assert_eq!(o.mru(), None);
+        o.insert(1, 1);
+        o.insert(2, 1);
+        assert_eq!(o.mru(), Some(2));
+        o.touch(1);
+        assert_eq!(o.mru(), Some(1));
+    }
+
+    #[test]
+    fn order_mru_to_lru_lists_all_entries() {
+        let mut o = LruOrder::new();
+        o.insert(1, 1);
+        o.insert(2, 1);
+        o.insert(3, 1);
+        // Most recently inserted first.
+        assert_eq!(o.order_mru_to_lru(), vec![3, 2, 1]);
+        o.touch(1);
+        assert_eq!(o.order_mru_to_lru(), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn next_and_prev_walk_the_chain() {
+        let mut o = LruOrder::new();
+        o.insert(1, 1);
+        o.insert(2, 1);
+        o.insert(3, 1);
+        // Chain MRU->LRU is 3, 2, 1.
+        assert_eq!(o.next(3), Some(2));
+        assert_eq!(o.next(2), Some(1));
+        assert_eq!(o.next(1), None);
+        assert_eq!(o.prev(1), Some(2));
+        assert_eq!(o.prev(2), Some(3));
+        assert_eq!(o.prev(3), None);
+        // Unknown ids have no neighbours.
+        assert_eq!(o.next(99), None);
+        assert_eq!(o.prev(99), None);
+    }
+
+    #[test]
+    fn contains_reflects_membership() {
+        let mut o = LruOrder::new();
+        o.insert(7, 1);
+        assert!(o.contains(7));
+        assert!(!o.contains(8));
+        o.remove(7);
+        assert!(!o.contains(7));
+    }
+
+    #[test]
+    fn update_size_unknown_id_is_noop() {
+        let mut o = LruOrder::new();
+        o.insert(1, 4);
+        o.update_size(99, 100);
+        assert_eq!(o.total_size(), 4);
+    }
+
+    #[test]
+    fn touch_unknown_id_is_noop() {
+        let mut o = LruOrder::new();
+        o.insert(1, 1);
+        o.insert(2, 1);
+        o.touch(99);
+        // Order unchanged: 2 is still MRU, 1 still LRU.
+        assert_eq!(o.mru(), Some(2));
+        assert_eq!(o.lru(), Some(1));
+    }
+
+    #[test]
+    fn remove_unknown_id_returns_none() {
+        let mut o = LruOrder::new();
+        o.insert(1, 5);
+        assert_eq!(o.remove(99), None);
+        assert_eq!(o.total_size(), 5);
+        assert_eq!(o.len(), 1);
+    }
+
+    #[test]
+    fn evict_until_removes_exact_lru_entries() {
+        let mut o = LruOrder::new();
+        o.insert(1, 5);
+        o.insert(2, 6);
+        o.insert(3, 7);
+        // Order MRU->LRU is 3, 2, 1. Evict until total_size <= 10:
+        // remove 1 (->13), remove 2 (->7). 3 stays.
+        let evicted = o.evict_until(10);
+        assert_eq!(evicted, vec![1, 2]);
+        assert_eq!(o.total_size(), 7);
+        assert_eq!(o.order_mru_to_lru(), vec![3]);
+    }
+
+    #[test]
+    fn evict_until_already_under_target_removes_nothing() {
+        let mut o = LruOrder::new();
+        o.insert(1, 3);
+        let evicted = o.evict_until(10);
+        assert!(evicted.is_empty());
+        assert_eq!(o.total_size(), 3);
+    }
+
+    #[test]
+    fn update_size_then_evict_uses_new_size() {
+        let mut o = LruOrder::new();
+        o.insert(1, 1);
+        o.update_size(1, 9);
+        assert_eq!(o.total_size(), 9);
+        let evicted = o.evict_until(5);
+        assert_eq!(evicted, vec![1]);
+        assert!(o.is_empty());
+    }
 }
