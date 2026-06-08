@@ -185,6 +185,9 @@ pub enum BzrDirError {
     },
     /// Opening a component (repository/branch/working tree) failed.
     Component(String),
+    /// No repository was found for a control directory, and no enclosing
+    /// shared repository exists.
+    NoRepositoryPresent,
     /// An underlying transport error.
     Transport(TransportError),
 }
@@ -205,6 +208,9 @@ impl std::fmt::Display for BzrDirError {
                 String::from_utf8_lossy(found)
             ),
             BzrDirError::Component(m) => write!(f, "{m}"),
+            BzrDirError::NoRepositoryPresent => {
+                write!(f, "no repository present and no shared repository found")
+            }
             BzrDirError::Transport(e) => write!(f, "transport error: {e}"),
         }
     }
@@ -308,6 +314,35 @@ pub trait ControlDir: Send + Sync {
 
     /// Open the working tree in this control directory.
     fn open_workingtree(&self) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError>;
+
+    /// Whether this control directory's repository is shared. The default is
+    /// `false` (the all-in-one weave format is never shared); [`BzrDirMeta`]
+    /// reads the `shared-storage` marker.
+    fn is_shared(&self) -> Result<bool, BzrDirError> {
+        Ok(false)
+    }
+
+    /// Whether this repository creates working trees for branches it serves.
+    /// The default is `true`; [`BzrDirMeta`] reads the `no-working-trees`
+    /// marker.
+    fn make_working_trees(&self) -> Result<bool, BzrDirError> {
+        Ok(true)
+    }
+
+    /// Set whether this repository creates working trees. Unsupported on
+    /// formats without a separate repository control dir (the default errors).
+    fn set_make_working_trees(&self, _value: bool) -> Result<(), BzrDirError> {
+        Err(BzrDirError::Component(
+            "format does not support setting make_working_trees".to_string(),
+        ))
+    }
+
+    /// Find the repository serving this control directory, walking up to an
+    /// enclosing shared repository when this one has none. The default opens
+    /// this control directory's own repository; [`BzrDirMeta`] walks up.
+    fn find_repository(&self) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        self.open_repository()
+    }
 }
 
 /// An opened `.bzr` meta directory.
@@ -444,6 +479,58 @@ impl BzrDirMeta {
         Self::open(bzr)
     }
 
+    /// Create a shared repository (no branch or working tree) under `parent`,
+    /// using the 2a format, and open it.
+    ///
+    /// This is the on-disk shape of `brz init-shared-repository`: a `.bzr` with
+    /// only a `repository/` component, carrying the empty `shared-storage`
+    /// marker so branches in sibling control directories resolve to it via
+    /// [`find_repository`](Self::find_repository).
+    pub fn create_shared_repository(parent: &SharedTransport) -> Result<Self, BzrDirError> {
+        Self::create_shared_repository_with_format(
+            parent,
+            find_control_dir_format("2a").expect("2a format is registered"),
+        )
+    }
+
+    /// Create a shared repository of `format`'s repository format under
+    /// `parent`, and open it.
+    ///
+    /// Shared repositories are a metadir feature, supported by every repository
+    /// format this crate creates except the all-in-one (pre-metadir) layout,
+    /// which has no separate `repository/` directory to mark. Passing such a
+    /// format errors with [`BzrDirError::Component`].
+    pub fn create_shared_repository_with_format(
+        parent: &SharedTransport,
+        format: &ControlDirFormat,
+    ) -> Result<Self, BzrDirError> {
+        let repo_format = crate::repository::find_format(format.repo_marker).ok_or_else(|| {
+            BzrDirError::Component(format!(
+                "repository format not registered: {:?}",
+                String::from_utf8_lossy(format.repo_marker)
+            ))
+        })?;
+        if repo_format.is_all_in_one() {
+            return Err(BzrDirError::Component(
+                "all-in-one formats cannot be shared repositories".to_string(),
+            ));
+        }
+
+        let bzr = parent.subtransport(".bzr")?;
+        bzr.mkdir("")?;
+        bzr.put_bytes("branch-format", METADIR_MARKER, None)?;
+
+        let repo_t = bzr.subtransport("repository")?;
+        (repo_format.create)(repo_format, repo_t)
+            .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
+
+        // Mark it shared.
+        bzr.subtransport("repository")?
+            .put_bytes("shared-storage", b"", None)?;
+
+        Self::open(bzr)
+    }
+
     /// Open the branch a reference's `location` points at.
     ///
     /// The location is the URL of the referenced branch's containing directory
@@ -497,6 +584,31 @@ impl BzrDirMeta {
             Err(TransportError::NoSuchFile(_)) => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// A transport rooted at the `repository/` component directory.
+    fn repository_transport(&self) -> Result<SharedTransport, BzrDirError> {
+        Ok(self
+            .transport
+            .subtransport(Component::Repository.subdir())?)
+    }
+}
+
+/// Whether two transports point at the same directory, comparing canonicalised
+/// filesystem paths so `..`-laden relative paths that resolve to the same place
+/// (e.g. stepping up from the filesystem root) are recognised as equal.
+fn same_location(a: &SharedTransport, b: &SharedTransport) -> bool {
+    match (a.local_path(""), b.local_path("")) {
+        (Some(pa), Some(pb)) => {
+            let ca = std::fs::canonicalize(&pa).unwrap_or(pa);
+            let cb = std::fs::canonicalize(&pb).unwrap_or(pb);
+            ca == cb
+        }
+        // Non-local transports: fall back to comparing abspaths.
+        _ => match (a.abspath(""), b.abspath("")) {
+            (Ok(pa), Ok(pb)) => pa == pb,
+            _ => false,
+        },
     }
 }
 
@@ -604,6 +716,90 @@ impl ControlDir for BzrDirMeta {
         let root = self.transport.subtransport("..")?;
         crate::workingtree::open(root)
             .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))
+    }
+
+    /// Whether this control directory's repository is shared (serves branches
+    /// in other control directories).
+    ///
+    /// A shared repository carries an empty `shared-storage` marker file.
+    /// Errors with [`BzrDirError::NotABzrDir`] if there is no repository.
+    fn is_shared(&self) -> Result<bool, BzrDirError> {
+        if !self.has_repository {
+            return Err(BzrDirError::NotABzrDir);
+        }
+        Ok(self.repository_transport()?.has("shared-storage")?)
+    }
+
+    /// Whether this repository creates working trees for branches it serves.
+    ///
+    /// True unless the `no-working-trees` marker is present (note the inverted
+    /// polarity: the marker's presence means *no* working trees).
+    fn make_working_trees(&self) -> Result<bool, BzrDirError> {
+        if !self.has_repository {
+            return Err(BzrDirError::NotABzrDir);
+        }
+        Ok(!self.repository_transport()?.has("no-working-trees")?)
+    }
+
+    /// Set whether this repository creates working trees. `true` removes the
+    /// `no-working-trees` marker; `false` writes it.
+    fn set_make_working_trees(&self, value: bool) -> Result<(), BzrDirError> {
+        if !self.has_repository {
+            return Err(BzrDirError::NotABzrDir);
+        }
+        let repo = self.repository_transport()?;
+        if value {
+            match repo.delete("no-working-trees") {
+                Ok(()) | Err(TransportError::NoSuchFile(_)) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        } else {
+            repo.put_bytes("no-working-trees", b"", None)?;
+            Ok(())
+        }
+    }
+
+    /// Find the repository serving this control directory, walking up to an
+    /// enclosing shared repository when this control directory has none of its
+    /// own.
+    ///
+    /// Mirrors breezy's `find_repository`: this control directory's own
+    /// repository is used unconditionally; an ancestor's repository is used
+    /// only if it is shared. A non-shared ancestor repository, the filesystem
+    /// root, or a missing control directory all stop the walk with
+    /// [`BzrDirError::NoRepositoryPresent`].
+    fn find_repository(&self) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        // Our own repository, if present, is used regardless of shared status.
+        if self.has_repository {
+            return self.open_repository();
+        }
+        // Walk up the directory tree looking for an enclosing shared
+        // repository. `dir` is the directory *containing* the control dir we
+        // are about to probe; it always exists, so it can be canonicalised to
+        // detect the filesystem root (where stepping up no longer moves).
+        let mut dir = self.transport.subtransport("..")?;
+        loop {
+            let parent = dir.subtransport("..")?;
+            if same_location(&dir, &parent) {
+                // Reached the filesystem root.
+                return Err(BzrDirError::NoRepositoryPresent);
+            }
+            let next_bzr = parent.subtransport(".bzr")?;
+            match BzrDirMeta::open(next_bzr) {
+                Ok(found) if found.has_repository => {
+                    if found.is_shared()? {
+                        return found.open_repository();
+                    }
+                    // A non-shared ancestor repository blocks the walk.
+                    return Err(BzrDirError::NoRepositoryPresent);
+                }
+                // No repository here, or not a control dir: keep walking up.
+                Ok(_) | Err(BzrDirError::NotABzrDir) | Err(BzrDirError::NotMetaDir(_)) => {
+                    dir = parent;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
@@ -1085,5 +1281,120 @@ mod tests {
             stacked.get_revision(b"rev-base").unwrap().message,
             "base commit"
         );
+    }
+
+    #[test]
+    fn create_shared_repository_is_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create_shared_repository(&parent).unwrap();
+        assert!(cd.has_repository());
+        assert!(!cd.has_branch());
+        assert!(cd.is_shared().unwrap());
+        // A normal control directory is not shared.
+        let other = tempfile::tempdir().unwrap();
+        let op: SharedTransport = std::sync::Arc::new(LocalTransport::new(other.path()));
+        assert!(!BzrDirMeta::create(&op).unwrap().is_shared().unwrap());
+    }
+
+    /// Shared repositories work for any metadir repository format, not just 2a.
+    #[cfg(feature = "knitpack")]
+    #[test]
+    fn create_shared_repository_knitpack_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(dir.path()));
+        let fmt = find_control_dir_format("1.9").expect("1.9 format registered");
+        let cd = BzrDirMeta::create_shared_repository_with_format(&parent, fmt).unwrap();
+        assert!(cd.has_repository());
+        assert!(!cd.has_branch());
+        assert!(cd.is_shared().unwrap());
+        // The repository opens under its own (knit-pack) format.
+        assert_eq!(
+            cd.open_repository().unwrap().format().format_string,
+            fmt.repo_marker
+        );
+    }
+
+    #[test]
+    fn make_working_trees_toggles_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create_shared_repository(&parent).unwrap();
+        // Default: working trees are made (no marker).
+        assert!(cd.make_working_trees().unwrap());
+        cd.set_make_working_trees(false).unwrap();
+        assert!(!cd.make_working_trees().unwrap());
+        cd.set_make_working_trees(true).unwrap();
+        assert!(cd.make_working_trees().unwrap());
+    }
+
+    #[test]
+    fn find_repository_walks_up_to_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        // A shared repository at the top.
+        let shared_root = dir.path().join("shared");
+        std::fs::create_dir_all(&shared_root).unwrap();
+        let shared_parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(&shared_root));
+        let shared = BzrDirMeta::create_shared_repository(&shared_parent).unwrap();
+        // Give the shared repo a revision so we can tell we resolved to it.
+        {
+            let mut repo = shared.open_repository().unwrap();
+            repo.start_write_group().unwrap();
+            let rev = crate::revision::Revision::new(
+                crate::RevisionId::from(&b"rev-shared"[..]),
+                vec![],
+                Some("T <t@e>".to_string()),
+                "shared".to_string(),
+                std::collections::HashMap::new(),
+                None,
+                1577880000.0,
+                Some(0),
+            );
+            repo.add_revision(&rev, &[]).unwrap();
+            repo.add_inventory_from_entries(
+                b"rev-shared",
+                &[],
+                crate::inventory::ROOT_ID,
+                &[crate::inventory::Entry::root(
+                    crate::FileId::from(crate::inventory::ROOT_ID),
+                    Some(crate::RevisionId::from(&b"rev-shared"[..])),
+                )],
+            )
+            .unwrap();
+            repo.commit_write_group().unwrap();
+        }
+
+        // A branch-only control directory inside the shared repository's tree.
+        let branch_root = shared_root.join("branch1");
+        let branch_bzr = branch_root.join(".bzr");
+        std::fs::create_dir_all(branch_bzr.join("branch")).unwrap();
+        std::fs::write(branch_bzr.join("branch-format"), METADIR_MARKER).unwrap();
+        std::fs::write(branch_bzr.join("branch/format"), BRANCH_FORMAT_7).unwrap();
+        std::fs::write(branch_bzr.join("branch/last-revision"), b"0 null:\n").unwrap();
+
+        let branch_cd =
+            BzrDirMeta::open(std::sync::Arc::new(LocalTransport::new(&branch_bzr))).unwrap();
+        assert!(!branch_cd.has_repository());
+        // find_repository walks up to the shared repository.
+        let repo = branch_cd.find_repository().unwrap();
+        assert!(repo.has_revision(b"rev-shared").unwrap());
+    }
+
+    #[test]
+    fn find_repository_errors_when_none() {
+        // A standalone control directory with its own (non-shared) repository
+        // returns it directly; a branch-only dir with no shared ancestor errors.
+        let dir = tempfile::tempdir().unwrap();
+        let branch_root = dir.path().join("lonely");
+        let branch_bzr = branch_root.join(".bzr");
+        std::fs::create_dir_all(branch_bzr.join("branch")).unwrap();
+        std::fs::write(branch_bzr.join("branch-format"), METADIR_MARKER).unwrap();
+        std::fs::write(branch_bzr.join("branch/format"), BRANCH_FORMAT_7).unwrap();
+        std::fs::write(branch_bzr.join("branch/last-revision"), b"0 null:\n").unwrap();
+        let cd = BzrDirMeta::open(std::sync::Arc::new(LocalTransport::new(&branch_bzr))).unwrap();
+        assert!(matches!(
+            cd.find_repository(),
+            Err(BzrDirError::NoRepositoryPresent)
+        ));
     }
 }

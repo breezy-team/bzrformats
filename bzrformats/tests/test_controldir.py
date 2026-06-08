@@ -300,3 +300,25 @@ class TestControlDir(TestCaseInTempDir):
         branch = controldir.create(self.test_dir).open_branch()
         self.assertIsNone(branch.get_reference())
         self.assertRaises(UnsupportedOperation, branch.set_reference, "x")
+
+    def test_create_shared_repository(self):
+        shared = os.path.join(self.test_dir, "shared")
+        os.makedirs(shared)
+        cd = controldir.create_shared_repository(shared)
+        self.assertTrue(cd.has_repository())
+        self.assertFalse(cd.has_branch())
+        self.assertTrue(cd.is_shared())
+        # A normal control directory is not shared.
+        normal = os.path.join(self.test_dir, "normal")
+        os.makedirs(normal)
+        self.assertFalse(controldir.create(normal).is_shared())
+
+    def test_make_working_trees_toggles(self):
+        shared = os.path.join(self.test_dir, "shared")
+        os.makedirs(shared)
+        cd = controldir.create_shared_repository(shared)
+        self.assertTrue(cd.make_working_trees())
+        cd.set_make_working_trees(False)
+        self.assertFalse(cd.make_working_trees())
+        cd.set_make_working_trees(True)
+        self.assertTrue(cd.make_working_trees())

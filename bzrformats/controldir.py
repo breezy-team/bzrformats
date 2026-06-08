@@ -27,6 +27,7 @@ from ._bzr_rs.controldir import (
     Repository,
     WorkingTree,
     create,
+    create_shared_repository,
     format_names,
     open,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "Repository",
     "WorkingTree",
     "create",
+    "create_shared_repository",
     "format_names",
     "open",
 ]
