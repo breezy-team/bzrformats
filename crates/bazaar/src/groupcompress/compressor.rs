@@ -5,6 +5,7 @@ use crate::groupcompress::NULL_SHA1;
 use crate::versionedfile::{Error, Key};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// Classification of a compressed record: either a fulltext insertion or
 /// a delta against earlier content in the same group.
@@ -151,7 +152,7 @@ pub trait GroupCompressor {
         };
 
         let (start, end, r#type) =
-            self.compress_block(&key, chunks, length, (length / 2) as u128, soft)?;
+            self.compress_block(key, chunks, length, (length / 2) as u128, soft)?;
         Ok((sha, start, end, r#type))
     }
 
@@ -175,7 +176,7 @@ pub trait GroupCompressor {
     ///     the type ('fulltext' or 'delta').
     fn compress_block(
         &mut self,
-        key: &[Vec<u8>],
+        key: Vec<Vec<u8>>,
         chunks: &[&[u8]],
         input_len: usize,
         max_delta_size: u128,
@@ -224,7 +225,7 @@ impl GroupCompressor for TraditionalGroupCompressor {
 
     fn compress_block(
         &mut self,
-        key: &[Vec<u8>],
+        key: Vec<Vec<u8>>,
         chunks: &[&[u8]],
         input_len: usize,
         max_delta_size: u128,
@@ -277,7 +278,7 @@ impl GroupCompressor for TraditionalGroupCompressor {
         self.input_bytes += input_len;
         let chunk_end = self.delta_index.lines().len();
         self.labels_deltas
-            .insert(key.to_vec(), (start, chunk_start, self.endpoint, chunk_end));
+            .insert(key, (start, chunk_start, self.endpoint, chunk_end));
         Ok((start, self.endpoint, kind))
     }
 }
@@ -348,6 +349,13 @@ pub struct RabinGroupCompressor {
     input_bytes: usize,
     last: Option<(usize, usize)>,
     labels_deltas: HashMap<Vec<Vec<u8>>, (usize, usize, usize, usize)>,
+    /// Memoised concatenation of `chunks[..n]`, used as the basis when
+    /// extracting a delta record. Bulk extraction walks records in order, so
+    /// the prefix grows monotonically and caching it turns an O(n^2) sequence
+    /// of `concat()` calls into O(n). Invalidated whenever `chunks` changes.
+    /// A `Mutex` (rather than `RefCell`) so the surrounding pyclass stays
+    /// `Sync`; the lock is uncontended in normal single-threaded extraction.
+    prefix_cache: Mutex<(usize, Vec<u8>)>,
 }
 
 impl Default for RabinGroupCompressor {
@@ -365,7 +373,32 @@ impl RabinGroupCompressor {
             input_bytes: 0,
             last: None,
             labels_deltas: HashMap::new(),
+            prefix_cache: Mutex::new((0, Vec::new())),
         }
+    }
+
+    /// Concatenation of `self.chunks[..n]`, reusing the memoised prefix when
+    /// the request grows monotonically (the bulk-extract case) and rebuilding
+    /// only when it shrinks.
+    fn source_prefix(&self, n: usize) -> Vec<u8> {
+        let mut cache = self.prefix_cache.lock().unwrap();
+        let (cached_n, buf) = &mut *cache;
+        if *cached_n > n {
+            // Requested a shorter prefix than cached: rebuild from scratch.
+            buf.clear();
+            *cached_n = 0;
+        }
+        for chunk in &self.chunks[*cached_n..n] {
+            buf.extend_from_slice(chunk);
+        }
+        *cached_n = n;
+        buf.clone()
+    }
+
+    fn invalidate_prefix_cache(&mut self) {
+        let (cached_n, buf) = &mut *self.prefix_cache.lock().unwrap();
+        *cached_n = 0;
+        buf.clear();
     }
 
     pub fn chunks(&self) -> &[Vec<u8>] {
@@ -415,7 +448,7 @@ impl RabinGroupCompressor {
         let data = match kind {
             b'f' => vec![payload.to_vec()],
             b'd' => {
-                let source = self.chunks[..*start_chunk].concat();
+                let source = self.source_prefix(*start_chunk);
                 vec![apply_delta(&source, payload)?]
             }
             other => return Err(ExtractError::UnknownKind(other)),
@@ -441,6 +474,8 @@ impl RabinGroupCompressor {
         self.chunks.truncate(chunk_start);
         self.endpoint = byte_endpoint;
         self.last = None;
+        // Truncation can drop chunks the cached prefix concatenated.
+        self.invalidate_prefix_cache();
     }
 }
 
@@ -464,24 +499,39 @@ impl GroupCompressor for RabinGroupCompressor {
 
     fn compress_block(
         &mut self,
-        key: &[Vec<u8>],
+        key: Vec<Vec<u8>>,
         chunks: &[&[u8]],
         input_len: usize,
         max_delta_size: u128,
         _soft: Option<bool>,
     ) -> Result<(usize, usize, RecordKind), Error> {
-        let bytes: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        // make_delta only reads the input, so for the common single-chunk case
+        // we can scan it in place and avoid copying the whole record. The
+        // fulltext branch still needs an owned buffer (the index keeps it), but
+        // the delta branch never materialises one.
         let max_delta = max_delta_size as usize;
-        let delta = self
-            .delta_index
-            .make_delta(&bytes, max_delta)
-            .expect("rabin delta indexing");
+        // For multi-chunk input we must concatenate before scanning; keep that
+        // buffer so the fulltext branch can reuse it instead of copying again.
+        let owned_input: Option<Vec<u8>> = if chunks.len() == 1 {
+            None
+        } else {
+            Some(chunks.iter().flat_map(|c| c.iter().copied()).collect())
+        };
+        let delta = {
+            let input: &[u8] = owned_input.as_deref().unwrap_or(chunks[0]);
+            self.delta_index
+                .make_delta(input, max_delta)
+                .expect("rabin delta indexing")
+        };
 
         let (kind, new_chunks): (RecordKind, Vec<Vec<u8>>) = match delta {
             None => {
                 let mut enc_length = Vec::new();
                 write_base128_int(&mut enc_length, input_len as u128).unwrap();
                 let len_mini_header = 1 + enc_length.len();
+                // The index must own the source bytes; reuse the buffer we
+                // already built for multi-chunk input, otherwise copy once.
+                let bytes = owned_input.unwrap_or_else(|| chunks[0].to_vec());
                 self.delta_index.add_source(bytes, len_mini_header);
                 let mut new_chunks = Vec::with_capacity(2 + chunks.len());
                 new_chunks.push(b"f".to_vec());
@@ -509,7 +559,7 @@ impl GroupCompressor for RabinGroupCompressor {
         self.input_bytes += input_len;
         let chunk_end = self.chunks.len();
         self.labels_deltas
-            .insert(key.to_vec(), (start, chunk_start, self.endpoint, chunk_end));
+            .insert(key, (start, chunk_start, self.endpoint, chunk_end));
         Ok((start, self.endpoint, kind))
     }
 }
@@ -726,6 +776,43 @@ mod tests {
         assert_eq!(data, vec![base.to_vec()]);
         let (data, _) = gc.extract(&vec![b"derived".to_vec()]).unwrap();
         assert_eq!(data, vec![derived.to_vec()]);
+    }
+
+    #[test]
+    fn rabin_compressor_extract_prefix_cache_orders() {
+        // The source-prefix cache must return correct bytes regardless of the
+        // order records are extracted in: growing (derived then a later
+        // record), then shrinking back to an earlier delta exercises both the
+        // monotonic-extend and rebuild branches.
+        let mut gc = RabinGroupCompressor::new(None);
+        let base = b"common prefix that is long enough to be worth indexing\nshared\n";
+        let d1 = b"common prefix that is long enough to be worth indexing\nshared\none\n";
+        let d2 = b"common prefix that is long enough to be worth indexing\nshared\none\ntwo\n";
+        for (k, text) in [
+            (b"base".as_slice(), base.as_slice()),
+            (b"d1".as_slice(), d1.as_slice()),
+            (b"d2".as_slice(), d2.as_slice()),
+        ] {
+            gc.compress(&key(&[k]), &[text], text.len(), None, None, None)
+                .unwrap();
+        }
+        // Extract out of order: late, early, late again.
+        assert_eq!(
+            gc.extract(&vec![b"d2".to_vec()]).unwrap().0,
+            vec![d2.to_vec()]
+        );
+        assert_eq!(
+            gc.extract(&vec![b"d1".to_vec()]).unwrap().0,
+            vec![d1.to_vec()]
+        );
+        assert_eq!(
+            gc.extract(&vec![b"base".to_vec()]).unwrap().0,
+            vec![base.to_vec()]
+        );
+        assert_eq!(
+            gc.extract(&vec![b"d2".to_vec()]).unwrap().0,
+            vec![d2.to_vec()]
+        );
     }
 
     #[test]

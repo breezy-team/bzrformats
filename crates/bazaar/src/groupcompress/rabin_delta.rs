@@ -166,8 +166,11 @@ impl RabinWindow {
     }
 
     pub fn push(&mut self, c: u8) {
-        self.hash.pushright(c);
+        // Cancel the byte that has just aged out of the window, then mix in the
+        // new byte -- the same order git's diff-delta uses, which keeps the
+        // rolled value equal to a fresh `rabin_hash` of the shifted window.
         self.hash.popleft(self.data[self.pos]);
+        self.hash.pushright(c);
         self.data[self.pos] = c;
         self.pos = (self.pos + 1) % RABIN_WINDOW;
     }
@@ -398,6 +401,13 @@ pub fn iter_delta_instructions<'a>(
     // Start of the current insert block (if any)
     let mut insert_start: usize = 0;
     let mut done = false;
+    // Rolling hash over `target[scan_pos..scan_pos + RABIN_WINDOW]`, kept in
+    // sync with `scan_pos`. `window_pos` is the position the window currently
+    // covers; when we only advanced by one byte (the common no-match case) we
+    // roll, otherwise (first window, or after a copy jumped scan_pos) we
+    // re-seed from scratch.
+    let mut window: Option<RabinWindow> = None;
+    let mut window_pos: usize = 0;
 
     std::iter::from_fn(move || -> Option<Instruction<&'a [u8]>> {
         if done {
@@ -418,11 +428,25 @@ pub fn iter_delta_instructions<'a>(
                 return None;
             }
 
-            let hash = rabin_hash(
-                target[scan_pos..scan_pos + RABIN_WINDOW]
-                    .try_into()
-                    .unwrap(),
-            );
+            let hash = match window {
+                Some(ref mut w) if window_pos + 1 == scan_pos => {
+                    // Single-byte advance: roll the entering byte in.
+                    w.push(target[scan_pos + RABIN_WINDOW - 1]);
+                    window_pos = scan_pos;
+                    w.hash()
+                }
+                _ => {
+                    let w = RabinWindow::new(
+                        target[scan_pos..scan_pos + RABIN_WINDOW]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let h = w.hash();
+                    window = Some(w);
+                    window_pos = scan_pos;
+                    h
+                }
+            };
             if let Some((entry, msize)) = index.find_match(hash, &target[scan_pos..], 4, Some(4096))
             {
                 // Found a match of at least 4 bytes
@@ -863,5 +887,24 @@ at the end of the file
         // 1 byte cap is well below any plausible delta header, so we expect
         // None back from make_delta.
         assert_eq!(idx.make_delta(TEXT3, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn rolling_window_matches_fresh_hash() {
+        // The scan loop rolls the rabin hash one byte at a time; every rolled
+        // value must equal a fresh hash of the same window.
+        use super::{rabin_hash, RabinWindow, RABIN_WINDOW};
+        use std::convert::TryInto;
+        let data: Vec<u8> = (0..200u32).map(|i| (i * 31 + 7) as u8).collect();
+        let mut window = RabinWindow::new(data[..RABIN_WINDOW].try_into().unwrap());
+        assert_eq!(
+            window.hash(),
+            rabin_hash(data[..RABIN_WINDOW].try_into().unwrap())
+        );
+        for pos in 1..=(data.len() - RABIN_WINDOW) {
+            window.push(data[pos + RABIN_WINDOW - 1]);
+            let fresh = rabin_hash(data[pos..pos + RABIN_WINDOW].try_into().unwrap());
+            assert_eq!(window.hash(), fresh, "mismatch at pos {pos}");
+        }
     }
 }
