@@ -871,8 +871,12 @@ impl LeafNode {
     /// the new key.
     pub fn map_no_split(&mut self, key: Vec<Vec<u8>>, value: Vec<u8>) -> bool {
         self.raw_size += leaf_node_key_value_len(&key, &value);
-        let serialised_key = Key::from(key.clone()).serialize();
-        let search_key = self.search_key_func.apply(&Key::from(key.clone()));
+        // Build one Key view and reuse it for both derivations instead of
+        // cloning `key` twice. This runs once per inventory entry on the CHK
+        // write path (commit/fetch), so the saved clone adds up.
+        let key_obj = Key::from(key.clone());
+        let serialised_key = key_obj.serialize();
+        let search_key = self.search_key_func.apply(&key_obj);
         self.items.insert(key, value);
 
         self.common_serialised_prefix = Some(match self.common_serialised_prefix.take() {

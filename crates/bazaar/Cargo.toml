@@ -83,6 +83,10 @@ harness = false
 name = "btree_index"
 harness = false
 
+[[bench]]
+name = "gcvf_read"
+harness = false
+
 [features]
 default = ["pyo3", "weave", "knit", "knitpack"]
 pyo3 = ["dep:pyo3"]
