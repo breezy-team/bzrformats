@@ -202,6 +202,41 @@ pub struct IndexEntry {
     pub offset: usize,
 }
 
+/// Length of the common byte prefix of `a` and `b`.
+///
+/// Compares a machine word at a time and locates the first differing byte
+/// with `trailing_zeros`, which is markedly faster than a byte-at-a-time
+/// scan for the long matches that dominate delta generation.
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    const W: usize = std::mem::size_of::<usize>();
+    while i + W <= n {
+        // Read unaligned native-endian words; equality and the index of the
+        // first mismatching byte are endianness-independent because we locate
+        // it via the count of matching low-order *bytes*.
+        let wa = usize::from_ne_bytes(a[i..i + W].try_into().unwrap());
+        let wb = usize::from_ne_bytes(b[i..i + W].try_into().unwrap());
+        let diff = wa ^ wb;
+        if diff != 0 {
+            // Number of equal bytes before the first differing one. On
+            // little-endian the first byte is in the low bits; on big-endian
+            // it is in the high bits, so pick the matching intrinsic.
+            let eq_bytes = if cfg!(target_endian = "little") {
+                diff.trailing_zeros() / 8
+            } else {
+                diff.leading_zeros() / 8
+            };
+            return i + eq_bytes as usize;
+        }
+        i += W;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
 impl DeltaIndex {
     fn iter_matches(&self, val: &RabinHash) -> impl Iterator<Item = &IndexEntry> + '_ {
         self.entries
@@ -220,16 +255,30 @@ impl DeltaIndex {
         let mut msource = None;
 
         for entry in self.iter_matches(&hash) {
+            // The target can't be matched beyond its own length, so once a
+            // match already covers all of `data` no candidate can improve on
+            // it and the byte-at-min_size probe below would also be out of
+            // range.
+            if min_size >= data.len() {
+                break;
+            }
             let entry_data = &self.buffer[entry.offset..];
             if entry_data.len() <= min_size {
                 // no point in checking this one
                 continue;
             }
-            let overlap = entry_data
-                .iter()
-                .zip(data.iter())
-                .take_while(|(x, y)| x == y)
-                .count();
+            // A candidate can only beat the current best if it matches at
+            // least one byte further, i.e. the byte at min_size matches. The
+            // hash only guarantees the window matched, not this position, so
+            // this is a cheap O(1) rejection that lets us skip the full
+            // prefix scan for the common case of a non-improving candidate.
+            // (Both slices are known to be longer than min_size here: data
+            // because it contained the hashed window, entry_data by the check
+            // above.)
+            if entry_data[min_size] != data[min_size] {
+                continue;
+            }
+            let overlap = common_prefix_len(entry_data, data);
             if overlap > min_size {
                 /* this is our best match so far */
                 min_size = overlap;
@@ -571,6 +620,28 @@ has a lot more data
 at the end of the file
 ";
 
+    #[test]
+    fn common_prefix_len_boundaries() {
+        use super::common_prefix_len;
+        assert_eq!(common_prefix_len(b"", b""), 0);
+        assert_eq!(common_prefix_len(b"abc", b"abc"), 3);
+        assert_eq!(common_prefix_len(b"abc", b"abd"), 2);
+        assert_eq!(common_prefix_len(b"abc", b"xyz"), 0);
+        // shorter slice bounds the result
+        assert_eq!(common_prefix_len(b"abcdef", b"abc"), 3);
+        assert_eq!(common_prefix_len(b"abc", b"abcdef"), 3);
+        // mismatches at, just before, and just after a word boundary
+        for n in [7usize, 8, 9, 15, 16, 17, 31, 32, 33] {
+            let a = vec![0x5au8; n + 4];
+            let mut b = a.clone();
+            b[n] ^= 0xff;
+            assert_eq!(common_prefix_len(&a, &b), n, "mismatch position {n}");
+        }
+        // full match longer than a word
+        let a = vec![0x11u8; 40];
+        assert_eq!(common_prefix_len(&a, &a), 40);
+    }
+
     fn apply_delta_test(source: &[u8], delta: &[u8]) -> Vec<u8> {
         use crate::groupcompress::delta::{decode_instruction, Instruction};
         let mut remaining = &delta[..];
@@ -600,6 +671,44 @@ at the end of the file
         // Verify the delta round-trips correctly
         let result = apply_delta_test(source, &out);
         assert_eq!(target, &result[..], "delta did not round-trip correctly");
+    }
+
+    #[test]
+    fn randomized_delta_round_trips() {
+        // Exercise find_match across many source/target pairs with repetition
+        // and edits, so matches of varied lengths (including across word
+        // boundaries) are produced and applied back.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        for _ in 0..50 {
+            let pool_lines = 4 + (next() % 12) as usize;
+            let pool: Vec<Vec<u8>> = (0..pool_lines)
+                .map(|_| {
+                    let len = 8 + (next() % 60) as usize;
+                    (0..len).map(|_| next() as u8).collect()
+                })
+                .collect();
+            let mut source = Vec::new();
+            for _ in 0..(20 + next() % 60) {
+                source.extend_from_slice(&pool[next() as usize % pool.len()]);
+            }
+            // target reuses the pool with a few mutations
+            let mut target = Vec::new();
+            for _ in 0..(20 + next() % 60) {
+                let mut line = pool[next() as usize % pool.len()].clone();
+                if next() % 4 == 0 && !line.is_empty() {
+                    let idx = next() as usize % line.len();
+                    line[idx] ^= 0xff;
+                }
+                target.extend_from_slice(&line);
+            }
+            assert_delta(&source, &target, &[]);
+        }
     }
 
     #[test]
