@@ -64,6 +64,29 @@ optional = true
 default-features = false
 features = ["crypto-openssl"]
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "groupcompress"
+harness = false
+
+[[bench]]
+name = "rabin_delta"
+harness = false
+
+[[bench]]
+name = "chk_map"
+harness = false
+
+[[bench]]
+name = "btree_index"
+harness = false
+
+[[bench]]
+name = "gcvf_read"
+harness = false
+
 [features]
 default = ["pyo3", "weave", "knit", "knitpack"]
 pyo3 = ["dep:pyo3"]

@@ -476,6 +476,27 @@ fn parse_decimal(bytes: &[u8], what: &str) -> Result<usize, Error> {
         .ok_or_else(|| Error::DeserializeError(format!("invalid {}: {:?}", what, bytes)))
 }
 
+/// Split `value` into newline-terminated lines, as if a trailing `\n` had been
+/// appended (so the final line is always terminated). Equivalent to
+/// `split_lines_inclusive(value + b"\n")` but without copying `value` into a
+/// padded buffer first: interior lines borrow nothing, and the last line is the
+/// remaining tail with the synthetic `\n` appended.
+fn value_to_lines(value: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(memchr::memchr_iter(b'\n', value).count() + 1);
+    let mut start = 0;
+    for nl in memchr::memchr_iter(b'\n', value) {
+        out.push(value[start..=nl].to_vec());
+        start = nl + 1;
+    }
+    // The tail after the last newline (or the whole value if it had none) plus
+    // the appended trailing newline.
+    let mut last = Vec::with_capacity(value.len() - start + 1);
+    last.extend_from_slice(&value[start..]);
+    last.push(b'\n');
+    out.push(last);
+    out
+}
+
 /// Build the byte chunks that [`LeafNode.serialise`] would emit before
 /// adding them to a store. `items` must be presented in already-sorted
 /// order (Python sorts `self._items.items()` before walking).
@@ -518,16 +539,15 @@ pub fn serialise_leaf_node(
     };
     let prefix_len = prefix_bytes.len();
     for (key, value) in items {
-        // Python's `osutils.chunks_to_lines([value + b"\n"])` resplits the
-        // value bytes on newlines, ensuring every value line ends in '\n'
-        // except possibly the last (and the trailing b"\n" we appended
-        // guarantees the last one ends in '\n' too).
-        let mut padded = value.to_vec();
-        padded.push(b'\n');
-        let value_lines: Vec<Vec<u8>> = split_lines_inclusive(&padded);
+        // Python's `osutils.chunks_to_lines([value + b"\n"])` splits the value
+        // bytes on newlines so every output chunk is a single line terminated
+        // by '\n' (the trailing b"\n" we append guarantees the last line is
+        // terminated too). Downstream stores reject chunks with embedded
+        // newlines, so the per-line split must be preserved. We split `value`
+        // in place rather than copying it into a padded buffer first.
+        let value_lines = value_to_lines(value);
 
-        let serialised_key = key.join(&b'\x00');
-        let mut header = serialised_key.clone();
+        let mut header = key.join(&b'\x00');
         header.push(b'\x00');
         header.extend_from_slice(format!("{}\n", value_lines.len()).as_bytes());
         if !header.starts_with(prefix_bytes) {
@@ -605,7 +625,7 @@ pub fn leaf_node_key_value_len(key: &[Vec<u8>], value: &[u8]) -> usize {
     } else {
         key.iter().map(Vec::len).sum::<usize>() + (key.len() - 1)
     };
-    let newline_count = value.iter().filter(|&&b| b == b'\n').count();
+    let newline_count = memchr::memchr_iter(b'\n', value).count();
     let newline_count_digits = if newline_count == 0 {
         1
     } else {
@@ -851,8 +871,12 @@ impl LeafNode {
     /// the new key.
     pub fn map_no_split(&mut self, key: Vec<Vec<u8>>, value: Vec<u8>) -> bool {
         self.raw_size += leaf_node_key_value_len(&key, &value);
-        let serialised_key = Key::from(key.clone()).serialize();
-        let search_key = self.search_key_func.apply(&Key::from(key.clone()));
+        // Build one Key view and reuse it for both derivations instead of
+        // cloning `key` twice. This runs once per inventory entry on the CHK
+        // write path (commit/fetch), so the saved clone adds up.
+        let key_obj = Key::from(key.clone());
+        let serialised_key = key_obj.serialize();
+        let search_key = self.search_key_func.apply(&key_obj);
         self.items.insert(key, value);
 
         self.common_serialised_prefix = Some(match self.common_serialised_prefix.take() {
@@ -2183,25 +2207,6 @@ where
     };
     let first = first.as_ref();
     iter.all(|k| k.as_ref() == first)
-}
-
-/// Split `data` into lines, keeping the trailing `\n` on each non-final
-/// line. Mirrors `osutils.chunks_to_lines([b"".join(chunks)])` for a
-/// single chunk input: every `\n` ends a line, and any unterminated
-/// tail becomes its own final line.
-fn split_lines_inclusive(data: &[u8]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, &b) in data.iter().enumerate() {
-        if b == b'\n' {
-            out.push(data[start..=i].to_vec());
-            start = i + 1;
-        }
-    }
-    if start < data.len() {
-        out.push(data[start..].to_vec());
-    }
-    out
 }
 
 #[test]
