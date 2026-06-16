@@ -291,7 +291,7 @@ fn rust_to_py_multiparent<'py>(py: Python<'py>, mp: &MultiParent) -> PyResult<Bo
 /// Rust [`MultiParent`].
 fn py_multiparent_to_rust(diff: &Bound<'_, PyAny>) -> PyResult<MultiParent> {
     let hunks = diff.getattr("hunks")?;
-    let hunks = hunks.downcast::<PyList>()?;
+    let hunks = hunks.cast::<PyList>()?;
     py_hunks_to_rust(hunks)
 }
 
@@ -568,7 +568,7 @@ impl NewText {
     }
 
     fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let Ok(other) = other.downcast::<NewText>() else {
+        let Ok(other) = other.cast::<NewText>() else {
             return Ok(false);
         };
         self.lines.bind(py).eq(&other.borrow().lines)
@@ -624,7 +624,7 @@ impl ParentText {
     }
 
     fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
-        match other.downcast::<ParentText>() {
+        match other.cast::<ParentText>() {
             Ok(o) => {
                 let o = o.borrow();
                 self.parent == o.parent
@@ -675,7 +675,7 @@ impl PyMultiParent {
     fn new(py: Python<'_>, hunks: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
         let hunks = match hunks {
             Some(h) if !h.is_none() => {
-                if let Ok(list) = h.downcast::<PyList>() {
+                if let Ok(list) = h.cast::<PyList>() {
                     list.clone().unbind()
                 } else {
                     // Accept any iterable, materialising into a list.
@@ -696,7 +696,7 @@ impl PyMultiParent {
     }
 
     fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let Ok(other) = other.downcast::<PyMultiParent>() else {
+        let Ok(other) = other.cast::<PyMultiParent>() else {
             return Ok(false);
         };
         self.hunks.bind(py).eq(&other.borrow().hunks)
@@ -743,7 +743,7 @@ impl PyMultiParent {
                 let mut out = Vec::new();
                 for p in ps.try_iter()? {
                     let p = p?;
-                    let bytes = p.downcast::<PyBytes>()?;
+                    let bytes = p.cast::<PyBytes>()?;
                     out.push(split_readlines(bytes.as_bytes()));
                 }
                 out
@@ -807,7 +807,7 @@ impl PyMultiParent {
     ) -> PyResult<Bound<'py, PyList>> {
         let out = PyList::empty(py);
         for hunk in self.hunks_list(py).iter() {
-            if let Ok(pt) = hunk.downcast::<ParentText>() {
+            if let Ok(pt) = hunk.cast::<ParentText>() {
                 let pt = pt.borrow();
                 if pt.parent == parent {
                     out.append((pt.parent_pos, pt.child_pos, pt.num_lines))?;
@@ -827,12 +827,12 @@ impl PyMultiParent {
         let mut start: usize = 0;
         for hunk in self.hunks_list(py).iter() {
             let (start_v, end, kind, data): (usize, usize, &str, Py<PyAny>) =
-                if let Ok(nt) = hunk.downcast::<NewText>() {
+                if let Ok(nt) = hunk.cast::<NewText>() {
                     let lines = nt.borrow().lines.bind(py).clone();
                     let len = lines.len()?;
                     (start, start + len, "new", lines.unbind())
                 } else {
-                    let pt = hunk.downcast::<ParentText>()?.borrow();
+                    let pt = hunk.cast::<ParentText>()?.borrow();
                     let s = pt.child_pos;
                     let data = (pt.parent, pt.parent_pos, pt.parent_pos + pt.num_lines)
                         .into_pyobject(py)?;
@@ -856,7 +856,7 @@ impl PyMultiParent {
                 let mut out = Vec::new();
                 for p in ps.try_iter()? {
                     let p = p?;
-                    let bytes = p.downcast::<PyBytes>()?;
+                    let bytes = p.cast::<PyBytes>()?;
                     out.push(split_readlines(bytes.as_bytes()));
                 }
                 out
@@ -931,7 +931,7 @@ fn extract_lines(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     for line in obj.try_iter()? {
         let line = line?;
-        out.push(line.downcast::<PyBytes>()?.as_bytes().to_vec());
+        out.push(line.cast::<PyBytes>()?.as_bytes().to_vec());
     }
     Ok(out)
 }

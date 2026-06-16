@@ -2184,10 +2184,10 @@ impl PyAnnotatedKnitContent {
 
 /// Extract plain text lines from a `PyAnnotatedKnitContent` or `PyPlainKnitContent`.
 fn extract_content_text(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u8>>> {
-    if let Ok(annotated) = obj.downcast::<PyAnnotatedKnitContent>() {
+    if let Ok(annotated) = obj.cast::<PyAnnotatedKnitContent>() {
         return Ok(annotated.borrow().0.text());
     }
-    if let Ok(plain) = obj.downcast::<PyPlainKnitContent>() {
+    if let Ok(plain) = obj.cast::<PyPlainKnitContent>() {
         return Ok(plain.borrow().0.text());
     }
     // Fallback for other content objects: call .text() and extract bytes.
@@ -2354,17 +2354,17 @@ impl PyPlainKnitContent {
 /// of bytes (key tuple), in which case the last element is taken — matching
 /// the breezy convention that `key[-1]` is the bare revision id.
 fn extract_version_id(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-    if let Ok(b) = obj.downcast::<PyBytes>() {
+    if let Ok(b) = obj.cast::<PyBytes>() {
         return Ok(b.as_bytes().to_vec());
     }
-    if let Ok(t) = obj.downcast::<PyTuple>() {
+    if let Ok(t) = obj.cast::<PyTuple>() {
         let len = t.len();
         if len == 0 {
             return Err(PyValueError::new_err("version_id tuple must be non-empty"));
         }
         let last = t.get_item(len - 1)?;
         return last
-            .downcast::<PyBytes>()
+            .cast::<PyBytes>()
             .map(|b| b.as_bytes().to_vec())
             .map_err(|_| PyValueError::new_err("version_id tuple elements must be bytes"));
     }
@@ -5265,7 +5265,7 @@ fn extract_py_knit_key_or_bytes(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::knit
 
 fn extract_py_knit_key(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::knit::KnitKey> {
     let tup = obj
-        .downcast::<PyTuple>()
+        .cast::<PyTuple>()
         .map_err(|_| PyValueError::new_err("knit key must be a tuple of bytes"))?;
     let mut key = Vec::with_capacity(tup.len());
     for item in tup.iter() {
@@ -5281,7 +5281,7 @@ fn extract_py_knit_key(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::knit::KnitKey
 /// Returns `(key, true)` when the last element was `None` (auto-generate).
 fn extract_py_knit_key_autogen(obj: &Bound<'_, PyAny>) -> PyResult<(bazaar::knit::KnitKey, bool)> {
     let tup = obj
-        .downcast::<PyTuple>()
+        .cast::<PyTuple>()
         .map_err(|_| PyValueError::new_err("knit key must be a tuple of bytes"))?;
     let mut key = Vec::with_capacity(tup.len());
     let mut autogen = false;

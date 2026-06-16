@@ -3624,14 +3624,14 @@ impl PyMPDiffGenerator {
             key_set.add(k?)?;
         }
         let parent_map = vf.call_method1("get_parent_map", (&key_set,))?;
-        let parent_map = parent_map.downcast::<PyDict>()?;
+        let parent_map = parent_map.cast::<PyDict>()?;
         slf.setattr("parent_map", parent_map)?;
         let module = py.import("bzrformats._bzr_rs.versionedfile")?;
         let res = module
             .getattr("mpdiff_first_pass")?
             .call1((&ordered_keys, parent_map))?;
-        let needed_keys = res.get_item(0)?.downcast_into::<PySet>()?;
-        let refcounts = res.get_item(1)?.downcast_into::<PyDict>()?;
+        let needed_keys = res.get_item(0)?.cast_into::<PySet>()?;
+        let refcounts = res.get_item(1)?.cast_into::<PyDict>()?;
         let just_parents = res.get_item(2)?;
         let missing_keys = res.get_item(3)?;
         if missing_keys.is_truthy()? {
@@ -3667,7 +3667,7 @@ impl PyMPDiffGenerator {
             .getattr("from_lines")?
             .call1((lines, parent_lines, py.None()))?;
         slf.getattr("diffs")?
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .set_item(&key, diff)?;
         Ok(())
     }
@@ -3679,11 +3679,11 @@ impl PyMPDiffGenerator {
     ) -> PyResult<()> {
         let py = slf.py();
         let parent_map = slf.getattr("parent_map")?;
-        let parent_map = parent_map.downcast::<PyDict>()?;
+        let parent_map = parent_map.cast::<PyDict>()?;
         let refcounts = slf.getattr("refcounts")?;
-        let refcounts = refcounts.downcast::<PyDict>()?;
+        let refcounts = refcounts.cast::<PyDict>()?;
         let chunks = slf.getattr("chunks")?;
-        let chunks = chunks.downcast::<PyDict>()?;
+        let chunks = chunks.cast::<PyDict>()?;
         let osutils = py.import("bzrformats.osutils")?;
         let chunks_to_lines = osutils.getattr("chunks_to_lines")?;
         let mut this_chunks = this_chunks;
@@ -3725,7 +3725,7 @@ impl PyMPDiffGenerator {
         py.import("builtins")?
             .getattr("list")?
             .call1((diffs,))?
-            .downcast_into::<PyList>()
+            .cast_into::<PyList>()
             .map_err(Into::into)
     }
 }
@@ -4032,7 +4032,7 @@ impl PyThunkedVersionedFiles {
         let result = PyDict::new(py);
         for (prefix, suffixes, vf) in Self::iter_keys_vf(slf, &keys)? {
             let parent_map = vf.call_method1("get_parent_map", (&suffixes,))?;
-            let parent_map = parent_map.downcast::<PyDict>()?;
+            let parent_map = parent_map.cast::<PyDict>()?;
             for (k, parents) in parent_map.iter() {
                 let new_key = prefix.call_method1("__add__", (PyTuple::new(py, [&k])?,))?;
                 let new_parents = PyList::empty(py);
@@ -4089,7 +4089,7 @@ impl PyThunkedVersionedFiles {
         let result = PyDict::new(py);
         for (prefix, suffixes, vf) in Self::iter_keys_vf(slf, &keys)? {
             let vf_sha1s = vf.call_method1("get_sha1s", (&suffixes,))?;
-            let vf_sha1s = vf_sha1s.downcast::<PyDict>()?;
+            let vf_sha1s = vf_sha1s.cast::<PyDict>()?;
             for (suffix, sha1) in vf_sha1s.iter() {
                 let new_key = prefix.call_method1("__add__", (PyTuple::new(py, [suffix])?,))?;
                 result.set_item(new_key, sha1)?;
@@ -4339,10 +4339,10 @@ impl PyPlanMergeVersionedFile {
             .getattr("tuple")?
             .call1((&parents,))?;
         slf.getattr("_parents")?
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .set_item(&key, parents_tuple)?;
         slf.getattr("_lines")?
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .set_item(&key, lines)?;
         Ok(py.None().into_bound(py))
     }
@@ -4357,9 +4357,9 @@ impl PyPlanMergeVersionedFile {
         let py = slf.py();
         let out = PyList::empty(py);
         let lines_map = slf.getattr("_lines")?;
-        let lines_map = lines_map.downcast::<PyDict>()?;
+        let lines_map = lines_map.cast::<PyDict>()?;
         let parents_map = slf.getattr("_parents")?;
-        let parents_map = parents_map.downcast::<PyDict>()?;
+        let parents_map = parents_map.cast::<PyDict>()?;
         // pending = set(keys); locally-held keys yield ChunkedContentFactory.
         let pending = PySet::empty(py)?;
         for k in keys.try_iter()? {
@@ -4443,7 +4443,7 @@ impl PyPlanMergeVersionedFile {
             .items()
             .iter()
             .map(|it| {
-                let t = it.downcast::<PyTuple>().unwrap();
+                let t = it.cast::<PyTuple>().unwrap();
                 (t.get_item(0).unwrap(), t.get_item(1).unwrap())
             })
             .collect();

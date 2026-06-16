@@ -2303,7 +2303,7 @@ impl CHKInventory {
     /// underlying CHKMaps. Mirrors Python's `__eq__`.
     fn __eq__<'py>(&self, py: Python<'py>, other: Bound<'py, PyAny>) -> PyResult<bool> {
         // Only equal to another CHKInventory.
-        let other_ref = match other.downcast::<CHKInventory>() {
+        let other_ref = match other.cast::<CHKInventory>() {
             Ok(o) => o,
             Err(_) => return Ok(false),
         };
@@ -3418,7 +3418,7 @@ impl CHKInventory {
         let args = PyTuple::new(py, [PyBytes::new(py, &search_key_name)])?;
         let inv_obj = cls.call1(args)?;
         {
-            let inv_cell = inv_obj.downcast::<CHKInventory>()?;
+            let inv_cell = inv_obj.cast::<CHKInventory>()?;
             let mut inv = inv_cell.borrow_mut();
             inv.root_id = Some(FileId::from(root_id.as_slice()));
             inv.revision_id = Some(RevisionId::from(revision_id.as_slice()));
@@ -3453,7 +3453,7 @@ impl CHKInventory {
             let file_id = entry.getattr("file_id")?.cast_into::<PyBytes>()?;
             let key_tuple = PyTuple::new(py, [&file_id])?;
             // Serialise the entry to bytes.
-            let entry_inner = entry.downcast::<InventoryEntry>()?;
+            let entry_inner = entry.cast::<InventoryEntry>()?;
             let entry_borrow = entry_inner.borrow();
             let bytes_val = chk_inventory_entry_to_bytes(py, &entry_borrow)?;
             id_to_entry_dict.set_item(key_tuple, &bytes_val)?;
@@ -3476,7 +3476,7 @@ impl CHKInventory {
         let args = PyTuple::new(py, [PyBytes::new(py, search_key_name)])?;
         let inv_obj = cls.call1(args)?;
         {
-            let inv_cell = inv_obj.downcast::<CHKInventory>()?;
+            let inv_cell = inv_obj.cast::<CHKInventory>()?;
             let mut inv = inv_cell.borrow_mut();
             inv.root_id = if root_id.is_none() {
                 None
@@ -3492,7 +3492,7 @@ impl CHKInventory {
             };
         }
         {
-            let inv_cell = inv_obj.downcast::<CHKInventory>()?;
+            let inv_cell = inv_obj.cast::<CHKInventory>()?;
             inv_cell.borrow_mut().populate_from_dicts(
                 py,
                 &chk_store,
@@ -3542,7 +3542,7 @@ impl CHKInventory {
         // Create the new (empty) Inventory; seed with the root.
         let inv_cls = py.get_type::<Inventory>();
         let inv_obj = inv_cls.call1((py.None(),))?;
-        let other = inv_obj.downcast::<Inventory>()?.clone();
+        let other = inv_obj.cast::<Inventory>()?.clone();
         let root_attr = slf.getattr("root")?;
         let root_revision = root_attr.getattr("revision")?;
         let root_id_obj = match slf.borrow().root_id.as_ref() {
@@ -3918,7 +3918,7 @@ impl CHKInventory {
         let cls = slf.get_type();
         let search_key_name_bytes = PyBytes::new(py, &slf.borrow().search_key_name).into_any();
         let result_obj = cls.call1((search_key_name_bytes,))?;
-        let result = result_obj.downcast::<CHKInventory>()?.clone();
+        let result = result_obj.cast::<CHKInventory>()?.clone();
         if propagate_caches {
             let pf = slf
                 .borrow()
@@ -4029,7 +4029,7 @@ impl CHKInventory {
                 (py.None(), py.None())
             } else {
                 let nk = PyTuple::new(py, [&file_id])?.into_any().unbind();
-                let entry_inner = entry.downcast::<InventoryEntry>()?.borrow();
+                let entry_inner = entry.cast::<InventoryEntry>()?.borrow();
                 let nv = chk_inventory_entry_to_bytes(py, &entry_inner)?
                     .into_any()
                     .unbind();

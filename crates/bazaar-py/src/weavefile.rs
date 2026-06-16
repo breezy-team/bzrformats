@@ -81,7 +81,7 @@ fn _read_weave_v5<'py>(
     let close_result = f.call_method0("close");
     let data = read_result?;
     close_result?;
-    let bytes: &[u8] = data.downcast::<PyBytes>()?.as_bytes();
+    let bytes: &[u8] = data.cast::<PyBytes>()?.as_bytes();
     w.call_method1("_load_from_v5_bytes", (bytes,))?;
     Ok(w)
 }
