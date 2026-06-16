@@ -3,6 +3,10 @@
 //! Texts are generated deterministically (no rng) so benchmark runs are
 //! comparable across machines and over time.
 
+// Each bench binary compiles this module independently and uses a different
+// subset of the fixtures, so some appear unused per binary.
+#![allow(dead_code)]
+
 /// A pseudo-source-file of `lines` lines, seeded by `seed`. Lines repeat in a
 /// way that gives realistic redundancy without being trivially compressible.
 pub fn make_text(seed: u64, lines: usize) -> Vec<u8> {
