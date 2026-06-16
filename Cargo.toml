@@ -6,9 +6,14 @@ resolver = "2"
 version = "3.5.0"
 
 [workspace.dependencies]
-nix = ">=0.26"
-pyo3 = "0.28"
+nix = ">=0.26,<0.32"
+patiencediff = "0.3"
+pyo3 = ">=0.28,<0.30"
 pyo3-filelike = "0.5.0"
 pyo3-log = "0.13.3"
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+sha1 = ">=0.10,<0.12"
+chrono = { version = "0.4", default-features = false, features = [
+	"std",
+	"clock",
+] }
 log = "0.4"

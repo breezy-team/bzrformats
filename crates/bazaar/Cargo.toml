@@ -16,12 +16,12 @@ repository = "https://github.com/breezy-team/bzrformats"
 [dependencies]
 lazy_static = "1.4.0"
 regex = "1.3.1"
-fancy-regex = ">=0.7"
+fancy-regex = ">=0.7,<0.19"
 chrono = { workspace = true }
 bendy = "0.6"
 xmltree = "0.12"
-sha1 = "0.11"
-md-5 = "0.10"
+sha1 = { workspace = true }
+md-5 = ">=0.10,<0.12"
 tempfile = "3"
 log = "0.4"
 pyo3 = { workspace = true, optional = true }
@@ -33,7 +33,7 @@ byteorder = "1.5.0"
 lru = "0.18.0"
 flate2 = { version = "1.0.28", default-features = false, features = ["zlib"] }
 xz2 = "0.1.7"
-patiencediff = { version = "0.2.1", default-features = false }
+patiencediff = { workspace = true, default-features = false }
 vcs-graph = "3.5.0"
 adler = "1.0.2"
 memchr = "2.8.1"
@@ -96,6 +96,6 @@ pyo3 = ["dep:pyo3"]
 gpg = ["dep:sequoia-openpgp"]
 # Older-generation repository backends, each gating its reader/writer and
 # format declarations. The current 2a (groupcompress) format is always built.
-weave = []     # all-in-one weave repository (bzr 0.8)
-knit = []      # non-pack knit repository (Bazaar-NG Knit Format 1)
-knitpack = []  # knit-pack repositories (0.92 through 1.14)
+weave = []    # all-in-one weave repository (bzr 0.8)
+knit = []     # non-pack knit repository (Bazaar-NG Knit Format 1)
+knitpack = [] # knit-pack repositories (0.92 through 1.14)
