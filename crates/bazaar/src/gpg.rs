@@ -64,6 +64,7 @@ pub fn clearsign(plaintext: &[u8], cert_bytes: &[u8]) -> Result<Vec<u8>, SignErr
         let message = Message::new(&mut sink);
         // The cleartext signature framework produces its own armor framing.
         let mut signer = Signer::new(message, keypair)
+            .map_err(|e| SignError::Sign(e.to_string()))?
             .cleartext()
             .build()
             .map_err(|e| SignError::Sign(e.to_string()))?;
