@@ -7,14 +7,14 @@ edition = "2018"
 crate-type = ["cdylib"]
 
 [dependencies]
-bazaar = { path = "../bazaar", features=["pyo3"] }
-patiencediff = { version = "0.2.1", default-features = false }
-pyo3 = { workspace = true, features = ["extension-module", "chrono"]}
+bazaar = { path = "../bazaar", features = ["pyo3"] }
+patiencediff = { workspace = true, default-features = false }
+pyo3 = { workspace = true, features = ["extension-module", "chrono"] }
 pyo3-filelike = { workspace = true }
 pyo3-log = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
-sha1 = "0.10"
+sha1 = { workspace = true }
 vcs-graph = "3.5.0"
 walkdir = "2"
 indexmap = "2"
