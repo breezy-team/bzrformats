@@ -3483,7 +3483,6 @@ where
 /// `pub(crate)`) so it's invisible at link time.
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::*;
 
     /// Minimal in-memory `VersionedFiles` for round-tripping pages.
     /// `add_lines` hashes content with sha1 and stores under the bare

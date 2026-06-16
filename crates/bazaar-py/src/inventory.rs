@@ -2176,8 +2176,8 @@ impl CHKInventory {
         pyo3::types::PyBytes::new(py, &self.search_key_name)
     }
 
-    #[setter]
-    fn set__search_key_name(&mut self, value: &[u8]) {
+    #[setter(_search_key_name)]
+    fn set_search_key_name(&mut self, value: &[u8]) {
         self.search_key_name = value.to_vec();
     }
 
@@ -2262,8 +2262,8 @@ impl CHKInventory {
         self.fileid_to_entry_cache.bind(py).clone()
     }
 
-    #[setter]
-    fn set__fileid_to_entry_cache(&mut self, value: Bound<'_, pyo3::types::PyDict>) {
+    #[setter(_fileid_to_entry_cache)]
+    fn set_fileid_to_entry_cache(&mut self, value: Bound<'_, pyo3::types::PyDict>) {
         self.fileid_to_entry_cache = value.unbind();
     }
 
@@ -2272,8 +2272,8 @@ impl CHKInventory {
         self.fully_cached
     }
 
-    #[setter]
-    fn set__fully_cached(&mut self, value: bool) {
+    #[setter(_fully_cached)]
+    fn set_fully_cached(&mut self, value: bool) {
         self.fully_cached = value;
     }
 
@@ -2282,8 +2282,8 @@ impl CHKInventory {
         self.path_to_fileid_cache.bind(py).clone()
     }
 
-    #[setter]
-    fn set__path_to_fileid_cache(&mut self, value: Bound<'_, pyo3::types::PyDict>) {
+    #[setter(_path_to_fileid_cache)]
+    fn set_path_to_fileid_cache(&mut self, value: Bound<'_, pyo3::types::PyDict>) {
         self.path_to_fileid_cache = value.unbind();
     }
 
@@ -2292,8 +2292,8 @@ impl CHKInventory {
         self.children_cache.bind(py).clone()
     }
 
-    #[setter]
-    fn set__children_cache(&mut self, value: Bound<'_, pyo3::types::PyDict>) {
+    #[setter(_children_cache)]
+    fn set_children_cache(&mut self, value: Bound<'_, pyo3::types::PyDict>) {
         self.children_cache = value.unbind();
     }
 

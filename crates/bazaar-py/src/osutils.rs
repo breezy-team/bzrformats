@@ -234,7 +234,7 @@ fn safe_unicode<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Boun
 /// Coerce a str/utf-8-bytes value to utf-8 bytes. Mirrors `osutils.safe_utf8`
 /// (raises TypeError on invalid utf-8 bytes).
 #[pyfunction]
-fn safe_utf8<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+fn safe_utf8<'py>(_py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     if let Ok(b) = value.cast::<PyBytes>() {
         // Validate utf-8, matching the Python guard.
         if std::str::from_utf8(b.as_bytes()).is_err() {

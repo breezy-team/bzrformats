@@ -598,7 +598,11 @@ impl NewText {
 }
 
 /// A reference to a slice of lines present in a parent text.
-#[pyclass(name = "ParentText", module = "bzrformats._bzr_rs.multiparent")]
+#[pyclass(
+    name = "ParentText",
+    module = "bzrformats._bzr_rs.multiparent",
+    skip_from_py_object
+)]
 #[derive(Clone)]
 pub struct ParentText {
     #[pyo3(get, set)]
