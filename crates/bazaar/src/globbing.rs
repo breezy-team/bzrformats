@@ -31,7 +31,10 @@ pub enum Replacement {
     Closure(Box<dyn FnMut(String) -> String + Sync + Send>),
 }
 
-// TODO(jelmer): Consider using RegexSet from the regex crate instead.
+// The regex crate's RegexSet only reports which patterns matched, not their
+// spans, so it cannot drive per-pattern substitution; the single-alternation
+// approach below is what makes replace_all able to pick the right replacement.
+// The patterns also come from breezy and may use fancy-regex features.
 
 /// Do a multiple-pattern substitution.
 ///

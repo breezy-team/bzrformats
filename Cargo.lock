@@ -129,6 +129,7 @@ dependencies = [
  "memchr",
  "nix",
  "patiencediff",
+ "percent-encoding",
  "pyo3",
  "rand",
  "regex",
@@ -1262,6 +1263,12 @@ name = "patiencediff"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c707262dd66fabcb1b2b79f2d65e2a1f8abb7e31005e882504c99680e009225"
+
+[[package]]
+name = "percent-encoding"
+version = "2.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "petgraph"
