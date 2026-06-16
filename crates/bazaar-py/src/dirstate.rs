@@ -2812,7 +2812,7 @@ impl PyDirState {
     ) -> PyResult<()> {
         // Accept either `str` (the canonical shape) or `bytes` (a few
         // legacy callers still pass utf-8 bytes for `path`).
-        let path_owned: String = if let Ok(b) = path.downcast::<PyBytes>() {
+        let path_owned: String = if let Ok(b) = path.cast::<PyBytes>() {
             String::from_utf8(b.as_bytes().to_vec())
                 .map_err(|e| PyTypeError::new_err(format!("path is not valid utf-8: {e}")))?
         } else {
@@ -4439,12 +4439,12 @@ impl DirstateInventoryChange {
         py: Python<'_>,
         other: Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        if let Ok(other_ref) = other.downcast::<DirstateInventoryChange>() {
+        if let Ok(other_ref) = other.cast::<DirstateInventoryChange>() {
             let a = slf._as_tuple(py)?;
             let b = other_ref.borrow()._as_tuple(py)?;
             return Ok(a.eq(b)?.into_pyobject(py)?.to_owned().into_any().unbind());
         }
-        if other.downcast::<PyTuple>().is_ok() {
+        if other.cast::<PyTuple>().is_ok() {
             let a = slf._as_tuple(py)?;
             return Ok(a
                 .eq(other)?

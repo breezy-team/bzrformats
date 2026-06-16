@@ -126,7 +126,7 @@ pub fn supports_symlinks(path: PathBuf) -> Option<bool> {
 
 /// Extract the utf-8 bytes of a str-or-bytes value (str is encoded utf-8).
 fn str_or_bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-    if let Ok(b) = value.downcast::<PyBytes>() {
+    if let Ok(b) = value.cast::<PyBytes>() {
         Ok(b.as_bytes().to_vec())
     } else {
         let s: String = value.extract()?;
@@ -163,7 +163,7 @@ fn sha_file<'py>(py: Python<'py>, file_obj: Bound<'py, PyAny>) -> PyResult<Bound
     let mut hasher = Sha1::new();
     loop {
         let chunk = file_obj.call_method1("read", (65536,))?;
-        let bytes = chunk.downcast::<PyBytes>()?.as_bytes();
+        let bytes = chunk.cast::<PyBytes>()?.as_bytes();
         if bytes.is_empty() {
             break;
         }
@@ -178,7 +178,7 @@ fn sha_file<'py>(py: Python<'py>, file_obj: Bound<'py, PyAny>) -> PyResult<Bound
 /// the str-vs-bytes type of `path`. Mirrors `osutils.splitpath`.
 #[pyfunction]
 fn splitpath<'py>(py: Python<'py>, path: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
-    if let Ok(b) = path.downcast::<PyBytes>() {
+    if let Ok(b) = path.cast::<PyBytes>() {
         let mut data = b.as_bytes();
         if data.first() == Some(&b'/') {
             data = &data[1..];
@@ -234,8 +234,8 @@ fn safe_unicode<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Boun
 /// Coerce a str/utf-8-bytes value to utf-8 bytes. Mirrors `osutils.safe_utf8`
 /// (raises TypeError on invalid utf-8 bytes).
 #[pyfunction]
-fn safe_utf8<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-    if let Ok(b) = value.downcast::<PyBytes>() {
+fn safe_utf8<'py>(_py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    if let Ok(b) = value.cast::<PyBytes>() {
         // Validate utf-8, matching the Python guard.
         if std::str::from_utf8(b.as_bytes()).is_err() {
             return Err(PyTypeError::new_err(value.unbind()));
@@ -259,7 +259,7 @@ impl PyIterableFile {
         match self.iter.bind(py).call_method0("__next__") {
             Ok(chunk) => {
                 self.buf
-                    .extend_from_slice(chunk.downcast::<PyBytes>()?.as_bytes());
+                    .extend_from_slice(chunk.cast::<PyBytes>()?.as_bytes());
                 Ok(true)
             }
             Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => Ok(false),

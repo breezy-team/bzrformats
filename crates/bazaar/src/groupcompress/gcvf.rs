@@ -926,7 +926,6 @@ where
         &self,
         keys: &[GcKey],
     ) -> Result<std::collections::HashMap<GcKey, Vec<u8>>, crate::knit::KnitError> {
-        use crate::versionedfile::ContentFactory;
         let mut out = std::collections::HashMap::new();
         for record in self.get_record_stream(keys, "unordered")? {
             if record.storage_kind() == "absent" {
@@ -976,7 +975,6 @@ where
         impl Iterator<Item = Result<(Vec<u8>, GcKey), crate::knit::KnitError>>,
         crate::knit::KnitError,
     > {
-        use crate::versionedfile::ContentFactory;
         let records = self.get_record_stream(keys, "unordered")?;
         Ok(records.into_iter().flat_map(|record| {
             if record.storage_kind() == "absent" {
@@ -1000,7 +998,6 @@ where
     ///
     /// Mirrors `GroupCompressVersionedFiles.check` with `keys=None`.
     pub fn check(&self) -> Result<(), crate::knit::KnitError> {
-        use crate::versionedfile::ContentFactory;
         let all_keys = self.keys()?;
         for record in self.get_record_stream(&all_keys, "unordered")? {
             if record.storage_kind() == "absent" {
@@ -1498,7 +1495,6 @@ mod tests {
     #[test]
     fn get_record_stream_extracts_records_from_a_block() {
         use crate::groupcompress::compressor::{GroupCompressor, RabinGroupCompressor};
-        use crate::versionedfile::ContentFactory;
 
         // Compress two records into one block, capturing their positions.
         let mut gc = RabinGroupCompressor::new(None);
@@ -1569,7 +1565,6 @@ mod tests {
 
     #[test]
     fn get_record_stream_yields_absent_for_missing_keys() {
-        use crate::versionedfile::ContentFactory;
         let access = MockAccess {
             blocks: std::collections::HashMap::new(),
             fetched: std::cell::RefCell::new(Vec::new()),

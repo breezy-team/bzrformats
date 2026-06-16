@@ -215,7 +215,6 @@ impl Transport for FileTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -351,7 +350,7 @@ mod tests {
         let mut transport = FileTransport::new(&path);
         let provider: Box<dyn crate::dirstate::SHA1Provider + Send + Sync> =
             Box::new(crate::dirstate::DefaultSHA1Provider::new());
-        let mut state =
+        let state =
             crate::dirstate::DirState::initialize(&mut transport, path.clone(), provider).unwrap();
         assert_eq!(state.parents, Vec::<Vec<u8>>::new());
         assert_eq!(state.dirblocks.len(), 2);

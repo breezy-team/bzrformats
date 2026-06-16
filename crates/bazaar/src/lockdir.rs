@@ -403,7 +403,7 @@ mod tests {
         let mut b = LockDir::new(&t, "test_lock");
         match b.attempt_lock() {
             Err(LockError::AlreadyHeld) => {}
-            other => panic!("expected AlreadyHeld, got {other:?}"),
+            other => panic!("expected AlreadyHeld, got {:?}", other.err()),
         }
         assert!(!b.is_held());
 
@@ -483,7 +483,10 @@ mod tests {
             Err(LockError::Transport(TransportError::Io { kind, .. })) => {
                 assert_eq!(kind, std::io::ErrorKind::PermissionDenied);
             }
-            other => panic!("expected the underlying transport error, got {other:?}"),
+            other => panic!(
+                "expected the underlying transport error, got {:?}",
+                other.err()
+            ),
         }
         assert!(!lock.is_held());
     }

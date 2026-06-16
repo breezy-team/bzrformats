@@ -1642,11 +1642,13 @@ mod tests {
         for name in &before {
             assert!(
                 t.has(&format!("obsolete_packs/{name}.pack")).unwrap(),
-                "old pack {name} should be obsoleted"
+                "old pack {} should be obsoleted",
+                name
             );
             assert!(
                 !t.has(&format!("packs/{name}.pack")).unwrap(),
-                "old pack {name} should be gone from packs/"
+                "old pack {} should be gone from packs/",
+                name
             );
         }
 

@@ -163,7 +163,7 @@ mod tests {
     fn empty_bytes_is_not_an_index() {
         match BTreeGraphIndex::from_bytes(b"not an index") {
             Err(IndexError::Parse(BTreeIndexError::BadSignature)) => {}
-            other => panic!("expected BadSignature, got {other:?}"),
+            other => panic!("expected BadSignature, got {:?}", other.err()),
         }
     }
 
@@ -189,7 +189,7 @@ mod tests {
 
         match BTreeGraphIndex::from_bytes(&data) {
             Err(IndexError::Parse(_)) => {}
-            other => panic!("expected a parse error, got {other:?}"),
+            other => panic!("expected a parse error, got {:?}", other.err()),
         }
     }
 }

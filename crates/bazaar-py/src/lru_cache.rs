@@ -654,7 +654,7 @@ pub struct FifoCache {
 
 impl FifoCache {
     fn dict<'py>(slf: &Bound<'py, Self>) -> Bound<'py, PyDict> {
-        slf.clone().into_any().downcast_into::<PyDict>().unwrap()
+        slf.clone().into_any().cast_into::<PyDict>().unwrap()
     }
 
     /// Drop a key from the dict and fire its cleanup callback if any.

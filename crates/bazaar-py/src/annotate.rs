@@ -75,7 +75,7 @@ impl VersionedFileAnnotator {
     ) -> PyResult<()> {
         let _ = key;
         let needed = Self::attr(slf, "_num_needed_children")?;
-        let needed = needed.downcast::<PyDict>()?;
+        let needed = needed.cast::<PyDict>()?;
         for parent_key in parent_keys.try_iter()? {
             let parent_key = parent_key?;
             match needed.get_item(&parent_key)? {
@@ -98,16 +98,16 @@ impl VersionedFileAnnotator {
     ) -> PyResult<(Bound<'py, PySet>, Bound<'py, PySet>)> {
         let py = slf.py();
         let parent_map = Self::attr(slf, "_parent_map")?;
-        let parent_map = parent_map.downcast::<PyDict>()?;
+        let parent_map = parent_map.cast::<PyDict>()?;
         let text_cache = Self::attr(slf, "_text_cache")?;
-        let text_cache = text_cache.downcast::<PyDict>()?;
+        let text_cache = text_cache.cast::<PyDict>()?;
         let annotations_cache = Self::attr(slf, "_annotations_cache")?;
-        let annotations_cache = annotations_cache.downcast::<PyDict>()?;
+        let annotations_cache = annotations_cache.cast::<PyDict>()?;
         let vf = Self::attr(slf, "_vf")?;
 
         // One extra copy of the node we are looking at when we are done.
         let needed_children = Self::attr(slf, "_num_needed_children")?;
-        needed_children.downcast::<PyDict>()?.set_item(&key, 1)?;
+        needed_children.cast::<PyDict>()?.set_item(&key, 1)?;
 
         let vf_keys_needed = PySet::empty(py)?;
         let ann_keys_needed = PySet::empty(py)?;
@@ -134,7 +134,7 @@ impl VersionedFileAnnotator {
             let looked_up = vf.call_method1("get_parent_map", (&parent_lookup,))?;
             next_parent_map.call_method1("update", (looked_up,))?;
             for item in next_parent_map.items().iter() {
-                let item = item.downcast::<PyTuple>()?;
+                let item = item.cast::<PyTuple>()?;
                 let k = item.get_item(0)?;
                 let mut parent_keys = item.get_item(1)?;
                 if parent_keys.is_none() {
@@ -171,7 +171,7 @@ impl VersionedFileAnnotator {
         let (keys, ann_keys) = Self::_get_needed_keys(slf, key)?;
         let vf = Self::attr(slf, "_vf")?;
         let text_cache = Self::attr(slf, "_text_cache")?;
-        let text_cache = text_cache.downcast::<PyDict>()?;
+        let text_cache = text_cache.cast::<PyDict>()?;
         let keys_len = keys.len();
         if let Some(pb) = &pb {
             pb.call_method1("update", ("getting stream", 0, keys_len))?;
@@ -215,12 +215,12 @@ impl VersionedFileAnnotator {
         let py = slf.py();
         let text_cache = Self::attr(slf, "_text_cache")?;
         let parent_lines = text_cache
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .get_item(&parent_key)?
             .ok_or_else(|| PyKeyError::new_err(parent_key.clone().unbind()))?;
         let annotations_cache = Self::attr(slf, "_annotations_cache")?;
         let parent_annotations = annotations_cache
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .get_item(&parent_key)?
             .ok_or_else(|| PyKeyError::new_err(parent_key.clone().unbind()))?;
         let matcher = py
@@ -243,12 +243,12 @@ impl VersionedFileAnnotator {
             "_get_parent_annotations_and_matches",
             (&key, &lines, &parent_key),
         )?;
-        let res = res.downcast::<PyTuple>()?;
+        let res = res.cast::<PyTuple>()?;
         let parent_annotations = res.get_item(0)?;
         let matching_blocks = res.get_item(1)?;
         for block in matching_blocks.try_iter()? {
             let block = block?;
-            let block = block.downcast::<PyTuple>()?;
+            let block = block.cast::<PyTuple>()?;
             let parent_idx: usize = block.get_item(0)?.extract()?;
             let lines_idx: usize = block.get_item(1)?.extract()?;
             let match_len: usize = block.get_item(2)?.extract()?;
@@ -274,7 +274,7 @@ impl VersionedFileAnnotator {
             "_get_parent_annotations_and_matches",
             (&key, &lines, &parent_key),
         )?;
-        let res = res.downcast::<PyTuple>()?;
+        let res = res.cast::<PyTuple>()?;
         let parent_annotations = res.get_item(0)?;
         let matching_blocks = res.get_item(1)?;
 
@@ -283,7 +283,7 @@ impl VersionedFileAnnotator {
         let mut last_res: Option<Bound<'_, PyAny>> = None;
         for block in matching_blocks.try_iter()? {
             let block = block?;
-            let block = block.downcast::<PyTuple>()?;
+            let block = block.cast::<PyTuple>()?;
             let parent_idx: usize = block.get_item(0)?.extract()?;
             let lines_idx: usize = block.get_item(1)?.extract()?;
             let match_len: usize = block.get_item(2)?.extract()?;
@@ -346,12 +346,12 @@ impl VersionedFileAnnotator {
         annotations: Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let annotations_cache = Self::attr(slf, "_annotations_cache")?;
-        let annotations_cache = annotations_cache.downcast::<PyDict>()?;
+        let annotations_cache = annotations_cache.cast::<PyDict>()?;
         annotations_cache.set_item(&key, &annotations)?;
         let needed = Self::attr(slf, "_num_needed_children")?;
-        let needed = needed.downcast::<PyDict>()?;
+        let needed = needed.cast::<PyDict>()?;
         let text_cache = Self::attr(slf, "_text_cache")?;
-        let text_cache = text_cache.downcast::<PyDict>()?;
+        let text_cache = text_cache.cast::<PyDict>()?;
         for parent_key in parent_keys.try_iter()? {
             let parent_key = parent_key?;
             let num: i64 = needed
@@ -383,7 +383,7 @@ impl VersionedFileAnnotator {
         }
         let parent_map = Self::attr(slf, "_parent_map")?;
         let parent_keys = parent_map
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .get_item(&key)?
             .ok_or_else(|| PyKeyError::new_err(key.clone().unbind()))?;
         let parents: Vec<Bound<'_, PyAny>> =
@@ -413,14 +413,14 @@ impl VersionedFileAnnotator {
     ) -> PyResult<()> {
         let py = slf.py();
         Self::attr(slf, "_parent_map")?
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .set_item(&key, parent_keys)?;
         let split = py
             .import("bzrformats.osutils")?
             .getattr("split_lines")?
             .call1((text,))?;
         Self::attr(slf, "_text_cache")?
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .set_item(&key, split)?;
         slf.setattr("_heads_provider", py.None())?;
         Ok(())
@@ -437,14 +437,14 @@ impl VersionedFileAnnotator {
         let needed = slf.call_method1("_get_needed_texts", (&key, pb))?;
         for item in needed.try_iter()? {
             let item = item?;
-            let item = item.downcast::<PyTuple>()?;
+            let item = item.cast::<PyTuple>()?;
             let text_key = item.get_item(0)?;
             let text = item.get_item(1)?;
             let num_lines: usize = item.get_item(2)?.extract()?;
             slf.call_method1("_annotate_one", (text_key, text, num_lines))?;
         }
         let annotations_cache = Self::attr(slf, "_annotations_cache")?;
-        let annotations = match annotations_cache.downcast::<PyDict>()?.get_item(&key)? {
+        let annotations = match annotations_cache.cast::<PyDict>()?.get_item(&key)? {
             Some(a) => a,
             None => {
                 let vf = Self::attr(slf, "_vf")?;
@@ -452,7 +452,7 @@ impl VersionedFileAnnotator {
             }
         };
         let lines = Self::attr(slf, "_text_cache")?
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .get_item(&key)?
             .ok_or_else(|| PyKeyError::new_err(key.clone().unbind()))?;
         Ok((annotations, lines))
@@ -519,7 +519,7 @@ impl VersionedFileAnnotator {
             .import("bzrformats.annotate")?
             .getattr("_break_annotation_tie")?;
         let result = slf.call_method1("annotate", (&key,))?;
-        let result = result.downcast::<PyTuple>()?;
+        let result = result.cast::<PyTuple>()?;
         let annotations = result.get_item(0)?;
         let lines = result.get_item(1)?;
         let heads_provider = slf.call_method0("_get_heads_provider")?;
@@ -531,7 +531,7 @@ impl VersionedFileAnnotator {
             .call1((&annotations, &lines))?;
         for pair in zipped.try_iter()? {
             let pair = pair?;
-            let pair = pair.downcast::<PyTuple>()?;
+            let pair = pair.cast::<PyTuple>()?;
             let annotation = pair.get_item(0)?;
             let line = pair.get_item(1)?;
             let head = if annotation.len()? == 1 {

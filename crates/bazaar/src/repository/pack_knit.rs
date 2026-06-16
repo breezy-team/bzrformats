@@ -1342,7 +1342,6 @@ type WriteStore = KnitVersionedFiles<KnitWriteIndex, KnitWriteAccess, KnitPlainF
 
 /// The in-progress new pack for a knit-pack write group.
 struct WriteGroup {
-    pack_name: PackName,
     pack: Arc<Mutex<ContainerWriter<Vec<u8>>>>,
     revisions: WriteStore,
     inventories: WriteStore,
@@ -1375,7 +1374,6 @@ impl WriteGroup {
         let signatures = make(false);
         let texts = make(true);
         Ok(WriteGroup {
-            pack_name: pack_name.to_string(),
             pack,
             revisions,
             inventories,
@@ -1430,7 +1428,6 @@ impl WriteGroup {
         existing: &[(String, Vec<u8>)],
     ) -> Result<String, RepositoryError> {
         let WriteGroup {
-            pack_name: _,
             pack,
             revisions,
             inventories,

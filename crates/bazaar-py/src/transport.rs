@@ -34,11 +34,6 @@ impl PyTransport {
     }
 }
 
-/// Convert a Python error into a [`TransportError`], mapping the
-/// `NoSuchFile` exception class to [`TransportError::NoSuchFile`] and
-/// everything else to [`TransportError::Other`] with the exception's
-/// `repr()`.
-#[allow(dead_code)]
 pyo3::import_exception!(bzrformats._bzr_rs.errors, NoSuchFile);
 mod transport_exc {
     pyo3::import_exception!(bzrformats.transport, NoSuchFile);
@@ -47,6 +42,10 @@ mod dromedary_exc {
     pyo3::import_exception!(dromedary.errors, NoSuchFile);
 }
 
+/// Convert a Python error into a [`TransportError`], mapping the
+/// `NoSuchFile` exception class to [`TransportError::NoSuchFile`] and
+/// everything else to [`TransportError::Other`] with the exception's
+/// `repr()`.
 fn map_py_err(py: Python<'_>, err: PyErr) -> TransportError {
     if err.is_instance_of::<NoSuchFile>(py)
         || err.is_instance_of::<transport_exc::NoSuchFile>(py)
