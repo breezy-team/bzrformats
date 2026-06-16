@@ -1715,7 +1715,7 @@ impl BTreeBuilder {
             // Compare on the underlying `_nodes` dict, matching the
             // Python original's `self._nodes < other._nodes`.
             let a = slf.borrow().nodes.lock().unwrap().clone_ref(py);
-            let b_borrow = other.downcast::<BTreeBuilder>().unwrap().borrow();
+            let b_borrow = other.cast::<BTreeBuilder>().unwrap().borrow();
             let b = b_borrow.nodes.lock().unwrap().clone_ref(py);
             return a.bind(py).lt(b.bind(py));
         }
@@ -2117,7 +2117,7 @@ fn ensure_key_tuple<'py>(
     py: Python<'py>,
     obj: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyTuple>> {
-    if let Ok(t) = obj.downcast::<PyTuple>() {
+    if let Ok(t) = obj.cast::<PyTuple>() {
         return Ok(t.clone());
     }
     // Equivalent to Python's `tuple(obj)`: materialise the iterable. A

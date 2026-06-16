@@ -34,15 +34,15 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 /// `fmt % d` and `repr(...)` never produce a bytes string in error messages.
 fn coerce_bytes<'py>(value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let py = value.py();
-    if let Ok(b) = value.downcast::<PyBytes>() {
+    if let Ok(b) = value.cast::<PyBytes>() {
         // repr() produces a b'...' literal, which is reversible.
         return Ok(b.repr()?.into_any());
     }
-    if let Ok(t) = value.downcast::<PyTuple>() {
+    if let Ok(t) = value.cast::<PyTuple>() {
         let items: PyResult<Vec<_>> = t.iter().map(|i| coerce_bytes(&i)).collect();
         return Ok(PyTuple::new(py, items?)?.into_any());
     }
-    if let Ok(l) = value.downcast::<PyList>() {
+    if let Ok(l) = value.cast::<PyList>() {
         let items: PyResult<Vec<_>> = l.iter().map(|i| coerce_bytes(&i)).collect();
         return Ok(PyList::new(py, items?)?.into_any());
     }
@@ -95,7 +95,7 @@ impl BzrFormatsError {
         slf.setattr("_preformatted_string", slf.py().None())?;
         if let Some(kwds) = kwds {
             for (key, value) in kwds.iter() {
-                slf.setattr(key.downcast::<PyString>()?, value)?;
+                slf.setattr(key.cast::<PyString>()?, value)?;
             }
         }
         Ok(())
@@ -108,10 +108,10 @@ impl BzrFormatsError {
             .ok()
             .filter(|s| !s.is_none());
         if let Some(s) = pre {
-            if let Ok(b) = s.downcast::<PyBytes>() {
+            if let Ok(b) = s.cast::<PyBytes>() {
                 return Ok(b.repr()?.extract()?);
             }
-            if s.downcast::<PyTuple>().is_ok() {
+            if s.cast::<PyTuple>().is_ok() {
                 return Ok(coerce_bytes(&s)?.repr()?.extract()?);
             }
             return s.str()?.extract();
@@ -121,7 +121,7 @@ impl BzrFormatsError {
             let Some(fmt) = fmt else { return Ok(None) };
             let d = PyDict::new(py);
             let inst_dict = slf.getattr("__dict__")?;
-            let inst_dict = inst_dict.downcast::<PyDict>()?;
+            let inst_dict = inst_dict.cast::<PyDict>()?;
             for (k, v) in inst_dict.iter() {
                 d.set_item(k, coerce_bytes(&v)?)?;
             }
@@ -151,7 +151,7 @@ impl BzrFormatsError {
     /// Return format string for this exception or None.
     fn _get_format_string(slf: &Bound<'_, Self>) -> PyResult<Option<Py<PyString>>> {
         match slf.getattr("_fmt") {
-            Ok(v) if !v.is_none() => Ok(Some(v.downcast::<PyString>()?.clone().unbind())),
+            Ok(v) if !v.is_none() => Ok(Some(v.cast::<PyString>()?.clone().unbind())),
             _ => Ok(None),
         }
     }

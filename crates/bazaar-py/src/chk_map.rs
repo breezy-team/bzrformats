@@ -628,8 +628,8 @@ impl LeafNode {
         }
     }
 
-    #[setter]
-    fn set__key(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
+    #[setter(_key)]
+    fn set_key(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
         if value.is_none() {
             self.inner.key = None;
         } else {
@@ -646,8 +646,8 @@ impl LeafNode {
         self.inner.len()
     }
 
-    #[setter]
-    fn set__len(&mut self, value: usize) -> PyResult<()> {
+    #[setter(_len)]
+    fn set_len(&mut self, value: usize) -> PyResult<()> {
         // `_len` mirrors `len(_items)`; the underlying IndexMap is
         // already authoritative. Writes are only accepted when they
         // match what the items dict actually contains, to catch
@@ -667,8 +667,8 @@ impl LeafNode {
         self.inner.maximum_size
     }
 
-    #[setter]
-    fn set__maximum_size(&mut self, value: usize) {
+    #[setter(_maximum_size)]
+    fn set_maximum_size_py(&mut self, value: usize) {
         self.inner.maximum_size = value;
     }
 
@@ -677,8 +677,8 @@ impl LeafNode {
         self.inner.key_width
     }
 
-    #[setter]
-    fn set__key_width(&mut self, value: usize) {
+    #[setter(_key_width)]
+    fn set_key_width(&mut self, value: usize) {
         self.inner.key_width = value;
     }
 
@@ -687,8 +687,8 @@ impl LeafNode {
         self.inner.raw_size
     }
 
-    #[setter]
-    fn set__raw_size(&mut self, value: usize) {
+    #[setter(_raw_size)]
+    fn set_raw_size(&mut self, value: usize) {
         self.inner.raw_size = value;
     }
 
@@ -708,8 +708,8 @@ impl LeafNode {
     }
 
     /// Bulk-replace `_items`. Used by `CHKMap._create_directly`.
-    #[setter]
-    fn set__items(&mut self, value: Bound<'_, PyDict>) -> PyResult<()> {
+    #[setter(_items)]
+    fn set_items(&mut self, value: Bound<'_, PyDict>) -> PyResult<()> {
         let mut items: indexmap::IndexMap<Vec<Vec<u8>>, Vec<u8>> =
             indexmap::IndexMap::with_capacity(value.len());
         for (k, v) in value.iter() {
@@ -736,8 +736,8 @@ impl LeafNode {
         }
     }
 
-    #[setter]
-    fn set__search_prefix(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
+    #[setter(_search_prefix)]
+    fn set_search_prefix(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
         if value.is(unknown_sentinel(py)) {
             self.inner.search_prefix = SearchPrefix::Unknown;
         } else if value.is_none() {
@@ -757,8 +757,8 @@ impl LeafNode {
         }
     }
 
-    #[setter]
-    fn set__common_serialised_prefix(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+    #[setter(_common_serialised_prefix)]
+    fn set_common_serialised_prefix(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
         if value.is_none() {
             self.inner.common_serialised_prefix = None;
         } else {
@@ -783,8 +783,8 @@ impl LeafNode {
         }
     }
 
-    #[setter]
-    fn set__search_key_func(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
+    #[setter(_search_key_func)]
+    fn set_search_key_func(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
         if value.is_none() {
             self.inner.search_key_func = SearchKeyFunc::Plain;
             self.search_key_callable = None;
@@ -1419,8 +1419,8 @@ impl InternalNode {
         }
     }
 
-    #[setter]
-    fn set__key(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+    #[setter(_key)]
+    fn set_key(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
         if value.is_none() {
             self.key = None;
         } else {
@@ -1436,8 +1436,8 @@ impl InternalNode {
         self.len
     }
 
-    #[setter]
-    fn set__len(&mut self, value: usize) {
+    #[setter(_len)]
+    fn set_len(&mut self, value: usize) {
         self.len = value;
     }
 
@@ -1446,8 +1446,8 @@ impl InternalNode {
         self.maximum_size
     }
 
-    #[setter]
-    fn set__maximum_size(&mut self, value: usize) {
+    #[setter(_maximum_size)]
+    fn set_maximum_size_py(&mut self, value: usize) {
         self.maximum_size = value;
     }
 
@@ -1456,8 +1456,8 @@ impl InternalNode {
         self.key_width
     }
 
-    #[setter]
-    fn set__key_width(&mut self, value: usize) {
+    #[setter(_key_width)]
+    fn set_key_width(&mut self, value: usize) {
         self.key_width = value;
     }
 
@@ -1466,8 +1466,8 @@ impl InternalNode {
         self.raw_size
     }
 
-    #[setter]
-    fn set__raw_size(&mut self, value: usize) {
+    #[setter(_raw_size)]
+    fn set_raw_size(&mut self, value: usize) {
         self.raw_size = value;
     }
 
@@ -1476,8 +1476,8 @@ impl InternalNode {
         self.node_width
     }
 
-    #[setter]
-    fn set__node_width(&mut self, value: usize) {
+    #[setter(_node_width)]
+    fn set_node_width(&mut self, value: usize) {
         self.node_width = value;
     }
 
@@ -1490,8 +1490,8 @@ impl InternalNode {
 
     /// Replace `_items` with a fresh dict. Mirrors
     /// `node._items = {...}`.
-    #[setter]
-    fn set__items(&mut self, py: Python<'_>, value: Bound<'_, PyDict>) -> PyResult<()> {
+    #[setter(_items)]
+    fn set_items(&mut self, py: Python<'_>, value: Bound<'_, PyDict>) -> PyResult<()> {
         let new_dict = PyDict::new(py);
         for (k, v) in value.iter() {
             new_dict.set_item(k, v)?;
@@ -1508,8 +1508,8 @@ impl InternalNode {
         }
     }
 
-    #[setter]
-    fn set__search_prefix(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+    #[setter(_search_prefix)]
+    fn set_search_prefix(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
         if value.is_none() {
             self.search_prefix = None;
         } else {
@@ -1530,8 +1530,8 @@ impl InternalNode {
         }
     }
 
-    #[setter]
-    fn set__search_key_func(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
+    #[setter(_search_key_func)]
+    fn set_search_key_func(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
         if value.is_none() {
             self.search_key_func = SearchKeyFunc::Plain;
             self.search_key_callable = None;
@@ -2589,8 +2589,8 @@ impl CHKMap {
         self.store.clone_ref(py)
     }
 
-    #[setter]
-    fn set__store(&mut self, value: Bound<'_, PyAny>) {
+    #[setter(_store)]
+    fn set_store(&mut self, value: Bound<'_, PyAny>) {
         self.store = value.unbind();
     }
 
@@ -2599,8 +2599,8 @@ impl CHKMap {
         self.root_node.clone_ref(py)
     }
 
-    #[setter]
-    fn set__root_node(&mut self, value: Bound<'_, PyAny>) {
+    #[setter(_root_node)]
+    fn set_root_node(&mut self, value: Bound<'_, PyAny>) {
         self.root_node = value.unbind();
     }
 
@@ -2612,8 +2612,8 @@ impl CHKMap {
         }
     }
 
-    #[setter]
-    fn set__search_key_func(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
+    #[setter(_search_key_func)]
+    fn set_search_key_func(&mut self, py: Python<'_>, value: Bound<'_, PyAny>) -> PyResult<()> {
         if value.is_none() {
             self.search_key_func = SearchKeyFunc::Plain;
             self.search_key_callable = None;

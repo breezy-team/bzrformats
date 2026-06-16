@@ -1140,7 +1140,7 @@ mod tests {
         let t = bzr_transport(dir.path());
         match BzrDirMeta::open(t) {
             Err(BzrDirError::NotABzrDir) => {}
-            other => panic!("expected NotABzrDir, got {other:?}"),
+            other => panic!("expected NotABzrDir, got {:?}", other.err()),
         }
     }
 
@@ -1153,7 +1153,7 @@ mod tests {
         let t = bzr_transport(dir.path());
         match BzrDirMeta::open(t) {
             Err(BzrDirError::NotMetaDir(_)) => {}
-            other => panic!("expected NotMetaDir, got {other:?}"),
+            other => panic!("expected NotMetaDir, got {:?}", other.err()),
         }
     }
 
@@ -1174,7 +1174,10 @@ mod tests {
                 component: Component::Repository,
                 ..
             }) => {}
-            other => panic!("expected UnsupportedFormat(Repository), got {other:?}"),
+            other => panic!(
+                "expected UnsupportedFormat(Repository), got {:?}",
+                other.err()
+            ),
         }
     }
 

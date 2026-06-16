@@ -642,10 +642,10 @@ impl PyWeave {
         }
         Ok(outer)
     }
-    #[setter]
-    fn set__parents<'py>(
+    #[setter(_parents)]
+    fn set_parents<'py>(
         &mut self,
-        py: Python<'py>,
+        _py: Python<'py>,
         new_parents: Bound<'py, PyAny>,
     ) -> PyResult<()> {
         let mut outer = Vec::new();
@@ -669,8 +669,8 @@ impl PyWeave {
         }
         Ok(out)
     }
-    #[setter]
-    fn set__names<'py>(&mut self, py: Python<'py>, new_names: Bound<'py, PyAny>) -> PyResult<()> {
+    #[setter(_names)]
+    fn set_names<'py>(&mut self, _py: Python<'py>, new_names: Bound<'py, PyAny>) -> PyResult<()> {
         let mut names = Vec::new();
         for n in new_names.try_iter()? {
             let b = n?
@@ -717,8 +717,8 @@ impl PyWeave {
         }
     }
 
-    #[setter]
-    fn set__weave_name(&mut self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+    #[setter(_weave_name)]
+    fn set_weave_name(&mut self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
         self.weave_name = if value.is_none(py) { None } else { Some(value) };
         Ok(())
     }

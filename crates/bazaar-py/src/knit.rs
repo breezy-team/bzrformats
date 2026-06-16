@@ -2117,8 +2117,8 @@ impl PyAnnotatedKnitContent {
         annotated_lines_to_py(py, &self.0.lines)
     }
 
-    #[setter]
-    fn set__lines(&mut self, lines: &Bound<PyAny>) -> PyResult<()> {
+    #[setter(_lines)]
+    fn set_lines(&mut self, lines: &Bound<PyAny>) -> PyResult<()> {
         self.0.lines = extract_annotated_lines(lines)?;
         Ok(())
     }
@@ -2128,8 +2128,8 @@ impl PyAnnotatedKnitContent {
         self.0.should_strip_eol()
     }
 
-    #[setter]
-    fn set__should_strip_eol(&mut self, val: bool) {
+    #[setter(_should_strip_eol)]
+    fn set_should_strip_eol(&mut self, val: bool) {
         self.0.set_should_strip_eol(val);
     }
 
@@ -2184,10 +2184,10 @@ impl PyAnnotatedKnitContent {
 
 /// Extract plain text lines from a `PyAnnotatedKnitContent` or `PyPlainKnitContent`.
 fn extract_content_text(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u8>>> {
-    if let Ok(annotated) = obj.downcast::<PyAnnotatedKnitContent>() {
+    if let Ok(annotated) = obj.cast::<PyAnnotatedKnitContent>() {
         return Ok(annotated.borrow().0.text());
     }
-    if let Ok(plain) = obj.downcast::<PyPlainKnitContent>() {
+    if let Ok(plain) = obj.cast::<PyPlainKnitContent>() {
         return Ok(plain.borrow().0.text());
     }
     // Fallback for other content objects: call .text() and extract bytes.
@@ -2266,8 +2266,8 @@ impl PyPlainKnitContent {
         PyList::new(py, items)
     }
 
-    #[setter]
-    fn set__lines(&mut self, lines: &Bound<PyAny>) -> PyResult<()> {
+    #[setter(_lines)]
+    fn set_lines(&mut self, lines: &Bound<PyAny>) -> PyResult<()> {
         self.0.lines = extract_byte_lines(lines)?;
         Ok(())
     }
@@ -2277,8 +2277,8 @@ impl PyPlainKnitContent {
         self.0.should_strip_eol()
     }
 
-    #[setter]
-    fn set__should_strip_eol(&mut self, val: bool) {
+    #[setter(_should_strip_eol)]
+    fn set_should_strip_eol(&mut self, val: bool) {
         self.0.set_should_strip_eol(val);
     }
 
@@ -2354,17 +2354,17 @@ impl PyPlainKnitContent {
 /// of bytes (key tuple), in which case the last element is taken — matching
 /// the breezy convention that `key[-1]` is the bare revision id.
 fn extract_version_id(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-    if let Ok(b) = obj.downcast::<PyBytes>() {
+    if let Ok(b) = obj.cast::<PyBytes>() {
         return Ok(b.as_bytes().to_vec());
     }
-    if let Ok(t) = obj.downcast::<PyTuple>() {
+    if let Ok(t) = obj.cast::<PyTuple>() {
         let len = t.len();
         if len == 0 {
             return Err(PyValueError::new_err("version_id tuple must be non-empty"));
         }
         let last = t.get_item(len - 1)?;
         return last
-            .downcast::<PyBytes>()
+            .cast::<PyBytes>()
             .map(|b| b.as_bytes().to_vec())
             .map_err(|_| PyValueError::new_err("version_id tuple elements must be bytes"));
     }
@@ -3906,7 +3906,7 @@ pub struct PyKndxIndex {
 impl PyKndxIndex {
     #[new]
     fn new(
-        py: Python<'_>,
+        _py: Python<'_>,
         transport: Bound<'_, PyAny>,
         mapper: Bound<'_, PyAny>,
         get_scope: Bound<'_, PyAny>,
@@ -3944,7 +3944,8 @@ impl PyKndxIndex {
     }
 
     #[classattr]
-    fn HEADER(py: Python<'_>) -> Py<PyBytes> {
+    #[pyo3(name = "HEADER")]
+    fn header(py: Python<'_>) -> Py<PyBytes> {
         PyBytes::new(py, bazaar::knit::KNDX_HEADER).unbind()
     }
 
@@ -4370,7 +4371,7 @@ impl PyKndxIndex {
         get_total_build_size_rs(py, keys, positions)
     }
 
-    fn __contains__(&mut self, py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<bool> {
+    fn __contains__(&mut self, _py: Python<'_>, key: Bound<'_, PyAny>) -> PyResult<bool> {
         let rust_key = extract_py_knit_key_or_bytes(&key)?;
         let prefix = PyKndxIndexInner::prefix_of(&rust_key);
         let suffix = PyKndxIndexInner::suffix_of(&rust_key);
@@ -4491,7 +4492,7 @@ impl PyKndxIndex {
 
     fn _sort_keys_by_io(
         &self,
-        py: Python<'_>,
+        _py: Python<'_>,
         keys: Bound<'_, pyo3::types::PyList>,
         positions: Bound<'_, PyDict>,
     ) -> PyResult<()> {
@@ -5265,7 +5266,7 @@ fn extract_py_knit_key_or_bytes(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::knit
 
 fn extract_py_knit_key(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::knit::KnitKey> {
     let tup = obj
-        .downcast::<PyTuple>()
+        .cast::<PyTuple>()
         .map_err(|_| PyValueError::new_err("knit key must be a tuple of bytes"))?;
     let mut key = Vec::with_capacity(tup.len());
     for item in tup.iter() {
@@ -5281,7 +5282,7 @@ fn extract_py_knit_key(obj: &Bound<'_, PyAny>) -> PyResult<bazaar::knit::KnitKey
 /// Returns `(key, true)` when the last element was `None` (auto-generate).
 fn extract_py_knit_key_autogen(obj: &Bound<'_, PyAny>) -> PyResult<(bazaar::knit::KnitKey, bool)> {
     let tup = obj
-        .downcast::<PyTuple>()
+        .cast::<PyTuple>()
         .map_err(|_| PyValueError::new_err("knit key must be a tuple of bytes"))?;
     let mut key = Vec::with_capacity(tup.len());
     let mut autogen = false;
@@ -6250,8 +6251,8 @@ impl PyKnitVersionedFiles {
         self.max_delta_chain
     }
 
-    #[setter]
-    fn set__max_delta_chain(&mut self, value: usize) {
+    #[setter(_max_delta_chain)]
+    fn set_max_delta_chain(&mut self, value: usize) {
         self.max_delta_chain = value;
     }
 
@@ -6295,6 +6296,10 @@ impl PyKnitVersionedFiles {
         random_id: bool,
         check_content: bool,
     ) -> PyResult<Py<PyAny>> {
+        // TODO: accepted for breezy add_lines() API compatibility but not yet
+        // used. parent_texts caches parent fulltexts for delta basis;
+        // left_matching_blocks supplies precomputed merge diff hints.
+        let _ = (&parent_texts, &left_matching_blocks);
         // TODO: call check_write_ok through the Rust KnitIndex trait once
         // key parsing can happen after the lock check.
         self.index_obj.bind(py).call_method0("_check_write_ok")?;

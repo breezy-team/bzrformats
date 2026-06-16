@@ -108,8 +108,8 @@ impl DirectPackAccess {
         self.indices.clone_ref(py)
     }
 
-    #[setter]
-    fn set__indices(&mut self, value: Py<PyDict>) {
+    #[setter(_indices)]
+    fn set_indices(&mut self, value: Py<PyDict>) {
         self.indices = value;
     }
 
@@ -124,8 +124,8 @@ impl DirectPackAccess {
             .unwrap_or_else(|| py.None())
     }
 
-    #[setter]
-    fn set__reload_func(&mut self, py: Python<'_>, value: Py<PyAny>) {
+    #[setter(_reload_func)]
+    fn set_reload_func(&mut self, py: Python<'_>, value: Py<PyAny>) {
         self.reload_func = if value.is_none(py) { None } else { Some(value) };
     }
 
@@ -138,8 +138,8 @@ impl DirectPackAccess {
             .unwrap_or_else(|| py.None())
     }
 
-    #[setter]
-    fn set__flush_func(&mut self, py: Python<'_>, value: Py<PyAny>) {
+    #[setter(_flush_func)]
+    fn set_flush_func(&mut self, py: Python<'_>, value: Py<PyAny>) {
         self.flush_func = if value.is_none(py) { None } else { Some(value) };
     }
 
@@ -152,8 +152,8 @@ impl DirectPackAccess {
             .unwrap_or_else(|| py.None())
     }
 
-    #[setter]
-    fn set__container_writer(&mut self, py: Python<'_>, value: Py<PyAny>) {
+    #[setter(_container_writer)]
+    fn set_container_writer(&mut self, py: Python<'_>, value: Py<PyAny>) {
         self.container_writer = if value.is_none(py) { None } else { Some(value) };
     }
 
@@ -166,8 +166,8 @@ impl DirectPackAccess {
             .unwrap_or_else(|| py.None())
     }
 
-    #[setter]
-    fn set__write_index(&mut self, value: Py<PyAny>) {
+    #[setter(_write_index)]
+    fn set_write_index(&mut self, value: Py<PyAny>) {
         self.write_index = Some(value);
     }
 

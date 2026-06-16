@@ -997,7 +997,11 @@ mod tests {
         assert_eq!(branch.get_stacked_on_url().unwrap(), "../parent");
         // Stored as a branch.conf no-name key.
         let conf = String::from_utf8(probe.get_bytes("branch.conf").unwrap()).unwrap();
-        assert!(conf.contains("stacked_on_location = ../parent"), "{conf}");
+        assert!(
+            conf.contains("stacked_on_location = ../parent"),
+            "{:?}",
+            conf
+        );
     }
 
     #[test]

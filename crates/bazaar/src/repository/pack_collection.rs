@@ -3,27 +3,10 @@
 //! autopack should fire.
 //!
 //! The arithmetic is a direct port of breezy's `RepositoryPackCollection`
-//! (`breezy/bzr/pack_repo.py`): `max_pack_count`, `pack_distribution` and
+//! (`breezy/bzr/pack_repo.py`): `pack_distribution` and
 //! `plan_autopack_combinations`. These are pure functions over a repository's
 //! pack list (each pack summarised by its revision count), kept separate from
 //! the I/O of `pack()` so they can be unit-tested in isolation.
-
-/// The largest number of packs a repository with `total_revisions` revisions
-/// is allowed before autopack repacks the excess.
-///
-/// breezy's rule (`_max_pack_count`): one pack for an empty repository,
-/// otherwise the sum of the decimal digits of the revision count (so 1234
-/// allows 1+2+3+4 = 10 packs).
-pub fn max_pack_count(total_revisions: u64) -> usize {
-    if total_revisions == 0 {
-        return 1;
-    }
-    total_revisions
-        .to_string()
-        .bytes()
-        .map(|b| (b - b'0') as usize)
-        .sum()
-}
 
 /// The target distribution of pack sizes for `total_revisions` revisions, as a
 /// list of revision-count buckets, largest first.
@@ -118,16 +101,6 @@ pub fn plan_autopack_combinations(pack_revision_counts: &[u64]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn max_pack_count_is_digit_sum() {
-        assert_eq!(max_pack_count(0), 1);
-        assert_eq!(max_pack_count(1), 1);
-        assert_eq!(max_pack_count(9), 9);
-        assert_eq!(max_pack_count(10), 1);
-        assert_eq!(max_pack_count(1234), 10);
-        assert_eq!(max_pack_count(1000000), 1);
-    }
 
     #[test]
     fn pack_distribution_powers_of_ten() {

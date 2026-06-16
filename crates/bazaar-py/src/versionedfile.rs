@@ -1042,7 +1042,6 @@ impl PyVirtualVersionedFiles {
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        use bazaar::versionedfile::VersionedFiles;
         let mut rust_keys: Vec<Key> = Vec::new();
         for k in keys.try_iter()? {
             rust_keys.push(k?.extract()?);
@@ -1067,7 +1066,6 @@ impl PyVirtualVersionedFiles {
         py: Python<'py>,
         keys: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        use bazaar::versionedfile::VersionedFiles;
         let mut rust_keys: Vec<Key> = Vec::new();
         for k in keys.try_iter()? {
             rust_keys.push(k?.extract()?);
@@ -1138,7 +1136,6 @@ impl PyVirtualVersionedFiles {
         keys: Bound<'py, PyAny>,
         pb: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        use bazaar::versionedfile::VersionedFiles;
         let _ = pb;
         let mut rust_keys: Vec<Key> = Vec::new();
         for k in keys.try_iter()? {
@@ -1223,13 +1220,6 @@ pub(crate) struct KeyRefs {
 }
 
 impl KeyRefs {
-    pub(crate) fn empty(py: Python<'_>) -> PyResult<Self> {
-        Ok(Self {
-            refs: PyDict::new(py).unbind(),
-            new_keys: None,
-        })
-    }
-
     pub(crate) fn new_rust(py: Python<'_>, track_new_keys: bool) -> PyResult<Self> {
         Ok(Self {
             refs: PyDict::new(py).unbind(),
@@ -1376,132 +1366,6 @@ impl KeyRefs {
             }
         }
         Ok(out)
-    }
-}
-
-/// Rust `ContentFactory` adapter wrapping a Python `ContentFactory` object.
-///
-/// The Python factory's metadata (key, parents, sha1, size, storage_kind)
-/// is extracted eagerly at construction. Chunks are materialised on first
-/// access via `get_bytes_as("chunked")` and cached so the borrowing trait
-/// methods can return `Cow::Borrowed` slices.
-pub struct PyContentFactory {
-    obj: Py<PyAny>,
-    key: bazaar::versionedfile::Key,
-    parents: Option<Vec<bazaar::versionedfile::Key>>,
-    sha1: Option<Vec<u8>>,
-    size: Option<usize>,
-    storage_kind: String,
-    chunks: std::sync::OnceLock<Vec<Vec<u8>>>,
-}
-
-impl PyContentFactory {
-    /// Wrap a Python `ContentFactory` object, extracting metadata eagerly.
-    pub fn from_py(obj: Bound<'_, PyAny>) -> PyResult<Self> {
-        let key: bazaar::versionedfile::Key = obj.getattr("key")?.extract()?;
-        let parents_obj = obj.getattr("parents")?;
-        let parents: Option<Vec<bazaar::versionedfile::Key>> = if parents_obj.is_none() {
-            None
-        } else {
-            Some(parents_obj.extract()?)
-        };
-        let sha1_obj = obj.getattr("sha1")?;
-        let sha1: Option<Vec<u8>> = if sha1_obj.is_none() {
-            None
-        } else {
-            Some(sha1_obj.extract()?)
-        };
-        let size_obj = obj.getattr("size")?;
-        let size: Option<usize> = if size_obj.is_none() {
-            None
-        } else {
-            Some(size_obj.extract()?)
-        };
-        let storage_kind: String = obj.getattr("storage_kind")?.extract()?;
-        Ok(PyContentFactory {
-            obj: obj.unbind(),
-            key,
-            parents,
-            sha1,
-            size,
-            storage_kind,
-            chunks: std::sync::OnceLock::new(),
-        })
-    }
-
-    /// Materialise the record's chunked text, caching it for repeat reads.
-    fn ensure_chunks(&self) -> &[Vec<u8>] {
-        self.chunks.get_or_init(|| {
-            Python::attach(|py| {
-                // get_bytes_as("chunked") returns a list of bytes chunks.
-                let obj = self.obj.bind(py);
-                let mut out = Vec::new();
-                if let Ok(result) = obj.call_method1("get_bytes_as", ("chunked",)) {
-                    if let Ok(iter) = result.try_iter() {
-                        for c in iter.flatten() {
-                            if let Ok(bytes) = c.extract::<Vec<u8>>() {
-                                out.push(bytes);
-                            }
-                        }
-                    }
-                }
-                out
-            })
-        })
-    }
-}
-
-impl bazaar::versionedfile::ContentFactory for PyContentFactory {
-    fn sha1(&self) -> Option<Vec<u8>> {
-        self.sha1.clone()
-    }
-    fn size(&self) -> Option<usize> {
-        self.size
-    }
-    fn key(&self) -> bazaar::versionedfile::Key {
-        self.key.clone()
-    }
-    fn parents(&self) -> Option<Vec<bazaar::versionedfile::Key>> {
-        self.parents.clone()
-    }
-    fn to_fulltext<'a, 'b>(&'a self) -> std::borrow::Cow<'b, [u8]>
-    where
-        'a: 'b,
-    {
-        std::borrow::Cow::Owned(self.ensure_chunks().concat())
-    }
-    fn to_chunks<'a, 'b>(&'a self) -> Box<dyn Iterator<Item = std::borrow::Cow<'b, [u8]>> + 'b>
-    where
-        'a: 'b,
-    {
-        Box::new(self.ensure_chunks().iter().map(|c| c.as_slice().into()))
-    }
-    fn to_lines<'a, 'b>(&'a self) -> Box<dyn Iterator<Item = std::borrow::Cow<'b, [u8]>> + 'b>
-    where
-        'a: 'b,
-    {
-        Box::new(
-            bazaar::osutils::chunks_to_lines(
-                self.ensure_chunks().iter().map(Ok::<_, std::io::Error>),
-            )
-            .map(|l| l.unwrap()),
-        )
-    }
-    fn into_fulltext(self) -> Vec<u8> {
-        self.ensure_chunks().concat()
-    }
-    fn into_chunks(self) -> Box<dyn Iterator<Item = Vec<u8>>> {
-        // Drain the cached chunks (or materialise if not yet cached).
-        self.ensure_chunks();
-        let chunks = self.chunks.into_inner().unwrap_or_default();
-        Box::new(chunks.into_iter())
-    }
-    fn storage_kind(&self) -> String {
-        self.storage_kind.clone()
-    }
-    fn map_key(&mut self, f: &dyn Fn(bazaar::versionedfile::Key) -> bazaar::versionedfile::Key) {
-        self.key = f(self.key.clone());
-        self.parents = self.parents.take().map(|v| v.into_iter().map(f).collect());
     }
 }
 
@@ -2653,7 +2517,7 @@ impl PyVersionedFileBase {
         Err(not_implemented(slf, "has_version"))
     }
 
-    fn insert_record_stream(slf: &Bound<'_, Self>, stream: Bound<'_, PyAny>) -> PyResult<()> {
+    fn insert_record_stream(_slf: &Bound<'_, Self>, stream: Bound<'_, PyAny>) -> PyResult<()> {
         let _ = stream;
         Err(pyo3::exceptions::PyNotImplementedError::new_err(()))
     }
@@ -3097,7 +2961,7 @@ impl PyVersionedFilesBase {
         Err(not_implemented(slf, "get_missing_compression_parent_keys"))
     }
 
-    fn insert_record_stream(slf: &Bound<'_, Self>, stream: Bound<'_, PyAny>) -> PyResult<()> {
+    fn insert_record_stream(_slf: &Bound<'_, Self>, stream: Bound<'_, PyAny>) -> PyResult<()> {
         let _ = stream;
         Err(pyo3::exceptions::PyNotImplementedError::new_err(()))
     }
@@ -3624,14 +3488,14 @@ impl PyMPDiffGenerator {
             key_set.add(k?)?;
         }
         let parent_map = vf.call_method1("get_parent_map", (&key_set,))?;
-        let parent_map = parent_map.downcast::<PyDict>()?;
+        let parent_map = parent_map.cast::<PyDict>()?;
         slf.setattr("parent_map", parent_map)?;
         let module = py.import("bzrformats._bzr_rs.versionedfile")?;
         let res = module
             .getattr("mpdiff_first_pass")?
             .call1((&ordered_keys, parent_map))?;
-        let needed_keys = res.get_item(0)?.downcast_into::<PySet>()?;
-        let refcounts = res.get_item(1)?.downcast_into::<PyDict>()?;
+        let needed_keys = res.get_item(0)?.cast_into::<PySet>()?;
+        let refcounts = res.get_item(1)?.cast_into::<PyDict>()?;
         let just_parents = res.get_item(2)?;
         let missing_keys = res.get_item(3)?;
         if missing_keys.is_truthy()? {
@@ -3667,7 +3531,7 @@ impl PyMPDiffGenerator {
             .getattr("from_lines")?
             .call1((lines, parent_lines, py.None()))?;
         slf.getattr("diffs")?
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .set_item(&key, diff)?;
         Ok(())
     }
@@ -3679,11 +3543,11 @@ impl PyMPDiffGenerator {
     ) -> PyResult<()> {
         let py = slf.py();
         let parent_map = slf.getattr("parent_map")?;
-        let parent_map = parent_map.downcast::<PyDict>()?;
+        let parent_map = parent_map.cast::<PyDict>()?;
         let refcounts = slf.getattr("refcounts")?;
-        let refcounts = refcounts.downcast::<PyDict>()?;
+        let refcounts = refcounts.cast::<PyDict>()?;
         let chunks = slf.getattr("chunks")?;
-        let chunks = chunks.downcast::<PyDict>()?;
+        let chunks = chunks.cast::<PyDict>()?;
         let osutils = py.import("bzrformats.osutils")?;
         let chunks_to_lines = osutils.getattr("chunks_to_lines")?;
         let mut this_chunks = this_chunks;
@@ -3725,7 +3589,7 @@ impl PyMPDiffGenerator {
         py.import("builtins")?
             .getattr("list")?
             .call1((diffs,))?
-            .downcast_into::<PyList>()
+            .cast_into::<PyList>()
             .map_err(Into::into)
     }
 }
@@ -4032,7 +3896,7 @@ impl PyThunkedVersionedFiles {
         let result = PyDict::new(py);
         for (prefix, suffixes, vf) in Self::iter_keys_vf(slf, &keys)? {
             let parent_map = vf.call_method1("get_parent_map", (&suffixes,))?;
-            let parent_map = parent_map.downcast::<PyDict>()?;
+            let parent_map = parent_map.cast::<PyDict>()?;
             for (k, parents) in parent_map.iter() {
                 let new_key = prefix.call_method1("__add__", (PyTuple::new(py, [&k])?,))?;
                 let new_parents = PyList::empty(py);
@@ -4089,7 +3953,7 @@ impl PyThunkedVersionedFiles {
         let result = PyDict::new(py);
         for (prefix, suffixes, vf) in Self::iter_keys_vf(slf, &keys)? {
             let vf_sha1s = vf.call_method1("get_sha1s", (&suffixes,))?;
-            let vf_sha1s = vf_sha1s.downcast::<PyDict>()?;
+            let vf_sha1s = vf_sha1s.cast::<PyDict>()?;
             for (suffix, sha1) in vf_sha1s.iter() {
                 let new_key = prefix.call_method1("__add__", (PyTuple::new(py, [suffix])?,))?;
                 result.set_item(new_key, sha1)?;
@@ -4339,10 +4203,10 @@ impl PyPlanMergeVersionedFile {
             .getattr("tuple")?
             .call1((&parents,))?;
         slf.getattr("_parents")?
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .set_item(&key, parents_tuple)?;
         slf.getattr("_lines")?
-            .downcast::<PyDict>()?
+            .cast::<PyDict>()?
             .set_item(&key, lines)?;
         Ok(py.None().into_bound(py))
     }
@@ -4357,9 +4221,9 @@ impl PyPlanMergeVersionedFile {
         let py = slf.py();
         let out = PyList::empty(py);
         let lines_map = slf.getattr("_lines")?;
-        let lines_map = lines_map.downcast::<PyDict>()?;
+        let lines_map = lines_map.cast::<PyDict>()?;
         let parents_map = slf.getattr("_parents")?;
-        let parents_map = parents_map.downcast::<PyDict>()?;
+        let parents_map = parents_map.cast::<PyDict>()?;
         // pending = set(keys); locally-held keys yield ChunkedContentFactory.
         let pending = PySet::empty(py)?;
         for k in keys.try_iter()? {
@@ -4443,7 +4307,7 @@ impl PyPlanMergeVersionedFile {
             .items()
             .iter()
             .map(|it| {
-                let t = it.downcast::<PyTuple>().unwrap();
+                let t = it.cast::<PyTuple>().unwrap();
                 (t.get_item(0).unwrap(), t.get_item(1).unwrap())
             })
             .collect();

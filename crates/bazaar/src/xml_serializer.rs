@@ -1834,8 +1834,6 @@ mod tests {
 
     #[test]
     fn inventory_v4_unpack() {
-        use crate::inventory::Inventory as _;
-
         let s = XMLInventorySerializer4;
         let inv = s.read_inventory_from_string(INVENTORY_V4).unwrap();
         // root + 3 entries
@@ -2001,7 +1999,6 @@ mod tests {
 
     #[test]
     fn inventory_v5_unpack_entry_details() {
-        use crate::inventory::Inventory as _;
         let s = XMLInventorySerializer5;
         let inv = s
             .read_inventory_from_lines(&[COMMITTED_INV_V5], None)
@@ -2130,7 +2127,6 @@ mod tests {
 
     #[test]
     fn tree_reference_only_supported_by_v7() {
-        use crate::inventory::Inventory as _;
         let mut inv = MutableInventory::new();
         inv.revision_id = Some(RevisionId::from(b"rev-outer".as_slice()));
         inv.add(Entry::root(

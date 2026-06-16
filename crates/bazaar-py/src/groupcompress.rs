@@ -453,11 +453,6 @@ impl PyBlockCache {
             py_cache,
         }
     }
-
-    /// The wrapped Python cache (`vf._group_cache`).
-    pub fn py_cache(&self, py: Python<'_>) -> Py<PyAny> {
-        self.py_cache.clone_ref(py)
-    }
 }
 
 impl Clone for PyBlockCache {
@@ -3345,8 +3340,8 @@ impl GroupCompressVersionedFiles {
         self.unadded_refs.clone_ref(py)
     }
 
-    #[setter]
-    fn set__unadded_refs(&mut self, value: Bound<'_, PyDict>) {
+    #[setter(_unadded_refs)]
+    fn set_unadded_refs(&mut self, value: Bound<'_, PyDict>) {
         self.unadded_refs = value.unbind();
     }
 
@@ -3369,8 +3364,8 @@ impl GroupCompressVersionedFiles {
         self.max_bytes_to_index
     }
 
-    #[setter]
-    fn set__max_bytes_to_index(&mut self, value: Option<usize>) {
+    #[setter(_max_bytes_to_index)]
+    fn set_max_bytes_to_index(&mut self, value: Option<usize>) {
         self.max_bytes_to_index = value;
     }
 
