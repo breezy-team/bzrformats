@@ -5,6 +5,40 @@
 //! The Python originals live in `bzrformats.versionedfile`.
 
 use adler::adler32_slice;
+use percent_encoding::{percent_decode_str, percent_encode, AsciiSet, CONTROLS};
+
+/// Characters Python's `urllib.parse.quote(s, safe='/')` percent-encodes:
+/// everything except the unreserved set `A-Za-z0-9_.-~` and the `/` separator.
+const QUOTE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'!')
+    .add(b'"')
+    .add(b'#')
+    .add(b'$')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b'+')
+    .add(b',')
+    .add(b':')
+    .add(b';')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}')
+    .add(0x7f);
 
 /// Translate between key tuples and storage paths.
 ///
@@ -98,52 +132,16 @@ impl Mapper for HashEscapedPrefixMapper {
 ///
 /// Safe characters are ASCII letters, digits, `_.-~` and `/`.
 pub(crate) fn url_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.as_bytes() {
-        if is_url_safe(*b) {
-            out.push(*b as char);
-        } else {
-            out.push('%');
-            out.push_str(&format!("{:02X}", b));
-        }
-    }
-    out
-}
-
-fn is_url_safe(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'~' | b'/')
+    percent_encode(s.as_bytes(), QUOTE_SET).to_string()
 }
 
 /// Percent-decode `s` matching Python's `urllib.parse.unquote(s)`.
 ///
 /// `%xx` sequences are decoded as raw bytes; the resulting byte sequence is
-/// interpreted as UTF-8. A malformed `%xx` sequence is left as-is, like Python.
+/// interpreted as UTF-8. A malformed `%xx` sequence is left as-is, like Python,
+/// and invalid UTF-8 is replaced with U+FFFD.
 pub(crate) fn url_unquote(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push((h << 4) | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    // Python's unquote replaces invalid UTF-8 with U+FFFD by default.
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    percent_decode_str(s).decode_utf8_lossy().into_owned()
 }
 
 fn basename(path: &str) -> &str {
@@ -253,5 +251,21 @@ mod tests {
         assert_eq!(url_unquote("a%20b"), "a b");
         assert_eq!(url_unquote("a%25b"), "a%b");
         assert_eq!(url_unquote("a%2zb"), "a%2zb");
+    }
+
+    #[test]
+    fn url_quote_emits_uppercase_hex() {
+        // Python's quote() emits uppercase hex digits.
+        assert_eq!(url_quote("\x7f"), "%7F");
+        assert_eq!(url_quote("\u{e9}"), "%C3%A9");
+    }
+
+    #[test]
+    fn url_unquote_matches_python_edge_cases() {
+        // Trailing %xx still decodes; a bare or truncated % is left as-is.
+        assert_eq!(url_unquote("a%20"), "a ");
+        assert_eq!(url_unquote("%20"), " ");
+        assert_eq!(url_unquote("%"), "%");
+        assert_eq!(url_unquote("a%2"), "a%2");
     }
 }
