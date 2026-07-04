@@ -2119,6 +2119,7 @@ mod tests {
     /// transport resolves to the literal `weaves/74/Foo:Bar.weave` on disk,
     /// with the exact weave bytes brz writes. The inventory weave starts as
     /// the empty-weave header.
+    #[cfg(feature = "weave")]
     #[test]
     fn weave_disk_layout_escapes_file_id() {
         use crate::bzrdir::BzrDirAllInOne;

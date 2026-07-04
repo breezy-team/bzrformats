@@ -852,6 +852,7 @@ mod tests {
     /// Setting the tip back to an earlier revno drops the later revisions
     /// (the uncommit case). Ported from breezy's per_branch
     /// `test_generate_revision_history`, which generates a shorter mainline.
+    #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn format5_set_last_revision_info_truncates() {
         let (_d, branch, _probe) = branch_transport_format5();
@@ -869,6 +870,7 @@ mod tests {
 
     /// Setting the tip to the null revision empties the history. Ported from
     /// breezy's `test_generate_revision_history_NULL_REVISION`.
+    #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn format5_set_last_revision_info_null_empties_history() {
         let (_d, branch, _probe) = branch_transport_format5();
