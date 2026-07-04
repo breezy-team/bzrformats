@@ -641,12 +641,15 @@ mod tests {
         signs: bool,
     }
 
+    #[cfg(feature = "knitpack")]
     fn knitpack6() -> &'static RepositoryFormat {
         find_format(b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n").unwrap()
     }
+    #[cfg(feature = "knit")]
     fn knit1() -> &'static RepositoryFormat {
         find_format(b"Bazaar-NG Knit Repository Format 1").unwrap()
     }
+    #[cfg(feature = "weave")]
     fn weave6() -> &'static RepositoryFormat {
         find_format(b"Bazaar-NG branch, format 6\n").unwrap()
     }
@@ -661,18 +664,21 @@ mod tests {
                 reopen: |t| Box::new(Pack2aRepository::open(t).unwrap()),
                 signs: true,
             },
+            #[cfg(feature = "knitpack")]
             Scenario {
                 label: "knit-pack",
                 create: |t| Box::new(KnitPackRepository::create(t, knitpack6()).unwrap()),
                 reopen: |t| Box::new(KnitPackRepository::open(t).unwrap()),
                 signs: true,
             },
+            #[cfg(feature = "knit")]
             Scenario {
                 label: "knit",
                 create: |t| Box::new(KnitRepository::create(t, knit1()).unwrap()),
                 reopen: |t| Box::new(KnitRepository::open(t).unwrap()),
                 signs: true,
             },
+            #[cfg(feature = "weave")]
             Scenario {
                 label: "weave",
                 create: |t| Box::new(WeaveRepository::create(t, weave6()).unwrap()),
