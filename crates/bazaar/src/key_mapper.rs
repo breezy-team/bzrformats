@@ -4,7 +4,7 @@
 //! partition identifier (a `String`) used as a relative storage path, and back.
 //! The Python originals live in `bzrformats.versionedfile`.
 
-use adler::adler32_slice;
+use adler2::adler32_slice;
 use percent_encoding::{percent_decode_str, percent_encode, AsciiSet, CONTROLS};
 
 /// Characters Python's `urllib.parse.quote(s, safe='/')` percent-encodes:
