@@ -21,6 +21,7 @@ mod dirstate_helpers;
 mod errors;
 mod groupcompress;
 mod groupcompress_delta;
+mod ignores;
 mod index;
 mod inventory;
 mod knit;
@@ -1159,6 +1160,8 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m_globbing.add_wrapped(wrap_pyfunction!(normalize_pattern))?;
     m_globbing.add_class::<Replacer>()?;
     m.add_submodule(&m_globbing)?;
+    let ignoresm = ignores::_ignores_rs(py)?;
+    m.add_submodule(&ignoresm)?;
     m.add_class::<Revision>()?;
     m.add_class::<RevisionV4>()?;
     let inventorym = inventory::_inventory_rs(py)?;
@@ -1340,6 +1343,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
 
     // Register submodules in sys.modules for dotted import support
     modules.set_item(format!("{}.globbing", module_name), &m_globbing)?;
+    modules.set_item(format!("{}.ignores", module_name), &ignoresm)?;
     modules.set_item(format!("{}.inventory", module_name), &inventorym)?;
     modules.set_item(format!("{}.rio", module_name), &riom)?;
     modules.set_item(format!("{}.hashcache", module_name), &hashcachem)?;
