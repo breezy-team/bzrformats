@@ -21,11 +21,17 @@ re-exported here.
 """
 
 from ._bzr_rs.globbing import (
+    ExceptionGlobster,
+    Globster,
     Replacer,
+    _OrderedGlobster,
     normalize_pattern,
 )
 
 __all__ = [
+    "ExceptionGlobster",
+    "Globster",
     "Replacer",
+    "_OrderedGlobster",
     "normalize_pattern",
 ]
