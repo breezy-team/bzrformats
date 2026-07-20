@@ -21,6 +21,7 @@ mod dirstate_helpers;
 mod errors;
 mod groupcompress;
 mod groupcompress_delta;
+mod ignores;
 mod index;
 mod inventory;
 mod knit;
@@ -45,6 +46,7 @@ mod weavefile;
 import_exception!(bzrformats._bzr_rs.errors, ReservedId);
 import_exception!(breezy.bugtracker, InvalidLineInBugsProperty);
 import_exception!(breezy.bugtracker, InvalidBugStatus);
+import_exception!(breezy.lazy_regex, InvalidPattern);
 
 /// Create a new file id suffix that is reasonably unique.
 ///
@@ -169,6 +171,97 @@ impl Replacer {
         } else {
             Ok(ret)
         }
+    }
+}
+
+/// Collect an arbitrary Python iterable of strings into a Vec.
+fn collect_patterns(patterns: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    patterns
+        .try_iter()?
+        .map(|item| item?.extract::<String>())
+        .collect()
+}
+
+/// Convert a globbing InvalidPattern into breezy's lazy_regex.InvalidPattern,
+/// with the same "ignore file contains errors" message the Python raised.
+fn invalid_pattern_err(e: bazaar::globbing::InvalidPattern) -> PyErr {
+    let mut msg = String::from("File ~/.config/breezy/ignore or .bzrignore contains error(s).");
+    for p in &e.bad_patterns {
+        msg.push_str(&format!("\n  {p}"));
+    }
+    InvalidPattern::new_err(msg)
+}
+
+#[pyclass]
+struct Globster(bazaar::globbing::Globster);
+
+#[pymethods]
+impl Globster {
+    #[new]
+    fn new(patterns: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Globster(bazaar::globbing::Globster::new(collect_patterns(
+            patterns,
+        )?)))
+    }
+
+    /// Return a matching pattern or None if there is no matching pattern.
+    #[pyo3(name = "match")]
+    fn match_(&self, filename: &str) -> PyResult<Option<String>> {
+        self.0.match_(filename).map_err(invalid_pattern_err)
+    }
+
+    /// Identify whether a normalized pattern is fullpath, basename or extension.
+    #[staticmethod]
+    fn identify(pattern: &str) -> &'static str {
+        match bazaar::globbing::identify(pattern) {
+            bazaar::globbing::PatternKind::Extension => "extension",
+            bazaar::globbing::PatternKind::Basename => "basename",
+            bazaar::globbing::PatternKind::Fullpath => "fullpath",
+        }
+    }
+
+    /// Return True if the normalized pattern compiles to a valid regex.
+    #[staticmethod]
+    fn is_pattern_valid(pattern: &str) -> bool {
+        bazaar::globbing::is_pattern_valid(pattern)
+    }
+}
+
+#[pyclass]
+struct ExceptionGlobster(bazaar::globbing::ExceptionGlobster);
+
+#[pymethods]
+impl ExceptionGlobster {
+    #[new]
+    fn new(patterns: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(ExceptionGlobster(bazaar::globbing::ExceptionGlobster::new(
+            collect_patterns(patterns)?,
+        )))
+    }
+
+    /// Return a matching pattern, or None (including when an exception matches).
+    #[pyo3(name = "match")]
+    fn match_(&self, filename: &str) -> PyResult<Option<String>> {
+        self.0.match_(filename).map_err(invalid_pattern_err)
+    }
+}
+
+#[pyclass(name = "_OrderedGlobster")]
+struct OrderedGlobster(bazaar::globbing::OrderedGlobster);
+
+#[pymethods]
+impl OrderedGlobster {
+    #[new]
+    fn new(patterns: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(OrderedGlobster(bazaar::globbing::OrderedGlobster::new(
+            collect_patterns(patterns)?,
+        )))
+    }
+
+    /// Return a matching pattern or None if there is no matching pattern.
+    #[pyo3(name = "match")]
+    fn match_(&self, filename: &str) -> PyResult<Option<String>> {
+        self.0.match_(filename).map_err(invalid_pattern_err)
     }
 }
 
@@ -1158,7 +1251,12 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     let m_globbing = PyModule::new(py, "globbing")?;
     m_globbing.add_wrapped(wrap_pyfunction!(normalize_pattern))?;
     m_globbing.add_class::<Replacer>()?;
+    m_globbing.add_class::<Globster>()?;
+    m_globbing.add_class::<ExceptionGlobster>()?;
+    m_globbing.add_class::<OrderedGlobster>()?;
     m.add_submodule(&m_globbing)?;
+    let ignoresm = ignores::_ignores_rs(py)?;
+    m.add_submodule(&ignoresm)?;
     m.add_class::<Revision>()?;
     m.add_class::<RevisionV4>()?;
     let inventorym = inventory::_inventory_rs(py)?;
@@ -1340,6 +1438,7 @@ fn _bzr_rs(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
 
     // Register submodules in sys.modules for dotted import support
     modules.set_item(format!("{}.globbing", module_name), &m_globbing)?;
+    modules.set_item(format!("{}.ignores", module_name), &ignoresm)?;
     modules.set_item(format!("{}.inventory", module_name), &inventorym)?;
     modules.set_item(format!("{}.rio", module_name), &riom)?;
     modules.set_item(format!("{}.hashcache", module_name), &hashcachem)?;

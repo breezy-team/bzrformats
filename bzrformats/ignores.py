@@ -1,4 +1,4 @@
-# Copyright (C) 2006-2010 Canonical Ltd
+# Copyright (C) 2006-2011 Canonical Ltd
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -14,24 +14,16 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
-"""Tools for converting globs to regular expressions.
+"""Parsing of ignore files.
 
-The implementation lives in Rust (``bzrformats._bzr_rs.globbing``) and is
+The implementation lives in Rust (``bzrformats._bzr_rs.ignores``) and is
 re-exported here.
 """
 
-from ._bzr_rs.globbing import (
-    ExceptionGlobster,
-    Globster,
-    Replacer,
-    _OrderedGlobster,
-    normalize_pattern,
+from ._bzr_rs.ignores import (
+    parse_ignore_file,
 )
 
 __all__ = [
-    "ExceptionGlobster",
-    "Globster",
-    "Replacer",
-    "_OrderedGlobster",
-    "normalize_pattern",
+    "parse_ignore_file",
 ]

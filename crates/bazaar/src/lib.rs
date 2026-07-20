@@ -24,6 +24,7 @@ pub mod globbing;
 pub mod gpg;
 pub mod groupcompress;
 pub mod hashcache;
+pub mod ignores;
 pub mod index;
 pub mod inventory;
 pub mod inventory_delta;
