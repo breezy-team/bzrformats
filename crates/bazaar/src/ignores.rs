@@ -51,6 +51,10 @@ mod tests {
         v
     }
 
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn empty() {
         assert!(parse_ignore_file(b"").is_empty());
@@ -91,5 +95,55 @@ mod tests {
         // First line is invalid utf8, second is fine.
         let data = b"\xff\xfe\n*.o\n";
         assert_eq!(parse(data), vec!["*.o"]);
+    }
+
+    // Mechanical ports of breezy.tests.test_ignores.TestParseIgnoreFile.
+
+    #[test]
+    fn parse_fancy() {
+        // Byte-for-byte the input from the Python test; assembled from explicit
+        // lines so leading/trailing whitespace (" xx ") is preserved exactly.
+        let mut input: Vec<u8> = Vec::new();
+        for line in [
+            b"./rootdir".as_slice(),
+            b"randomfile*",
+            b"path/from/ro?t",
+            b"unicode\xc2\xb5", // u'\xb5'.encode('utf8')
+            b"dos\r",
+            b"", // empty line
+            b"#comment",
+            b" xx ", // whitespace
+            b"!RE:^\\.z.*",
+            b"!!./.zcompdump",
+        ] {
+            input.extend_from_slice(line);
+            input.push(b'\n');
+        }
+        let ignored = parse_ignore_file(&input);
+        assert_eq!(
+            ignored,
+            set(&[
+                "./rootdir",
+                "randomfile*",
+                "path/from/ro?t",
+                "unicode\u{b5}",
+                "dos",
+                " xx ",
+                "!RE:^\\.z.*",
+                "!!./.zcompdump",
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_empty() {
+        assert_eq!(parse_ignore_file(b""), HashSet::new());
+    }
+
+    #[test]
+    fn parse_non_utf8() {
+        // Lines with non utf8 characters should be discarded.
+        let ignored = parse_ignore_file(b"utf8filename_a\ninvalid utf8\x80\nutf8filename_b\n");
+        assert_eq!(ignored, set(&["utf8filename_a", "utf8filename_b"]));
     }
 }
