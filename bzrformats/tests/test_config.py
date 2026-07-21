@@ -123,9 +123,22 @@ class TestConfigObjParseValues(TestCase):
         c = ConfigObj.parse(b'a = "v a l" # tail\n')
         self.assertEqual('"v a l"', c.section(None).get("a"))
 
-    def test_unterminated_quote_is_whole_value(self):
-        c = ConfigObj.parse(b'a = "oops\n')
-        self.assertEqual('"oops', c.section(None).get("a"))
+    def test_unterminated_quote_is_an_error(self):
+        # configobj raises a parse error for a value that opens a quote it never
+        # closes; the binding surfaces that as ValueError.
+        self.assertRaises(ValueError, ConfigObj.parse, b'a = "oops\n')
+
+    def test_triple_quoted_multiline_value(self):
+        c = ConfigObj.parse(b"a = '''1\n2\n'''\n")
+        self.assertEqual("1\n2\n", c.section(None).get("a"))
+
+    def test_hash_in_unquoted_value_starts_comment(self):
+        c = ConfigObj.parse(b"a = has#hash\n")
+        self.assertEqual("has", c.section(None).get("a"))
+
+    def test_quoted_value_followed_by_more_is_kept_whole(self):
+        c = ConfigObj.parse(b'a = " bar", "baz "\n')
+        self.assertEqual('" bar", "baz "', c.section(None).get("a"))
 
 
 class TestSection(TestCase):
@@ -156,6 +169,53 @@ class TestSection(TestCase):
     def test_repr_no_name(self):
         sec = ConfigObj.parse(b"k = v\n").section(None)
         self.assertEqual("<Section (no name)>", repr(sec))
+
+
+class TestSectionTree(TestCase):
+    def test_empty_headers_preserved(self):
+        c = ConfigObj.parse(b"[/foo]\n[/foo/bar]\n")
+        self.assertEqual(
+            ["/foo", "/foo/bar"],
+            [name for name, _opts, _subs in c.section_tree()],
+        )
+
+    def test_no_name_section_first(self):
+        c = ConfigObj.parse(b"a = 1\n[s]\nb = 2\n")
+        tree = c.section_tree()
+        self.assertEqual(
+            [(None, [("a", "1")], []), ("s", [("b", "2")], [])], tree
+        )
+
+    def test_nested_subsections(self):
+        c = ConfigObj.parse(
+            b"[baz]\nfoo_in_baz = barbaz\n[[qux]]\nfoo_in_qux = quux\n"
+        )
+        self.assertEqual(
+            [
+                (
+                    "baz",
+                    [("foo_in_baz", "barbaz")],
+                    [("qux", [("foo_in_qux", "quux")])],
+                )
+            ],
+            c.section_tree(),
+        )
+
+
+class TestSetSubsectionValue(TestCase):
+    def test_builds_nested_structure_from_empty(self):
+        c = ConfigObj()
+        c.set_value("baz", "foo_in_baz", "barbaz")
+        c.set_subsection_value("baz", "qux", "foo_in_qux", "quux")
+        self.assertEqual(
+            b"[baz]\nfoo_in_baz = barbaz\n[[qux]]\nfoo_in_qux = quux\n",
+            c.to_bytes(),
+        )
+
+    def test_updates_in_place(self):
+        c = ConfigObj.parse(b"[baz]\n[[qux]]\na = 1\n")
+        c.set_subsection_value("baz", "qux", "a", "2")
+        self.assertEqual(b"[baz]\n[[qux]]\na = 2\n", c.to_bytes())
 
 
 class TestConfigObjWrite(TestCase):
