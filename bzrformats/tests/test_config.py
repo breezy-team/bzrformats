@@ -40,15 +40,92 @@ class TestConfigObjParse(TestCase):
         c = ConfigObj.parse(b"a = 1\n")
         self.assertIsNone(c.section(None).get("missing"))
 
+    def test_section_defaults_to_no_name(self):
+        c = ConfigObj.parse(b"a = 1\n")
+        self.assertEqual("1", c.section().get("a"))
+
+    def test_no_name_section_absent_without_top_level_scalar(self):
+        c = ConfigObj.parse(b"[s1]\nx = 1\n")
+        self.assertIsNone(c.section(None))
+
     def test_sections_in_file_order(self):
         c = ConfigObj.parse(b"a = 1\n[s1]\nx = 1\n[s2]\ny = 2\n")
         self.assertEqual([None, "s1", "s2"], [s.id for s in c.sections()])
+
+    def test_sections_omits_no_name_when_only_named(self):
+        c = ConfigObj.parse(b"[s1]\nx = 1\n[s2]\ny = 2\n")
+        self.assertEqual(["s1", "s2"], [s.id for s in c.sections()])
+
+    def test_sections_empty_when_no_entries(self):
+        c = ConfigObj.parse(b"# just a comment\n")
+        self.assertEqual([], c.sections())
+
+    def test_duplicate_key_last_value_wins(self):
+        c = ConfigObj.parse(b"a = 1\na = 2\n")
+        sec = c.section(None)
+        self.assertEqual("2", sec.get("a"))
+        self.assertEqual(["a"], sec.option_names())
+
+    def test_interleaved_same_section_merges(self):
+        c = ConfigObj.parse(b"[s1]\nx = 1\n[s2]\nz = 3\n[s1]\ny = 2\n")
+        sec = c.section("s1")
+        self.assertEqual("1", sec.get("x"))
+        self.assertEqual("2", sec.get("y"))
+        self.assertEqual(["x", "y"], sec.option_names())
 
     def test_empty_config_writes_nothing(self):
         self.assertEqual(b"", ConfigObj().to_bytes())
 
     def test_missing_equals_raises(self):
         self.assertRaises(ValueError, ConfigObj.parse, b"not a config line\n")
+
+    def test_bad_section_header_raises(self):
+        self.assertRaises(ValueError, ConfigObj.parse, b"[unterminated\n")
+
+    def test_empty_section_name_raises(self):
+        self.assertRaises(ValueError, ConfigObj.parse, b"[]\n")
+
+    def test_nested_section_raises(self):
+        self.assertRaises(ValueError, ConfigObj.parse, b"[[sub]]\n")
+
+    def test_non_utf8_raises(self):
+        self.assertRaises(ValueError, ConfigObj.parse, b"a = \xff\n")
+
+    def test_key_name_is_unquoted(self):
+        c = ConfigObj.parse(b'"k" = 1\n')
+        self.assertEqual("1", c.section(None).get("k"))
+
+    def test_section_name_is_unquoted(self):
+        c = ConfigObj.parse(b"['/a path']\nk = v\n")
+        self.assertEqual("v", c.section("/a path").get("k"))
+
+
+class TestConfigObjParseValues(TestCase):
+    """The raw value the parser stores (list_values=False keeps quotes)."""
+
+    def test_quoted_value_keeps_quotes(self):
+        c = ConfigObj.parse(b"a = 'q'\n")
+        self.assertEqual("'q'", c.section(None).get("a"))
+
+    def test_double_quoted_value_keeps_quotes(self):
+        c = ConfigObj.parse(b'a = "q"\n')
+        self.assertEqual('"q"', c.section(None).get("a"))
+
+    def test_hash_inside_quotes_is_not_a_comment(self):
+        c = ConfigObj.parse(b"a = '#x'\n")
+        self.assertEqual("'#x'", c.section(None).get("a"))
+
+    def test_inline_comment_stripped_from_value(self):
+        c = ConfigObj.parse(b"a = 1 # hi\n")
+        self.assertEqual("1", c.section(None).get("a"))
+
+    def test_quoted_value_with_trailing_comment(self):
+        c = ConfigObj.parse(b'a = "v a l" # tail\n')
+        self.assertEqual('"v a l"', c.section(None).get("a"))
+
+    def test_unterminated_quote_is_whole_value(self):
+        c = ConfigObj.parse(b'a = "oops\n')
+        self.assertEqual('"oops', c.section(None).get("a"))
 
 
 class TestSection(TestCase):
@@ -72,6 +149,14 @@ class TestSection(TestCase):
     def test_is_section(self):
         self.assertIsInstance(ConfigObj.parse(b"a = 1\n").section(None), Section)
 
+    def test_repr_named(self):
+        sec = ConfigObj.parse(b"[loc]\nk = v\n").section("loc")
+        self.assertEqual('<Section "loc">', repr(sec))
+
+    def test_repr_no_name(self):
+        sec = ConfigObj.parse(b"k = v\n").section(None)
+        self.assertEqual("<Section (no name)>", repr(sec))
+
 
 class TestConfigObjWrite(TestCase):
     def test_set_value_updates_in_place(self):
@@ -84,27 +169,65 @@ class TestConfigObjWrite(TestCase):
         c.set_value("loc", "k", "v")
         self.assertEqual(b"a = 1\n[loc]\nk = v\n", c.to_bytes())
 
+    def test_set_value_new_no_name_key_lands_before_sections(self):
+        c = ConfigObj.parse(b"a = 1\n[s]\nx = y\n")
+        c.set_value(None, "b", "2")
+        self.assertEqual(b"a = 1\nb = 2\n[s]\nx = y\n", c.to_bytes())
+
     def test_set_value_appends_after_last_entry_of_section(self):
         c = ConfigObj.parse(b"[s1]\nx = 1\ny = 2\n[s2]\nz = 3\n")
         c.set_value("s1", "w", "4")
+        self.assertEqual(b"[s1]\nx = 1\ny = 2\nw = 4\n[s2]\nz = 3\n", c.to_bytes())
+
+    def test_set_value_into_empty_header_section(self):
+        c = ConfigObj.parse(b"[s1]\n[s2]\nz = 3\n")
+        c.set_value("s1", "k", "v")
+        self.assertEqual(b"[s1]\nk = v\n[s2]\nz = 3\n", c.to_bytes())
+
+    def test_set_value_targets_first_interleaved_block(self):
+        c = ConfigObj.parse(b"[s1]\nx = 1\n[s2]\nz = 3\n[s1]\nw = 4\n")
+        c.set_value("s1", "y", "2")
         self.assertEqual(
-            b"[s1]\nx = 1\ny = 2\nw = 4\n[s2]\nz = 3\n", c.to_bytes()
+            b"[s1]\nx = 1\ny = 2\n[s2]\nz = 3\n[s1]\nw = 4\n", c.to_bytes()
         )
+
+    def test_set_value_on_empty_config(self):
+        c = ConfigObj()
+        c.set_value(None, "a", "1")
+        self.assertEqual(b"a = 1\n", c.to_bytes())
 
     def test_remove_value(self):
         c = ConfigObj.parse(b"a = 1\nb = 2\n")
         c.remove_value(None, "a")
         self.assertEqual(b"b = 2\n", c.to_bytes())
 
+    def test_remove_absent_value_is_noop(self):
+        c = ConfigObj.parse(b"a = 1\n")
+        c.remove_value(None, "missing")
+        self.assertEqual(b"a = 1\n", c.to_bytes())
+
+    def test_remove_value_from_missing_section_is_noop(self):
+        c = ConfigObj.parse(b"a = 1\n")
+        c.remove_value("nope", "a")
+        self.assertEqual(b"a = 1\n", c.to_bytes())
+
     def test_round_trips_comments_and_blanks(self):
         data = b"# a comment\n\nnickname = trunk\n"
         self.assertEqual(data, ConfigObj.parse(data).to_bytes())
+
+    def test_missing_trailing_newline_is_added(self):
+        c = ConfigObj.parse(b"a = 1")
+        self.assertEqual(b"a = 1\n", c.to_bytes())
 
     def test_inline_comment_round_trips(self):
         data = b"a = 1 # hi\n"
         c = ConfigObj.parse(data)
         self.assertEqual("1", c.section(None).get("a"))
         self.assertEqual(data, c.to_bytes())
+
+    def test_quoted_value_with_comment_round_trips(self):
+        data = b'a = "v a l" # tail\n'
+        self.assertEqual(data, ConfigObj.parse(data).to_bytes())
 
 
 class TestQuoting(TestCase):
@@ -117,52 +240,41 @@ class TestQuoting(TestCase):
     def test_quote_leading_space(self):
         self.assertEqual("' leading'", quote_value(" leading"))
 
+    def test_quote_trailing_space(self):
+        self.assertEqual("'trailing '", quote_value("trailing "))
+
+    def test_quote_leading_tab(self):
+        self.assertEqual("'\tleading'", quote_value("\tleading"))
+
     def test_quote_comma(self):
         self.assertEqual("'a,b'", quote_value("a,b"))
 
     def test_quote_hash(self):
         self.assertEqual("'has#hash'", quote_value("has#hash"))
 
-    def test_quote_needing_double(self):
-        self.assertEqual("\"a,'b\"", quote_value("a,'b"))
+    def test_quote_mid_string_quote_not_quoted(self):
+        # A single quote in the middle is not an edge char and there is no
+        # comma or hash, so no quoting is applied.
+        self.assertEqual("has'quote", quote_value("has'quote"))
 
-    def test_unquote_pairs(self):
+    def test_quote_needing_double(self):
+        self.assertEqual('"a,\'b"', quote_value("a,'b"))
+
+    def test_unquote_single_pair(self):
         self.assertEqual("x", unquote_value("'x'"))
+
+    def test_unquote_double_pair(self):
         self.assertEqual("x", unquote_value('"x"'))
+
+    def test_unquote_unquoted(self):
         self.assertEqual("x", unquote_value("x"))
 
+    def test_unquote_mismatched_edges_left_alone(self):
+        self.assertEqual("'x\"", unquote_value("'x\""))
 
-class TestConfigObjAgainstConfigObj(TestCase):
-    """Cross-check against the reference configobj library.
+    def test_unquote_single_char_left_alone(self):
+        self.assertEqual("'", unquote_value("'"))
 
-    Only the semantics the Rust parser deliberately shares with configobj
-    (list_values=False, interpolation off) are compared.
-    """
-
-    def _reference(self, data):
-        import configobj
-
-        return configobj.ConfigObj(
-            data.splitlines(), list_values=False, interpolation=False
-        )
-
-    def test_matches_reference_scalars(self):
-        data = b"a = 1\nb = two\n"
-        ref = self._reference(data)
-        sec = ConfigObj.parse(data).section(None)
-        self.assertEqual(ref["a"], sec.get("a"))
-        self.assertEqual(ref["b"], sec.get("b"))
-
-    def test_matches_reference_named_section(self):
-        data = b"[loc]\nkey = val\n"
-        ref = self._reference(data)
-        sec = ConfigObj.parse(data).section("loc")
-        self.assertEqual(ref["loc"]["key"], sec.get("key"))
-
-    def test_matches_reference_quoted_value_kept(self):
-        # With list_values=False configobj keeps surrounding quotes.
-        data = b"a = 'q'\n"
-        ref = self._reference(data)
-        sec = ConfigObj.parse(data).section(None)
-        self.assertEqual(ref["a"], sec.get("a"))
-        self.assertEqual("'q'", sec.get("a"))
+    def test_quote_unquote_round_trip(self):
+        for value in ["plain", "", " lead", "a,b", "has#hash", "a,'b"]:
+            self.assertEqual(value, unquote_value(quote_value(value)))
