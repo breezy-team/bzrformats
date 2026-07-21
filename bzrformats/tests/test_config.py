@@ -291,6 +291,8 @@ class TestConfigObjWrite(TestCase):
 
 
 class TestQuoting(TestCase):
+    """quote_value/unquote_value match configobj's list-aware _quote/_unquote."""
+
     def test_quote_plain(self):
         self.assertEqual("plain", quote_value("plain"))
 
@@ -298,27 +300,45 @@ class TestQuoting(TestCase):
         self.assertEqual('""', quote_value(""))
 
     def test_quote_leading_space(self):
-        self.assertEqual("' leading'", quote_value(" leading"))
+        # An edge whitespace char forces quoting; configobj prefers double
+        # quotes.
+        self.assertEqual('" leading"', quote_value(" leading"))
 
     def test_quote_trailing_space(self):
-        self.assertEqual("'trailing '", quote_value("trailing "))
+        self.assertEqual('"trailing "', quote_value("trailing "))
 
     def test_quote_leading_tab(self):
-        self.assertEqual("'\tleading'", quote_value("\tleading"))
+        self.assertEqual('"\tleading"', quote_value("\tleading"))
 
     def test_quote_comma(self):
-        self.assertEqual("'a,b'", quote_value("a,b"))
+        self.assertEqual('"a,b"', quote_value("a,b"))
+
+    def test_quote_bare_comma(self):
+        self.assertEqual('","', quote_value(","))
 
     def test_quote_hash(self):
-        self.assertEqual("'has#hash'", quote_value("has#hash"))
+        self.assertEqual('"has#hash"', quote_value("has#hash"))
+
+    def test_quote_leading_hash(self):
+        self.assertEqual('"#leadinghash"', quote_value("#leadinghash"))
 
     def test_quote_mid_string_quote_not_quoted(self):
         # A single quote in the middle is not an edge char and there is no
         # comma or hash, so no quoting is applied.
         self.assertEqual("has'quote", quote_value("has'quote"))
 
-    def test_quote_needing_double(self):
-        self.assertEqual('"a,\'b"', quote_value("a,'b"))
+    def test_quote_value_containing_double_uses_single(self):
+        self.assertEqual("'\" a b c \"'", quote_value('" a b c "'))
+
+    def test_quote_newline_uses_triple(self):
+        self.assertEqual("'''a\nb'''", quote_value("a\nb"))
+
+    def test_quote_both_quote_kinds_uses_triple(self):
+        self.assertEqual("'''has ' and \"'''", quote_value("has ' and \""))
+
+    def test_quote_unquotable_raises(self):
+        # A value containing both ''' and \"\"\" cannot be safely quoted.
+        self.assertRaises(ValueError, quote_value, "a '''b''' c \"\"\"d\"\"\"")
 
     def test_unquote_single_pair(self):
         self.assertEqual("x", unquote_value("'x'"))
@@ -332,9 +352,12 @@ class TestQuoting(TestCase):
     def test_unquote_mismatched_edges_left_alone(self):
         self.assertEqual("'x\"", unquote_value("'x\""))
 
-    def test_unquote_single_char_left_alone(self):
-        self.assertEqual("'", unquote_value("'"))
+    def test_unquote_lone_quote_becomes_empty(self):
+        # configobj strips whenever first == last and is a quote, so a lone
+        # quote char unquotes to empty.
+        self.assertEqual("", unquote_value("'"))
 
     def test_quote_unquote_round_trip(self):
-        for value in ["plain", "", " lead", "a,b", "has#hash", "a,'b"]:
+        for value in ['" a b c "', '" a , b c "', '","', '""']:
+            self.assertEqual(value, quote_value(unquote_value(value)))
             self.assertEqual(value, unquote_value(quote_value(value)))

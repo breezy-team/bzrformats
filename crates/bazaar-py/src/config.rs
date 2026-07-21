@@ -153,13 +153,16 @@ impl ConfigObj {
     }
 }
 
-/// Quote `value` for writing, matching breezy's list-aware `Store.quote`.
+/// Quote `value` for writing, matching configobj's list-aware `_quote`. Raises
+/// `ValueError` when the value cannot be safely quoted (as configobj does).
 #[pyfunction]
-fn quote_value(value: &str) -> String {
+fn quote_value(value: &str) -> PyResult<String> {
     bazaar::config::quote_value(value)
+        .ok_or_else(|| PyValueError::new_err(format!("value cannot be safely quoted: {value:?}")))
 }
 
-/// Strip a matched surrounding quote pair from a raw value, as `Store.unquote`.
+/// Strip a matched surrounding quote pair from a raw value, as configobj's
+/// `_unquote`.
 #[pyfunction]
 fn unquote_value(value: &str) -> String {
     bazaar::config::unquote_value(value)

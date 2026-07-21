@@ -388,7 +388,11 @@ impl Branch {
             let mut store = crate::config::IniFileStore::new();
             store.load_from_bytes(&bytes)?;
             let mut section = store.get_mutable_section(None);
-            section.set(name, &store.quote(value.unwrap_or("")));
+            let raw = value.unwrap_or("");
+            let quoted = store.quote(raw).ok_or_else(|| {
+                BranchError::Unsupported(format!("config value cannot be quoted: {raw:?}"))
+            })?;
+            section.set(name, &quoted);
             store.apply_changes(&section);
             self.transport
                 .put_bytes("branch.conf", &store.to_bytes(), None)?;

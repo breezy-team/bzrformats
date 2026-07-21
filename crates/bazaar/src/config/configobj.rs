@@ -557,14 +557,19 @@ fn path_is_depth1(path: &[String], id: Option<&str>) -> bool {
 }
 
 /// Strip a matched surrounding quote pair from a section or key name, as
-/// configobj's `_unquote` does.
+/// configobj's `_unquote` does. configobj strips whenever the first and last
+/// character are the same quote char, so a lone `'` or `"` unquotes to empty.
 fn unquote_name(s: &str) -> String {
     let bytes = s.as_bytes();
-    if bytes.len() >= 2 {
+    if !bytes.is_empty() {
         let first = bytes[0];
         let last = bytes[bytes.len() - 1];
         if first == last && (first == b'"' || first == b'\'') {
-            return s[1..s.len() - 1].to_string();
+            // A lone quote (len 1) has first == last and strips to empty.
+            return s
+                .get(1..s.len().saturating_sub(1))
+                .unwrap_or("")
+                .to_string();
         }
     }
     s.to_string()
@@ -664,39 +669,75 @@ fn split_value_and_comment(s: &str) -> Result<(String, String), ConfigObjError> 
     }
 }
 
-/// Quote `value` for writing, matching breezy's list-aware `Store.quote`.
+/// Quote a scalar `value` for writing, matching configobj's `_quote` with the
+/// settings breezy's store uses (`list_values=True`, `multiline=True`,
+/// `write_empty_values=False`).
 ///
-/// A scalar needs no quotes unless its first/last char is whitespace or a
-/// quote, or it contains a comma or `#`. Empty string becomes `""`.
-pub fn quote_value(value: &str) -> String {
+/// Returns `None` when the value cannot be safely quoted (it contains both a
+/// `'''` and a `"""`, or both a `'` and a `"` and needs single-quoting),
+/// mirroring configobj raising `ConfigObjError`.
+pub fn quote_value(value: &str) -> Option<String> {
+    // configobj's wspace_plus: whitespace plus the two quote chars.
+    fn is_wspace_plus(c: char) -> bool {
+        matches!(c, ' ' | '\r' | '\n' | '\u{0b}' | '\t' | '\'' | '"')
+    }
+
     if value.is_empty() {
-        return "\"\"".to_string();
+        return Some("\"\"".to_string());
     }
-    let needs_quote = {
-        let bytes = value.as_bytes();
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        let edge_ws_or_quote = |c: u8| matches!(c, b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'');
-        edge_ws_or_quote(first)
-            || edge_ws_or_quote(last)
-            || value.contains(',')
-            || value.contains('#')
-    };
-    if !needs_quote {
-        return value.to_string();
-    }
-    // Prefer single quotes; use double quotes if the value contains a single
-    // quote (configobj's rule). Both present is not expected for the keys we
-    // write (locations/booleans), so fall back to double quoting.
-    if value.contains('\'') {
-        format!("\"{value}\"")
+
+    let has_single = value.contains('\'');
+    let has_double = value.contains('"');
+    let need_triple = (has_single && has_double) || value.contains('\n');
+
+    if !need_triple {
+        // check_for_single branch.
+        let first = value.chars().next().unwrap();
+        let last = value.chars().next_back().unwrap();
+        let mut quoted = if !is_wspace_plus(first) && !is_wspace_plus(last) && !value.contains(',')
+        {
+            value.to_string()
+        } else {
+            single_or_double_quote(value, has_single, has_double)?
+        };
+        // A `noquot` result still gets single/double quoted if it contains `#`
+        // (list_values is True).
+        if quoted == value && value.contains('#') {
+            quoted = single_or_double_quote(value, has_single, has_double)?;
+        }
+        Some(quoted)
     } else {
-        format!("'{value}'")
+        // Triple quoting (configobj's _get_triple_quote): `'''` unless the value
+        // already contains `"""`, in which case `"""`; both present is
+        // unquotable.
+        let has_triple_double = value.contains("\"\"\"");
+        let has_triple_single = value.contains("'''");
+        if has_triple_double && has_triple_single {
+            return None;
+        }
+        if has_triple_double {
+            Some(format!("\"\"\"{value}\"\"\""))
+        } else {
+            Some(format!("'''{value}'''"))
+        }
     }
 }
 
-/// Strip a matched surrounding quote pair from a raw value, as
-/// `Store.unquote` (configobj's `_unquote`).
+/// configobj's `_get_single_quote`: double quotes normally, single quotes if the
+/// value contains a `"`, and unquotable if it contains both quote kinds.
+fn single_or_double_quote(value: &str, has_single: bool, has_double: bool) -> Option<String> {
+    if has_single && has_double {
+        None
+    } else if has_double {
+        Some(format!("'{value}'"))
+    } else {
+        Some(format!("\"{value}\""))
+    }
+}
+
+/// Strip a matched surrounding quote pair from a raw value, as configobj's
+/// `_unquote`. Empty input is returned unchanged (configobj raises, but breezy's
+/// `Store.unquote` guards against empty/non-string before calling this).
 pub fn unquote_value(value: &str) -> String {
     unquote_name(value)
 }
@@ -812,15 +853,34 @@ mod tests {
 
     #[test]
     fn quote_value_rules() {
-        assert_eq!(quote_value("plain"), "plain");
-        assert_eq!(quote_value(""), "\"\"");
-        assert_eq!(quote_value(" leading"), "' leading'");
-        assert_eq!(quote_value("a,b"), "'a,b'");
-        assert_eq!(quote_value("has#hash"), "'has#hash'");
+        // Matches configobj's _quote (list_values=True, multiline=True).
+        assert_eq!(quote_value("plain").unwrap(), "plain");
+        assert_eq!(quote_value("").unwrap(), "\"\"");
+        assert_eq!(quote_value(" leading").unwrap(), "\" leading\"");
+        assert_eq!(quote_value("trailing ").unwrap(), "\"trailing \"");
+        assert_eq!(quote_value("a,b").unwrap(), "\"a,b\"");
+        assert_eq!(quote_value(",").unwrap(), "\",\"");
+        assert_eq!(quote_value("has#hash").unwrap(), "\"has#hash\"");
+        assert_eq!(quote_value("#leadinghash").unwrap(), "\"#leadinghash\"");
         // A mid-string quote needs no quoting (no comma/#, not an edge char).
-        assert_eq!(quote_value("has'quote"), "has'quote");
-        // A value that needs quoting and contains a single quote uses doubles.
-        assert_eq!(quote_value("a,'b"), "\"a,'b\"");
+        assert_eq!(quote_value("a'b").unwrap(), "a'b");
+        assert_eq!(quote_value("a\"b").unwrap(), "a\"b");
+        // A value that needs quoting and contains a double quote uses singles.
+        assert_eq!(quote_value("\" a b c \"").unwrap(), "'\" a b c \"'");
+        assert_eq!(quote_value("\",\"").unwrap(), "'\",\"'");
+        // A newline forces triple quotes.
+        assert_eq!(quote_value("a\nb").unwrap(), "'''a\nb'''");
+        // Both quote kinds present -> triple quotes.
+        assert_eq!(
+            quote_value("has both ' and \"").unwrap(),
+            "'''has both ' and \"'''"
+        );
+    }
+
+    #[test]
+    fn quote_value_unquotable_returns_none() {
+        // A value containing both `'''` and `"""` cannot be safely quoted.
+        assert_eq!(quote_value("a '''and''' b \"\"\"c\"\"\""), None);
     }
 
     #[test]
