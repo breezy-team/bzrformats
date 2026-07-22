@@ -90,3 +90,52 @@ impl RevisionTree {
             .and_then(|e| e.revision().map(|r| r.as_bytes().to_vec())))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::MutableInventory;
+
+    fn id(bytes: &[u8]) -> FileId {
+        FileId::from(bytes.to_vec())
+    }
+
+    fn file(file_id: &[u8], name: &str, parent_id: &[u8]) -> Entry {
+        Entry::file(
+            id(file_id),
+            name.to_string(),
+            id(parent_id),
+            None,
+            Some(b"sha".to_vec()),
+            Some(1),
+            Some(false),
+            None,
+        )
+    }
+
+    /// A tree holding `a`, `sub/b` and `sub/c`.
+    fn sample_tree() -> RevisionTree {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(id(b"TREE_ROOT"), None)).unwrap();
+        inv.add(Entry::directory(
+            id(b"sub-id"),
+            "sub".to_string(),
+            id(b"TREE_ROOT"),
+            None,
+        ))
+        .unwrap();
+        inv.add(file(b"c-id", "c", b"sub-id")).unwrap();
+        inv.add(file(b"b-id", "b", b"sub-id")).unwrap();
+        inv.add(file(b"a-id", "a", b"TREE_ROOT")).unwrap();
+        RevisionTree::new(b"rev1".to_vec(), Box::new(inv))
+    }
+
+    #[test]
+    fn can_be_sent_to_another_thread() {
+        let tree = sample_tree();
+        let found = std::thread::spawn(move || tree.path2id("sub/b"))
+            .join()
+            .unwrap();
+        assert_eq!(found, Some(id(b"b-id")));
+    }
+}

@@ -542,7 +542,7 @@ pub fn find_interesting_parents<'a>(
 /// is object-safe and can be satisfied by both an in-memory inventory and
 /// a lazy CHK inventory that reads entries from a store on demand. This is
 /// what a repository's `get_inventory` returns as `Box<dyn Inventory>`.
-pub trait Inventory {
+pub trait Inventory: Send {
     /// Whether a path is versioned. A backend read failure propagates rather
     /// than reading as absent.
     fn has_filename(&self, filename: &str) -> Result<bool, Error>;
@@ -1913,6 +1913,12 @@ mod tests {
                 ("sub/b".to_string(), b"b-id".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn inventory_trait_object_is_send() {
+        fn assert_send<T: Send + ?Sized>() {}
+        assert_send::<dyn Inventory>();
     }
 
     /// Add a directory entry under `parent` by path-splitting. Returns the
