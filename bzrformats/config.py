@@ -14,12 +14,14 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
-"""Parser and writer for the ConfigObj INI dialect breezy stores config in.
+"""A configobj-compatible reader/writer for the INI dialect breezy uses.
 
-ConfigObj parses config bytes (UTF-8, list_values=False, interpolation off),
-hands out Section views, and writes changes back preserving section/key order
-and comments. quote_value/unquote_value implement breezy's list-aware quoting.
-The parser is implemented as a Rust pyclass in the bazaar crate.
+``ConfigObj`` is a drop-in for the subset of ``configobj.ConfigObj`` breezy's
+config store relies on: a dict-like top level whose items are scalar option
+strings and nested ``Section`` mappings, ``scalars``/``sections`` name lists,
+``setdefault``/``write`` and live mutation. Parsing (UTF-8, list_values=False,
+interpolation off), serialization and list-aware ``quote_value``/
+``unquote_value`` are implemented as Rust pyclasses in the bazaar crate.
 """
 
 from ._bzr_rs.config import (  # noqa: F401

@@ -302,6 +302,20 @@ impl ConfigObj {
         roots
     }
 
+    /// Ensure a depth-1 section header `[name]` exists, appending an empty one
+    /// at end of file if absent. Used so a section created via `setdefault`
+    /// appears in file order even before it has any entries.
+    pub fn ensure_section(&mut self, name: &str) {
+        let exists = self.lines.iter().any(
+            |l| matches!(l, Line::SectionHeader { path } if path.len() == 1 && path[0] == name),
+        );
+        if !exists {
+            self.lines.push(Line::SectionHeader {
+                path: vec![name.to_string()],
+            });
+        }
+    }
+
     /// Set `key` to `value` in section `id`, in place if it already exists,
     /// otherwise appended after the last entry of that section (creating the
     /// section header if needed).
