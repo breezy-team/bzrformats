@@ -102,9 +102,14 @@ impl<'s, S: AnnotateSource> Annotator<'s, S> {
             let mut parent_lookup: Vec<Key> = Vec::new();
             let mut next_parent_map: HashMap<Key, Vec<Key>> = HashMap::new();
             for key in needed_keys.drain() {
-                if self.parent_map.contains_key(&key) {
+                if let Some(parents) = self.parent_map.get(&key) {
+                    // We already know this key's parents (e.g. it was seeded).
                     if !self.text_cache.contains_key(&key) {
                         vf_keys_needed.insert(key);
+                    } else if !self.annotations_cache.contains_key(&key) {
+                        // Text is present but unannotated: walk its parents so
+                        // they annotate first.
+                        next_parent_map.insert(key.clone(), parents.clone());
                     }
                 } else {
                     parent_lookup.push(key.clone());

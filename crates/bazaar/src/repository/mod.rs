@@ -48,6 +48,10 @@ pub use weave_repo::WeaveRepository;
 
 use crate::inventory::Inventory;
 
+/// One annotated line: the id of the revision that introduced it, and the line
+/// bytes. Returned in file order by the annotate methods.
+pub type AnnotatedLine = (Vec<u8>, Vec<u8>);
+
 /// The common read interface to a bzr repository.
 ///
 /// Object-safe: `get_inventory` returns `Box<dyn Inventory>`, so a repository
@@ -156,8 +160,26 @@ pub trait Repository: Send + Sync {
         &self,
         _file_id: &[u8],
         _revision: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RepositoryError> {
+    ) -> Result<Vec<AnnotatedLine>, RepositoryError> {
         Err(RepositoryError::UnsupportedFormat("annotate_file_lines"))
+    }
+
+    /// Annotate not-yet-committed `working_lines` of `file_id`, whose parents
+    /// are `(file_id, parent_revision)` for each `parent_revision`.
+    ///
+    /// Lines new in `working_lines` are attributed to `default_revision`. The
+    /// base implementation is unsupported; formats that store file texts
+    /// override it. Mirrors the working-tree path of `Tree.annotate_iter`.
+    fn annotate_file_lines_special(
+        &self,
+        _file_id: &[u8],
+        _default_revision: &[u8],
+        _parent_revisions: &[Vec<u8>],
+        _working_lines: Vec<Vec<u8>>,
+    ) -> Result<Vec<AnnotatedLine>, RepositoryError> {
+        Err(RepositoryError::UnsupportedFormat(
+            "annotate_file_lines_special",
+        ))
     }
 
     /// Open a write group: a batch of additions flushed atomically by

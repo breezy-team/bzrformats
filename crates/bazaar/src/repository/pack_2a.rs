@@ -26,6 +26,7 @@ use crate::transport::{Transport, TransportError};
 use crate::versionedfile::Key;
 
 use super::format::RepositoryFormat;
+use super::AnnotatedLine;
 use crate::bencode_serializer::BEncodeRevisionSerializer1;
 use crate::declare_repository_format;
 use crate::xml_serializer::Chk255BigPageInventorySerializer;
@@ -584,7 +585,7 @@ impl Pack2aRepository {
         &self,
         file_id: &[u8],
         revision: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RepositoryError> {
+    ) -> Result<Vec<AnnotatedLine>, RepositoryError> {
         let key = Key::fixed(vec![file_id.to_vec(), revision.to_vec()]);
         let mut annotator = crate::annotate::Annotator::new(&self.texts);
         let flat = annotator.annotate_flat(&key).map_err(|e| match e {
@@ -595,6 +596,40 @@ impl Pack2aRepository {
             crate::annotate::Error::Backend(msg) => RepositoryError::Corrupt(msg),
         })?;
         // The origin key is (file_id, revision); report just its revision id.
+        Ok(flat
+            .into_iter()
+            .map(|(origin, line)| (origin.version_id().to_vec(), line))
+            .collect())
+    }
+
+    /// Annotate `working_lines` as a not-yet-committed text of `file_id` whose
+    /// parents are `(file_id, parent_revision)` for each `parent_revision`.
+    ///
+    /// This is the working-tree case: the edited content is injected as a
+    /// special text keyed by `default_revision`, so lines new in the working
+    /// copy are attributed to `default_revision` and the rest to the commit
+    /// that introduced them. Mirrors `WorkingTree.annotate_iter`.
+    pub fn annotate_file_lines_special(
+        &self,
+        file_id: &[u8],
+        default_revision: &[u8],
+        parent_revisions: &[Vec<u8>],
+        working_lines: Vec<Vec<u8>>,
+    ) -> Result<Vec<AnnotatedLine>, RepositoryError> {
+        let this_key = Key::fixed(vec![file_id.to_vec(), default_revision.to_vec()]);
+        let parent_keys: Vec<Key> = parent_revisions
+            .iter()
+            .map(|rev| Key::fixed(vec![file_id.to_vec(), rev.clone()]))
+            .collect();
+        let mut annotator = crate::annotate::Annotator::new(&self.texts);
+        annotator.add_special_text(this_key.clone(), parent_keys, working_lines);
+        let flat = annotator.annotate_flat(&this_key).map_err(|e| match e {
+            crate::annotate::Error::RevisionNotPresent(_) => RepositoryError::NoSuchFileText {
+                file_id: file_id.to_vec(),
+                revision: default_revision.to_vec(),
+            },
+            crate::annotate::Error::Backend(msg) => RepositoryError::Corrupt(msg),
+        })?;
         Ok(flat
             .into_iter()
             .map(|(origin, line)| (origin.version_id().to_vec(), line))
@@ -1212,8 +1247,24 @@ impl super::Repository for Pack2aRepository {
         &self,
         file_id: &[u8],
         revision: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RepositoryError> {
+    ) -> Result<Vec<AnnotatedLine>, RepositoryError> {
         Pack2aRepository::annotate_file_lines(self, file_id, revision)
+    }
+
+    fn annotate_file_lines_special(
+        &self,
+        file_id: &[u8],
+        default_revision: &[u8],
+        parent_revisions: &[Vec<u8>],
+        working_lines: Vec<Vec<u8>>,
+    ) -> Result<Vec<AnnotatedLine>, RepositoryError> {
+        Pack2aRepository::annotate_file_lines_special(
+            self,
+            file_id,
+            default_revision,
+            parent_revisions,
+            working_lines,
+        )
     }
 
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {

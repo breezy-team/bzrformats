@@ -1854,4 +1854,41 @@ mod tests {
             vec![(r1.clone(), b"a\n".to_vec()), (r1.clone(), b"b\n".to_vec()),]
         );
     }
+
+    #[test]
+    fn annotate_special_text_attributes_new_lines_to_default() {
+        use crate::annotate::Annotator;
+        let store = std::rc::Rc::new(std::cell::RefCell::new(MemStore::default()));
+        let vf = GroupCompressVersionedFiles::new(
+            MemIndex(store.clone()),
+            MemAccess(store.clone()),
+            true,
+        );
+        let r1 = gckey(b"r1");
+        vf.add_lines(
+            r1.clone(),
+            Some(vec![]),
+            vec![b"a\n".to_vec(), b"b\n".to_vec()],
+        )
+        .unwrap();
+
+        // An edited working copy: keeps "a", changes "b", appends a new line.
+        // It is not in the store; inject it with r1 as its parent.
+        let working = gckey(b"current:");
+        let mut annotator = Annotator::new(&vf);
+        annotator.add_special_text(
+            working.clone(),
+            vec![r1.clone()],
+            vec![b"a\n".to_vec(), b"B\n".to_vec(), b"new\n".to_vec()],
+        );
+        let flat = annotator.annotate_flat(&working).unwrap();
+        assert_eq!(
+            flat,
+            vec![
+                (r1.clone(), b"a\n".to_vec()),
+                (working.clone(), b"B\n".to_vec()),
+                (working.clone(), b"new\n".to_vec()),
+            ]
+        );
+    }
 }
