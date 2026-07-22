@@ -72,6 +72,49 @@ impl RevisionTree {
         self.inventory.entries().unwrap_or_default()
     }
 
+    /// Walk the tree in by-directory order, yielding `(path, entry)` pairs.
+    ///
+    /// The root is yielded first as `("", root)`. When `specific_files` is
+    /// given, only those paths (and the directories needed to reach them) are
+    /// yielded; a path that is not versioned is silently skipped.
+    pub fn iter_entries_by_dir(
+        &self,
+        specific_files: Option<&[&str]>,
+    ) -> Result<Vec<(String, Entry)>, crate::inventory::Error> {
+        let specific_file_ids = match specific_files {
+            None => None,
+            Some(paths) => {
+                let mut ids = Vec::with_capacity(paths.len());
+                for path in paths {
+                    if let Some(id) = self.path2id(path) {
+                        ids.push(id);
+                    }
+                }
+                Some(ids)
+            }
+        };
+        self.inventory
+            .iter_entries_by_dir(None, specific_file_ids.as_deref())
+    }
+
+    /// The direct children of the directory at `path`, sorted by name.
+    ///
+    /// A `path` that is not versioned is
+    /// [`Error::ParentNotVersioned`](crate::inventory::Error::ParentNotVersioned),
+    /// and one that is not a directory is
+    /// [`Error::ParentNotDirectory`](crate::inventory::Error::ParentNotDirectory).
+    pub fn iter_child_entries(&self, path: &str) -> Result<Vec<Entry>, crate::inventory::Error> {
+        let file_id = if path.trim_matches('/').is_empty() {
+            // The root has no path-keyed entry; look it up via the inventory.
+            self.inventory.root_entry()?.map(|e| e.file_id().clone())
+        } else {
+            self.path2id(path)
+        };
+        let file_id =
+            file_id.ok_or_else(|| crate::inventory::Error::ParentNotVersioned(path.to_string()))?;
+        self.inventory.sorted_children(&file_id)
+    }
+
     /// The inventory entry for `file_id`, or `None` if it is not in this
     /// tree. A backend read failure propagates rather than reading as absent.
     pub fn get_entry(&self, file_id: &FileId) -> Result<Option<Entry>, crate::inventory::Error> {
@@ -137,5 +180,59 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(found, Some(id(b"b-id")));
+    }
+
+    fn paths(entries: &[(String, Entry)]) -> Vec<&str> {
+        entries.iter().map(|(path, _)| path.as_str()).collect()
+    }
+
+    #[test]
+    fn iter_entries_by_dir_yields_the_root_first() {
+        let tree = sample_tree();
+        let entries = tree.iter_entries_by_dir(None).unwrap();
+        assert_eq!(paths(&entries), vec!["", "a", "sub", "sub/b", "sub/c"]);
+        assert_eq!(entries[0].1.file_id(), &id(b"TREE_ROOT"));
+    }
+
+    #[test]
+    fn iter_entries_by_dir_limits_to_specific_files() {
+        let tree = sample_tree();
+        let entries = tree
+            .iter_entries_by_dir(Some(&["sub/c", "a", "not-versioned"]))
+            .unwrap();
+        assert_eq!(paths(&entries), vec!["a", "sub/c"]);
+    }
+
+    #[test]
+    fn iter_child_entries_lists_a_directory() {
+        let tree = sample_tree();
+        let names = |path: &str| -> Vec<String> {
+            tree.iter_child_entries(path)
+                .unwrap()
+                .iter()
+                .map(|e| e.name().to_string())
+                .collect()
+        };
+        assert_eq!(names(""), vec!["a", "sub"]);
+        assert_eq!(names("sub"), vec!["b", "c"]);
+        assert_eq!(names("sub/"), vec!["b", "c"]);
+    }
+
+    #[test]
+    fn iter_child_entries_needs_a_versioned_directory() {
+        use crate::inventory::Error;
+
+        let tree = sample_tree();
+        match tree.iter_child_entries("a") {
+            Err(Error::ParentNotDirectory(path, file_id)) => {
+                assert_eq!(path, "a");
+                assert_eq!(file_id, id(b"a-id"));
+            }
+            other => panic!("expected a non-directory error, got {:?}", other.is_ok()),
+        }
+        match tree.iter_child_entries("not-versioned") {
+            Err(Error::ParentNotVersioned(path)) => assert_eq!(path, "not-versioned"),
+            other => panic!("expected an unversioned error, got {:?}", other.is_ok()),
+        }
     }
 }

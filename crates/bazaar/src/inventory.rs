@@ -566,6 +566,27 @@ pub trait Inventory: Send {
     /// The root entry, or `None` for an empty inventory. (`entries` omits the
     /// root, so callers rebuilding a full inventory need this separately.)
     fn root_entry(&self) -> Result<Option<Entry>, Error>;
+
+    /// Walk the inventory in by-directory order, yielding `(path, entry)`
+    /// pairs. All of a directory's entries are yielded before descending into
+    /// its subdirectories. When `from_dir` is `None`, iteration starts at the
+    /// root and the root entry is yielded first as `("", root)`. When
+    /// `specific_file_ids` is given, only those entries (and the paths needed
+    /// to reach them) are yielded.
+    ///
+    /// A `from_dir` that is not in the inventory is [`Error::NoSuchId`], and
+    /// one that is not a directory is [`Error::ParentNotDirectory`].
+    fn iter_entries_by_dir(
+        &self,
+        from_dir: Option<&FileId>,
+        specific_file_ids: Option<&[FileId]>,
+    ) -> Result<Vec<(String, Entry)>, Error>;
+
+    /// The direct children of the directory `file_id`, sorted by name.
+    ///
+    /// A `file_id` that is not in the inventory is [`Error::NoSuchId`], and
+    /// one that is not a directory is [`Error::ParentNotDirectory`].
+    fn sorted_children(&self, file_id: &FileId) -> Result<Vec<Entry>, Error>;
 }
 
 #[derive(Clone)]
@@ -613,9 +634,49 @@ impl Inventory for MutableInventory {
     fn root_entry(&self) -> Result<Option<Entry>, Error> {
         Ok(self.root().cloned())
     }
+
+    fn iter_entries_by_dir(
+        &self,
+        from_dir: Option<&FileId>,
+        specific_file_ids: Option<&[FileId]>,
+    ) -> Result<Vec<(String, Entry)>, Error> {
+        if let Some(from_dir) = from_dir {
+            self.check_directory(from_dir)?;
+        }
+        let set: Option<HashSet<&FileId>> = specific_file_ids.map(|ids| ids.iter().collect());
+        Ok(
+            MutableInventory::iter_entries_by_dir(self, from_dir, set.as_ref())
+                .map(|(p, e)| (p, e.clone()))
+                .collect(),
+        )
+    }
+
+    fn sorted_children(&self, file_id: &FileId) -> Result<Vec<Entry>, Error> {
+        self.check_directory(file_id)?;
+        Ok(self
+            .iter_sorted_children(file_id)
+            .into_iter()
+            .flatten()
+            .map(|(_, e)| e.clone())
+            .collect())
+    }
 }
 
 impl MutableInventory {
+    /// Check that `file_id` names a directory in this inventory.
+    fn check_directory(&self, file_id: &FileId) -> Result<(), Error> {
+        let entry = self
+            .get_entry(file_id)
+            .ok_or_else(|| Error::NoSuchId(file_id.clone()))?;
+        if entry.kind() != Kind::Directory {
+            return Err(Error::ParentNotDirectory(
+                self.id2path(file_id)?,
+                file_id.clone(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn new() -> MutableInventory {
         Self {
             by_id: HashMap::new(),
@@ -1919,6 +1980,137 @@ mod tests {
     fn inventory_trait_object_is_send() {
         fn assert_send<T: Send + ?Sized>() {}
         assert_send::<dyn Inventory>();
+    }
+
+    /// An inventory holding `a`, `sub/b` and `sub/c`, added out of name order.
+    fn nested_inventory() -> MutableInventory {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        inv.add(Entry::directory(
+            FileId::from(b"sub-id".to_vec()),
+            "sub".to_string(),
+            root_id(),
+            None,
+        ))
+        .unwrap();
+        for (file_id, name, parent_id) in [
+            (&b"c-id"[..], "c", FileId::from(b"sub-id".to_vec())),
+            (&b"b-id"[..], "b", FileId::from(b"sub-id".to_vec())),
+            (&b"a-id"[..], "a", root_id()),
+        ] {
+            inv.add(Entry::file(
+                FileId::from(file_id.to_vec()),
+                name.to_string(),
+                parent_id,
+                None,
+                Some(b"sha".to_vec()),
+                Some(1),
+                Some(false),
+                None,
+            ))
+            .unwrap();
+        }
+        inv
+    }
+
+    fn paths_and_ids(entries: Vec<(String, Entry)>) -> Vec<(String, Vec<u8>)> {
+        entries
+            .into_iter()
+            .map(|(path, entry)| (path, entry.file_id().as_bytes().to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn trait_iter_entries_by_dir() {
+        let inv = nested_inventory();
+        let inv: &dyn Inventory = &inv;
+        assert_eq!(
+            paths_and_ids(inv.iter_entries_by_dir(None, None).unwrap()),
+            vec![
+                ("".to_string(), b"TREE_ROOT".to_vec()),
+                ("a".to_string(), b"a-id".to_vec()),
+                ("sub".to_string(), b"sub-id".to_vec()),
+                ("sub/b".to_string(), b"b-id".to_vec()),
+                ("sub/c".to_string(), b"c-id".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn trait_iter_entries_by_dir_specific_file_ids() {
+        let inv = nested_inventory();
+        let inv: &dyn Inventory = &inv;
+        let wanted = [
+            FileId::from(b"c-id".to_vec()),
+            FileId::from(b"a-id".to_vec()),
+        ];
+        assert_eq!(
+            paths_and_ids(inv.iter_entries_by_dir(None, Some(&wanted)).unwrap()),
+            vec![
+                ("a".to_string(), b"a-id".to_vec()),
+                ("sub/c".to_string(), b"c-id".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn trait_iter_entries_by_dir_from_dir() {
+        let inv = nested_inventory();
+        let inv: &dyn Inventory = &inv;
+        let sub_id = FileId::from(b"sub-id".to_vec());
+        // The starting directory is not yielded and paths are relative to it.
+        assert_eq!(
+            paths_and_ids(inv.iter_entries_by_dir(Some(&sub_id), None).unwrap()),
+            vec![
+                ("b".to_string(), b"b-id".to_vec()),
+                ("c".to_string(), b"c-id".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn trait_sorted_children() {
+        let inv = nested_inventory();
+        let inv: &dyn Inventory = &inv;
+        let names = |file_id: &[u8]| -> Vec<String> {
+            inv.sorted_children(&FileId::from(file_id.to_vec()))
+                .unwrap()
+                .iter()
+                .map(|e| e.name().to_string())
+                .collect()
+        };
+        assert_eq!(names(b"TREE_ROOT"), vec!["a", "sub"]);
+        assert_eq!(names(b"sub-id"), vec!["b", "c"]);
+    }
+
+    /// Only a directory in the inventory can be listed or walked from.
+    #[test]
+    fn trait_iteration_needs_a_directory() {
+        let inv = nested_inventory();
+        let inv: &dyn Inventory = &inv;
+        let file = FileId::from(b"a-id".to_vec());
+        let missing = FileId::from(b"missing-id".to_vec());
+        let outcomes = |file_id: &FileId| {
+            [
+                inv.sorted_children(file_id).map(|_| ()),
+                inv.iter_entries_by_dir(Some(file_id), None).map(|_| ()),
+            ]
+        };
+        for outcome in outcomes(&file) {
+            match outcome {
+                Err(Error::ParentNotDirectory(path, file_id)) => {
+                    assert_eq!(path, "a");
+                    assert_eq!(file_id, file);
+                }
+                other => panic!("expected a non-directory error, got {:?}", other.is_ok()),
+            }
+        }
+        for outcome in outcomes(&missing) {
+            match outcome {
+                Err(Error::NoSuchId(file_id)) => assert_eq!(file_id, missing),
+                other => panic!("expected an unknown id error, got {:?}", other.is_ok()),
+            }
+        }
     }
 
     /// Add a directory entry under `parent` by path-splitting. Returns the
