@@ -30,7 +30,7 @@ use crate::transport::{SharedTransport, TransportError};
 mod configobj;
 mod option;
 
-pub use configobj::{quote_value, unquote_value, ConfigObj, ConfigObjError};
+pub use configobj::{quote_value, unquote_value, ConfigObj, ConfigObjError, SectionNode};
 pub use option::{
     bool_from_store, int_from_store, int_si_from_store, list_from_store, Option as ConfigOption,
     OptionRegistry,
@@ -239,8 +239,8 @@ impl IniFileStore {
     }
 
     /// The store's quoting of a value for writing (list-aware, as breezy's
-    /// `Store.quote`).
-    pub fn quote(&self, value: &str) -> String {
+    /// `Store.quote`). Returns `None` when the value cannot be safely quoted.
+    pub fn quote(&self, value: &str) -> Option<String> {
         configobj::quote_value(value)
     }
 

@@ -5,13 +5,27 @@
 //! This is the parsing layer breezy's `config.py` consumes; the `Store`/`Stack`
 //! layers stay in the pure-Rust crate for now.
 
-use bazaar::config::{ConfigObj as RsConfigObj, ConfigObjError, Section as RsSection};
+use bazaar::config::{ConfigObj as RsConfigObj, ConfigObjError, Section as RsSection, SectionNode};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 fn parse_error_to_py(e: ConfigObjError) -> PyErr {
     PyValueError::new_err(e.to_string())
+}
+
+/// A subsection as returned to Python: `(name, [(key, value), ...])`.
+type PySubsection = (Option<String>, Vec<(String, String)>);
+/// A top-level section: `(name, options, subsections)`.
+type PySectionNode = (Option<String>, Vec<(String, String)>, Vec<PySubsection>);
+
+fn node_to_py(node: SectionNode) -> PySectionNode {
+    let subsections = node
+        .subsections
+        .into_iter()
+        .map(|sub| (sub.name, sub.options))
+        .collect();
+    (node.name, node.options, subsections)
 }
 
 /// A read view of one config section.
@@ -98,11 +112,33 @@ impl ConfigObj {
         self.inner.section(id).map(|inner| Section { inner })
     }
 
+    /// The full section tree in file order, including empty headers and depth-2
+    /// subsections.
+    ///
+    /// Each node is a `(name, options, subsections)` tuple: `name` is `None` for
+    /// the no-name section, `options` is a list of `(key, value)` pairs in file
+    /// order, and `subsections` is a list of `(name, options)` tuples for any
+    /// nested `[[sub]]` sections.
+    fn section_tree(&self) -> Vec<PySectionNode> {
+        self.inner
+            .section_tree()
+            .into_iter()
+            .map(node_to_py)
+            .collect()
+    }
+
     /// Set `key` to `value` in section `id`, in place if it already exists,
     /// otherwise appended to that section (creating the header if needed).
     #[pyo3(signature = (id, key, value))]
     fn set_value(&mut self, id: Option<&str>, key: &str, value: &str) {
         self.inner.set_value(id, key, value);
+    }
+
+    /// Set `key` to `value` in the subsection `[[sub]]` nested under
+    /// `[section]`, creating the headers as needed.
+    #[pyo3(signature = (section, sub, key, value))]
+    fn set_subsection_value(&mut self, section: &str, sub: &str, key: &str, value: &str) {
+        self.inner.set_subsection_value(section, sub, key, value);
     }
 
     /// Remove `key` from section `id` if present.
@@ -117,13 +153,16 @@ impl ConfigObj {
     }
 }
 
-/// Quote `value` for writing, matching breezy's list-aware `Store.quote`.
+/// Quote `value` for writing, matching configobj's list-aware `_quote`. Raises
+/// `ValueError` when the value cannot be safely quoted (as configobj does).
 #[pyfunction]
-fn quote_value(value: &str) -> String {
+fn quote_value(value: &str) -> PyResult<String> {
     bazaar::config::quote_value(value)
+        .ok_or_else(|| PyValueError::new_err(format!("value cannot be safely quoted: {value:?}")))
 }
 
-/// Strip a matched surrounding quote pair from a raw value, as `Store.unquote`.
+/// Strip a matched surrounding quote pair from a raw value, as configobj's
+/// `_unquote`.
 #[pyfunction]
 fn unquote_value(value: &str) -> String {
     bazaar::config::unquote_value(value)
