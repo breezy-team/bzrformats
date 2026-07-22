@@ -1110,6 +1110,41 @@ where
     }
 }
 
+/// Drive the format-agnostic [`crate::annotate::Annotator`] over a
+/// groupcompress store, which cannot annotate from its own record chain.
+impl<I, A, C> crate::annotate::AnnotateSource for GroupCompressVersionedFiles<I, A, C>
+where
+    I: GcIndex,
+    A: GcAccess<F = I::F>,
+    C: BlockCache<I::F>,
+{
+    fn get_parent_map(
+        &self,
+        keys: &[GcKey],
+    ) -> Result<std::collections::HashMap<GcKey, Vec<GcKey>>, crate::annotate::Error> {
+        GroupCompressVersionedFiles::get_parent_map(self, keys)
+            .map_err(|e| crate::annotate::Error::Backend(e.to_string()))
+    }
+
+    fn get_line_texts(
+        &self,
+        keys: &[GcKey],
+    ) -> Result<Vec<crate::annotate::KeyLines>, crate::annotate::Error> {
+        let records = GroupCompressVersionedFiles::get_record_stream(self, keys, "topological")
+            .map_err(|e| crate::annotate::Error::Backend(e.to_string()))?;
+        let mut out = Vec::with_capacity(records.len());
+        for record in records {
+            if record.storage_kind() == "absent" {
+                return Err(crate::annotate::Error::RevisionNotPresent(record.key()));
+            }
+            let key = record.key();
+            let lines = record.to_lines().map(|l| l.into_owned()).collect();
+            out.push((key, lines));
+        }
+        Ok(out)
+    }
+}
+
 /// Compress one record into `compressor`, mapping the result to plain
 /// types and `nostore_sha` rejection to `KnitError::ExistingContent`.
 fn compress_record(
@@ -1771,5 +1806,52 @@ mod tests {
 
         // check passes over a sound store.
         vf.check().unwrap();
+    }
+
+    #[test]
+    fn annotate_flat_attributes_each_line_to_its_origin() {
+        use crate::annotate::Annotator;
+        let store = std::rc::Rc::new(std::cell::RefCell::new(MemStore::default()));
+        let vf = GroupCompressVersionedFiles::new(
+            MemIndex(store.clone()),
+            MemAccess(store.clone()),
+            true,
+        );
+        // r1 introduces two lines; r2 (child of r1) keeps line 1, changes line
+        // 2 and appends line 3.
+        let r1 = gckey(b"r1");
+        let r2 = gckey(b"r2");
+        vf.add_lines(
+            r1.clone(),
+            Some(vec![]),
+            vec![b"a\n".to_vec(), b"b\n".to_vec()],
+        )
+        .unwrap();
+        vf.add_lines(
+            r2.clone(),
+            Some(vec![r1.clone()]),
+            vec![b"a\n".to_vec(), b"B\n".to_vec(), b"c\n".to_vec()],
+        )
+        .unwrap();
+
+        let mut annotator = Annotator::new(&vf);
+        let flat = annotator.annotate_flat(&r2).unwrap();
+        // Line "a" comes from r1 (unchanged); "B" and "c" are new in r2.
+        assert_eq!(
+            flat,
+            vec![
+                (r1.clone(), b"a\n".to_vec()),
+                (r2.clone(), b"B\n".to_vec()),
+                (r2.clone(), b"c\n".to_vec()),
+            ]
+        );
+
+        // Annotating the parent alone attributes both lines to r1.
+        let mut annotator = Annotator::new(&vf);
+        let flat = annotator.annotate_flat(&r1).unwrap();
+        assert_eq!(
+            flat,
+            vec![(r1.clone(), b"a\n".to_vec()), (r1.clone(), b"b\n".to_vec()),]
+        );
     }
 }

@@ -577,6 +577,30 @@ impl Pack2aRepository {
         Ok(record.to_fulltext().into_owned())
     }
 
+    /// Annotate the file text `(file_id, revision)` line by line, returning
+    /// `(origin_revision, line)` pairs. Runs the format-agnostic annotator over
+    /// the text store, since groupcompress cannot annotate from its own chain.
+    pub fn annotate_file_lines(
+        &self,
+        file_id: &[u8],
+        revision: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RepositoryError> {
+        let key = Key::fixed(vec![file_id.to_vec(), revision.to_vec()]);
+        let mut annotator = crate::annotate::Annotator::new(&self.texts);
+        let flat = annotator.annotate_flat(&key).map_err(|e| match e {
+            crate::annotate::Error::RevisionNotPresent(_) => RepositoryError::NoSuchFileText {
+                file_id: file_id.to_vec(),
+                revision: revision.to_vec(),
+            },
+            crate::annotate::Error::Backend(msg) => RepositoryError::Corrupt(msg),
+        })?;
+        // The origin key is (file_id, revision); report just its revision id.
+        Ok(flat
+            .into_iter()
+            .map(|(origin, line)| (origin.version_id().to_vec(), line))
+            .collect())
+    }
+
     /// Open a write group: subsequent `add_*` calls accumulate into a new
     /// pack, made durable by [`commit_write_group`](Self::commit_write_group).
     /// Errors if a write group is already open.
@@ -1182,6 +1206,14 @@ impl super::Repository for Pack2aRepository {
 
     fn get_file_text(&self, file_id: &[u8], revision: &[u8]) -> Result<Vec<u8>, RepositoryError> {
         Pack2aRepository::get_file_text(self, file_id, revision)
+    }
+
+    fn annotate_file_lines(
+        &self,
+        file_id: &[u8],
+        revision: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RepositoryError> {
+        Pack2aRepository::annotate_file_lines(self, file_id, revision)
     }
 
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {

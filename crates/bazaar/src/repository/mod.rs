@@ -146,6 +146,20 @@ pub trait Repository: Send + Sync {
         self.get_file_text(file_id.as_bytes(), revision)
     }
 
+    /// Annotate the file text `(file_id, revision)` line by line.
+    ///
+    /// Returns one `(origin_revision, line)` pair per line, where
+    /// `origin_revision` is the revision that introduced the line. The base
+    /// implementation is unsupported; formats that store file texts override
+    /// it. Mirrors what `Tree.annotate_iter` builds on.
+    fn annotate_file_lines(
+        &self,
+        _file_id: &[u8],
+        _revision: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RepositoryError> {
+        Err(RepositoryError::UnsupportedFormat("annotate_file_lines"))
+    }
+
     /// Open a write group: a batch of additions flushed atomically by
     /// [`Repository::commit_write_group`].
     fn start_write_group(&mut self) -> Result<(), RepositoryError>;
