@@ -182,14 +182,10 @@ class TestSectionTree(TestCase):
     def test_no_name_section_first(self):
         c = ConfigObj.parse(b"a = 1\n[s]\nb = 2\n")
         tree = c.section_tree()
-        self.assertEqual(
-            [(None, [("a", "1")], []), ("s", [("b", "2")], [])], tree
-        )
+        self.assertEqual([(None, [("a", "1")], []), ("s", [("b", "2")], [])], tree)
 
     def test_nested_subsections(self):
-        c = ConfigObj.parse(
-            b"[baz]\nfoo_in_baz = barbaz\n[[qux]]\nfoo_in_qux = quux\n"
-        )
+        c = ConfigObj.parse(b"[baz]\nfoo_in_baz = barbaz\n[[qux]]\nfoo_in_qux = quux\n")
         self.assertEqual(
             [
                 (
