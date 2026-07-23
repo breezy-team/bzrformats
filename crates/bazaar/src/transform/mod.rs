@@ -17,6 +17,7 @@
 //! consumed by the disk and apply layers, which are added incrementally.
 #![allow(dead_code)]
 
+pub mod apply;
 pub mod disk;
 
 use crate::osutils::Kind;
@@ -104,6 +105,16 @@ pub trait TransformTree {
             Kind::File | Kind::Directory | Kind::Symlink | Kind::TreeReference
         )
     }
+
+    /// The absolute on-disk path of tree-relative `path`.
+    fn abspath(&self, path: &str) -> std::path::PathBuf;
+
+    /// Apply `delta` to the tree's live inventory (the mutation an applied
+    /// transform performs).
+    fn apply_inventory_delta(
+        &mut self,
+        delta: &crate::inventory_delta::InventoryDelta,
+    ) -> Result<(), Error>;
 
     /// The canonical form of `path` (case/encoding normalised). The default
     /// returns the path unchanged.
@@ -496,6 +507,102 @@ impl<T: TransformTree> TreeTransformBase<T> {
         self.case_sensitive
     }
 
+    /// The final tree-relative path of `trans_id` after the transform (breezy's
+    /// `FinalPaths.get_path`). The root and [`ROOT_PARENT`] map to `""`.
+    pub fn final_path(&mut self, trans_id: &str) -> Result<String, Error> {
+        if Some(trans_id) == self.new_root.as_deref() || trans_id == ROOT_PARENT {
+            return Ok(String::new());
+        }
+        let name = self.final_name(trans_id)?;
+        let parent = self.final_parent(trans_id);
+        if Some(parent.as_str()) == self.new_root.as_deref() {
+            Ok(name)
+        } else {
+            let parent_path = self.final_path(&parent)?;
+            Ok(joinpath(&parent_path, &name))
+        }
+    }
+
+    /// The `(final_path, trans_id)` of every trans-id whose inventory entry
+    /// changes (name, parent, file id, kind or executability), sorted by path.
+    /// This is breezy's `_inventory_altered`.
+    pub fn inventory_altered(&mut self) -> Result<Vec<(String, String)>, Error> {
+        let mut changed: HashSet<String> = HashSet::new();
+        // file ids that are new or changed.
+        let new_file_id: HashSet<String> = self
+            .new_id
+            .iter()
+            .filter(|(t, id)| Some(*id) != self.tree_file_id(t).as_ref())
+            .map(|(t, _)| t.clone())
+            .collect();
+        for t in self.new_name.keys() {
+            changed.insert(t.clone());
+        }
+        for t in self.new_parent.keys() {
+            changed.insert(t.clone());
+        }
+        changed.extend(new_file_id.iter().cloned());
+        for t in self.new_executability.keys() {
+            changed.insert(t.clone());
+        }
+        // A kind change (removed AND re-added content) where the kind differs.
+        let mut changed_kind: HashSet<String> = self.removed_contents.clone();
+        changed_kind.retain(|t| self.new_contents.contains_key(t));
+        changed_kind.retain(|t| !changed.contains(t));
+        changed_kind.retain(|t| self.tree_kind_of(t) != self.final_kind(t));
+        changed.extend(changed_kind);
+        // Children of entries whose file id changed need re-parenting entries.
+        for parent in &new_file_id {
+            for child in self.registered_children_of(parent) {
+                changed.insert(child);
+            }
+        }
+        let mut out = Vec::new();
+        for t in changed {
+            out.push((self.final_path(&t)?, t));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// The `(final_path, trans_id)` of every new/changed entry, sorted by path.
+    /// Breezy's `new_paths(filesystem_only=False)`.
+    pub fn new_paths(&mut self) -> Result<Vec<(String, String)>, Error> {
+        let mut ids: HashSet<String> = HashSet::new();
+        ids.extend(self.new_name.keys().cloned());
+        ids.extend(self.new_parent.keys().cloned());
+        ids.extend(self.new_executability.keys().cloned());
+        ids.extend(self.new_contents.keys().cloned());
+        ids.extend(self.new_id.keys().cloned());
+        let mut out = Vec::new();
+        for t in ids {
+            out.push((self.final_path(&t)?, t));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// The registered tree children of `parent_id` (its trans-id children among
+    /// the tree paths seen so far).
+    fn registered_children_of(&self, parent_id: &str) -> Vec<String> {
+        let parent_path = match self.tree_id_paths.get(parent_id) {
+            Some(p) => p.clone(),
+            None => return Vec::new(),
+        };
+        let prefix = if parent_path.is_empty() {
+            String::new()
+        } else {
+            format!("{parent_path}/")
+        };
+        self.tree_path_ids
+            .iter()
+            .filter(|(path, _)| {
+                !path.is_empty() && path.starts_with(&prefix) && !path[prefix.len()..].contains('/')
+            })
+            .map(|(_, id)| id.clone())
+            .collect()
+    }
+
     /// Register a tree path's trans-id, recording the reverse mapping. Used
     /// while walking a directory's children.
     fn register_tree_path(&mut self, path: &str) -> String {
@@ -808,6 +915,9 @@ pub(crate) mod tests_support {
     pub(crate) struct FakeTree {
         // path -> (file_id, kind); "" is the root.
         entries: HashMap<String, (FileId, Kind)>,
+        // The on-disk root, for the apply layer's abspath. When unset, abspath
+        // returns a synthetic path (fine for the pure bookkeeping tests).
+        basedir: Option<std::path::PathBuf>,
     }
 
     impl FakeTree {
@@ -817,12 +927,26 @@ pub(crate) mod tests_support {
                 String::new(),
                 (FileId::from(b"root-id".to_vec()), Kind::Directory),
             );
-            FakeTree { entries }
+            FakeTree {
+                entries,
+                basedir: None,
+            }
+        }
+
+        /// A tree rooted at a real on-disk directory, for apply tests.
+        pub(crate) fn with_basedir(basedir: std::path::PathBuf) -> Self {
+            let mut t = Self::new();
+            t.basedir = Some(basedir);
+            t
         }
 
         pub(crate) fn add(&mut self, path: &str, id: &[u8], kind: Kind) {
             self.entries
                 .insert(path.to_string(), (FileId::from(id.to_vec()), kind));
+        }
+
+        pub(crate) fn is_versioned_path(&self, path: &str) -> bool {
+            self.entries.contains_key(path)
         }
     }
 
@@ -863,6 +987,27 @@ pub(crate) mod tests_support {
         }
         fn is_control_filename(&self, path: &str) -> bool {
             path == ".bzr" || path.starts_with(".bzr/")
+        }
+        fn abspath(&self, path: &str) -> std::path::PathBuf {
+            match &self.basedir {
+                Some(base) => base.join(path),
+                None => std::path::PathBuf::from("/fake").join(path),
+            }
+        }
+        fn apply_inventory_delta(
+            &mut self,
+            delta: &crate::inventory_delta::InventoryDelta,
+        ) -> Result<(), Error> {
+            for entry in delta.iter() {
+                if let Some(old) = &entry.old_path {
+                    self.entries.remove(old);
+                }
+                if let (Some(new), Some(inv_entry)) = (&entry.new_path, &entry.new_entry) {
+                    self.entries
+                        .insert(new.clone(), (entry.file_id.clone(), inv_entry.kind()));
+                }
+            }
+            Ok(())
         }
     }
 }
