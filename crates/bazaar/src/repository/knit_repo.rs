@@ -52,6 +52,7 @@ declare_repository_format! {
         supports_tree_reference: true,
         supported: true,
         deprecated: true,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_4),
     }
 }
 
@@ -66,6 +67,7 @@ declare_repository_format! {
         rich_root_data: true,
         supported: true,
         deprecated: true,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_4),
     }
 }
 

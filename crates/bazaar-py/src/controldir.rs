@@ -970,7 +970,7 @@ fn upgrade(path: &str, format: &str) -> PyResult<()> {
 fn format_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = bazaar::bzrdir::control_dir_formats()
         .iter()
-        .map(|f| f.name)
+        .filter_map(|f| f.name)
         .collect();
     names.push("weave");
     names
