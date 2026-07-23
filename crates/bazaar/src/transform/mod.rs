@@ -74,15 +74,6 @@ pub trait TransformTree {
     /// The file id at tree-relative `path`, or `None` if not versioned.
     fn path2id(&self, path: &str) -> Option<FileId>;
 
-    /// The basenames of the direct children of the directory at `path`.
-    fn tree_children(&self, path: &str) -> Result<Vec<String>, Error>;
-
-    /// The basenames of the on-disk children of the directory at `path`,
-    /// excluding control files (`.bzr`). Empty when the path is not a
-    /// directory. This is what the transform walks to register a directory's
-    /// existing children before detecting conflicts.
-    fn list_disk_children(&self, path: &str) -> Result<Vec<String>, Error>;
-
     /// Whether `path` is a control file (part of `.bzr`) that the transform
     /// must not touch.
     fn is_control_filename(&self, path: &str) -> bool;
@@ -611,13 +602,40 @@ impl<T: TransformTree> TreeTransformBase<T> {
 
     /// Register every on-disk child of the directory at `trans_id` (breezy's
     /// `iter_tree_children`), so conflict detection sees them.
+    ///
+    /// Like Python's `iter_tree_children`, this lists the directory on disk
+    /// directly (via the tree's absolute path) rather than through a tree
+    /// method; a path that is missing or not a directory yields nothing.
     fn add_tree_children_of(&mut self, trans_id: &str) -> Result<(), Error> {
+        use std::io::ErrorKind;
+
         let path = match self.tree_id_paths.get(trans_id) {
             Some(p) => p.clone(),
             None => return Ok(()),
         };
-        for child in self.tree.list_disk_children(&path)? {
-            let child_path = joinpath(&path, &child);
+        let abspath = self.tree.abspath(&path);
+        let listing_err =
+            |e: std::io::Error| Error::Tree(format!("listing {}: {e}", abspath.display()));
+        let dir = match std::fs::read_dir(&abspath) {
+            Ok(d) => d,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                return Ok(())
+            }
+            Err(e) => return Err(listing_err(e)),
+        };
+        let mut names: Vec<String> = Vec::new();
+        for entry in dir {
+            let name = entry.map_err(listing_err)?.file_name();
+            let name = name.into_string().map_err(|name| {
+                Error::Tree(format!(
+                    "{} contains a file name that is not valid UTF-8: {name:?}",
+                    abspath.display()
+                ))
+            })?;
+            names.push(name);
+        }
+        for name in names {
+            let child_path = joinpath(&path, &name);
             if self.tree.is_control_filename(&child_path) {
                 continue;
             }
@@ -966,25 +984,6 @@ pub(crate) mod tests_support {
         fn path2id(&self, path: &str) -> Option<FileId> {
             self.entries.get(path).map(|(id, _)| id.clone())
         }
-        fn tree_children(&self, path: &str) -> Result<Vec<String>, Error> {
-            let prefix = if path.is_empty() {
-                String::new()
-            } else {
-                format!("{path}/")
-            };
-            Ok(self
-                .entries
-                .keys()
-                .filter(|p| {
-                    !p.is_empty() && p.starts_with(&prefix) && !p[prefix.len()..].contains('/')
-                })
-                .map(|p| basename(p))
-                .collect())
-        }
-        fn list_disk_children(&self, path: &str) -> Result<Vec<String>, Error> {
-            // The fake tree's disk state mirrors its versioned entries.
-            self.tree_children(path)
-        }
         fn is_control_filename(&self, path: &str) -> bool {
             path == ".bzr" || path.starts_with(".bzr/")
         }
@@ -1210,6 +1209,94 @@ mod tests {
         tt.version_file(&tid, FileId::from(b"new-id".to_vec()))
             .unwrap();
         assert_eq!(tt.find_raw_conflicts().unwrap(), vec![]);
+    }
+
+    /// A tree rooted in a fresh temporary directory.
+    fn disk_tree() -> (tempfile::TempDir, FakeTree) {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = FakeTree::with_basedir(dir.path().to_path_buf());
+        (dir, tree)
+    }
+
+    /// Before conflicts are detected, the on-disk children of each directory
+    /// the transform touches are registered, versioned or not. Control files
+    /// are left alone.
+    #[test]
+    fn on_disk_children_are_registered() {
+        let (dir, tree) = disk_tree();
+        std::fs::write(dir.path().join("unversioned"), b"contents").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/nested"), b"contents").unwrap();
+        std::fs::create_dir(dir.path().join(".bzr")).unwrap();
+        let mut tt = TreeTransformBase::new(tree, true);
+        let root = tt.root().unwrap().to_string();
+        tt.create_path("new", &root).unwrap();
+
+        tt.find_raw_conflicts().unwrap();
+
+        let mut registered: Vec<&str> = tt.tree_path_ids.keys().map(String::as_str).collect();
+        registered.sort();
+        // Only the root is a parent in this transform, so `sub` is not
+        // descended into.
+        assert_eq!(registered, vec!["", "sub", "unversioned"]);
+    }
+
+    /// A path that is not a directory on disk has no children to register.
+    #[test]
+    fn a_file_has_no_on_disk_children() {
+        let (dir, mut tree) = disk_tree();
+        std::fs::write(dir.path().join("a.txt"), b"contents").unwrap();
+        tree.add("a.txt", b"a-id", Kind::File);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let a = tt.trans_id_tree_path("a.txt");
+        tt.delete_contents(&a);
+        assert_eq!(tt.find_raw_conflicts().unwrap(), vec![]);
+    }
+
+    /// A directory that cannot be listed is an error, not an empty directory.
+    #[test]
+    fn unlistable_directory_is_an_error() {
+        let (_dir, mut tree) = disk_tree();
+        // A NUL byte makes the path one the filesystem refuses to look up.
+        tree.add("bad\0dir", b"dir-id", Kind::Directory);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let bad = tt.trans_id_tree_path("bad\0dir");
+        tt.create_path("child", &bad).unwrap();
+
+        let abspath = tt.tree.abspath("bad\0dir");
+        let cause = std::fs::read_dir(&abspath).unwrap_err();
+        match tt.find_raw_conflicts() {
+            Err(Error::Tree(message)) => {
+                assert_eq!(message, format!("listing {}: {}", abspath.display(), cause))
+            }
+            other => panic!("expected a tree error, got {:?}", other),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_file_name_is_an_error() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (dir, tree) = disk_tree();
+        let name = std::ffi::OsStr::from_bytes(b"caf\xe9");
+        std::fs::write(dir.path().join(name), b"contents").unwrap();
+        let mut tt = TreeTransformBase::new(tree, true);
+        let root = tt.root().unwrap().to_string();
+        tt.create_path("new", &root).unwrap();
+
+        let abspath = tt.tree.abspath("");
+        match tt.find_raw_conflicts() {
+            Err(Error::Tree(message)) => assert_eq!(
+                message,
+                format!(
+                    "{} contains a file name that is not valid UTF-8: {:?}",
+                    abspath.display(),
+                    name
+                )
+            ),
+            other => panic!("expected a tree error, got {:?}", other),
+        }
     }
 
     #[test]
