@@ -425,6 +425,19 @@ pub trait WorkingTree: Send + Sync {
         Err(WorkingTreeError::Unsupported("set_parent_ids".to_string()))
     }
 
+    /// Apply an inventory delta to the live working tree, updating the
+    /// dirstate's tree-0 column. The default is unsupported; the dirstate
+    /// format overrides it. This is the primitive a tree transform's
+    /// `apply` step calls.
+    fn apply_inventory_delta(
+        &mut self,
+        _delta: &crate::inventory_delta::InventoryDelta,
+    ) -> Result<(), WorkingTreeError> {
+        Err(WorkingTreeError::Unsupported(
+            "apply_inventory_delta".to_string(),
+        ))
+    }
+
     /// List the tracked files and directories in the live working tree.
     fn list_files(&self) -> Vec<VersionedEntry>;
 
@@ -813,6 +826,19 @@ impl WorkingTree4 {
         self.dirstate
             .set_parent_trees(parents, ghosts, per_parent)
             .map_err(|e| WorkingTreeError::Commit(format!("set parents: {e:?}")))?;
+        self.save_dirstate()
+    }
+
+    /// Apply an inventory delta to the live working tree (dirstate tree-0),
+    /// then rewrite the dirstate to disk. This is the format-specific mutation
+    /// a tree transform performs when it applies.
+    pub fn apply_inventory_delta(
+        &mut self,
+        delta: &crate::inventory_delta::InventoryDelta,
+    ) -> Result<(), WorkingTreeError> {
+        self.dirstate
+            .update_by_delta_from_inventory_delta(delta)
+            .map_err(|e| WorkingTreeError::Commit(format!("apply inventory delta: {e:?}")))?;
         self.save_dirstate()
     }
 
@@ -1615,6 +1641,13 @@ impl WorkingTree for WorkingTree4 {
         allow_leftmost_as_ghost: bool,
     ) -> Result<(), WorkingTreeError> {
         WorkingTree4::set_parent_ids(self, repository, revision_ids, allow_leftmost_as_ghost)
+    }
+
+    fn apply_inventory_delta(
+        &mut self,
+        delta: &crate::inventory_delta::InventoryDelta,
+    ) -> Result<(), WorkingTreeError> {
+        WorkingTree4::apply_inventory_delta(self, delta)
     }
 
     fn list_files(&self) -> Vec<VersionedEntry> {
@@ -2657,6 +2690,88 @@ mod tests {
             other => panic!("expected a repository error, got {:?}", other),
         }
         assert_eq!(wt.parent_ids(), vec![r2]);
+    }
+
+    #[test]
+    fn apply_inventory_delta_versions_a_new_file() {
+        use crate::inventory::Entry;
+        use crate::inventory_delta::{InventoryDelta, InventoryDeltaEntry};
+        use crate::FileId;
+
+        let (_d, parent, mut wt) = fresh_tree();
+        // The dirstate root id is needed as the new file's parent.
+        let root_id = wt.path2id("").unwrap();
+        parent.put_bytes("new.txt", b"hi\n", None).unwrap();
+
+        let entry = Entry::file(
+            FileId::from(b"new-id".to_vec()),
+            "new.txt".to_string(),
+            FileId::from(root_id),
+            None,
+            None,
+            Some(3),
+            Some(false),
+            None,
+        );
+        let delta = InventoryDelta(vec![InventoryDeltaEntry {
+            old_path: None,
+            new_path: Some("new.txt".to_string()),
+            file_id: FileId::from(b"new-id".to_vec()),
+            new_entry: Some(entry),
+        }]);
+        wt.apply_inventory_delta(&delta).unwrap();
+
+        // The file is now versioned, and the change persists to disk.
+        assert_eq!(wt.path2id("new.txt"), Some(b"new-id".to_vec()));
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.path2id("new.txt"), Some(b"new-id".to_vec()));
+    }
+
+    #[test]
+    fn apply_inventory_delta_removes_and_renames() {
+        use crate::inventory::Entry;
+        use crate::inventory_delta::{InventoryDelta, InventoryDeltaEntry};
+        use crate::FileId;
+
+        let (_d, parent, mut wt) = fresh_tree();
+        let root_id = wt.path2id("").unwrap();
+        parent.put_bytes("gone.txt", b"gone\n", None).unwrap();
+        parent.put_bytes("old.txt", b"moved\n", None).unwrap();
+        wt.add("gone.txt", EntryKind::File, None).unwrap();
+        wt.add("old.txt", EntryKind::File, None).unwrap();
+        let gone_id = wt.path2id("gone.txt").unwrap();
+        let moved_id = wt.path2id("old.txt").unwrap();
+
+        let renamed = Entry::file(
+            FileId::from(moved_id.clone()),
+            "new.txt".to_string(),
+            FileId::from(root_id),
+            None,
+            None,
+            Some(6),
+            Some(false),
+            None,
+        );
+        let delta = InventoryDelta(vec![
+            InventoryDeltaEntry {
+                old_path: Some("gone.txt".to_string()),
+                new_path: None,
+                file_id: FileId::from(gone_id),
+                new_entry: None,
+            },
+            InventoryDeltaEntry {
+                old_path: Some("old.txt".to_string()),
+                new_path: Some("new.txt".to_string()),
+                file_id: FileId::from(moved_id.clone()),
+                new_entry: Some(renamed),
+            },
+        ]);
+        wt.apply_inventory_delta(&delta).unwrap();
+
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.path2id("gone.txt"), None);
+        assert_eq!(reread.path2id("old.txt"), None);
+        assert_eq!(reread.path2id("new.txt"), Some(moved_id));
     }
 
     /// Create an all-in-one weave control dir, add a file, commit, then
