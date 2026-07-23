@@ -48,6 +48,7 @@ pub mod smart;
 pub mod testament;
 pub mod textinv;
 pub mod textmerge;
+pub mod transform;
 pub mod transport;
 pub mod tuned_gzip;
 pub mod versionedfile;
