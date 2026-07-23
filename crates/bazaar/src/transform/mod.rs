@@ -498,6 +498,118 @@ impl<T: TransformTree> TreeTransformBase<T> {
         self.case_sensitive
     }
 
+    /// Whether a directory `parent_id` already has a child named `name`, among
+    /// the transform's known children and on disk. Breezy's `_has_named_child`.
+    fn has_named_child(&mut self, name: &str, parent_id: &str) -> Result<bool, Error> {
+        let known = self.by_parent().get(parent_id).cloned().unwrap_or_default();
+        for child in &known {
+            if self.final_name(child)? == name {
+                return Ok(true);
+            }
+        }
+        let parent_path = match self.tree_id_paths.get(parent_id) {
+            Some(p) => p.clone(),
+            None => return Ok(false),
+        };
+        let child_path = joinpath(&parent_path, name);
+        if self.tree_path_ids.contains_key(&child_path) {
+            // Known to the transform via a tree path already handled above.
+            return Ok(false);
+        }
+        // Otherwise consult the filesystem.
+        let abspath = self.tree.abspath(&child_path);
+        match abspath.symlink_metadata() {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::Tree(format!(
+                "checking for {}: {e}",
+                abspath.display()
+            ))),
+        }
+    }
+
+    /// An available `.~N~` backup name for `name` under `target_id`, avoiding
+    /// collisions. Breezy's `_available_backup_name`.
+    pub fn available_backup_name(&mut self, name: &str, target_id: &str) -> Result<String, Error> {
+        let mut counter = 1;
+        loop {
+            let candidate = format!("{name}.~{counter}~");
+            if !self.has_named_child(&candidate, target_id)? {
+                return Ok(candidate);
+            }
+            counter += 1;
+        }
+    }
+
+    /// Reinterpret requests to change the root directory (breezy's
+    /// `fixup_new_roots`): fold a newly-created root's attributes and children
+    /// into the existing root.
+    pub fn fixup_new_roots(&mut self) -> Result<(), Error> {
+        let new_roots: Vec<String> = self
+            .new_parent
+            .iter()
+            .filter(|(_, p)| p.as_str() == ROOT_PARENT)
+            .map(|(t, _)| t.clone())
+            .collect();
+        if new_roots.is_empty() {
+            return Ok(());
+        }
+        if new_roots.len() != 1 {
+            return Err(Error::Malformed("a tree cannot have two roots".to_string()));
+        }
+        if self.new_root.is_none() {
+            self.new_root = Some(new_roots[0].clone());
+            return Ok(());
+        }
+        let old_new_root = new_roots[0].clone();
+        let new_root = self.new_root.clone().unwrap();
+        // Unversion the new root's directory, adopting its (or the old root's)
+        // file id.
+        let file_id = if self.final_kind(&new_root).is_none() {
+            self.final_file_id(&old_new_root)
+        } else {
+            self.final_file_id(&new_root)
+        };
+        if self.new_id.contains_key(&old_new_root) {
+            self.cancel_versioning(&old_new_root);
+        } else {
+            self.unversion_file(&old_new_root);
+        }
+        if self.tree_file_id(&new_root).is_some() && !self.removed_id.contains(&new_root) {
+            self.unversion_file(&new_root);
+        }
+        if let Some(file_id) = file_id {
+            self.version_file(&new_root, file_id)?;
+        }
+        // Move children of the new root into the old root directory, first
+        // making sure those it has on disk are known to the transform.
+        self.add_tree_children_of(&old_new_root)?;
+        let children: Vec<String> = self
+            .by_parent()
+            .get(&old_new_root)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for child in children {
+            let name = self.final_name(&child)?;
+            self.adjust_path(&name, &new_root, &child)?;
+        }
+        // Ensure the old new-root has no directory.
+        if self.new_contents.contains_key(&old_new_root) {
+            self.cancel_contents(&old_new_root);
+        } else {
+            self.delete_contents(&old_new_root);
+        }
+        // Prevent deletion of the real root directory.
+        if self.removed_contents.contains(&new_root) {
+            self.cancel_deletion(&new_root);
+        }
+        self.new_parent.remove(&old_new_root);
+        self.new_name.remove(&old_new_root);
+        Ok(())
+    }
+
     /// The final tree-relative path of `trans_id` after the transform (breezy's
     /// `FinalPaths.get_path`). The root and [`ROOT_PARENT`] map to `""`.
     pub fn final_path(&mut self, trans_id: &str) -> Result<String, Error> {
@@ -951,6 +1063,14 @@ pub(crate) mod tests_support {
             }
         }
 
+        /// A tree with no root yet.
+        pub(crate) fn rootless() -> Self {
+            FakeTree {
+                entries: HashMap::new(),
+                basedir: None,
+            }
+        }
+
         /// A tree rooted at a real on-disk directory, for apply tests.
         pub(crate) fn with_basedir(basedir: std::path::PathBuf) -> Self {
             let mut t = Self::new();
@@ -1311,6 +1431,183 @@ mod tests {
         assert!(conflicts
             .iter()
             .any(|c| matches!(c, RawConflict::Duplicate { name, .. } if name == "dup")));
+    }
+
+    #[test]
+    fn available_backup_name_appends_a_counter() {
+        let (_dir, tree) = disk_tree();
+        let mut tt = TreeTransformBase::new(tree, true);
+        let root = tt.root().unwrap().to_string();
+        assert_eq!(
+            tt.available_backup_name("a.txt", &root).unwrap(),
+            "a.txt.~1~"
+        );
+    }
+
+    /// The file being backed up is usually known to the transform already,
+    /// as when revert moves an existing file out of the way.
+    #[test]
+    fn available_backup_name_for_an_existing_tree_file() {
+        let (dir, mut tree) = disk_tree();
+        std::fs::write(dir.path().join("a.txt"), b"contents").unwrap();
+        tree.add("a.txt", b"a-id", Kind::File);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let root = tt.root().unwrap().to_string();
+        tt.trans_id_tree_path("a.txt");
+        assert_eq!(
+            tt.available_backup_name("a.txt", &root).unwrap(),
+            "a.txt.~1~"
+        );
+    }
+
+    #[test]
+    fn available_backup_name_skips_names_on_disk() {
+        let (dir, tree) = disk_tree();
+        std::fs::write(dir.path().join("a.txt.~1~"), b"older backup").unwrap();
+        let mut tt = TreeTransformBase::new(tree, true);
+        let root = tt.root().unwrap().to_string();
+        assert_eq!(
+            tt.available_backup_name("a.txt", &root).unwrap(),
+            "a.txt.~2~"
+        );
+    }
+
+    #[test]
+    fn available_backup_name_skips_names_in_the_transform() {
+        let (_dir, tree) = disk_tree();
+        let mut tt = TreeTransformBase::new(tree, true);
+        let root = tt.root().unwrap().to_string();
+        tt.create_path("a.txt.~1~", &root).unwrap();
+        assert_eq!(
+            tt.available_backup_name("a.txt", &root).unwrap(),
+            "a.txt.~2~"
+        );
+    }
+
+    /// A candidate the filesystem cannot be asked about is an error, not a
+    /// free name.
+    #[test]
+    fn available_backup_name_reports_filesystem_errors() {
+        let (_dir, tree) = disk_tree();
+        let mut tt = TreeTransformBase::new(tree, true);
+        let root = tt.root().unwrap().to_string();
+
+        // A NUL byte makes the candidate a path the filesystem refuses.
+        let abspath = tt.tree.abspath("bad\0name.~1~");
+        let cause = abspath.symlink_metadata().unwrap_err();
+        match tt.available_backup_name("bad\0name", &root) {
+            Err(Error::Tree(message)) => assert_eq!(
+                message,
+                format!("checking for {}: {}", abspath.display(), cause)
+            ),
+            other => panic!("expected a tree error, got {:?}", other),
+        }
+    }
+
+    /// When an existing directory becomes the root, what it holds on disk
+    /// moves to the root with it, known to the transform or not.
+    #[test]
+    fn fixup_new_roots_moves_on_disk_children() {
+        let (dir, mut tree) = disk_tree();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/f"), b"contents").unwrap();
+        tree.add("sub", b"sub-id", Kind::Directory);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let root = tt.root().unwrap().to_string();
+        let sub = tt.trans_id_tree_path("sub");
+        tt.adjust_path("", ROOT_PARENT, &sub).unwrap();
+
+        tt.fixup_new_roots().unwrap();
+
+        let child = tt.tree_path_ids.get("sub/f").cloned().unwrap();
+        assert_eq!(tt.final_parent(&child), root);
+        assert_eq!(tt.final_name(&child).unwrap(), "f");
+    }
+
+    #[test]
+    fn fixup_new_roots_without_a_new_root() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let root = tt.root().unwrap().to_string();
+        let child = tt.create_path("a.txt", &root).unwrap();
+        tt.fixup_new_roots().unwrap();
+        assert_eq!(tt.root(), Some(root.as_str()));
+        assert_eq!(tt.final_parent(&child), root);
+    }
+
+    #[test]
+    fn fixup_new_roots_rejects_two_roots() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        tt.create_path("", ROOT_PARENT).unwrap();
+        tt.create_path("", ROOT_PARENT).unwrap();
+        match tt.fixup_new_roots() {
+            Err(Error::Malformed(message)) => {
+                assert_eq!(message, "a tree cannot have two roots")
+            }
+            other => panic!("expected a malformed transform, got {:?}", other),
+        }
+    }
+
+    /// A tree without a root takes the new root as is.
+    #[test]
+    fn fixup_new_roots_adopts_the_first_root() {
+        let mut tt = TreeTransformBase::new(FakeTree::rootless(), true);
+        assert_eq!(tt.root(), None);
+        let new_root = tt.create_path("", ROOT_PARENT).unwrap();
+        tt.fixup_new_roots().unwrap();
+        assert_eq!(tt.root(), Some(new_root.as_str()));
+        assert_eq!(tt.final_parent(&new_root), ROOT_PARENT);
+    }
+
+    /// A second root is folded into the existing one: its children move
+    /// there and it is dropped, while the existing root keeps its file id.
+    #[test]
+    fn fixup_new_roots_folds_a_new_root_into_the_existing_one() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let root = tt.root().unwrap().to_string();
+        let new_root = tt.create_path("", ROOT_PARENT).unwrap();
+        tt.set_new_contents(&new_root, ContentKind::Directory);
+        tt.version_file(&new_root, FileId::from(b"new-root-id".to_vec()))
+            .unwrap();
+        let child = tt.create_path("child", &new_root).unwrap();
+        tt.set_new_contents(&child, ContentKind::File);
+
+        tt.fixup_new_roots().unwrap();
+
+        assert_eq!(tt.root(), Some(root.as_str()));
+        assert_eq!(tt.final_parent(&child), root);
+        assert_eq!(tt.final_name(&child).unwrap(), "child");
+        assert_eq!(
+            tt.final_file_id(&root),
+            Some(FileId::from(b"root-id".to_vec()))
+        );
+        assert_eq!(tt.final_file_id(&new_root), None);
+        assert_eq!(tt.final_kind(&new_root), None);
+        assert!(!tt.new_parent.contains_key(&new_root));
+        assert!(!tt.new_name.contains_key(&new_root));
+    }
+
+    /// When the existing root directory is being removed, the root takes the
+    /// new root's file id and its directory is kept.
+    #[test]
+    fn fixup_new_roots_replaces_a_removed_root() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let root = tt.root().unwrap().to_string();
+        tt.delete_contents(&root);
+        tt.unversion_file(&root);
+        let new_root = tt.create_path("", ROOT_PARENT).unwrap();
+        tt.set_new_contents(&new_root, ContentKind::Directory);
+        tt.version_file(&new_root, FileId::from(b"new-root-id".to_vec()))
+            .unwrap();
+
+        tt.fixup_new_roots().unwrap();
+
+        assert_eq!(tt.root(), Some(root.as_str()));
+        assert_eq!(
+            tt.final_file_id(&root),
+            Some(FileId::from(b"new-root-id".to_vec()))
+        );
+        assert_eq!(tt.final_kind(&root), Some(Kind::Directory));
+        assert_eq!(tt.final_file_id(&new_root), None);
     }
 
     #[test]
