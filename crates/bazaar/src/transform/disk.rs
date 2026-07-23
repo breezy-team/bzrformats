@@ -250,6 +250,23 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         Ok(trans_id)
     }
 
+    /// Fold a newly created root into the existing one, as
+    /// [`TreeTransformBase::fixup_new_roots`] does, and discard whatever was
+    /// staged in limbo for the root that goes away.
+    pub fn fixup_new_roots(&mut self) -> Result<(), Error> {
+        self.base.fixup_new_roots()?;
+        let cancelled: Vec<String> = self
+            .creation_done
+            .iter()
+            .filter(|trans_id| !self.base.new_contents_map().contains_key(*trans_id))
+            .cloned()
+            .collect();
+        for trans_id in cancelled {
+            self.cancel_creation(&trans_id)?;
+        }
+        Ok(())
+    }
+
     /// Cancel staged content creation for `trans_id`, removing its limbo file.
     pub fn cancel_creation(&mut self, trans_id: &str) -> Result<(), Error> {
         self.base.cancel_contents(trans_id);
@@ -442,6 +459,23 @@ mod tests {
         tt.create_symlink("target", &tid).unwrap();
         assert!(tt.limbo_name(&tid).symlink_metadata().is_err());
         assert_eq!(tt.base().final_kind(&tid), Some(Kind::Symlink));
+    }
+
+    #[test]
+    fn fixup_new_roots_discards_the_staged_root() {
+        let (_d, mut tt) = disk_tt();
+        let new_root = tt
+            .base_mut()
+            .create_path("", crate::transform::ROOT_PARENT)
+            .unwrap();
+        tt.create_directory(&new_root).unwrap();
+        let staged = tt.limbo_name(&new_root);
+        assert!(staged.is_dir());
+
+        tt.fixup_new_roots().unwrap();
+
+        assert!(!staged.exists());
+        assert_eq!(tt.base().final_kind(&new_root), None);
     }
 
     #[test]
