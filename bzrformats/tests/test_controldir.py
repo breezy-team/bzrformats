@@ -231,6 +231,21 @@ class TestControlDir(TestCaseInTempDir):
             ],
         )
 
+    def test_path_conflict_round_trip(self):
+        cd = controldir.create(self.test_dir)
+        wt = cd.open_workingtree()
+        conflicts = [
+            {
+                "type": "path conflict",
+                "path": "dir/b",
+                "file_id": b"b-id",
+                "conflict_path": "dir/c",
+            },
+        ]
+        wt.set_conflicts(conflicts)
+        got = controldir.open(self.test_dir).open_workingtree().conflicts()
+        self.assertEqual(got, conflicts)
+
     def test_format_introspection(self):
         cd = controldir.create(self.test_dir)
         rf = cd.open_repository().format()
