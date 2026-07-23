@@ -542,12 +542,45 @@ pub trait WorkingTree: Send + Sync {
         )?;
         Ok(())
     }
+
+    /// The raw merge-modified list as `(file_id, sha1)` pairs, read from
+    /// `.bzr/checkout/merge-hashes`; empty when the file is absent.
+    ///
+    /// This is the on-disk record set by a merge; callers typically map the
+    /// file ids to paths and drop entries whose file no longer matches.
+    fn merge_modified_hashes(&self) -> Result<Vec<MergeModifiedHash>, WorkingTreeError> {
+        let bytes = match self.control_transport().get_bytes(MERGE_MODIFIED_PATH) {
+            Ok(b) => b,
+            Err(TransportError::NoSuchFile(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        merge_modified_io::deserialize(&bytes).map_err(WorkingTreeError::Corrupt)
+    }
+
+    /// Write the merge-modified list of `(file_id, sha1)` pairs to
+    /// `.bzr/checkout/merge-hashes`.
+    fn set_merge_modified_hashes(
+        &self,
+        hashes: &[MergeModifiedHash],
+    ) -> Result<(), WorkingTreeError> {
+        self.control_transport().put_bytes(
+            MERGE_MODIFIED_PATH,
+            &merge_modified_io::serialize(hashes),
+            None,
+        )?;
+        Ok(())
+    }
 }
 
 /// The `views` control file path (relative to the tree's control transport).
 const VIEWS_PATH: &str = ".bzr/checkout/views";
 /// The `conflicts` control file path.
 const CONFLICTS_PATH: &str = ".bzr/checkout/conflicts";
+/// The `merge-hashes` control file path.
+const MERGE_MODIFIED_PATH: &str = ".bzr/checkout/merge-hashes";
+
+/// One merge-modified record: a `(file_id, sha1)` pair.
+pub type MergeModifiedHash = (Vec<u8>, Vec<u8>);
 
 /// The views defined in a working tree: the current (enabled) view, if any,
 /// and a map from view name to the list of tree-relative paths it scopes to.
@@ -2104,6 +2137,53 @@ mod conflicts_io {
     }
 }
 
+mod merge_modified_io {
+    use crate::rio::{read_stanzas, rio_iter, Stanza, StanzaValue};
+
+    // The header (without trailing newline; rio_iter appends one).
+    const HEADER: &[u8] = b"BZR merge-modified list format 1";
+    const HEADER_LINE: &[u8] = b"BZR merge-modified list format 1\n";
+
+    pub(super) fn serialize(hashes: &[super::MergeModifiedHash]) -> Vec<u8> {
+        let stanzas = hashes.iter().map(|(file_id, sha1)| {
+            let mut s = Stanza::new();
+            // The tags are constant, so `add` only fails on programmer error.
+            let _ = s.add(
+                "file_id".to_string(),
+                StanzaValue::String(String::from_utf8_lossy(file_id).into_owned()),
+            );
+            let _ = s.add(
+                "hash".to_string(),
+                StanzaValue::String(String::from_utf8_lossy(sha1).into_owned()),
+            );
+            s
+        });
+        rio_iter(stanzas, Some(HEADER.to_vec())).flatten().collect()
+    }
+
+    pub(super) fn deserialize(bytes: &[u8]) -> Result<Vec<super::MergeModifiedHash>, String> {
+        let rest = bytes
+            .strip_prefix(HEADER_LINE)
+            .ok_or_else(|| "missing 'BZR merge-modified list format 1' header".to_string())?;
+        let mut reader = std::io::BufReader::new(rest);
+        let stanzas =
+            read_stanzas(&mut reader).map_err(|e| format!("merge-modified rio: {e:?}"))?;
+        let mut out = Vec::new();
+        for stanza in stanzas {
+            let get = |tag: &str| match stanza.get(tag) {
+                Some(StanzaValue::String(s)) => Some(s.clone()),
+                _ => None,
+            };
+            let file_id = get("file_id")
+                .ok_or_else(|| "merge-modified stanza missing 'file_id'".to_string())?;
+            let hash =
+                get("hash").ok_or_else(|| "merge-modified stanza missing 'hash'".to_string())?;
+            out.push((file_id.into_bytes(), hash.into_bytes()));
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3565,5 +3645,28 @@ mod tests {
 
         let reread = WorkingTree4::open(parent).unwrap();
         assert_eq!(reread.conflicts().unwrap(), conflicts);
+    }
+
+    #[test]
+    fn merge_modified_hashes_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        let wt = cd.open_workingtree().unwrap();
+        // No merge-hashes file initially.
+        assert!(wt.merge_modified_hashes().unwrap().is_empty());
+
+        let hashes = vec![
+            (b"a-id".to_vec(), b"0123456789abcdef".to_vec()),
+            (b"b-id".to_vec(), b"fedcba9876543210".to_vec()),
+        ];
+        wt.set_merge_modified_hashes(&hashes).unwrap();
+
+        // The file starts with the breezy header.
+        let on_disk = parent.get_bytes(".bzr/checkout/merge-hashes").unwrap();
+        assert!(on_disk.starts_with(b"BZR merge-modified list format 1\n"));
+
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.merge_modified_hashes().unwrap(), hashes);
     }
 }
