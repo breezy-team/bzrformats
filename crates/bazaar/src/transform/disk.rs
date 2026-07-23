@@ -99,12 +99,49 @@ impl<T: TransformTree> DiskTreeTransform<T> {
             .map_err(io_err)
     }
 
+    /// Give the file staged for `trans_id` the mode of the regular file the
+    /// tree has at `mode_id`, if it has one (breezy's `_set_mode`).
+    fn copy_mode(&mut self, trans_id: &str, mode_id: &str) -> Result<(), Error> {
+        use std::io::ErrorKind;
+
+        let Some(old_path) = self.base.tree_path(mode_id) else {
+            return Ok(());
+        };
+        let metadata = match std::fs::metadata(self.base.tree().abspath(old_path)) {
+            Ok(metadata) => metadata,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                return Ok(())
+            }
+            Err(e) => return Err(io_err(e)),
+        };
+        if !metadata.is_file() {
+            return Ok(());
+        }
+        let name = self.limbo_name(trans_id);
+        chmod_if_possible(&name, metadata.permissions()).map_err(io_err)
+    }
+
     /// Stage a new file with `contents` for `trans_id`. `sha1`, when known,
     /// is recorded so apply can seed the tree's stat cache.
+    ///
+    /// If `trans_id` is a regular file in the tree, the new file keeps its
+    /// mode.
     pub fn create_file(
         &mut self,
         contents: &[u8],
         trans_id: &str,
+        sha1: Option<Vec<u8>>,
+    ) -> Result<(), Error> {
+        self.create_file_with_mode_of(contents, trans_id, trans_id, sha1)
+    }
+
+    /// Stage a new file as [`create_file`](Self::create_file) does, taking
+    /// its mode from the tree file at `mode_id` rather than at `trans_id`.
+    pub fn create_file_with_mode_of(
+        &mut self,
+        contents: &[u8],
+        trans_id: &str,
+        mode_id: &str,
         sha1: Option<Vec<u8>>,
     ) -> Result<(), Error> {
         self.check_no_contents(trans_id)?;
@@ -113,6 +150,7 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         self.base.set_new_contents(trans_id, ContentKind::File);
         self.creation_done.insert(trans_id.to_string());
         self.set_mtime(&name)?;
+        self.copy_mode(trans_id, mode_id)?;
         if let Some(sha1) = sha1 {
             self.observed_sha1s
                 .insert(trans_id.to_string(), (sha1, contents.len() as u64));
@@ -138,6 +176,13 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         let name = self.limbo_name(trans_id);
         if self.create_symlinks {
             symlink(target, &name).map_err(io_err)?;
+        } else {
+            match self.base.final_path(trans_id) {
+                Ok(path) => {
+                    log::warn!("Unable to create symlink \"{path}\" on this filesystem.")
+                }
+                Err(_) => log::warn!("Unable to create symlink \"None\" on this filesystem."),
+            }
         }
         self.base.set_new_contents(trans_id, ContentKind::Symlink);
         self.creation_done.insert(trans_id.to_string());
@@ -174,6 +219,21 @@ impl<T: TransformTree> DiskTreeTransform<T> {
 /// Map an I/O error into a transform error.
 fn io_err(e: std::io::Error) -> Error {
     Error::Tree(e.to_string())
+}
+
+/// Set the mode of `path` where the filesystem allows it; some refuse even
+/// on Unix, which is not worth failing over.
+pub(super) fn chmod_if_possible(
+    path: &Path,
+    permissions: std::fs::Permissions,
+) -> std::io::Result<()> {
+    match std::fs::set_permissions(path, permissions) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            log::debug!("ignore error on chmod of {path:?}: {e:?}");
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// Delete a file, directory or symlink at `path`, ignoring absence.
@@ -305,6 +365,22 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(mtime(&mut tt, &first), mtime(&mut tt, &second));
+    }
+
+    /// Where symlinks cannot be made the link is left out, but still counts
+    /// as the contents.
+    #[test]
+    fn create_symlink_without_symlink_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let limbo = dir.path().join("limbo");
+        std::fs::create_dir(&limbo).unwrap();
+        let base = TreeTransformBase::new(FakeTree::new(), true);
+        let mut tt = DiskTreeTransform::new(base, limbo, false);
+        let root = tt.base().root().unwrap().to_string();
+        let tid = tt.base_mut().create_path("link", &root).unwrap();
+        tt.create_symlink("target", &tid).unwrap();
+        assert!(tt.limbo_name(&tid).symlink_metadata().is_err());
+        assert_eq!(tt.base().final_kind(&tid), Some(Kind::Symlink));
     }
 
     #[test]
