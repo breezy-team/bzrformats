@@ -40,6 +40,8 @@ pub enum Error {
     Malformed(String),
     /// A tree query failed.
     Tree(String),
+    /// The orphaning policy forbids creating an orphan.
+    OrphaningForbidden(String),
 }
 
 impl std::fmt::Display for Error {
@@ -50,6 +52,9 @@ impl std::fmt::Display for Error {
             Error::CantMoveRoot => write!(f, "cannot move the tree root"),
             Error::Malformed(m) => write!(f, "malformed transform: {m}"),
             Error::Tree(m) => write!(f, "tree error: {m}"),
+            Error::OrphaningForbidden(policy) => {
+                write!(f, "policy: {policy} doesn't allow creating orphans")
+            }
         }
     }
 }
@@ -456,6 +461,20 @@ impl<T: TransformTree> TreeTransformBase<T> {
         self.final_file_id(trans_id).is_some()
     }
 
+    /// The inactive file id of `trans_id`: the id it has in the tree, or the
+    /// non-present id recorded for it. Unlike [`final_file_id`](Self::final_file_id)
+    /// this ignores unversioning, so it recovers the identity of an entry the
+    /// transform is about to version or has just unversioned.
+    pub fn inactive_file_id(&self, trans_id: &str) -> Option<FileId> {
+        if let Some(file_id) = self.tree_file_id(trans_id) {
+            return Some(file_id);
+        }
+        self.non_present_ids
+            .iter()
+            .find(|(_, id)| id.as_str() == trans_id)
+            .map(|(file_id, _)| file_id.clone())
+    }
+
     /// The trans-id for `file_id`: its new-id trans-id, its tree path's
     /// trans-id, or a freshly-assigned id recorded as non-present.
     pub fn trans_id_file_id(&mut self, file_id: &FileId) -> String {
@@ -491,6 +510,50 @@ impl<T: TransformTree> TreeTransformBase<T> {
             by_parent.entry(parent_id).or_default().insert(trans_id);
         }
         by_parent
+    }
+
+    /// Find the potential orphans in a directory being removed.
+    ///
+    /// A directory can't be safely deleted if it still contains versioned
+    /// files. Returns the trans-ids of its unversioned children, or `None` if
+    /// at least one versioned child is present (so the directory must be kept).
+    pub fn get_potential_orphans(&mut self, dir_id: &str) -> Option<Vec<String>> {
+        let children = self.by_parent().remove(dir_id).unwrap_or_default();
+        let mut orphans = Vec::new();
+        for child_tid in children {
+            if self.removed_contents.contains(&child_tid) {
+                // Removed as part of the transform; it was versioned before,
+                // so it is not an orphan.
+                continue;
+            }
+            if self.final_is_versioned(&child_tid) {
+                // A versioned file is present, so searching for orphans is
+                // meaningless.
+                return None;
+            }
+            orphans.push(child_tid);
+        }
+        Some(orphans)
+    }
+
+    /// Reparent every child of `old_parent` onto `new_parent`, keeping each
+    /// child's final name. Returns the reparented children's trans-ids.
+    pub fn reparent_transform_children(
+        &mut self,
+        old_parent: &str,
+        new_parent: &str,
+    ) -> Result<Vec<String>, Error> {
+        let children: Vec<String> = self
+            .by_parent()
+            .remove(old_parent)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for child in &children {
+            let name = self.final_name(child)?;
+            self.adjust_path(&name, new_parent, child)?;
+        }
+        Ok(children)
     }
 
     /// Whether the target filesystem is case sensitive.
@@ -1680,5 +1743,68 @@ mod tests {
             c,
             RawConflict::NonDirectoryParent { parent_id } if parent_id == &parent
         )));
+    }
+
+    #[test]
+    fn inactive_file_id_recovers_a_versioned_paths_id() {
+        let mut tree = FakeTree::new();
+        tree.add("afile", b"afile-id", Kind::File);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let tid = tt.trans_id_tree_path("afile");
+        // Even after unversioning, the tree id is recovered.
+        tt.unversion_file(&tid);
+        assert_eq!(
+            tt.inactive_file_id(&tid),
+            Some(FileId::from(b"afile-id".to_vec()))
+        );
+    }
+
+    #[test]
+    fn inactive_file_id_recovers_a_non_present_id() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let file_id = FileId::from(b"ghost-id".to_vec());
+        let tid = tt.trans_id_file_id(&file_id);
+        assert_eq!(tt.inactive_file_id(&tid), Some(file_id));
+    }
+
+    #[test]
+    fn get_potential_orphans_lists_unversioned_children() {
+        let mut tree = FakeTree::new();
+        tree.add("dir", b"dir-id", Kind::Directory);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let dir = tt.trans_id_tree_path("dir");
+        // An unversioned child staged under the directory.
+        let child = tt.create_path("child", &dir).unwrap();
+        tt.set_new_contents(&child, ContentKind::File);
+        let orphans = tt.get_potential_orphans(&dir).unwrap();
+        assert_eq!(orphans, vec![child]);
+    }
+
+    #[test]
+    fn get_potential_orphans_is_none_when_a_versioned_child_is_present() {
+        let mut tree = FakeTree::new();
+        tree.add("dir", b"dir-id", Kind::Directory);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let dir = tt.trans_id_tree_path("dir");
+        let child = tt.create_path("child", &dir).unwrap();
+        tt.set_new_contents(&child, ContentKind::File);
+        tt.version_file(&child, FileId::from(b"child-id".to_vec()))
+            .unwrap();
+        assert_eq!(tt.get_potential_orphans(&dir), None);
+    }
+
+    #[test]
+    fn reparent_transform_children_moves_children_to_new_parent() {
+        let mut tree = FakeTree::new();
+        tree.add("old", b"old-id", Kind::Directory);
+        tree.add("new", b"new-id", Kind::Directory);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let old = tt.trans_id_tree_path("old");
+        let new = tt.trans_id_tree_path("new");
+        let child = tt.create_path("c", &old).unwrap();
+        tt.set_new_contents(&child, ContentKind::File);
+        let moved = tt.reparent_transform_children(&old, &new).unwrap();
+        assert_eq!(moved, vec![child.clone()]);
+        assert!(tt.by_parent().get(&new).unwrap().contains(&child));
     }
 }
