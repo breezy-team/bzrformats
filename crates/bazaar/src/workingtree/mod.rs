@@ -106,6 +106,9 @@ pub enum WorkingTreeError {
     /// The working-tree format (its `.bzr/checkout/format` marker) is not
     /// supported by this crate.
     UnsupportedFormat(Vec<u8>),
+    /// A reserved revision id (one ending in `:`, such as `null:`) was given
+    /// where a real revision is needed.
+    ReservedId(Vec<u8>),
     /// A control file (views, conflicts) was malformed.
     Corrupt(String),
     /// An operation is not supported by this working-tree format (e.g. views
@@ -142,6 +145,9 @@ impl std::fmt::Display for WorkingTreeError {
                 "unsupported working-tree format: {}",
                 String::from_utf8_lossy(marker)
             ),
+            WorkingTreeError::ReservedId(r) => {
+                write!(f, "reserved revision id: {}", String::from_utf8_lossy(r))
+            }
             WorkingTreeError::Corrupt(m) => write!(f, "corrupt working-tree control file: {m}"),
             WorkingTreeError::Unsupported(m) => write!(f, "unsupported operation: {m}"),
         }
@@ -406,6 +412,18 @@ pub trait WorkingTree: Send + Sync {
     /// Add `revision_id` as a pending-merge parent, so the next commit
     /// records it as an additional parent.
     fn add_pending_merge(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError>;
+
+    /// Set the tree's parent revisions to `revision_ids`, rewriting the
+    /// dirstate parent columns from each parent's tree in `repository`. The
+    /// default is unsupported; the dirstate format overrides it.
+    fn set_parent_ids(
+        &mut self,
+        _repository: &dyn crate::repository::Repository,
+        _revision_ids: &[Vec<u8>],
+        _allow_leftmost_as_ghost: bool,
+    ) -> Result<(), WorkingTreeError> {
+        Err(WorkingTreeError::Unsupported("set_parent_ids".to_string()))
+    }
 
     /// List the tracked files and directories in the live working tree.
     fn list_files(&self) -> Vec<VersionedEntry>;
@@ -725,6 +743,150 @@ impl WorkingTree4 {
             .set_parent_trees(parents, Vec::new(), per_parent)
             .map_err(|e| WorkingTreeError::Commit(format!("set parents: {e:?}")))?;
         self.save_dirstate()
+    }
+
+    /// Set the working tree's parent revisions to `revision_ids`, rewriting the
+    /// dirstate's parent columns.
+    ///
+    /// Each parent's per-entry tree data is fetched from `repository`; a parent
+    /// absent from the repository is recorded as a ghost. Parents that are
+    /// ancestors of a later parent are dropped (heads filtering), matching
+    /// breezy's `set_parent_trees`. The first parent must not be a ghost unless
+    /// `allow_leftmost_as_ghost`, and no parent may be a reserved id such as
+    /// `null:`.
+    pub fn set_parent_ids(
+        &mut self,
+        repository: &dyn crate::repository::Repository,
+        revision_ids: &[Vec<u8>],
+        allow_leftmost_as_ghost: bool,
+    ) -> Result<(), WorkingTreeError> {
+        // Which parents are present (have a tree) vs ghosts.
+        let present: Vec<bool> = revision_ids
+            .iter()
+            .map(|r| {
+                if r.as_slice() == crate::branch::NULL_REVISION {
+                    return Ok(true);
+                }
+                repository
+                    .has_revision(r)
+                    .map_err(WorkingTreeError::Repository)
+            })
+            .collect::<Result<_, _>>()?;
+        if let Some(false) = present.first() {
+            if !allow_leftmost_as_ghost {
+                return Err(WorkingTreeError::Commit(format!(
+                    "left-hand parent {} is a ghost",
+                    String::from_utf8_lossy(&revision_ids[0])
+                )));
+            }
+        }
+
+        // Heads filtering: drop a parent that is an ancestor of an
+        // already-accepted parent. The first parent is always accepted.
+        let heads = self.parent_heads(repository, revision_ids)?;
+        let mut accepted: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut kept: Vec<(Vec<u8>, bool)> = Vec::new();
+        for (rev_id, is_present) in revision_ids.iter().zip(&present) {
+            if !accepted.is_empty() && (accepted.contains(rev_id) || !heads.contains(rev_id)) {
+                continue;
+            }
+            if rev_id.ends_with(b":") {
+                return Err(WorkingTreeError::ReservedId(rev_id.clone()));
+            }
+            accepted.insert(rev_id.clone());
+            kept.push((rev_id.clone(), *is_present));
+        }
+
+        let mut parents = Vec::new();
+        let mut ghosts = Vec::new();
+        let mut per_parent = Vec::new();
+        for (rev_id, is_present) in kept {
+            parents.push(rev_id.clone());
+            if is_present {
+                per_parent.push(self.revision_tree_entries(repository, &rev_id)?);
+            } else {
+                // A ghost has no tree column in the dirstate.
+                ghosts.push(rev_id.clone());
+            }
+        }
+
+        self.dirstate
+            .set_parent_trees(parents, ghosts, per_parent)
+            .map_err(|e| WorkingTreeError::Commit(format!("set parents: {e:?}")))?;
+        self.save_dirstate()
+    }
+
+    /// The heads of `revision_ids` in the repository's revision graph: the
+    /// parents that are not ancestors of any other parent.
+    fn parent_heads(
+        &self,
+        repository: &dyn crate::repository::Repository,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashSet<Vec<u8>>, WorkingTreeError> {
+        // Build the ancestry closure of the parents, then let vcs-graph pick
+        // the heads.
+        let mut parent_map: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        let mut pending: Vec<Vec<u8>> = revision_ids
+            .iter()
+            .filter(|r| r.as_slice() != crate::branch::NULL_REVISION)
+            .cloned()
+            .collect();
+        while !pending.is_empty() {
+            let batch = std::mem::take(&mut pending);
+            let map = repository
+                .get_parent_map(&batch)
+                .map_err(|e| WorkingTreeError::Commit(format!("parent map: {e:?}")))?;
+            for (rev, parents) in map {
+                for p in &parents {
+                    if !parent_map.contains_key(p) && p.as_slice() != crate::branch::NULL_REVISION {
+                        pending.push(p.clone());
+                    }
+                }
+                parent_map.insert(rev, parents);
+            }
+        }
+        // A ghost (a parent absent from the repository) has no graph entry;
+        // give it empty parents so it is treated as its own head.
+        for rev_id in revision_ids {
+            if rev_id.as_slice() != crate::branch::NULL_REVISION {
+                parent_map.entry(rev_id.clone()).or_default();
+            }
+        }
+        let mut graph = vcs_graph::KnownGraph::new(parent_map, false);
+        Ok(graph
+            .heads(revision_ids.iter().cloned())
+            .into_iter()
+            .collect())
+    }
+
+    /// The `(path, file_id, TreeData)` entries of `revision_id`'s tree, for use
+    /// as a dirstate parent column.
+    fn revision_tree_entries(
+        &self,
+        repository: &dyn crate::repository::Repository,
+        revision_id: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, crate::dirstate::TreeData)>, WorkingTreeError> {
+        use crate::dirstate::{inv_entry_to_details, TreeData, NULLSTAT};
+        let tree = repository
+            .revision_tree(revision_id)
+            .map_err(|e| WorkingTreeError::Commit(format!("revision tree: {e:?}")))?;
+        let mut out = Vec::new();
+        for (path, entry) in tree.iter_entries() {
+            let (minikind, fingerprint, size, executable, _rev) = inv_entry_to_details(&entry);
+            out.push((
+                path.into_bytes(),
+                entry.file_id().as_bytes().to_vec(),
+                TreeData {
+                    minikind,
+                    fingerprint,
+                    size,
+                    executable,
+                    packed_stat: NULLSTAT.to_vec(),
+                },
+            ));
+        }
+        Ok(out)
     }
 
     /// The basis (tree-1) entries as `(path, file_id, TreeData)`, for
@@ -1444,6 +1606,15 @@ impl WorkingTree for WorkingTree4 {
 
     fn add_pending_merge(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError> {
         WorkingTree4::add_pending_merge(self, revision_id)
+    }
+
+    fn set_parent_ids(
+        &mut self,
+        repository: &dyn crate::repository::Repository,
+        revision_ids: &[Vec<u8>],
+        allow_leftmost_as_ghost: bool,
+    ) -> Result<(), WorkingTreeError> {
+        WorkingTree4::set_parent_ids(self, repository, revision_ids, allow_leftmost_as_ghost)
     }
 
     fn list_files(&self) -> Vec<VersionedEntry> {
@@ -2243,6 +2414,249 @@ mod tests {
         let inv = repo.get_inventory(&revid).unwrap();
         // An empty tree has only the root, so no non-root entries.
         assert!(inv.entries().unwrap().is_empty());
+    }
+
+    /// A tree with two commits to `a.txt`, returning its transport, control
+    /// directory and the two revision ids.
+    fn tree_with_two_commits() -> (
+        tempfile::TempDir,
+        SharedTransport,
+        BzrDirMeta,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let mut wt = cd.open_workingtree().unwrap();
+
+        parent.put_bytes("a.txt", b"one\n", None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        let r1 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "one").timestamp(1577880000),
+            )
+            .unwrap();
+
+        // Reopen the control objects (fresh basis/branch tip) before the
+        // second commit.
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"two\n", None).unwrap();
+        let r2 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "two").timestamp(1577880001),
+            )
+            .unwrap();
+        (dir, parent, cd, r1, r2)
+    }
+
+    #[test]
+    fn set_parent_ids_rewrites_the_dirstate_basis() {
+        let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
+        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        assert_eq!(wt.parent_ids(), vec![r2.clone()]);
+
+        // Point the tree's parent back at r1; the dirstate basis follows.
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let repo = cd.open_repository().unwrap();
+        wt.set_parent_ids(repo.as_ref(), std::slice::from_ref(&r1), false)
+            .unwrap();
+        assert_eq!(wt.parent_ids(), vec![r1.clone()]);
+        // The basis is persisted.
+        let reread = WorkingTree4::open(parent.clone()).unwrap();
+        assert_eq!(reread.basis_revision().as_deref(), Some(r1.as_slice()));
+
+        // Setting no parents clears the basis.
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        wt.set_parent_ids(repo.as_ref(), &[], false).unwrap();
+        assert_eq!(wt.parent_ids(), Vec::<Vec<u8>>::new());
+
+        // A ghost merge parent (absent from the repository) is kept alongside
+        // the present basis.
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        wt.set_parent_ids(repo.as_ref(), &[r1.clone(), b"ghost-rev".to_vec()], false)
+            .unwrap();
+        assert_eq!(wt.parent_ids(), vec![r1.clone(), b"ghost-rev".to_vec()]);
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.parent_ids(), vec![r1, b"ghost-rev".to_vec()]);
+        assert_eq!(reread.path2id("a.txt"), wt.path2id("a.txt"));
+    }
+
+    /// A parent that is an ancestor of another parent is dropped.
+    #[test]
+    fn set_parent_ids_drops_ancestor_parents() {
+        let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
+        let repo = cd.open_repository().unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        wt.set_parent_ids(repo.as_ref(), &[r2.clone(), r1], false)
+            .unwrap();
+        assert_eq!(wt.parent_ids(), vec![r2.clone()]);
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.parent_ids(), vec![r2]);
+    }
+
+    #[test]
+    fn set_parent_ids_leftmost_ghost() {
+        let (_dir, parent, cd, _r1, r2) = tree_with_two_commits();
+        let repo = cd.open_repository().unwrap();
+        let ghost = b"ghost-rev".to_vec();
+
+        // A ghost is refused as the left-hand parent, leaving the parents
+        // untouched.
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        match wt.set_parent_ids(repo.as_ref(), std::slice::from_ref(&ghost), false) {
+            Err(WorkingTreeError::Commit(message)) => {
+                assert_eq!(message, "left-hand parent ghost-rev is a ghost")
+            }
+            other => panic!("expected a ghost error, got {:?}", other),
+        }
+        assert_eq!(wt.parent_ids(), vec![r2]);
+
+        // Unless the caller allows it.
+        wt.set_parent_ids(repo.as_ref(), std::slice::from_ref(&ghost), true)
+            .unwrap();
+        assert_eq!(wt.parent_ids(), vec![ghost.clone()]);
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.parent_ids(), vec![ghost]);
+    }
+
+    /// A reserved revision id such as `null:` cannot be a parent.
+    #[test]
+    fn set_parent_ids_rejects_reserved_ids() {
+        let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
+        let repo = cd.open_repository().unwrap();
+        let mut wt = WorkingTree4::open(parent).unwrap();
+        for parents in [
+            vec![crate::branch::NULL_REVISION.to_vec()],
+            vec![r1, b"current:".to_vec()],
+        ] {
+            let reserved = parents.last().unwrap().clone();
+            match wt.set_parent_ids(repo.as_ref(), &parents, false) {
+                Err(WorkingTreeError::ReservedId(revision_id)) => {
+                    assert_eq!(revision_id, reserved)
+                }
+                other => panic!("expected a reserved id error, got {:?}", other),
+            }
+            assert_eq!(wt.parent_ids(), vec![r2.clone()]);
+        }
+    }
+
+    use crate::repository::RepositoryError;
+
+    /// A repository whose revision index cannot be read.
+    struct UnreadableRepository;
+
+    impl crate::repository::Repository for UnreadableRepository {
+        fn format(&self) -> &'static crate::repository::RepositoryFormat {
+            unimplemented!()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
+            unimplemented!()
+        }
+        fn get_parent_map(
+            &self,
+            _revision_ids: &[Vec<u8>],
+        ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+            Err(RepositoryError::Corrupt("unreadable index".to_string()))
+        }
+        fn get_revision(
+            &self,
+            _revision_id: &[u8],
+        ) -> Result<crate::revision::Revision, RepositoryError> {
+            unimplemented!()
+        }
+        fn get_inventory(
+            &self,
+            _revision_id: &[u8],
+        ) -> Result<Box<dyn crate::inventory::Inventory>, RepositoryError> {
+            unimplemented!()
+        }
+        fn get_file_text(
+            &self,
+            _file_id: &[u8],
+            _revision: &[u8],
+        ) -> Result<Vec<u8>, RepositoryError> {
+            unimplemented!()
+        }
+        fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        fn add_revision(
+            &mut self,
+            _revision: &crate::revision::Revision,
+            _parents: &[Vec<u8>],
+        ) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        fn add_inventory_from_entries(
+            &mut self,
+            _revision_id: &[u8],
+            _parents: &[Vec<u8>],
+            _root_id: &[u8],
+            _entries: &[crate::inventory::Entry],
+        ) -> Result<Vec<u8>, RepositoryError> {
+            unimplemented!()
+        }
+        fn add_inventory_by_delta(
+            &mut self,
+            _basis_revision_id: &[u8],
+            _delta: &crate::inventory_delta::InventoryDelta,
+            _new_revision_id: &[u8],
+            _parents: &[Vec<u8>],
+        ) -> Result<Vec<u8>, RepositoryError> {
+            unimplemented!()
+        }
+        fn add_text(
+            &mut self,
+            _file_id: &[u8],
+            _revision: &[u8],
+            _parents: &[(Vec<u8>, Vec<u8>)],
+            _bytes: &[u8],
+        ) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        fn add_signature_text(
+            &mut self,
+            _revision_id: &[u8],
+            _signature: &[u8],
+        ) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        fn get_signature_text(
+            &self,
+            _revision_id: &[u8],
+        ) -> Result<Option<Vec<u8>>, RepositoryError> {
+            unimplemented!()
+        }
+        fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+    }
+
+    /// A parent the repository could not be asked about is an error, not a
+    /// ghost.
+    #[test]
+    fn set_parent_ids_propagates_repository_errors() {
+        let (_dir, parent, _cd, r1, r2) = tree_with_two_commits();
+        let mut wt = WorkingTree4::open(parent).unwrap();
+        match wt.set_parent_ids(&UnreadableRepository, std::slice::from_ref(&r1), true) {
+            Err(WorkingTreeError::Repository(RepositoryError::Corrupt(message))) => {
+                assert_eq!(message, "unreadable index")
+            }
+            other => panic!("expected a repository error, got {:?}", other),
+        }
+        assert_eq!(wt.parent_ids(), vec![r2]);
     }
 
     /// Create an all-in-one weave control dir, add a file, commit, then
