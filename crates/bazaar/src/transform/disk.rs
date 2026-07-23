@@ -15,6 +15,19 @@ use super::{ContentKind, Error, TransformTree, TreeTransformBase};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// How to handle unversioned children of a directory being removed.
+///
+/// Mirrors breezy's `transform.orphan_policy` config option, whose default is
+/// `Conflict` (refuse, leaving a conflict on the directory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OrphanPolicy {
+    /// Refuse to create orphans; the caller keeps the directory and conflicts.
+    #[default]
+    Conflict,
+    /// Move orphans into a `brz-orphans` directory at the tree root.
+    Move,
+}
+
 /// A tree transform that stages new contents in a limbo directory on disk.
 pub struct DiskTreeTransform<T: TransformTree> {
     base: TreeTransformBase<T>,
@@ -97,6 +110,48 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         self.base.set_new_contents(trans_id, ContentKind::Directory);
         self.creation_done.insert(trans_id.to_string());
         Ok(())
+    }
+
+    /// Schedule `trans_id` to be orphaned, under `policy`.
+    ///
+    /// When a directory is removed, its unversioned children are orphaned
+    /// rather than deleted. With [`OrphanPolicy::Conflict`] (breezy's default)
+    /// this refuses, returning [`Error::OrphaningForbidden`] so the caller
+    /// cancels the directory deletion. With [`OrphanPolicy::Move`] the child is
+    /// moved into a `brz-orphans` directory at the tree root, with a warning.
+    pub fn new_orphan(
+        &mut self,
+        trans_id: &str,
+        parent_id: &str,
+        policy: OrphanPolicy,
+    ) -> Result<(), Error> {
+        match policy {
+            OrphanPolicy::Conflict => Err(Error::OrphaningForbidden("conflict".to_string())),
+            OrphanPolicy::Move => {
+                let orphan_dir_basename = "brz-orphans";
+                let od_id = self.base.trans_id_tree_path(orphan_dir_basename);
+                if self.base.final_kind(&od_id).is_none() {
+                    self.create_directory(&od_id)?;
+                }
+                let parent_path = self
+                    .base
+                    .tree_id_paths_map()
+                    .get(parent_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Tree(format!("orphan parent {parent_id} is not a tree path"))
+                    })?;
+                let actual_name = self.base.final_name(trans_id)?;
+                let new_name = self.base.available_backup_name(&actual_name, &od_id)?;
+                self.base.adjust_path(&new_name, &od_id, trans_id)?;
+                log::warn!(
+                    "{} has been orphaned in {}",
+                    super::joinpath(&parent_path, &actual_name),
+                    orphan_dir_basename
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Stage a new symlink to `target` for `trans_id`. On a filesystem without
@@ -340,5 +395,79 @@ mod tests {
         let limbo = tt.limbo_dir.clone();
         tt.finalize().unwrap();
         assert!(!limbo.exists());
+    }
+
+    /// An unversioned file in a directory that is being removed.
+    fn orphan_in_removed_dir(tt: &mut DiskTreeTransform<FakeTree>) -> (String, String) {
+        tt.base_mut().tree.add("dir", b"dir-id", Kind::Directory);
+        let dir = tt.base_mut().trans_id_tree_path("dir");
+        let orphan = tt.base_mut().trans_id_tree_path("dir/foo");
+        tt.base_mut().delete_contents(&dir);
+        tt.base_mut().unversion_file(&dir);
+        (dir, orphan)
+    }
+
+    #[test]
+    fn new_orphan_refuses_by_default() {
+        let (_d, mut tt) = disk_tt();
+        let (dir, orphan) = orphan_in_removed_dir(&mut tt);
+        match tt.new_orphan(&orphan, &dir, OrphanPolicy::default()) {
+            Err(Error::OrphaningForbidden(policy)) => assert_eq!(policy, "conflict"),
+            other => panic!("expected orphaning to be forbidden, got {:?}", other),
+        }
+        // The orphan stays where it was.
+        assert_eq!(tt.base_mut().final_parent(&orphan), dir);
+        assert_eq!(tt.base().final_name(&orphan).unwrap(), "foo");
+    }
+
+    #[test]
+    fn new_orphan_moves_into_the_orphans_directory() {
+        let (_d, mut tt) = disk_tt();
+        let (dir, orphan) = orphan_in_removed_dir(&mut tt);
+        tt.new_orphan(&orphan, &dir, OrphanPolicy::Move).unwrap();
+
+        let orphans_dir = tt.base_mut().final_parent(&orphan);
+        assert_eq!(tt.base().final_name(&orphans_dir).unwrap(), "brz-orphans");
+        assert_eq!(tt.base().final_kind(&orphans_dir), Some(Kind::Directory));
+        assert!(tt.limbo_name(&orphans_dir).is_dir());
+        assert_eq!(tt.base().final_name(&orphan).unwrap(), "foo.~1~");
+    }
+
+    /// The parent of an orphan is a directory of the tree.
+    #[test]
+    fn new_orphan_needs_a_tree_parent() {
+        let (_d, mut tt) = disk_tt();
+        let root = tt.base().root().unwrap().to_string();
+        let new_dir = tt.base_mut().create_path("dir", &root).unwrap();
+        let orphan = tt.base_mut().create_path("foo", &new_dir).unwrap();
+        match tt.new_orphan(&orphan, &new_dir, OrphanPolicy::Move) {
+            Err(Error::Tree(message)) => assert_eq!(
+                message,
+                format!("orphan parent {new_dir} is not a tree path")
+            ),
+            other => panic!("expected a tree error, got {:?}", other),
+        }
+    }
+
+    /// A second orphan of the same name goes into the same directory under
+    /// the next free backup name.
+    #[test]
+    fn new_orphan_avoids_earlier_orphans() {
+        let (_d, mut tt) = disk_tt();
+        let (dir, first) = orphan_in_removed_dir(&mut tt);
+        tt.base_mut()
+            .tree
+            .add("other", b"other-id", Kind::Directory);
+        let other = tt.base_mut().trans_id_tree_path("other");
+        let second = tt.base_mut().trans_id_tree_path("other/foo");
+        tt.new_orphan(&first, &dir, OrphanPolicy::Move).unwrap();
+        tt.new_orphan(&second, &other, OrphanPolicy::Move).unwrap();
+
+        assert_eq!(
+            tt.base_mut().final_parent(&second),
+            tt.base_mut().final_parent(&first)
+        );
+        assert_eq!(tt.base().final_name(&first).unwrap(), "foo.~1~");
+        assert_eq!(tt.base().final_name(&second).unwrap(), "foo.~2~");
     }
 }
