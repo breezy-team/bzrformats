@@ -663,6 +663,9 @@ pub struct Conflict {
     pub path: String,
     /// The file id of the conflicted entry, if recorded.
     pub file_id: Option<Vec<u8>>,
+    /// The other path involved in the conflict (path conflicts only): the
+    /// entry's path on the OTHER side.
+    pub conflict_path: Option<String>,
 }
 
 /// Open the working tree reachable through `transport` (rooted at the
@@ -2310,6 +2313,12 @@ mod conflicts_io {
                     StanzaValue::String(String::from_utf8_lossy(fid).into_owned()),
                 );
             }
+            if let Some(conflict_path) = &c.conflict_path {
+                let _ = s.add(
+                    "conflict_path".to_string(),
+                    StanzaValue::String(conflict_path.clone()),
+                );
+            }
             s
         });
         // rio_iter writes the header line and separates stanzas with a blank
@@ -2333,10 +2342,12 @@ mod conflicts_io {
                 get("type").ok_or_else(|| "conflict stanza missing 'type'".to_string())?;
             let path = get("path").ok_or_else(|| "conflict stanza missing 'path'".to_string())?;
             let file_id = get("file_id").map(|s| s.into_bytes());
+            let conflict_path = get("conflict_path");
             out.push(Conflict {
                 typestring,
                 path,
                 file_id,
+                conflict_path,
             });
         }
         Ok(out)
@@ -4163,11 +4174,13 @@ mod tests {
                 typestring: "text conflict".to_string(),
                 path: "a.txt".to_string(),
                 file_id: Some(b"a-id".to_vec()),
+                conflict_path: None,
             },
             Conflict {
                 typestring: "path conflict".to_string(),
                 path: "dir/b".to_string(),
                 file_id: None,
+                conflict_path: Some("dir/c".to_string()),
             },
         ];
         wt.set_conflicts(&conflicts).unwrap();
@@ -4178,6 +4191,70 @@ mod tests {
 
         let reread = WorkingTree4::open(parent).unwrap();
         assert_eq!(reread.conflicts().unwrap(), conflicts);
+    }
+
+    /// A path conflict records the other path under the `conflict_path`
+    /// keyword, after the keywords every conflict has.
+    #[test]
+    fn path_conflict_writes_conflict_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        let wt = cd.open_workingtree().unwrap();
+        wt.set_conflicts(&[Conflict {
+            typestring: "path conflict".to_string(),
+            path: "dir/b".to_string(),
+            file_id: Some(b"b-id".to_vec()),
+            conflict_path: Some("dir/c".to_string()),
+        }])
+        .unwrap();
+        assert_eq!(
+            parent.get_bytes(".bzr/checkout/conflicts").unwrap(),
+            b"BZR conflict list format 1\n\
+              type: path conflict\n\
+              path: dir/b\n\
+              file_id: b-id\n\
+              conflict_path: dir/c\n"
+        );
+    }
+
+    #[test]
+    fn conflicts_reads_conflict_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        parent
+            .put_bytes(
+                ".bzr/checkout/conflicts",
+                b"BZR conflict list format 1\n\
+                  type: path conflict\n\
+                  path: dir/b\n\
+                  file_id: b-id\n\
+                  conflict_path: dir/c\n\
+                  \n\
+                  type: text conflict\n\
+                  path: a.txt\n\
+                  file_id: a-id\n",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            cd.open_workingtree().unwrap().conflicts().unwrap(),
+            vec![
+                Conflict {
+                    typestring: "path conflict".to_string(),
+                    path: "dir/b".to_string(),
+                    file_id: Some(b"b-id".to_vec()),
+                    conflict_path: Some("dir/c".to_string()),
+                },
+                Conflict {
+                    typestring: "text conflict".to_string(),
+                    path: "a.txt".to_string(),
+                    file_id: Some(b"a-id".to_vec()),
+                    conflict_path: None,
+                },
+            ]
+        );
     }
 
     #[test]
