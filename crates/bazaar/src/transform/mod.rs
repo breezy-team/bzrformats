@@ -74,6 +74,35 @@ pub trait TransformTree {
     /// The basenames of the direct children of the directory at `path`.
     fn tree_children(&self, path: &str) -> Result<Vec<String>, Error>;
 
+    /// The basenames of the on-disk children of the directory at `path`,
+    /// excluding control files (`.bzr`). Empty when the path is not a
+    /// directory. This is what the transform walks to register a directory's
+    /// existing children before detecting conflicts.
+    fn list_disk_children(&self, path: &str) -> Result<Vec<String>, Error>;
+
+    /// Whether `path` is a control file (part of `.bzr`) that the transform
+    /// must not touch.
+    fn is_control_filename(&self, path: &str) -> bool;
+
+    /// The kind recorded for `path` in the tree's inventory (which, unlike
+    /// [`tree_kind`](Self::tree_kind), may differ from the on-disk kind).
+    fn stored_kind(&self, path: &str) -> Option<Kind> {
+        self.tree_kind(path)
+    }
+
+    /// Whether the tree's filesystem supports symlinks.
+    fn supports_symlinks(&self) -> bool {
+        true
+    }
+
+    /// Whether `kind` is a kind that can be versioned in this tree.
+    fn versionable_kind(&self, kind: Kind) -> bool {
+        matches!(
+            kind,
+            Kind::File | Kind::Directory | Kind::Symlink | Kind::TreeReference
+        )
+    }
+
     /// The canonical form of `path` (case/encoding normalised). The default
     /// returns the path unchanged.
     fn canonical_path(&self, path: &str) -> String {
@@ -104,6 +133,40 @@ impl ContentKind {
             ContentKind::TreeReference => Kind::TreeReference,
         }
     }
+}
+
+/// A raw (uncooked) conflict detected in a transform, mirroring breezy's
+/// conflict tuples. These are what `find_raw_conflicts` produces and what
+/// conflict resolution consumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawConflict {
+    /// An entry is its own ancestor.
+    ParentLoop { trans_id: String },
+    /// A versioned child under an unversioned parent.
+    UnversionedParent { parent_id: String },
+    /// A file scheduled to be versioned has no contents.
+    VersioningNoContents { trans_id: String },
+    /// A file scheduled to be versioned has an unversionable kind.
+    VersioningBadKind { trans_id: String, kind: Kind },
+    /// An executability change on an unversioned entry.
+    UnversionedExecutability { trans_id: String },
+    /// An executability change on a non-file entry.
+    NonFileExecutability { trans_id: String },
+    /// New content would overwrite an existing entry not scheduled for removal.
+    Overwrite { trans_id: String, name: String },
+    /// Two entries in one directory share a name.
+    Duplicate {
+        /// The first entry's trans-id.
+        old_trans_id: String,
+        /// The second entry's trans-id.
+        new_trans_id: String,
+        /// The shared name.
+        name: String,
+    },
+    /// A directory needed to hold children is being deleted.
+    MissingParent { parent_id: String },
+    /// A parent that must be a directory is not one.
+    NonDirectoryParent { parent_id: String },
 }
 
 /// The base bookkeeping of a tree transform: the pending operations and the
@@ -431,6 +494,243 @@ impl<T: TransformTree> TreeTransformBase<T> {
         self.case_sensitive
     }
 
+    /// Register a tree path's trans-id, recording the reverse mapping. Used
+    /// while walking a directory's children.
+    fn register_tree_path(&mut self, path: &str) -> String {
+        self.trans_id_tree_path(path)
+    }
+
+    /// Register every on-disk child of the directory at `trans_id` (breezy's
+    /// `iter_tree_children`), so conflict detection sees them.
+    fn add_tree_children_of(&mut self, trans_id: &str) -> Result<(), Error> {
+        let path = match self.tree_id_paths.get(trans_id) {
+            Some(p) => p.clone(),
+            None => return Ok(()),
+        };
+        for child in self.tree.list_disk_children(&path)? {
+            let child_path = joinpath(&path, &child);
+            if self.tree.is_control_filename(&child_path) {
+                continue;
+            }
+            self.register_tree_path(&child_path);
+        }
+        Ok(())
+    }
+
+    /// Ensure every child of every active parent is registered before
+    /// conflict detection (breezy's `_add_tree_children`).
+    fn add_tree_children(&mut self) -> Result<(), Error> {
+        let mut parents: Vec<String> = self.by_parent().into_keys().collect();
+        // Directories whose contents are removed.
+        for trans_id in self.removed_contents.clone() {
+            if self.tree_kind_of(&trans_id) == Some(Kind::Directory) {
+                parents.push(trans_id);
+            }
+        }
+        // Directories being unversioned.
+        for trans_id in self.removed_id.clone() {
+            match self.tree_id_paths.get(&trans_id) {
+                Some(path) => {
+                    if self.tree.stored_kind(path) == Some(Kind::Directory) {
+                        parents.push(trans_id);
+                    }
+                }
+                None => {
+                    if self.tree_kind_of(&trans_id) == Some(Kind::Directory) {
+                        parents.push(trans_id);
+                    }
+                }
+            }
+        }
+        for parent_id in parents {
+            self.add_tree_children_of(&parent_id)?;
+        }
+        Ok(())
+    }
+
+    /// Find all invariant violations in the transform (breezy's
+    /// `find_raw_conflicts`).
+    pub fn find_raw_conflicts(&mut self) -> Result<Vec<RawConflict>, Error> {
+        self.add_tree_children()?;
+        let by_parent = self.by_parent();
+        let mut conflicts = Vec::new();
+        conflicts.extend(self.unversioned_parents(&by_parent));
+        conflicts.extend(self.parent_loops());
+        conflicts.extend(self.duplicate_entries(&by_parent)?);
+        conflicts.extend(self.parent_type_conflicts(&by_parent));
+        conflicts.extend(self.improper_versioning());
+        conflicts.extend(self.executability_conflicts());
+        conflicts.extend(self.overwrite_conflicts()?);
+        Ok(conflicts)
+    }
+
+    /// No entry may be its own ancestor.
+    fn parent_loops(&mut self) -> Vec<RawConflict> {
+        let mut out = Vec::new();
+        let trans_ids: Vec<String> = self.new_parent.keys().cloned().collect();
+        for trans_id in trans_ids {
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut parent_id = trans_id.clone();
+            while parent_id != ROOT_PARENT {
+                seen.insert(parent_id.clone());
+                parent_id = self.final_parent(&parent_id);
+                if parent_id == trans_id {
+                    out.push(RawConflict::ParentLoop {
+                        trans_id: trans_id.clone(),
+                    });
+                }
+                if seen.contains(&parent_id) {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// A versioned parent's children must all be versioned.
+    fn unversioned_parents(
+        &self,
+        by_parent: &HashMap<String, HashSet<String>>,
+    ) -> Vec<RawConflict> {
+        let mut out = Vec::new();
+        for (parent_id, children) in by_parent {
+            if parent_id == ROOT_PARENT {
+                continue;
+            }
+            if self.final_is_versioned(parent_id) {
+                continue;
+            }
+            if children.iter().any(|c| self.final_is_versioned(c)) {
+                out.push(RawConflict::UnversionedParent {
+                    parent_id: parent_id.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// A file cannot be versioned with no contents or a bad kind.
+    fn improper_versioning(&self) -> Vec<RawConflict> {
+        let mut out = Vec::new();
+        for trans_id in self.new_id.keys() {
+            match self.final_kind(trans_id) {
+                Some(Kind::Symlink) if !self.tree.supports_symlinks() => continue,
+                None => out.push(RawConflict::VersioningNoContents {
+                    trans_id: trans_id.clone(),
+                }),
+                Some(kind) if !self.tree.versionable_kind(kind) => {
+                    out.push(RawConflict::VersioningBadKind {
+                        trans_id: trans_id.clone(),
+                        kind,
+                    })
+                }
+                Some(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Only versioned files may have their executability set.
+    fn executability_conflicts(&self) -> Vec<RawConflict> {
+        let mut out = Vec::new();
+        for trans_id in self.new_executability.keys() {
+            if !self.final_is_versioned(trans_id) {
+                out.push(RawConflict::UnversionedExecutability {
+                    trans_id: trans_id.clone(),
+                });
+            } else if self.final_kind(trans_id) != Some(Kind::File) {
+                out.push(RawConflict::NonFileExecutability {
+                    trans_id: trans_id.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// New contents must not overwrite an existing entry unless it is also
+    /// scheduled for removal.
+    fn overwrite_conflicts(&self) -> Result<Vec<RawConflict>, Error> {
+        let mut out = Vec::new();
+        for trans_id in self.new_contents.keys() {
+            if self.tree_kind_of(trans_id).is_none() {
+                continue;
+            }
+            if !self.removed_contents.contains(trans_id) {
+                out.push(RawConflict::Overwrite {
+                    trans_id: trans_id.clone(),
+                    name: self.final_name(trans_id)?,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// No directory may have two entries with the same name.
+    fn duplicate_entries(
+        &self,
+        by_parent: &HashMap<String, HashSet<String>>,
+    ) -> Result<Vec<RawConflict>, Error> {
+        let mut out = Vec::new();
+        if self.new_name.is_empty() && self.new_parent.is_empty() {
+            return Ok(out);
+        }
+        for children in by_parent.values() {
+            let mut name_ids: Vec<(String, String)> = Vec::new();
+            for child in children {
+                let mut name = self.final_name(child)?;
+                if !self.case_sensitive {
+                    name = name.to_lowercase();
+                }
+                name_ids.push((name, child.clone()));
+            }
+            name_ids.sort();
+            let mut last: Option<(String, String)> = None;
+            for (name, trans_id) in name_ids {
+                let kind = self.final_kind(&trans_id);
+                if kind.is_none() && !self.final_is_versioned(&trans_id) {
+                    continue;
+                }
+                if let Some((last_name, last_tid)) = &last {
+                    if &name == last_name {
+                        out.push(RawConflict::Duplicate {
+                            old_trans_id: last_tid.clone(),
+                            new_trans_id: trans_id.clone(),
+                            name: name.clone(),
+                        });
+                    }
+                }
+                last = Some((name, trans_id));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Children must have an existing directory parent.
+    fn parent_type_conflicts(
+        &self,
+        by_parent: &HashMap<String, HashSet<String>>,
+    ) -> Vec<RawConflict> {
+        let mut out = Vec::new();
+        for (parent_id, children) in by_parent {
+            if parent_id == ROOT_PARENT {
+                continue;
+            }
+            if !children.iter().any(|c| self.final_kind(c).is_some()) {
+                continue;
+            }
+            match self.final_kind(parent_id) {
+                None => out.push(RawConflict::MissingParent {
+                    parent_id: parent_id.clone(),
+                }),
+                Some(Kind::Directory) => {}
+                Some(_) => out.push(RawConflict::NonDirectoryParent {
+                    parent_id: parent_id.clone(),
+                }),
+            }
+        }
+        out
+    }
+
     pub(crate) fn new_contents_map(&self) -> &HashMap<String, ContentKind> {
         &self.new_contents
     }
@@ -485,6 +785,15 @@ fn basename(path: &str) -> String {
     match path.rfind('/') {
         Some(i) => path[i + 1..].to_string(),
         None => path.to_string(),
+    }
+}
+
+/// Join `parent` and `child` into a tree-relative path (breezy's `joinpath`).
+fn joinpath(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_string()
+    } else {
+        format!("{parent}/{child}")
     }
 }
 
@@ -544,6 +853,13 @@ mod tests {
                 })
                 .map(|p| basename(p))
                 .collect())
+        }
+        fn list_disk_children(&self, path: &str) -> Result<Vec<String>, Error> {
+            // The fake tree's disk state mirrors its versioned entries.
+            self.tree_children(path)
+        }
+        fn is_control_filename(&self, path: &str) -> bool {
+            path == ".bzr" || path.starts_with(".bzr/")
         }
     }
 
@@ -625,5 +941,181 @@ mod tests {
             tt.adjust_path("x", &root, &root),
             Err(Error::CantMoveRoot)
         ));
+    }
+
+    #[test]
+    fn parent_loop_is_a_conflict() {
+        let mut tree = FakeTree::new();
+        tree.add("a", b"a-id", Kind::Directory);
+        tree.add("a/b", b"b-id", Kind::Directory);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let a = tt.trans_id_tree_path("a");
+        let b = tt.trans_id_tree_path("a/b");
+        // Move `a` into its own child.
+        tt.adjust_path("a", &b, &a).unwrap();
+        assert_eq!(
+            tt.find_raw_conflicts().unwrap(),
+            vec![RawConflict::ParentLoop { trans_id: a }]
+        );
+    }
+
+    #[test]
+    fn versioned_child_of_unversioned_parent_is_a_conflict() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let root = tt.root().unwrap().to_string();
+        let dir = tt.create_path("dir", &root).unwrap();
+        tt.set_new_contents(&dir, ContentKind::Directory);
+        let child = tt.create_path("f", &dir).unwrap();
+        tt.set_new_contents(&child, ContentKind::File);
+        tt.version_file(&child, FileId::from(b"f-id".to_vec()))
+            .unwrap();
+        assert_eq!(
+            tt.find_raw_conflicts().unwrap(),
+            vec![RawConflict::UnversionedParent { parent_id: dir }]
+        );
+    }
+
+    #[test]
+    fn executability_on_an_unversioned_file_is_a_conflict() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let root = tt.root().unwrap().to_string();
+        let f = tt.create_path("f", &root).unwrap();
+        tt.set_new_contents(&f, ContentKind::File);
+        tt.set_executability(Some(true), &f);
+        assert_eq!(
+            tt.find_raw_conflicts().unwrap(),
+            vec![RawConflict::UnversionedExecutability { trans_id: f }]
+        );
+    }
+
+    #[test]
+    fn child_of_a_removed_directory_is_a_conflict() {
+        let mut tree = FakeTree::new();
+        tree.add("dir", b"dir-id", Kind::Directory);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let dir = tt.trans_id_tree_path("dir");
+        tt.delete_contents(&dir);
+        tt.unversion_file(&dir);
+        let child = tt.create_path("f", &dir).unwrap();
+        tt.set_new_contents(&child, ContentKind::File);
+        assert_eq!(
+            tt.find_raw_conflicts().unwrap(),
+            vec![RawConflict::MissingParent { parent_id: dir }]
+        );
+    }
+
+    #[test]
+    fn new_contents_over_an_existing_entry_is_a_conflict() {
+        let mut tree = FakeTree::new();
+        tree.add("a.txt", b"a-id", Kind::File);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let a = tt.trans_id_tree_path("a.txt");
+        tt.set_new_contents(&a, ContentKind::File);
+        assert_eq!(
+            tt.find_raw_conflicts().unwrap(),
+            vec![RawConflict::Overwrite {
+                trans_id: a.clone(),
+                name: "a.txt".to_string(),
+            }]
+        );
+
+        // Removing the old contents first makes the replacement fine.
+        tt.delete_contents(&a);
+        assert_eq!(tt.find_raw_conflicts().unwrap(), vec![]);
+    }
+
+    #[test]
+    fn names_differing_in_case_conflict_on_a_case_insensitive_tree() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), false);
+        let root = tt.root().unwrap().to_string();
+        for name in ["README", "readme"] {
+            let tid = tt.create_path(name, &root).unwrap();
+            tt.set_new_contents(&tid, ContentKind::File);
+        }
+        let conflicts = tt.find_raw_conflicts().unwrap();
+        assert!(matches!(
+            conflicts.as_slice(),
+            [RawConflict::Duplicate { name, .. }] if name == "readme"
+        ));
+
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let root = tt.root().unwrap().to_string();
+        for name in ["README", "readme"] {
+            let tid = tt.create_path(name, &root).unwrap();
+            tt.set_new_contents(&tid, ContentKind::File);
+        }
+        assert_eq!(tt.find_raw_conflicts().unwrap(), vec![]);
+    }
+
+    #[test]
+    fn no_conflicts_for_a_simple_add() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let root = tt.root().unwrap().to_string();
+        let tid = tt.create_path("new.txt", &root).unwrap();
+        tt.set_new_contents(&tid, ContentKind::File);
+        tt.version_file(&tid, FileId::from(b"new-id".to_vec()))
+            .unwrap();
+        assert_eq!(tt.find_raw_conflicts().unwrap(), vec![]);
+    }
+
+    #[test]
+    fn duplicate_name_is_a_conflict() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let root = tt.root().unwrap().to_string();
+        let a = tt.create_path("dup", &root).unwrap();
+        tt.set_new_contents(&a, ContentKind::File);
+        let b = tt.create_path("dup", &root).unwrap();
+        tt.set_new_contents(&b, ContentKind::File);
+        let conflicts = tt.find_raw_conflicts().unwrap();
+        assert!(conflicts
+            .iter()
+            .any(|c| matches!(c, RawConflict::Duplicate { name, .. } if name == "dup")));
+    }
+
+    #[test]
+    fn versioning_no_contents_is_a_conflict() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let root = tt.root().unwrap().to_string();
+        // A path that is versioned but never gets contents.
+        let tid = tt.create_path("ghost", &root).unwrap();
+        tt.version_file(&tid, FileId::from(b"ghost-id".to_vec()))
+            .unwrap();
+        let conflicts = tt.find_raw_conflicts().unwrap();
+        assert!(conflicts.iter().any(|c| matches!(
+            c,
+            RawConflict::VersioningNoContents { trans_id } if trans_id == &tid
+        )));
+    }
+
+    #[test]
+    fn executability_on_a_directory_is_a_conflict() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let root = tt.root().unwrap().to_string();
+        let tid = tt.create_path("sub", &root).unwrap();
+        tt.set_new_contents(&tid, ContentKind::Directory);
+        tt.version_file(&tid, FileId::from(b"sub-id".to_vec()))
+            .unwrap();
+        tt.set_executability(Some(true), &tid);
+        let conflicts = tt.find_raw_conflicts().unwrap();
+        assert!(conflicts.iter().any(|c| matches!(
+            c,
+            RawConflict::NonFileExecutability { trans_id } if trans_id == &tid
+        )));
+    }
+
+    #[test]
+    fn non_directory_parent_is_a_conflict() {
+        let mut tree = FakeTree::new();
+        tree.add("afile", b"afile-id", Kind::File);
+        let mut tt = TreeTransformBase::new(tree, true);
+        // Put a child under the existing file (not a directory).
+        let parent = tt.trans_id_tree_path("afile");
+        let child = tt.create_path("under", &parent).unwrap();
+        tt.set_new_contents(&child, ContentKind::File);
+        let conflicts = tt.find_raw_conflicts().unwrap();
+        assert!(conflicts.iter().any(|c| matches!(
+            c,
+            RawConflict::NonDirectoryParent { parent_id } if parent_id == &parent
+        )));
     }
 }
