@@ -189,6 +189,67 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         Ok(())
     }
 
+    /// Create a new path under `parent_id`, versioning it with `file_id` if
+    /// given. Breezy's `_new_entry`.
+    fn new_entry(
+        &mut self,
+        name: &str,
+        parent_id: &str,
+        file_id: Option<crate::FileId>,
+    ) -> Result<String, Error> {
+        let trans_id = self.base.create_path(name, parent_id)?;
+        if let Some(file_id) = file_id {
+            self.base.version_file(&trans_id, file_id)?;
+        }
+        Ok(trans_id)
+    }
+
+    /// Convenience: create (and optionally version) a new file, staging its
+    /// content and setting executability. Breezy's `new_file`.
+    pub fn new_file(
+        &mut self,
+        name: &str,
+        parent_id: &str,
+        contents: &[u8],
+        file_id: Option<crate::FileId>,
+        executable: Option<bool>,
+        sha1: Option<Vec<u8>>,
+    ) -> Result<String, Error> {
+        let trans_id = self.new_entry(name, parent_id, file_id)?;
+        self.create_file(contents, &trans_id, sha1)?;
+        if let Some(executable) = executable {
+            self.base.set_executability(Some(executable), &trans_id);
+        }
+        Ok(trans_id)
+    }
+
+    /// Convenience: create (and optionally version) a new directory. Breezy's
+    /// `new_directory`.
+    pub fn new_directory(
+        &mut self,
+        name: &str,
+        parent_id: &str,
+        file_id: Option<crate::FileId>,
+    ) -> Result<String, Error> {
+        let trans_id = self.new_entry(name, parent_id, file_id)?;
+        self.create_directory(&trans_id)?;
+        Ok(trans_id)
+    }
+
+    /// Convenience: create (and optionally version) a new symlink. Breezy's
+    /// `new_symlink`.
+    pub fn new_symlink(
+        &mut self,
+        name: &str,
+        parent_id: &str,
+        target: &str,
+        file_id: Option<crate::FileId>,
+    ) -> Result<String, Error> {
+        let trans_id = self.new_entry(name, parent_id, file_id)?;
+        self.create_symlink(target, &trans_id)?;
+        Ok(trans_id)
+    }
+
     /// Cancel staged content creation for `trans_id`, removing its limbo file.
     pub fn cancel_creation(&mut self, trans_id: &str) -> Result<(), Error> {
         self.base.cancel_contents(trans_id);
