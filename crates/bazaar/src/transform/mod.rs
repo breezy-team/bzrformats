@@ -17,6 +17,8 @@
 //! consumed by the disk and apply layers, which are added incrementally.
 #![allow(dead_code)]
 
+pub mod disk;
+
 use crate::osutils::Kind;
 use crate::FileId;
 use std::collections::{HashMap, HashSet};
@@ -797,18 +799,19 @@ fn joinpath(parent: &str, child: &str) -> String {
     }
 }
 
+/// Shared test fixtures for the transform layers.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests_support {
     use super::*;
 
-    /// A minimal in-memory tree for exercising the base bookkeeping.
-    struct FakeTree {
+    /// A minimal in-memory tree for exercising the transform layers.
+    pub(crate) struct FakeTree {
         // path -> (file_id, kind); "" is the root.
         entries: HashMap<String, (FileId, Kind)>,
     }
 
     impl FakeTree {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let mut entries = HashMap::new();
             entries.insert(
                 String::new(),
@@ -817,7 +820,7 @@ mod tests {
             FakeTree { entries }
         }
 
-        fn add(&mut self, path: &str, id: &[u8], kind: Kind) {
+        pub(crate) fn add(&mut self, path: &str, id: &[u8], kind: Kind) {
             self.entries
                 .insert(path.to_string(), (FileId::from(id.to_vec()), kind));
         }
@@ -862,6 +865,12 @@ mod tests {
             path == ".bzr" || path.starts_with(".bzr/")
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::FakeTree;
+    use super::*;
 
     #[test]
     fn assign_id_is_sequential() {
