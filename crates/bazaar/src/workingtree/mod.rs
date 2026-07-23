@@ -410,6 +410,21 @@ pub trait WorkingTree: Send + Sync {
     /// List the tracked files and directories in the live working tree.
     fn list_files(&self) -> Vec<VersionedEntry>;
 
+    /// The live working tree's inventory entries as `(path, entry)` pairs in
+    /// path order, including the tree root as `("", root)`.
+    ///
+    /// The entries reflect the uncommitted working state, so they carry no
+    /// recorded revision, text sha1 or size, or symlink target; breezy's
+    /// working tree inventory leaves those unset too. The base implementation
+    /// is unsupported; the dirstate format overrides it.
+    fn live_inventory_entries(
+        &self,
+    ) -> Result<Vec<(String, crate::inventory::Entry)>, WorkingTreeError> {
+        Err(WorkingTreeError::Unsupported(
+            "live_inventory_entries".to_string(),
+        ))
+    }
+
     /// The file id of the entry at `path`, or `None` if `path` is not
     /// versioned in the live tree.
     fn path2id(&self, path: &str) -> Option<Vec<u8>>;
@@ -720,6 +735,92 @@ impl WorkingTree4 {
             });
         }
         out
+    }
+
+    /// The live working tree's inventory entries as `(path, entry)` pairs in
+    /// path order, including the tree root as `("", root)`.
+    pub fn live_inventory_entries(
+        &self,
+    ) -> Result<Vec<(String, crate::inventory::Entry)>, WorkingTreeError> {
+        use crate::inventory::Entry as InvEntry;
+        use crate::{FileId, RevisionId};
+
+        // First pass: map each directory's path to its file id, so a child can
+        // name its parent. The root lives at path "".
+        let mut path_to_id: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        let mut root_id: Option<Vec<u8>> = None;
+        for entry in self.dirstate.iter_entries() {
+            let Some(td) = entry.trees.first() else {
+                continue;
+            };
+            if EntryKind::from_minikind(td.minikind).is_none() {
+                continue;
+            }
+            let path = join_path(&entry.key.dirname, &entry.key.basename);
+            if path.is_empty() {
+                root_id = Some(entry.key.file_id.clone());
+            } else if td.minikind == Kind::Directory {
+                path_to_id.insert(path, entry.key.file_id.clone());
+            }
+        }
+        let root_id =
+            root_id.ok_or_else(|| WorkingTreeError::Commit("dirstate has no root".to_string()))?;
+
+        let mut out: Vec<(String, InvEntry)> = Vec::new();
+        for entry in self.dirstate.iter_entries() {
+            let Some(td) = entry.trees.first() else {
+                continue;
+            };
+            let minikind = td.minikind;
+            if EntryKind::from_minikind(minikind).is_none() {
+                continue;
+            }
+            let path = join_path(&entry.key.dirname, &entry.key.basename);
+            let file_id = FileId::from(entry.key.file_id.clone());
+            if path.is_empty() {
+                out.push((String::new(), InvEntry::root(file_id, None)));
+                continue;
+            }
+            let name = String::from_utf8_lossy(&entry.key.basename).into_owned();
+            // The parent is the entry at this entry's dirname; a top-level
+            // entry's parent is the root.
+            let dirname = String::from_utf8_lossy(&entry.key.dirname).into_owned();
+            let parent_id = if dirname.is_empty() {
+                FileId::from(root_id.clone())
+            } else {
+                match path_to_id.get(&dirname) {
+                    Some(id) => FileId::from(id.clone()),
+                    // Its directory is not versioned in this tree, so breezy
+                    // takes nothing under it to be either.
+                    None => continue,
+                }
+            };
+            let inv_entry = match minikind {
+                Kind::Directory => InvEntry::directory(file_id, name, parent_id, None),
+                // The sha1, size and link target in the dirstate are a cache
+                // of what was last seen on disk, not part of the entry.
+                Kind::File => InvEntry::file(
+                    file_id,
+                    name,
+                    parent_id,
+                    None,
+                    None,
+                    None,
+                    Some(td.executable),
+                    None,
+                ),
+                Kind::Symlink => InvEntry::link(file_id, name, parent_id, None, None),
+                Kind::TreeReference => {
+                    let reference = (!td.fingerprint.is_empty())
+                        .then(|| RevisionId::from(td.fingerprint.clone()));
+                    InvEntry::tree_reference(file_id, name, parent_id, None, reference)
+                }
+                Kind::Absent | Kind::Relocated => continue,
+            };
+            out.push((path, inv_entry));
+        }
+        Ok(out)
     }
 
     /// The file id of the entry at `path`, or `None` if `path` is not
@@ -1312,6 +1413,12 @@ impl WorkingTree for WorkingTree4 {
 
     fn list_files(&self) -> Vec<VersionedEntry> {
         WorkingTree4::list_files(self)
+    }
+
+    fn live_inventory_entries(
+        &self,
+    ) -> Result<Vec<(String, crate::inventory::Entry)>, WorkingTreeError> {
+        WorkingTree4::live_inventory_entries(self)
     }
 
     fn path2id(&self, path: &str) -> Option<Vec<u8>> {
@@ -2443,6 +2550,135 @@ mod tests {
         assert!(changes[0].new_executable);
         // Only the exec bit changed, so the content did not.
         assert!(!changes[0].content_change);
+    }
+
+    /// live_inventory_entries returns the root, directories and files with
+    /// each entry's name, kind and parent id resolved from the dirstate.
+    #[test]
+    fn live_inventory_entries_lists_versioned_entries() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.mkdir("sub").unwrap();
+        parent.put_bytes("a.txt", b"a\n", None).unwrap();
+        parent.put_bytes("sub/b.txt", b"b\n", None).unwrap();
+        wt.add("sub", EntryKind::Directory, None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        wt.add("sub/b.txt", EntryKind::File, None).unwrap();
+
+        let entries = wt.live_inventory_entries().unwrap();
+        let by_path: std::collections::HashMap<&str, &crate::inventory::Entry> =
+            entries.iter().map(|(p, e)| (p.as_str(), e)).collect();
+
+        // The root has no parent.
+        let root = by_path[""];
+        assert!(matches!(root, crate::inventory::Entry::Root { .. }));
+        let root_id = root.file_id().clone();
+
+        // Top-level entries name the root as their parent.
+        let a = by_path["a.txt"];
+        assert_eq!(a.kind(), crate::osutils::Kind::File);
+        assert_eq!(a.name(), "a.txt");
+        assert_eq!(a.parent_id(), Some(&root_id));
+
+        let sub = by_path["sub"];
+        assert_eq!(sub.kind(), crate::osutils::Kind::Directory);
+        assert_eq!(sub.parent_id(), Some(&root_id));
+
+        // A nested file names its directory as parent.
+        let b = by_path["sub/b.txt"];
+        assert_eq!(b.name(), "b.txt");
+        assert_eq!(b.parent_id(), Some(sub.file_id()));
+    }
+
+    /// The sha1, size and link target the dirstate caches are not reported,
+    /// as in breezy's working tree inventory.
+    #[test]
+    fn live_inventory_entries_omit_cached_details() {
+        use crate::inventory::Entry;
+
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("a.txt", b"contents\n", None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        wt.add("link", EntryKind::Symlink, None).unwrap();
+        // Fill in the cache as a stat of the tree would.
+        for block in wt.dirstate.dirblocks.iter_mut() {
+            for entry in block.entries.iter_mut() {
+                if entry.key.basename == b"a.txt" {
+                    entry.trees[0].fingerprint =
+                        b"0f0e0d0c0b0a09080706050403020100deadbeef".to_vec();
+                    entry.trees[0].size = 9;
+                } else if entry.key.basename == b"link" {
+                    entry.trees[0].fingerprint = b"a.txt".to_vec();
+                }
+            }
+        }
+
+        let entries = wt.live_inventory_entries().unwrap();
+        match &entries[1].1 {
+            Entry::File {
+                text_sha1,
+                text_size,
+                executable,
+                ..
+            } => {
+                assert_eq!(text_sha1, &None);
+                assert_eq!(text_size, &None);
+                assert!(!executable);
+            }
+            other => panic!("expected a file entry, got {:?}", other),
+        }
+        match &entries[2].1 {
+            Entry::Link { symlink_target, .. } => assert_eq!(symlink_target, &None),
+            other => panic!("expected a link entry, got {:?}", other),
+        }
+    }
+
+    /// Entries under a directory that is not versioned in the tree are left
+    /// out, as breezy leaves them out.
+    #[test]
+    fn live_inventory_entries_skips_entries_without_parent() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.mkdir("sub").unwrap();
+        parent.put_bytes("sub/b.txt", b"b\n", None).unwrap();
+        parent.put_bytes("a.txt", b"a\n", None).unwrap();
+        wt.add("sub", EntryKind::Directory, None).unwrap();
+        wt.add("sub/b.txt", EntryKind::File, None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+
+        // Drop the directory from the tree while keeping its child.
+        for block in wt.dirstate.dirblocks.iter_mut() {
+            for entry in block.entries.iter_mut() {
+                if entry.key.dirname.is_empty() && entry.key.basename == b"sub" {
+                    entry.trees[0].minikind = Kind::Absent;
+                }
+            }
+        }
+
+        let entries = wt.live_inventory_entries().unwrap();
+        let paths: Vec<&str> = entries.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["", "a.txt"]);
+    }
+
+    /// A symlink is listed as a link entry, and the entries come in path
+    /// order after the root.
+    #[cfg(unix)]
+    #[test]
+    fn live_inventory_entries_lists_a_symlink() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("target.txt", b"contents\n", None).unwrap();
+        std::os::unix::fs::symlink("target.txt", parent.local_path("link").unwrap()).unwrap();
+        wt.add("target.txt", EntryKind::File, None).unwrap();
+        let link_id = wt.add("link", EntryKind::Symlink, None).unwrap();
+
+        let entries = wt.live_inventory_entries().unwrap();
+        let paths: Vec<&str> = entries.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["", "link", "target.txt"]);
+
+        let root_id = entries[0].1.file_id().clone();
+        let link = &entries[1].1;
+        assert_eq!(link.kind(), crate::osutils::Kind::Symlink);
+        assert_eq!(link.name(), "link");
+        assert_eq!(link.file_id().as_bytes(), link_id.as_slice());
+        assert_eq!(link.parent_id(), Some(&root_id));
     }
 
     /// A second commit that changes one file records that file at the new
