@@ -415,6 +415,88 @@ mod tests {
     }
 
     #[test]
+    fn new_file_convenience_creates_and_versions() {
+        let (_d, mut tt, deletion) = apply_tt();
+        let root = tt.base().root().unwrap().to_string();
+        tt.new_file(
+            "conv.txt",
+            &root,
+            b"data\n",
+            Some(FileId::from(b"conv-id".to_vec())),
+            None,
+            None,
+        )
+        .unwrap();
+        let base_dir = tt.base().tree().abspath("");
+        tt.apply(&deletion, false).unwrap();
+        assert_eq!(std::fs::read(base_dir.join("conv.txt")).unwrap(), b"data\n");
+        assert!(tt.base().tree().is_versioned_path("conv.txt"));
+    }
+
+    #[test]
+    fn new_file_convenience_leaves_a_file_unversioned() {
+        let (_d, mut tt, deletion) = apply_tt();
+        let root = tt.base().root().unwrap().to_string();
+        tt.new_file("plain.txt", &root, b"data\n", None, None, None)
+            .unwrap();
+        let base_dir = tt.base().tree().abspath("");
+        tt.apply(&deletion, false).unwrap();
+        assert_eq!(
+            std::fs::read(base_dir.join("plain.txt")).unwrap(),
+            b"data\n"
+        );
+        assert!(!tt.base().tree().is_versioned_path("plain.txt"));
+    }
+
+    #[test]
+    fn new_directory_convenience_creates_and_versions() {
+        let (_d, mut tt, deletion) = apply_tt();
+        let root = tt.base().root().unwrap().to_string();
+        let sub = tt
+            .new_directory("sub", &root, Some(FileId::from(b"sub-id".to_vec())))
+            .unwrap();
+        tt.new_file(
+            "inner.txt",
+            &sub,
+            b"data\n",
+            Some(FileId::from(b"inner-id".to_vec())),
+            None,
+            None,
+        )
+        .unwrap();
+        let base_dir = tt.base().tree().abspath("");
+        tt.apply(&deletion, false).unwrap();
+        assert!(base_dir.join("sub").is_dir());
+        assert_eq!(
+            std::fs::read(base_dir.join("sub/inner.txt")).unwrap(),
+            b"data\n"
+        );
+        assert!(tt.base().tree().is_versioned_path("sub"));
+        assert!(tt.base().tree().is_versioned_path("sub/inner.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_symlink_convenience_creates_and_versions() {
+        let (_d, mut tt, deletion) = apply_tt();
+        let root = tt.base().root().unwrap().to_string();
+        tt.new_symlink(
+            "link",
+            &root,
+            "target",
+            Some(FileId::from(b"link-id".to_vec())),
+        )
+        .unwrap();
+        let base_dir = tt.base().tree().abspath("");
+        tt.apply(&deletion, false).unwrap();
+        assert_eq!(
+            std::fs::read_link(base_dir.join("link")).unwrap(),
+            std::path::PathBuf::from("target")
+        );
+        assert!(tt.base().tree().is_versioned_path("link"));
+    }
+
+    #[test]
     fn apply_deletes_a_removed_file() {
         let (_d, mut tt, deletion) = apply_tt();
         // An existing versioned file, present on disk.
