@@ -368,6 +368,74 @@ mod tests {
         assert_eq!(fetch(&source, &mut target, Some(&ids[2])).unwrap(), 2);
     }
 
+    /// Commit one revision `rev` (child of `parent`) that sets `file-1`'s
+    /// content, into an already-open 2a repository.
+    fn commit_file_rev(repo: &mut Pack2aRepository, rev: &[u8], parent: &[u8], content: &[u8]) {
+        let root = crate::inventory::ROOT_ID;
+        let parents: Vec<&[u8]> = vec![parent];
+        let parent_vecs: Vec<Vec<u8>> = vec![parent.to_vec()];
+        repo.start_write_group().unwrap();
+        repo.add_text(b"file-1", rev, &[], content).unwrap();
+        let entries = vec![
+            crate::inventory::Entry::root(
+                crate::FileId::from(root),
+                Some(crate::RevisionId::from(rev)),
+            ),
+            crate::inventory::Entry::file(
+                crate::FileId::from(&b"file-1"[..]),
+                "a.txt".into(),
+                crate::FileId::from(root),
+                Some(crate::RevisionId::from(rev)),
+                Some(crate::weave::sha_strings(&[content])),
+                Some(content.len() as u64),
+                Some(false),
+                None,
+            ),
+        ];
+        repo.add_inventory_from_entries(rev, &parent_vecs, root, &entries)
+            .unwrap();
+        repo.add_revision(&revision(rev, parents), &parent_vecs)
+            .unwrap();
+        repo.commit_write_group().unwrap();
+    }
+
+    /// Fetch a revision from a source that has diverged from the target: both
+    /// committed a different child of a shared base, each modifying the same
+    /// file. The target's diverged inventory's CHK pages are absent from the
+    /// source, so the difference walk must not treat that inventory as an
+    /// uninteresting root (it would fail with an absent-record error).
+    #[test]
+    fn fetch_diverged_same_file() {
+        // Source: base rev-1, then source-side rev-2s modifying file-1.
+        let (_sd, st) = temp_repo();
+        let base = make_chain(&st, 1);
+        let mut source = Pack2aRepository::open(st.clone()).unwrap();
+        commit_file_rev(&mut source, b"rev-2s", &base[0], b"other change\n");
+        let source = Pack2aRepository::open(st).unwrap();
+
+        // Target: fetch the shared base, then commit its own diverged rev-2t.
+        let (_td, tt) = temp_repo();
+        let mut target = Pack2aRepository::create(tt.clone()).unwrap();
+        assert_eq!(fetch(&source, &mut target, Some(&base[0])).unwrap(), 1);
+        let mut target = Pack2aRepository::open(tt.clone()).unwrap();
+        commit_file_rev(&mut target, b"rev-2t", &base[0], b"this change\n");
+
+        // Fetch the source's diverged revision: must copy just rev-2s.
+        let mut target = Pack2aRepository::open(tt.clone()).unwrap();
+        assert_eq!(fetch(&source, &mut target, Some(b"rev-2s")).unwrap(), 1);
+
+        // Both diverged texts read back from the target.
+        let target = Pack2aRepository::open(tt).unwrap();
+        assert_eq!(
+            target.get_file_text(b"file-1", b"rev-2s").unwrap(),
+            b"other change\n"
+        );
+        assert_eq!(
+            target.get_file_text(b"file-1", b"rev-2t").unwrap(),
+            b"this change\n"
+        );
+    }
+
     /// Cross-format fetch: copy from a knit-pack source into a 2a target. The
     /// two formats use different inventory serializers (XML vs CHK) and
     /// record encodings, so this exercises the universal object-level rebuild.
