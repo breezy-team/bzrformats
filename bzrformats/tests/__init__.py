@@ -438,6 +438,7 @@ def load_tests(loader, basic_tests, pattern):
         "test_textinv",
         "test_tuned_gzip",
         "test_versionedfile",
+        "test_views",
         "test_weave",
         "test_xml",
     ]

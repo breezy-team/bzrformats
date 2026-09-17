@@ -482,7 +482,7 @@ pub trait WorkingTree: Send + Sync {
             Err(TransportError::NoSuchFile(_)) => return Ok(ViewInfo::default()),
             Err(e) => return Err(e.into()),
         };
-        views::deserialize(&bytes).map_err(WorkingTreeError::Corrupt)
+        ViewInfo::deserialize(&bytes).map_err(|e| WorkingTreeError::Corrupt(e.to_string()))
     }
 
     /// Replace the defined views and the current-view selection.
@@ -503,7 +503,7 @@ pub trait WorkingTree: Send + Sync {
             }
         }
         self.control_transport()
-            .put_bytes(VIEWS_PATH, &views::serialize(info), None)?;
+            .put_bytes(VIEWS_PATH, &info.serialize(), None)?;
         Ok(())
     }
 
@@ -536,12 +536,42 @@ const CONFLICTS_PATH: &str = ".bzr/checkout/conflicts";
 
 /// The views defined in a working tree: the current (enabled) view, if any,
 /// and a map from view name to the list of tree-relative paths it scopes to.
+///
+/// This is the working-tree view of the `views` control file, which stores the
+/// current view as a `current=` keyword; see [`crate::views`] for the codec.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ViewInfo {
     /// The name of the currently enabled view, or `None`.
     pub current: Option<String>,
     /// Each defined view's name and its list of paths.
-    pub views: std::collections::BTreeMap<String, Vec<String>>,
+    pub views: crate::views::ViewDict,
+}
+
+/// The keyword naming the enabled view in the `views` file.
+const CURRENT_KEYWORD: &str = "current";
+
+impl ViewInfo {
+    /// Serialise to `views` file content. An empty definition serialises to an
+    /// empty file, which breezy reads back as "no views".
+    pub fn serialize(&self) -> Vec<u8> {
+        if self.current.is_none() && self.views.is_empty() {
+            return Vec::new();
+        }
+        let mut keywords = crate::views::Keywords::new();
+        if let Some(current) = &self.current {
+            keywords.insert(CURRENT_KEYWORD.to_string(), current.clone());
+        }
+        crate::views::serialize(&keywords, &self.views)
+    }
+
+    /// Parse `views` file content. Keywords other than `current` are ignored.
+    pub fn deserialize(content: &[u8]) -> Result<Self, crate::views::ViewsError> {
+        let (keywords, views) = crate::views::deserialize(content)?;
+        Ok(ViewInfo {
+            current: keywords.get(CURRENT_KEYWORD).cloned(),
+            views,
+        })
+    }
 }
 
 /// One recorded conflict, mirroring a stanza in the `conflicts` file: a
@@ -1878,74 +1908,6 @@ fn sign_commit(
             .map_err(|e| WorkingTreeError::Commit(format!("testament: {e:?}")))?;
         crate::gpg::clearsign(&short, signing_key)
             .map_err(|e| WorkingTreeError::Commit(format!("sign: {e}")))
-    }
-}
-
-/// Serialise and parse the `views` file (`Bazaar views format 1`).
-mod views {
-    use super::ViewInfo;
-
-    const MARKER: &[u8] = b"Bazaar views format 1\n";
-
-    /// Serialise `info` to the `views` file bytes. An empty definition (no
-    /// current view, no views) serialises to an empty file, matching breezy.
-    pub(super) fn serialize(info: &ViewInfo) -> Vec<u8> {
-        if info.current.is_none() && info.views.is_empty() {
-            return Vec::new();
-        }
-        let mut out = MARKER.to_vec();
-        // The current-view selection is stored as a `current=<name>` keyword.
-        if let Some(current) = &info.current {
-            out.extend_from_slice(format!("current={current}\n").as_bytes());
-        }
-        if !info.views.is_empty() {
-            out.extend_from_slice(b"views:\n");
-            // BTreeMap iterates sorted by name, matching breezy's sorted().
-            for (name, paths) in &info.views {
-                let mut line = name.clone();
-                for p in paths {
-                    line.push('\0');
-                    line.push_str(p);
-                }
-                line.push('\n');
-                out.extend_from_slice(line.as_bytes());
-            }
-        }
-        out
-    }
-
-    /// Parse `views` file bytes into a [`ViewInfo`]. An empty file is no views.
-    pub(super) fn deserialize(bytes: &[u8]) -> Result<ViewInfo, String> {
-        if bytes.is_empty() {
-            return Ok(ViewInfo::default());
-        }
-        let text = std::str::from_utf8(bytes).map_err(|_| "views file not utf-8".to_string())?;
-        let mut lines = text.split_inclusive('\n');
-        let first = lines.next().unwrap_or("");
-        if first.as_bytes() != MARKER {
-            return Err("missing 'Bazaar views format 1' marker".to_string());
-        }
-        let mut info = ViewInfo::default();
-        let mut in_views = false;
-        for raw in lines {
-            let line = raw.strip_suffix('\n').unwrap_or(raw);
-            if in_views {
-                let mut parts = line.split('\0');
-                let name = parts.next().unwrap_or("").to_string();
-                let paths: Vec<String> = parts.map(|s| s.to_string()).collect();
-                info.views.insert(name, paths);
-            } else if line == "views:" {
-                in_views = true;
-            } else if let Some((k, v)) = line.split_once('=') {
-                if k == "current" {
-                    info.current = Some(v.to_string());
-                }
-                // Other keywords are accepted and ignored (forward-compatible).
-            } else if !line.is_empty() {
-                return Err(format!("unparsable views line: {line:?}"));
-            }
-        }
-        Ok(info)
     }
 }
 
