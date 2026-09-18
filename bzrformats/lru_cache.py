@@ -18,14 +18,15 @@
 
 import logging
 
-# LRUCache, LRUSizeCache and FIFOCache are implemented as Rust pyclasses.
-# LRUCache is count-based; LRUSizeCache evicts on the cumulative size of the
-# values (compute_size(value), defaulting to len); FIFOCache is a dict subclass
-# that evicts the oldest entries first. The ordering/eviction engines live in
-# the bazaar crate. The _LRUNode handle is re-exported for the whitebox tests
-# that walk the linked list.
+# The caches are implemented as Rust pyclasses. LRUCache and FIFOCache are
+# count-based; LRUSizeCache and FIFOSizeCache evict on the cumulative size of
+# the values (compute_size(value), defaulting to len). The FIFO variants are
+# dict subclasses that evict the oldest entries first. The ordering/eviction
+# engines live in the bazaar crate. The _LRUNode handle is re-exported for the
+# whitebox tests that walk the linked list.
 from ._bzr_rs.lru_cache import (  # noqa: F401
     FIFOCache,
+    FIFOSizeCache,
     LRUCache,
     LRUSizeCache,
     _LRUNode,

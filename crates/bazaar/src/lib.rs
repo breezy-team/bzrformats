@@ -17,6 +17,7 @@ pub mod chk_map;
 pub mod chunk_writer;
 pub mod config;
 pub mod dirstate;
+pub mod fifo_cache;
 pub mod filters;
 pub mod gen_ids;
 pub mod globbing;
