@@ -426,3 +426,126 @@ class TestLRUSizeCache(TestCase):
         self.assertEqual([2, 3, 4, 5, 6], sorted(cache.keys()))
         cache[7] = "stu"
         self.assertEqual([4, 5, 6, 7], sorted(cache.keys()))
+
+
+class TestFIFOCache(TestCase):
+    def test_add_evicts_oldest(self):
+        c = lru_cache.FIFOCache(3, 2)
+        for i in range(3):
+            c[i] = i
+        self.assertEqual({0: 0, 1: 1, 2: 2}, dict(c))
+        c[3] = 3
+        self.assertEqual({2: 2, 3: 3}, dict(c))
+        self.assertEqual([2, 3], list(c._queue))
+
+    def test_readding_bumps_to_end_of_queue(self):
+        c = lru_cache.FIFOCache(3, 3)
+        c[1] = "a"
+        c[2] = "b"
+        c[1] = "c"
+        self.assertEqual([2, 1], list(c._queue))
+        self.assertEqual({1: "c", 2: "b"}, dict(c))
+
+    def test_cleanup_callback_fires_on_eviction(self):
+        removed = []
+        c = lru_cache.FIFOCache(2, 1)
+        c.add(1, "a", cleanup=lambda k, v: removed.append((k, v)))
+        c.add(2, "b")
+        c.add(3, "c")
+        self.assertEqual([(1, "a")], removed)
+        self.assertEqual({}, dict(c._cleanup))
+
+    def test_clear_fires_cleanups(self):
+        removed = []
+        c = lru_cache.FIFOCache(5)
+        c.add(1, "a", cleanup=lambda k, v: removed.append((k, v)))
+        c.add(2, "b", cleanup=lambda k, v: removed.append((k, v)))
+        c.clear()
+        self.assertEqual([(1, "a"), (2, "b")], removed)
+        self.assertEqual({}, dict(c))
+
+    def test_mutating_dict_methods_are_refused(self):
+        # These cannot be honoured while cleanup callbacks exist, since the
+        # value would have to be cleaned up before being handed back.
+        c = lru_cache.FIFOCache()
+        self.assertRaises(NotImplementedError, c.copy)
+        self.assertRaises(NotImplementedError, c.pop, "key")
+        self.assertRaises(NotImplementedError, c.popitem)
+
+    def test_update_goes_through_add(self):
+        c = lru_cache.FIFOCache(3, 2)
+        c.update([(1, "a"), (2, "b")])
+        self.assertEqual({1: "a", 2: "b"}, dict(c))
+        c.update({3: "c", 4: "d"})
+        self.assertEqual({3: "c", 4: "d"}, dict(c))
+        c.update(five="e")
+        self.assertEqual({3: "c", 4: "d", "five": "e"}, dict(c))
+        self.assertRaises(TypeError, c.update, [(1, 2)], [(3, 4)])
+
+    def test_resize_smaller_cleans_up(self):
+        c = lru_cache.FIFOCache(5, 4)
+        for i in range(5):
+            c[i] = i
+        c.resize(3, 2)
+        self.assertEqual(3, c.cache_size())
+        self.assertEqual({3: 3, 4: 4}, dict(c))
+
+    def test_setdefault(self):
+        c = lru_cache.FIFOCache(3)
+        self.assertEqual("a", c.setdefault(1, "a"))
+        self.assertEqual("a", c.setdefault(1, "b"))
+        self.assertEqual({1: "a"}, dict(c))
+
+
+class TestFIFOSizeCache(TestCase):
+    def test_evicts_on_total_value_size(self):
+        c = lru_cache.FIFOSizeCache(10, 8)
+        c[1] = "ab"
+        c[2] = "cde"
+        c[3] = "fghi"
+        self.assertEqual({1: "ab", 2: "cde", 3: "fghi"}, dict(c))
+        c[4] = "jkl"
+        self.assertEqual({3: "fghi", 4: "jkl"}, dict(c))
+        self.assertEqual(7, c._value_size)
+
+    def test_oversized_value_is_not_stored(self):
+        c = lru_cache.FIFOSizeCache(10, 8)
+        c[1] = "abcdefgh"
+        self.assertEqual({}, dict(c))
+        c[1] = "abcdefg"
+        self.assertEqual({1: "abcdefg"}, dict(c))
+        # Replacing with a too-large value still drops the old entry.
+        c[1] = "abcdefgh"
+        self.assertEqual({}, dict(c))
+        self.assertEqual(0, c._value_size)
+
+    def test_cache_size_reports_max_size(self):
+        c = lru_cache.FIFOSizeCache()
+        self.assertEqual(1024 * 1024, c.cache_size())
+
+    def test_compute_size_override(self):
+        c = lru_cache.FIFOSizeCache(10, 8, compute_size=lambda v: 4)
+        c[1] = "a"
+        c[2] = "b"
+        self.assertEqual(8, c._value_size)
+        # Shrinking stops as soon as the total is back under 8, so one entry
+        # is evicted rather than all of them.
+        c[3] = "c"
+        self.assertEqual({2: "b", 3: "c"}, dict(c))
+        self.assertEqual(8, c._value_size)
+
+    def test_resize_larger_keeps_entries(self):
+        c = lru_cache.FIFOSizeCache(10, 8)
+        for key, value in [(1, "a"), (2, "bc"), (3, "def"), (4, "ghij")]:
+            c[key] = value
+        c.resize(12, 10)
+        self.assertEqual({1: "a", 2: "bc", 3: "def", 4: "ghij"}, dict(c))
+        c[5] = "kl"
+        self.assertEqual(12, c._value_size)
+
+    def test_resize_smaller_shrinks(self):
+        c = lru_cache.FIFOSizeCache(20, 16)
+        for key, value in [(1, "a"), (2, "bc"), (3, "def"), (4, "ghij")]:
+            c[key] = value
+        c.resize(5, 4)
+        self.assertEqual({4: "ghij"}, dict(c))

@@ -7,6 +7,7 @@
 //! whitebox attributes (`_cache`, `_value_size`, `_max_size`, ...) the test
 //! suite reads.
 
+use bazaar::fifo_cache::{FifoCache as FifoCore, KeyIndex, Slot};
 use bazaar::lru_cache::{LruOrder, NodeId};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -637,17 +638,68 @@ impl LruCache {
     }
 }
 
+/// Key index backed by a Python dict.
+///
+/// Python keys are arbitrary objects whose `hash`/`eq` live in the interpreter
+/// and can raise, so lookups go through a real dict rather than Rust hashing.
+struct PyKeyIndex {
+    map: Py<PyDict>,
+}
+
+impl PyKeyIndex {
+    fn new(py: Python<'_>) -> Self {
+        Self {
+            map: PyDict::new(py).unbind(),
+        }
+    }
+}
+
+impl KeyIndex for PyKeyIndex {
+    type Key = Py<PyAny>;
+    type Error = PyErr;
+
+    fn get(&self, key: &Py<PyAny>) -> PyResult<Option<Slot>> {
+        Python::attach(|py| match self.map.bind(py).get_item(key.bind(py))? {
+            Some(slot) => Ok(Some(slot.extract()?)),
+            None => Ok(None),
+        })
+    }
+
+    fn insert(&mut self, key: &Py<PyAny>, slot: Slot) -> PyResult<()> {
+        Python::attach(|py| self.map.bind(py).set_item(key.bind(py), slot))
+    }
+
+    fn remove(&mut self, key: &Py<PyAny>) -> PyResult<()> {
+        Python::attach(|py| {
+            let map = self.map.bind(py);
+            if map.contains(key.bind(py))? {
+                map.del_item(key.bind(py))?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// The cache core as the Python wrappers use it: Python keys and values, with
+/// lookups delegated to a Python dict.
+type PyFifoCore = FifoCore<Py<PyAny>, Py<PyAny>, PyKeyIndex>;
+
 /// `FIFOCache` — a `dict` subclass that evicts the oldest entries first.
 ///
 /// Mirrors `bzrformats.lru_cache.FIFOCache`. The key/value storage is the
 /// `dict` base; this wrapper layers a FIFO insertion `_queue` and an optional
 /// per-key `_cleanup` callback invoked on eviction/removal.
-#[pyclass(name = "FIFOCache", extends = pyo3::types::PyDict, module = "bzrformats._bzr_rs.lru_cache")]
+#[pyclass(
+    name = "FIFOCache",
+    extends = pyo3::types::PyDict,
+    module = "bzrformats._bzr_rs.lru_cache",
+    subclass
+)]
 pub struct FifoCache {
     max_cache: usize,
     after_cleanup_count: usize,
-    /// Insertion order of live keys (front = oldest).
-    queue: std::collections::VecDeque<Py<PyAny>>,
+    /// Queue, sizes and values; the `dict` base mirrors it for `dict` reads.
+    core: PyFifoCore,
     /// key -> cleanup callable, applied when the key leaves the cache.
     cleanup: Py<PyDict>,
 }
@@ -657,27 +709,54 @@ impl FifoCache {
         slf.clone().into_any().cast_into::<PyDict>().unwrap()
     }
 
-    /// Drop a key from the dict and fire its cleanup callback if any.
-    fn remove(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>) -> PyResult<()> {
+    /// Is `key` live in the cache?
+    fn holds(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>) -> PyResult<bool> {
+        slf.borrow().core.contains(&key.clone().unbind())
+    }
+
+    /// Mirror an eviction into the `dict` base and fire its cleanup callback.
+    fn retire(slf: &Bound<'_, Self>, key: Py<PyAny>, value: Py<PyAny>) -> PyResult<()> {
         let py = slf.py();
+        let key = key.bind(py);
         let cleanup = slf.borrow().cleanup.bind(py).clone();
         let cb = cleanup.get_item(key)?;
         if cb.is_some() {
             cleanup.del_item(key)?;
         }
         let dict = Self::dict(slf);
-        let val = dict.get_item(key)?;
-        dict.del_item(key)?;
-        if let (Some(cb), Some(val)) = (cb, val) {
-            cb.call1((key, val))?;
+        if dict.contains(key)? {
+            dict.del_item(key)?;
+        }
+        if let Some(cb) = cb {
+            cb.call1((key, value.bind(py)))?;
         }
         Ok(())
     }
 
-    fn remove_oldest(slf: &Bound<'_, Self>) -> PyResult<()> {
-        let key = slf.borrow_mut().queue.pop_front();
-        if let Some(key) = key {
-            Self::remove(slf, key.bind(slf.py()))?;
+    /// Insert a key/value with an explicit size weight.
+    fn insert_sized(
+        slf: &Bound<'_, Self>,
+        key: Bound<'_, PyAny>,
+        value: Bound<'_, PyAny>,
+        cleanup: Option<Bound<'_, PyAny>>,
+        size: usize,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        slf.borrow_mut()
+            .core
+            .insert(key.clone().unbind(), value.clone().unbind(), size)?;
+        Self::dict(slf).set_item(&key, value)?;
+        if let Some(cb) = cleanup {
+            slf.borrow().cleanup.bind(py).set_item(&key, cb)?;
+        }
+        Ok(())
+    }
+
+    /// Evict whatever the policy says should go, given a size limit.
+    fn evict_until(slf: &Bound<'_, Self>, after_cleanup: usize) -> PyResult<()> {
+        let evicted = slf.borrow_mut().core.evict_until(after_cleanup)?;
+        for (key, value) in evicted {
+            Self::retire(slf, key, value)?;
         }
         Ok(())
     }
@@ -695,7 +774,7 @@ impl FifoCache {
         Self {
             max_cache,
             after_cleanup_count,
-            queue: std::collections::VecDeque::new(),
+            core: FifoCore::with_index(PyKeyIndex::new(py)),
             cleanup: PyDict::new(py).unbind(),
         }
     }
@@ -717,18 +796,12 @@ impl FifoCache {
     }
 
     fn __delitem__(slf: &Bound<'_, Self>, key: Bound<'_, PyAny>) -> PyResult<()> {
-        // Remove from the FIFO queue, then from the dict (firing cleanup).
-        {
-            let mut me = slf.borrow_mut();
-            if let Some(pos) = me
-                .queue
-                .iter()
-                .position(|k| k.bind(slf.py()).eq(&key).unwrap_or(false))
-            {
-                me.queue.remove(pos);
-            }
+        let removed = slf.borrow_mut().core.remove(&key.clone().unbind())?;
+        match removed {
+            Some((key, value)) => Self::retire(slf, key, value),
+            // Mirror dict: deleting something absent is a KeyError.
+            None => Err(pyo3::exceptions::PyKeyError::new_err(key.unbind())),
         }
-        Self::remove(slf, &key)
     }
 
     #[pyo3(signature = (key, value, cleanup=None))]
@@ -738,23 +811,19 @@ impl FifoCache {
         value: Bound<'_, PyAny>,
         cleanup: Option<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let py = slf.py();
-        let dict = Self::dict(slf);
-        if dict.contains(&key)? {
-            // Replace: drop the existing entry (and its cleanup) first.
+        if Self::holds(slf, &key)? {
+            // Replace: drop the existing entry (and its cleanup) first, so
+            // re-adding bumps the key to the back of the queue.
             FifoCache::__delitem__(slf, key.clone())?;
         }
-        slf.borrow_mut().queue.push_back(key.clone().unbind());
-        dict.set_item(&key, value)?;
-        if let Some(cb) = cleanup {
-            slf.borrow().cleanup.bind(py).set_item(&key, cb)?;
-        }
-        let (len, max) = {
+        // Count-based: every entry weighs 1.
+        Self::insert_sized(slf, key, value, cleanup, 1)?;
+        let (len, max, after) = {
             let me = slf.borrow();
-            (dict.len(), me.max_cache)
+            (me.core.len(), me.max_cache, me.after_cleanup_count)
         };
         if len > max {
-            Self::cleanup(slf)?;
+            Self::evict_until(slf, after)?;
         }
         Ok(())
     }
@@ -773,16 +842,28 @@ impl FifoCache {
         self.after_cleanup_count
     }
 
+    /// Live keys in insertion order, oldest first.
+    #[getter]
+    fn _queue<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let items = PyList::new(py, self.core.keys_oldest_first().map(|k| k.bind(py)))?;
+        py.import("collections")?.call_method1("deque", (items,))
+    }
+
+    /// Per-key cleanup callbacks, keyed the same way as the cache itself.
+    #[getter]
+    fn _cleanup(&self, py: Python<'_>) -> Py<PyDict> {
+        self.cleanup.clone_ref(py)
+    }
+
     fn cleanup(slf: &Bound<'_, Self>) -> PyResult<()> {
-        while Self::dict(slf).len() > slf.borrow().after_cleanup_count {
-            Self::remove_oldest(slf)?;
-        }
-        Ok(())
+        let after = slf.borrow().after_cleanup_count;
+        Self::evict_until(slf, after)
     }
 
     fn clear(slf: &Bound<'_, Self>) -> PyResult<()> {
-        while Self::dict(slf).len() > 0 {
-            Self::remove_oldest(slf)?;
+        let drained = slf.borrow_mut().core.drain_oldest()?;
+        for (key, value) in drained {
+            Self::retire(slf, key, value)?;
         }
         Ok(())
     }
@@ -801,8 +882,73 @@ impl FifoCache {
                 None => max_cache * 8 / 10,
             };
         }
-        if Self::dict(slf).len() > max_cache {
-            Self::cleanup(slf)?;
+        let (len, after) = {
+            let me = slf.borrow();
+            (me.core.len(), me.after_cleanup_count)
+        };
+        if len > max_cache {
+            Self::evict_until(slf, after)?;
+        }
+        Ok(())
+    }
+
+    /// Not supported: a copy would not carry the queue or cleanup callbacks.
+    fn copy(&self) -> PyResult<()> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "FIFOCache.copy",
+        ))
+    }
+
+    /// Not supported: the cleanup callback would have to run on the value
+    /// before returning it, which would leave the caller holding something
+    /// already cleaned up.
+    #[pyo3(signature = (key, default=None))]
+    fn pop(&self, key: &Bound<'_, PyAny>, default: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let _ = (key, default);
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "FIFOCache.pop",
+        ))
+    }
+
+    /// Not supported, for the same reason as [`pop`](Self::pop).
+    fn popitem(&self) -> PyResult<()> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "FIFOCache.popitem",
+        ))
+    }
+
+    /// Like `dict.update`, but each entry goes through `add` so that inserting
+    /// past `max_cache` still evicts.
+    #[pyo3(signature = (*args, **kwargs))]
+    fn update(
+        slf: &Bound<'_, Self>,
+        args: &Bound<'_, pyo3::types::PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        if args.len() > 1 {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "update expected at most 1 argument, got {}",
+                args.len()
+            )));
+        }
+        if let Ok(arg) = args.get_item(0) {
+            if let Ok(dict) = arg.cast::<PyDict>() {
+                for (key, value) in dict.iter() {
+                    Self::add(slf, key, value, None)?;
+                }
+            } else {
+                for item in arg.try_iter()? {
+                    let pair = item?;
+                    let key = pair.get_item(0)?;
+                    let value = pair.get_item(1)?;
+                    Self::add(slf, key, value, None)?;
+                }
+            }
+        }
+        if let Some(kwargs) = kwargs {
+            for (key, value) in kwargs.iter() {
+                Self::add(slf, key, value, None)?;
+            }
         }
         Ok(())
     }
@@ -824,6 +970,175 @@ impl FifoCache {
     }
 }
 
+/// `FIFOSizeCache` — a `FIFOCache` that evicts on the total size of its values.
+///
+/// Mirrors `bzrformats.lru_cache.FIFOSizeCache`. Entry count is irrelevant;
+/// what matters is the sum of `compute_size(value)`, defaulting to `len`. A
+/// value that alone would exceed `after_cleanup_size` is never stored.
+#[pyclass(name = "FIFOSizeCache", extends = FifoCache, module = "bzrformats._bzr_rs.lru_cache")]
+pub struct FifoSizeCache {
+    max_size: usize,
+    after_cleanup_size: usize,
+    compute_size: Option<Py<PyAny>>,
+}
+
+impl FifoSizeCache {
+    /// Size of one value, via `compute_size` or `len`.
+    fn value_size(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<usize> {
+        match &self.compute_size {
+            Some(cb) => cb.bind(py).call1((value,))?.extract(),
+            None => value.len(),
+        }
+    }
+
+    /// Evict oldest entries until the total value size fits.
+    fn shrink(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let after = slf.borrow().after_cleanup_size;
+        FifoCache::evict_until(&slf.clone().into_super(), after)
+    }
+}
+
+#[pymethods]
+impl FifoSizeCache {
+    #[new]
+    #[pyo3(signature = (max_size=1024 * 1024, after_cleanup_size=None, compute_size=None))]
+    fn new(
+        py: Python<'_>,
+        max_size: usize,
+        after_cleanup_size: Option<usize>,
+        compute_size: Option<Py<PyAny>>,
+    ) -> PyClassInitializer<Self> {
+        let after_cleanup_size = match after_cleanup_size {
+            Some(v) => v.min(max_size),
+            None => max_size * 8 / 10,
+        };
+        // The count limit is irrelevant here; size is what evicts.
+        PyClassInitializer::from(FifoCache::new(py, max_size, None)).add_subclass(Self {
+            max_size,
+            after_cleanup_size,
+            compute_size,
+        })
+    }
+
+    /// Swallow the constructor arguments, as `FIFOCache` does.
+    #[pyo3(signature = (max_size=1024 * 1024, after_cleanup_size=None, compute_size=None))]
+    fn __init__(
+        &self,
+        max_size: usize,
+        after_cleanup_size: Option<usize>,
+        compute_size: Option<Py<PyAny>>,
+    ) {
+        let _ = (max_size, after_cleanup_size, compute_size);
+    }
+
+    fn __setitem__(
+        slf: &Bound<'_, Self>,
+        key: Bound<'_, PyAny>,
+        value: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        Self::add(slf, key, value, None)
+    }
+
+    fn __delitem__(slf: &Bound<'_, Self>, key: Bound<'_, PyAny>) -> PyResult<()> {
+        FifoCache::__delitem__(&slf.clone().into_super(), key)
+    }
+
+    /// Store a value, unless it alone would exceed `after_cleanup_size`.
+    #[pyo3(signature = (key, value, cleanup=None))]
+    fn add(
+        slf: &Bound<'_, Self>,
+        key: Bound<'_, PyAny>,
+        value: Bound<'_, PyAny>,
+        cleanup: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let py = slf.py();
+        let base = slf.clone().into_super();
+        // Replacing drops the old entry even when the new value is too big.
+        if FifoCache::holds(&base, &key)? {
+            Self::__delitem__(slf, key.clone())?;
+        }
+        let size = slf.borrow().value_size(py, &value)?;
+        if size >= slf.borrow().after_cleanup_size {
+            return Ok(());
+        }
+        FifoCache::insert_sized(&base, key, value, cleanup, size)?;
+        let (total, max) = {
+            let me = base.borrow();
+            (me.core.total_size(), slf.borrow().max_size)
+        };
+        if total > max {
+            Self::shrink(slf)?;
+        }
+        Ok(())
+    }
+
+    fn cache_size(&self) -> usize {
+        self.max_size
+    }
+
+    #[getter]
+    fn _max_size(&self) -> usize {
+        self.max_size
+    }
+
+    #[getter]
+    fn _after_cleanup_size(&self) -> usize {
+        self.after_cleanup_size
+    }
+
+    #[getter]
+    fn _value_size(slf: &Bound<'_, Self>) -> usize {
+        slf.clone().into_super().borrow().core.total_size()
+    }
+
+    #[getter]
+    fn _compute_size(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.compute_size {
+            Some(cb) => Ok(cb.clone_ref(py)),
+            None => Ok(py.import("builtins")?.getattr("len")?.unbind()),
+        }
+    }
+
+    fn cleanup(slf: &Bound<'_, Self>) -> PyResult<()> {
+        Self::shrink(slf)
+    }
+
+    fn clear(slf: &Bound<'_, Self>) -> PyResult<()> {
+        FifoCache::clear(&slf.clone().into_super())
+    }
+
+    #[pyo3(signature = (max_size, after_cleanup_size=None))]
+    fn resize(
+        slf: &Bound<'_, Self>,
+        max_size: usize,
+        after_cleanup_size: Option<usize>,
+    ) -> PyResult<()> {
+        {
+            let base = slf.clone().into_super();
+            let mut me = base.borrow_mut();
+            me.max_cache = max_size;
+            me.after_cleanup_count = max_size * 8 / 10;
+        }
+        {
+            let mut me = slf.borrow_mut();
+            me.max_size = max_size;
+            me.after_cleanup_size = match after_cleanup_size {
+                Some(v) => v.min(max_size),
+                None => max_size * 8 / 10,
+            };
+        }
+        let (total, max) = {
+            let base = slf.clone().into_super();
+            let total = base.borrow().core.total_size();
+            (total, slf.borrow().max_size)
+        };
+        if total > max {
+            Self::shrink(slf)?;
+        }
+        Ok(())
+    }
+}
+
 /// Fetch the `bzrformats.lru_cache._null_key` sentinel object.
 fn null_key_sentinel(py: Python<'_>) -> PyResult<Py<PyAny>> {
     Ok(py
@@ -842,6 +1157,7 @@ pub(crate) fn _lru_cache_rs(py: Python) -> PyResult<Bound<PyModule>> {
     let m = PyModule::new(py, "lru_cache")?;
     m.add_class::<LruCache>()?;
     m.add_class::<LruSizeCache>()?;
+    m.add_class::<FifoSizeCache>()?;
     m.add_class::<FifoCache>()?;
     m.add_class::<LruNode>()?;
     Ok(m)
