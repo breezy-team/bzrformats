@@ -493,13 +493,11 @@ struct BEncodeRevisionSerializerv1;
 #[pymethods]
 impl BEncodeRevisionSerializerv1 {
     #[new]
-    fn new() -> (Self, RevisionSerializer) {
-        (
-            Self {},
-            RevisionSerializer(Box::new(
-                bazaar::bencode_serializer::BEncodeRevisionSerializer1,
-            )),
-        )
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(RevisionSerializer(Box::new(
+            bazaar::bencode_serializer::BEncodeRevisionSerializer1,
+        )))
+        .add_subclass(Self {})
     }
 }
 
@@ -509,11 +507,11 @@ struct XMLRevisionSerializer8;
 #[pymethods]
 impl XMLRevisionSerializer8 {
     #[new]
-    fn new() -> (Self, RevisionSerializer) {
-        (
-            Self {},
-            RevisionSerializer(Box::new(bazaar::xml_serializer::XMLRevisionSerializer8)),
-        )
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(RevisionSerializer(Box::new(
+            bazaar::xml_serializer::XMLRevisionSerializer8,
+        )))
+        .add_subclass(Self {})
     }
 }
 
@@ -584,11 +582,11 @@ struct XMLRevisionSerializer5;
 #[pymethods]
 impl XMLRevisionSerializer5 {
     #[new]
-    fn new() -> (Self, RevisionSerializer) {
-        (
-            Self {},
-            RevisionSerializer(Box::new(bazaar::xml_serializer::XMLRevisionSerializer5)),
-        )
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(RevisionSerializer(Box::new(
+            bazaar::xml_serializer::XMLRevisionSerializer5,
+        )))
+        .add_subclass(Self {})
     }
 }
 
@@ -824,11 +822,11 @@ struct XMLInventorySerializer4;
 #[pymethods]
 impl XMLInventorySerializer4 {
     #[new]
-    fn new() -> (Self, InventorySerializer) {
-        (
-            Self,
-            InventorySerializer(Box::new(bazaar::xml_serializer::XMLInventorySerializer4)),
-        )
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(InventorySerializer(Box::new(
+            bazaar::xml_serializer::XMLInventorySerializer4,
+        )))
+        .add_subclass(Self)
     }
 }
 
@@ -838,11 +836,11 @@ struct XMLInventorySerializer5;
 #[pymethods]
 impl XMLInventorySerializer5 {
     #[new]
-    fn new() -> (Self, InventorySerializer) {
-        (
-            Self,
-            InventorySerializer(Box::new(bazaar::xml_serializer::XMLInventorySerializer5)),
-        )
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(InventorySerializer(Box::new(
+            bazaar::xml_serializer::XMLInventorySerializer5,
+        )))
+        .add_subclass(Self)
     }
 }
 
@@ -852,11 +850,11 @@ struct XMLInventorySerializer6;
 #[pymethods]
 impl XMLInventorySerializer6 {
     #[new]
-    fn new() -> (Self, InventorySerializer) {
-        (
-            Self,
-            InventorySerializer(Box::new(bazaar::xml_serializer::XMLInventorySerializer6)),
-        )
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(InventorySerializer(Box::new(
+            bazaar::xml_serializer::XMLInventorySerializer6,
+        )))
+        .add_subclass(Self)
     }
 }
 
@@ -866,11 +864,11 @@ struct XMLInventorySerializer7;
 #[pymethods]
 impl XMLInventorySerializer7 {
     #[new]
-    fn new() -> (Self, InventorySerializer) {
-        (
-            Self,
-            InventorySerializer(Box::new(bazaar::xml_serializer::XMLInventorySerializer7)),
-        )
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(InventorySerializer(Box::new(
+            bazaar::xml_serializer::XMLInventorySerializer7,
+        )))
+        .add_subclass(Self)
     }
 }
 
@@ -880,11 +878,11 @@ struct XMLInventorySerializer8;
 #[pymethods]
 impl XMLInventorySerializer8 {
     #[new]
-    fn new() -> (Self, InventorySerializer) {
-        (
-            Self,
-            InventorySerializer(Box::new(bazaar::xml_serializer::XMLInventorySerializer8)),
-        )
+    fn new() -> PyClassInitializer<Self> {
+        PyClassInitializer::from(InventorySerializer(Box::new(
+            bazaar::xml_serializer::XMLInventorySerializer8,
+        )))
+        .add_subclass(Self)
     }
 }
 
@@ -906,18 +904,15 @@ impl CHKInventorySerializer {
         format_num: Vec<u8>,
         maximum_size: usize,
         search_key_name: Vec<u8>,
-    ) -> (Self, InventorySerializer) {
-        (
-            CHKInventorySerializer {
-                maximum_size,
-                search_key_name: search_key_name.clone(),
-            },
-            InventorySerializer(Box::new(bazaar::xml_serializer::CHKSerializer::new(
-                format_num,
-                maximum_size,
-                search_key_name,
-            ))),
-        )
+    ) -> PyClassInitializer<Self> {
+        let sub = CHKInventorySerializer {
+            maximum_size,
+            search_key_name: search_key_name.clone(),
+        };
+        PyClassInitializer::from(InventorySerializer(Box::new(
+            bazaar::xml_serializer::CHKSerializer::new(format_num, maximum_size, search_key_name),
+        )))
+        .add_subclass(sub)
     }
 
     #[getter]

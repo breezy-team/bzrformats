@@ -1535,7 +1535,7 @@ impl BTreeBuilder {
         reference_lists: usize,
         key_elements: usize,
         spill_at: usize,
-    ) -> (Self, PyGraphIndexBuilder) {
+    ) -> PyClassInitializer<Self> {
         use bazaar::index::GraphIndexBuilder as RsGraphIndexBuilder;
         let parent = PyGraphIndexBuilder {
             inner: Mutex::new(RsGraphIndexBuilder::new(reference_lists, key_elements)),
@@ -1548,7 +1548,7 @@ impl BTreeBuilder {
             nodes: Mutex::new(PyDict::new(py).unbind()),
             nodes_by_key: Mutex::new(None),
         };
-        (me, parent)
+        PyClassInitializer::from(parent).add_subclass(me)
     }
 
     #[getter]

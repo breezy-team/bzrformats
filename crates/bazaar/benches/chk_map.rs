@@ -2,7 +2,8 @@
 //! result. These run on every CHK inventory read/write.
 
 use bazaar::chk_map::{deserialise_leaf_node, serialise_leaf_node};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 
 /// `n` items keyed `aaa{i}` so they share the common prefix `a`, with realistic
 /// inventory-style values.

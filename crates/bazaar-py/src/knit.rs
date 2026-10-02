@@ -8793,13 +8793,11 @@ macro_rules! knit_adapter {
             }
 
             #[new]
-            fn new(basis_vf: Option<Py<PyAny>>) -> (Self, PyKnitAdapterShim) {
-                (
-                    $name,
-                    PyKnitAdapterShim {
-                        basis_vf: basis_vf.filter(|v| Python::attach(|py| !v.is_none(py))),
-                    },
-                )
+            fn new(basis_vf: Option<Py<PyAny>>) -> PyClassInitializer<Self> {
+                PyClassInitializer::from(PyKnitAdapterShim {
+                    basis_vf: basis_vf.filter(|v| Python::attach(|py| !v.is_none(py))),
+                })
+                .add_subclass($name)
             }
         }
     };

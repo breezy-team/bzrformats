@@ -4,7 +4,8 @@
 
 use bazaar::groupcompress::compressor::{GroupCompressor, RabinGroupCompressor};
 use bazaar::versionedfile::Key;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 
 #[path = "common/mod.rs"]
 mod common;
