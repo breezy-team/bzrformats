@@ -1003,18 +1003,13 @@ struct PyInMemoryGraphIndex;
 impl PyInMemoryGraphIndex {
     #[new]
     #[pyo3(signature = (reference_lists = 0, key_elements = 1))]
-    fn new(reference_lists: usize, key_elements: usize) -> (Self, PyGraphIndexBuilder) {
-        (
-            PyInMemoryGraphIndex,
-            PyGraphIndexBuilder {
-                inner: std::sync::Mutex::new(RsGraphIndexBuilder::new(
-                    reference_lists,
-                    key_elements,
-                )),
-                optimize_for_size_py: std::sync::Mutex::new(None),
-                combine_backing_indices_py: std::sync::Mutex::new(None),
-            },
-        )
+    fn new(reference_lists: usize, key_elements: usize) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyGraphIndexBuilder {
+            inner: std::sync::Mutex::new(RsGraphIndexBuilder::new(reference_lists, key_elements)),
+            optimize_for_size_py: std::sync::Mutex::new(None),
+            combine_backing_indices_py: std::sync::Mutex::new(None),
+        })
+        .add_subclass(PyInMemoryGraphIndex)
     }
 
     fn __lt__(slf: Bound<'_, Self>, other: Bound<'_, PyAny>) -> PyResult<bool> {

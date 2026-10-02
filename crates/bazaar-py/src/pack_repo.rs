@@ -752,8 +752,11 @@ pub struct ExistingPack;
 impl ExistingPack {
     #[new]
     #[pyo3(signature = (*_args, **_kwargs))]
-    fn new(_args: Bound<'_, PyTuple>, _kwargs: Option<Bound<'_, PyDict>>) -> (Self, Pack) {
-        (ExistingPack, Pack)
+    fn new(
+        _args: Bound<'_, PyTuple>,
+        _kwargs: Option<Bound<'_, PyDict>>,
+    ) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(Pack).add_subclass(ExistingPack)
     }
 
     #[pyo3(signature = (pack_transport, name, revision_index, inventory_index, text_index, signature_index, chk_index=None))]
@@ -991,8 +994,11 @@ pub struct NewPack;
 impl NewPack {
     #[new]
     #[pyo3(signature = (*_args, **_kwargs))]
-    fn new(_args: Bound<'_, PyTuple>, _kwargs: Option<Bound<'_, PyDict>>) -> (Self, Pack) {
-        (NewPack, Pack)
+    fn new(
+        _args: Bound<'_, PyTuple>,
+        _kwargs: Option<Bound<'_, PyDict>>,
+    ) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(Pack).add_subclass(NewPack)
     }
 
     #[pyo3(signature = (pack_collection, upload_suffix="", file_mode=None))]

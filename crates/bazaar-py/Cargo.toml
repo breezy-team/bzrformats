@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bazaar = { path = "../bazaar", features = ["pyo3"] }
-patiencediff = { workspace = true, default-features = false }
+patiencediff = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module", "chrono"] }
 pyo3-filelike = { workspace = true }
 pyo3-log = { workspace = true }

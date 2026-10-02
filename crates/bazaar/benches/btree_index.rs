@@ -2,7 +2,8 @@
 //! used to locate keys across a sorted page.
 
 use bazaar::btree_index::{multi_bisect_right, parse_leaf_lines, LeafKey};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 
 /// Build a serialised leaf-node body with `n` zero-ref entries, sorted by key.
 fn make_leaf_body(n: usize) -> Vec<u8> {

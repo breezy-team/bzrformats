@@ -123,10 +123,13 @@ impl FulltextContentFactory {
         parents: Option<Vec<Key>>,
         sha1: Option<Vec<u8>>,
         text: Vec<u8>,
-    ) -> PyResult<(Self, AbstractContentFactory)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let of = bazaar::versionedfile::FulltextContentFactory::new(sha1, key, parents, text);
 
-        Ok((FulltextContentFactory, AbstractContentFactory(Box::new(of))))
+        Ok(
+            PyClassInitializer::from(AbstractContentFactory(Box::new(of)))
+                .add_subclass(FulltextContentFactory),
+        )
     }
 }
 
@@ -142,10 +145,13 @@ impl ChunkedContentFactory {
         parents: Option<Vec<Key>>,
         sha1: Option<Vec<u8>>,
         chunks: Vec<Vec<u8>>,
-    ) -> PyResult<(Self, AbstractContentFactory)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let of = bazaar::versionedfile::ChunkedContentFactory::new(sha1, key, parents, chunks);
 
-        Ok((ChunkedContentFactory, AbstractContentFactory(Box::new(of))))
+        Ok(
+            PyClassInitializer::from(AbstractContentFactory(Box::new(of)))
+                .add_subclass(ChunkedContentFactory),
+        )
     }
 }
 
@@ -287,7 +293,7 @@ impl PyFileContentFactory {
         fileobj: Py<PyAny>,
         sha1: Option<Vec<u8>>,
         size: Option<usize>,
-    ) -> PyResult<(Self, AbstractContentFactory)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let inner = FileContentFactoryInner {
             key,
             parents,
@@ -296,10 +302,10 @@ impl PyFileContentFactory {
             file: fileobj,
             cache: std::sync::Mutex::new(None),
         };
-        Ok((
-            PyFileContentFactory,
-            AbstractContentFactory(Box::new(inner)),
-        ))
+        Ok(
+            PyClassInitializer::from(AbstractContentFactory(Box::new(inner)))
+                .add_subclass(PyFileContentFactory),
+        )
     }
 }
 
@@ -452,19 +458,20 @@ impl PyAdapterFactory {
         key: Key,
         parents: Option<Vec<Key>>,
         adapted: Py<PyAny>,
-    ) -> PyResult<(Self, AbstractContentFactory)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let adapted_for_forward = adapted.clone_ref(py);
         let inner = AdapterFactoryInner {
             key,
             parents,
             adapted,
         };
-        Ok((
-            PyAdapterFactory {
-                adapted: adapted_for_forward,
-            },
-            AbstractContentFactory(Box::new(inner)),
-        ))
+        Ok(
+            PyClassInitializer::from(AbstractContentFactory(Box::new(inner))).add_subclass(
+                PyAdapterFactory {
+                    adapted: adapted_for_forward,
+                },
+            ),
+        )
     }
 
     /// Forward arbitrary attribute access to the adapted factory. Mirrors
@@ -510,10 +517,13 @@ pub(crate) struct AbsentContentFactory;
 #[pymethods]
 impl AbsentContentFactory {
     #[new]
-    fn new(key: Key) -> PyResult<(Self, AbstractContentFactory)> {
+    fn new(key: Key) -> PyResult<PyClassInitializer<Self>> {
         let of = bazaar::versionedfile::AbsentContentFactory::new(key);
 
-        Ok((AbsentContentFactory, AbstractContentFactory(Box::new(of))))
+        Ok(
+            PyClassInitializer::from(AbstractContentFactory(Box::new(of)))
+                .add_subclass(AbsentContentFactory),
+        )
     }
 }
 

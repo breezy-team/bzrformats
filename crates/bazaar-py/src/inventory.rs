@@ -317,7 +317,7 @@ impl InventoryFile {
         text_size: Option<u64>,
         executable: Option<bool>,
         text_id: Option<Vec<u8>>,
-    ) -> PyResult<(Self, InventoryEntry)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         let executable = executable.unwrap_or(false);
         check_name(name.as_str())?;
         let entry = Entry::File {
@@ -330,7 +330,7 @@ impl InventoryFile {
             text_id,
             executable,
         };
-        Ok((Self(), InventoryEntry(entry)))
+        Ok(PyClassInitializer::from(InventoryEntry(entry)).add_subclass(Self()))
     }
 
     #[getter]
@@ -482,7 +482,7 @@ impl InventoryDirectory {
         name: String,
         parent_id: Option<FileId>,
         revision: Option<RevisionId>,
-    ) -> PyResult<(Self, InventoryEntry)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         check_name(name.as_str())?;
         let entry = if let Some(parent_id) = parent_id {
             Entry::Directory {
@@ -494,7 +494,7 @@ impl InventoryDirectory {
         } else {
             Entry::Root { file_id, revision }
         };
-        Ok((Self(), InventoryEntry(entry)))
+        Ok(PyClassInitializer::from(InventoryEntry(entry)).add_subclass(Self()))
     }
 
     fn copy<'py>(slf: PyRef<Self>, py: Python<'py>) -> PyResult<Bound<'py, InventoryDirectory>> {
@@ -594,7 +594,7 @@ impl TreeReference {
         parent_id: FileId,
         revision: Option<RevisionId>,
         reference_revision: Option<RevisionId>,
-    ) -> PyResult<(Self, InventoryEntry)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         check_name(name.as_str())?;
         let entry = Entry::TreeReference {
             file_id,
@@ -603,7 +603,7 @@ impl TreeReference {
             revision,
             reference_revision,
         };
-        Ok((Self(), InventoryEntry(entry)))
+        Ok(PyClassInitializer::from(InventoryEntry(entry)).add_subclass(Self()))
     }
 
     #[getter]
@@ -643,7 +643,7 @@ impl InventoryLink {
         parent_id: FileId,
         revision: Option<RevisionId>,
         symlink_target: Option<String>,
-    ) -> PyResult<(Self, InventoryEntry)> {
+    ) -> PyResult<PyClassInitializer<Self>> {
         check_name(name.as_str())?;
         let entry = Entry::Link {
             file_id,
@@ -652,7 +652,7 @@ impl InventoryLink {
             symlink_target,
             revision,
         };
-        Ok((Self(), InventoryEntry(entry)))
+        Ok(PyClassInitializer::from(InventoryEntry(entry)).add_subclass(Self()))
     }
 
     #[getter]
