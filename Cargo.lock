@@ -125,7 +125,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bazaar"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "adler2",
  "base64 0.23.1",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "bazaar-py"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "bazaar",
  "chrono",
