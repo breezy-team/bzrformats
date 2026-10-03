@@ -190,10 +190,6 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
                 f"Missing elements {missing!r}: {sublist!r} not a subset of {superlist!r}"
             )
 
-    def knownFailure(self, reason):
-        """Mark test as a known failure."""
-        raise expectedFailure(reason)
-
     def requireFeature(self, feature):
         """This test requires a specific feature is available.
 
