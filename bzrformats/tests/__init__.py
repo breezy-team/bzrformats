@@ -190,10 +190,6 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
                 f"Missing elements {missing!r}: {sublist!r} not a subset of {superlist!r}"
             )
 
-    def knownFailure(self, reason):
-        """Mark test as a known failure."""
-        raise expectedFailure(reason)
-
     def requireFeature(self, feature):
         """This test requires a specific feature is available.
 
@@ -416,6 +412,7 @@ def load_tests(loader, basic_tests, pattern):
         "test__chk_map",
         "test__dirstate_helpers",
         "test__groupcompress",
+        "test_bisect_multi",
         "test_btree_index",
         "test_chk_map",
         "test_chk_serializer",
@@ -423,6 +420,7 @@ def load_tests(loader, basic_tests, pattern):
         "test_config",
         "test_controldir",
         "test_dirstate",
+        "test_errors",
         "test_generate_ids",
         "test_groupcompress",
         "test_hashcache",
@@ -431,11 +429,18 @@ def load_tests(loader, basic_tests, pattern):
         "test_inventory_delta",
         "test_knit",
         "test_lock",
+        "test_lru_cache",
+        "test_merge",
+        "test_multiparent",
+        "test_osutils",
         "test_pack",
+        "test_registry",
+        "test_revision",
         "test_rio",
         "test_serializer",
         "test_testament",
         "test_textinv",
+        "test_textmerge",
         "test_tuned_gzip",
         "test_versionedfile",
         "test_views",
