@@ -26,41 +26,45 @@ use std::path::{Path, PathBuf};
 /// succeeds. Mirrors breezy's `_FileMover`.
 #[derive(Default)]
 pub struct FileMover {
-    /// Renames performed so far, as `(from, to)`, newest last.
-    renames: Vec<(PathBuf, PathBuf)>,
-    /// Pending deletions, as `(original, holding)`.
-    pending_deletions: Vec<(PathBuf, PathBuf)>,
+    /// Every rename done so far, oldest first, including those that moved
+    /// something to the holding area.
+    past_renames: Vec<(PathBuf, PathBuf)>,
+    /// The holding-area paths to delete once the apply has succeeded.
+    pending_deletions: Vec<PathBuf>,
 }
 
 impl FileMover {
-    /// Rename `from` to `to`, recording it for possible rollback.
+    /// Rename `from` to `to`, remembering it for rollback.
     pub fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
         std::fs::rename(from, to)?;
-        self.renames.push((from.to_path_buf(), to.to_path_buf()));
-        Ok(())
-    }
-
-    /// Move `from` aside to the holding path `to`, to be deleted on success.
-    pub fn pre_delete(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
-        std::fs::rename(from, to)?;
-        self.pending_deletions
+        self.past_renames
             .push((from.to_path_buf(), to.to_path_buf()));
         Ok(())
     }
 
-    /// Undo all renames and restore all staged deletions (on error).
-    pub fn rollback(&mut self) {
-        for (from, to) in self.renames.drain(..).rev() {
-            let _ = std::fs::rename(&to, &from);
-        }
-        for (original, holding) in self.pending_deletions.drain(..).rev() {
-            let _ = std::fs::rename(&holding, &original);
-        }
+    /// Stage `from` for deletion by moving it to the holding path `to`.
+    pub fn pre_delete(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.rename(from, to)?;
+        self.pending_deletions.push(to.to_path_buf());
+        Ok(())
     }
 
-    /// Permanently delete everything staged by [`pre_delete`](Self::pre_delete).
+    /// Undo every rename, newest first, restoring what was staged for
+    /// deletion along the way. Stops at the first rename that cannot be
+    /// undone.
+    pub fn rollback(&mut self) -> std::io::Result<()> {
+        let past_renames = std::mem::take(&mut self.past_renames);
+        self.pending_deletions.clear();
+        for (from, to) in past_renames.iter().rev() {
+            std::fs::rename(to, from)?;
+        }
+        Ok(())
+    }
+
+    /// Make the staged deletions permanent.
     pub fn apply_deletions(&mut self) -> std::io::Result<()> {
-        for (_original, holding) in self.pending_deletions.drain(..) {
+        self.past_renames.clear();
+        for holding in std::mem::take(&mut self.pending_deletions) {
             delete_any(&holding)?;
         }
         Ok(())
@@ -256,16 +260,17 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         let mut modified = Vec::new();
         for (path, trans_id) in &new_paths {
             let full_path = self.base().tree().abspath(path);
-            // In the simple limbo scheme, everything with staged contents
-            // needs renaming from limbo into place.
-            let has_contents = self.base().has_new_contents(trans_id);
-            if has_contents {
-                let limbo = self.limbo_name(trans_id);
+            // In the simple limbo scheme, everything in limbo needs renaming
+            // into place: what was staged, and what the removals moved out
+            // of the way because its path changed.
+            if let Some(limbo) = self.limbo_path_of(trans_id).map(Path::to_path_buf) {
                 match mover.rename(&limbo, &full_path) {
                     Ok(()) => *rename_count += 1,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(io_err(e)),
                 }
+            }
+            if self.base().has_new_contents(trans_id) {
                 modified.push(full_path.clone());
             }
             if let Some(exec) = self.base().new_executability_map().get(trans_id).copied() {
@@ -300,7 +305,9 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         let modified = match modified {
             Ok(m) => m,
             Err(e) => {
-                mover.rollback();
+                mover.rollback().map_err(|rollback| {
+                    Error::Tree(format!("rolling back after {e}: {rollback}"))
+                })?;
                 return Err(e);
             }
         };
@@ -318,7 +325,7 @@ impl<T: TransformTree> DiskTreeTransform<T> {
             InventoryDelta::from(
                 inventory_delta
                     .iter()
-                    .filter(|e| e.new_path.as_deref() != Some(""))
+                    .filter(|e| e.old_path.as_deref() != Some(""))
                     .cloned()
                     .collect::<Vec<_>>(),
             )
@@ -352,18 +359,41 @@ fn delete_any(path: &Path) -> std::io::Result<()> {
 }
 
 /// Set (or clear) the executable bit on `path`.
+/// The process's file mode creation mask, read once.
+#[cfg(unix)]
+fn umask() -> u32 {
+    static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UMASK.get_or_init(|| {
+        // The mask can only be read by setting it.
+        let mask = nix::sys::stat::umask(nix::sys::stat::Mode::empty());
+        nix::sys::stat::umask(mask);
+        // mode_t is narrower than u32 on some platforms.
+        #[allow(clippy::useless_conversion)]
+        u32::from(mask.bits())
+    })
+}
+
+/// Set or clear the executable bits of `path` as breezy's
+/// `_set_executability` does: executable for the owner, and for the group
+/// and others where they can read the file, as far as the umask allows.
 #[cfg(unix)]
 fn set_executable(path: &Path, executable: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    let mode = perms.mode();
+    let mode = std::fs::metadata(path)?.permissions().mode();
     let new_mode = if executable {
-        mode | 0o111
+        let umask = umask();
+        let mut new_mode = mode | (0o100 & !umask);
+        if mode & 0o004 != 0 {
+            new_mode |= 0o001 & !umask;
+        }
+        if mode & 0o040 != 0 {
+            new_mode |= 0o010 & !umask;
+        }
+        new_mode
     } else {
         mode & !0o111
     };
-    perms.set_mode(new_mode);
-    std::fs::set_permissions(path, perms)
+    super::disk::chmod_if_possible(path, std::fs::Permissions::from_mode(new_mode))
 }
 
 #[cfg(not(unix))]
@@ -523,8 +553,174 @@ mod tests {
         let mut mover = FileMover::default();
         mover.rename(&a, &b).unwrap();
         assert!(!a.exists() && b.exists());
-        mover.rollback();
+        mover.rollback().unwrap();
         // The rename is undone.
         assert!(a.exists() && !b.exists());
+    }
+
+    /// What was moved is put back newest first, so a directory staged for
+    /// deletion is back before what was moved out of it returns.
+    #[test]
+    fn file_mover_rolls_back_in_reverse_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("child"), b"contents").unwrap();
+        let mut mover = FileMover::default();
+        mover
+            .rename(&parent.join("child"), &dir.path().join("limbo-child"))
+            .unwrap();
+        mover
+            .pre_delete(&parent, &dir.path().join("deleted-parent"))
+            .unwrap();
+
+        mover.rollback().unwrap();
+
+        assert_eq!(std::fs::read(parent.join("child")).unwrap(), b"contents");
+        assert!(!dir.path().join("limbo-child").exists());
+        assert!(!dir.path().join("deleted-parent").exists());
+    }
+
+    #[test]
+    fn file_mover_reports_a_failed_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, b"a").unwrap();
+        let mut mover = FileMover::default();
+        mover.rename(&a, &b).unwrap();
+        std::fs::remove_file(&b).unwrap();
+        assert_eq!(
+            mover.rollback().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn apply_renames_an_existing_file() {
+        let (_d, mut tt, deletion) = apply_tt();
+        let base_dir = tt.base().tree().abspath("");
+        std::fs::write(base_dir.join("old.txt"), b"contents\n").unwrap();
+        tt.base_mut()
+            .tree
+            .add("old.txt", b"old-id", crate::osutils::Kind::File);
+        let root = tt.base().root().unwrap().to_string();
+        let tid = tt.base_mut().trans_id_tree_path("old.txt");
+        tt.base_mut().adjust_path("new.txt", &root, &tid).unwrap();
+
+        let results = tt.apply(&deletion, false).unwrap();
+
+        assert!(!base_dir.join("old.txt").exists());
+        assert_eq!(
+            std::fs::read(base_dir.join("new.txt")).unwrap(),
+            b"contents\n"
+        );
+        assert!(tt.base().tree().is_versioned_path("new.txt"));
+        assert!(!tt.base().tree().is_versioned_path("old.txt"));
+        // Out of the way, then into place.
+        assert_eq!(results.rename_count, 2);
+        // Only new contents count as modified.
+        assert_eq!(results.modified_paths, Vec::<PathBuf>::new());
+    }
+
+    /// A renamed directory takes what it holds along, and new entries land
+    /// inside it under its new name.
+    #[test]
+    fn apply_renames_a_directory_with_its_contents() {
+        use crate::osutils::Kind;
+
+        let (_d, mut tt, deletion) = apply_tt();
+        let base_dir = tt.base().tree().abspath("");
+        std::fs::create_dir(base_dir.join("old")).unwrap();
+        std::fs::write(base_dir.join("old/kept.txt"), b"kept\n").unwrap();
+        tt.base_mut().tree.add("old", b"dir-id", Kind::Directory);
+        tt.base_mut()
+            .tree
+            .add("old/kept.txt", b"kept-id", Kind::File);
+        let root = tt.base().root().unwrap().to_string();
+        let dir = tt.base_mut().trans_id_tree_path("old");
+        tt.base_mut().adjust_path("new", &root, &dir).unwrap();
+        let added = tt.base_mut().create_path("added.txt", &dir).unwrap();
+        tt.create_file(b"added\n", &added, None).unwrap();
+
+        tt.apply(&deletion, false).unwrap();
+
+        assert!(!base_dir.join("old").exists());
+        assert_eq!(
+            std::fs::read(base_dir.join("new/kept.txt")).unwrap(),
+            b"kept\n"
+        );
+        assert_eq!(
+            std::fs::read(base_dir.join("new/added.txt")).unwrap(),
+            b"added\n"
+        );
+    }
+
+    /// Unversioning the root leaves its entry alone, as breezy leaves it.
+    #[test]
+    fn apply_keeps_the_entry_of_an_unversioned_root() {
+        let (_d, mut tt, deletion) = apply_tt();
+        let root = tt.base().root().unwrap().to_string();
+        tt.base_mut().unversion_file(&root);
+        tt.apply(&deletion, false).unwrap();
+        assert!(tt.base().tree().is_versioned_path(""));
+    }
+
+    /// Making a file executable gives execute permission to its owner, and
+    /// to the group and others where they can read it, within the umask.
+    #[cfg(unix)]
+    #[test]
+    fn apply_sets_the_executable_bit_as_breezy_does() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode_after = |mode: u32, executable: bool| -> u32 {
+            let (_d, mut tt, deletion) = apply_tt();
+            let path = tt.base().tree().abspath("tool");
+            std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            tt.base_mut()
+                .tree
+                .add("tool", b"tool-id", crate::osutils::Kind::File);
+            let tid = tt.base_mut().trans_id_tree_path("tool");
+            tt.base_mut().set_executability(Some(executable), &tid);
+            tt.apply(&deletion, false).unwrap();
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777
+        };
+        let allowed = !umask() & 0o111;
+        // Readable by owner and group only: no execute bit for others.
+        assert_eq!(mode_after(0o640, true), 0o640 | (0o110 & allowed));
+        assert_eq!(mode_after(0o644, true), 0o644 | (0o111 & allowed));
+        assert_eq!(mode_after(0o600, true), 0o600 | (0o100 & allowed));
+        assert_eq!(mode_after(0o755, false), 0o644);
+    }
+
+    /// New contents for a file in the tree keep the mode it had.
+    #[cfg(unix)]
+    #[test]
+    fn create_file_keeps_the_mode_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, mut tt, deletion) = apply_tt();
+        let path = tt.base().tree().abspath("tool");
+        std::fs::write(&path, b"old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
+        tt.base_mut()
+            .tree
+            .add("tool", b"tool-id", crate::osutils::Kind::File);
+        let root = tt.base().root().unwrap().to_string();
+        let tid = tt.base_mut().trans_id_tree_path("tool");
+        tt.base_mut().delete_contents(&tid);
+        tt.create_file(b"new\n", &tid, None).unwrap();
+        // A new file can borrow the mode of another one.
+        let copy = tt.base_mut().create_path("copy", &root).unwrap();
+        tt.create_file_with_mode_of(b"copy\n", &copy, &tid, None)
+            .unwrap();
+
+        tt.apply(&deletion, false).unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(mode(&path), 0o750);
+        assert_eq!(mode(&tt.base().tree().abspath("copy")), 0o750);
     }
 }
