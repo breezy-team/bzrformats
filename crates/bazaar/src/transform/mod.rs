@@ -575,9 +575,12 @@ impl<T: TransformTree> TreeTransformBase<T> {
             None => return Ok(false),
         };
         let child_path = joinpath(&parent_path, name);
-        if self.tree_path_ids.contains_key(&child_path) {
-            // Known to the transform via a tree path already handled above.
-            return Ok(false);
+        if let Some(child_id) = self.tree_path_ids.get(&child_path) {
+            // A tree path the transform knows is among the children checked
+            // above unless it was moved away, which breezy does not expect.
+            return Err(Error::Malformed(format!(
+                "child_id is missing: {name}, {parent_id}, {child_id}"
+            )));
         }
         // Otherwise consult the filesystem.
         let abspath = self.tree.abspath(&child_path);
@@ -1548,6 +1551,25 @@ mod tests {
             tt.available_backup_name("a.txt", &root).unwrap(),
             "a.txt.~2~"
         );
+    }
+
+    /// A candidate that is a tree path moved elsewhere by the transform is
+    /// refused, as breezy refuses it.
+    #[test]
+    fn available_backup_name_rejects_a_moved_tree_path() {
+        let (_dir, mut tree) = disk_tree();
+        tree.add("a.txt.~1~", b"backup-id", Kind::File);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let root = tt.root().unwrap().to_string();
+        let moved = tt.trans_id_tree_path("a.txt.~1~");
+        tt.adjust_path("elsewhere", &root, &moved).unwrap();
+        match tt.available_backup_name("a.txt", &root) {
+            Err(Error::Malformed(message)) => assert_eq!(
+                message,
+                format!("child_id is missing: a.txt.~1~, {root}, {moved}")
+            ),
+            other => panic!("expected a malformed transform, got {:?}", other),
+        }
     }
 
     /// A candidate the filesystem cannot be asked about is an error, not a
