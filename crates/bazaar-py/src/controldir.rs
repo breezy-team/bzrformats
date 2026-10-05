@@ -711,7 +711,7 @@ impl WorkingTree {
     }
 
     /// The recorded conflicts, each a dict with `type`, `path`, and optional
-    /// `file_id` and `conflict_path`.
+    /// `file_id`, `action`, `conflict_path` and `conflict_file_id`.
     fn conflicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let conflicts = self.inner.conflicts().map_err(err)?;
         let items: Vec<Bound<'py, PyDict>> = conflicts
@@ -723,8 +723,14 @@ impl WorkingTree {
                 if let Some(fid) = &c.file_id {
                     d.set_item("file_id", PyBytes::new(py, fid))?;
                 }
+                if let Some(action) = &c.action {
+                    d.set_item("action", action)?;
+                }
                 if let Some(conflict_path) = &c.conflict_path {
                     d.set_item("conflict_path", conflict_path)?;
+                }
+                if let Some(fid) = &c.conflict_file_id {
+                    d.set_item("conflict_file_id", PyBytes::new(py, fid))?;
                 }
                 Ok::<_, PyErr>(d)
             })
@@ -733,7 +739,8 @@ impl WorkingTree {
     }
 
     /// Replace the recorded conflicts. `conflicts` is a list of dicts with
-    /// `type`, `path`, and optional `file_id` and `conflict_path`.
+    /// `type`, `path`, and optional `file_id`, `action`, `conflict_path` and
+    /// `conflict_file_id`.
     fn set_conflicts(&self, conflicts: Vec<Bound<'_, PyDict>>) -> PyResult<()> {
         let mut out = Vec::with_capacity(conflicts.len());
         for d in &conflicts {
@@ -749,7 +756,15 @@ impl WorkingTree {
                 Some(v) if !v.is_none() => Some(v.extract()?),
                 _ => None,
             };
+            let action: Option<String> = match d.get_item("action")? {
+                Some(v) if !v.is_none() => Some(v.extract()?),
+                _ => None,
+            };
             let conflict_path: Option<String> = match d.get_item("conflict_path")? {
+                Some(v) if !v.is_none() => Some(v.extract()?),
+                _ => None,
+            };
+            let conflict_file_id: Option<Vec<u8>> = match d.get_item("conflict_file_id")? {
                 Some(v) if !v.is_none() => Some(v.extract()?),
                 _ => None,
             };
@@ -757,7 +772,9 @@ impl WorkingTree {
                 typestring,
                 path,
                 file_id,
+                action,
                 conflict_path,
+                conflict_file_id,
             });
         }
         self.inner.set_conflicts(&out).map_err(err)
