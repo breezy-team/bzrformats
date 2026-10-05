@@ -1670,15 +1670,16 @@ fn content_changed(
 type FileSha<'a> = dyn Fn(&str) -> Result<Vec<u8>, WorkingTreeError> + 'a;
 
 /// The live executable bit of the working-tree file at `path`, read from
-/// disk. Returns `None` when the transport is not local or the file cannot be
+/// disk: whether it is a regular file its owner may execute, as breezy has
+/// it. Returns `None` when the transport is not local or the file cannot be
 /// stat'd, and always `Some(false)` on platforms without a Unix mode.
 fn disk_executable(transport: &SharedTransport, path: &str) -> Option<bool> {
     let local = transport.local_path(path)?;
-    let metadata = std::fs::metadata(local).ok()?;
+    let metadata = std::fs::symlink_metadata(local).ok()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        Some(metadata.permissions().mode() & 0o111 != 0)
+        Some(metadata.is_file() && metadata.permissions().mode() & 0o100 != 0)
     }
     #[cfg(not(unix))]
     {
@@ -2404,6 +2405,36 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].old_path.as_deref(), Some("a.txt"));
         assert_eq!(changes[0].new_path, None);
+    }
+
+    /// Only the owner's execute bit makes a file executable, as in breezy; a
+    /// file others alone may execute is not.
+    #[cfg(unix)]
+    #[test]
+    fn iter_changes_ignores_other_execute_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"hello\n", None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &crate::workingtree::CommitOptions::new("T <t@e>", "add a").timestamp(1577880000),
+            )
+            .unwrap();
+
+        let path = parent.local_path("a.txt").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o645)).unwrap();
+
+        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let repo = cd.open_repository().unwrap();
+        let basis = repo.revision_tree(&revid).unwrap();
+        assert_eq!(wt.iter_changes(&basis).unwrap().len(), 0);
     }
 
     /// An executable-bit change on disk that the dirstate has not yet
