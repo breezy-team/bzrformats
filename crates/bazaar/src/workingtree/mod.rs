@@ -1022,11 +1022,9 @@ impl WorkingTree4 {
             } else {
                 match path_to_id.get(&dirname) {
                     Some(id) => FileId::from(id.clone()),
-                    None => {
-                        return Err(WorkingTreeError::Corrupt(format!(
-                            "dirstate entry {path} has no parent directory entry"
-                        )))
-                    }
+                    // Its directory is not versioned in this tree, so breezy
+                    // takes nothing under it to be either.
+                    None => continue,
                 }
             };
             let inv_entry = match minikind {
@@ -3294,15 +3292,17 @@ mod tests {
         }
     }
 
-    /// An entry whose directory is not in the tree means the dirstate is
-    /// inconsistent.
+    /// Entries under a directory that is not versioned in the tree are left
+    /// out, as breezy leaves them out.
     #[test]
-    fn live_inventory_entries_rejects_an_entry_without_parent() {
+    fn live_inventory_entries_skips_entries_without_parent() {
         let (_d, parent, mut wt) = fresh_tree();
         parent.mkdir("sub").unwrap();
         parent.put_bytes("sub/b.txt", b"b\n", None).unwrap();
+        parent.put_bytes("a.txt", b"a\n", None).unwrap();
         wt.add("sub", EntryKind::Directory, None).unwrap();
         wt.add("sub/b.txt", EntryKind::File, None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
 
         // Drop the directory from the tree while keeping its child.
         for block in wt.dirstate.dirblocks.iter_mut() {
@@ -3313,13 +3313,9 @@ mod tests {
             }
         }
 
-        match wt.live_inventory_entries() {
-            Err(WorkingTreeError::Corrupt(message)) => assert_eq!(
-                message,
-                "dirstate entry sub/b.txt has no parent directory entry"
-            ),
-            other => panic!("expected a corrupt dirstate, got {:?}", other),
-        }
+        let entries = wt.live_inventory_entries().unwrap();
+        let paths: Vec<&str> = entries.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["", "a.txt"]);
     }
 
     /// A symlink is listed as a link entry, and the entries come in path
