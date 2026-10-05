@@ -273,7 +273,7 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         let trans_id = self.new_entry(name, parent_id, file_id)?;
         self.create_file(contents, &trans_id, sha1)?;
         if let Some(executable) = executable {
-            self.base.set_executability(Some(executable), &trans_id);
+            self.base.set_executability(Some(executable), &trans_id)?;
         }
         Ok(trans_id)
     }
@@ -317,14 +317,24 @@ impl<T: TransformTree> DiskTreeTransform<T> {
             .cloned()
             .collect();
         for trans_id in cancelled {
-            self.cancel_creation(&trans_id)?;
+            self.discard_staged(&trans_id)?;
         }
         Ok(())
     }
 
     /// Cancel staged content creation for `trans_id`, removing its limbo file.
     pub fn cancel_creation(&mut self, trans_id: &str) -> Result<(), Error> {
+        if !self.base.has_new_contents(trans_id) {
+            return Err(Error::Malformed(format!(
+                "{trans_id} has no contents scheduled"
+            )));
+        }
         self.base.cancel_contents(trans_id);
+        self.discard_staged(trans_id)
+    }
+
+    /// Remove what is staged in limbo for `trans_id`.
+    fn discard_staged(&mut self, trans_id: &str) -> Result<(), Error> {
         self.observed_sha1s.remove(trans_id);
         if let Some(path) = self.limbo_files.remove(trans_id) {
             delete_any(&path).map_err(io_err)?;
@@ -534,6 +544,19 @@ mod tests {
     }
 
     #[test]
+    fn cancel_creation_needs_staged_contents() {
+        let (_d, mut tt) = disk_tt();
+        let root = tt.base().root().unwrap().to_string();
+        let tid = tt.base_mut().create_path("f", &root).unwrap();
+        match tt.cancel_creation(&tid) {
+            Err(Error::Malformed(message)) => {
+                assert_eq!(message, format!("{tid} has no contents scheduled"))
+            }
+            other => panic!("expected a malformed transform, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn finalize_removes_limbo() {
         let (_d, mut tt) = disk_tt();
         let root = tt.base().root().unwrap().to_string();
@@ -563,7 +586,7 @@ mod tests {
             other => panic!("expected orphaning to be forbidden, got {:?}", other),
         }
         // The orphan stays where it was.
-        assert_eq!(tt.base_mut().final_parent(&orphan), dir);
+        assert_eq!(tt.base_mut().final_parent(&orphan).unwrap(), dir);
         assert_eq!(tt.base().final_name(&orphan).unwrap(), "foo");
     }
 
@@ -573,7 +596,7 @@ mod tests {
         let (dir, orphan) = orphan_in_removed_dir(&mut tt);
         tt.new_orphan(&orphan, &dir, OrphanPolicy::Move).unwrap();
 
-        let orphans_dir = tt.base_mut().final_parent(&orphan);
+        let orphans_dir = tt.base_mut().final_parent(&orphan).unwrap();
         assert_eq!(tt.base().final_name(&orphans_dir).unwrap(), "brz-orphans");
         assert_eq!(tt.base().final_kind(&orphans_dir), Some(Kind::Directory));
         assert!(tt.limbo_name(&orphans_dir).is_dir());
@@ -611,8 +634,8 @@ mod tests {
         tt.new_orphan(&second, &other, OrphanPolicy::Move).unwrap();
 
         assert_eq!(
-            tt.base_mut().final_parent(&second),
-            tt.base_mut().final_parent(&first)
+            tt.base_mut().final_parent(&second).unwrap(),
+            tt.base_mut().final_parent(&first).unwrap()
         );
         assert_eq!(tt.base().final_name(&first).unwrap(), "foo.~1~");
         assert_eq!(tt.base().final_name(&second).unwrap(), "foo.~2~");
