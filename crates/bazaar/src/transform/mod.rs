@@ -719,9 +719,7 @@ impl<T: TransformTree> TreeTransformBase<T> {
         changed.extend(changed_kind);
         // Children of entries whose file id changed need re-parenting entries.
         for parent in &new_file_id {
-            for child in self.registered_children_of(parent) {
-                changed.insert(child);
-            }
+            changed.extend(self.add_tree_children_of(parent)?);
         }
         let mut out = Vec::new();
         for t in changed {
@@ -748,27 +746,6 @@ impl<T: TransformTree> TreeTransformBase<T> {
         Ok(out)
     }
 
-    /// The registered tree children of `parent_id` (its trans-id children among
-    /// the tree paths seen so far).
-    fn registered_children_of(&self, parent_id: &str) -> Vec<String> {
-        let parent_path = match self.tree_id_paths.get(parent_id) {
-            Some(p) => p.clone(),
-            None => return Vec::new(),
-        };
-        let prefix = if parent_path.is_empty() {
-            String::new()
-        } else {
-            format!("{parent_path}/")
-        };
-        self.tree_path_ids
-            .iter()
-            .filter(|(path, _)| {
-                !path.is_empty() && path.starts_with(&prefix) && !path[prefix.len()..].contains('/')
-            })
-            .map(|(_, id)| id.clone())
-            .collect()
-    }
-
     /// Register a tree path's trans-id, recording the reverse mapping. Used
     /// while walking a directory's children.
     fn register_tree_path(&mut self, path: &str) -> String {
@@ -776,17 +753,18 @@ impl<T: TransformTree> TreeTransformBase<T> {
     }
 
     /// Register every on-disk child of the directory at `trans_id` (breezy's
-    /// `iter_tree_children`), so conflict detection sees them.
+    /// `iter_tree_children`), so conflict detection sees them, and return
+    /// their trans-ids.
     ///
     /// Like Python's `iter_tree_children`, this lists the directory on disk
     /// directly (via the tree's absolute path) rather than through a tree
     /// method; a path that is missing or not a directory yields nothing.
-    fn add_tree_children_of(&mut self, trans_id: &str) -> Result<(), Error> {
+    fn add_tree_children_of(&mut self, trans_id: &str) -> Result<Vec<String>, Error> {
         use std::io::ErrorKind;
 
         let path = match self.tree_id_paths.get(trans_id) {
             Some(p) => p.clone(),
-            None => return Ok(()),
+            None => return Ok(Vec::new()),
         };
         let abspath = self.tree.abspath(&path);
         let listing_err =
@@ -794,7 +772,7 @@ impl<T: TransformTree> TreeTransformBase<T> {
         let dir = match std::fs::read_dir(&abspath) {
             Ok(d) => d,
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-                return Ok(())
+                return Ok(Vec::new())
             }
             Err(e) => return Err(listing_err(e)),
         };
@@ -809,14 +787,15 @@ impl<T: TransformTree> TreeTransformBase<T> {
             })?;
             names.push(name);
         }
+        let mut children = Vec::new();
         for name in names {
             let child_path = joinpath(&path, &name);
             if self.tree.is_control_filename(&child_path) {
                 continue;
             }
-            self.register_tree_path(&child_path);
+            children.push(self.register_tree_path(&child_path));
         }
-        Ok(())
+        Ok(children)
     }
 
     /// Ensure every child of every active parent is registered before
@@ -1434,6 +1413,30 @@ mod tests {
         let a = tt.trans_id_tree_path("a.txt");
         tt.delete_contents(&a);
         assert_eq!(tt.find_raw_conflicts().unwrap(), vec![]);
+    }
+
+    /// When a directory gets another file id, the entries of what it holds
+    /// on disk are altered with it, known to the transform or not.
+    #[test]
+    fn inventory_altered_includes_on_disk_children_of_a_re_identified_directory() {
+        let (dir, mut tree) = disk_tree();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/f"), b"contents").unwrap();
+        tree.add("sub", b"sub-id", Kind::Directory);
+        tree.add("sub/f", b"f-id", Kind::File);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let sub = tt.trans_id_tree_path("sub");
+        tt.unversion_file(&sub);
+        tt.version_file(&sub, FileId::from(b"new-sub-id".to_vec()))
+            .unwrap();
+
+        let altered = tt.inventory_altered().unwrap();
+
+        let child = tt.tree_path_ids.get("sub/f").cloned().unwrap();
+        assert_eq!(
+            altered,
+            vec![("sub".to_string(), sub), ("sub/f".to_string(), child)]
+        );
     }
 
     /// A directory that cannot be listed is an error, not an empty directory.
