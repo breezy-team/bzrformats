@@ -231,6 +231,38 @@ class TestControlDir(TestCaseInTempDir):
             ],
         )
 
+    def test_path_conflict_round_trip(self):
+        cd = controldir.create(self.test_dir)
+        wt = cd.open_workingtree()
+        conflicts = [
+            {
+                "type": "path conflict",
+                "path": "dir/b",
+                "file_id": b"b-id",
+                "conflict_path": "dir/c",
+            },
+        ]
+        wt.set_conflicts(conflicts)
+        got = controldir.open(self.test_dir).open_workingtree().conflicts()
+        self.assertEqual(got, conflicts)
+
+    def test_handled_conflict_round_trip(self):
+        cd = controldir.create(self.test_dir)
+        wt = cd.open_workingtree()
+        conflicts = [
+            {
+                "type": "duplicate",
+                "path": "x.moved",
+                "file_id": b"x-id",
+                "action": "Moved existing file to",
+                "conflict_path": "x",
+                "conflict_file_id": b"y-id",
+            },
+        ]
+        wt.set_conflicts(conflicts)
+        got = controldir.open(self.test_dir).open_workingtree().conflicts()
+        self.assertEqual(got, conflicts)
+
     def test_format_introspection(self):
         cd = controldir.create(self.test_dir)
         rf = cd.open_repository().format()

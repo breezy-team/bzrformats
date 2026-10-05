@@ -106,6 +106,9 @@ pub enum WorkingTreeError {
     /// The working-tree format (its `.bzr/checkout/format` marker) is not
     /// supported by this crate.
     UnsupportedFormat(Vec<u8>),
+    /// A reserved revision id (one ending in `:`, such as `null:`) was given
+    /// where a real revision is needed.
+    ReservedId(Vec<u8>),
     /// A control file (views, conflicts) was malformed.
     Corrupt(String),
     /// An operation is not supported by this working-tree format (e.g. views
@@ -142,6 +145,9 @@ impl std::fmt::Display for WorkingTreeError {
                 "unsupported working-tree format: {}",
                 String::from_utf8_lossy(marker)
             ),
+            WorkingTreeError::ReservedId(r) => {
+                write!(f, "reserved revision id: {}", String::from_utf8_lossy(r))
+            }
             WorkingTreeError::Corrupt(m) => write!(f, "corrupt working-tree control file: {m}"),
             WorkingTreeError::Unsupported(m) => write!(f, "unsupported operation: {m}"),
         }
@@ -407,8 +413,48 @@ pub trait WorkingTree: Send + Sync {
     /// records it as an additional parent.
     fn add_pending_merge(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError>;
 
+    /// Set the tree's parent revisions to `revision_ids`, rewriting the
+    /// dirstate parent columns from each parent's tree in `repository`. The
+    /// default is unsupported; the dirstate format overrides it.
+    fn set_parent_ids(
+        &mut self,
+        _repository: &dyn crate::repository::Repository,
+        _revision_ids: &[Vec<u8>],
+        _allow_leftmost_as_ghost: bool,
+    ) -> Result<(), WorkingTreeError> {
+        Err(WorkingTreeError::Unsupported("set_parent_ids".to_string()))
+    }
+
+    /// Apply an inventory delta to the live working tree, updating the
+    /// dirstate's tree-0 column. The default is unsupported; the dirstate
+    /// format overrides it. This is the primitive a tree transform's
+    /// `apply` step calls.
+    fn apply_inventory_delta(
+        &mut self,
+        _delta: &crate::inventory_delta::InventoryDelta,
+    ) -> Result<(), WorkingTreeError> {
+        Err(WorkingTreeError::Unsupported(
+            "apply_inventory_delta".to_string(),
+        ))
+    }
+
     /// List the tracked files and directories in the live working tree.
     fn list_files(&self) -> Vec<VersionedEntry>;
+
+    /// The live working tree's inventory entries as `(path, entry)` pairs in
+    /// path order, including the tree root as `("", root)`.
+    ///
+    /// The entries reflect the uncommitted working state, so they carry no
+    /// recorded revision, text sha1 or size, or symlink target; breezy's
+    /// working tree inventory leaves those unset too. The base implementation
+    /// is unsupported; the dirstate format overrides it.
+    fn live_inventory_entries(
+        &self,
+    ) -> Result<Vec<(String, crate::inventory::Entry)>, WorkingTreeError> {
+        Err(WorkingTreeError::Unsupported(
+            "live_inventory_entries".to_string(),
+        ))
+    }
 
     /// The file id of the entry at `path`, or `None` if `path` is not
     /// versioned in the live tree.
@@ -527,12 +573,45 @@ pub trait WorkingTree: Send + Sync {
         )?;
         Ok(())
     }
+
+    /// The raw merge-modified list as `(file_id, sha1)` pairs, read from
+    /// `.bzr/checkout/merge-hashes`; empty when the file is absent.
+    ///
+    /// This is the on-disk record set by a merge; callers typically map the
+    /// file ids to paths and drop entries whose file no longer matches.
+    fn merge_modified_hashes(&self) -> Result<Vec<MergeModifiedHash>, WorkingTreeError> {
+        let bytes = match self.control_transport().get_bytes(MERGE_MODIFIED_PATH) {
+            Ok(b) => b,
+            Err(TransportError::NoSuchFile(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        merge_modified_io::deserialize(&bytes).map_err(WorkingTreeError::Corrupt)
+    }
+
+    /// Write the merge-modified list of `(file_id, sha1)` pairs to
+    /// `.bzr/checkout/merge-hashes`.
+    fn set_merge_modified_hashes(
+        &self,
+        hashes: &[MergeModifiedHash],
+    ) -> Result<(), WorkingTreeError> {
+        self.control_transport().put_bytes(
+            MERGE_MODIFIED_PATH,
+            &merge_modified_io::serialize(hashes),
+            None,
+        )?;
+        Ok(())
+    }
 }
 
 /// The `views` control file path (relative to the tree's control transport).
 const VIEWS_PATH: &str = ".bzr/checkout/views";
 /// The `conflicts` control file path.
 const CONFLICTS_PATH: &str = ".bzr/checkout/conflicts";
+/// The `merge-hashes` control file path.
+const MERGE_MODIFIED_PATH: &str = ".bzr/checkout/merge-hashes";
+
+/// One merge-modified record: a `(file_id, sha1)` pair.
+pub type MergeModifiedHash = (Vec<u8>, Vec<u8>);
 
 /// The views defined in a working tree: the current (enabled) view, if any,
 /// and a map from view name to the list of tree-relative paths it scopes to.
@@ -575,7 +654,8 @@ impl ViewInfo {
 }
 
 /// One recorded conflict, mirroring a stanza in the `conflicts` file: a
-/// conflict type, the tree path it affects, and (optionally) the file id.
+/// conflict type, the tree path it affects, and the optional details breezy
+/// records for that type of conflict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conflict {
     /// The conflict type string (e.g. `"text conflict"`, `"path conflict"`).
@@ -584,6 +664,15 @@ pub struct Conflict {
     pub path: String,
     /// The file id of the conflicted entry, if recorded.
     pub file_id: Option<Vec<u8>>,
+    /// How the conflict was handled when it was recorded (e.g. `"Moved
+    /// existing file to"`), for the conflict types breezy resolves on the
+    /// spot, such as `"duplicate"` or `"missing parent"`.
+    pub action: Option<String>,
+    /// The other path involved in the conflict: the entry's path on the OTHER
+    /// side of a path conflict, or the path the handled entry clashed with.
+    pub conflict_path: Option<String>,
+    /// The file id of the entry at `conflict_path`, if recorded.
+    pub conflict_file_id: Option<Vec<u8>>,
 }
 
 /// Open the working tree reachable through `transport` (rooted at the
@@ -679,6 +768,163 @@ impl WorkingTree4 {
         self.save_dirstate()
     }
 
+    /// Set the working tree's parent revisions to `revision_ids`, rewriting the
+    /// dirstate's parent columns.
+    ///
+    /// Each parent's per-entry tree data is fetched from `repository`; a parent
+    /// absent from the repository is recorded as a ghost. Parents that are
+    /// ancestors of a later parent are dropped (heads filtering), matching
+    /// breezy's `set_parent_trees`. The first parent must not be a ghost unless
+    /// `allow_leftmost_as_ghost`, and no parent may be a reserved id such as
+    /// `null:`.
+    pub fn set_parent_ids(
+        &mut self,
+        repository: &dyn crate::repository::Repository,
+        revision_ids: &[Vec<u8>],
+        allow_leftmost_as_ghost: bool,
+    ) -> Result<(), WorkingTreeError> {
+        // Which parents are present (have a tree) vs ghosts.
+        let present: Vec<bool> = revision_ids
+            .iter()
+            .map(|r| {
+                if r.as_slice() == crate::branch::NULL_REVISION {
+                    return Ok(true);
+                }
+                repository
+                    .has_revision(r)
+                    .map_err(WorkingTreeError::Repository)
+            })
+            .collect::<Result<_, _>>()?;
+        if let Some(false) = present.first() {
+            if !allow_leftmost_as_ghost {
+                return Err(WorkingTreeError::Commit(format!(
+                    "left-hand parent {} is a ghost",
+                    String::from_utf8_lossy(&revision_ids[0])
+                )));
+            }
+        }
+
+        // Heads filtering: drop a parent that is an ancestor of an
+        // already-accepted parent. The first parent is always accepted.
+        let heads = self.parent_heads(repository, revision_ids)?;
+        let mut accepted: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut kept: Vec<(Vec<u8>, bool)> = Vec::new();
+        for (rev_id, is_present) in revision_ids.iter().zip(&present) {
+            if !accepted.is_empty() && (accepted.contains(rev_id) || !heads.contains(rev_id)) {
+                continue;
+            }
+            if rev_id.ends_with(b":") {
+                return Err(WorkingTreeError::ReservedId(rev_id.clone()));
+            }
+            accepted.insert(rev_id.clone());
+            kept.push((rev_id.clone(), *is_present));
+        }
+
+        let mut parents = Vec::new();
+        let mut ghosts = Vec::new();
+        let mut per_parent = Vec::new();
+        for (rev_id, is_present) in kept {
+            parents.push(rev_id.clone());
+            if is_present {
+                per_parent.push(self.revision_tree_entries(repository, &rev_id)?);
+            } else {
+                // A ghost has no tree column in the dirstate.
+                ghosts.push(rev_id.clone());
+            }
+        }
+
+        self.dirstate
+            .set_parent_trees(parents, ghosts, per_parent)
+            .map_err(|e| WorkingTreeError::Commit(format!("set parents: {e:?}")))?;
+        self.save_dirstate()
+    }
+
+    /// Apply an inventory delta to the live working tree (dirstate tree-0),
+    /// then rewrite the dirstate to disk. This is the format-specific mutation
+    /// a tree transform performs when it applies.
+    pub fn apply_inventory_delta(
+        &mut self,
+        delta: &crate::inventory_delta::InventoryDelta,
+    ) -> Result<(), WorkingTreeError> {
+        self.dirstate
+            .update_by_delta_from_inventory_delta(delta)
+            .map_err(|e| WorkingTreeError::Commit(format!("apply inventory delta: {e:?}")))?;
+        self.save_dirstate()
+    }
+
+    /// The heads of `revision_ids` in the repository's revision graph: the
+    /// parents that are not ancestors of any other parent.
+    fn parent_heads(
+        &self,
+        repository: &dyn crate::repository::Repository,
+        revision_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashSet<Vec<u8>>, WorkingTreeError> {
+        // Build the ancestry closure of the parents, then let vcs-graph pick
+        // the heads.
+        let mut parent_map: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        let mut pending: Vec<Vec<u8>> = revision_ids
+            .iter()
+            .filter(|r| r.as_slice() != crate::branch::NULL_REVISION)
+            .cloned()
+            .collect();
+        while !pending.is_empty() {
+            let batch = std::mem::take(&mut pending);
+            let map = repository
+                .get_parent_map(&batch)
+                .map_err(|e| WorkingTreeError::Commit(format!("parent map: {e:?}")))?;
+            for (rev, parents) in map {
+                for p in &parents {
+                    if !parent_map.contains_key(p) && p.as_slice() != crate::branch::NULL_REVISION {
+                        pending.push(p.clone());
+                    }
+                }
+                parent_map.insert(rev, parents);
+            }
+        }
+        // A ghost (a parent absent from the repository) has no graph entry;
+        // give it empty parents so it is treated as its own head.
+        for rev_id in revision_ids {
+            if rev_id.as_slice() != crate::branch::NULL_REVISION {
+                parent_map.entry(rev_id.clone()).or_default();
+            }
+        }
+        let mut graph = vcs_graph::KnownGraph::new(parent_map, false);
+        Ok(graph
+            .heads(revision_ids.iter().cloned())
+            .into_iter()
+            .collect())
+    }
+
+    /// The `(path, file_id, TreeData)` entries of `revision_id`'s tree, for use
+    /// as a dirstate parent column.
+    fn revision_tree_entries(
+        &self,
+        repository: &dyn crate::repository::Repository,
+        revision_id: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, crate::dirstate::TreeData)>, WorkingTreeError> {
+        use crate::dirstate::{inv_entry_to_details, TreeData, NULLSTAT};
+        let tree = repository
+            .revision_tree(revision_id)
+            .map_err(|e| WorkingTreeError::Commit(format!("revision tree: {e:?}")))?;
+        let mut out = Vec::new();
+        for (path, entry) in tree.iter_entries() {
+            let (minikind, fingerprint, size, executable, _rev) = inv_entry_to_details(&entry);
+            out.push((
+                path.into_bytes(),
+                entry.file_id().as_bytes().to_vec(),
+                TreeData {
+                    minikind,
+                    fingerprint,
+                    size,
+                    executable,
+                    packed_stat: NULLSTAT.to_vec(),
+                },
+            ));
+        }
+        Ok(out)
+    }
+
     /// The basis (tree-1) entries as `(path, file_id, TreeData)`, for
     /// re-establishing the basis when changing the parent list.
     fn basis_tree_entries(&self) -> Vec<(Vec<u8>, Vec<u8>, crate::dirstate::TreeData)> {
@@ -720,6 +966,94 @@ impl WorkingTree4 {
             });
         }
         out
+    }
+
+    /// The live working tree's inventory entries as `(path, entry)` pairs in
+    /// path order, including the tree root as `("", root)`.
+    pub fn live_inventory_entries(
+        &self,
+    ) -> Result<Vec<(String, crate::inventory::Entry)>, WorkingTreeError> {
+        use crate::inventory::Entry as InvEntry;
+        use crate::{FileId, RevisionId};
+
+        // First pass: map each directory's path to its file id, so a child can
+        // name its parent. The root lives at path "".
+        let mut path_to_id: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        let mut root_id: Option<Vec<u8>> = None;
+        for entry in self.dirstate.iter_entries() {
+            let Some(td) = entry.trees.first() else {
+                continue;
+            };
+            if EntryKind::from_minikind(td.minikind).is_none() {
+                continue;
+            }
+            let path = join_path(&entry.key.dirname, &entry.key.basename);
+            if path.is_empty() {
+                root_id = Some(entry.key.file_id.clone());
+            } else if td.minikind == Kind::Directory {
+                path_to_id.insert(path, entry.key.file_id.clone());
+            }
+        }
+        let root_id =
+            root_id.ok_or_else(|| WorkingTreeError::Commit("dirstate has no root".to_string()))?;
+
+        let mut out: Vec<(String, InvEntry)> = Vec::new();
+        for entry in self.dirstate.iter_entries() {
+            let Some(td) = entry.trees.first() else {
+                continue;
+            };
+            let minikind = td.minikind;
+            if EntryKind::from_minikind(minikind).is_none() {
+                continue;
+            }
+            let path = join_path(&entry.key.dirname, &entry.key.basename);
+            let file_id = FileId::from(entry.key.file_id.clone());
+            if path.is_empty() {
+                out.push((String::new(), InvEntry::root(file_id, None)));
+                continue;
+            }
+            let name = String::from_utf8_lossy(&entry.key.basename).into_owned();
+            // The parent is the entry at this entry's dirname; a top-level
+            // entry's parent is the root.
+            let dirname = String::from_utf8_lossy(&entry.key.dirname).into_owned();
+            let parent_id = if dirname.is_empty() {
+                FileId::from(root_id.clone())
+            } else {
+                match path_to_id.get(&dirname) {
+                    Some(id) => FileId::from(id.clone()),
+                    None => {
+                        return Err(WorkingTreeError::Corrupt(format!(
+                            "dirstate entry {path} has no parent directory entry"
+                        )))
+                    }
+                }
+            };
+            let inv_entry = match minikind {
+                Kind::Directory => InvEntry::directory(file_id, name, parent_id, None),
+                // The sha1, size and link target in the dirstate are a cache
+                // of what was last seen on disk, not part of the entry.
+                Kind::File => InvEntry::file(
+                    file_id,
+                    name,
+                    parent_id,
+                    None,
+                    None,
+                    None,
+                    Some(td.executable),
+                    None,
+                ),
+                Kind::Symlink => InvEntry::link(file_id, name, parent_id, None, None),
+                Kind::TreeReference => {
+                    let reference = (!td.fingerprint.is_empty())
+                        .then(|| RevisionId::from(td.fingerprint.clone()));
+                    InvEntry::tree_reference(file_id, name, parent_id, None, reference)
+                }
+                Kind::Absent | Kind::Relocated => continue,
+            };
+            out.push((path, inv_entry));
+        }
+        Ok(out)
     }
 
     /// The file id of the entry at `path`, or `None` if `path` is not
@@ -1310,8 +1644,30 @@ impl WorkingTree for WorkingTree4 {
         WorkingTree4::add_pending_merge(self, revision_id)
     }
 
+    fn set_parent_ids(
+        &mut self,
+        repository: &dyn crate::repository::Repository,
+        revision_ids: &[Vec<u8>],
+        allow_leftmost_as_ghost: bool,
+    ) -> Result<(), WorkingTreeError> {
+        WorkingTree4::set_parent_ids(self, repository, revision_ids, allow_leftmost_as_ghost)
+    }
+
+    fn apply_inventory_delta(
+        &mut self,
+        delta: &crate::inventory_delta::InventoryDelta,
+    ) -> Result<(), WorkingTreeError> {
+        WorkingTree4::apply_inventory_delta(self, delta)
+    }
+
     fn list_files(&self) -> Vec<VersionedEntry> {
         WorkingTree4::list_files(self)
+    }
+
+    fn live_inventory_entries(
+        &self,
+    ) -> Result<Vec<(String, crate::inventory::Entry)>, WorkingTreeError> {
+        WorkingTree4::live_inventory_entries(self)
     }
 
     fn path2id(&self, path: &str) -> Option<Vec<u8>> {
@@ -1953,16 +2309,24 @@ mod conflicts_io {
         let stanzas = conflicts.iter().map(|c| {
             let mut s = Stanza::new();
             // `add` only fails on an invalid tag; these tags are constant.
-            let _ = s.add(
-                "type".to_string(),
-                StanzaValue::String(c.typestring.clone()),
-            );
-            let _ = s.add("path".to_string(), StanzaValue::String(c.path.clone()));
-            if let Some(fid) = &c.file_id {
-                let _ = s.add(
-                    "file_id".to_string(),
-                    StanzaValue::String(String::from_utf8_lossy(fid).into_owned()),
-                );
+            let mut add = |tag: &str, value: String| {
+                let _ = s.add(tag.to_string(), StanzaValue::String(value));
+            };
+            let file_id = |id: &Vec<u8>| String::from_utf8_lossy(id).into_owned();
+            // The order breezy writes the fields in.
+            add("path", c.path.clone());
+            add("type", c.typestring.clone());
+            if let Some(id) = &c.file_id {
+                add("file_id", file_id(id));
+            }
+            if let Some(action) = &c.action {
+                add("action", action.clone());
+            }
+            if let Some(conflict_path) = &c.conflict_path {
+                add("conflict_path", conflict_path.clone());
+            }
+            if let Some(id) = &c.conflict_file_id {
+                add("conflict_file_id", file_id(id));
             }
             s
         });
@@ -1986,12 +2350,61 @@ mod conflicts_io {
             let typestring =
                 get("type").ok_or_else(|| "conflict stanza missing 'type'".to_string())?;
             let path = get("path").ok_or_else(|| "conflict stanza missing 'path'".to_string())?;
-            let file_id = get("file_id").map(|s| s.into_bytes());
             out.push(Conflict {
                 typestring,
                 path,
-                file_id,
+                file_id: get("file_id").map(|s| s.into_bytes()),
+                action: get("action"),
+                conflict_path: get("conflict_path"),
+                conflict_file_id: get("conflict_file_id").map(|s| s.into_bytes()),
             });
+        }
+        Ok(out)
+    }
+}
+
+mod merge_modified_io {
+    use crate::rio::{read_stanzas, rio_iter, Stanza, StanzaValue};
+
+    // The header (without trailing newline; rio_iter appends one).
+    const HEADER: &[u8] = b"BZR merge-modified list format 1";
+    const HEADER_LINE: &[u8] = b"BZR merge-modified list format 1\n";
+
+    pub(super) fn serialize(hashes: &[super::MergeModifiedHash]) -> Vec<u8> {
+        let stanzas = hashes.iter().map(|(file_id, sha1)| {
+            let mut s = Stanza::new();
+            // The tags are constant, so `add` only fails on programmer error.
+            let _ = s.add(
+                "file_id".to_string(),
+                StanzaValue::String(String::from_utf8_lossy(file_id).into_owned()),
+            );
+            let _ = s.add(
+                "hash".to_string(),
+                StanzaValue::String(String::from_utf8_lossy(sha1).into_owned()),
+            );
+            s
+        });
+        rio_iter(stanzas, Some(HEADER.to_vec())).flatten().collect()
+    }
+
+    pub(super) fn deserialize(bytes: &[u8]) -> Result<Vec<super::MergeModifiedHash>, String> {
+        let rest = bytes
+            .strip_prefix(HEADER_LINE)
+            .ok_or_else(|| "missing 'BZR merge-modified list format 1' header".to_string())?;
+        let mut reader = std::io::BufReader::new(rest);
+        let stanzas =
+            read_stanzas(&mut reader).map_err(|e| format!("merge-modified rio: {e:?}"))?;
+        let mut out = Vec::new();
+        for stanza in stanzas {
+            let get = |tag: &str| match stanza.get(tag) {
+                Some(StanzaValue::String(s)) => Some(s.clone()),
+                _ => None,
+            };
+            let file_id = get("file_id")
+                .ok_or_else(|| "merge-modified stanza missing 'file_id'".to_string())?;
+            let hash =
+                get("hash").ok_or_else(|| "merge-modified stanza missing 'hash'".to_string())?;
+            out.push((file_id.into_bytes(), hash.into_bytes()));
         }
         Ok(out)
     }
@@ -2054,6 +2467,331 @@ mod tests {
         let inv = repo.get_inventory(&revid).unwrap();
         // An empty tree has only the root, so no non-root entries.
         assert!(inv.entries().unwrap().is_empty());
+    }
+
+    /// A tree with two commits to `a.txt`, returning its transport, control
+    /// directory and the two revision ids.
+    fn tree_with_two_commits() -> (
+        tempfile::TempDir,
+        SharedTransport,
+        BzrDirMeta,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let mut wt = cd.open_workingtree().unwrap();
+
+        parent.put_bytes("a.txt", b"one\n", None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        let r1 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "one").timestamp(1577880000),
+            )
+            .unwrap();
+
+        // Reopen the control objects (fresh basis/branch tip) before the
+        // second commit.
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        parent.put_bytes("a.txt", b"two\n", None).unwrap();
+        let r2 = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &CommitOptions::new("T <t@e>", "two").timestamp(1577880001),
+            )
+            .unwrap();
+        (dir, parent, cd, r1, r2)
+    }
+
+    #[test]
+    fn set_parent_ids_rewrites_the_dirstate_basis() {
+        let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
+        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        assert_eq!(wt.parent_ids(), vec![r2.clone()]);
+
+        // Point the tree's parent back at r1; the dirstate basis follows.
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let repo = cd.open_repository().unwrap();
+        wt.set_parent_ids(repo.as_ref(), std::slice::from_ref(&r1), false)
+            .unwrap();
+        assert_eq!(wt.parent_ids(), vec![r1.clone()]);
+        // The basis is persisted.
+        let reread = WorkingTree4::open(parent.clone()).unwrap();
+        assert_eq!(reread.basis_revision().as_deref(), Some(r1.as_slice()));
+
+        // Setting no parents clears the basis.
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        wt.set_parent_ids(repo.as_ref(), &[], false).unwrap();
+        assert_eq!(wt.parent_ids(), Vec::<Vec<u8>>::new());
+
+        // A ghost merge parent (absent from the repository) is kept alongside
+        // the present basis.
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        wt.set_parent_ids(repo.as_ref(), &[r1.clone(), b"ghost-rev".to_vec()], false)
+            .unwrap();
+        assert_eq!(wt.parent_ids(), vec![r1.clone(), b"ghost-rev".to_vec()]);
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.parent_ids(), vec![r1, b"ghost-rev".to_vec()]);
+        assert_eq!(reread.path2id("a.txt"), wt.path2id("a.txt"));
+    }
+
+    /// A parent that is an ancestor of another parent is dropped.
+    #[test]
+    fn set_parent_ids_drops_ancestor_parents() {
+        let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
+        let repo = cd.open_repository().unwrap();
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        wt.set_parent_ids(repo.as_ref(), &[r2.clone(), r1], false)
+            .unwrap();
+        assert_eq!(wt.parent_ids(), vec![r2.clone()]);
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.parent_ids(), vec![r2]);
+    }
+
+    #[test]
+    fn set_parent_ids_leftmost_ghost() {
+        let (_dir, parent, cd, _r1, r2) = tree_with_two_commits();
+        let repo = cd.open_repository().unwrap();
+        let ghost = b"ghost-rev".to_vec();
+
+        // A ghost is refused as the left-hand parent, leaving the parents
+        // untouched.
+        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        match wt.set_parent_ids(repo.as_ref(), std::slice::from_ref(&ghost), false) {
+            Err(WorkingTreeError::Commit(message)) => {
+                assert_eq!(message, "left-hand parent ghost-rev is a ghost")
+            }
+            other => panic!("expected a ghost error, got {:?}", other),
+        }
+        assert_eq!(wt.parent_ids(), vec![r2]);
+
+        // Unless the caller allows it.
+        wt.set_parent_ids(repo.as_ref(), std::slice::from_ref(&ghost), true)
+            .unwrap();
+        assert_eq!(wt.parent_ids(), vec![ghost.clone()]);
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.parent_ids(), vec![ghost]);
+    }
+
+    /// A reserved revision id such as `null:` cannot be a parent.
+    #[test]
+    fn set_parent_ids_rejects_reserved_ids() {
+        let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
+        let repo = cd.open_repository().unwrap();
+        let mut wt = WorkingTree4::open(parent).unwrap();
+        for parents in [
+            vec![crate::branch::NULL_REVISION.to_vec()],
+            vec![r1, b"current:".to_vec()],
+        ] {
+            let reserved = parents.last().unwrap().clone();
+            match wt.set_parent_ids(repo.as_ref(), &parents, false) {
+                Err(WorkingTreeError::ReservedId(revision_id)) => {
+                    assert_eq!(revision_id, reserved)
+                }
+                other => panic!("expected a reserved id error, got {:?}", other),
+            }
+            assert_eq!(wt.parent_ids(), vec![r2.clone()]);
+        }
+    }
+
+    use crate::repository::RepositoryError;
+
+    /// A repository whose revision index cannot be read.
+    struct UnreadableRepository;
+
+    impl crate::repository::Repository for UnreadableRepository {
+        fn format(&self) -> &'static crate::repository::RepositoryFormat {
+            unimplemented!()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn all_revision_ids(&self) -> Result<Vec<Vec<u8>>, RepositoryError> {
+            unimplemented!()
+        }
+        fn get_parent_map(
+            &self,
+            _revision_ids: &[Vec<u8>],
+        ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>>, RepositoryError> {
+            Err(RepositoryError::Corrupt("unreadable index".to_string()))
+        }
+        fn get_revision(
+            &self,
+            _revision_id: &[u8],
+        ) -> Result<crate::revision::Revision, RepositoryError> {
+            unimplemented!()
+        }
+        fn get_inventory(
+            &self,
+            _revision_id: &[u8],
+        ) -> Result<Box<dyn crate::inventory::Inventory>, RepositoryError> {
+            unimplemented!()
+        }
+        fn get_file_text(
+            &self,
+            _file_id: &[u8],
+            _revision: &[u8],
+        ) -> Result<Vec<u8>, RepositoryError> {
+            unimplemented!()
+        }
+        fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        fn add_revision(
+            &mut self,
+            _revision: &crate::revision::Revision,
+            _parents: &[Vec<u8>],
+        ) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        fn add_inventory_from_entries(
+            &mut self,
+            _revision_id: &[u8],
+            _parents: &[Vec<u8>],
+            _root_id: &[u8],
+            _entries: &[crate::inventory::Entry],
+        ) -> Result<Vec<u8>, RepositoryError> {
+            unimplemented!()
+        }
+        fn add_inventory_by_delta(
+            &mut self,
+            _basis_revision_id: &[u8],
+            _delta: &crate::inventory_delta::InventoryDelta,
+            _new_revision_id: &[u8],
+            _parents: &[Vec<u8>],
+        ) -> Result<Vec<u8>, RepositoryError> {
+            unimplemented!()
+        }
+        fn add_text(
+            &mut self,
+            _file_id: &[u8],
+            _revision: &[u8],
+            _parents: &[(Vec<u8>, Vec<u8>)],
+            _bytes: &[u8],
+        ) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        fn add_signature_text(
+            &mut self,
+            _revision_id: &[u8],
+            _signature: &[u8],
+        ) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        fn get_signature_text(
+            &self,
+            _revision_id: &[u8],
+        ) -> Result<Option<Vec<u8>>, RepositoryError> {
+            unimplemented!()
+        }
+        fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+    }
+
+    /// A parent the repository could not be asked about is an error, not a
+    /// ghost.
+    #[test]
+    fn set_parent_ids_propagates_repository_errors() {
+        let (_dir, parent, _cd, r1, r2) = tree_with_two_commits();
+        let mut wt = WorkingTree4::open(parent).unwrap();
+        match wt.set_parent_ids(&UnreadableRepository, std::slice::from_ref(&r1), true) {
+            Err(WorkingTreeError::Repository(RepositoryError::Corrupt(message))) => {
+                assert_eq!(message, "unreadable index")
+            }
+            other => panic!("expected a repository error, got {:?}", other),
+        }
+        assert_eq!(wt.parent_ids(), vec![r2]);
+    }
+
+    #[test]
+    fn apply_inventory_delta_versions_a_new_file() {
+        use crate::inventory::Entry;
+        use crate::inventory_delta::{InventoryDelta, InventoryDeltaEntry};
+        use crate::FileId;
+
+        let (_d, parent, mut wt) = fresh_tree();
+        // The dirstate root id is needed as the new file's parent.
+        let root_id = wt.path2id("").unwrap();
+        parent.put_bytes("new.txt", b"hi\n", None).unwrap();
+
+        let entry = Entry::file(
+            FileId::from(b"new-id".to_vec()),
+            "new.txt".to_string(),
+            FileId::from(root_id),
+            None,
+            None,
+            Some(3),
+            Some(false),
+            None,
+        );
+        let delta = InventoryDelta(vec![InventoryDeltaEntry {
+            old_path: None,
+            new_path: Some("new.txt".to_string()),
+            file_id: FileId::from(b"new-id".to_vec()),
+            new_entry: Some(entry),
+        }]);
+        wt.apply_inventory_delta(&delta).unwrap();
+
+        // The file is now versioned, and the change persists to disk.
+        assert_eq!(wt.path2id("new.txt"), Some(b"new-id".to_vec()));
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.path2id("new.txt"), Some(b"new-id".to_vec()));
+    }
+
+    #[test]
+    fn apply_inventory_delta_removes_and_renames() {
+        use crate::inventory::Entry;
+        use crate::inventory_delta::{InventoryDelta, InventoryDeltaEntry};
+        use crate::FileId;
+
+        let (_d, parent, mut wt) = fresh_tree();
+        let root_id = wt.path2id("").unwrap();
+        parent.put_bytes("gone.txt", b"gone\n", None).unwrap();
+        parent.put_bytes("old.txt", b"moved\n", None).unwrap();
+        wt.add("gone.txt", EntryKind::File, None).unwrap();
+        wt.add("old.txt", EntryKind::File, None).unwrap();
+        let gone_id = wt.path2id("gone.txt").unwrap();
+        let moved_id = wt.path2id("old.txt").unwrap();
+
+        let renamed = Entry::file(
+            FileId::from(moved_id.clone()),
+            "new.txt".to_string(),
+            FileId::from(root_id),
+            None,
+            None,
+            Some(6),
+            Some(false),
+            None,
+        );
+        let delta = InventoryDelta(vec![
+            InventoryDeltaEntry {
+                old_path: Some("gone.txt".to_string()),
+                new_path: None,
+                file_id: FileId::from(gone_id),
+                new_entry: None,
+            },
+            InventoryDeltaEntry {
+                old_path: Some("old.txt".to_string()),
+                new_path: Some("new.txt".to_string()),
+                file_id: FileId::from(moved_id.clone()),
+                new_entry: Some(renamed),
+            },
+        ]);
+        wt.apply_inventory_delta(&delta).unwrap();
+
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.path2id("gone.txt"), None);
+        assert_eq!(reread.path2id("old.txt"), None);
+        assert_eq!(reread.path2id("new.txt"), Some(moved_id));
     }
 
     /// Create an all-in-one weave control dir, add a file, commit, then
@@ -2443,6 +3181,137 @@ mod tests {
         assert!(changes[0].new_executable);
         // Only the exec bit changed, so the content did not.
         assert!(!changes[0].content_change);
+    }
+
+    /// live_inventory_entries returns the root, directories and files with
+    /// each entry's name, kind and parent id resolved from the dirstate.
+    #[test]
+    fn live_inventory_entries_lists_versioned_entries() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.mkdir("sub").unwrap();
+        parent.put_bytes("a.txt", b"a\n", None).unwrap();
+        parent.put_bytes("sub/b.txt", b"b\n", None).unwrap();
+        wt.add("sub", EntryKind::Directory, None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        wt.add("sub/b.txt", EntryKind::File, None).unwrap();
+
+        let entries = wt.live_inventory_entries().unwrap();
+        let by_path: std::collections::HashMap<&str, &crate::inventory::Entry> =
+            entries.iter().map(|(p, e)| (p.as_str(), e)).collect();
+
+        // The root has no parent.
+        let root = by_path[""];
+        assert!(matches!(root, crate::inventory::Entry::Root { .. }));
+        let root_id = root.file_id().clone();
+
+        // Top-level entries name the root as their parent.
+        let a = by_path["a.txt"];
+        assert_eq!(a.kind(), crate::osutils::Kind::File);
+        assert_eq!(a.name(), "a.txt");
+        assert_eq!(a.parent_id(), Some(&root_id));
+
+        let sub = by_path["sub"];
+        assert_eq!(sub.kind(), crate::osutils::Kind::Directory);
+        assert_eq!(sub.parent_id(), Some(&root_id));
+
+        // A nested file names its directory as parent.
+        let b = by_path["sub/b.txt"];
+        assert_eq!(b.name(), "b.txt");
+        assert_eq!(b.parent_id(), Some(sub.file_id()));
+    }
+
+    /// The sha1, size and link target the dirstate caches are not reported,
+    /// as in breezy's working tree inventory.
+    #[test]
+    fn live_inventory_entries_omit_cached_details() {
+        use crate::inventory::Entry;
+
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("a.txt", b"contents\n", None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        wt.add("link", EntryKind::Symlink, None).unwrap();
+        // Fill in the cache as a stat of the tree would.
+        for block in wt.dirstate.dirblocks.iter_mut() {
+            for entry in block.entries.iter_mut() {
+                if entry.key.basename == b"a.txt" {
+                    entry.trees[0].fingerprint =
+                        b"0f0e0d0c0b0a09080706050403020100deadbeef".to_vec();
+                    entry.trees[0].size = 9;
+                } else if entry.key.basename == b"link" {
+                    entry.trees[0].fingerprint = b"a.txt".to_vec();
+                }
+            }
+        }
+
+        let entries = wt.live_inventory_entries().unwrap();
+        match &entries[1].1 {
+            Entry::File {
+                text_sha1,
+                text_size,
+                executable,
+                ..
+            } => {
+                assert_eq!(text_sha1, &None);
+                assert_eq!(text_size, &None);
+                assert!(!executable);
+            }
+            other => panic!("expected a file entry, got {:?}", other),
+        }
+        match &entries[2].1 {
+            Entry::Link { symlink_target, .. } => assert_eq!(symlink_target, &None),
+            other => panic!("expected a link entry, got {:?}", other),
+        }
+    }
+
+    /// An entry whose directory is not in the tree means the dirstate is
+    /// inconsistent.
+    #[test]
+    fn live_inventory_entries_rejects_an_entry_without_parent() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.mkdir("sub").unwrap();
+        parent.put_bytes("sub/b.txt", b"b\n", None).unwrap();
+        wt.add("sub", EntryKind::Directory, None).unwrap();
+        wt.add("sub/b.txt", EntryKind::File, None).unwrap();
+
+        // Drop the directory from the tree while keeping its child.
+        for block in wt.dirstate.dirblocks.iter_mut() {
+            for entry in block.entries.iter_mut() {
+                if entry.key.dirname.is_empty() && entry.key.basename == b"sub" {
+                    entry.trees[0].minikind = Kind::Absent;
+                }
+            }
+        }
+
+        match wt.live_inventory_entries() {
+            Err(WorkingTreeError::Corrupt(message)) => assert_eq!(
+                message,
+                "dirstate entry sub/b.txt has no parent directory entry"
+            ),
+            other => panic!("expected a corrupt dirstate, got {:?}", other),
+        }
+    }
+
+    /// A symlink is listed as a link entry, and the entries come in path
+    /// order after the root.
+    #[cfg(unix)]
+    #[test]
+    fn live_inventory_entries_lists_a_symlink() {
+        let (_d, parent, mut wt) = fresh_tree();
+        parent.put_bytes("target.txt", b"contents\n", None).unwrap();
+        std::os::unix::fs::symlink("target.txt", parent.local_path("link").unwrap()).unwrap();
+        wt.add("target.txt", EntryKind::File, None).unwrap();
+        let link_id = wt.add("link", EntryKind::Symlink, None).unwrap();
+
+        let entries = wt.live_inventory_entries().unwrap();
+        let paths: Vec<&str> = entries.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["", "link", "target.txt"]);
+
+        let root_id = entries[0].1.file_id().clone();
+        let link = &entries[1].1;
+        assert_eq!(link.kind(), crate::osutils::Kind::Symlink);
+        assert_eq!(link.name(), "link");
+        assert_eq!(link.file_id().as_bytes(), link_id.as_slice());
+        assert_eq!(link.parent_id(), Some(&root_id));
     }
 
     /// A second commit that changes one file records that file at the new
@@ -3299,6 +4168,57 @@ mod tests {
         ));
     }
 
+    /// A conflict list as breezy writes it: a path conflict, a text conflict
+    /// and two conflicts it handled on the spot.
+    const BREEZY_CONFLICTS: &[u8] = b"BZR conflict list format 1\n\
+        path: dir/b\n\
+        type: path conflict\n\
+        file_id: b-id\n\
+        conflict_path: dir/c\n\
+        \n\
+        path: a.txt\n\
+        type: text conflict\n\
+        file_id: a-id\n\
+        \n\
+        path: x.moved\n\
+        type: duplicate\n\
+        file_id: x-id\n\
+        action: Moved existing file to\n\
+        conflict_path: x\n\
+        conflict_file_id: y-id\n\
+        \n\
+        path: d\n\
+        type: missing parent\n\
+        action: Created directory\n";
+
+    fn breezy_conflicts() -> Vec<Conflict> {
+        let conflict = |typestring: &str, path: &str, file_id: Option<&[u8]>| Conflict {
+            typestring: typestring.to_string(),
+            path: path.to_string(),
+            file_id: file_id.map(|id| id.to_vec()),
+            action: None,
+            conflict_path: None,
+            conflict_file_id: None,
+        };
+        vec![
+            Conflict {
+                conflict_path: Some("dir/c".to_string()),
+                ..conflict("path conflict", "dir/b", Some(b"b-id"))
+            },
+            conflict("text conflict", "a.txt", Some(b"a-id")),
+            Conflict {
+                action: Some("Moved existing file to".to_string()),
+                conflict_path: Some("x".to_string()),
+                conflict_file_id: Some(b"y-id".to_vec()),
+                ..conflict("duplicate", "x.moved", Some(b"x-id"))
+            },
+            Conflict {
+                action: Some("Created directory".to_string()),
+                ..conflict("missing parent", "d", None)
+            },
+        ]
+    }
+
     /// Conflicts round-trip through the `conflicts` file.
     #[test]
     fn conflicts_round_trip() {
@@ -3309,25 +4229,61 @@ mod tests {
         // None initially (the create path writes a header-only file).
         assert!(wt.conflicts().unwrap().is_empty());
 
-        let conflicts = vec![
-            Conflict {
-                typestring: "text conflict".to_string(),
-                path: "a.txt".to_string(),
-                file_id: Some(b"a-id".to_vec()),
-            },
-            Conflict {
-                typestring: "path conflict".to_string(),
-                path: "dir/b".to_string(),
-                file_id: None,
-            },
-        ];
-        wt.set_conflicts(&conflicts).unwrap();
-
-        // The file starts with the breezy header.
-        let on_disk = parent.get_bytes(".bzr/checkout/conflicts").unwrap();
-        assert!(on_disk.starts_with(b"BZR conflict list format 1\n"));
+        wt.set_conflicts(&breezy_conflicts()).unwrap();
 
         let reread = WorkingTree4::open(parent).unwrap();
-        assert_eq!(reread.conflicts().unwrap(), conflicts);
+        assert_eq!(reread.conflicts().unwrap(), breezy_conflicts());
+    }
+
+    /// The conflicts file has the layout breezy gives it.
+    #[test]
+    fn conflicts_are_written_as_breezy_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        let wt = cd.open_workingtree().unwrap();
+        wt.set_conflicts(&breezy_conflicts()).unwrap();
+        assert_eq!(
+            String::from_utf8(parent.get_bytes(".bzr/checkout/conflicts").unwrap()).unwrap(),
+            String::from_utf8(BREEZY_CONFLICTS.to_vec()).unwrap()
+        );
+    }
+
+    /// Every field of a conflict breezy wrote is read back.
+    #[test]
+    fn conflicts_written_by_breezy_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        parent
+            .put_bytes(".bzr/checkout/conflicts", BREEZY_CONFLICTS, None)
+            .unwrap();
+        assert_eq!(
+            cd.open_workingtree().unwrap().conflicts().unwrap(),
+            breezy_conflicts()
+        );
+    }
+
+    #[test]
+    fn merge_modified_hashes_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        let wt = cd.open_workingtree().unwrap();
+        // No merge-hashes file initially.
+        assert!(wt.merge_modified_hashes().unwrap().is_empty());
+
+        let hashes = vec![
+            (b"a-id".to_vec(), b"0123456789abcdef".to_vec()),
+            (b"b-id".to_vec(), b"fedcba9876543210".to_vec()),
+        ];
+        wt.set_merge_modified_hashes(&hashes).unwrap();
+
+        // The file starts with the breezy header.
+        let on_disk = parent.get_bytes(".bzr/checkout/merge-hashes").unwrap();
+        assert!(on_disk.starts_with(b"BZR merge-modified list format 1\n"));
+
+        let reread = WorkingTree4::open(parent).unwrap();
+        assert_eq!(reread.merge_modified_hashes().unwrap(), hashes);
     }
 }
