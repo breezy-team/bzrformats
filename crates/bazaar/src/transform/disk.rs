@@ -41,6 +41,9 @@ pub struct DiskTreeTransform<T: TransformTree> {
     create_symlinks: bool,
     /// Whether apply must still consult the mode/mtime (set once created).
     creation_done: HashSet<String>,
+    /// The modification time every file staged by this transform is given,
+    /// taken when the first one is created.
+    creation_mtime: Option<std::time::SystemTime>,
 }
 
 impl<T: TransformTree> DiskTreeTransform<T> {
@@ -55,6 +58,7 @@ impl<T: TransformTree> DiskTreeTransform<T> {
             observed_sha1s: HashMap::new(),
             create_symlinks,
             creation_done: HashSet::new(),
+            creation_mtime: None,
         }
     }
 
@@ -84,6 +88,30 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         self.limbo_files.get(trans_id).map(PathBuf::as_path)
     }
 
+    /// Check that no contents are staged for `trans_id` yet.
+    fn check_no_contents(&self, trans_id: &str) -> Result<(), Error> {
+        if self.base.new_contents_map().contains_key(trans_id) {
+            return Err(Error::DuplicateKey(format!("{trans_id:?}")));
+        }
+        Ok(())
+    }
+
+    /// Give the file staged at `path` the modification time shared by all
+    /// files this transform creates (breezy's `_set_mtime`).
+    fn set_mtime(&mut self, path: &Path) -> Result<(), Error> {
+        let mtime = *self
+            .creation_mtime
+            .get_or_insert_with(std::time::SystemTime::now);
+        let times = std::fs::FileTimes::new()
+            .set_accessed(mtime)
+            .set_modified(mtime);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_times(times))
+            .map_err(io_err)
+    }
+
     /// Stage a new file with `contents` for `trans_id`. `sha1`, when known,
     /// is recorded so apply can seed the tree's stat cache.
     pub fn create_file(
@@ -92,10 +120,12 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         trans_id: &str,
         sha1: Option<Vec<u8>>,
     ) -> Result<(), Error> {
+        self.check_no_contents(trans_id)?;
         let name = self.limbo_name(trans_id);
         std::fs::write(&name, contents).map_err(io_err)?;
         self.base.set_new_contents(trans_id, ContentKind::File);
         self.creation_done.insert(trans_id.to_string());
+        self.set_mtime(&name)?;
         if let Some(sha1) = sha1 {
             self.observed_sha1s
                 .insert(trans_id.to_string(), (sha1, contents.len() as u64));
@@ -105,6 +135,7 @@ impl<T: TransformTree> DiskTreeTransform<T> {
 
     /// Stage a new directory for `trans_id`.
     pub fn create_directory(&mut self, trans_id: &str) -> Result<(), Error> {
+        self.check_no_contents(trans_id)?;
         let name = self.limbo_name(trans_id);
         std::fs::create_dir(&name).map_err(io_err)?;
         self.base.set_new_contents(trans_id, ContentKind::Directory);
@@ -158,6 +189,7 @@ impl<T: TransformTree> DiskTreeTransform<T> {
     /// symlink support the link is not created, but the content is still
     /// recorded (matching breezy) so conflict detection is consistent.
     pub fn create_symlink(&mut self, target: &str, trans_id: &str) -> Result<(), Error> {
+        self.check_no_contents(trans_id)?;
         let name = self.limbo_name(trans_id);
         if self.create_symlinks {
             symlink(target, &name).map_err(io_err)?;
@@ -367,6 +399,45 @@ mod tests {
             "target"
         );
         assert_eq!(tt.base().final_kind(&tid), Some(Kind::Symlink));
+    }
+
+    /// Contents can be staged for a trans-id only once.
+    #[test]
+    fn staging_contents_twice_is_refused() {
+        let (_d, mut tt) = disk_tt();
+        let root = tt.base().root().unwrap().to_string();
+        let tid = tt.base_mut().create_path("f.txt", &root).unwrap();
+        tt.create_file(b"first\n", &tid, None).unwrap();
+        for result in [
+            tt.create_file(b"second\n", &tid, None),
+            tt.create_directory(&tid),
+            tt.create_symlink("target", &tid),
+        ] {
+            match result {
+                Err(Error::DuplicateKey(key)) => assert_eq!(key, format!("{tid:?}")),
+                other => panic!("expected a duplicate key, got {:?}", other),
+            }
+        }
+        assert_eq!(std::fs::read(tt.limbo_name(&tid)).unwrap(), b"first\n");
+    }
+
+    /// Every file a transform creates gets the same modification time.
+    #[test]
+    fn created_files_share_an_mtime() {
+        let (_d, mut tt) = disk_tt();
+        let root = tt.base().root().unwrap().to_string();
+        let first = tt.base_mut().create_path("first", &root).unwrap();
+        tt.create_file(b"1", &first, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = tt.base_mut().create_path("second", &root).unwrap();
+        tt.create_file(b"2", &second, None).unwrap();
+        let mtime = |tt: &mut DiskTreeTransform<FakeTree>, tid: &str| {
+            std::fs::metadata(tt.limbo_name(tid))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        assert_eq!(mtime(&mut tt, &first), mtime(&mut tt, &second));
     }
 
     #[test]
