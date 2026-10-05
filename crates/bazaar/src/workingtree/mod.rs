@@ -1271,11 +1271,20 @@ impl WorkingTree4 {
                 root_id = entry.key.file_id.clone();
                 continue;
             }
+            // The dirstate's cached executable bit can lag behind the disk
+            // (e.g. a chmod that has not been flushed). When the tree trusts
+            // the filesystem for executability, re-read the live bit from disk
+            // for files, matching breezy's _process_entry.
+            let executable = if kind == EntryKind::File && self.dirstate.use_filesystem_for_exec {
+                disk_executable(&self.transport, &path).unwrap_or(tree0.executable)
+            } else {
+                tree0.executable
+            };
             entries.push(LiveEntry {
                 path,
                 file_id: entry.key.file_id.clone(),
                 kind,
-                executable: tree0.executable,
+                executable,
                 // For symlinks the dirstate fingerprint is the link target.
                 symlink_target: if kind == EntryKind::Symlink {
                     tree0.fingerprint.clone()
@@ -1659,6 +1668,24 @@ fn content_changed(
 /// path. The dirstate backend reads and hashes directly; the format-3 backend
 /// consults its stat cache so unchanged files are not re-hashed.
 type FileSha<'a> = dyn Fn(&str) -> Result<Vec<u8>, WorkingTreeError> + 'a;
+
+/// The live executable bit of the working-tree file at `path`, read from
+/// disk. Returns `None` when the transport is not local or the file cannot be
+/// stat'd, and always `Some(false)` on platforms without a Unix mode.
+fn disk_executable(transport: &SharedTransport, path: &str) -> Option<bool> {
+    let local = transport.local_path(path)?;
+    let metadata = std::fs::metadata(local).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Some(false)
+    }
+}
 
 /// A [`FileSha`] that reads the file through `transport` and hashes it (no
 /// caching). Used by the dirstate backend, whose stat caching lives in the
@@ -2377,6 +2404,45 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].old_path.as_deref(), Some("a.txt"));
         assert_eq!(changes[0].new_path, None);
+    }
+
+    /// An executable-bit change on disk that the dirstate has not yet
+    /// recorded is still reported, because iter_changes reads the live bit
+    /// from the filesystem.
+    #[cfg(unix)]
+    #[test]
+    fn iter_changes_reports_executable_bit_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, parent, mut wt) = fresh_tree();
+        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        parent.put_bytes("a.txt", b"hello\n", None).unwrap();
+        wt.add("a.txt", EntryKind::File, None).unwrap();
+        let mut repo = cd.open_repository().unwrap();
+        let branch = cd.open_branch().unwrap();
+        let revid = wt
+            .commit(
+                repo.as_mut(),
+                &branch,
+                &crate::workingtree::CommitOptions::new("T <t@e>", "add a").timestamp(1577880000),
+            )
+            .unwrap();
+
+        // chmod +x on disk without any dirstate update.
+        let path = parent.local_path("a.txt").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(perms.mode() | 0o111);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let repo = cd.open_repository().unwrap();
+        let basis = repo.revision_tree(&revid).unwrap();
+        let changes = wt.iter_changes(&basis).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].new_path.as_deref(), Some("a.txt"));
+        assert!(changes[0].new_executable);
+        // Only the exec bit changed, so the content did not.
+        assert!(!changes[0].content_change);
     }
 
     /// A second commit that changes one file records that file at the new
