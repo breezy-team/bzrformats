@@ -654,7 +654,8 @@ impl ViewInfo {
 }
 
 /// One recorded conflict, mirroring a stanza in the `conflicts` file: a
-/// conflict type, the tree path it affects, and (optionally) the file id.
+/// conflict type, the tree path it affects, and the optional details breezy
+/// records for that type of conflict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conflict {
     /// The conflict type string (e.g. `"text conflict"`, `"path conflict"`).
@@ -663,9 +664,15 @@ pub struct Conflict {
     pub path: String,
     /// The file id of the conflicted entry, if recorded.
     pub file_id: Option<Vec<u8>>,
-    /// The other path involved in the conflict (path conflicts only): the
-    /// entry's path on the OTHER side.
+    /// How the conflict was handled when it was recorded (e.g. `"Moved
+    /// existing file to"`), for the conflict types breezy resolves on the
+    /// spot, such as `"duplicate"` or `"missing parent"`.
+    pub action: Option<String>,
+    /// The other path involved in the conflict: the entry's path on the OTHER
+    /// side of a path conflict, or the path the handled entry clashed with.
     pub conflict_path: Option<String>,
+    /// The file id of the entry at `conflict_path`, if recorded.
+    pub conflict_file_id: Option<Vec<u8>>,
 }
 
 /// Open the working tree reachable through `transport` (rooted at the
@@ -2302,22 +2309,24 @@ mod conflicts_io {
         let stanzas = conflicts.iter().map(|c| {
             let mut s = Stanza::new();
             // `add` only fails on an invalid tag; these tags are constant.
-            let _ = s.add(
-                "type".to_string(),
-                StanzaValue::String(c.typestring.clone()),
-            );
-            let _ = s.add("path".to_string(), StanzaValue::String(c.path.clone()));
-            if let Some(fid) = &c.file_id {
-                let _ = s.add(
-                    "file_id".to_string(),
-                    StanzaValue::String(String::from_utf8_lossy(fid).into_owned()),
-                );
+            let mut add = |tag: &str, value: String| {
+                let _ = s.add(tag.to_string(), StanzaValue::String(value));
+            };
+            let file_id = |id: &Vec<u8>| String::from_utf8_lossy(id).into_owned();
+            // The order breezy writes the fields in.
+            add("path", c.path.clone());
+            add("type", c.typestring.clone());
+            if let Some(id) = &c.file_id {
+                add("file_id", file_id(id));
+            }
+            if let Some(action) = &c.action {
+                add("action", action.clone());
             }
             if let Some(conflict_path) = &c.conflict_path {
-                let _ = s.add(
-                    "conflict_path".to_string(),
-                    StanzaValue::String(conflict_path.clone()),
-                );
+                add("conflict_path", conflict_path.clone());
+            }
+            if let Some(id) = &c.conflict_file_id {
+                add("conflict_file_id", file_id(id));
             }
             s
         });
@@ -2341,13 +2350,13 @@ mod conflicts_io {
             let typestring =
                 get("type").ok_or_else(|| "conflict stanza missing 'type'".to_string())?;
             let path = get("path").ok_or_else(|| "conflict stanza missing 'path'".to_string())?;
-            let file_id = get("file_id").map(|s| s.into_bytes());
-            let conflict_path = get("conflict_path");
             out.push(Conflict {
                 typestring,
                 path,
-                file_id,
-                conflict_path,
+                file_id: get("file_id").map(|s| s.into_bytes()),
+                action: get("action"),
+                conflict_path: get("conflict_path"),
+                conflict_file_id: get("conflict_file_id").map(|s| s.into_bytes()),
             });
         }
         Ok(out)
@@ -4159,6 +4168,57 @@ mod tests {
         ));
     }
 
+    /// A conflict list as breezy writes it: a path conflict, a text conflict
+    /// and two conflicts it handled on the spot.
+    const BREEZY_CONFLICTS: &[u8] = b"BZR conflict list format 1\n\
+        path: dir/b\n\
+        type: path conflict\n\
+        file_id: b-id\n\
+        conflict_path: dir/c\n\
+        \n\
+        path: a.txt\n\
+        type: text conflict\n\
+        file_id: a-id\n\
+        \n\
+        path: x.moved\n\
+        type: duplicate\n\
+        file_id: x-id\n\
+        action: Moved existing file to\n\
+        conflict_path: x\n\
+        conflict_file_id: y-id\n\
+        \n\
+        path: d\n\
+        type: missing parent\n\
+        action: Created directory\n";
+
+    fn breezy_conflicts() -> Vec<Conflict> {
+        let conflict = |typestring: &str, path: &str, file_id: Option<&[u8]>| Conflict {
+            typestring: typestring.to_string(),
+            path: path.to_string(),
+            file_id: file_id.map(|id| id.to_vec()),
+            action: None,
+            conflict_path: None,
+            conflict_file_id: None,
+        };
+        vec![
+            Conflict {
+                conflict_path: Some("dir/c".to_string()),
+                ..conflict("path conflict", "dir/b", Some(b"b-id"))
+            },
+            conflict("text conflict", "a.txt", Some(b"a-id")),
+            Conflict {
+                action: Some("Moved existing file to".to_string()),
+                conflict_path: Some("x".to_string()),
+                conflict_file_id: Some(b"y-id".to_vec()),
+                ..conflict("duplicate", "x.moved", Some(b"x-id"))
+            },
+            Conflict {
+                action: Some("Created directory".to_string()),
+                ..conflict("missing parent", "d", None)
+            },
+        ]
+    }
+
     /// Conflicts round-trip through the `conflicts` file.
     #[test]
     fn conflicts_round_trip() {
@@ -4169,91 +4229,38 @@ mod tests {
         // None initially (the create path writes a header-only file).
         assert!(wt.conflicts().unwrap().is_empty());
 
-        let conflicts = vec![
-            Conflict {
-                typestring: "text conflict".to_string(),
-                path: "a.txt".to_string(),
-                file_id: Some(b"a-id".to_vec()),
-                conflict_path: None,
-            },
-            Conflict {
-                typestring: "path conflict".to_string(),
-                path: "dir/b".to_string(),
-                file_id: None,
-                conflict_path: Some("dir/c".to_string()),
-            },
-        ];
-        wt.set_conflicts(&conflicts).unwrap();
-
-        // The file starts with the breezy header.
-        let on_disk = parent.get_bytes(".bzr/checkout/conflicts").unwrap();
-        assert!(on_disk.starts_with(b"BZR conflict list format 1\n"));
+        wt.set_conflicts(&breezy_conflicts()).unwrap();
 
         let reread = WorkingTree4::open(parent).unwrap();
-        assert_eq!(reread.conflicts().unwrap(), conflicts);
+        assert_eq!(reread.conflicts().unwrap(), breezy_conflicts());
     }
 
-    /// A path conflict records the other path under the `conflict_path`
-    /// keyword, after the keywords every conflict has.
+    /// The conflicts file has the layout breezy gives it.
     #[test]
-    fn path_conflict_writes_conflict_path() {
+    fn conflicts_are_written_as_breezy_does() {
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let cd = BzrDirMeta::create(&parent).unwrap();
         let wt = cd.open_workingtree().unwrap();
-        wt.set_conflicts(&[Conflict {
-            typestring: "path conflict".to_string(),
-            path: "dir/b".to_string(),
-            file_id: Some(b"b-id".to_vec()),
-            conflict_path: Some("dir/c".to_string()),
-        }])
-        .unwrap();
+        wt.set_conflicts(&breezy_conflicts()).unwrap();
         assert_eq!(
-            parent.get_bytes(".bzr/checkout/conflicts").unwrap(),
-            b"BZR conflict list format 1\n\
-              type: path conflict\n\
-              path: dir/b\n\
-              file_id: b-id\n\
-              conflict_path: dir/c\n"
+            String::from_utf8(parent.get_bytes(".bzr/checkout/conflicts").unwrap()).unwrap(),
+            String::from_utf8(BREEZY_CONFLICTS.to_vec()).unwrap()
         );
     }
 
+    /// Every field of a conflict breezy wrote is read back.
     #[test]
-    fn conflicts_reads_conflict_path() {
+    fn conflicts_written_by_breezy_are_read() {
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let cd = BzrDirMeta::create(&parent).unwrap();
         parent
-            .put_bytes(
-                ".bzr/checkout/conflicts",
-                b"BZR conflict list format 1\n\
-                  type: path conflict\n\
-                  path: dir/b\n\
-                  file_id: b-id\n\
-                  conflict_path: dir/c\n\
-                  \n\
-                  type: text conflict\n\
-                  path: a.txt\n\
-                  file_id: a-id\n",
-                None,
-            )
+            .put_bytes(".bzr/checkout/conflicts", BREEZY_CONFLICTS, None)
             .unwrap();
         assert_eq!(
             cd.open_workingtree().unwrap().conflicts().unwrap(),
-            vec![
-                Conflict {
-                    typestring: "path conflict".to_string(),
-                    path: "dir/b".to_string(),
-                    file_id: Some(b"b-id".to_vec()),
-                    conflict_path: Some("dir/c".to_string()),
-                },
-                Conflict {
-                    typestring: "text conflict".to_string(),
-                    path: "a.txt".to_string(),
-                    file_id: Some(b"a-id".to_vec()),
-                    conflict_path: None,
-                },
-            ]
+            breezy_conflicts()
         );
     }
 
