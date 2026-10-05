@@ -139,7 +139,7 @@ impl<T: TransformTree> DiskTreeTransform<T> {
                 }
             };
             let name = self.base_mut().final_name(trans_id)?;
-            let parent_trans_id = self.base_mut().final_parent(trans_id);
+            let parent_trans_id = self.base_mut().final_parent(trans_id)?;
             let parent_file_id = new_path_file_ids
                 .get(&parent_trans_id)
                 .cloned()
@@ -682,7 +682,9 @@ mod tests {
                 .tree
                 .add("tool", b"tool-id", crate::osutils::Kind::File);
             let tid = tt.base_mut().trans_id_tree_path("tool");
-            tt.base_mut().set_executability(Some(executable), &tid);
+            tt.base_mut()
+                .set_executability(Some(executable), &tid)
+                .unwrap();
             tt.apply(&deletion, false).unwrap();
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777
         };

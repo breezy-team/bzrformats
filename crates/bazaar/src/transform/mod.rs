@@ -277,17 +277,24 @@ impl<T: TransformTree> TreeTransformBase<T> {
     }
 
     /// The parent trans-id of `trans_id` in the tree (before the transform).
-    /// Returns [`ROOT_PARENT`] for the root.
-    pub fn get_tree_parent(&mut self, trans_id: &str) -> String {
+    /// Returns [`ROOT_PARENT`] for the root. A trans-id that is not a tree
+    /// path has no tree parent.
+    pub fn get_tree_parent(&mut self, trans_id: &str) -> Result<String, Error> {
         let path = self
             .tree_id_paths
             .get(trans_id)
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| Error::NoFinalPath(trans_id.to_string()))?;
+        Ok(self.tree_parent_of_path(&path))
+    }
+
+    /// The trans-id of the directory holding the tree path `path`, or
+    /// [`ROOT_PARENT`] for the root.
+    fn tree_parent_of_path(&mut self, path: &str) -> String {
         if path.is_empty() {
             return ROOT_PARENT.to_string();
         }
-        let parent = dirname(&path);
+        let parent = dirname(path);
         self.trans_id_tree_path(&parent)
     }
 
@@ -318,8 +325,13 @@ impl<T: TransformTree> TreeTransformBase<T> {
     }
 
     /// Cancel a scheduled contents deletion.
-    pub fn cancel_deletion(&mut self, trans_id: &str) {
-        self.removed_contents.remove(trans_id);
+    pub fn cancel_deletion(&mut self, trans_id: &str) -> Result<(), Error> {
+        if !self.removed_contents.remove(trans_id) {
+            return Err(Error::Malformed(format!(
+                "{trans_id} is not scheduled for deletion"
+            )));
+        }
+        Ok(())
     }
 
     /// Schedule `trans_id` to become unversioned.
@@ -334,14 +346,21 @@ impl<T: TransformTree> TreeTransformBase<T> {
     }
 
     /// Schedule the executable bit for `trans_id`. `None` unschedules it.
-    pub fn set_executability(&mut self, executability: Option<bool>, trans_id: &str) {
+    pub fn set_executability(
+        &mut self,
+        executability: Option<bool>,
+        trans_id: &str,
+    ) -> Result<(), Error> {
         match executability {
             None => {
-                self.new_executability.remove(trans_id);
+                if self.new_executability.remove(trans_id).is_none() {
+                    return Err(Error::Malformed(format!(
+                        "{trans_id} has no executability scheduled"
+                    )));
+                }
+                Ok(())
             }
-            Some(value) => {
-                self.new_executability.insert(trans_id.to_string(), value);
-            }
+            Some(value) => unique_add(&mut self.new_executability, trans_id.to_string(), value),
         }
     }
 
@@ -366,10 +385,12 @@ impl<T: TransformTree> TreeTransformBase<T> {
     }
 
     /// Undo a previous [`version_file`](Self::version_file).
-    pub fn cancel_versioning(&mut self, trans_id: &str) {
-        if let Some(file_id) = self.new_id.remove(trans_id) {
-            self.r_new_id.remove(&file_id);
-        }
+    pub fn cancel_versioning(&mut self, trans_id: &str) -> Result<(), Error> {
+        let file_id = self.new_id.remove(trans_id).ok_or_else(|| {
+            Error::Malformed(format!("{trans_id} is not scheduled to be versioned"))
+        })?;
+        self.r_new_id.remove(&file_id);
+        Ok(())
     }
 
     /// Record new content of `kind` for `trans_id`.
@@ -410,9 +431,9 @@ impl<T: TransformTree> TreeTransformBase<T> {
 
     /// The final parent trans-id of `trans_id` (its scheduled parent, else its
     /// tree parent).
-    pub fn final_parent(&mut self, trans_id: &str) -> String {
+    pub fn final_parent(&mut self, trans_id: &str) -> Result<String, Error> {
         if let Some(parent) = self.new_parent.get(trans_id) {
-            return parent.clone();
+            return Ok(parent.clone());
         }
         self.get_tree_parent(trans_id)
     }
@@ -500,9 +521,16 @@ impl<T: TransformTree> TreeTransformBase<T> {
             .iter()
             .map(|(t, p)| (t.clone(), p.clone()))
             .collect();
-        let tree_ids: Vec<String> = self.tree_id_paths.keys().cloned().collect();
-        for trans_id in tree_ids {
-            let parent = self.final_parent(&trans_id);
+        let tree_ids: Vec<(String, String)> = self
+            .tree_id_paths
+            .iter()
+            .map(|(t, p)| (t.clone(), p.clone()))
+            .collect();
+        for (trans_id, path) in tree_ids {
+            let parent = match self.new_parent.get(&trans_id) {
+                Some(parent) => parent.clone(),
+                None => self.tree_parent_of_path(&path),
+            };
             items.push((trans_id, parent));
         }
         let mut by_parent: HashMap<String, HashSet<String>> = HashMap::new();
@@ -637,7 +665,7 @@ impl<T: TransformTree> TreeTransformBase<T> {
             self.final_file_id(&new_root)
         };
         if self.new_id.contains_key(&old_new_root) {
-            self.cancel_versioning(&old_new_root);
+            self.cancel_versioning(&old_new_root)?;
         } else {
             self.unversion_file(&old_new_root);
         }
@@ -669,7 +697,7 @@ impl<T: TransformTree> TreeTransformBase<T> {
         }
         // Prevent deletion of the real root directory.
         if self.removed_contents.contains(&new_root) {
-            self.cancel_deletion(&new_root);
+            self.cancel_deletion(&new_root)?;
         }
         self.new_parent.remove(&old_new_root);
         self.new_name.remove(&old_new_root);
@@ -683,7 +711,7 @@ impl<T: TransformTree> TreeTransformBase<T> {
             return Ok(String::new());
         }
         let name = self.final_name(trans_id)?;
-        let parent = self.final_parent(trans_id);
+        let parent = self.final_parent(trans_id)?;
         if Some(parent.as_str()) == self.new_root.as_deref() {
             Ok(name)
         } else {
@@ -857,7 +885,12 @@ impl<T: TransformTree> TreeTransformBase<T> {
             let mut parent_id = trans_id.clone();
             while parent_id != ROOT_PARENT {
                 seen.insert(parent_id.clone());
-                parent_id = self.final_parent(&parent_id);
+                // An entry that is neither moved nor in the tree ends the
+                // walk, as it does in breezy.
+                parent_id = match self.final_parent(&parent_id) {
+                    Ok(parent_id) => parent_id,
+                    Err(_) => break,
+                };
                 if parent_id == trans_id {
                     out.push(RawConflict::ParentLoop {
                         trans_id: trans_id.clone(),
@@ -1201,7 +1234,7 @@ mod tests {
         let root = tt.root().unwrap().to_string();
         let tid = tt.create_path("hello.txt", &root).unwrap();
         assert_eq!(tt.final_name(&tid).unwrap(), "hello.txt");
-        assert_eq!(tt.final_parent(&tid), root);
+        assert_eq!(tt.final_parent(&tid).unwrap(), root);
         assert!(tt.path_changed(&tid));
     }
 
@@ -1261,6 +1294,59 @@ mod tests {
         ));
     }
 
+    /// Only an entry that was moved or is in the tree has a parent.
+    #[test]
+    fn final_parent_of_an_unplaced_entry_is_an_error() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let unplaced = tt.trans_id_file_id(&FileId::from(b"not-in-tree".to_vec()));
+        match tt.final_parent(&unplaced) {
+            Err(Error::NoFinalPath(trans_id)) => assert_eq!(trans_id, unplaced),
+            other => panic!("expected no final path, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn executability_is_scheduled_once() {
+        let mut tt = TreeTransformBase::new(FakeTree::new(), true);
+        let root = tt.root().unwrap().to_string();
+        let f = tt.create_path("f", &root).unwrap();
+        // Nothing to unset yet.
+        assert!(matches!(
+            tt.set_executability(None, &f),
+            Err(Error::Malformed(_))
+        ));
+        tt.set_executability(Some(true), &f).unwrap();
+        match tt.set_executability(Some(false), &f) {
+            Err(Error::DuplicateKey(key)) => assert_eq!(key, format!("{f:?}")),
+            other => panic!("expected a duplicate key, got {:?}", other),
+        }
+        tt.set_executability(None, &f).unwrap();
+        tt.set_executability(Some(false), &f).unwrap();
+    }
+
+    #[test]
+    fn cancelling_what_is_not_scheduled_is_an_error() {
+        let mut tree = FakeTree::new();
+        tree.add("a.txt", b"a-id", Kind::File);
+        let mut tt = TreeTransformBase::new(tree, true);
+        let a = tt.trans_id_tree_path("a.txt");
+        match tt.cancel_deletion(&a) {
+            Err(Error::Malformed(message)) => {
+                assert_eq!(message, format!("{a} is not scheduled for deletion"))
+            }
+            other => panic!("expected a malformed transform, got {:?}", other),
+        }
+        match tt.cancel_versioning(&a) {
+            Err(Error::Malformed(message)) => {
+                assert_eq!(message, format!("{a} is not scheduled to be versioned"))
+            }
+            other => panic!("expected a malformed transform, got {:?}", other),
+        }
+        tt.delete_contents(&a);
+        tt.cancel_deletion(&a).unwrap();
+        assert_eq!(tt.final_kind(&a), Some(Kind::File));
+    }
+
     #[test]
     fn parent_loop_is_a_conflict() {
         let mut tree = FakeTree::new();
@@ -1299,7 +1385,7 @@ mod tests {
         let root = tt.root().unwrap().to_string();
         let f = tt.create_path("f", &root).unwrap();
         tt.set_new_contents(&f, ContentKind::File);
-        tt.set_executability(Some(true), &f);
+        tt.set_executability(Some(true), &f).unwrap();
         assert_eq!(
             tt.find_raw_conflicts().unwrap(),
             vec![RawConflict::UnversionedExecutability { trans_id: f }]
@@ -1608,7 +1694,7 @@ mod tests {
         tt.fixup_new_roots().unwrap();
 
         let child = tt.tree_path_ids.get("sub/f").cloned().unwrap();
-        assert_eq!(tt.final_parent(&child), root);
+        assert_eq!(tt.final_parent(&child).unwrap(), root);
         assert_eq!(tt.final_name(&child).unwrap(), "f");
     }
 
@@ -1619,7 +1705,7 @@ mod tests {
         let child = tt.create_path("a.txt", &root).unwrap();
         tt.fixup_new_roots().unwrap();
         assert_eq!(tt.root(), Some(root.as_str()));
-        assert_eq!(tt.final_parent(&child), root);
+        assert_eq!(tt.final_parent(&child).unwrap(), root);
     }
 
     #[test]
@@ -1643,7 +1729,7 @@ mod tests {
         let new_root = tt.create_path("", ROOT_PARENT).unwrap();
         tt.fixup_new_roots().unwrap();
         assert_eq!(tt.root(), Some(new_root.as_str()));
-        assert_eq!(tt.final_parent(&new_root), ROOT_PARENT);
+        assert_eq!(tt.final_parent(&new_root).unwrap(), ROOT_PARENT);
     }
 
     /// A second root is folded into the existing one: its children move
@@ -1662,7 +1748,7 @@ mod tests {
         tt.fixup_new_roots().unwrap();
 
         assert_eq!(tt.root(), Some(root.as_str()));
-        assert_eq!(tt.final_parent(&child), root);
+        assert_eq!(tt.final_parent(&child).unwrap(), root);
         assert_eq!(tt.final_name(&child).unwrap(), "child");
         assert_eq!(
             tt.final_file_id(&root),
@@ -1721,7 +1807,7 @@ mod tests {
         tt.set_new_contents(&tid, ContentKind::Directory);
         tt.version_file(&tid, FileId::from(b"sub-id".to_vec()))
             .unwrap();
-        tt.set_executability(Some(true), &tid);
+        tt.set_executability(Some(true), &tid).unwrap();
         let conflicts = tt.find_raw_conflicts().unwrap();
         assert!(conflicts.iter().any(|c| matches!(
             c,
