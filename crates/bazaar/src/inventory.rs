@@ -525,7 +525,10 @@ pub fn find_interesting_parents<'a>(
     let mut parents: HashSet<&'a FileId> = HashSet::new();
     let mut todo = file_ids.iter().cloned().collect::<Vec<_>>();
     while let Some(file_id) = todo.pop() {
-        let ie = inv.get_entry(file_id).unwrap();
+        // An id the inventory does not have has no parents to walk through.
+        let Some(ie) = inv.get_entry(file_id) else {
+            continue;
+        };
         if let Some(parent_id) = ie.parent_id() {
             if !parents.contains(parent_id) {
                 todo.push(parent_id);
@@ -1862,6 +1865,42 @@ mod tests {
         let children = inv.get_children(&dir_id).expect("children map present");
         assert_eq!(children.len(), 1);
         assert!(children.contains_key("file"));
+    }
+
+    /// Ids the inventory does not have are passed over when limiting a walk
+    /// to specific ids.
+    #[test]
+    fn iter_entries_by_dir_ignores_unknown_specific_ids() {
+        let mut inv = MutableInventory::new();
+        inv.add(Entry::root(root_id(), None)).unwrap();
+        inv.add(Entry::directory(
+            FileId::from(b"sub-id".to_vec()),
+            "sub".to_string(),
+            root_id(),
+            None,
+        ))
+        .unwrap();
+        inv.add(Entry::file(
+            FileId::from(b"b-id".to_vec()),
+            "b".to_string(),
+            FileId::from(b"sub-id".to_vec()),
+            None,
+            Some(b"sha".to_vec()),
+            Some(1),
+            Some(false),
+            None,
+        ))
+        .unwrap();
+        let known = FileId::from(b"b-id".to_vec());
+        let unknown = FileId::from(b"unknown-id".to_vec());
+        let paths = |ids: &[&FileId]| -> Vec<String> {
+            let ids: HashSet<&FileId> = ids.iter().copied().collect();
+            inv.iter_entries_by_dir(None, Some(&ids))
+                .map(|(path, _)| path)
+                .collect()
+        };
+        assert_eq!(paths(&[&known, &unknown]), vec!["sub/b"]);
+        assert_eq!(paths(&[&unknown]), Vec::<String>::new());
     }
 
     #[test]
