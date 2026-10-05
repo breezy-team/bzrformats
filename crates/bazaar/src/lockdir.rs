@@ -28,6 +28,14 @@ pub enum LockError {
     AlreadyHeld,
     /// The lock was not held when release/confirm was attempted.
     NotHeld,
+    /// The token given does not name the lock that is held (breezy's
+    /// `TokenMismatch`).
+    TokenMismatch {
+        /// The token that was given.
+        given: String,
+        /// The token of the lock that is held, if one is.
+        held: Option<String>,
+    },
     /// The held `info` file could not be parsed.
     Corrupt(String),
     /// An underlying transport error.
@@ -39,6 +47,10 @@ impl std::fmt::Display for LockError {
         match self {
             LockError::AlreadyHeld => write!(f, "lock already held"),
             LockError::NotHeld => write!(f, "lock not held"),
+            LockError::TokenMismatch { given, held } => write!(
+                f,
+                "the lock token {given:?} does not match lock token {held:?}"
+            ),
             LockError::Corrupt(m) => write!(f, "corrupt lock info: {m}"),
             LockError::Transport(e) => write!(f, "transport error: {e}"),
         }
@@ -181,6 +193,27 @@ impl<'t> LockDir<'t> {
     pub fn with_extra_holder_info(mut self, extra: HashMap<String, String>) -> Self {
         self.extra_holder_info = extra;
         self
+    }
+
+    /// Adopt a lock held by an earlier handle, identified by its `nonce`.
+    ///
+    /// A lock taken with [`Lock::attempt_lock`] returns a nonce; a later handle
+    /// created with [`LockDir::new`] can [`LockDir::resume`] that nonce to take
+    /// over releasing it (e.g. when the lock is tracked across calls by nonce
+    /// rather than by keeping the original handle alive). The nonce must name
+    /// the lock this handle currently observes as held, which is checked as
+    /// breezy's `validate_token` checks a token.
+    pub fn resume(&mut self, nonce: &str) -> Result<(), LockError> {
+        let held = self.peek()?.and_then(|info| info.nonce);
+        if held.as_deref() != Some(nonce) {
+            return Err(LockError::TokenMismatch {
+                given: nonce.to_string(),
+                held,
+            });
+        }
+        self.nonce = Some(nonce.to_string());
+        self.lock_held = true;
+        Ok(())
     }
 
     /// Create the lock directory (the container for `held/`).
@@ -423,6 +456,57 @@ mod tests {
         }
         let probe = LockDir::new(&t, "test_lock");
         assert_eq!(probe.peek().unwrap(), None);
+    }
+
+    #[test]
+    fn resume_adopts_lock_by_nonce() {
+        let (_dir, t) = temp_transport();
+        let mut a = LockDir::new(&t, "test_lock");
+        a.create().unwrap();
+        let nonce = a.attempt_lock().unwrap();
+        // The original handle goes away without releasing the lock.
+        std::mem::forget(a);
+
+        let mut b = LockDir::new(&t, "test_lock");
+        assert!(!b.is_held());
+        b.resume(&nonce).unwrap();
+        assert!(b.is_held());
+        b.unlock().unwrap();
+        assert_eq!(b.peek().unwrap(), None);
+    }
+
+    #[test]
+    fn resume_rejects_other_nonce() {
+        let (_dir, t) = temp_transport();
+        let mut a = LockDir::new(&t, "test_lock");
+        a.create().unwrap();
+        let nonce = a.attempt_lock().unwrap();
+
+        let mut b = LockDir::new(&t, "test_lock");
+        match b.resume("not-the-nonce") {
+            Err(LockError::TokenMismatch { given, held }) => {
+                assert_eq!(given, "not-the-nonce");
+                assert_eq!(held, Some(nonce));
+            }
+            other => panic!("expected a token mismatch, got {:?}", other),
+        }
+        assert!(!b.is_held());
+        assert!(a.is_held());
+    }
+
+    #[test]
+    fn resume_rejects_free_lock() {
+        let (_dir, t) = temp_transport();
+        let mut ld = LockDir::new(&t, "test_lock");
+        ld.create().unwrap();
+        match ld.resume("nonce") {
+            Err(LockError::TokenMismatch { given, held }) => {
+                assert_eq!(given, "nonce");
+                assert_eq!(held, None);
+            }
+            other => panic!("expected a token mismatch, got {:?}", other),
+        }
+        assert!(!ld.is_held());
     }
 
     /// A transport that delegates to an inner one but fails `rename` with a
