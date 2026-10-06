@@ -39,6 +39,7 @@ declare_repository_format! {
         create: create_knit_pack,
         supported: true,
         uses_btree_index: false,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_4),
     }
 }
 
@@ -54,6 +55,7 @@ declare_repository_format! {
         supports_tree_reference: true,
         supported: true,
         uses_btree_index: false,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_4),
     }
 }
 
@@ -68,6 +70,7 @@ declare_repository_format! {
         rich_root_data: true,
         supported: true,
         uses_btree_index: false,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_4),
     }
 }
 
@@ -82,6 +85,7 @@ declare_repository_format! {
         supports_external_lookups: true,
         supported: true,
         uses_btree_index: false,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_4),
     }
 }
 
@@ -97,6 +101,7 @@ declare_repository_format! {
         supports_external_lookups: true,
         supported: true,
         uses_btree_index: false,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_4),
     }
 }
 
@@ -112,6 +117,7 @@ declare_repository_format! {
         supports_external_lookups: true,
         deprecated: true,
         uses_btree_index: false,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_4),
     }
 }
 
@@ -125,6 +131,7 @@ declare_repository_format! {
         create: create_knit_pack,
         supports_external_lookups: true,
         supported: true,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_4),
     }
 }
 
@@ -139,6 +146,7 @@ declare_repository_format! {
         rich_root_data: true,
         supports_external_lookups: true,
         supported: true,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_4),
     }
 }
 

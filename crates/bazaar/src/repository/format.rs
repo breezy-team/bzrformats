@@ -85,6 +85,11 @@ pub struct RepositoryFormat {
     /// format is opened through the all-in-one control-dir path, not the
     /// metadir `open` dispatcher (its `open` stays `open_unsupported`).
     pub all_in_one: bool,
+    /// The working tree format of the control-dir format breezy matches to
+    /// this repository format (`RepositoryFormat._matchingcontroldir`), or
+    /// `None` for the default one. A clone of a control directory without a
+    /// working tree gets this tree format.
+    pub matching_tree_format: Option<&'static [u8]>,
 }
 
 impl RepositoryFormat {
@@ -106,6 +111,7 @@ impl RepositoryFormat {
         supported: false,
         deprecated: false,
         all_in_one: false,
+        matching_tree_format: None,
     };
 
     /// The `.bzr/repository/format` marker for this format.

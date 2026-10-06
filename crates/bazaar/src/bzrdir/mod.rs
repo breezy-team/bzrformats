@@ -42,6 +42,9 @@ pub const REPOSITORY_FORMAT_2A: &[u8] = b"Bazaar repository format 2a (needs bzr
 /// Supported branch format marker (Format 7).
 pub const BRANCH_FORMAT_7: &[u8] = b"Bazaar Branch Format 7 (needs bzr 1.6)\n";
 
+/// Working-tree format 4 marker.
+pub const WORKINGTREE_FORMAT_4: &[u8] = b"Bazaar Working Tree Format 4 (bzr 0.15)\n";
+
 /// Supported working-tree format marker (Format 6).
 pub const WORKINGTREE_FORMAT_6: &[u8] = b"Bazaar Working Tree Format 6 (bzr 1.14)\n";
 
@@ -53,13 +56,13 @@ const B5: &[u8] = b"Bazaar-NG branch format 5\n";
 const B6: &[u8] = b"Bazaar Branch Format 6 (bzr 0.15)\n";
 const B7: &[u8] = BRANCH_FORMAT_7;
 const WT3: &[u8] = b"Bazaar-NG Working Tree format 3";
-const WT4: &[u8] = b"Bazaar Working Tree Format 4 (bzr 0.15)\n";
+const WT4: &[u8] = WORKINGTREE_FORMAT_4;
 const WT5: &[u8] = b"Bazaar Working Tree Format 5 (bzr 1.11)\n";
 const WT6: &[u8] = WORKINGTREE_FORMAT_6;
 
 declare_bzrdir_format! {
     FORMAT_2A {
-        name: "2a",
+        name: Some("2a"),
         repo_marker: REPOSITORY_FORMAT_2A,
         branch_marker: B7,
         wt_marker: WT6,
@@ -70,7 +73,7 @@ declare_bzrdir_format! {
 #[cfg(feature = "knitpack")]
 declare_bzrdir_format! {
     FORMAT_PACK_0_92 {
-        name: "pack-0.92",
+        name: Some("pack-0.92"),
         repo_marker: b"Bazaar pack repository format 1 (needs bzr 0.92)\n",
         branch_marker: B6,
         wt_marker: WT4,
@@ -80,7 +83,7 @@ declare_bzrdir_format! {
 #[cfg(feature = "knitpack")]
 declare_bzrdir_format! {
     FORMAT_PACK_0_92_SUBTREE {
-        name: "pack-0.92-subtree",
+        name: Some("pack-0.92-subtree"),
         repo_marker: b"Bazaar pack repository format 1 with subtree support (needs bzr 0.92)\n",
         branch_marker: B6,
         wt_marker: WT4,
@@ -90,7 +93,7 @@ declare_bzrdir_format! {
 #[cfg(feature = "knitpack")]
 declare_bzrdir_format! {
     FORMAT_RICH_ROOT_PACK {
-        name: "rich-root-pack",
+        name: Some("rich-root-pack"),
         repo_marker: b"Bazaar pack repository format 1 with rich root (needs bzr 1.0)\n",
         branch_marker: B6,
         wt_marker: WT4,
@@ -100,7 +103,7 @@ declare_bzrdir_format! {
 #[cfg(feature = "knitpack")]
 declare_bzrdir_format! {
     FORMAT_1_6 {
-        name: "1.6",
+        name: Some("1.6"),
         repo_marker: b"Bazaar RepositoryFormatKnitPack5 (bzr 1.6)\n",
         branch_marker: B7,
         wt_marker: WT4,
@@ -110,7 +113,7 @@ declare_bzrdir_format! {
 #[cfg(feature = "knitpack")]
 declare_bzrdir_format! {
     FORMAT_1_6_1_RICH_ROOT {
-        name: "1.6.1-rich-root",
+        name: Some("1.6.1-rich-root"),
         repo_marker: b"Bazaar RepositoryFormatKnitPack5RichRoot (bzr 1.6.1)\n",
         branch_marker: B7,
         wt_marker: WT4,
@@ -120,7 +123,7 @@ declare_bzrdir_format! {
 #[cfg(feature = "knitpack")]
 declare_bzrdir_format! {
     FORMAT_1_9 {
-        name: "1.9",
+        name: Some("1.9"),
         repo_marker: b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n",
         branch_marker: B7,
         wt_marker: WT4,
@@ -130,7 +133,7 @@ declare_bzrdir_format! {
 #[cfg(feature = "knitpack")]
 declare_bzrdir_format! {
     FORMAT_1_9_RICH_ROOT {
-        name: "1.9-rich-root",
+        name: Some("1.9-rich-root"),
         repo_marker: b"Bazaar RepositoryFormatKnitPack6RichRoot (bzr 1.9)\n",
         branch_marker: B7,
         wt_marker: WT4,
@@ -140,7 +143,7 @@ declare_bzrdir_format! {
 #[cfg(feature = "knitpack")]
 declare_bzrdir_format! {
     FORMAT_1_14 {
-        name: "1.14",
+        name: Some("1.14"),
         repo_marker: b"Bazaar RepositoryFormatKnitPack6 (bzr 1.9)\n",
         branch_marker: B7,
         wt_marker: WT5,
@@ -150,7 +153,7 @@ declare_bzrdir_format! {
 #[cfg(feature = "knitpack")]
 declare_bzrdir_format! {
     FORMAT_1_14_RICH_ROOT {
-        name: "1.14-rich-root",
+        name: Some("1.14-rich-root"),
         repo_marker: b"Bazaar RepositoryFormatKnitPack6RichRoot (bzr 1.9)\n",
         branch_marker: B7,
         wt_marker: WT5,
@@ -160,7 +163,7 @@ declare_bzrdir_format! {
 #[cfg(feature = "knit")]
 declare_bzrdir_format! {
     FORMAT_KNIT {
-        name: "knit",
+        name: Some("knit"),
         repo_marker: b"Bazaar-NG Knit Repository Format 1",
         branch_marker: B5,
         wt_marker: WT3,
@@ -314,6 +317,17 @@ pub trait ControlDir: Send + Sync {
 
     /// Open the working tree in this control directory.
     fn open_workingtree(&self) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError>;
+
+    /// The control-directory format to create when cloning/sprouting from this
+    /// one, so the new line of development is in the same format as its
+    /// source (breezy's `ControlDir.cloning_metadir`).
+    ///
+    /// The default is unsupported; [`BzrDirMeta`] overrides it.
+    fn cloning_format(&self) -> Result<ControlDirFormat, BzrDirError> {
+        Err(BzrDirError::Component(
+            "cloning is not supported for this control directory format".to_string(),
+        ))
+    }
 
     /// Whether this control directory's repository is shared. The default is
     /// `false` (the all-in-one weave format is never shared); [`BzrDirMeta`]
@@ -539,13 +553,60 @@ impl BzrDirMeta {
     /// control directory, and its branch returned (which may itself be a
     /// reference, so the open recurses through [`open`]).
     fn open_referenced_branch(&self, location: &str) -> Result<crate::branch::Branch, BzrDirError> {
+        let target = open(self.reference_control_transport(location)?)?;
+        target.open_branch()
+    }
+
+    /// The transport of the control directory a branch reference's
+    /// `location` points at.
+    fn reference_control_transport(&self, location: &str) -> Result<SharedTransport, BzrDirError> {
         let path = location.strip_prefix("file://").unwrap_or(location);
         // The reference points at the directory containing `.bzr`; descend into
-        // its control directory and open the branch there.
+        // its control directory.
         let containing = self.transport.subtransport(path)?;
-        let target_bzr = containing.subtransport(".bzr")?;
-        let target = open(target_bzr)?;
-        target.open_branch()
+        Ok(containing.subtransport(".bzr")?)
+    }
+
+    /// The branch and repository formats a clone of this control directory
+    /// takes, each `None` when there is nothing to take it from.
+    ///
+    /// The repository is the branch's own: the one found for it (possibly an
+    /// enclosing shared repository), or the referenced branch's repository
+    /// when the branch is a reference. Without a branch it is the repository
+    /// held here.
+    fn cloning_source_formats(
+        &self,
+    ) -> Result<
+        (
+            Option<&'static crate::branch::BranchFormat>,
+            Option<&'static crate::repository::RepositoryFormat>,
+        ),
+        BzrDirError,
+    > {
+        if !self.has_branch {
+            let repository = if self.has_repository {
+                Some(self.open_repository()?.format())
+            } else {
+                None
+            };
+            return Ok((None, repository));
+        }
+        let sub = self.transport.subtransport(Component::Branch.subdir())?;
+        let branch = crate::branch::Branch::new(sub);
+        if let Some(location) = branch
+            .get_reference()
+            .map_err(|e| BzrDirError::Component(format!("reading branch reference: {e}")))?
+        {
+            let target = BzrDirMeta::open(self.reference_control_transport(&location)?)?;
+            return target.cloning_source_formats();
+        }
+        match self.find_repository() {
+            Ok(repository) => Ok((Some(branch.format()), Some(repository.format()))),
+            // A branch without a repository cannot be opened, so it has no
+            // format to offer either.
+            Err(BzrDirError::NoRepositoryPresent) => Ok((None, None)),
+            Err(e) => Err(e),
+        }
     }
 
     /// Open the repository of the branch this one is stacked on, following the
@@ -699,6 +760,57 @@ impl ControlDir for BzrDirMeta {
             Some(location) => self.open_referenced_branch(&location),
             None => Ok(branch),
         }
+    }
+
+    /// The format to create a clone or sprout of this control directory in.
+    ///
+    /// Mirrors breezy's `cloning_metadir`. The branch and repository formats
+    /// are those of the branch here and its repository, and the working tree
+    /// format is that of the tree here. A component that is missing gets the
+    /// default format, except that without a tree the tree format is the
+    /// repository format's [`matching_tree_format`].
+    ///
+    /// [`matching_tree_format`]: crate::repository::RepositoryFormat::matching_tree_format
+    fn cloning_format(&self) -> Result<ControlDirFormat, BzrDirError> {
+        let default = &FORMAT_2A;
+        let formats = control_dir_formats();
+        let (branch_format, repository_format) = self.cloning_source_formats()?;
+        let (wt_marker, wt_has_views) = if self.has_workingtree {
+            let marker = self
+                .transport
+                .get_bytes(&format!("{}/format", Component::WorkingTree.subdir()))?;
+            let format =
+                crate::workingtree::find_format(&marker).ok_or(BzrDirError::UnsupportedFormat {
+                    component: Component::WorkingTree,
+                    found: marker,
+                })?;
+            (format.format_string, format.supports_views)
+        } else {
+            let marker = repository_format
+                .and_then(|format| format.matching_tree_format)
+                .unwrap_or(default.wt_marker);
+            let format = crate::workingtree::find_format(marker).ok_or_else(|| {
+                BzrDirError::Component(format!(
+                    "working tree format not registered: {:?}",
+                    String::from_utf8_lossy(marker)
+                ))
+            })?;
+            (format.format_string, format.supports_views)
+        };
+        let cloned = ControlDirFormat {
+            name: None,
+            repo_marker: repository_format.map_or(default.repo_marker, |f| f.format_string),
+            branch_marker: branch_format.map_or(default.branch_marker, |f| f.format_string),
+            wt_marker,
+            wt_has_views,
+        };
+        // Use the registered format for this combination, if it has one.
+        let registered = formats.into_iter().find(|format| {
+            format.repo_marker == cloned.repo_marker
+                && format.branch_marker == cloned.branch_marker
+                && format.wt_marker == cloned.wt_marker
+        });
+        Ok(registered.copied().unwrap_or(cloned))
     }
 
     /// Open the working tree in this control directory.
@@ -1132,6 +1244,190 @@ mod tests {
         assert!(bd.has_repository());
         assert!(!bd.has_branch());
         assert!(!bd.has_workingtree());
+    }
+
+    /// Create a control directory in `format` under `root` and reopen it
+    /// with the listed components removed.
+    fn create_without(
+        root: &std::path::Path,
+        format: &ControlDirFormat,
+        removed: &[Component],
+    ) -> BzrDirMeta {
+        std::fs::create_dir_all(root).unwrap();
+        let parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(root));
+        BzrDirMeta::create_with_format(&parent, format).unwrap();
+        for component in removed {
+            std::fs::remove_dir_all(root.join(".bzr").join(component.subdir())).unwrap();
+        }
+        BzrDirMeta::open(bzr_transport(root)).unwrap()
+    }
+
+    fn markers(format: &ControlDirFormat) -> [&'static [u8]; 3] {
+        [format.repo_marker, format.branch_marker, format.wt_marker]
+    }
+
+    /// A control directory with a working tree is cloned in the format it was
+    /// created in.
+    #[test]
+    fn cloning_format_matches_the_source_format() {
+        for fmt in control_dir_formats() {
+            let dir = tempfile::tempdir().unwrap();
+            let cd = create_without(dir.path(), fmt, &[]);
+            assert_eq!(cd.cloning_format().unwrap().name, fmt.name);
+        }
+    }
+
+    /// Without a working tree, the tree format is that of the repository
+    /// format's matching control directory format.
+    #[cfg(feature = "knitpack")]
+    #[test]
+    fn cloning_format_without_working_tree() {
+        for (source, expected) in [("2a", "2a"), ("1.9", "1.9"), ("1.14", "1.9")] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = find_control_dir_format(source).unwrap();
+            let cd = create_without(dir.path(), source, &[Component::WorkingTree]);
+            assert_eq!(cd.cloning_format().unwrap().name, Some(expected));
+        }
+    }
+
+    /// Knit repository formats 3 and 4 take format 4 working trees, as their
+    /// matching control-dir formats in breezy do.
+    #[cfg(feature = "knit")]
+    #[test]
+    fn cloning_format_without_working_tree_rich_root_knit() {
+        for repo_marker in [
+            &b"Bazaar Knit Repository Format 3 (bzr 0.15)\n"[..],
+            &b"Bazaar Knit Repository Format 4 (bzr 1.0)\n"[..],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let knit = find_control_dir_format("knit").unwrap();
+            let source = ControlDirFormat {
+                repo_marker,
+                ..*knit
+            };
+            let cd = create_without(dir.path(), &source, &[Component::WorkingTree]);
+            let format = cd.cloning_format().unwrap();
+            assert_eq!(markers(&format), [repo_marker, knit.branch_marker, WT4]);
+            assert!(!format.wt_has_views);
+            assert_eq!(format.name, None);
+        }
+    }
+
+    /// A repository format without a matching control directory format gets
+    /// the default tree format.
+    #[cfg(feature = "knit")]
+    #[test]
+    fn cloning_format_without_working_tree_or_matching_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = find_control_dir_format("knit").unwrap();
+        let cd = create_without(dir.path(), source, &[Component::WorkingTree]);
+        let format = cd.cloning_format().unwrap();
+        assert_eq!(
+            markers(&format),
+            [
+                source.repo_marker,
+                source.branch_marker,
+                WORKINGTREE_FORMAT_6
+            ]
+        );
+        assert!(format.wt_has_views);
+        assert_eq!(format.name, None);
+    }
+
+    /// A combination of component formats that has no name is cloned as it
+    /// is.
+    #[cfg(feature = "knitpack")]
+    #[test]
+    fn cloning_format_keeps_an_unregistered_combination() {
+        let dir = tempfile::tempdir().unwrap();
+        create_without(dir.path(), &FORMAT_2A, &[]);
+        std::fs::write(dir.path().join(".bzr/branch/format"), B6).unwrap();
+        std::fs::write(dir.path().join(".bzr/checkout/format"), WT4).unwrap();
+        let cd = BzrDirMeta::open(bzr_transport(dir.path())).unwrap();
+        let format = cd.cloning_format().unwrap();
+        assert_eq!(markers(&format), [REPOSITORY_FORMAT_2A, B6, WT4]);
+        assert!(!format.wt_has_views);
+        assert_eq!(format.name, None);
+    }
+
+    /// Components that are missing get the default format.
+    #[test]
+    fn cloning_format_defaults_missing_components() {
+        // Only a repository: the default branch format.
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create_shared_repository(&parent).unwrap();
+        assert_eq!(cd.cloning_format().unwrap().name, Some("2a"));
+
+        // Nothing at all.
+        let dir = tempfile::tempdir().unwrap();
+        make_bzrdir(dir.path(), &[]);
+        let cd = BzrDirMeta::open(bzr_transport(dir.path())).unwrap();
+        assert_eq!(cd.cloning_format().unwrap().name, Some("2a"));
+    }
+
+    /// A branch held in a shared repository is cloned with that repository's
+    /// format.
+    #[cfg(feature = "knitpack")]
+    #[test]
+    fn cloning_format_of_a_branch_in_a_shared_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(dir.path()));
+        let shared = find_control_dir_format("1.9").unwrap();
+        BzrDirMeta::create_shared_repository_with_format(&parent, shared).unwrap();
+        let cd = create_without(
+            &dir.path().join("branch"),
+            &FORMAT_2A,
+            &[Component::Repository],
+        );
+        let format = cd.cloning_format().unwrap();
+        assert_eq!(
+            markers(&format),
+            [shared.repo_marker, BRANCH_FORMAT_7, WORKINGTREE_FORMAT_6]
+        );
+    }
+
+    /// A branch reference is cloned in the format of the branch it points at
+    /// and of that branch's repository.
+    #[cfg(feature = "knitpack")]
+    #[test]
+    fn cloning_format_follows_a_branch_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_root = dir.path().join("target");
+        let target = find_control_dir_format("pack-0.92").unwrap();
+        create_without(&target_root, target, &[]);
+
+        let ref_root = dir.path().join("ref");
+        make_bzrdir(&ref_root, &[]);
+        std::fs::create_dir_all(ref_root.join(".bzr/branch")).unwrap();
+        std::fs::write(
+            ref_root.join(".bzr/branch/format"),
+            b"Bazaar-NG Branch Reference Format 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ref_root.join(".bzr/branch/location"),
+            target_root.to_str().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let cd = BzrDirMeta::open(bzr_transport(&ref_root)).unwrap();
+        assert_eq!(cd.cloning_format().unwrap().name, Some("pack-0.92"));
+    }
+
+    #[cfg(feature = "weave")]
+    #[test]
+    fn cloning_format_is_unsupported_for_all_in_one() {
+        let dir = tempfile::tempdir().unwrap();
+        make_weave_bzrdir(dir.path());
+        let cd = open(bzr_transport(dir.path())).unwrap();
+        match cd.cloning_format() {
+            Err(BzrDirError::Component(message)) => assert_eq!(
+                message,
+                "cloning is not supported for this control directory format"
+            ),
+            other => panic!("expected a Component error, got {:?}", other),
+        }
     }
 
     #[test]

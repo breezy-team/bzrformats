@@ -43,6 +43,7 @@ declare_repository_format! {
         supports_tree_reference: true,
         supports_external_lookups: true,
         supported: true,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_6),
     }
 }
 
@@ -59,6 +60,7 @@ declare_repository_format! {
         supports_tree_reference: true,
         supports_external_lookups: true,
         supported: true,
+        matching_tree_format: Some(crate::bzrdir::WORKINGTREE_FORMAT_6),
     }
 }
 

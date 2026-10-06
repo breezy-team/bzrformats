@@ -12,8 +12,9 @@
 /// `controldir.format_registry` (e.g. "2a", "pack-0.92", "1.9").
 #[derive(Debug, Clone, Copy)]
 pub struct ControlDirFormat {
-    /// The registry name (`brz init --format=<name>`).
-    pub name: &'static str,
+    /// The registry name (`brz init --format=<name>`), or `None` for a
+    /// combination that is not registered under a name.
+    pub name: Option<&'static str>,
     /// The `.bzr/repository/format` marker of the repository to create.
     pub repo_marker: &'static [u8],
     /// The `.bzr/branch/format` marker of the branch to create.
@@ -28,7 +29,7 @@ impl ControlDirFormat {
     /// Baseline format with empty markers; the `..` base used by
     /// [`declare_bzrdir_format!`].
     pub const DEFAULT: ControlDirFormat = ControlDirFormat {
-        name: "",
+        name: None,
         repo_marker: b"",
         branch_marker: b"",
         wt_marker: b"",
@@ -68,7 +69,7 @@ pub fn find_control_dir_format(name: &str) -> Option<&'static ControlDirFormat> 
     inventory::iter::<ControlDirFormatRegistration>
         .into_iter()
         .map(|r| r.0)
-        .find(|f| f.name == name)
+        .find(|f| f.name == Some(name))
 }
 
 /// All declared control-directory formats.
@@ -103,11 +104,18 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_combo_has_a_name() {
+        for f in control_dir_formats() {
+            assert!(f.name.is_some(), "a registered combo has no name: {:?}", f);
+        }
+    }
+
+    #[test]
     fn every_combo_names_a_registered_repository_format() {
         for f in control_dir_formats() {
             assert!(
                 crate::repository::find_format(f.repo_marker).is_some(),
-                "combo {} names an unregistered repository marker",
+                "combo {:?} names an unregistered repository marker",
                 f.name
             );
         }
