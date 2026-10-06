@@ -649,6 +649,79 @@ mod tests {
     }
 
     #[test]
+    fn trait_iter_entries_by_dir() {
+        let inv = build_test_inv_deeper();
+        let inv: &dyn crate::inventory::Inventory = &inv;
+        let entries = inv.iter_entries_by_dir(None, None).unwrap();
+        let paths: Vec<&str> = entries.iter().map(|(p, _)| p.as_str()).collect();
+        // Each directory's entries come before those of its subdirectories.
+        assert_eq!(
+            paths,
+            vec![
+                "",
+                "dir",
+                "top.txt",
+                "dir/file.txt",
+                "dir/sub",
+                "dir/sub/nested.txt",
+            ]
+        );
+
+        let entries = inv
+            .iter_entries_by_dir(None, Some(&[FileId::from(&b"f2"[..])]))
+            .unwrap();
+        let paths: Vec<&str> = entries.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["dir/sub/nested.txt"]);
+    }
+
+    #[test]
+    fn trait_sorted_children() {
+        let inv = build_test_inv_deeper();
+        let inv: &dyn crate::inventory::Inventory = &inv;
+        let names = |file_id: &[u8]| -> Vec<String> {
+            inv.sorted_children(&FileId::from(file_id))
+                .unwrap()
+                .iter()
+                .map(|e| e.name().to_string())
+                .collect()
+        };
+        assert_eq!(names(b"root-id"), vec!["dir", "top.txt"]);
+        assert_eq!(names(b"dir-id"), vec!["file.txt", "sub"]);
+    }
+
+    /// Only a directory in the inventory can be listed or walked from.
+    #[test]
+    fn trait_iteration_needs_a_directory() {
+        use crate::inventory::Error as InventoryError;
+
+        let inv = build_test_inv_deeper();
+        let inv: &dyn crate::inventory::Inventory = &inv;
+        let file = FileId::from(&b"top-id"[..]);
+        let missing = FileId::from(&b"missing-id"[..]);
+        let outcomes = |file_id: &FileId| {
+            [
+                inv.sorted_children(file_id).map(|_| ()),
+                inv.iter_entries_by_dir(Some(file_id), None).map(|_| ()),
+            ]
+        };
+        for outcome in outcomes(&file) {
+            match outcome {
+                Err(InventoryError::ParentNotDirectory(path, file_id)) => {
+                    assert_eq!(path, "top.txt");
+                    assert_eq!(file_id, file);
+                }
+                other => panic!("expected a non-directory error, got {:?}", other.is_ok()),
+            }
+        }
+        for outcome in outcomes(&missing) {
+            match outcome {
+                Err(InventoryError::NoSuchId(file_id)) => assert_eq!(file_id, missing),
+                other => panic!("expected an unknown id error, got {:?}", other.is_ok()),
+            }
+        }
+    }
+
+    #[test]
     fn iter_entries_root_recursive_yields_full_tree() {
         let inv = build_test_inv_deeper();
         let entries = inv.iter_entries(None, true).unwrap();
@@ -2178,6 +2251,42 @@ where
             Err(Error::NoSuchId(_)) => Ok(None),
             Err(e) => Err(backend_err(e)),
         }
+    }
+
+    fn iter_entries_by_dir(
+        &self,
+        from_dir: Option<&crate::FileId>,
+        specific_file_ids: Option<&[crate::FileId]>,
+    ) -> Result<Vec<(String, Entry)>, crate::inventory::Error> {
+        if let Some(from_dir) = from_dir {
+            self.check_directory(from_dir)?;
+        }
+        CHKInventory::iter_entries_by_dir(self, from_dir, specific_file_ids).map_err(backend_err)
+    }
+
+    fn sorted_children(
+        &self,
+        file_id: &crate::FileId,
+    ) -> Result<Vec<Entry>, crate::inventory::Error> {
+        self.check_directory(file_id)?;
+        CHKInventory::iter_sorted_children(self, file_id).map_err(backend_err)
+    }
+}
+
+impl<S> CHKInventory<S>
+where
+    S: crate::versionedfile::VersionedFiles + ?Sized,
+{
+    /// Check that `file_id` names a directory in this inventory.
+    fn check_directory(&self, file_id: &crate::FileId) -> Result<(), crate::inventory::Error> {
+        let entry = self.get_entry(file_id).map_err(backend_err)?;
+        if entry.kind() != crate::osutils::Kind::Directory {
+            return Err(crate::inventory::Error::ParentNotDirectory(
+                self.id2path(file_id).map_err(backend_err)?,
+                file_id.clone(),
+            ));
+        }
+        Ok(())
     }
 }
 
