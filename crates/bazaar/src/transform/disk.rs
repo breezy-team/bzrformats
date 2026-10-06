@@ -41,6 +41,9 @@ pub struct DiskTreeTransform<T: TransformTree> {
     create_symlinks: bool,
     /// Whether apply must still consult the mode/mtime (set once created).
     creation_done: HashSet<String>,
+    /// The modification time every file staged by this transform is given,
+    /// taken when the first one is created.
+    creation_mtime: Option<std::time::SystemTime>,
 }
 
 impl<T: TransformTree> DiskTreeTransform<T> {
@@ -55,6 +58,7 @@ impl<T: TransformTree> DiskTreeTransform<T> {
             observed_sha1s: HashMap::new(),
             create_symlinks,
             creation_done: HashSet::new(),
+            creation_mtime: None,
         }
     }
 
@@ -84,18 +88,82 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         self.limbo_files.get(trans_id).map(PathBuf::as_path)
     }
 
+    /// Check that no contents are staged for `trans_id` yet.
+    fn check_no_contents(&self, trans_id: &str) -> Result<(), Error> {
+        if self.base.new_contents_map().contains_key(trans_id) {
+            return Err(Error::DuplicateKey(format!("{trans_id:?}")));
+        }
+        Ok(())
+    }
+
+    /// Give the file staged at `path` the modification time shared by all
+    /// files this transform creates (breezy's `_set_mtime`).
+    fn set_mtime(&mut self, path: &Path) -> Result<(), Error> {
+        let mtime = *self
+            .creation_mtime
+            .get_or_insert_with(std::time::SystemTime::now);
+        let times = std::fs::FileTimes::new()
+            .set_accessed(mtime)
+            .set_modified(mtime);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_times(times))
+            .map_err(io_err)
+    }
+
+    /// Give the file staged for `trans_id` the mode of the regular file the
+    /// tree has at `mode_id`, if it has one (breezy's `_set_mode`).
+    fn copy_mode(&mut self, trans_id: &str, mode_id: &str) -> Result<(), Error> {
+        use std::io::ErrorKind;
+
+        let Some(old_path) = self.base.tree_path(mode_id) else {
+            return Ok(());
+        };
+        let metadata = match std::fs::metadata(self.base.tree().abspath(old_path)) {
+            Ok(metadata) => metadata,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                return Ok(())
+            }
+            Err(e) => return Err(io_err(e)),
+        };
+        if !metadata.is_file() {
+            return Ok(());
+        }
+        let name = self.limbo_name(trans_id);
+        chmod_if_possible(&name, metadata.permissions()).map_err(io_err)
+    }
+
     /// Stage a new file with `contents` for `trans_id`. `sha1`, when known,
     /// is recorded so apply can seed the tree's stat cache.
+    ///
+    /// If `trans_id` is a regular file in the tree, the new file keeps its
+    /// mode.
     pub fn create_file(
         &mut self,
         contents: &[u8],
         trans_id: &str,
         sha1: Option<Vec<u8>>,
     ) -> Result<(), Error> {
+        self.create_file_with_mode_of(contents, trans_id, trans_id, sha1)
+    }
+
+    /// Stage a new file as [`create_file`](Self::create_file) does, taking
+    /// its mode from the tree file at `mode_id` rather than at `trans_id`.
+    pub fn create_file_with_mode_of(
+        &mut self,
+        contents: &[u8],
+        trans_id: &str,
+        mode_id: &str,
+        sha1: Option<Vec<u8>>,
+    ) -> Result<(), Error> {
+        self.check_no_contents(trans_id)?;
         let name = self.limbo_name(trans_id);
         std::fs::write(&name, contents).map_err(io_err)?;
         self.base.set_new_contents(trans_id, ContentKind::File);
         self.creation_done.insert(trans_id.to_string());
+        self.set_mtime(&name)?;
+        self.copy_mode(trans_id, mode_id)?;
         if let Some(sha1) = sha1 {
             self.observed_sha1s
                 .insert(trans_id.to_string(), (sha1, contents.len() as u64));
@@ -105,6 +173,7 @@ impl<T: TransformTree> DiskTreeTransform<T> {
 
     /// Stage a new directory for `trans_id`.
     pub fn create_directory(&mut self, trans_id: &str) -> Result<(), Error> {
+        self.check_no_contents(trans_id)?;
         let name = self.limbo_name(trans_id);
         std::fs::create_dir(&name).map_err(io_err)?;
         self.base.set_new_contents(trans_id, ContentKind::Directory);
@@ -158,9 +227,17 @@ impl<T: TransformTree> DiskTreeTransform<T> {
     /// symlink support the link is not created, but the content is still
     /// recorded (matching breezy) so conflict detection is consistent.
     pub fn create_symlink(&mut self, target: &str, trans_id: &str) -> Result<(), Error> {
+        self.check_no_contents(trans_id)?;
         let name = self.limbo_name(trans_id);
         if self.create_symlinks {
             symlink(target, &name).map_err(io_err)?;
+        } else {
+            match self.base.final_path(trans_id) {
+                Ok(path) => {
+                    log::warn!("Unable to create symlink \"{path}\" on this filesystem.")
+                }
+                Err(_) => log::warn!("Unable to create symlink \"None\" on this filesystem."),
+            }
         }
         self.base.set_new_contents(trans_id, ContentKind::Symlink);
         self.creation_done.insert(trans_id.to_string());
@@ -196,7 +273,7 @@ impl<T: TransformTree> DiskTreeTransform<T> {
         let trans_id = self.new_entry(name, parent_id, file_id)?;
         self.create_file(contents, &trans_id, sha1)?;
         if let Some(executable) = executable {
-            self.base.set_executability(Some(executable), &trans_id);
+            self.base.set_executability(Some(executable), &trans_id)?;
         }
         Ok(trans_id)
     }
@@ -240,14 +317,24 @@ impl<T: TransformTree> DiskTreeTransform<T> {
             .cloned()
             .collect();
         for trans_id in cancelled {
-            self.cancel_creation(&trans_id)?;
+            self.discard_staged(&trans_id)?;
         }
         Ok(())
     }
 
     /// Cancel staged content creation for `trans_id`, removing its limbo file.
     pub fn cancel_creation(&mut self, trans_id: &str) -> Result<(), Error> {
+        if !self.base.has_new_contents(trans_id) {
+            return Err(Error::Malformed(format!(
+                "{trans_id} has no contents scheduled"
+            )));
+        }
         self.base.cancel_contents(trans_id);
+        self.discard_staged(trans_id)
+    }
+
+    /// Remove what is staged in limbo for `trans_id`.
+    fn discard_staged(&mut self, trans_id: &str) -> Result<(), Error> {
         self.observed_sha1s.remove(trans_id);
         if let Some(path) = self.limbo_files.remove(trans_id) {
             delete_any(&path).map_err(io_err)?;
@@ -275,6 +362,21 @@ impl<T: TransformTree> DiskTreeTransform<T> {
 /// Map an I/O error into a transform error.
 fn io_err(e: std::io::Error) -> Error {
     Error::Tree(e.to_string())
+}
+
+/// Set the mode of `path` where the filesystem allows it; some refuse even
+/// on Unix, which is not worth failing over.
+pub(super) fn chmod_if_possible(
+    path: &Path,
+    permissions: std::fs::Permissions,
+) -> std::io::Result<()> {
+    match std::fs::set_permissions(path, permissions) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            log::debug!("ignore error on chmod of {path:?}: {e:?}");
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// Delete a file, directory or symlink at `path`, ignoring absence.
@@ -369,6 +471,61 @@ mod tests {
         assert_eq!(tt.base().final_kind(&tid), Some(Kind::Symlink));
     }
 
+    /// Contents can be staged for a trans-id only once.
+    #[test]
+    fn staging_contents_twice_is_refused() {
+        let (_d, mut tt) = disk_tt();
+        let root = tt.base().root().unwrap().to_string();
+        let tid = tt.base_mut().create_path("f.txt", &root).unwrap();
+        tt.create_file(b"first\n", &tid, None).unwrap();
+        for result in [
+            tt.create_file(b"second\n", &tid, None),
+            tt.create_directory(&tid),
+            tt.create_symlink("target", &tid),
+        ] {
+            match result {
+                Err(Error::DuplicateKey(key)) => assert_eq!(key, format!("{tid:?}")),
+                other => panic!("expected a duplicate key, got {:?}", other),
+            }
+        }
+        assert_eq!(std::fs::read(tt.limbo_name(&tid)).unwrap(), b"first\n");
+    }
+
+    /// Every file a transform creates gets the same modification time.
+    #[test]
+    fn created_files_share_an_mtime() {
+        let (_d, mut tt) = disk_tt();
+        let root = tt.base().root().unwrap().to_string();
+        let first = tt.base_mut().create_path("first", &root).unwrap();
+        tt.create_file(b"1", &first, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = tt.base_mut().create_path("second", &root).unwrap();
+        tt.create_file(b"2", &second, None).unwrap();
+        let mtime = |tt: &mut DiskTreeTransform<FakeTree>, tid: &str| {
+            std::fs::metadata(tt.limbo_name(tid))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        assert_eq!(mtime(&mut tt, &first), mtime(&mut tt, &second));
+    }
+
+    /// Where symlinks cannot be made the link is left out, but still counts
+    /// as the contents.
+    #[test]
+    fn create_symlink_without_symlink_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let limbo = dir.path().join("limbo");
+        std::fs::create_dir(&limbo).unwrap();
+        let base = TreeTransformBase::new(FakeTree::new(), true);
+        let mut tt = DiskTreeTransform::new(base, limbo, false);
+        let root = tt.base().root().unwrap().to_string();
+        let tid = tt.base_mut().create_path("link", &root).unwrap();
+        tt.create_symlink("target", &tid).unwrap();
+        assert!(tt.limbo_name(&tid).symlink_metadata().is_err());
+        assert_eq!(tt.base().final_kind(&tid), Some(Kind::Symlink));
+    }
+
     #[test]
     fn fixup_new_roots_discards_the_staged_root() {
         let (_d, mut tt) = disk_tt();
@@ -384,6 +541,19 @@ mod tests {
 
         assert!(!staged.exists());
         assert_eq!(tt.base().final_kind(&new_root), None);
+    }
+
+    #[test]
+    fn cancel_creation_needs_staged_contents() {
+        let (_d, mut tt) = disk_tt();
+        let root = tt.base().root().unwrap().to_string();
+        let tid = tt.base_mut().create_path("f", &root).unwrap();
+        match tt.cancel_creation(&tid) {
+            Err(Error::Malformed(message)) => {
+                assert_eq!(message, format!("{tid} has no contents scheduled"))
+            }
+            other => panic!("expected a malformed transform, got {:?}", other),
+        }
     }
 
     #[test]
@@ -416,7 +586,7 @@ mod tests {
             other => panic!("expected orphaning to be forbidden, got {:?}", other),
         }
         // The orphan stays where it was.
-        assert_eq!(tt.base_mut().final_parent(&orphan), dir);
+        assert_eq!(tt.base_mut().final_parent(&orphan).unwrap(), dir);
         assert_eq!(tt.base().final_name(&orphan).unwrap(), "foo");
     }
 
@@ -426,7 +596,7 @@ mod tests {
         let (dir, orphan) = orphan_in_removed_dir(&mut tt);
         tt.new_orphan(&orphan, &dir, OrphanPolicy::Move).unwrap();
 
-        let orphans_dir = tt.base_mut().final_parent(&orphan);
+        let orphans_dir = tt.base_mut().final_parent(&orphan).unwrap();
         assert_eq!(tt.base().final_name(&orphans_dir).unwrap(), "brz-orphans");
         assert_eq!(tt.base().final_kind(&orphans_dir), Some(Kind::Directory));
         assert!(tt.limbo_name(&orphans_dir).is_dir());
@@ -464,8 +634,8 @@ mod tests {
         tt.new_orphan(&second, &other, OrphanPolicy::Move).unwrap();
 
         assert_eq!(
-            tt.base_mut().final_parent(&second),
-            tt.base_mut().final_parent(&first)
+            tt.base_mut().final_parent(&second).unwrap(),
+            tt.base_mut().final_parent(&first).unwrap()
         );
         assert_eq!(tt.base().final_name(&first).unwrap(), "foo.~1~");
         assert_eq!(tt.base().final_name(&second).unwrap(), "foo.~2~");
