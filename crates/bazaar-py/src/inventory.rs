@@ -28,7 +28,7 @@ import_exception!(bzrformats._bzr_rs.errors, InvalidNormalization);
 import_exception!(bzrformats._bzr_rs.errors, InconsistentDelta);
 import_exception!(bzrformats._bzr_rs.errors, AlreadyVersionedError);
 import_exception!(bzrformats._bzr_rs.errors, BzrFormatsError);
-import_exception!(bzrformats.errors, NotADirectory);
+import_exception!(bzrformats._bzr_rs.errors, NotADirectory);
 import_exception!(bzrformats._bzr_rs.errors, NotVersionedError);
 create_exception!(
     bzrformats.inventory_delta,

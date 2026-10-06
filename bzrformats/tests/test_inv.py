@@ -59,6 +59,42 @@ class TestInventoryUpdates(TestCase):
         self.assertEqual(b"hello-id", ie.file_id)
         self.assertEqual("file", ie.kind)
 
+    def make_nested_inventory(self):
+        inv = inventory.Inventory(root_id=b"tree-root")
+        inv.add_path("sub", "directory", b"sub-id")
+        inv.add_path("sub/file", "file", b"file-id")
+        return inv
+
+    def test_iter_entries_by_dir_from_a_file(self):
+        inv = self.make_nested_inventory()
+        e = self.assertRaises(
+            bzrformats_errors.NotADirectory,
+            inv.iter_entries_by_dir,
+            from_dir=b"file-id",
+        )
+        self.assertEqual("The file id \"b'file-id'\" is not a directory.", str(e))
+
+    def test_iter_entries_by_dir_from_an_unknown_id(self):
+        inv = self.make_nested_inventory()
+        self.assertRaises(
+            bzrformats_errors.NoSuchId, inv.iter_entries_by_dir, from_dir=b"unknown-id"
+        )
+
+    def test_iter_entries_by_dir_ignores_unknown_specific_ids(self):
+        inv = self.make_nested_inventory()
+        self.assertEqual(
+            [("sub/file", b"file-id")],
+            [
+                (path, entry.file_id)
+                for path, entry in inv.iter_entries_by_dir(
+                    specific_file_ids={b"file-id", b"unknown-id"}
+                )
+            ],
+        )
+        self.assertEqual(
+            [], list(inv.iter_entries_by_dir(specific_file_ids={b"unknown-id"}))
+        )
+
     def test_copy(self):
         """Make sure copy() works and creates a deep copy."""
         inv = inventory.Inventory(root_id=b"some-tree-root")
