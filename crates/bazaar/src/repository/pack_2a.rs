@@ -796,12 +796,29 @@ impl Pack2aRepository {
             }
         }
 
-        // The uninteresting CHK roots: the inventories already present here, so
-        // their pages are not re-copied. Reading them all is the price of an
-        // exact difference; for a fetch into an empty repository this is empty.
+        // The uninteresting CHK roots: inventories already present here, so
+        // their pages are not re-copied. The difference walk reads pages from
+        // the *source* store, so a root is only usable as uninteresting if the
+        // source can read it, i.e. the inventory is present in the source too.
+        // A revision present here but absent from the source (the two sides
+        // diverged) must be skipped; its CHK pages do not exist in the source
+        // and reading them would fail with an absent-record error. This mirrors
+        // breezy's `_get_filtered_chk_streams`, which restricts the excluded
+        // roots to inventories actually present in the source.
+        let mut source_inventories: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
+        for key in source.inventories.keys()? {
+            let revision = key.segments().first().cloned().ok_or_else(|| {
+                RepositoryError::Corrupt("empty key in inventories index".to_string())
+            })?;
+            source_inventories.insert(revision);
+        }
         let mut uninteresting_roots: Vec<Vec<u8>> = Vec::new();
         for rev in self.all_revision_ids()? {
-            let inv = self.get_inventory(&rev)?;
+            if !source_inventories.contains(&rev) {
+                continue;
+            }
+            let inv = source.get_inventory(&rev)?;
             uninteresting_roots.extend(chk_root_keys(&inv));
         }
 
