@@ -173,13 +173,13 @@ pub fn get_host_name() -> std::io::Result<String> {
 ///
 /// Honours the usual environment overrides before falling back to the
 /// system account database.
-pub fn get_user_name() -> String {
+pub fn get_user_name() -> std::io::Result<String> {
     for name in &["LOGNAME", "USER", "LNAME", "USERNAME"] {
         if let Ok(user) = std::env::var(name) {
-            return user;
+            return Ok(user);
         }
     }
-    whoami::username()
+    Ok(whoami::username()?)
 }
 
 /// Whether a local process is known to be dead.
