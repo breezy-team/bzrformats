@@ -123,7 +123,7 @@ impl Replacer {
             .compiled
             .as_ref()
             .unwrap()
-            .replace_all(text, |caps: &Captures| {
+            .replace_all(text, |caps: &Captures<str>| {
                 for (index, m) in caps.iter().skip(1).enumerate() {
                     if let Some(m) = m {
                         return sub(&m, &mut pats[index].1);
