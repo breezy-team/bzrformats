@@ -903,13 +903,13 @@ impl WorkingTree4 {
         repository: &dyn crate::repository::Repository,
         revision_id: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>, crate::dirstate::TreeData)>, WorkingTreeError> {
-        use crate::dirstate::{inv_entry_to_details, TreeData, NULLSTAT};
+        use crate::dirstate::{inv_entry_to_details, TreeData};
         let tree = repository
             .revision_tree(revision_id)
             .map_err(|e| WorkingTreeError::Commit(format!("revision tree: {e:?}")))?;
         let mut out = Vec::new();
         for (path, entry) in tree.iter_entries() {
-            let (minikind, fingerprint, size, executable, _rev) = inv_entry_to_details(&entry);
+            let (minikind, fingerprint, size, executable, revision) = inv_entry_to_details(&entry);
             out.push((
                 path.into_bytes(),
                 entry.file_id().as_bytes().to_vec(),
@@ -918,7 +918,7 @@ impl WorkingTree4 {
                     fingerprint,
                     size,
                     executable,
-                    packed_stat: NULLSTAT.to_vec(),
+                    packed_stat: revision,
                 },
             ));
         }
@@ -1514,13 +1514,16 @@ impl WorkingTree4 {
             .iter()
             .zip(inv_entries)
             .map(|(path, entry)| {
-                let (minikind, fingerprint, size, executable, _rev) = inv_entry_to_details(entry);
+                // A parent tree's row records the revision the entry last
+                // changed in where the working tree's records its stat.
+                let (minikind, fingerprint, size, executable, revision) =
+                    inv_entry_to_details(entry);
                 let td = TreeData {
                     minikind,
                     fingerprint,
                     size,
                     executable,
-                    packed_stat: crate::dirstate::NULLSTAT.to_vec(),
+                    packed_stat: revision,
                 };
                 (
                     path.clone().into_bytes(),
@@ -2543,6 +2546,32 @@ mod tests {
     }
 
     /// A parent that is an ancestor of another parent is dropped.
+    #[test]
+    fn basis_rows_record_entry_revisions() {
+        // A parent tree's dirstate row holds the revision the entry last
+        // changed in, which is the basis entry's revision.
+        let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
+        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let repo = cd.open_repository().unwrap();
+        let inventory = repo.get_inventory(&r2).unwrap();
+        let mut checked = 0;
+        for entry in wt.dirstate.iter_entries() {
+            let slot = &entry.trees[1];
+            if entry.key.basename.is_empty() {
+                continue;
+            }
+            let file_id = crate::FileId::from(entry.key.file_id.clone());
+            let ie = inventory.get_entry(&file_id).unwrap().unwrap();
+            assert_eq!(
+                ie.revision().unwrap().as_bytes(),
+                slot.packed_stat.as_slice()
+            );
+            checked += 1;
+        }
+        assert_eq!(1, checked);
+        assert_ne!(r1, r2);
+    }
+
     #[test]
     fn set_parent_ids_drops_ancestor_parents() {
         let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
