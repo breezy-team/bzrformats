@@ -7,7 +7,7 @@
 //! path and metadata.
 
 use crate::inventory::{Entry, Inventory};
-use crate::FileId;
+use crate::{FileId, RevisionId};
 
 /// Map an inventory lookup error to the absent/present distinction the tree
 /// methods expose: a genuinely missing id becomes `Ok(None)`, while a backend
@@ -23,12 +23,13 @@ fn absent_or_err(e: crate::inventory::Error) -> Result<(), crate::inventory::Err
 /// inventory. The inventory keeps its natural representation (a lazy CHK
 /// inventory for 2a, an in-memory one for knit-pack) behind the box.
 pub struct RevisionTree {
-    revision_id: Vec<u8>,
+    revision_id: RevisionId,
     inventory: Box<dyn Inventory>,
 }
 
 impl RevisionTree {
-    pub(super) fn new(revision_id: Vec<u8>, inventory: Box<dyn Inventory>) -> Self {
+    /// The tree of `revision_id` whose inventory is `inventory`.
+    pub fn new(revision_id: RevisionId, inventory: Box<dyn Inventory>) -> Self {
         RevisionTree {
             revision_id,
             inventory,
@@ -36,7 +37,7 @@ impl RevisionTree {
     }
 
     /// The revision this tree represents.
-    pub fn revision_id(&self) -> &[u8] {
+    pub fn revision_id(&self) -> &RevisionId {
         &self.revision_id
     }
 
@@ -170,7 +171,7 @@ mod tests {
         inv.add(file(b"c-id", "c", b"sub-id")).unwrap();
         inv.add(file(b"b-id", "b", b"sub-id")).unwrap();
         inv.add(file(b"a-id", "a", b"TREE_ROOT")).unwrap();
-        RevisionTree::new(b"rev1".to_vec(), Box::new(inv))
+        RevisionTree::new(RevisionId::from(b"rev1".to_vec()), Box::new(inv))
     }
 
     #[test]

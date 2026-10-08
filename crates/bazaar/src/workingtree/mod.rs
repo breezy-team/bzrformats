@@ -401,6 +401,14 @@ impl CommitOptions {
 ///
 /// `Send + Sync` so a boxed tree can be held by the pyo3 bindings.
 pub trait WorkingTree: Send + Sync {
+    /// The inventory of the basis tree as the working tree keeps a copy of
+    /// it, or `None` if it keeps none. The base implementation keeps none.
+    fn basis_inventory(
+        &self,
+    ) -> Result<Option<crate::inventory::MutableInventory>, WorkingTreeError> {
+        Ok(None)
+    }
+
     /// The basis revision id this tree was checked out from, or `None` if
     /// the tree has no parent (a fresh, never-committed tree).
     fn basis_revision(&self) -> Option<Vec<u8>>;
@@ -675,6 +683,36 @@ pub struct Conflict {
     pub conflict_file_id: Option<Vec<u8>>,
 }
 
+impl Conflict {
+    /// The conflict as the user sees it, with `None` for a missing field.
+    pub fn describe(&self) -> String {
+        let path = &self.path;
+        let conflict_path = self.conflict_path.as_deref().unwrap_or("None");
+        let action = self.action.as_deref().unwrap_or("None");
+        match self.typestring.as_str() {
+            "path conflict" => format!("Path conflict: {path} / {conflict_path}"),
+            "contents conflict" => format!("Contents conflict in {path}"),
+            "text conflict" => format!("Text conflict in {path}"),
+            "duplicate id" => {
+                format!("Conflict adding id to {conflict_path}.  {action} {path}.")
+            }
+            "duplicate" => format!("Conflict adding file {conflict_path}.  {action} {path}."),
+            "parent loop" => format!("Conflict moving {path} into {conflict_path}. {action}."),
+            "unversioned parent" => format!(
+                "Conflict because {path} is not versioned, but has versioned children.  {action}."
+            ),
+            "missing parent" => format!("Conflict adding files to {path}.  {action}."),
+            "deleting parent" => {
+                format!("Conflict: can't delete {path} because it is not empty.  {action}.")
+            }
+            "non-directory parent" => {
+                format!("Conflict: {path} is not a directory, but has files in it.  {action}.")
+            }
+            other => format!("{other}: {path}"),
+        }
+    }
+}
+
 /// Open the working tree reachable through `transport` (rooted at the
 /// directory that contains `.bzr`), dispatching on the
 /// `.bzr/checkout/format` marker.
@@ -712,6 +750,94 @@ pub struct WorkingTree4 {
 }
 
 impl WorkingTree4 {
+    /// The inventory of the basis tree from the dirstate's copy of it;
+    /// `None` if the tree has no basis or its basis is a ghost, which the
+    /// dirstate keeps no copy of.
+    pub fn basis_inventory(
+        &self,
+    ) -> Result<Option<crate::inventory::MutableInventory>, WorkingTreeError> {
+        use crate::inventory::{Entry, MutableInventory};
+        use crate::{FileId, RevisionId};
+
+        let Some(basis) = self.dirstate.parents.first() else {
+            return Ok(None);
+        };
+        if self.dirstate.ghosts.contains(basis) {
+            return Ok(None);
+        }
+        let revision_id = RevisionId::from(basis.as_slice());
+        // The basis is the first parent, so its rows are the first after
+        // the working tree's.
+        let index = 1;
+        let corrupt = |what: String| WorkingTreeError::Corrupt(format!("dirstate: {what}"));
+        let mut inventory = MutableInventory::new();
+        let mut parent_ids: std::collections::HashMap<Vec<u8>, FileId> =
+            std::collections::HashMap::new();
+        for entry in self.dirstate.iter_entries() {
+            let Some(slot) = entry.trees.get(index) else {
+                continue;
+            };
+            let revision =
+                (!slot.packed_stat.is_empty()).then(|| RevisionId::from(slot.packed_stat.clone()));
+            let file_id = FileId::from(entry.key.file_id.clone());
+            let mut add = |ie: Entry| inventory.add(ie).map_err(|e| corrupt(format!("{e:?}")));
+            if entry.key.dirname.is_empty() && entry.key.basename.is_empty() {
+                if slot.minikind != Kind::Directory {
+                    return Err(corrupt(
+                        "the root of the basis tree is not a directory".to_string(),
+                    ));
+                }
+                let revision = revision.unwrap_or_else(|| revision_id.clone());
+                add(Entry::root(file_id.clone(), Some(revision)))?;
+                parent_ids.insert(Vec::new(), file_id);
+                continue;
+            }
+            if matches!(slot.minikind, Kind::Absent | Kind::Relocated) {
+                continue;
+            }
+            let Some(parent_id) = parent_ids.get(&entry.key.dirname).cloned() else {
+                continue;
+            };
+            let name = String::from_utf8(entry.key.basename.clone())
+                .map_err(|e| corrupt(format!("name is not UTF-8: {e}")))?;
+            let ie = match slot.minikind {
+                Kind::File => Entry::file(
+                    file_id,
+                    name,
+                    parent_id,
+                    revision,
+                    Some(slot.fingerprint.clone()),
+                    Some(slot.size),
+                    Some(slot.executable),
+                    None,
+                ),
+                Kind::Directory => {
+                    let mut path = entry.key.dirname.clone();
+                    if !path.is_empty() {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(&entry.key.basename);
+                    parent_ids.insert(path, file_id.clone());
+                    Entry::directory(file_id, name, parent_id, revision)
+                }
+                Kind::Symlink => {
+                    let target = String::from_utf8(slot.fingerprint.clone())
+                        .map_err(|e| corrupt(format!("symlink target is not UTF-8: {e}")))?;
+                    Entry::link(file_id, name, parent_id, revision, Some(target))
+                }
+                Kind::TreeReference => {
+                    let reference = (!slot.fingerprint.is_empty())
+                        .then(|| RevisionId::from(slot.fingerprint.clone()));
+                    Entry::tree_reference(file_id, name, parent_id, revision, reference)
+                }
+                Kind::Absent | Kind::Relocated => unreachable!("skipped above"),
+            };
+            add(ie)?;
+        }
+        inventory.revision_id = Some(revision_id);
+        Ok(Some(inventory))
+    }
+
     /// Open the working tree reachable through `transport` (rooted at the
     /// directory that contains `.bzr`).
     pub fn open(transport: SharedTransport) -> Result<Self, WorkingTreeError> {
@@ -1633,6 +1759,12 @@ impl WorkingTree4 {
 }
 
 impl WorkingTree for WorkingTree4 {
+    fn basis_inventory(
+        &self,
+    ) -> Result<Option<crate::inventory::MutableInventory>, WorkingTreeError> {
+        WorkingTree4::basis_inventory(self)
+    }
+
     fn basis_revision(&self) -> Option<Vec<u8>> {
         WorkingTree4::basis_revision(self)
     }
@@ -2511,6 +2643,63 @@ mod tests {
             )
             .unwrap();
         (dir, parent, cd, r1, r2)
+    }
+
+    #[test]
+    fn basis_inventory_matches_the_repository() {
+        let (_dir, parent, cd, _r1, r2) = tree_with_two_commits();
+        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let from_dirstate = wt.basis_inventory().unwrap().expect("r2 is the basis");
+        let repo = cd.open_repository().unwrap();
+        let from_repo = repo.get_inventory(&r2).unwrap();
+        let mut want = from_repo.entries().unwrap();
+        let mut got = crate::inventory::Inventory::entries(&from_dirstate).unwrap();
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(want, got);
+        assert_eq!(
+            from_repo.root_entry().unwrap(),
+            crate::inventory::Inventory::root_entry(&from_dirstate).unwrap()
+        );
+        assert_eq!(Some(crate::RevisionId::from(r2)), from_dirstate.revision_id);
+    }
+
+    #[test]
+    fn ghost_basis_has_no_inventory() {
+        let (_dir, parent, cd, _r1, _r2) = tree_with_two_commits();
+        let repo = cd.open_repository().unwrap();
+        let mut wt = WorkingTree4::open(parent).unwrap();
+        wt.set_parent_ids(repo.as_ref(), &[b"ghost-rev".to_vec()], true)
+            .unwrap();
+        assert!(wt.basis_inventory().unwrap().is_none());
+    }
+
+    #[test]
+    fn conflict_descriptions() {
+        let conflict = |typestring: &str, conflict_path: Option<&str>, action: Option<&str>| {
+            Conflict {
+                typestring: typestring.to_string(),
+                path: "a".to_string(),
+                file_id: None,
+                action: action.map(str::to_string),
+                conflict_path: conflict_path.map(str::to_string),
+                conflict_file_id: None,
+            }
+            .describe()
+        };
+        assert_eq!("Text conflict in a", conflict("text conflict", None, None));
+        assert_eq!(
+            "Path conflict: a / b",
+            conflict("path conflict", Some("b"), None)
+        );
+        assert_eq!(
+            "Conflict adding file b.  Moved existing file to a.",
+            conflict("duplicate", Some("b"), Some("Moved existing file to"))
+        );
+        assert_eq!(
+            "Conflict adding files to a.  Created directory.",
+            conflict("missing parent", None, Some("Created directory"))
+        );
     }
 
     #[test]
