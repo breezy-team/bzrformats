@@ -301,6 +301,70 @@ pub trait ControlDir: Send + Sync {
     /// Open the repository in this control directory.
     fn open_repository(&self) -> Result<Box<dyn crate::repository::Repository>, BzrDirError>;
 
+    /// The transport of the repository in this control directory.
+    fn repository_transport(&self) -> Result<SharedTransport, BzrDirError> {
+        Ok(self.transport().clone())
+    }
+
+    /// The format of the working tree in this control directory, if there
+    /// is one; [`BzrDirError::UnsupportedFormat`] for a marker this crate
+    /// does not know.
+    fn workingtree_format(
+        &self,
+    ) -> Result<Option<&'static crate::workingtree::format::WorkingTreeFormat>, BzrDirError> {
+        Ok(None)
+    }
+
+    /// The names of the colocated branches, which the default branch is not
+    /// among, as `branch-list` lists them.
+    fn colocated_branch_names(&self) -> Result<Vec<String>, BzrDirError> {
+        Ok(Vec::new())
+    }
+
+    /// The transport of the branch `name` (empty for the default branch).
+    fn branch_transport(&self, name: &str) -> Result<SharedTransport, BzrDirError> {
+        if name.is_empty() {
+            Ok(self.transport().clone())
+        } else {
+            Err(BzrDirError::Component(format!(
+                "colocated branch {name:?} is not supported by this control directory"
+            )))
+        }
+    }
+
+    /// The format of the branch `name` (empty for the default branch), or
+    /// `None` if there is no such branch; [`BzrDirError::UnsupportedFormat`]
+    /// for a marker this crate does not know.
+    fn branch_format(
+        &self,
+        name: &str,
+    ) -> Result<Option<&'static crate::branch::BranchFormat>, BzrDirError> {
+        let marker = match self.branch_transport(name)?.get_bytes("format") {
+            Ok(marker) => marker,
+            Err(TransportError::NoSuchFile(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        crate::branch::find_format(&marker)
+            .map(Some)
+            .ok_or(BzrDirError::UnsupportedFormat {
+                component: Component::Branch,
+                found: marker,
+            })
+    }
+
+    /// The location the branch `name` refers to, as recorded, if it is a
+    /// branch reference.
+    fn branch_reference(&self, name: &str) -> Result<Option<String>, BzrDirError> {
+        crate::branch::Branch::new(self.branch_transport(name)?)
+            .get_reference()
+            .map_err(|e| BzrDirError::Component(format!("reading branch reference: {e}")))
+    }
+
+    /// Open the branch `name` itself, without following a reference.
+    fn open_branch_named(&self, name: &str) -> Result<crate::branch::Branch, BzrDirError> {
+        Ok(crate::branch::Branch::new(self.branch_transport(name)?))
+    }
+
     /// Open the repository with any stacked-on fallback activated.
     ///
     /// The default returns the plain repository (correct for formats that
@@ -674,6 +738,50 @@ fn same_location(a: &SharedTransport, b: &SharedTransport) -> bool {
 }
 
 impl ControlDir for BzrDirMeta {
+    fn repository_transport(&self) -> Result<SharedTransport, BzrDirError> {
+        Ok(self
+            .transport
+            .subtransport(Component::Repository.subdir())?)
+    }
+
+    fn workingtree_format(
+        &self,
+    ) -> Result<Option<&'static crate::workingtree::format::WorkingTreeFormat>, BzrDirError> {
+        let path = format!("{}/format", Component::WorkingTree.subdir());
+        let marker = match self.transport.get_bytes(&path) {
+            Ok(marker) => marker,
+            Err(TransportError::NoSuchFile(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        crate::workingtree::find_format(&marker)
+            .map(Some)
+            .ok_or(BzrDirError::UnsupportedFormat {
+                component: Component::WorkingTree,
+                found: marker,
+            })
+    }
+
+    fn colocated_branch_names(&self) -> Result<Vec<String>, BzrDirError> {
+        let content = match self.transport.get_bytes("branch-list") {
+            Ok(content) => content,
+            Err(TransportError::NoSuchFile(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let content = String::from_utf8(content)
+            .map_err(|e| BzrDirError::Component(format!("branch-list is not UTF-8: {e}")))?;
+        Ok(content.lines().map(str::to_string).collect())
+    }
+
+    /// `branch` for the default branch and `branches/NAME` for a colocated
+    /// one. The transport takes
+    /// the raw name; escaping it for a URL is the transport's business.
+    fn branch_transport(&self, name: &str) -> Result<SharedTransport, BzrDirError> {
+        if name.is_empty() {
+            return Ok(self.transport.subtransport(Component::Branch.subdir())?);
+        }
+        Ok(self.transport.subtransport(&format!("branches/{name}"))?)
+    }
+
     fn transport(&self) -> &SharedTransport {
         &self.transport
     }
@@ -1171,6 +1279,40 @@ fn empty_dirstate_bytes() -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::transport::LocalTransport;
+
+    #[test]
+    fn colocated_branches_and_component_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        assert!(cd.colocated_branch_names().unwrap().is_empty());
+        let default = cd.branch_format("").unwrap().expect("a default branch");
+        assert!(!default.is_reference);
+        assert_eq!(None, cd.branch_reference("").unwrap());
+        assert!(cd.workingtree_format().unwrap().is_some());
+        assert_eq!(
+            Some(dir.path().join(".bzr/repository")),
+            cd.repository_transport().unwrap().local_path("")
+        );
+
+        std::fs::write(dir.path().join(".bzr/branch-list"), "a b\nc\n").unwrap();
+        assert_eq!(vec!["a b", "c"], cd.colocated_branch_names().unwrap());
+        assert_eq!(
+            Some(dir.path().join(".bzr/branches/a b")),
+            cd.branch_transport("a b").unwrap().local_path("")
+        );
+        assert_eq!(None, cd.branch_format("c").unwrap());
+
+        std::fs::create_dir_all(dir.path().join(".bzr/branches/c")).unwrap();
+        std::fs::write(dir.path().join(".bzr/branches/c/format"), "bogus\n").unwrap();
+        assert!(matches!(
+            cd.branch_format("c"),
+            Err(BzrDirError::UnsupportedFormat {
+                component: Component::Branch,
+                ..
+            })
+        ));
+    }
 
     /// The supported on-disk marker for a component (used to write
     /// fixtures). These are the 2a / Branch 7 / Working Tree 6 markers.
