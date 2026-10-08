@@ -91,6 +91,7 @@ const WT3_ALL_IN_ONE_LAYOUT: Wt3Layout = Wt3Layout {
 /// basis advances.
 pub struct WorkingTree3 {
     transport: SharedTransport,
+    lock: super::TreeLock,
     inventory: crate::inventory::MutableInventory,
     layout: Wt3Layout,
     /// The stat (hash) cache, or `None` when the tree is not on the local
@@ -119,7 +120,14 @@ impl WorkingTree3 {
     ) -> Result<Self, WorkingTreeError> {
         let inventory = Self::read_inventory(&transport, &layout)?;
         let hashcache = Self::open_hashcache(&transport, &layout);
+        // TODO: lock the all-in-one tree through an OS lock on
+        // `.bzr/branch-lock`, which is not taken here.
+        let lock_dir = match layout.basis {
+            Wt3Basis::LastRevisionFile(_) => Some(super::lock::CHECKOUT_LOCK),
+            Wt3Basis::RevisionHistory(_) => None,
+        };
         Ok(WorkingTree3 {
+            lock: super::TreeLock::new(SharedTransport::clone(&transport), lock_dir, None),
             transport,
             inventory,
             layout,
@@ -204,6 +212,10 @@ impl WorkingTree3 {
 }
 
 impl WorkingTree for WorkingTree3 {
+    fn lock(&self) -> &super::TreeLock {
+        &self.lock
+    }
+
     fn basis_revision(&self) -> Option<Vec<u8>> {
         let bytes = match self.layout.basis {
             Wt3Basis::LastRevisionFile(path) => self.transport.get_bytes(path).ok()?,

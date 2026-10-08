@@ -631,6 +631,21 @@ pub fn open(transport: SharedTransport) -> Result<Box<dyn Repository>, Repositor
     (format.open)(transport)
 }
 
+/// The lock of the repository whose `.bzr/repository` `transport` reaches,
+/// which takes a lock directory or only counts locks depending on its
+/// format.
+pub fn lockable_files(
+    transport: SharedTransport,
+) -> Result<crate::lockable_files::LockableFiles, RepositoryError> {
+    let marker = transport.get_bytes("format")?;
+    let format =
+        find_format(&marker).ok_or_else(|| RepositoryError::UnknownFormat(marker.clone()))?;
+    Ok(crate::lockable_files::LockableFiles::new(
+        transport,
+        format.uses_lock_dir.then_some("lock"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

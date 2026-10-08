@@ -363,7 +363,7 @@ impl Branch {
 
     /// Read a config location option from `branch.conf` only.
     ///
-    /// Mirrors breezy's `_get_config_location`: the empty string is the
+    /// The empty string is the
     /// on-disk representation of "unset" and is normalized to `None`. Only the
     /// branch's own `branch.conf` is consulted (the `BranchOnlyStack`), not the
     /// wider locations.conf/bazaar.conf stack, so a value is never inherited.

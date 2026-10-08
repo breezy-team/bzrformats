@@ -80,6 +80,9 @@ pub struct RepositoryFormat {
     pub supported: bool,
     /// Whether the format is deprecated (still readable, upgrade advised).
     pub deprecated: bool,
+    /// Whether write locks take a lock directory, `lock`, as the knit
+    /// formats' do; the pack formats only count their locks.
+    pub uses_lock_dir: bool,
     /// Whether this is an all-in-one (pre-metadir) format whose stores live
     /// directly under `.bzr` with no `.bzr/repository/format` marker. Such a
     /// format is opened through the all-in-one control-dir path, not the
@@ -110,6 +113,7 @@ impl RepositoryFormat {
         uses_btree_index: true,
         supported: false,
         deprecated: false,
+        uses_lock_dir: false,
         all_in_one: false,
         matching_tree_format: None,
     };
