@@ -211,6 +211,8 @@ mod tests {
     fn make_one(t: &SharedTransport, rev: &[u8], text: &[u8]) {
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
         let root = crate::inventory::ROOT_ID;
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         repo.add_text(b"file-1", rev, &[], text).unwrap();
         let entries = vec![
@@ -233,6 +235,7 @@ mod tests {
             .unwrap();
         repo.add_revision(&revision(rev, vec![]), &[]).unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
     }
 
     #[test]
@@ -256,6 +259,8 @@ mod tests {
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
         let root = crate::inventory::ROOT_ID;
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         repo.add_text(b"file-1", b"rev-2", &[], b"hi\n").unwrap();
         let entries = vec![
@@ -279,6 +284,7 @@ mod tests {
         repo.add_revision(&revision(b"rev-2", vec![b"rev-1"]), &[b"rev-1".to_vec()])
             .unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
 
         let repo = Pack2aRepository::open(t).unwrap();
         let result = check(&repo).unwrap();
@@ -292,6 +298,8 @@ mod tests {
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
         let root = crate::inventory::ROOT_ID;
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         repo.add_text(b"file-1", b"rev-1", &[], b"hello\n").unwrap();
         let entries = vec![
@@ -315,6 +323,7 @@ mod tests {
             .unwrap();
         repo.add_revision(&revision(b"rev-1", vec![]), &[]).unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
 
         let repo = Pack2aRepository::open(t).unwrap();
         let result = check(&repo).unwrap();

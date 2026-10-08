@@ -42,6 +42,8 @@ declare_repository_format! {
 /// `.bzr` (the control directory itself).
 pub struct WeaveRepository {
     format: &'static RepositoryFormat,
+    /// The repository's lock.
+    lock: crate::lockable_files::LockableFiles,
     transport: SharedTransport,
 }
 
@@ -57,7 +59,16 @@ impl WeaveRepository {
                 format.get_format_description(),
             ));
         }
-        Ok(WeaveRepository { format, transport })
+        // TODO: lock the all-in-one repository with an OS lock on
+        // `.bzr/branch-lock`; here it only counts locks.
+        Ok(WeaveRepository {
+            lock: crate::lockable_files::LockableFiles::new(
+                SharedTransport::clone(&transport),
+                None,
+            ),
+            format,
+            transport,
+        })
     }
 
     /// Create an empty all-in-one weave repository scaffold under `transport`
@@ -385,6 +396,10 @@ impl WeaveRepository {
 }
 
 impl super::Repository for WeaveRepository {
+    fn lock(&self) -> &crate::lockable_files::LockableFiles {
+        &self.lock
+    }
+
     fn format(&self) -> &'static RepositoryFormat {
         WeaveRepository::format(self)
     }
@@ -423,6 +438,10 @@ impl super::Repository for WeaveRepository {
     }
 
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        // Writing needs the write lock.
+        if self.lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
+            return Err(RepositoryError::NotWriteLocked);
+        }
         // Weave writes append immediately; there is no write group.
         Ok(())
     }

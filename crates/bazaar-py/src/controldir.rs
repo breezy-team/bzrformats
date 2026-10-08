@@ -302,8 +302,29 @@ impl Repository {
         Ok(result as u8)
     }
 
+    /// Lock the repository for reading.
+    fn lock_read(&mut self) -> PyResult<()> {
+        self.inner.lock_read().map_err(err)
+    }
+
+    /// Lock the repository for writing, failing if someone else holds it.
+    /// Returns the token of the lock directory, if the format takes one.
+    fn lock_write(&mut self) -> PyResult<Option<String>> {
+        let locked = self
+            .inner
+            .lock_write(None, &mut bazaar::lockable_files::NoWait)
+            .map_err(err)?;
+        Ok(locked.token)
+    }
+
+    /// Release one lock.
+    fn unlock(&mut self) -> PyResult<()> {
+        self.inner.unlock().map(|_| ()).map_err(err)
+    }
+
     /// Open a write group: a batch of additions flushed by
-    /// `commit_write_group`. Writing requires an open write group.
+    /// `commit_write_group`. Writing requires a write lock and an open write
+    /// group.
     fn start_write_group(&mut self) -> PyResult<()> {
         self.inner.start_write_group().map_err(err)
     }

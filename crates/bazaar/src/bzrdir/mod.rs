@@ -1790,6 +1790,8 @@ mod tests {
         let base = BzrDirMeta::create(&base_parent).unwrap();
         {
             let mut repo = base.open_repository().unwrap();
+            repo.lock_write(None, &mut crate::lockable_files::NoWait)
+                .unwrap();
             repo.start_write_group().unwrap();
             let rev = crate::revision::Revision::new(
                 crate::RevisionId::from(&b"rev-base"[..]),
@@ -1809,6 +1811,7 @@ mod tests {
             repo.add_inventory_from_entries(b"rev-base", &[], ROOT_ID, &entries)
                 .unwrap();
             repo.commit_write_group().unwrap();
+            repo.unlock().unwrap();
         }
 
         // The stacked branch lives under `top/`: its own (empty) 2a repository,
@@ -1893,6 +1896,8 @@ mod tests {
         // Give the shared repo a revision so we can tell we resolved to it.
         {
             let mut repo = shared.open_repository().unwrap();
+            repo.lock_write(None, &mut crate::lockable_files::NoWait)
+                .unwrap();
             repo.start_write_group().unwrap();
             let rev = crate::revision::Revision::new(
                 crate::RevisionId::from(&b"rev-shared"[..]),
@@ -1916,6 +1921,7 @@ mod tests {
             )
             .unwrap();
             repo.commit_write_group().unwrap();
+            repo.unlock().unwrap();
         }
 
         // A branch-only control directory inside the shared repository's tree.
@@ -1969,6 +1975,8 @@ mod tests {
             let mut repo = cd.open_repository().unwrap();
             let root = crate::inventory::ROOT_ID;
             revid = b"rev-1".to_vec();
+            repo.lock_write(None, &mut crate::lockable_files::NoWait)
+                .unwrap();
             repo.start_write_group().unwrap();
             repo.add_text(b"file-1", &revid, &[], b"hi\n").unwrap();
             let entries = vec![
@@ -2001,6 +2009,7 @@ mod tests {
             );
             repo.add_revision(&rev, &[]).unwrap();
             repo.commit_write_group().unwrap();
+            repo.unlock().unwrap();
         }
         cd.open_branch()
             .unwrap()

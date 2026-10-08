@@ -99,6 +99,17 @@ impl TreeLock {
         }
     }
 
+    /// Run `f` on the dirstate file while the tree holds its write lock, so
+    /// the dirstate is written under the lock the tree took; `None` if the
+    /// tree does not hold it.
+    pub fn with_dirstate_write<R>(
+        &self,
+        f: impl FnOnce(&mut crate::dirstate::FileTransport) -> R,
+    ) -> Option<R> {
+        let mut dirstate = self.dirstate.as_ref()?.lock().unwrap();
+        (dirstate.lock_state() == Some(crate::dirstate::LockState::Write)).then(|| f(&mut dirstate))
+    }
+
     /// The mode the tree is locked in, if it is.
     pub fn lock_mode(&self) -> Option<LockMode> {
         self.files.lock_mode()
