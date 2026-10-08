@@ -531,12 +531,7 @@ pub trait WorkingTree: Send + Sync {
     /// `current_view` is the name of the enabled view, or `None`. Reads the
     /// `.bzr/checkout/views` file; an absent or empty file means no views.
     fn views(&self) -> Result<ViewInfo, WorkingTreeError> {
-        let bytes = match self.control_transport().get_bytes(VIEWS_PATH) {
-            Ok(b) => b,
-            Err(TransportError::NoSuchFile(_)) => return Ok(ViewInfo::default()),
-            Err(e) => return Err(e.into()),
-        };
-        ViewInfo::deserialize(&bytes).map_err(|e| WorkingTreeError::Corrupt(e.to_string()))
+        read_views(self.control_transport().as_ref())
     }
 
     /// Replace the defined views and the current-view selection.
@@ -556,9 +551,7 @@ pub trait WorkingTree: Send + Sync {
                 )));
             }
         }
-        self.control_transport()
-            .put_bytes(VIEWS_PATH, &info.serialize(), None)?;
-        Ok(())
+        write_views(self.control_transport().as_ref(), info)
     }
 
     /// The recorded conflicts (read from `.bzr/checkout/conflicts`); an empty
@@ -636,6 +629,29 @@ pub struct ViewInfo {
 
 /// The keyword naming the enabled view in the `views` file.
 const CURRENT_KEYWORD: &str = "current";
+
+/// The views defined for the tree rooted at `transport`, from its
+/// `.bzr/checkout/views` file; none when the file is absent or empty.
+pub fn read_views(
+    transport: &dyn crate::transport::Transport,
+) -> Result<ViewInfo, WorkingTreeError> {
+    let bytes = match transport.get_bytes(VIEWS_PATH) {
+        Ok(b) => b,
+        Err(TransportError::NoSuchFile(_)) => return Ok(ViewInfo::default()),
+        Err(e) => return Err(e.into()),
+    };
+    ViewInfo::deserialize(&bytes).map_err(|e| WorkingTreeError::Corrupt(e.to_string()))
+}
+
+/// Record `info` as the views of the tree rooted at `transport`. Whether
+/// the tree's format stores views is for the caller to check.
+pub fn write_views(
+    transport: &dyn crate::transport::Transport,
+    info: &ViewInfo,
+) -> Result<(), WorkingTreeError> {
+    transport.put_bytes(VIEWS_PATH, &info.serialize(), None)?;
+    Ok(())
+}
 
 impl ViewInfo {
     /// Serialise to `views` file content. An empty definition serialises to an
