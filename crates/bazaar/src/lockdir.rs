@@ -234,7 +234,16 @@ impl<'t> LockDir<'t> {
 
     fn create_pending_dir(&self, info: &LockHeldInfo) -> Result<String, LockError> {
         let tmpname = format!("{}/{}.tmp", self.path, crate::osutils::rand_chars(10));
-        self.transport.mkdir(&tmpname)?;
+        match self.transport.mkdir(&tmpname) {
+            Ok(()) => {}
+            // The lock directory does not exist yet: create it and try
+            // again.
+            Err(TransportError::NoSuchFile(_)) => {
+                self.create()?;
+                self.transport.mkdir(&tmpname)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
         self.transport
             .put_bytes(&format!("{tmpname}{INFO_NAME}"), &info.to_bytes(), None)?;
         Ok(tmpname)
@@ -376,6 +385,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = LocalTransport::new(dir.path());
         (dir, t)
+    }
+
+    #[test]
+    fn attempt_lock_creates_a_missing_lock_dir() {
+        let (dir, t) = temp_transport();
+        let mut lock = LockDir::new(&t, "lock");
+        lock.attempt_lock().unwrap();
+        assert!(dir.path().join("lock/held/info").exists());
+        lock.unlock().unwrap();
     }
 
     #[test]
