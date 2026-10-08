@@ -13,7 +13,7 @@ pub use format::{all_formats, find_format, BranchFormat};
 use std::collections::BTreeMap;
 
 use crate::declare_branch_format;
-use crate::lockdir::{Lock, LockDir, LockError};
+use crate::lockdir::LockError;
 use crate::transport::{SharedTransport, TransportError};
 
 // Branch format 5 (full history) is the weave/knit-era layout: it keeps the
@@ -87,6 +87,8 @@ pub enum BranchError {
     Corrupt(String),
     /// The branch lock could not be taken or released.
     Lock(LockError),
+    /// Locking the branch failed, or it is locked for reading.
+    Locking(crate::lockable_files::LockableFilesError),
     /// An underlying transport error.
     Transport(TransportError),
     /// A config file could not be parsed.
@@ -105,6 +107,7 @@ impl std::fmt::Display for BranchError {
         match self {
             BranchError::Corrupt(m) => write!(f, "corrupt branch data: {m}"),
             BranchError::Lock(e) => write!(f, "branch lock error: {e}"),
+            BranchError::Locking(e) => write!(f, "branch lock error: {e}"),
             BranchError::Transport(e) => write!(f, "transport error: {e}"),
             BranchError::Config(e) => write!(f, "config error: {e}"),
             BranchError::NotStacked => write!(f, "branch is not stacked"),
@@ -147,6 +150,8 @@ pub type RevisionInfo = (u64, Vec<u8>);
 pub struct Branch {
     transport: SharedTransport,
     format: &'static BranchFormat,
+    /// The branch's lock, which its writes take.
+    lock: crate::lockable_files::LockableFiles,
 }
 
 impl Branch {
@@ -158,7 +163,12 @@ impl Branch {
             Ok(marker) => find_format(&marker).unwrap_or(DEFAULT_FORMAT),
             Err(_) => DEFAULT_FORMAT,
         };
-        Branch { transport, format }
+        let lock = crate::lockable_files::branch_lock(SharedTransport::clone(&transport));
+        Branch {
+            transport,
+            format,
+            lock,
+        }
     }
 
     /// Open the branch reachable through `transport` as a specific `format`,
@@ -167,8 +177,23 @@ impl Branch {
     /// The all-in-one weave layout has no `.bzr/branch/format` file -- the
     /// branch lives at `.bzr` itself with its tip in `.bzr/revision-history`
     /// -- so the format (full-history branch format 5) is supplied directly.
+    ///
+    /// TODO: lock the all-in-one branch with an OS lock on
+    /// `.bzr/branch-lock`; its writes here only count their locks.
     pub fn with_format(transport: SharedTransport, format: &'static BranchFormat) -> Self {
-        Branch { transport, format }
+        let lock =
+            crate::lockable_files::LockableFiles::new(SharedTransport::clone(&transport), None);
+        Branch {
+            transport,
+            format,
+            lock,
+        }
+    }
+
+    /// The branch's lock. Locking it before a series of writes makes them
+    /// share the lock rather than each taking it.
+    pub fn lock(&self) -> &crate::lockable_files::LockableFiles {
+        &self.lock
     }
 
     /// The format this branch was opened as.
@@ -265,23 +290,23 @@ impl Branch {
         }
     }
 
-    /// Take the branch write lock for the duration of `f`.
-    ///
-    /// The branch lock dir is `lock` under the branch directory.
+    /// Run `f` under a write lock on the branch: a write lock the caller
+    /// holds is counted, and otherwise one is taken for `f` without waiting
+    /// for another holder.
     fn with_write_lock<R>(
         &self,
         f: impl FnOnce() -> Result<R, BranchError>,
     ) -> Result<R, BranchError> {
-        let mut lock = LockDir::new(self.transport.as_ref(), "lock");
-        lock.create()?;
-        lock.attempt_lock()?;
+        self.lock
+            .lock_write(None, &mut crate::lockable_files::NoWait)
+            .map_err(BranchError::Locking)?;
         let result = f();
         // Release even if f failed; prefer reporting f's error.
-        let unlock = lock.unlock();
+        let unlock = self.lock.unlock().map_err(BranchError::Locking);
         match (result, unlock) {
-            (Ok(r), Ok(())) => Ok(r),
+            (Ok(r), Ok(_)) => Ok(r),
             (Err(e), _) => Err(e),
-            (Ok(_), Err(e)) => Err(e.into()),
+            (Ok(_), Err(e)) => Err(e),
         }
     }
 
@@ -783,6 +808,48 @@ mod tests {
             .unwrap();
         let shared: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         (dir, Branch::new(shared), probe)
+    }
+
+    #[test]
+    fn writes_share_a_held_write_lock() {
+        let (_dir, branch, t) = branch_transport();
+        branch
+            .lock()
+            .lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
+        branch.set_last_revision_info(1, b"rev-1").unwrap();
+        assert!(t.has("lock/held").unwrap());
+        assert_eq!(1, branch.lock().lock_count());
+        branch.lock().unlock().unwrap();
+        assert!(!t.has("lock/held").unwrap());
+        // Unlocked, a write takes the lock for itself.
+        branch.set_last_revision_info(2, b"rev-2").unwrap();
+        assert!(!branch.lock().is_locked());
+    }
+
+    #[test]
+    fn writes_are_refused_under_a_read_lock_or_another_holder() {
+        let (_dir, branch, t) = branch_transport();
+        branch.lock().lock_read();
+        assert!(matches!(
+            branch.set_last_revision_info(1, b"rev-1"),
+            Err(BranchError::Locking(
+                crate::lockable_files::LockableFilesError::ReadOnly
+            ))
+        ));
+        branch.lock().unlock().unwrap();
+        let other = Branch::new(t.clone() as SharedTransport);
+        other
+            .lock()
+            .lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
+        assert!(matches!(
+            branch.set_last_revision_info(1, b"rev-1"),
+            Err(BranchError::Locking(
+                crate::lockable_files::LockableFilesError::Contention
+            ))
+        ));
+        other.lock().unlock().unwrap();
     }
 
     #[test]
