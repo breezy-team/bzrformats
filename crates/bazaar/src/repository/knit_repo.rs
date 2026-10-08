@@ -35,6 +35,7 @@ declare_repository_format! {
         inventory_serializer: &XMLInventorySerializer5,
         open: open_knit,
         create: create_knit,
+        uses_lock_dir: true,
         supported: true,
         deprecated: true,
     }
@@ -48,6 +49,7 @@ declare_repository_format! {
         inventory_serializer: &XMLInventorySerializer7,
         open: open_knit,
         create: create_knit,
+        uses_lock_dir: true,
         rich_root_data: true,
         supports_tree_reference: true,
         supported: true,
@@ -64,6 +66,7 @@ declare_repository_format! {
         inventory_serializer: &XMLInventorySerializer6,
         open: open_knit,
         create: create_knit,
+        uses_lock_dir: true,
         rich_root_data: true,
         supported: true,
         deprecated: true,

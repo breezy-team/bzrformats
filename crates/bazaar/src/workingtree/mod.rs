@@ -20,6 +20,8 @@
 //! live state as a new revision.
 
 pub mod format;
+pub mod lock;
+pub use lock::TreeLock;
 #[cfg(any(feature = "weave", feature = "knit"))]
 mod wt3;
 
@@ -401,6 +403,10 @@ impl CommitOptions {
 ///
 /// `Send + Sync` so a boxed tree can be held by the pyo3 bindings.
 pub trait WorkingTree: Send + Sync {
+    /// The tree's lock. Locking the tree's branch with it is left to the
+    /// caller.
+    fn lock(&self) -> &TreeLock;
+
     /// The inventory of the basis tree as the working tree keeps a copy of
     /// it, or `None` if it keeps none. The base implementation keeps none.
     fn basis_inventory(
@@ -763,6 +769,7 @@ const FORMAT_3_MARKER: &[u8] = b"Bazaar-NG Working Tree format 3";
 pub struct WorkingTree4 {
     transport: SharedTransport,
     dirstate: DirState,
+    lock: TreeLock,
 }
 
 impl WorkingTree4 {
@@ -862,6 +869,11 @@ impl WorkingTree4 {
             DirState::new(DIRSTATE_PATH, Box::new(DefaultSHA1Provider), 0, true, false);
         dirstate.load_bytes(&data)?;
         Ok(WorkingTree4 {
+            lock: TreeLock::new(
+                SharedTransport::clone(&transport),
+                Some(lock::CHECKOUT_LOCK),
+                Some(DIRSTATE_PATH),
+            ),
             transport,
             dirstate,
         })
@@ -1775,6 +1787,10 @@ impl WorkingTree4 {
 }
 
 impl WorkingTree for WorkingTree4 {
+    fn lock(&self) -> &TreeLock {
+        &self.lock
+    }
+
     fn basis_inventory(
         &self,
     ) -> Result<Option<crate::inventory::MutableInventory>, WorkingTreeError> {
