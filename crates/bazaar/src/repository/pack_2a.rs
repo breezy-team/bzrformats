@@ -94,6 +94,12 @@ pub enum RepositoryError {
     UnknownFormat(Vec<u8>),
     /// The format is recognised but this crate cannot open it yet.
     UnsupportedFormat(&'static str),
+    /// A write was attempted without a write lock.
+    NotWriteLocked,
+    /// The last write lock was released with a write group open.
+    WriteGroupOpen,
+    /// Locking the repository failed.
+    Locking(crate::lockable_files::LockableFilesError),
 }
 
 impl std::fmt::Display for RepositoryError {
@@ -120,6 +126,11 @@ impl std::fmt::Display for RepositoryError {
             RepositoryError::UnsupportedFormat(desc) => {
                 write!(f, "unsupported repository format: {desc}")
             }
+            RepositoryError::NotWriteLocked => f.write_str("repository is not write locked"),
+            RepositoryError::WriteGroupOpen => {
+                f.write_str("Must end write group before releasing write lock")
+            }
+            RepositoryError::Locking(e) => write!(f, "repository lock error: {e}"),
         }
     }
 }
@@ -382,6 +393,8 @@ type SharedChkStore = std::sync::Arc<dyn crate::versionedfile::VersionedFiles + 
 /// is private (the [`WriteGroup`]); there is no separate writer type.
 pub struct Pack2aRepository {
     format: &'static RepositoryFormat,
+    /// The repository's lock.
+    lock: crate::lockable_files::LockableFiles,
     transport: SharedTransport,
     revisions: Store,
     inventories: Store,
@@ -411,6 +424,10 @@ impl Pack2aRepository {
         let chk_bytes: SharedChkStore =
             std::sync::Arc::new(build_store(&transport, &packs, IndexKind::Chk)?);
         Ok(Pack2aRepository {
+            lock: crate::lockable_files::LockableFiles::new(
+                SharedTransport::clone(&transport),
+                format.uses_lock_dir.then_some("lock"),
+            ),
             format,
             transport,
             revisions,
@@ -581,6 +598,10 @@ impl Pack2aRepository {
     /// pack, made durable by [`commit_write_group`](Self::commit_write_group).
     /// Errors if a write group is already open.
     pub fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        // Writing needs the write lock.
+        if self.lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
+            return Err(RepositoryError::NotWriteLocked);
+        }
         if self.write_group.is_some() {
             return Err(RepositoryError::Corrupt(
                 "a write group is already open".to_string(),
@@ -879,6 +900,10 @@ impl Pack2aRepository {
     ///
     /// Requires no open write group.
     pub fn reconcile(&mut self) -> Result<super::ReconcileResult, RepositoryError> {
+        super::with_write_lock(self, |repository| repository.reconcile_locked())
+    }
+
+    fn reconcile_locked(&mut self) -> Result<super::ReconcileResult, RepositoryError> {
         if self.write_group.is_some() {
             return Err(RepositoryError::Corrupt(
                 "cannot reconcile with an open write group".to_string(),
@@ -997,6 +1022,10 @@ impl Pack2aRepository {
     /// Requires no open write group. After packing, re-open the repository to
     /// read through the new pack.
     pub fn pack(&mut self) -> Result<(), RepositoryError> {
+        super::with_write_lock(self, |repository| repository.pack_locked())
+    }
+
+    fn pack_locked(&mut self) -> Result<(), RepositoryError> {
         if self.write_group.is_some() {
             return Err(RepositoryError::Corrupt(
                 "cannot pack with an open write group".to_string(),
@@ -1021,6 +1050,10 @@ impl Pack2aRepository {
     ///
     /// Requires no open write group.
     pub fn autopack(&mut self) -> Result<bool, RepositoryError> {
+        super::with_write_lock(self, |repository| repository.autopack_locked())
+    }
+
+    fn autopack_locked(&mut self) -> Result<bool, RepositoryError> {
         if self.write_group.is_some() {
             return Err(RepositoryError::Corrupt(
                 "cannot autopack with an open write group".to_string(),
@@ -1127,6 +1160,26 @@ impl Pack2aRepository {
 }
 
 impl super::Repository for Pack2aRepository {
+    fn lock(&self) -> &crate::lockable_files::LockableFiles {
+        &self.lock
+    }
+
+    fn is_in_write_group(&self) -> bool {
+        self.write_group.is_some()
+    }
+
+    /// Reread the pack names and the indices of the packs, as a pack
+    /// repository's `_refresh_data` reloads its pack names.
+    fn refresh_data(&mut self) -> Result<(), RepositoryError> {
+        if self.write_group.is_some() {
+            return Ok(());
+        }
+        let reopened = Self::open(SharedTransport::clone(&self.transport))?;
+        let lock = self.lock.clone();
+        *self = Self { lock, ..reopened };
+        Ok(())
+    }
+
     fn format(&self) -> &'static RepositoryFormat {
         Pack2aRepository::format(self)
     }
@@ -1394,6 +1447,7 @@ fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, Repositor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::Repository as _;
     use crate::transport::LocalTransport;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1424,12 +1478,64 @@ mod tests {
         (dir, t)
     }
 
+    #[test]
+    fn write_groups_need_a_write_lock() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t).unwrap();
+        assert!(matches!(
+            repo.start_write_group(),
+            Err(RepositoryError::NotWriteLocked)
+        ));
+        repo.lock_read().unwrap();
+        assert!(matches!(
+            repo.start_write_group(),
+            Err(RepositoryError::NotWriteLocked)
+        ));
+        repo.unlock().unwrap();
+    }
+
+    /// Releasing the last write lock with a write group open is an error,
+    /// but the lock is released.
+    #[test]
+    fn unlock_with_a_write_group_open_is_an_error() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t).unwrap();
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
+        repo.start_write_group().unwrap();
+        // An inner unlock leaves the write group to the outer lock.
+        repo.unlock().unwrap();
+        assert!(matches!(
+            repo.unlock(),
+            Err(RepositoryError::WriteGroupOpen)
+        ));
+        assert!(!repo.lock().is_locked());
+    }
+
+    /// The first lock reads the pack names again, so packs another writer
+    /// added since the repository was opened become visible.
+    #[test]
+    fn first_lock_sees_packs_added_since_open() {
+        let (_d, t) = temp_repo();
+        let mut reader = Pack2aRepository::create(SharedTransport::clone(&t)).unwrap();
+        let mut writer = Pack2aRepository::open(t).unwrap();
+        commit_one(&mut writer, b"rev-1");
+        assert!(!reader.has_revision(b"rev-1").unwrap());
+        reader.lock_read().unwrap();
+        assert!(reader.has_revision(b"rev-1").unwrap());
+        reader.unlock().unwrap();
+    }
+
     /// Opening a second write group while one is already open is an error.
     /// Ported from per_repository/test_write_group.test_start_write_group_twice.
     #[test]
     fn double_start_write_group_is_rejected() {
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t).unwrap();
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         assert!(repo.start_write_group().is_err());
     }
@@ -1454,6 +1560,8 @@ mod tests {
         use crate::FileId;
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
 
         let rev = b"rev-1";
@@ -1485,6 +1593,7 @@ mod tests {
         repo.add_revision(&make_revision(rev, vec![], "commit", Some(inv_sha1)), &[])
             .unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
 
         // Re-open and materialize the inventory.
         let repo = Pack2aRepository::open(t).unwrap();
@@ -1528,6 +1637,8 @@ mod tests {
 
         // rev-1: a.txt under the root.
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         let text1 = b"hello\n";
         repo.add_text(b"file-a", b"rev-1", &[], text1).unwrap();
@@ -1553,9 +1664,12 @@ mod tests {
         repo.add_revision(&make_revision(b"rev-1", vec![], "one", Some(sha1)), &[])
             .unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
 
         // rev-2: change a.txt, add b.txt -- expressed as an inventory delta.
         let mut repo = Pack2aRepository::open(t.clone()).unwrap();
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         let text1b = b"hello again\n";
         let text2 = b"world\n";
@@ -1602,6 +1716,7 @@ mod tests {
         )
         .unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
 
         // rev-2 reads back as the full inventory with both files.
         let repo = Pack2aRepository::open(t).unwrap();
@@ -1619,6 +1734,8 @@ mod tests {
     /// Commit one revision (with a root-only inventory) in its own write group,
     /// producing one pack.
     fn commit_one(repo: &mut Pack2aRepository, rev: &[u8]) {
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         repo.add_revision(&make_revision(rev, vec![], "m", None), &[])
             .unwrap();
@@ -1634,6 +1751,7 @@ mod tests {
         .unwrap();
         repo.add_text(b"file-1", rev, &[], b"hello\n").unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
     }
 
     /// pack() combines several packs into one, moves the old packs to
@@ -1755,6 +1873,8 @@ mod tests {
     /// file text is reachable), unlike `commit_one` which adds an orphan text.
     fn commit_with_file(repo: &mut Pack2aRepository, rev: &[u8], text: &[u8]) {
         let root = crate::inventory::ROOT_ID;
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         repo.add_text(b"file-1", rev, &[], text).unwrap();
         let entries = vec![
@@ -1778,6 +1898,7 @@ mod tests {
         repo.add_revision(&make_revision(rev, vec![], "m", None), &[])
             .unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
     }
 
     /// reconcile() drops a garbage inventory (one with no revision) while
@@ -1790,6 +1911,8 @@ mod tests {
         commit_with_file(&mut repo, b"rev-good", b"hello\n");
         // A second write group that writes an inventory + text but no revision:
         // its inventory is unreachable garbage.
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         repo.add_inventory_from_entries(
             b"rev-garbage",
@@ -1802,6 +1925,7 @@ mod tests {
         )
         .unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
 
         // Reopen and reconcile.
         let mut repo = Pack2aRepository::open(t.clone()).unwrap();
@@ -1844,6 +1968,8 @@ mod tests {
     fn pack_name_is_content_md5() {
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         repo.add_revision(&make_revision(b"rev-1", vec![], "m", None), &[])
             .unwrap();
@@ -1858,6 +1984,7 @@ mod tests {
         )
         .unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
 
         let names = read_pack_names(t.as_ref()).unwrap();
         assert_eq!(names.len(), 1);

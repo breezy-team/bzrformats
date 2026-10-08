@@ -211,6 +211,163 @@ impl WorkingTree3 {
     }
 }
 
+impl WorkingTree3 {
+    fn commit_under_lock(
+        &mut self,
+        repository: &mut dyn crate::repository::Repository,
+        branch: &crate::branch::Branch,
+        options: &CommitOptions,
+    ) -> Result<Vec<u8>, WorkingTreeError> {
+        if options.strict {
+            let unknowns = self.unknowns()?;
+            if !unknowns.is_empty() {
+                return Err(WorkingTreeError::StrictCommitFailed(unknowns));
+            }
+        }
+
+        let parents = self.parent_ids();
+        let revid = match &options.revision_id {
+            Some(id) => id.clone(),
+            None => crate::RevisionId::generate(&options.committer, Some(options.timestamp))
+                .as_bytes()
+                .to_vec(),
+        };
+        let properties = options.build_properties()?;
+        let basis_revision_id = parents
+            .first()
+            .cloned()
+            .unwrap_or_else(|| crate::branch::NULL_REVISION.to_vec());
+
+        let selective = !options.specific_files.is_empty() || !options.exclude.is_empty();
+        if selective && parents.len() > 1 {
+            return Err(WorkingTreeError::CannotCommitSelectedFileMerge);
+        }
+
+        let basis = repository
+            .revision_tree(&basis_revision_id)
+            .map_err(WorkingTreeError::Repository)?;
+        let other_parents: Vec<crate::repository::RevisionTree> = parents
+            .iter()
+            .skip(1)
+            .map(|p| repository.revision_tree(p))
+            .collect::<Result<_, _>>()
+            .map_err(WorkingTreeError::Repository)?;
+        let live = self.collect_live_entries();
+        let mut changes = self.with_file_sha(|file_sha| {
+            compute_changes(&self.transport, file_sha, &live, &basis, &other_parents)
+        })?;
+        if selective {
+            changes.retain(|c| change_selected(c, &options.specific_files, &options.exclude));
+        }
+
+        if !options.allow_pointless && parents.len() <= 1 {
+            let basis_is_null = basis_revision_id == crate::branch::NULL_REVISION;
+            let pointless = if basis_is_null {
+                changes.len() <= 1
+            } else {
+                changes.is_empty()
+            };
+            if pointless {
+                return Err(WorkingTreeError::PointlessCommit);
+            }
+        }
+
+        repository
+            .start_write_group()
+            .map_err(WorkingTreeError::Repository)?;
+        {
+            let mut builder = repository
+                .get_commit_builder(
+                    parents.clone(),
+                    revid.clone(),
+                    options.committer.clone(),
+                    options.timestamp,
+                    options.timezone,
+                )
+                .with_properties(properties.clone());
+            builder
+                .record_iter_changes(&changes, |path| {
+                    self.transport
+                        .get_bytes(path)
+                        .map_err(crate::repository::RepositoryError::Transport)
+                })
+                .map_err(WorkingTreeError::Repository)?;
+            builder
+                .finish_inventory()
+                .map_err(WorkingTreeError::Repository)?;
+            builder
+                .commit(&options.message)
+                .map_err(WorkingTreeError::Repository)?;
+        }
+
+        if let Some(key) = &options.signing_key {
+            // The committed inventory entries (root first), needed only to
+            // build the testament for signing.
+            let (paths, inv_entries) =
+                build_committed_entries(&self.transport, &live, &revid, &basis, &changes)?;
+            let signature = sign_commit(
+                &parents,
+                &revid,
+                options,
+                &properties,
+                &paths,
+                &inv_entries,
+                key,
+            )?;
+            repository
+                .add_signature_text(&revid, &signature)
+                .map_err(WorkingTreeError::Repository)?;
+        }
+
+        repository
+            .commit_write_group()
+            .map_err(WorkingTreeError::Repository)?;
+
+        // Unversion files committed as deletions (they vanished from disk).
+        let deleted_paths: Vec<String> = changes
+            .iter()
+            .filter(|c| c.new_path.is_none())
+            .filter_map(|c| c.old_path.clone())
+            .filter(|p| self.path2id(p).is_some())
+            .collect();
+        for path in &deleted_paths {
+            self.remove(path)?;
+        }
+
+        // Advance the branch tip. The new revno is one past the branch's
+        // current tip (format 5's full history determines it).
+        let new_revno = branch
+            .last_revision_info()
+            .map_err(WorkingTreeError::Branch)?
+            .0
+            + 1;
+        branch
+            .set_last_revision_info(new_revno, &revid)
+            .map_err(WorkingTreeError::Branch)?;
+
+        // Update the basis: the new revision becomes the basis and the only
+        // parent, so pending-merges is cleared. The working inventory stays
+        // revision-less (it now equals the basis). For the checkout layout the
+        // basis lives in a dedicated last-revision file; for the all-in-one
+        // layout it is the branch's revision-history, which the branch already
+        // advanced above, so nothing more to write there.
+        if let Wt3Basis::LastRevisionFile(path) = self.layout.basis {
+            self.transport.put_bytes(path, &revid, None)?;
+        }
+        self.transport
+            .put_bytes(self.layout.pending_merges, b"", None)?;
+
+        // Cache the new basis inventory (as xml7), reading it back from the
+        // now-committed repository so no working-tree file is re-hashed.
+        self.write_basis_inventory_cache(repository, &revid)?;
+
+        // Persist any stat-cache entries the diff computed.
+        self.flush_hashcache();
+
+        Ok(revid)
+    }
+}
+
 impl WorkingTree for WorkingTree3 {
     fn lock(&self) -> &super::TreeLock {
         &self.lock
@@ -420,153 +577,9 @@ impl WorkingTree for WorkingTree3 {
         branch: &crate::branch::Branch,
         options: &CommitOptions,
     ) -> Result<Vec<u8>, WorkingTreeError> {
-        if options.strict {
-            let unknowns = self.unknowns()?;
-            if !unknowns.is_empty() {
-                return Err(WorkingTreeError::StrictCommitFailed(unknowns));
-            }
-        }
-
-        let parents = self.parent_ids();
-        let revid = match &options.revision_id {
-            Some(id) => id.clone(),
-            None => crate::RevisionId::generate(&options.committer, Some(options.timestamp))
-                .as_bytes()
-                .to_vec(),
-        };
-        let properties = options.build_properties()?;
-        let basis_revision_id = parents
-            .first()
-            .cloned()
-            .unwrap_or_else(|| crate::branch::NULL_REVISION.to_vec());
-
-        let selective = !options.specific_files.is_empty() || !options.exclude.is_empty();
-        if selective && parents.len() > 1 {
-            return Err(WorkingTreeError::CannotCommitSelectedFileMerge);
-        }
-
-        let basis = repository
-            .revision_tree(&basis_revision_id)
-            .map_err(WorkingTreeError::Repository)?;
-        let other_parents: Vec<crate::repository::RevisionTree> = parents
-            .iter()
-            .skip(1)
-            .map(|p| repository.revision_tree(p))
-            .collect::<Result<_, _>>()
-            .map_err(WorkingTreeError::Repository)?;
-        let live = self.collect_live_entries();
-        let mut changes = self.with_file_sha(|file_sha| {
-            compute_changes(&self.transport, file_sha, &live, &basis, &other_parents)
-        })?;
-        if selective {
-            changes.retain(|c| change_selected(c, &options.specific_files, &options.exclude));
-        }
-
-        if !options.allow_pointless && parents.len() <= 1 {
-            let basis_is_null = basis_revision_id == crate::branch::NULL_REVISION;
-            let pointless = if basis_is_null {
-                changes.len() <= 1
-            } else {
-                changes.is_empty()
-            };
-            if pointless {
-                return Err(WorkingTreeError::PointlessCommit);
-            }
-        }
-
-        repository
-            .start_write_group()
-            .map_err(WorkingTreeError::Repository)?;
-        {
-            let mut builder = repository
-                .get_commit_builder(
-                    parents.clone(),
-                    revid.clone(),
-                    options.committer.clone(),
-                    options.timestamp,
-                    options.timezone,
-                )
-                .with_properties(properties.clone());
-            builder
-                .record_iter_changes(&changes, |path| {
-                    self.transport
-                        .get_bytes(path)
-                        .map_err(crate::repository::RepositoryError::Transport)
-                })
-                .map_err(WorkingTreeError::Repository)?;
-            builder
-                .finish_inventory()
-                .map_err(WorkingTreeError::Repository)?;
-            builder
-                .commit(&options.message)
-                .map_err(WorkingTreeError::Repository)?;
-        }
-
-        if let Some(key) = &options.signing_key {
-            // The committed inventory entries (root first), needed only to
-            // build the testament for signing.
-            let (paths, inv_entries) =
-                build_committed_entries(&self.transport, &live, &revid, &basis, &changes)?;
-            let signature = sign_commit(
-                &parents,
-                &revid,
-                options,
-                &properties,
-                &paths,
-                &inv_entries,
-                key,
-            )?;
-            repository
-                .add_signature_text(&revid, &signature)
-                .map_err(WorkingTreeError::Repository)?;
-        }
-
-        repository
-            .commit_write_group()
-            .map_err(WorkingTreeError::Repository)?;
-
-        // Unversion files committed as deletions (they vanished from disk).
-        let deleted_paths: Vec<String> = changes
-            .iter()
-            .filter(|c| c.new_path.is_none())
-            .filter_map(|c| c.old_path.clone())
-            .filter(|p| self.path2id(p).is_some())
-            .collect();
-        for path in &deleted_paths {
-            self.remove(path)?;
-        }
-
-        // Advance the branch tip. The new revno is one past the branch's
-        // current tip (format 5's full history determines it).
-        let new_revno = branch
-            .last_revision_info()
-            .map_err(WorkingTreeError::Branch)?
-            .0
-            + 1;
-        branch
-            .set_last_revision_info(new_revno, &revid)
-            .map_err(WorkingTreeError::Branch)?;
-
-        // Update the basis: the new revision becomes the basis and the only
-        // parent, so pending-merges is cleared. The working inventory stays
-        // revision-less (it now equals the basis). For the checkout layout the
-        // basis lives in a dedicated last-revision file; for the all-in-one
-        // layout it is the branch's revision-history, which the branch already
-        // advanced above, so nothing more to write there.
-        if let Wt3Basis::LastRevisionFile(path) = self.layout.basis {
-            self.transport.put_bytes(path, &revid, None)?;
-        }
-        self.transport
-            .put_bytes(self.layout.pending_merges, b"", None)?;
-
-        // Cache the new basis inventory (as xml7), reading it back from the
-        // now-committed repository so no working-tree file is re-hashed.
-        self.write_basis_inventory_cache(repository, &revid)?;
-
-        // Persist any stat-cache entries the diff computed.
-        self.flush_hashcache();
-
-        Ok(revid)
+        super::with_commit_locks(repository, branch, |repository| {
+            self.commit_under_lock(repository, branch, options)
+        })
     }
 
     fn control_transport(&self) -> &SharedTransport {

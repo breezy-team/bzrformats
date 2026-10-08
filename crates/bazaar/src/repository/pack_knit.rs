@@ -427,6 +427,8 @@ fn build_store(
 /// `add_*`, [`commit_write_group`](Self::commit_write_group)).
 pub struct KnitPackRepository {
     format: &'static RepositoryFormat,
+    /// The repository's lock.
+    lock: crate::lockable_files::LockableFiles,
     transport: SharedTransport,
     revisions: Store,
     inventories: Store,
@@ -442,6 +444,10 @@ impl KnitPackRepository {
         let format = check_format(transport.as_ref())?;
         let packs = read_pack_names(transport.as_ref())?;
         Ok(KnitPackRepository {
+            lock: crate::lockable_files::LockableFiles::new(
+                SharedTransport::clone(&transport),
+                format.uses_lock_dir.then_some("lock"),
+            ),
             format,
             revisions: build_store(&transport, &packs, IndexKind::Revision)?,
             inventories: build_store(&transport, &packs, IndexKind::Inventory)?,
@@ -476,6 +482,10 @@ impl KnitPackRepository {
 
     /// Open a write group.
     pub fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        // Writing needs the write lock.
+        if self.lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
+            return Err(RepositoryError::NotWriteLocked);
+        }
         if self.write_group.is_some() {
             return Err(RepositoryError::Corrupt(
                 "a write group is already open".to_string(),
@@ -644,6 +654,10 @@ impl KnitPackRepository {
     /// repository's revisions, discarding garbage. Returns the number of
     /// unreachable inventories dropped. Requires no open write group.
     pub fn reconcile(&mut self) -> Result<super::ReconcileResult, RepositoryError> {
+        super::with_write_lock(self, |repository| repository.reconcile_locked())
+    }
+
+    fn reconcile_locked(&mut self) -> Result<super::ReconcileResult, RepositoryError> {
         if self.write_group.is_some() {
             return Err(RepositoryError::Corrupt(
                 "cannot reconcile with an open write group".to_string(),
@@ -708,6 +722,10 @@ impl KnitPackRepository {
     /// old packs and their indices into `obsolete_packs/`. A single-pack
     /// repository is left untouched. Requires no open write group.
     pub fn pack(&mut self) -> Result<(), RepositoryError> {
+        super::with_write_lock(self, |repository| repository.pack_locked())
+    }
+
+    fn pack_locked(&mut self) -> Result<(), RepositoryError> {
         if self.write_group.is_some() {
             return Err(RepositoryError::Corrupt(
                 "cannot pack with an open write group".to_string(),
@@ -723,6 +741,10 @@ impl KnitPackRepository {
     /// Repack the smallest packs when the repository has too many, per the
     /// pack-distribution heuristic. Returns whether a repack happened.
     pub fn autopack(&mut self) -> Result<bool, RepositoryError> {
+        super::with_write_lock(self, |repository| repository.autopack_locked())
+    }
+
+    fn autopack_locked(&mut self) -> Result<bool, RepositoryError> {
         if self.write_group.is_some() {
             return Err(RepositoryError::Corrupt(
                 "cannot autopack with an open write group".to_string(),
@@ -969,6 +991,26 @@ impl KnitPackRepository {
 }
 
 impl super::Repository for KnitPackRepository {
+    fn lock(&self) -> &crate::lockable_files::LockableFiles {
+        &self.lock
+    }
+
+    fn is_in_write_group(&self) -> bool {
+        self.write_group.is_some()
+    }
+
+    /// Reread the pack names and the indices of the packs, as a pack
+    /// repository's `_refresh_data` reloads its pack names.
+    fn refresh_data(&mut self) -> Result<(), RepositoryError> {
+        if self.write_group.is_some() {
+            return Ok(());
+        }
+        let reopened = Self::open(SharedTransport::clone(&self.transport))?;
+        let lock = self.lock.clone();
+        *self = Self { lock, ..reopened };
+        Ok(())
+    }
+
     fn format(&self) -> &'static RepositoryFormat {
         KnitPackRepository::format(self)
     }
@@ -1550,6 +1592,7 @@ fn serialise_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::Repository as _;
     use crate::transport::LocalTransport;
     use std::sync::Arc;
 
@@ -1590,6 +1633,8 @@ mod tests {
     /// Commit one revision (root-only inventory + one file text) in its own
     /// write group, producing one pack.
     fn commit_one(repo: &mut KnitPackRepository, rev: &[u8]) {
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         let root = crate::inventory::ROOT_ID;
         let entries = vec![
@@ -1616,6 +1661,7 @@ mod tests {
         repo.add_revision(&r, &[]).unwrap();
         repo.add_text(b"file-1", rev, &[], b"hello\n").unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
     }
 
     /// pack() combines knit-pack packs into one, obsoletes the old packs, and
@@ -1703,6 +1749,8 @@ mod tests {
         commit_one(&mut repo, b"rev-good");
         // An inventory + text with no revision -> unreachable garbage.
         let root = crate::inventory::ROOT_ID;
+        repo.lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
         repo.start_write_group().unwrap();
         repo.add_inventory_from_entries(
             b"rev-garbage",
@@ -1715,6 +1763,7 @@ mod tests {
         )
         .unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
 
         let mut repo = KnitPackRepository::open(t.clone()).unwrap();
         let result = repo.reconcile().unwrap();

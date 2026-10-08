@@ -96,6 +96,8 @@ where
 /// `.bzr/repository`.
 pub struct KnitRepository {
     format: &'static RepositoryFormat,
+    /// The repository's lock.
+    lock: crate::lockable_files::LockableFiles,
     revisions: KnitStore<ConstantMapper, KnitPlainFactory>,
     inventories: KnitStore<ConstantMapper, KnitPlainFactory>,
     signatures: KnitStore<ConstantMapper, KnitPlainFactory>,
@@ -144,6 +146,10 @@ impl KnitRepository {
             .subtransport("knits")
             .map_err(|e| RepositoryError::Corrupt(format!("knits subtransport: {e}")))?;
         Ok(KnitRepository {
+            lock: crate::lockable_files::LockableFiles::new(
+                SharedTransport::clone(&transport),
+                format.uses_lock_dir.then_some("lock"),
+            ),
             format,
             revisions,
             inventories,
@@ -389,6 +395,10 @@ impl KnitRepository {
 }
 
 impl super::Repository for KnitRepository {
+    fn lock(&self) -> &crate::lockable_files::LockableFiles {
+        &self.lock
+    }
+
     fn format(&self) -> &'static RepositoryFormat {
         KnitRepository::format(self)
     }
@@ -427,6 +437,10 @@ impl super::Repository for KnitRepository {
     }
 
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        // Writing needs the write lock.
+        if self.lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
+            return Err(RepositoryError::NotWriteLocked);
+        }
         // Knit writes append immediately; there is no write group.
         Ok(())
     }

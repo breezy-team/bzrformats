@@ -274,6 +274,7 @@ class TestControlDir(TestCaseInTempDir):
     def test_add_revision_round_trip(self):
         cd = controldir.create(self.test_dir)
         repo = cd.open_repository()
+        repo.lock_write()
         repo.start_write_group()
         repo.add_revision(
             b"rev-x",
@@ -285,6 +286,7 @@ class TestControlDir(TestCaseInTempDir):
             revprops={"k": b"v"},
         )
         repo.commit_write_group()
+        repo.unlock()
         got = controldir.open(self.test_dir).open_repository().get_revision(b"rev-x")
         self.assertEqual(got["message"], "hello")
         self.assertEqual(got["committer"], "T <t@e>")

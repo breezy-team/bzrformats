@@ -116,6 +116,8 @@ pub enum WorkingTreeError {
     /// An operation is not supported by this working-tree format (e.g. views
     /// on a format that does not store them).
     Unsupported(String),
+    /// Locking the tree failed, or it is not locked for writing.
+    Locking(crate::lockable_files::LockableFilesError),
 }
 
 impl std::fmt::Display for WorkingTreeError {
@@ -151,6 +153,7 @@ impl std::fmt::Display for WorkingTreeError {
                 write!(f, "reserved revision id: {}", String::from_utf8_lossy(r))
             }
             WorkingTreeError::Corrupt(m) => write!(f, "corrupt working-tree control file: {m}"),
+            WorkingTreeError::Locking(e) => write!(f, "working tree lock error: {e}"),
             WorkingTreeError::Unsupported(m) => write!(f, "unsupported operation: {m}"),
         }
     }
@@ -406,6 +409,28 @@ pub trait WorkingTree: Send + Sync {
     /// The tree's lock. Locking the tree's branch with it is left to the
     /// caller.
     fn lock(&self) -> &TreeLock;
+
+    /// Lock the tree for reading. Locking its branch is left to the caller.
+    fn lock_read(&mut self) -> Result<(), WorkingTreeError> {
+        self.lock().lock_read().map_err(WorkingTreeError::Locking)
+    }
+
+    /// Lock the tree itself for writing, with `waiter` deciding what to do
+    /// while someone else holds it.
+    fn lock_tree_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError> {
+        self.lock()
+            .lock_write(waiter)
+            .map_err(WorkingTreeError::Locking)
+    }
+
+    /// Release one lock, saving the tree's changes with the last write
+    /// lock. Returns the nonce of the lock directory if that released it.
+    fn unlock(&mut self) -> Result<Option<String>, WorkingTreeError> {
+        self.lock().unlock().map_err(WorkingTreeError::Locking)
+    }
 
     /// The inventory of the basis tree as the working tree keeps a copy of
     /// it, or `None` if it keeps none. The base implementation keeps none.
@@ -770,9 +795,60 @@ pub struct WorkingTree4 {
     transport: SharedTransport,
     dirstate: DirState,
     lock: TreeLock,
+    /// The in-memory dirstate has changes to save when the last write lock
+    /// is released.
+    dirty: bool,
 }
 
 impl WorkingTree4 {
+    /// Run `f` under a tree write lock: a write lock the caller holds is
+    /// counted, and otherwise one is taken for `f`, saving the dirstate when
+    /// it is released.
+    fn with_tree_write<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R, WorkingTreeError>,
+    ) -> Result<R, WorkingTreeError> {
+        WorkingTree::lock_tree_write(self, &mut crate::lockable_files::NoWait)?;
+        let result = f(self);
+        let unlocked = WorkingTree::unlock(self);
+        match (result, unlocked) {
+            (Ok(r), Ok(_)) => Ok(r),
+            (Err(e), _) => Err(e),
+            (Ok(_), Err(e)) => Err(e),
+        }
+    }
+
+    /// Note that the in-memory dirstate has changes to save.
+    fn mark_dirty(&mut self) -> Result<(), WorkingTreeError> {
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Read the dirstate from disk again when the tree is first locked,
+    /// since another process may have changed it.
+    fn reload_dirstate(&mut self) -> Result<(), WorkingTreeError> {
+        self.dirstate = read_dirstate(self.transport.as_ref())?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Run `lock` for the first lock or a further one, reading the dirstate
+    /// again with the first.
+    fn lock_and_reload<R>(
+        &mut self,
+        lock: impl FnOnce(&TreeLock) -> Result<R, crate::lockable_files::LockableFilesError>,
+    ) -> Result<R, WorkingTreeError> {
+        let first = !self.lock.files().is_locked();
+        let locked = lock(&self.lock).map_err(WorkingTreeError::Locking)?;
+        if first {
+            if let Err(e) = self.reload_dirstate() {
+                self.lock.unlock().map_err(WorkingTreeError::Locking)?;
+                return Err(e);
+            }
+        }
+        Ok(locked)
+    }
+
     /// The inventory of the basis tree from the dirstate's copy of it;
     /// `None` if the tree has no basis or its basis is a ghost, which the
     /// dirstate keeps no copy of.
@@ -864,10 +940,7 @@ impl WorkingTree4 {
     /// Open the working tree reachable through `transport` (rooted at the
     /// directory that contains `.bzr`).
     pub fn open(transport: SharedTransport) -> Result<Self, WorkingTreeError> {
-        let data = transport.get_bytes(DIRSTATE_PATH)?;
-        let mut dirstate =
-            DirState::new(DIRSTATE_PATH, Box::new(DefaultSHA1Provider), 0, true, false);
-        dirstate.load_bytes(&data)?;
+        let dirstate = read_dirstate(transport.as_ref())?;
         Ok(WorkingTree4 {
             lock: TreeLock::new(
                 SharedTransport::clone(&transport),
@@ -876,6 +949,7 @@ impl WorkingTree4 {
             ),
             transport,
             dirstate,
+            dirty: false,
         })
     }
 
@@ -902,6 +976,10 @@ impl WorkingTree4 {
     /// per-entry tree is not stored, matching brz's dirstate). The dirstate
     /// is rewritten to disk.
     pub fn add_pending_merge(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError> {
+        self.with_tree_write(|wt| wt.add_pending_merge_under_lock(revision_id))
+    }
+
+    fn add_pending_merge_under_lock(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError> {
         let mut parents = self.parent_ids();
         if parents.iter().any(|p| p == revision_id) {
             return Ok(());
@@ -919,7 +997,7 @@ impl WorkingTree4 {
         self.dirstate
             .set_parent_trees(parents, Vec::new(), per_parent)
             .map_err(|e| WorkingTreeError::Commit(format!("set parents: {e:?}")))?;
-        self.save_dirstate()
+        self.mark_dirty()
     }
 
     /// Set the working tree's parent revisions to `revision_ids`, rewriting the
@@ -932,6 +1010,17 @@ impl WorkingTree4 {
     /// `allow_leftmost_as_ghost`, and no parent may be a reserved id such as
     /// `null:`.
     pub fn set_parent_ids(
+        &mut self,
+        repository: &dyn crate::repository::Repository,
+        revision_ids: &[Vec<u8>],
+        allow_leftmost_as_ghost: bool,
+    ) -> Result<(), WorkingTreeError> {
+        self.with_tree_write(|wt| {
+            wt.set_parent_ids_under_lock(repository, revision_ids, allow_leftmost_as_ghost)
+        })
+    }
+
+    fn set_parent_ids_under_lock(
         &mut self,
         repository: &dyn crate::repository::Repository,
         revision_ids: &[Vec<u8>],
@@ -990,7 +1079,7 @@ impl WorkingTree4 {
         self.dirstate
             .set_parent_trees(parents, ghosts, per_parent)
             .map_err(|e| WorkingTreeError::Commit(format!("set parents: {e:?}")))?;
-        self.save_dirstate()
+        self.mark_dirty()
     }
 
     /// Apply an inventory delta to the live working tree (dirstate tree-0),
@@ -1000,10 +1089,17 @@ impl WorkingTree4 {
         &mut self,
         delta: &crate::inventory_delta::InventoryDelta,
     ) -> Result<(), WorkingTreeError> {
+        self.with_tree_write(|wt| wt.apply_inventory_delta_under_lock(delta))
+    }
+
+    fn apply_inventory_delta_under_lock(
+        &mut self,
+        delta: &crate::inventory_delta::InventoryDelta,
+    ) -> Result<(), WorkingTreeError> {
         self.dirstate
             .update_by_delta_from_inventory_delta(delta)
             .map_err(|e| WorkingTreeError::Commit(format!("apply inventory delta: {e:?}")))?;
-        self.save_dirstate()
+        self.mark_dirty()
     }
 
     /// The heads of `revision_ids` in the repository's revision graph: the
@@ -1327,6 +1423,15 @@ impl WorkingTree4 {
         kind: EntryKind,
         file_id: Option<&[u8]>,
     ) -> Result<Vec<u8>, WorkingTreeError> {
+        self.with_tree_write(|wt| wt.add_under_lock(path, kind, file_id))
+    }
+
+    fn add_under_lock(
+        &mut self,
+        path: &str,
+        kind: EntryKind,
+        file_id: Option<&[u8]>,
+    ) -> Result<Vec<u8>, WorkingTreeError> {
         let path = path.trim_matches('/');
         if let Some(existing) = self.path2id(path) {
             return Ok(existing);
@@ -1338,7 +1443,7 @@ impl WorkingTree4 {
         self.dirstate
             .add_path(path, &file_id, kind.to_osutils_kind(), None, b"")
             .map_err(WorkingTreeError::Add)?;
-        self.save_dirstate()?;
+        self.mark_dirty()?;
         Ok(file_id)
     }
 
@@ -1348,6 +1453,10 @@ impl WorkingTree4 {
     ///
     /// Returns [`WorkingTreeError::NotVersioned`] if `path` is not tracked.
     pub fn remove(&mut self, path: &str) -> Result<(), WorkingTreeError> {
+        self.with_tree_write(|wt| wt.remove_under_lock(path))
+    }
+
+    fn remove_under_lock(&mut self, path: &str) -> Result<(), WorkingTreeError> {
         let path = path.trim_matches('/');
         if self.path2id(path).is_none() {
             return Err(WorkingTreeError::NotVersioned(path.to_string()));
@@ -1380,7 +1489,7 @@ impl WorkingTree4 {
                 .make_absent(key)
                 .map_err(WorkingTreeError::Remove)?;
         }
-        self.save_dirstate()
+        self.mark_dirty()
     }
 
     /// Move a versioned entry from `from_path` to `to_path`, keeping its
@@ -1391,6 +1500,14 @@ impl WorkingTree4 {
     /// Only a single file or empty directory is moved; moving a directory
     /// with versioned children is not yet supported.
     pub fn rename(&mut self, from_path: &str, to_path: &str) -> Result<(), WorkingTreeError> {
+        self.with_tree_write(|wt| wt.rename_under_lock(from_path, to_path))
+    }
+
+    fn rename_under_lock(
+        &mut self,
+        from_path: &str,
+        to_path: &str,
+    ) -> Result<(), WorkingTreeError> {
         let from_path = from_path.trim_matches('/');
         let to_path = to_path.trim_matches('/');
 
@@ -1442,7 +1559,7 @@ impl WorkingTree4 {
         self.transport
             .rename(from_path, to_path)
             .map_err(WorkingTreeError::Transport)?;
-        self.save_dirstate()
+        self.mark_dirty()
     }
 
     /// Commit the live working tree as a new revision.
@@ -1463,6 +1580,19 @@ impl WorkingTree4 {
     /// case) is still re-recorded at the new revision so its per-file graph
     /// merges those versions.
     pub fn commit(
+        &mut self,
+        repository: &mut dyn crate::repository::Repository,
+        branch: &crate::branch::Branch,
+        options: &CommitOptions,
+    ) -> Result<Vec<u8>, WorkingTreeError> {
+        self.with_tree_write(|wt| {
+            with_commit_locks(repository, branch, |repository| {
+                wt.commit_under_lock(repository, branch, options)
+            })
+        })
+    }
+
+    fn commit_under_lock(
         &mut self,
         repository: &mut dyn crate::repository::Repository,
         branch: &crate::branch::Branch,
@@ -1690,7 +1820,7 @@ impl WorkingTree4 {
         self.dirstate
             .set_parent_trees(vec![revid.to_vec()], Vec::new(), vec![parent_entries])
             .map_err(|e| WorkingTreeError::Commit(format!("set basis: {e:?}")))?;
-        self.save_dirstate()
+        self.mark_dirty()
     }
 
     /// Rewrite the dirstate to disk under a write lock.
@@ -1701,6 +1831,16 @@ impl WorkingTree4 {
     fn save_dirstate(&mut self) -> Result<(), WorkingTreeError> {
         use crate::dirstate::{FileTransport, Transport as DirstateTransport};
 
+        let dirstate = &mut self.dirstate;
+        let saved = self.lock.with_dirstate_write(|ft| {
+            dirstate.mark_modified(&[], true);
+            dirstate.save_to(ft)
+        });
+        if let Some(saved) = saved {
+            return saved
+                .map(|_| ())
+                .map_err(|e| WorkingTreeError::Commit(format!("save dirstate: {e:?}")));
+        }
         let dirstate_path = match self.transport.local_path(DIRSTATE_PATH) {
             Some(p) => p,
             None => return Ok(()),
@@ -1787,6 +1927,31 @@ impl WorkingTree4 {
 }
 
 impl WorkingTree for WorkingTree4 {
+    /// The dirstate is read again with the first lock.
+    fn lock_read(&mut self) -> Result<(), WorkingTreeError> {
+        self.lock_and_reload(|lock| lock.lock_read())
+    }
+
+    /// The dirstate is read again with the first lock.
+    fn lock_tree_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError> {
+        self.lock_and_reload(|lock| lock.lock_write(waiter))
+    }
+
+    /// A changed dirstate is saved under the lock before the last write lock
+    /// is released; if saving fails the tree stays locked.
+    fn unlock(&mut self) -> Result<Option<String>, WorkingTreeError> {
+        let last_write = self.lock.files().lock_count() == 1
+            && self.lock.lock_mode() == Some(crate::lockable_files::LockMode::Write);
+        if last_write && self.dirty {
+            self.save_dirstate()?;
+            self.dirty = false;
+        }
+        self.lock.unlock().map_err(WorkingTreeError::Locking)
+    }
+
     fn lock(&self) -> &TreeLock {
         &self.lock
     }
@@ -2576,6 +2741,39 @@ mod merge_modified_io {
     }
 }
 
+/// Read the tree's dirstate from `transport`.
+fn read_dirstate(
+    transport: &dyn crate::transport::Transport,
+) -> Result<DirState, WorkingTreeError> {
+    let data = transport.get_bytes(DIRSTATE_PATH)?;
+    let mut dirstate = DirState::new(DIRSTATE_PATH, Box::new(DefaultSHA1Provider), 0, true, false);
+    dirstate.load_bytes(&data)?;
+    Ok(dirstate)
+}
+
+/// Run `f` with `branch` and `repository` write-locked, as a commit needs.
+/// Locks the caller holds are counted.
+fn with_commit_locks<R>(
+    repository: &mut dyn crate::repository::Repository,
+    branch: &crate::branch::Branch,
+    f: impl FnOnce(&mut dyn crate::repository::Repository) -> Result<R, WorkingTreeError>,
+) -> Result<R, WorkingTreeError> {
+    branch
+        .lock()
+        .lock_write(None, &mut crate::lockable_files::NoWait)
+        .map_err(WorkingTreeError::Locking)?;
+    let result = match repository.lock_write(None, &mut crate::lockable_files::NoWait) {
+        Ok(_) => {
+            let result = f(repository);
+            let unlocked = repository.unlock().map_err(WorkingTreeError::Repository);
+            result.and_then(|r| unlocked.map(|_| r))
+        }
+        Err(e) => Err(WorkingTreeError::Repository(e)),
+    };
+    let unlocked = branch.lock().unlock().map_err(WorkingTreeError::Locking);
+    result.and_then(|r| unlocked.map(|_| r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2858,6 +3056,9 @@ mod tests {
 
     impl crate::repository::Repository for UnreadableRepository {
         fn format(&self) -> &'static crate::repository::RepositoryFormat {
+            unimplemented!()
+        }
+        fn lock(&self) -> &crate::lockable_files::LockableFiles {
             unimplemented!()
         }
         fn as_any(&self) -> &dyn std::any::Any {
@@ -3156,6 +3357,36 @@ mod tests {
         let wt = WorkingTree4::open(parent.clone()).unwrap();
         let _ = cd;
         (dir, parent, wt)
+    }
+
+    /// The first lock reads the dirstate again, so changes another tree
+    /// object saved since this one was opened become visible.
+    #[test]
+    fn first_lock_rereads_the_dirstate() {
+        let (_dir, transport, mut wt) = fresh_tree();
+        let mut other = WorkingTree4::open(transport.clone()).unwrap();
+        transport.put_bytes("f", b"x", None).unwrap();
+        other.add("f", EntryKind::File, None).unwrap();
+        assert!(wt.path2id("f").is_none());
+        WorkingTree::lock_read(&mut wt).unwrap();
+        assert!(wt.path2id("f").is_some());
+        WorkingTree::unlock(&mut wt).unwrap();
+    }
+
+    #[test]
+    fn add_under_the_tree_write_lock() {
+        let (_dir, transport, mut wt) = fresh_tree();
+        WorkingTree::lock_tree_write(&mut wt, &mut crate::lockable_files::NoWait).unwrap();
+        transport.put_bytes("f", b"x", None).unwrap();
+        wt.add("f", EntryKind::File, None).unwrap();
+        // Saved with the last unlock, not by the add.
+        assert!(WorkingTree4::open(transport.clone())
+            .unwrap()
+            .path2id("f")
+            .is_none());
+        WorkingTree::unlock(&mut wt).unwrap();
+        let reopened = WorkingTree4::open(transport).unwrap();
+        assert!(reopened.path2id("f").is_some());
     }
 
     #[test]
