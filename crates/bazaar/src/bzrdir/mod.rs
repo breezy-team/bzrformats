@@ -276,6 +276,14 @@ impl Component {
     }
 }
 
+/// Create the lock directory `lock` of the component `transport` reaches,
+/// when the component is made.
+fn create_lock_dir(transport: &SharedTransport) -> Result<(), BzrDirError> {
+    crate::lockable_files::LockableFiles::new(SharedTransport::clone(transport), Some("lock"))
+        .create_lock()
+        .map_err(|e| BzrDirError::Component(format!("creating lock directory: {e}")))
+}
+
 /// An opened `.bzr` control directory.
 ///
 /// Two layouts implement this: [`BzrDirMeta`] for the meta-directory
@@ -509,8 +517,9 @@ impl BzrDirMeta {
                 String::from_utf8_lossy(format.repo_marker)
             ))
         })?;
-        (repo_format.create)(repo_format, repo_t)
+        (repo_format.create)(repo_format, SharedTransport::clone(&repo_t))
             .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
+        create_lock_dir(&repo_t)?;
 
         // Branch: format marker, null tip, empty config and tags. Format 5
         // (full history) keeps the tip in revision-history rather than a
@@ -529,6 +538,7 @@ impl BzrDirMeta {
         }
         branch.put_bytes("branch.conf", b"", None)?;
         branch.put_bytes("tags", b"", None)?;
+        create_lock_dir(&branch)?;
 
         // Working tree: format marker and conflicts. A dirstate format (4/5/6)
         // writes an empty dirstate and (6+) a views file; the pre-dirstate
@@ -537,6 +547,7 @@ impl BzrDirMeta {
         checkout.mkdir("")?;
         checkout.put_bytes("format", format.wt_marker, None)?;
         checkout.put_bytes("conflicts", b"BZR conflict list format 1\n", None)?;
+        create_lock_dir(&checkout)?;
         let wt_uses_dirstate = crate::workingtree::find_format(format.wt_marker)
             .map(|f| f.uses_dirstate)
             .unwrap_or(true);
@@ -599,8 +610,9 @@ impl BzrDirMeta {
         bzr.put_bytes("branch-format", METADIR_MARKER, None)?;
 
         let repo_t = bzr.subtransport("repository")?;
-        (repo_format.create)(repo_format, repo_t)
+        (repo_format.create)(repo_format, SharedTransport::clone(&repo_t))
             .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
+        create_lock_dir(&repo_t)?;
 
         // Mark it shared.
         bzr.subtransport("repository")?
