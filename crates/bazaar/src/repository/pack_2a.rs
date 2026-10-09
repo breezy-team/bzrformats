@@ -26,6 +26,7 @@ use crate::transport::{Transport, TransportError};
 use crate::versionedfile::Key;
 
 use super::format::RepositoryFormat;
+use super::pack_collection::CombinedIndex as _;
 use crate::bencode_serializer::BEncodeRevisionSerializer1;
 use crate::declare_repository_format;
 use crate::xml_serializer::Chk255BigPageInventorySerializer;
@@ -195,8 +196,15 @@ fn parse_index_value(value: &[u8]) -> Result<(u64, u64, u64, u64), RepositoryErr
 /// (revisions, inventories, texts or chk), merged across all packs.
 ///
 /// Each key resolves to the pack it lives in plus the record's location
-/// inside that pack's groupcompress data.
+/// inside that pack's groupcompress data. Clones share the index, so the
+/// repository can add and remove packs under the store reading through it.
+#[derive(Clone, Default)]
 struct PackGcIndex {
+    state: std::sync::Arc<std::sync::RwLock<PackGcIndexState>>,
+}
+
+#[derive(Default)]
+struct PackGcIndexState {
     /// key -> (build details, graph parents).
     entries: HashMap<Key, GcBuildDetails<PackName>>,
     /// Whether the underlying index stores graph parents.
@@ -211,18 +219,33 @@ impl PackGcIndex {
         packs: &[PackName],
         kind: IndexKind,
     ) -> Result<Self, RepositoryError> {
-        let ext = index_extension(kind);
-        let mut entries: HashMap<Key, GcBuildDetails<PackName>> = HashMap::new();
-        let mut has_graph = false;
+        let index = PackGcIndex::default();
         for pack in packs {
-            let name = format!("indices/{pack}{ext}");
-            let index = BTreeGraphIndex::open(transport, &name)?;
-            if index.node_ref_lists() > 0 {
-                has_graph = true;
-            }
+            index.add_pack(transport, pack, kind)?;
+        }
+        Ok(index)
+    }
+}
+
+impl super::pack_collection::CombinedIndex for PackGcIndex {
+    /// Add the entries of `pack`'s index for `kind`.
+    fn add_pack(
+        &self,
+        transport: &dyn Transport,
+        pack: &str,
+        kind: IndexKind,
+    ) -> Result<(), RepositoryError> {
+        let name = format!("indices/{pack}{}", index_extension(kind));
+        let index = BTreeGraphIndex::open(transport, &name)?;
+        let mut state = self.state.write().unwrap();
+        if index.node_ref_lists() > 0 {
+            state.has_graph = true;
+        }
+        {
+            let entries = &mut state.entries;
             for (key, value, refs) in index.iter_all_entries() {
                 let (start, length, basis_end, delta_end) = parse_index_value(value)?;
-                let read_memo = ReadMemo::new(pack.clone(), start, start + length);
+                let read_memo = ReadMemo::new(pack.to_string(), start, start + length);
                 let index_memo = IndexMemo::new(read_memo, basis_end, delta_end);
                 let parents = if index.node_ref_lists() > 0 {
                     let first = refs.first().cloned().unwrap_or_default();
@@ -239,7 +262,16 @@ impl PackGcIndex {
                 );
             }
         }
-        Ok(PackGcIndex { entries, has_graph })
+        Ok(())
+    }
+
+    /// Drop the entries of `pack`.
+    fn remove_pack(&self, pack: &str) {
+        self.state
+            .write()
+            .unwrap()
+            .entries
+            .retain(|_, details| details.index_memo.read_memo.index != pack);
     }
 }
 
@@ -250,9 +282,10 @@ impl GcIndex for PackGcIndex {
         &self,
         keys: &[Key],
     ) -> Result<HashMap<Key, GcBuildDetails<Self::F>>, KnitError> {
+        let state = self.state.read().unwrap();
         let mut out = HashMap::new();
         for key in keys {
-            if let Some(details) = self.entries.get(key) {
+            if let Some(details) = state.entries.get(key) {
                 out.insert(key.clone(), details.clone());
             }
         }
@@ -260,9 +293,10 @@ impl GcIndex for PackGcIndex {
     }
 
     fn get_parent_map(&self, keys: &[Key]) -> Result<HashMap<Key, Vec<Key>>, KnitError> {
+        let state = self.state.read().unwrap();
         let mut out = HashMap::new();
         for key in keys {
-            if let Some(details) = self.entries.get(key) {
+            if let Some(details) = state.entries.get(key) {
                 if let Some(parents) = &details.parents {
                     out.insert(key.clone(), parents.clone());
                 }
@@ -272,11 +306,11 @@ impl GcIndex for PackGcIndex {
     }
 
     fn keys(&self) -> Result<Vec<Key>, KnitError> {
-        Ok(self.entries.keys().cloned().collect())
+        Ok(self.state.read().unwrap().entries.keys().cloned().collect())
     }
 
     fn has_graph(&self) -> bool {
-        self.has_graph
+        self.state.read().unwrap().has_graph
     }
 
     fn check_write_ok(&self) -> Result<(), KnitError> {
@@ -295,20 +329,21 @@ impl GcIndex for PackGcIndex {
 pub use crate::transport::SharedTransport;
 
 /// A [`GcAccess`] that reads raw groupcompress block bytes from the
-/// `.pack` files of the repository.
+/// `.pack` files of the repository. Clones share the cache.
+#[derive(Clone)]
 struct PackGcAccess {
     transport: SharedTransport,
     /// Cache of whole pack files, keyed by pack name. The packs a single
     /// repository produces are small enough to hold in memory; this avoids
     /// re-reading the file for every record.
-    cache: std::sync::Mutex<HashMap<PackName, std::sync::Arc<Vec<u8>>>>,
+    cache: std::sync::Arc<std::sync::Mutex<HashMap<PackName, std::sync::Arc<Vec<u8>>>>>,
 }
 
 impl PackGcAccess {
     fn new(transport: SharedTransport) -> Self {
         PackGcAccess {
             transport,
-            cache: std::sync::Mutex::new(HashMap::new()),
+            cache: Default::default(),
         }
     }
 
@@ -327,6 +362,12 @@ impl PackGcAccess {
             .unwrap()
             .insert(pack.to_string(), arc.clone());
         Ok(arc)
+    }
+}
+
+impl super::pack_collection::PackReader for PackGcAccess {
+    fn forget(&self, pack: &str) {
+        self.cache.lock().unwrap().remove(pack);
     }
 }
 
@@ -368,15 +409,41 @@ impl GcAccess for PackGcAccess {
 /// A groupcompress store for one kind of object in the repository.
 type Store = GroupCompressVersionedFiles<PackGcIndex, PackGcAccess>;
 
-/// Build the groupcompress store for one index kind across all packs.
+/// Build the groupcompress store for one index kind across `packs`.
 fn build_store(
     transport: &SharedTransport,
     packs: &[PackName],
     kind: IndexKind,
 ) -> Result<Store, RepositoryError> {
+    Ok(build_store_with_handles(transport, packs, kind)?.0)
+}
+
+/// The packs of the repository and the stores reading them.
+type Packs = super::pack_collection::PackCollection<PackGcIndex, PackGcAccess>;
+
+/// Build the store for `kind` across the packs of `packs`, registering it
+/// so it keeps reading them as they change.
+fn build_registered_store(
+    packs: &mut Packs,
+    transport: &SharedTransport,
+    kind: IndexKind,
+) -> Result<Store, RepositoryError> {
+    let (store, index, access) = build_store_with_handles(transport, &packs.names(), kind)?;
+    packs.add_store(kind, index, access);
+    Ok(store)
+}
+
+/// Build the groupcompress store for one index kind across `packs`, with
+/// handles on its index and pack reader for adding and removing packs.
+fn build_store_with_handles(
+    transport: &SharedTransport,
+    packs: &[PackName],
+    kind: IndexKind,
+) -> Result<(Store, PackGcIndex, PackGcAccess), RepositoryError> {
     let index = PackGcIndex::load(transport.as_ref(), packs, kind)?;
     let access = PackGcAccess::new(transport.clone());
-    Ok(GroupCompressVersionedFiles::new(index, access, false))
+    let store = GroupCompressVersionedFiles::new(index.clone(), access.clone(), false);
+    Ok((store, index, access))
 }
 
 /// The CHK byte store as a trait object, so it can be shared with the
@@ -402,6 +469,8 @@ pub struct Pack2aRepository {
     signatures: Store,
     /// The CHK byte store, shared with the `CHKInventory`s it materializes.
     chk_bytes: SharedChkStore,
+    /// The packs the stores read, kept in step with `pack-names`.
+    packs: Packs,
     /// The in-progress write group, if one is open.
     write_group: Option<super::pack_2a_writer::WriteGroup>,
 }
@@ -416,13 +485,16 @@ impl Pack2aRepository {
     /// is [`RepositoryError::UnsupportedFormat`].
     pub fn open(transport: SharedTransport) -> Result<Self, RepositoryError> {
         let format = check_format(transport.as_ref())?;
-        let packs = read_pack_names(transport.as_ref())?;
-        let revisions = build_store(&transport, &packs, IndexKind::Revision)?;
-        let inventories = build_store(&transport, &packs, IndexKind::Inventory)?;
-        let texts = build_store(&transport, &packs, IndexKind::Text)?;
-        let signatures = build_store(&transport, &packs, IndexKind::Signature)?;
-        let chk_bytes: SharedChkStore =
-            std::sync::Arc::new(build_store(&transport, &packs, IndexKind::Chk)?);
+        let mut packs = Packs::open(SharedTransport::clone(&transport), true)?;
+        let revisions = build_registered_store(&mut packs, &transport, IndexKind::Revision)?;
+        let inventories = build_registered_store(&mut packs, &transport, IndexKind::Inventory)?;
+        let texts = build_registered_store(&mut packs, &transport, IndexKind::Text)?;
+        let signatures = build_registered_store(&mut packs, &transport, IndexKind::Signature)?;
+        let chk_bytes: SharedChkStore = std::sync::Arc::new(build_registered_store(
+            &mut packs,
+            &transport,
+            IndexKind::Chk,
+        )?);
         Ok(Pack2aRepository {
             lock: crate::lockable_files::LockableFiles::new(
                 SharedTransport::clone(&transport),
@@ -435,6 +507,7 @@ impl Pack2aRepository {
             texts,
             signatures,
             chk_bytes,
+            packs,
             write_group: None,
         })
     }
@@ -466,12 +539,6 @@ impl Pack2aRepository {
             .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e:?}")))?;
         transport.put_bytes("pack-names", &empty, None)?;
         Self::open(transport)
-    }
-
-    /// The list of pack names, read fresh from `pack-names`.
-    #[allow(dead_code)]
-    fn pack_names(&self) -> Result<Vec<PackName>, RepositoryError> {
-        read_pack_names(self.transport.as_ref())
     }
 
     /// All revision ids stored in this repository.
@@ -745,19 +812,20 @@ impl Pack2aRepository {
     }
 
     /// Flush the open write group: write its pack, indices and an updated
-    /// `pack-names`. After this, re-open the repository to read the newly
-    /// committed data (the in-memory read stores are not refreshed).
+    /// `pack-names`, and make the new pack readable through this object.
     pub fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
         let group = self
             .write_group
             .take()
             .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))?;
-        let existing = read_pack_names_with_values(self.transport.as_ref())?;
-        let new_pack = group.finish(self.transport.as_ref(), &existing)?;
-        // After inserting new content, autopack if the repository has
-        // accumulated too many packs (as brz does on commit_write_group).
-        if new_pack.is_some() {
-            self.autopack()?;
+        let Some((name, value)) = group.finish(self.transport.as_ref())? else {
+            return Ok(());
+        };
+        self.packs.allocate(name, value)?;
+        // Autopack if the repository has accumulated too many packs, as brz
+        // does on commit_write_group; a repack saves the pack names itself.
+        if !self.autopack()? {
+            self.packs.save()?;
         }
         Ok(())
     }
@@ -909,7 +977,7 @@ impl Pack2aRepository {
                 "cannot reconcile with an open write group".to_string(),
             ));
         }
-        let old_packs = read_pack_names(self.transport.as_ref())?;
+        let old_packs = self.packs.names();
         let reachable = self.all_revision_ids()?;
 
         // Garbage = inventories stored but not reachable from any revision.
@@ -919,8 +987,7 @@ impl Pack2aRepository {
         if old_packs.is_empty() || reachable.is_empty() {
             // Nothing to keep; just discard any stray packs.
             if !old_packs.is_empty() {
-                self.write_empty_pack_names()?;
-                self.obsolete_packs(&old_packs)?;
+                self.packs.replace(&old_packs, None)?;
             }
             return Ok(super::ReconcileResult {
                 garbage_inventories,
@@ -986,29 +1053,15 @@ impl Pack2aRepository {
             }
         }
 
-        // The reconciled pack is the only survivor; finish with no others, then
-        // obsolete the old packs. `commit_write_group` (called by finish-via-
-        // start/commit) would re-list existing packs, so finish directly here.
+        // The reconciled pack replaces every old one.
         let group = self.write_group.take().expect("write group open");
-        group.finish(self.transport.as_ref(), &[])?;
-        self.obsolete_packs(&old_packs)?;
+        let new_pack = group.finish(self.transport.as_ref())?;
+        self.packs.replace(&old_packs, new_pack)?;
 
         Ok(super::ReconcileResult {
             garbage_inventories,
             repacked: true,
         })
-    }
-
-    /// Write a `pack-names` index that references no packs (used when reconcile
-    /// discards everything).
-    fn write_empty_pack_names(&self) -> Result<(), RepositoryError> {
-        use crate::btree_builder::BTreeBuilder;
-        let names = BTreeBuilder::new(0, 1);
-        let bytes = names
-            .finish()
-            .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e:?}")))?;
-        self.transport.put_bytes("pack-names", &bytes, None)?;
-        Ok(())
     }
 
     /// Combine all packs in this repository into a single new pack.
@@ -1031,13 +1084,12 @@ impl Pack2aRepository {
                 "cannot pack with an open write group".to_string(),
             ));
         }
-        let old_packs = read_pack_names(self.transport.as_ref())?;
+        let old_packs = self.packs.names();
         if old_packs.len() <= 1 {
             // Zero or one pack: already as packed as it gets.
             return Ok(());
         }
-        // Combine every pack; no survivors.
-        self.repack(&old_packs, &[])
+        self.repack(&old_packs)
     }
 
     /// Repack the smallest packs when the repository has accumulated too many,
@@ -1059,7 +1111,7 @@ impl Pack2aRepository {
                 "cannot autopack with an open write group".to_string(),
             ));
         }
-        let all_packs = read_pack_names(self.transport.as_ref())?;
+        let all_packs = self.packs.names();
         if all_packs.len() <= 1 {
             return Ok(false);
         }
@@ -1076,26 +1128,12 @@ impl Pack2aRepository {
             return Ok(false);
         }
         let to_combine: Vec<PackName> = selected.iter().map(|&i| all_packs[i].clone()).collect();
-        let survivors: Vec<(PackName, Vec<u8>)> = {
-            let with_values = read_pack_names_with_values(self.transport.as_ref())?;
-            let combine: std::collections::HashSet<&PackName> = to_combine.iter().collect();
-            with_values
-                .into_iter()
-                .filter(|(n, _)| !combine.contains(n))
-                .collect()
-        };
-        self.repack(&to_combine, &survivors)?;
+        self.repack(&to_combine)?;
         Ok(true)
     }
 
-    /// Combine `to_combine` into a single new pack, rewrite `pack-names` to list
-    /// `survivors` plus the new pack, and move the combined packs into
-    /// `obsolete_packs/`.
-    fn repack(
-        &mut self,
-        to_combine: &[PackName],
-        survivors: &[(PackName, Vec<u8>)],
-    ) -> Result<(), RepositoryError> {
+    /// Combine `to_combine` into a single new pack, which replaces them.
+    fn repack(&mut self, to_combine: &[PackName]) -> Result<(), RepositoryError> {
         // Read-side stores over the packs being combined, one per object kind.
         let revisions = build_store(&self.transport, to_combine, IndexKind::Revision)?;
         let inventories = build_store(&self.transport, to_combine, IndexKind::Inventory)?;
@@ -1116,46 +1154,8 @@ impl Pack2aRepository {
         group.copy_store(&texts, RepackTarget::Texts)?;
         group.copy_store(&signatures, RepackTarget::Signatures)?;
 
-        // Write the combined pack; pack-names now lists the survivors plus it.
-        group.finish(self.transport.as_ref(), survivors)?;
-
-        // Move the now-superseded packs and their indices into obsolete_packs/.
-        self.obsolete_packs(to_combine)?;
-        Ok(())
-    }
-
-    /// Move `packs` (their `.pack` files and every index suffix) into the
-    /// `obsolete_packs/` directory, creating it if needed. Old packs are moved
-    /// rather than deleted, matching brz, so a mistaken pack can be recovered.
-    fn obsolete_packs(&self, packs: &[PackName]) -> Result<(), RepositoryError> {
-        let t = self.transport.as_ref();
-        // Best-effort directory creation (ignore "already exists").
-        let _ = t.mkdir("obsolete_packs");
-        for name in packs {
-            self.move_to_obsolete(&format!("packs/{name}.pack"), &format!("{name}.pack"))?;
-            for kind in [
-                IndexKind::Revision,
-                IndexKind::Inventory,
-                IndexKind::Text,
-                IndexKind::Signature,
-                IndexKind::Chk,
-            ] {
-                let ext = index_extension(kind);
-                self.move_to_obsolete(&format!("indices/{name}{ext}"), &format!("{name}{ext}"))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Move one file into `obsolete_packs/`, tolerating a missing source (a
-    /// pack with no chk index has no `.cix`, for instance).
-    fn move_to_obsolete(&self, from: &str, basename: &str) -> Result<(), RepositoryError> {
-        let to = format!("obsolete_packs/{basename}");
-        match self.transport.rename(from, &to) {
-            Ok(()) => Ok(()),
-            Err(TransportError::NoSuchFile(_)) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        let new_pack = group.finish(self.transport.as_ref())?;
+        self.packs.replace(to_combine, new_pack)
     }
 }
 
@@ -1193,10 +1193,7 @@ impl super::Repository for Pack2aRepository {
         if self.write_group.is_some() {
             return Ok(());
         }
-        let reopened = Self::open(SharedTransport::clone(&self.transport))?;
-        let lock = self.lock.clone();
-        *self = Self { lock, ..reopened };
-        Ok(())
+        self.packs.reload()
     }
 
     fn format(&self) -> &'static RepositoryFormat {
@@ -1399,20 +1396,6 @@ fn new_pack_name() -> String {
         .collect()
 }
 
-/// Read `pack-names`, returning each `(pack_name, value_bytes)` pair.
-fn read_pack_names_with_values(
-    transport: &dyn Transport,
-) -> Result<Vec<(String, Vec<u8>)>, RepositoryError> {
-    let index = BTreeGraphIndex::open(transport, "pack-names")?;
-    let mut out = Vec::new();
-    for (key, value, _refs) in index.iter_all_entries() {
-        if let Some(name) = key.first() {
-            out.push((String::from_utf8_lossy(name).into_owned(), value.clone()));
-        }
-    }
-    Ok(out)
-}
-
 /// Open the repository at `transport` as a 2a (groupcompress) repository.
 /// The [`OpenFn`](super::format::OpenFn) carried by every 2a
 /// [`RepositoryFormat`].
@@ -1451,18 +1434,6 @@ fn check_format(
     Ok(format)
 }
 
-/// Read `pack-names` and return the pack names in it.
-fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, RepositoryError> {
-    let index = BTreeGraphIndex::open(transport, "pack-names")?;
-    let mut names = Vec::new();
-    for (key, _value, _refs) in index.iter_all_entries() {
-        if let Some(name) = key.first() {
-            names.push(String::from_utf8_lossy(name).into_owned());
-        }
-    }
-    Ok(names)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1471,6 +1442,14 @@ mod tests {
     use crate::transport::LocalTransport;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// The pack names listed in `pack-names` on disk.
+    fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, RepositoryError> {
+        Ok(super::super::pack_collection::read_pack_names(transport)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
 
     fn make_revision(
         id: &[u8],
@@ -1563,6 +1542,27 @@ mod tests {
         assert!(!reader.has_revision(b"rev-1").unwrap());
         let reader = reader.read_locked().unwrap();
         assert!(reader.has_revision(b"rev-1").unwrap());
+        reader.unlock().unwrap();
+    }
+
+    /// The first lock drops the packs another writer repacked away since the
+    /// repository was opened, and reads the pack that replaced them.
+    #[test]
+    fn first_lock_follows_a_repack_by_another_writer() {
+        let (_d, t) = temp_repo();
+        let mut writer = Pack2aRepository::create(SharedTransport::clone(&t)).unwrap();
+        commit_one(&mut writer, b"rev-1");
+        let mut reader = Pack2aRepository::open(t).unwrap();
+        commit_one(&mut writer, b"rev-2");
+        writer.pack().unwrap();
+        let reader = reader.read_locked().unwrap();
+        assert_eq!(1, reader.packs.names().len());
+        for rev in [&b"rev-1"[..], b"rev-2"] {
+            assert_eq!(
+                rev,
+                reader.get_revision(rev).unwrap().revision_id.as_bytes()
+            );
+        }
         reader.unlock().unwrap();
     }
 
@@ -1787,6 +1787,28 @@ mod tests {
         repo.add_text(b"file-1", rev, &[], b"hello\n").unwrap();
         repo.commit_write_group().unwrap();
         repo.unlock().unwrap();
+    }
+
+    /// Packing moves the old packs aside; reads through the repository that
+    /// packed go to the new pack without reopening it.
+    #[test]
+    fn packed_data_is_readable_through_the_packer() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t).unwrap();
+        for rev in [b"rev-1", b"rev-2", b"rev-3"] {
+            commit_one(&mut repo, rev);
+        }
+        repo.pack().unwrap();
+        for rev in [b"rev-1", b"rev-2", b"rev-3"] {
+            assert_eq!(
+                rev.to_vec(),
+                repo.get_revision(rev)
+                    .unwrap()
+                    .revision_id
+                    .as_bytes()
+                    .to_vec()
+            );
+        }
     }
 
     /// pack() combines several packs into one, moves the old packs to

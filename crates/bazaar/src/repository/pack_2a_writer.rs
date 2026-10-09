@@ -459,16 +459,14 @@ impl WriteGroup {
     }
 
     /// Flush this write group to `transport` (rooted at `.bzr/repository`):
-    /// write the new `.pack`, its five indices, and an updated `pack-names`
-    /// that lists `existing_packs` plus the new one.
+    /// write the new `.pack` and its five indices. Listing it in
+    /// `pack-names` is left to the repository.
     ///
-    /// Returns the new pack's `(name, pack-names value bytes)` so the caller
-    /// can track it. Does nothing and returns `None` when the group is empty
-    /// (no records added).
+    /// Returns the new pack's `(name, pack-names value bytes)`. Does nothing
+    /// and returns `None` when the group is empty (no records added).
     pub(super) fn finish(
         self,
         transport: &dyn Transport,
-        existing_packs: &[(String, Vec<u8>)],
     ) -> Result<Option<(String, Vec<u8>)>, RepositoryError> {
         // Build each index from its store's collected records.
         let rix = serialise_index(&self.revisions, 1)?;
@@ -511,26 +509,6 @@ impl WriteGroup {
             .collect::<Vec<_>>()
             .join(" ")
             .into_bytes();
-
-        // pack-names: a btree index mapping (pack_name,) -> the five sizes,
-        // for every existing pack plus the new one.
-        let mut names = BTreeBuilder::new(0, 1);
-        for (name, value) in existing_packs {
-            names
-                .add_node(vec![name.clone().into_bytes()], value.clone(), vec![])
-                .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e:?}")))?;
-        }
-        names
-            .add_node(
-                vec![pack_name.clone().into_bytes()],
-                new_value.clone(),
-                vec![],
-            )
-            .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e:?}")))?;
-        let names_bytes = names
-            .finish()
-            .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e:?}")))?;
-        transport.put_bytes("pack-names", &names_bytes, None)?;
 
         Ok(Some((pack_name, new_value)))
     }

@@ -18,10 +18,11 @@ use crate::knit::{
     KnitPlainFactory, KnitRecordDetails, KnitVersionedFiles,
 };
 use crate::pack_repo::{index_extension, IndexKind};
-use crate::transport::{SharedTransport, Transport, TransportError};
+use crate::transport::{SharedTransport, Transport};
 
 use super::format::RepositoryFormat;
 use super::pack_2a::RepositoryError;
+use super::pack_collection::CombinedIndex as _;
 use super::unkey_knit_parent_map;
 use crate::declare_repository_format;
 use crate::xml_serializer::{
@@ -164,8 +165,15 @@ enum RepackTarget {
 }
 
 /// A [`KnitIndex`] built from the per-pack btree indices of one kind,
-/// merged across all packs.
+/// merged across all packs. Clones share the index, so the repository can
+/// add and remove packs under the store reading through it.
+#[derive(Clone, Default)]
 struct PackKnitIndex {
+    state: std::sync::Arc<std::sync::RwLock<PackKnitIndexState>>,
+}
+
+#[derive(Default)]
+struct PackKnitIndexState {
     /// key -> record details (method, noeol, location, parents).
     entries: HashMap<KnitKey, KnitRecordDetails<PackName>>,
     has_graph: bool,
@@ -183,15 +191,30 @@ impl PackKnitIndex {
         packs: &[PackName],
         kind: IndexKind,
     ) -> Result<Self, RepositoryError> {
-        let ext = index_extension(kind);
-        let mut entries: HashMap<KnitKey, KnitRecordDetails<PackName>> = HashMap::new();
-        let mut has_graph = false;
+        let index = PackKnitIndex::default();
         for pack in packs {
-            let name = format!("indices/{pack}{ext}");
-            let index = super::pack_index::PackIndex::open(transport, &name)?;
-            if index.node_ref_lists() > 0 {
-                has_graph = true;
-            }
+            index.add_pack(transport, pack, kind)?;
+        }
+        Ok(index)
+    }
+}
+
+impl super::pack_collection::CombinedIndex for PackKnitIndex {
+    /// Add the entries of `pack`'s index for `kind`.
+    fn add_pack(
+        &self,
+        transport: &dyn Transport,
+        pack: &str,
+        kind: IndexKind,
+    ) -> Result<(), RepositoryError> {
+        let name = format!("indices/{pack}{}", index_extension(kind));
+        let index = super::pack_index::PackIndex::open(transport, &name)?;
+        let mut state = self.state.write().unwrap();
+        if index.node_ref_lists() > 0 {
+            state.has_graph = true;
+        }
+        {
+            let entries = &mut state.entries;
             for (key, value, refs) in index.iter_all_entries() {
                 let parsed = parse_knit_index_value(value)
                     .map_err(|e| RepositoryError::Corrupt(format!("knit index value: {e}")))?;
@@ -211,7 +234,7 @@ impl PackKnitIndex {
                         method,
                         noeol: parsed.noeol,
                         index_memo: KnitIndexMemo {
-                            file_ref: pack.clone(),
+                            file_ref: pack.to_string(),
                             offset: parsed.pos,
                             length: parsed.size as usize,
                         },
@@ -221,7 +244,16 @@ impl PackKnitIndex {
                 );
             }
         }
-        Ok(PackKnitIndex { entries, has_graph })
+        Ok(())
+    }
+
+    /// Drop the entries of `pack`.
+    fn remove_pack(&self, pack: &str) {
+        self.state
+            .write()
+            .unwrap()
+            .entries
+            .retain(|_, details| details.index_memo.file_ref != pack);
     }
 }
 
@@ -234,7 +266,7 @@ impl KnitIndex for PackKnitIndex {
     ) -> Result<HashMap<KnitKey, KnitRecordDetails<Self::F>>, KnitError> {
         let mut out = HashMap::new();
         for key in keys {
-            if let Some(d) = self.entries.get(key) {
+            if let Some(d) = self.state.read().unwrap().entries.get(key) {
                 out.insert(key.clone(), d.clone());
             }
         }
@@ -242,7 +274,7 @@ impl KnitIndex for PackKnitIndex {
     }
 
     fn keys(&self) -> Result<Vec<KnitKey>, KnitError> {
-        Ok(self.entries.keys().cloned().collect())
+        Ok(self.state.read().unwrap().entries.keys().cloned().collect())
     }
 
     fn get_parent_map(
@@ -251,7 +283,7 @@ impl KnitIndex for PackKnitIndex {
     ) -> Result<HashMap<KnitKey, Vec<KnitKey>>, KnitError> {
         let mut out = HashMap::new();
         for key in keys {
-            if let Some(d) = self.entries.get(key) {
+            if let Some(d) = self.state.read().unwrap().entries.get(key) {
                 out.insert(key.clone(), d.parents.clone());
             }
         }
@@ -259,7 +291,10 @@ impl KnitIndex for PackKnitIndex {
     }
 
     fn get_method(&self, key: &KnitKey) -> Result<KnitMethod, KnitError> {
-        self.entries
+        self.state
+            .read()
+            .unwrap()
+            .entries
             .get(key)
             .map(|d| d.method)
             .ok_or_else(|| KnitError::RevisionNotPresent(key.clone()))
@@ -293,11 +328,11 @@ impl KnitIndex for PackKnitIndex {
     }
 
     fn has_graph(&self) -> bool {
-        self.has_graph
+        self.state.read().unwrap().has_graph
     }
 
     fn contains(&self, key: &KnitKey) -> Result<bool, KnitError> {
-        Ok(self.entries.contains_key(key))
+        Ok(self.state.read().unwrap().entries.contains_key(key))
     }
 
     fn get_missing_compression_parents(&self) -> Result<Vec<KnitKey>, KnitError> {
@@ -324,16 +359,18 @@ impl KnitIndex for PackKnitIndex {
 }
 
 /// A [`KnitAccess`] that reads raw knit records from the `.pack` files.
+/// Clones share the cache.
+#[derive(Clone)]
 struct PackKnitAccess {
     transport: SharedTransport,
-    cache: std::sync::Mutex<HashMap<PackName, std::sync::Arc<Vec<u8>>>>,
+    cache: std::sync::Arc<std::sync::Mutex<HashMap<PackName, std::sync::Arc<Vec<u8>>>>>,
 }
 
 impl PackKnitAccess {
     fn new(transport: SharedTransport) -> Self {
         PackKnitAccess {
             transport,
-            cache: std::sync::Mutex::new(HashMap::new()),
+            cache: Default::default(),
         }
     }
 
@@ -369,6 +406,12 @@ impl PackKnitAccess {
         // record (gzip) is the record body.
         crate::pack::read_bytes_record_body(&bytes[start..stop])
             .map_err(|e| KnitError::Corrupt(format!("reading pack record: {e}")))
+    }
+}
+
+impl super::pack_collection::PackReader for PackKnitAccess {
+    fn forget(&self, pack: &str) {
+        self.cache.lock().unwrap().remove(pack);
     }
 }
 
@@ -409,15 +452,36 @@ fn build_store(
     packs: &[PackName],
     kind: IndexKind,
 ) -> Result<Store, RepositoryError> {
+    Ok(build_store_with_handles(transport, packs, kind)?.0)
+}
+
+/// The packs of the repository and the stores reading them.
+type Packs = super::pack_collection::PackCollection<PackKnitIndex, PackKnitAccess>;
+
+/// Build the store for `kind` across the packs of `packs`, registering it
+/// so it keeps reading them as they change.
+fn build_registered_store(
+    packs: &mut Packs,
+    transport: &SharedTransport,
+    kind: IndexKind,
+) -> Result<Store, RepositoryError> {
+    let (store, index, access) = build_store_with_handles(transport, &packs.names(), kind)?;
+    packs.add_store(kind, index, access);
+    Ok(store)
+}
+
+/// Build the knit store for one index kind across `packs`, with handles on
+/// its index and pack reader for adding and removing packs.
+fn build_store_with_handles(
+    transport: &SharedTransport,
+    packs: &[PackName],
+    kind: IndexKind,
+) -> Result<(Store, PackKnitIndex, PackKnitAccess), RepositoryError> {
     let index = PackKnitIndex::load(transport.as_ref(), packs, kind)?;
     let access = PackKnitAccess::new(transport.clone());
     // max_delta_chain of 200 mirrors breezy's pack repositories.
-    Ok(KnitVersionedFiles::new(
-        index,
-        access,
-        KnitPlainFactory,
-        200,
-    ))
+    let store = KnitVersionedFiles::new(index.clone(), access.clone(), KnitPlainFactory, 200);
+    Ok((store, index, access))
 }
 
 /// A knit-pack repository.
@@ -434,6 +498,8 @@ pub struct KnitPackRepository {
     inventories: Store,
     texts: Store,
     signatures: Store,
+    /// The packs the stores read, kept in step with `pack-names`.
+    packs: Packs,
     write_group: Option<WriteGroup>,
 }
 
@@ -442,18 +508,19 @@ impl KnitPackRepository {
     /// rooted at `transport`.
     pub fn open(transport: SharedTransport) -> Result<Self, RepositoryError> {
         let format = check_format(transport.as_ref())?;
-        let packs = read_pack_names(transport.as_ref())?;
+        let mut packs = Packs::open(SharedTransport::clone(&transport), format.uses_btree_index)?;
         Ok(KnitPackRepository {
             lock: crate::lockable_files::LockableFiles::new(
                 SharedTransport::clone(&transport),
                 format.uses_lock_dir.then_some("lock"),
             ),
             format,
-            revisions: build_store(&transport, &packs, IndexKind::Revision)?,
-            inventories: build_store(&transport, &packs, IndexKind::Inventory)?,
-            texts: build_store(&transport, &packs, IndexKind::Text)?,
-            signatures: build_store(&transport, &packs, IndexKind::Signature)?,
+            revisions: build_registered_store(&mut packs, &transport, IndexKind::Revision)?,
+            inventories: build_registered_store(&mut packs, &transport, IndexKind::Inventory)?,
+            texts: build_registered_store(&mut packs, &transport, IndexKind::Text)?,
+            signatures: build_registered_store(&mut packs, &transport, IndexKind::Signature)?,
             transport,
+            packs,
             write_group: None,
         })
     }
@@ -593,11 +660,13 @@ impl KnitPackRepository {
             .write_group
             .take()
             .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))?;
-        let existing = read_pack_names_with_values(self.transport.as_ref())?;
-        group.finish(self.transport.as_ref(), &existing)?;
+        let (name, value) = group.finish(self.transport.as_ref())?;
+        self.packs.allocate(name, value)?;
         // Autopack if the repository has accumulated too many packs, as brz
-        // does on commit_write_group.
-        self.autopack()?;
+        // does on commit_write_group; a repack saves the pack names itself.
+        if !self.autopack()? {
+            self.packs.save()?;
+        }
         Ok(())
     }
 
@@ -663,15 +732,14 @@ impl KnitPackRepository {
                 "cannot reconcile with an open write group".to_string(),
             ));
         }
-        let old_packs = read_pack_names(self.transport.as_ref())?;
+        let old_packs = self.packs.names();
         let reachable = self.all_revision_ids()?;
         let stored_inventories = self.inventories.keys()?.len();
         let garbage_inventories = stored_inventories.saturating_sub(reachable.len());
 
         if old_packs.is_empty() || reachable.is_empty() {
             if !old_packs.is_empty() {
-                self.write_empty_pack_names()?;
-                self.obsolete_packs(&old_packs)?;
+                self.packs.replace(&old_packs, None)?;
             }
             return Ok(super::ReconcileResult {
                 garbage_inventories,
@@ -695,24 +763,14 @@ impl KnitPackRepository {
         group.copy_store_keys(&self.inventories, RepackTarget::Inventories, &rev_keys)?;
         group.copy_store_keys(&self.signatures, RepackTarget::Signatures, &rev_keys)?;
         group.copy_store_keys(&self.texts, RepackTarget::Texts, &text_keys)?;
-        // The reconciled pack is the only survivor.
-        group.finish(self.transport.as_ref(), &[])?;
-        self.obsolete_packs(&old_packs)?;
+        // The reconciled pack replaces every old one.
+        let new_pack = group.finish(self.transport.as_ref())?;
+        self.packs.replace(&old_packs, Some(new_pack))?;
 
         Ok(super::ReconcileResult {
             garbage_inventories,
             repacked: true,
         })
-    }
-
-    /// Write a `pack-names` index referencing no packs (reconcile discarded all).
-    fn write_empty_pack_names(&self) -> Result<(), RepositoryError> {
-        let names = super::pack_index::IndexBuilder::new(self.format.uses_btree_index, 0, 1);
-        let bytes = names
-            .finish()
-            .map_err(|e| RepositoryError::Corrupt(format!("empty pack-names: {e}")))?;
-        self.transport.put_bytes("pack-names", &bytes, None)?;
-        Ok(())
     }
 
     /// Combine all packs in this repository into a single new pack.
@@ -731,11 +789,11 @@ impl KnitPackRepository {
                 "cannot pack with an open write group".to_string(),
             ));
         }
-        let old_packs = read_pack_names(self.transport.as_ref())?;
+        let old_packs = self.packs.names();
         if old_packs.len() <= 1 {
             return Ok(());
         }
-        self.repack(&old_packs, &[])
+        self.repack(&old_packs)
     }
 
     /// Repack the smallest packs when the repository has too many, per the
@@ -750,7 +808,7 @@ impl KnitPackRepository {
                 "cannot autopack with an open write group".to_string(),
             ));
         }
-        let all_packs = read_pack_names(self.transport.as_ref())?;
+        let all_packs = self.packs.names();
         if all_packs.len() <= 1 {
             return Ok(false);
         }
@@ -769,25 +827,12 @@ impl KnitPackRepository {
             return Ok(false);
         }
         let to_combine: Vec<PackName> = selected.iter().map(|&i| all_packs[i].clone()).collect();
-        let survivors: Vec<(PackName, Vec<u8>)> = {
-            let with_values = read_pack_names_with_values(self.transport.as_ref())?;
-            let combine: std::collections::HashSet<&PackName> = to_combine.iter().collect();
-            with_values
-                .into_iter()
-                .filter(|(n, _)| !combine.contains(n))
-                .collect()
-        };
-        self.repack(&to_combine, &survivors)?;
+        self.repack(&to_combine)?;
         Ok(true)
     }
 
-    /// Combine `to_combine` into one new pack, rewrite `pack-names` to list
-    /// `survivors` plus the new pack, and obsolete the combined packs.
-    fn repack(
-        &mut self,
-        to_combine: &[PackName],
-        survivors: &[(PackName, Vec<u8>)],
-    ) -> Result<(), RepositoryError> {
+    /// Combine `to_combine` into a single new pack, which replaces them.
+    fn repack(&mut self, to_combine: &[PackName]) -> Result<(), RepositoryError> {
         let revisions = build_store(&self.transport, to_combine, IndexKind::Revision)?;
         let inventories = build_store(&self.transport, to_combine, IndexKind::Inventory)?;
         let texts = build_store(&self.transport, to_combine, IndexKind::Text)?;
@@ -800,39 +845,8 @@ impl KnitPackRepository {
         group.copy_store(&inventories, RepackTarget::Inventories)?;
         group.copy_store(&texts, RepackTarget::Texts)?;
         group.copy_store(&signatures, RepackTarget::Signatures)?;
-        group.finish(self.transport.as_ref(), survivors)?;
-
-        self.obsolete_packs(to_combine)?;
-        Ok(())
-    }
-
-    /// Move `packs` (their `.pack` files and the four index suffixes) into
-    /// `obsolete_packs/`, creating it if needed.
-    fn obsolete_packs(&self, packs: &[PackName]) -> Result<(), RepositoryError> {
-        let _ = self.transport.mkdir("obsolete_packs");
-        for name in packs {
-            self.move_to_obsolete(&format!("packs/{name}.pack"), &format!("{name}.pack"))?;
-            for kind in [
-                IndexKind::Revision,
-                IndexKind::Inventory,
-                IndexKind::Text,
-                IndexKind::Signature,
-            ] {
-                let ext = index_extension(kind);
-                self.move_to_obsolete(&format!("indices/{name}{ext}"), &format!("{name}{ext}"))?;
-            }
-        }
-        Ok(())
-    }
-
-    fn move_to_obsolete(&self, from: &str, basename: &str) -> Result<(), RepositoryError> {
-        match self
-            .transport
-            .rename(from, &format!("obsolete_packs/{basename}"))
-        {
-            Ok(()) | Err(TransportError::NoSuchFile(_)) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        let new_pack = group.finish(self.transport.as_ref())?;
+        self.packs.replace(to_combine, Some(new_pack))
     }
 
     /// All revision ids in this repository, sorted.
@@ -1026,10 +1040,7 @@ impl super::Repository for KnitPackRepository {
         if self.write_group.is_some() {
             return Ok(());
         }
-        let reopened = Self::open(SharedTransport::clone(&self.transport))?;
-        let lock = self.lock.clone();
-        *self = Self { lock, ..reopened };
-        Ok(())
+        self.packs.reload()
     }
 
     fn format(&self) -> &'static RepositoryFormat {
@@ -1212,32 +1223,6 @@ fn new_pack_name() -> String {
         .chars()
         .map(|ch| char::from_digit((ch as u32) % 16, 16).unwrap())
         .collect()
-}
-
-/// Read `pack-names`, returning each `(pack_name, value_bytes)` pair.
-fn read_pack_names_with_values(
-    transport: &dyn Transport,
-) -> Result<Vec<(String, Vec<u8>)>, RepositoryError> {
-    let index = super::pack_index::PackIndex::open(transport, "pack-names")?;
-    let mut out = Vec::new();
-    for (key, value, _refs) in index.iter_all_entries() {
-        if let Some(name) = key.first() {
-            out.push((String::from_utf8_lossy(name).into_owned(), value.clone()));
-        }
-    }
-    Ok(out)
-}
-
-/// Read `pack-names` and return the pack names in it.
-fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, RepositoryError> {
-    let index = super::pack_index::PackIndex::open(transport, "pack-names")?;
-    let mut names = Vec::new();
-    for (key, _value, _refs) in index.iter_all_entries() {
-        if let Some(name) = key.first() {
-            names.push(String::from_utf8_lossy(name).into_owned());
-        }
-    }
-    Ok(names)
 }
 
 /// Split a byte buffer into lines, each keeping its trailing newline.
@@ -1495,13 +1480,10 @@ impl WriteGroup {
         Ok(())
     }
 
-    /// Flush the pack, its four indices and an updated `pack-names`. Returns
-    /// the new pack's name (its content md5).
-    fn finish(
-        self,
-        transport: &dyn Transport,
-        existing: &[(String, Vec<u8>)],
-    ) -> Result<String, RepositoryError> {
+    /// Flush the pack and its four indices; listing it in `pack-names` is
+    /// left to the repository. Returns the new pack's name (its content md5)
+    /// and its `pack-names` value.
+    fn finish(self, transport: &dyn Transport) -> Result<(String, Vec<u8>), RepositoryError> {
         let WriteGroup {
             pack,
             revisions,
@@ -1548,20 +1530,7 @@ impl WriteGroup {
             .join(" ")
             .into_bytes();
 
-        let mut names = super::pack_index::IndexBuilder::new(uses_btree, 0, 1);
-        for (name, value) in existing {
-            names
-                .add_node(vec![name.clone().into_bytes()], value.clone(), vec![])
-                .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e}")))?;
-        }
-        names
-            .add_node(vec![pack_name.clone().into_bytes()], new_value, vec![])
-            .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e}")))?;
-        let names_bytes = names
-            .finish()
-            .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e}")))?;
-        transport.put_bytes("pack-names", &names_bytes, None)?;
-        Ok(pack_name)
+        Ok((pack_name, new_value))
     }
 }
 
@@ -1613,6 +1582,14 @@ fn serialise_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pack names listed in `pack-names` on disk.
+    fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, RepositoryError> {
+        Ok(super::super::pack_collection::read_pack_names(transport)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
     use crate::lockable_files::LockableExt as _;
     use crate::transport::LocalTransport;
     use std::sync::Arc;
