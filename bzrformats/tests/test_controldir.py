@@ -21,6 +21,7 @@ import os
 from .. import controldir
 from ..errors import (
     BzrFormatsError,
+    LockActive,
     LockContention,
     LockNotHeld,
     NotStacked,
@@ -560,3 +561,39 @@ class TestLocking(TestCaseInTempDir):
         revid = wt.commit("T <t@e>", "empty", 1577880000, 0, allow_pointless=True)
         self.assertEqual((1, revid), wt.branch.last_revision_info())
         self.assertTrue(wt.branch.repository.has_revision(revid))
+
+    def test_break_lock_asks_before_breaking(self):
+        cd = controldir.create(self.test_dir)
+        holder = cd.open_branch()
+        token = holder.lock_write().token
+        branch = controldir.open(self.test_dir).open_branch()
+        asked = []
+
+        def decline(info):
+            asked.append(info["nonce"])
+            return False
+
+        branch.break_lock(decline)
+        self.assertEqual([token], asked)
+        branch.break_lock()
+        self.assertTrue(branch.get_physical_lock_status())
+        branch.break_lock(lambda info: True)
+        self.assertFalse(branch.get_physical_lock_status())
+
+    def test_break_lock_raises_what_confirm_raises(self):
+        cd = controldir.create(self.test_dir)
+        cd.open_branch().lock_write()
+
+        def confirm(info):
+            raise KeyboardInterrupt
+
+        branch = controldir.open(self.test_dir).open_branch()
+        self.assertRaises(KeyboardInterrupt, branch.break_lock, confirm)
+        self.assertTrue(branch.get_physical_lock_status())
+
+    def test_break_lock_refuses_a_tree_in_use(self):
+        wt = controldir.create(self.test_dir).open_workingtree()
+        wt.lock_write()
+        other = controldir.open(self.test_dir).open_workingtree()
+        self.assertRaises(LockActive, other.break_lock, lambda info: True)
+        wt.unlock()

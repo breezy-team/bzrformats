@@ -323,6 +323,24 @@ impl Branch {
         self.repository.as_mut()
     }
 
+    /// Break the branch's lock directory, then its repository's, if someone
+    /// else holds them and `confirm` agrees (see
+    /// [`LockableFiles::break_lock`](crate::lockable_files::LockableFiles::break_lock)).
+    ///
+    /// TODO: also break the lock of a bound branch's master;
+    /// this crate cannot open the master branch yet.
+    pub fn break_lock(
+        &self,
+        confirm: &mut dyn FnMut(Option<&crate::lockdir::LockHeldInfo>) -> bool,
+    ) -> Result<(), BranchError> {
+        self.lock
+            .break_lock(confirm)
+            .map_err(BranchError::Locking)?;
+        self.repository
+            .break_lock(confirm)
+            .map_err(BranchError::Repository)
+    }
+
     /// Lock the branch for writing, with `token` taking over a held branch
     /// lock and `waiter` deciding what to do while someone else holds it.
     /// The first lock also write-locks the repository.
