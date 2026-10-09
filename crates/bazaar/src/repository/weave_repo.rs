@@ -42,6 +42,8 @@ declare_repository_format! {
 /// `.bzr` (the control directory itself).
 pub struct WeaveRepository {
     format: &'static RepositoryFormat,
+    /// Whether a write group is open.
+    in_write_group: bool,
     /// The repository's lock.
     lock: crate::lockable_files::LockableFiles,
     transport: SharedTransport,
@@ -63,6 +65,7 @@ impl WeaveRepository {
             ));
         }
         Ok(WeaveRepository {
+            in_write_group: false,
             lock: crate::lockable_files::LockableFiles::with_os_lock(
                 SharedTransport::clone(&transport),
                 os_lock,
@@ -423,6 +426,17 @@ impl crate::lockable_files::Lockable for WeaveRepository {
     }
 }
 
+impl WeaveRepository {
+    /// Close the open write group.
+    fn end_write_group(&mut self) -> Result<(), RepositoryError> {
+        if !self.in_write_group {
+            return Err(RepositoryError::NotInWriteGroup);
+        }
+        self.in_write_group = false;
+        Ok(())
+    }
+}
+
 impl super::Repository for WeaveRepository {
     fn lock(&self) -> &crate::lockable_files::LockableFiles {
         &self.lock
@@ -470,8 +484,17 @@ impl super::Repository for WeaveRepository {
         if self.lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
             return Err(RepositoryError::NotWriteLocked);
         }
-        // Weave writes append immediately; there is no write group.
+        if self.in_write_group {
+            return Err(RepositoryError::AlreadyInWriteGroup);
+        }
+        // Weave writes append immediately, so the write group only marks
+        // that writing is under way.
+        self.in_write_group = true;
         Ok(())
+    }
+
+    fn is_in_write_group(&self) -> bool {
+        self.in_write_group
     }
 
     fn add_revision(
@@ -530,12 +553,15 @@ impl super::Repository for WeaveRepository {
         WeaveRepository::get_signature_text(self, revision_id)
     }
 
-    fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
-        Ok(())
+    fn commit_write_group(&mut self) -> Result<Option<Vec<String>>, RepositoryError> {
+        self.end_write_group()?;
+        Ok(None)
     }
 
+    /// What the write group added stays: the format cannot
+    /// take back appended records.
     fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
-        Ok(())
+        self.end_write_group()
     }
 }
 

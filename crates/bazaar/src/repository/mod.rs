@@ -265,12 +265,31 @@ pub trait Repository: Lockable<Error = RepositoryError> + Send + Sync {
     /// The signature text stored for `revision_id`, or `None` if unsigned.
     fn get_signature_text(&self, revision_id: &[u8]) -> Result<Option<Vec<u8>>, RepositoryError>;
 
-    /// Flush the open write group, committing its additions.
-    fn commit_write_group(&mut self) -> Result<(), RepositoryError>;
+    /// Commit the open write group's additions.
+    ///
+    /// Returns the names of the packs written, which can be passed to `pack`
+    /// as a hint, or `None` for formats without packs.
+    fn commit_write_group(&mut self) -> Result<Option<Vec<String>>, RepositoryError>;
 
-    /// Close the open write group, discarding its additions. Formats whose
-    /// writes land immediately have no write group, and keep them.
+    /// Abort the open write group, dropping what it added where the format
+    /// can.
     fn abort_write_group(&mut self) -> Result<(), RepositoryError>;
+
+    /// Suspend the open write group, returning the tokens that resume it
+    /// with [`Repository::resume_write_group`]. Formats that cannot suspend
+    /// write groups refuse.
+    fn suspend_write_group(&mut self) -> Result<Vec<String>, RepositoryError> {
+        Err(RepositoryError::UnsuspendableWriteGroup)
+    }
+
+    /// Open a write group holding the suspended write group `tokens`.
+    /// Formats that cannot suspend write groups refuse.
+    fn resume_write_group(&mut self, _tokens: &[String]) -> Result<(), RepositoryError> {
+        if !self.is_write_locked() {
+            return Err(RepositoryError::NotWriteLocked);
+        }
+        Err(RepositoryError::UnsuspendableWriteGroup)
+    }
 
     /// Combine the repository's packs into a single pack.
     ///
@@ -698,12 +717,20 @@ impl Repository for StackedRepository {
         }
     }
 
-    fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+    fn commit_write_group(&mut self) -> Result<Option<Vec<String>>, RepositoryError> {
         self.primary.commit_write_group()
     }
 
     fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
         self.primary.abort_write_group()
+    }
+
+    fn suspend_write_group(&mut self) -> Result<Vec<String>, RepositoryError> {
+        self.primary.suspend_write_group()
+    }
+
+    fn resume_write_group(&mut self, tokens: &[String]) -> Result<(), RepositoryError> {
+        self.primary.resume_write_group(tokens)
     }
 
     fn add_fallback_repository(
@@ -812,9 +839,28 @@ pub fn unlock<R: Repository + ?Sized>(
         .map_err(RepositoryError::Locking)?;
     aborted?;
     if group_left_open {
-        return Err(RepositoryError::WriteGroupOpen);
+        return Err(RepositoryError::WriteGroupOpen { released });
     }
     Ok(released)
+}
+
+/// Run `f` on `repository` in a write group: the write group is committed
+/// if `f` succeeds and aborted if it fails. Returns `f`'s result and the commit's pack hint.
+pub fn with_write_group<T: Repository + ?Sized, R>(
+    repository: &mut T,
+    f: impl FnOnce(&mut T) -> Result<R, RepositoryError>,
+) -> Result<(R, Option<Vec<String>>), RepositoryError> {
+    repository.start_write_group()?;
+    match f(repository) {
+        Ok(r) => Ok((r, repository.commit_write_group()?)),
+        Err(e) => {
+            // Report f's failure rather than a failure to clean up after it.
+            if let Err(abort) = repository.abort_write_group() {
+                log::warn!("failed to abort write group: {abort}");
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Run `f` on `repository` under a write lock: a write lock the caller
@@ -988,64 +1034,33 @@ mod tests {
         }
     }
 
-    /// Aborting a write group discards what was added to it; formats that
-    /// write immediately have no write group to discard.
-    #[test]
-    fn aborted_write_group_is_discarded() {
-        for s in scenarios() {
-            let dir = tempfile::tempdir().unwrap();
-            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
-            let mut repo = (s.create)(SharedTransport::clone(&t));
-            let mut locked = repo.write_locked().unwrap();
-            locked.start_write_group().unwrap();
-            let grouped = locked.is_in_write_group();
-            locked
-                .add_revision(&revision(b"rev-1", vec![], "first"), &[])
-                .unwrap();
-            locked.abort_write_group().unwrap();
-            assert!(!locked.is_in_write_group(), "{}", s.label);
-            locked.unlock().unwrap();
-            let reopened = (s.reopen)(t);
-            assert_eq!(
-                !grouped,
-                reopened.has_revision(b"rev-1").unwrap(),
-                "{}",
-                s.label
-            );
-        }
+    /// Whether the scenario's format suspends write groups (the pack
+    /// formats), as `require_suspendable_write_groups` checks.
+    fn suspends(s: &Scenario) -> bool {
+        matches!(s.label, "2a" | "knit-pack")
     }
 
-    /// Releasing the last write lock with a write group open aborts the
-    /// write group, so the next write lock can start a new one.
-    #[test]
-    fn unlock_aborts_an_open_write_group() {
-        for s in scenarios() {
-            let dir = tempfile::tempdir().unwrap();
-            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
-            let mut repo = (s.create)(SharedTransport::clone(&t));
-            let mut locked = repo.write_locked().unwrap();
-            locked.start_write_group().unwrap();
-            if !locked.is_in_write_group() {
-                continue;
-            }
-            locked
-                .add_revision(&revision(b"rev-1", vec![], "first"), &[])
-                .unwrap();
-            assert!(
-                matches!(locked.unlock(), Err(RepositoryError::WriteGroupOpen)),
-                "{}",
-                s.label
-            );
-            assert!(!repo.is_in_write_group(), "{}", s.label);
-            assert!(!repo.lock().is_locked(), "{}", s.label);
-            assert!(!(s.reopen)(SharedTransport::clone(&t))
-                .has_revision(b"rev-1")
-                .unwrap());
+    /// A fresh write-locked repository of scenario `s`, with its transport.
+    fn write_locked(s: &Scenario) -> (tempfile::TempDir, SharedTransport, Box<dyn Repository>) {
+        let dir = tempfile::tempdir().unwrap();
+        let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let mut repo = (s.create)(t.clone());
+        repo.lock_write(&mut crate::lockable_files::NoWait).unwrap();
+        (dir, t, repo)
+    }
 
-            let mut locked = repo.write_locked().unwrap();
-            locked.start_write_group().unwrap();
-            locked.commit_write_group().unwrap();
-            locked.unlock().unwrap();
+    /// Re-open the repository at `t`, write-locked.
+    fn reopen_locked(s: &Scenario, t: &SharedTransport) -> Box<dyn Repository> {
+        let mut repo = (s.reopen)(t.clone());
+        repo.lock_write(&mut crate::lockable_files::NoWait).unwrap();
+        repo
+    }
+
+    fn has_text(repo: &dyn Repository, file_id: &[u8], revision: &[u8]) -> bool {
+        match repo.get_file_text(file_id, revision) {
+            Ok(_) => true,
+            Err(RepositoryError::NoSuchFileText { .. }) => false,
+            Err(e) => panic!("{}", format!("reading ({file_id:?}, {revision:?}): {e}")),
         }
     }
 
@@ -1060,6 +1075,530 @@ mod tests {
                     repo.get_file_text(b"file-id", b"revid"),
                     Err(RepositoryError::NoSuchFileText { .. })
                 ),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    #[test]
+    fn write_groups_follow_the_lock() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(t);
+            assert!(
+                matches!(
+                    repo.start_write_group(),
+                    Err(RepositoryError::NotWriteLocked)
+                ),
+                "{}",
+                s.label
+            );
+            repo.lock_read().unwrap();
+            assert!(
+                matches!(
+                    repo.start_write_group(),
+                    Err(RepositoryError::NotWriteLocked)
+                ),
+                "{}",
+                s.label
+            );
+            repo.unlock().unwrap();
+            repo.lock_write(&mut crate::lockable_files::NoWait).unwrap();
+            assert!(!repo.is_in_write_group(), "{}", s.label);
+            repo.start_write_group().unwrap();
+            assert!(repo.is_in_write_group(), "{}", s.label);
+            assert!(
+                matches!(
+                    repo.start_write_group(),
+                    Err(RepositoryError::AlreadyInWriteGroup)
+                ),
+                "{}",
+                s.label
+            );
+            repo.commit_write_group().unwrap();
+            assert!(!repo.is_in_write_group(), "{}", s.label);
+            assert!(
+                matches!(
+                    repo.abort_write_group(),
+                    Err(RepositoryError::NotInWriteGroup)
+                ),
+                "{}",
+                s.label
+            );
+            repo.start_write_group().unwrap();
+            repo.abort_write_group().unwrap();
+            assert!(!repo.is_in_write_group(), "{}", s.label);
+            repo.unlock().unwrap();
+        }
+    }
+
+    /// Unlocking in a write group aborts it, releases the lock, and
+    /// reports the unlock as an error.
+    #[test]
+    fn unlock_in_write_group_aborts_it() {
+        for s in scenarios() {
+            let (_dir, t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            repo.add_text(b"file-id", b"revid", &[], b"lines\n")
+                .unwrap();
+            assert!(
+                matches!(repo.unlock(), Err(RepositoryError::WriteGroupOpen { .. })),
+                "{}",
+                s.label
+            );
+            assert!(!repo.lock().is_locked(), "{}", s.label);
+            assert!(!repo.is_in_write_group(), "{}", s.label);
+            if suspends(&s) {
+                assert!(!has_text((s.reopen)(t).as_ref(), b"file-id", b"revid"));
+            }
+        }
+    }
+
+    #[test]
+    fn abort_drops_what_a_pack_write_group_added() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            repo.add_text(b"file-id", b"revid", &[], b"lines\n")
+                .unwrap();
+            repo.abort_write_group().unwrap();
+            assert!(
+                !has_text(repo.as_ref(), b"file-id", b"revid"),
+                "{}",
+                s.label
+            );
+            assert!(!has_text((s.reopen)(t).as_ref(), b"file-id", b"revid"));
+        }
+    }
+
+    #[test]
+    fn formats_without_packs_cannot_suspend() {
+        for s in scenarios().into_iter().filter(|s| !suspends(s)) {
+            let (_dir, _t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            assert!(
+                matches!(
+                    repo.suspend_write_group(),
+                    Err(RepositoryError::UnsuspendableWriteGroup)
+                ),
+                "{}",
+                s.label
+            );
+            // Refusing leaves the write group open.
+            assert!(repo.is_in_write_group(), "{}", s.label);
+            repo.abort_write_group().unwrap();
+            assert!(
+                matches!(
+                    repo.resume_write_group(&[]),
+                    Err(RepositoryError::UnsuspendableWriteGroup)
+                ),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    #[test]
+    fn suspend_then_resume_and_commit() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            repo.add_text(b"file-id", b"revid", &[], b"lines\n")
+                .unwrap();
+            let tokens = repo.suspend_write_group().unwrap();
+            assert_eq!(1, tokens.len(), "{}", s.label);
+            assert!(!repo.is_in_write_group(), "{}", s.label);
+            // test_read_after_suspend_fails
+            assert!(
+                !has_text(repo.as_ref(), b"file-id", b"revid"),
+                "{}",
+                s.label
+            );
+
+            let mut same = reopen_locked(&s, &t);
+            same.resume_write_group(&tokens).unwrap();
+            assert!(same.is_in_write_group(), "{}", s.label);
+            assert_eq!(
+                b"lines\n".to_vec(),
+                same.get_file_text(b"file-id", b"revid").unwrap(),
+                "{}",
+                s.label
+            );
+            same.add_text(
+                b"file-id",
+                b"second-revid",
+                &[(b"file-id".to_vec(), b"revid".to_vec())],
+                b"more lines\n",
+            )
+            .unwrap();
+            same.commit_write_group().unwrap();
+            assert_eq!(
+                b"lines\n".to_vec(),
+                same.get_file_text(b"file-id", b"revid").unwrap(),
+                "{}",
+                s.label
+            );
+            assert_eq!(
+                b"more lines\n".to_vec(),
+                same.get_file_text(b"file-id", b"second-revid").unwrap(),
+                "{}",
+                s.label
+            );
+            let reopened = (s.reopen)(t.clone());
+            assert!(
+                has_text(reopened.as_ref(), b"file-id", b"revid"),
+                "{}",
+                s.label
+            );
+            // A committed write group cannot be resumed again.
+            assert!(
+                matches!(
+                    same.resume_write_group(&tokens),
+                    Err(RepositoryError::UnresumableWriteGroup { .. })
+                ),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    #[test]
+    fn resumed_write_groups_suspend_with_their_tokens() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            repo.add_text(b"file-id", b"revid", &[], b"lines\n")
+                .unwrap();
+            let tokens = repo.suspend_write_group().unwrap();
+
+            // test_no_op_suspend_resume
+            let mut same = reopen_locked(&s, &t);
+            same.resume_write_group(&tokens).unwrap();
+            assert_eq!(tokens, same.suspend_write_group().unwrap(), "{}", s.label);
+            // test_read_after_second_suspend_fails
+            assert!(
+                !has_text(same.as_ref(), b"file-id", b"revid"),
+                "{}",
+                s.label
+            );
+
+            // test_multiple_resume_write_group
+            let mut same = reopen_locked(&s, &t);
+            same.resume_write_group(&tokens).unwrap();
+            same.add_text(
+                b"file-id",
+                b"second-revid",
+                &[(b"file-id".to_vec(), b"revid".to_vec())],
+                b"more lines\n",
+            )
+            .unwrap();
+            let new_tokens = same.suspend_write_group().unwrap();
+            assert_eq!(2, new_tokens.len(), "{}", s.label);
+            assert_eq!(tokens[0], new_tokens[0], "{}", s.label);
+            let mut same = reopen_locked(&s, &t);
+            same.resume_write_group(&new_tokens).unwrap();
+            assert!(has_text(same.as_ref(), b"file-id", b"revid"), "{}", s.label);
+            assert!(
+                has_text(same.as_ref(), b"file-id", b"second-revid"),
+                "{}",
+                s.label
+            );
+            same.abort_write_group().unwrap();
+        }
+    }
+
+    #[test]
+    fn aborting_a_resumed_write_group_discards_it() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            repo.add_text(b"file-id", b"revid", &[], b"lines\n")
+                .unwrap();
+            let tokens = repo.suspend_write_group().unwrap();
+            let mut same = reopen_locked(&s, &t);
+            same.resume_write_group(&tokens).unwrap();
+            same.abort_write_group().unwrap();
+            // test_read_after_resume_abort_fails
+            assert!(
+                !has_text(same.as_ref(), b"file-id", b"revid"),
+                "{}",
+                s.label
+            );
+            // test_cannot_resume_aborted_write_group
+            let mut same = reopen_locked(&s, &t);
+            assert!(
+                matches!(
+                    same.resume_write_group(&tokens),
+                    Err(RepositoryError::UnresumableWriteGroup { .. })
+                ),
+                "{}",
+                s.label
+            );
+            assert!(!same.is_in_write_group(), "{}", s.label);
+        }
+    }
+
+    #[test]
+    fn empty_write_groups_suspend_to_no_tokens() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, _t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            assert_eq!(
+                Vec::<String>::new(),
+                repo.suspend_write_group().unwrap(),
+                "{}",
+                s.label
+            );
+            repo.resume_write_group(&[]).unwrap();
+            assert!(repo.is_in_write_group(), "{}", s.label);
+            repo.abort_write_group().unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_tokens_are_unresumable() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, _t, mut repo) = write_locked(&s);
+            match repo.resume_write_group(&["../pack-names".to_string()]) {
+                Err(RepositoryError::UnresumableWriteGroup { tokens, reason }) => {
+                    assert_eq!(vec!["../pack-names".to_string()], tokens);
+                    assert_eq!("Malformed write group token", reason);
+                }
+                other => panic!("{}: {other:?}", s.label),
+            }
+        }
+    }
+
+    /// The sorted names in directory `dir` of the repository at `t`.
+    fn list_sorted(t: &SharedTransport, dir: &str) -> Vec<String> {
+        let mut names = t.list_dir(dir).unwrap();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn missing_suspended_packs_are_unresumable() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, _t, mut repo) = write_locked(&s);
+            let token = "0".repeat(32);
+            match repo.resume_write_group(std::slice::from_ref(&token)) {
+                Err(RepositoryError::UnresumableWriteGroup { tokens, reason }) => {
+                    assert_eq!(vec![token.clone()], tokens, "{}", s.label);
+                    assert_eq!(format!("No such file: upload/{token}.pack"), reason);
+                }
+                other => panic!("{}: {other:?}", s.label),
+            }
+            assert!(!repo.is_in_write_group(), "{}", s.label);
+        }
+    }
+
+    #[test]
+    fn resuming_in_a_write_group_is_an_error() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, _t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            assert!(
+                matches!(
+                    repo.resume_write_group(&[]),
+                    Err(RepositoryError::AlreadyInWriteGroup)
+                ),
+                "{}",
+                s.label
+            );
+            assert!(repo.is_in_write_group(), "{}", s.label);
+            repo.abort_write_group().unwrap();
+        }
+    }
+
+    #[test]
+    fn new_pack_repositories_have_upload_and_obsolete_packs() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, t, _repo) = write_locked(&s);
+            assert_eq!(
+                Vec::<String>::new(),
+                list_sorted(&t, "upload"),
+                "{}",
+                s.label
+            );
+            assert_eq!(
+                Vec::<String>::new(),
+                list_sorted(&t, "obsolete_packs"),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    #[test]
+    fn commit_returns_the_packs_written() {
+        for s in scenarios() {
+            let (_dir, t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            repo.add_text(b"file-id", b"revid", &[], b"lines\n")
+                .unwrap();
+            let hint = repo.commit_write_group().unwrap();
+            if !suspends(&s) {
+                assert_eq!(None, hint, "{}", s.label);
+                continue;
+            }
+            let hint = hint.unwrap();
+            assert_eq!(1, hint.len(), "{}", s.label);
+            assert_eq!(
+                vec![format!("{}.pack", hint[0])],
+                list_sorted(&t, "packs"),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    #[test]
+    fn empty_write_groups_commit_no_pack() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            assert_eq!(
+                Some(vec![]),
+                repo.commit_write_group().unwrap(),
+                "{}",
+                s.label
+            );
+            assert_eq!(
+                Vec::<String>::new(),
+                list_sorted(&t, "packs"),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    /// Committing a resumed write group moves its pack out of the upload
+    /// directory and returns it in the hint.
+    #[test]
+    fn committing_a_resumed_write_group_moves_its_packs() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            repo.add_text(b"file-id", b"revid", &[], b"lines\n")
+                .unwrap();
+            let tokens = repo.suspend_write_group().unwrap();
+            assert!(
+                list_sorted(&t, "upload").contains(&format!("{}.pack", tokens[0])),
+                "{}",
+                s.label
+            );
+            assert_eq!(
+                Vec::<String>::new(),
+                list_sorted(&t, "packs"),
+                "{}",
+                s.label
+            );
+
+            let mut same = reopen_locked(&s, &t);
+            same.resume_write_group(&tokens).unwrap();
+            assert_eq!(Some(tokens.clone()), same.commit_write_group().unwrap());
+            assert_eq!(
+                Vec::<String>::new(),
+                list_sorted(&t, "upload"),
+                "{}",
+                s.label
+            );
+            assert_eq!(
+                vec![format!("{}.pack", tokens[0])],
+                list_sorted(&t, "packs"),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    #[test]
+    fn aborting_a_resumed_write_group_deletes_its_uploads() {
+        for s in scenarios().into_iter().filter(suspends) {
+            let (_dir, t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            repo.add_text(b"file-id", b"revid", &[], b"lines\n")
+                .unwrap();
+            let tokens = repo.suspend_write_group().unwrap();
+            let mut same = reopen_locked(&s, &t);
+            same.resume_write_group(&tokens).unwrap();
+            same.abort_write_group().unwrap();
+            assert_eq!(
+                Vec::<String>::new(),
+                list_sorted(&t, "upload"),
+                "{}",
+                s.label
+            );
+            assert_eq!(
+                Vec::<String>::new(),
+                list_sorted(&t, "packs"),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    /// Formats that append immediately keep what an aborted write group
+    /// added.
+    #[test]
+    fn abort_keeps_what_an_unsuspendable_write_group_added() {
+        for s in scenarios().into_iter().filter(|s| !suspends(s)) {
+            let (_dir, t, mut repo) = write_locked(&s);
+            repo.start_write_group().unwrap();
+            repo.add_text(b"file-id", b"revid", &[], b"lines\n")
+                .unwrap();
+            repo.abort_write_group().unwrap();
+            assert!(!repo.is_in_write_group(), "{}", s.label);
+            repo.unlock().unwrap();
+            assert!(
+                has_text((s.reopen)(t).as_ref(), b"file-id", b"revid"),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    #[test]
+    fn with_write_group_commits_on_success() {
+        for s in scenarios() {
+            let (_dir, t, mut repo) = write_locked(&s);
+            let (value, hint) = with_write_group(repo.as_mut(), |repo| {
+                assert!(repo.is_in_write_group());
+                repo.add_text(b"file-id", b"revid", &[], b"lines\n")?;
+                Ok(42)
+            })
+            .unwrap();
+            assert_eq!(42, value, "{}", s.label);
+            assert_eq!(suspends(&s), hint.is_some(), "{}", s.label);
+            assert!(!repo.is_in_write_group(), "{}", s.label);
+            repo.unlock().unwrap();
+            assert!(
+                has_text((s.reopen)(t).as_ref(), b"file-id", b"revid"),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    #[test]
+    fn with_write_group_aborts_on_failure() {
+        for s in scenarios() {
+            let (_dir, t, mut repo) = write_locked(&s);
+            let result = with_write_group(repo.as_mut(), |repo| -> Result<(), _> {
+                repo.add_text(b"file-id", b"revid", &[], b"lines\n")?;
+                Err(RepositoryError::Corrupt("failed".to_string()))
+            });
+            match result {
+                Err(RepositoryError::Corrupt(msg)) => assert_eq!("failed", msg, "{}", s.label),
+                other => panic!("{}: {other:?}", s.label),
+            }
+            assert!(!repo.is_in_write_group(), "{}", s.label);
+            repo.unlock().unwrap();
+            assert_eq!(
+                !suspends(&s),
+                has_text((s.reopen)(t).as_ref(), b"file-id", b"revid"),
                 "{}",
                 s.label
             );
