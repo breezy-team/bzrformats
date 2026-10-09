@@ -363,14 +363,26 @@ pub trait ControlDir: Send + Sync {
     /// The location the branch `name` refers to, as recorded, if it is a
     /// branch reference.
     fn branch_reference(&self, name: &str) -> Result<Option<String>, BzrDirError> {
-        crate::branch::Branch::new(self.branch_transport(name)?)
-            .get_reference()
+        crate::branch::reference_location(self.branch_transport(name)?.as_ref())
             .map_err(|e| BzrDirError::Component(format!("reading branch reference: {e}")))
     }
 
     /// Open the branch `name` itself, without following a reference.
     fn open_branch_named(&self, name: &str) -> Result<crate::branch::Branch, BzrDirError> {
-        Ok(crate::branch::Branch::new(self.branch_transport(name)?))
+        let transport = self.branch_transport(name)?;
+        let repository = self.branch_repository(transport.as_ref())?;
+        Ok(crate::branch::Branch::open(transport, repository))
+    }
+
+    /// The repository of the branch reachable through `branch_transport`:
+    /// the one [`find_repository`](Self::find_repository) finds. The default
+    /// ignores stacking; [`BzrDirMeta`] adds the stacked-on repository as a
+    /// fallback.
+    fn branch_repository(
+        &self,
+        _branch_transport: &dyn Transport,
+    ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        self.find_repository()
     }
 
     /// Open the repository with any stacked-on fallback activated.
@@ -668,21 +680,44 @@ impl BzrDirMeta {
             return Ok((None, repository));
         }
         let sub = self.transport.subtransport(Component::Branch.subdir())?;
-        let branch = crate::branch::Branch::new(sub);
-        if let Some(location) = branch
-            .get_reference()
+        if let Some(location) = crate::branch::reference_location(sub.as_ref())
             .map_err(|e| BzrDirError::Component(format!("reading branch reference: {e}")))?
         {
             let target = BzrDirMeta::open(self.reference_control_transport(&location)?)?;
             return target.cloning_source_formats();
         }
         match self.find_repository() {
-            Ok(repository) => Ok((Some(branch.format()), Some(repository.format()))),
+            Ok(repository) => Ok((
+                Some(crate::branch::branch_format(sub.as_ref())),
+                Some(repository.format()),
+            )),
             // A branch without a repository cannot be opened, so it has no
             // format to offer either.
             Err(BzrDirError::NoRepositoryPresent) => Ok((None, None)),
             Err(e) => Err(e),
         }
+    }
+
+    /// Wrap `repo` with the repository of the branch reachable through
+    /// `branch_transport` is stacked on as its fallback; `repo` itself if
+    /// that branch is not stacked.
+    fn stack_repository(
+        &self,
+        repo: Box<dyn crate::repository::Repository>,
+        branch_transport: &dyn Transport,
+    ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        let Some(stacked_on) = crate::branch::stacked_on_location(branch_transport)
+            .map_err(|e| BzrDirError::Component(format!("reading stacked-on location: {e}")))?
+        else {
+            return Ok(repo);
+        };
+        use crate::repository::Repository as _;
+        let base = self.open_stacked_on_repository(&stacked_on)?;
+        let mut stacked = crate::repository::StackedRepository::new(repo);
+        stacked
+            .add_fallback_repository(base)
+            .map_err(|e| BzrDirError::Component(format!("wiring fallback repository: {e}")))?;
+        Ok(Box::new(stacked))
     }
 
     /// Open the repository of the branch this one is stacked on, following the
@@ -840,25 +875,18 @@ impl ControlDir for BzrDirMeta {
         if !self.has_branch {
             return Ok(repo);
         }
-        let branch = self.open_branch()?;
-        let stacked_on = match branch.get_stacked_on_url() {
-            Ok(url) => url,
-            // Not stacked, or a format that cannot stack: plain repository.
-            Err(crate::branch::BranchError::NotStacked)
-            | Err(crate::branch::BranchError::Unstackable) => return Ok(repo),
-            Err(e) => {
-                return Err(BzrDirError::Component(format!(
-                    "reading stacked-on location: {e}"
-                )))
-            }
-        };
-        use crate::repository::Repository as _;
-        let base = self.open_stacked_on_repository(&stacked_on)?;
-        let mut stacked = crate::repository::StackedRepository::new(repo);
-        stacked
-            .add_fallback_repository(base)
-            .map_err(|e| BzrDirError::Component(format!("wiring fallback repository: {e}")))?;
-        Ok(Box::new(stacked))
+        let branch = self.transport.subtransport(Component::Branch.subdir())?;
+        self.stack_repository(repo, branch.as_ref())
+    }
+
+    /// The branch's repository with the repository of the branch it is
+    /// stacked on, if any, as its fallback.
+    fn branch_repository(
+        &self,
+        branch_transport: &dyn Transport,
+    ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        let repo = self.find_repository()?;
+        self.stack_repository(repo, branch_transport)
     }
 
     /// Open the branch in this control directory.
@@ -872,14 +900,13 @@ impl ControlDir for BzrDirMeta {
             return Err(BzrDirError::NotABzrDir);
         }
         let sub = self.transport.subtransport(Component::Branch.subdir())?;
-        let branch = crate::branch::Branch::new(sub);
-        match branch
-            .get_reference()
+        if let Some(location) = crate::branch::reference_location(sub.as_ref())
             .map_err(|e| BzrDirError::Component(format!("reading branch reference: {e}")))?
         {
-            Some(location) => self.open_referenced_branch(&location),
-            None => Ok(branch),
+            return self.open_referenced_branch(&location);
         }
+        let repository = self.branch_repository(sub.as_ref())?;
+        Ok(crate::branch::Branch::open(sub, repository))
     }
 
     /// The format to create a clone or sprout of this control directory in.
@@ -945,8 +972,9 @@ impl ControlDir for BzrDirMeta {
         if !self.has_workingtree {
             return Err(BzrDirError::NotABzrDir);
         }
+        let branch = self.open_branch()?;
         let root = self.transport.subtransport("..")?;
-        crate::workingtree::open(root)
+        crate::workingtree::open(root, branch)
             .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))
     }
 
@@ -1137,6 +1165,7 @@ impl ControlDir for BzrDirAllInOne {
         Ok(crate::branch::Branch::with_format(
             self.transport.clone(),
             format,
+            self.open_repository()?,
         ))
     }
 
@@ -1147,8 +1176,9 @@ impl ControlDir for BzrDirAllInOne {
     /// `checkout/` subdir or dirstate. Like the metadir tree it is rooted at
     /// the directory that *contains* `.bzr`.
     fn open_workingtree(&self) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError> {
+        let branch = self.open_branch()?;
         let root = self.transport.subtransport("..")?;
-        let wt = crate::workingtree::WorkingTree3::open_all_in_one(root)
+        let wt = crate::workingtree::WorkingTree3::open_all_in_one(root, branch)
             .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))?;
         Ok(Box::new(wt))
     }
@@ -1235,7 +1265,7 @@ pub fn upgrade(
     }
 
     // Carry over the branch tip and tags.
-    let new_branch = new.open_branch()?;
+    let mut new_branch = new.open_branch()?;
     new_branch
         .set_last_revision_info(revno, &tip)
         .map_err(|e| BzrDirError::Component(format!("setting branch tip: {e}")))?;

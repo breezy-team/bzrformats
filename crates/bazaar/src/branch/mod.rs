@@ -15,7 +15,8 @@ use std::collections::BTreeMap;
 use crate::declare_branch_format;
 use crate::lockable_files::{LockToken, LockWaiter, Lockable, LockableExt as _, WriteLocked};
 use crate::lockdir::LockError;
-use crate::transport::{SharedTransport, TransportError};
+use crate::repository::Repository;
+use crate::transport::{SharedTransport, Transport, TransportError};
 
 // Branch format 5 (full history) is the weave/knit-era layout: it keeps the
 // whole mainline in `revision-history` rather than a single `last-revision`
@@ -90,6 +91,8 @@ pub enum BranchError {
     Lock(LockError),
     /// Locking the branch failed, or it is locked for reading.
     Locking(crate::lockable_files::LockableFilesError),
+    /// Locking or unlocking the branch's repository failed.
+    Repository(crate::repository::RepositoryError),
     /// An underlying transport error.
     Transport(TransportError),
     /// A config file could not be parsed.
@@ -109,6 +112,7 @@ impl std::fmt::Display for BranchError {
             BranchError::Corrupt(m) => write!(f, "corrupt branch data: {m}"),
             BranchError::Lock(e) => write!(f, "branch lock error: {e}"),
             BranchError::Locking(e) => write!(f, "branch lock error: {e}"),
+            BranchError::Repository(e) => write!(f, "repository error: {e}"),
             BranchError::Transport(e) => write!(f, "transport error: {e}"),
             BranchError::Config(e) => write!(f, "config error: {e}"),
             BranchError::NotStacked => write!(f, "branch is not stacked"),
@@ -147,53 +151,141 @@ pub type RevisionInfo = (u64, Vec<u8>);
 ///
 /// Owns its transport (as a [`SharedTransport`]) for consistency with the
 /// other opener objects, so a `BzrDir` can hand out a `Branch` that
-/// outlives it.
-///
-/// A `Branch` is a handle: clones share the branch's lock, so a clone can
-/// be locked on behalf of code that only holds a `&Branch`.
-#[derive(Clone)]
+/// outlives it, and owns the repository that stores its revisions.
 pub struct Branch {
     transport: SharedTransport,
     format: &'static BranchFormat,
     /// The branch's lock, which its writes take.
     lock: crate::lockable_files::LockableFiles,
+    repository: Box<dyn Repository>,
 }
 
-/// Locking a branch takes the lock its writes share; they take it for
-/// themselves while the branch is unlocked.
+/// Locking a branch locks its repository in the same mode with the first
+/// lock, and releases it with the last. Writes take a write
+/// lock for themselves while the branch is unlocked.
 impl Lockable for Branch {
     type Error = BranchError;
 
     fn lock_read(&mut self) -> Result<(), BranchError> {
+        if !self.lock.is_locked() {
+            self.repository
+                .lock_read()
+                .map_err(BranchError::Repository)?;
+        }
         self.lock.lock_read();
         Ok(())
     }
 
     fn lock_write(&mut self, waiter: &mut dyn LockWaiter) -> Result<WriteLocked, BranchError> {
-        self.lock
-            .lock_write(None, waiter)
-            .map_err(BranchError::Locking)
+        self.lock_write_with_token(None, waiter)
     }
 
+    /// The repository is released once the branch is no longer locked, even
+    /// if releasing the branch's own lock failed after giving it up.
     fn unlock(&mut self) -> Result<Option<LockToken>, BranchError> {
-        self.lock.unlock().map_err(BranchError::Locking)
+        let was_locked = self.lock.is_locked();
+        let released = self.lock.unlock().map_err(BranchError::Locking);
+        if was_locked && !self.lock.is_locked() {
+            let unlocked = self.repository.unlock().map_err(BranchError::Repository);
+            return released.and_then(|token| unlocked.map(|_| token));
+        }
+        released
+    }
+}
+
+/// The format of the branch reachable through `transport`, from its
+/// `format` marker, as [`Branch::open`] opens it. A missing marker is
+/// treated as the modern default format.
+pub fn branch_format(transport: &dyn Transport) -> &'static BranchFormat {
+    match transport.get_bytes("format") {
+        Ok(marker) => find_format(&marker).unwrap_or(DEFAULT_FORMAT),
+        Err(_) => DEFAULT_FORMAT,
+    }
+}
+
+/// The location the branch reachable through `transport` refers to, if it
+/// is a branch reference; read before the branch is opened, since a
+/// reference has no repository of its own.
+pub fn reference_location(transport: &dyn Transport) -> Result<Option<String>, BranchError> {
+    read_reference(transport, branch_format(transport))
+}
+
+/// The location the branch reachable through `transport` is stacked on, if
+/// it is stacked; read before the branch is opened, to find the fallback
+/// for its repository.
+pub fn stacked_on_location(transport: &dyn Transport) -> Result<Option<String>, BranchError> {
+    if !branch_format(transport).supports_stacking {
+        return Ok(None);
+    }
+    read_config_location(transport, "stacked_on_location")
+}
+
+/// The raw contents of `branch.conf`, or empty if absent.
+fn read_config_bytes(transport: &dyn Transport) -> Result<Vec<u8>, BranchError> {
+    match transport.get_bytes("branch.conf") {
+        Ok(b) => Ok(b),
+        Err(TransportError::NoSuchFile(_)) => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read a config location option from `branch.conf` only.
+///
+/// The empty string is the
+/// on-disk representation of "unset" and is normalized to `None`. Only the
+/// branch's own `branch.conf` is consulted (the `BranchOnlyStack`), not the
+/// wider locations.conf/bazaar.conf stack, so a value is never inherited.
+fn read_config_location(
+    transport: &dyn Transport,
+    name: &str,
+) -> Result<Option<String>, BranchError> {
+    let bytes = read_config_bytes(transport)?;
+    let mut store = crate::config::IniFileStore::new();
+    store.load_from_bytes(&bytes)?;
+    let value = store
+        .get_sections()
+        .into_iter()
+        .find(|s| s.id().is_none())
+        .and_then(|s| s.get(name).map(|v| store.unquote(v)));
+    Ok(value.filter(|v| !v.is_empty()))
+}
+
+/// The location a branch of `format` refers to, if it is a reference.
+///
+/// A branch of `REFERENCE_FORMAT_1` stores the referenced branch's URL in a
+/// `location` file (UTF-8, no trailing newline). For any other format this
+/// is `None`.
+fn read_reference(
+    transport: &dyn Transport,
+    format: &BranchFormat,
+) -> Result<Option<String>, BranchError> {
+    if !format.is_reference {
+        return Ok(None);
+    }
+    match transport.get_bytes("location") {
+        Ok(b) => {
+            let url = String::from_utf8(b)
+                .map_err(|_| BranchError::Corrupt("location file not utf-8".to_string()))?;
+            Ok(Some(url))
+        }
+        Err(TransportError::NoSuchFile(_)) => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
 impl Branch {
     /// Open the branch reachable through `transport` (rooted at
-    /// `.bzr/branch`), reading its `format` marker to learn how the tip is
-    /// stored. A missing marker is treated as the modern default format.
-    pub fn new(transport: SharedTransport) -> Self {
-        let format = match transport.get_bytes("format") {
-            Ok(marker) => find_format(&marker).unwrap_or(DEFAULT_FORMAT),
-            Err(_) => DEFAULT_FORMAT,
-        };
+    /// `.bzr/branch`), with its revisions in `repository`, reading its
+    /// `format` marker to learn how the tip is stored. A missing marker is
+    /// treated as the modern default format.
+    pub fn open(transport: SharedTransport, repository: Box<dyn Repository>) -> Self {
+        let format = branch_format(transport.as_ref());
         let lock = crate::lockable_files::branch_lock(SharedTransport::clone(&transport));
         Branch {
             transport,
             format,
             lock,
+            repository,
         }
     }
 
@@ -206,13 +298,53 @@ impl Branch {
     ///
     /// TODO: lock the all-in-one branch with an OS lock on
     /// `.bzr/branch-lock`; its writes here only count their locks.
-    pub fn with_format(transport: SharedTransport, format: &'static BranchFormat) -> Self {
+    pub fn with_format(
+        transport: SharedTransport,
+        format: &'static BranchFormat,
+        repository: Box<dyn Repository>,
+    ) -> Self {
         let lock =
             crate::lockable_files::LockableFiles::new(SharedTransport::clone(&transport), None);
         Branch {
             transport,
             format,
             lock,
+            repository,
+        }
+    }
+
+    /// The repository holding the branch's revisions.
+    pub fn repository(&self) -> &dyn Repository {
+        self.repository.as_ref()
+    }
+
+    /// The repository holding the branch's revisions, for writing.
+    pub fn repository_mut(&mut self) -> &mut dyn Repository {
+        self.repository.as_mut()
+    }
+
+    /// Lock the branch for writing, with `token` taking over a held branch
+    /// lock and `waiter` deciding what to do while someone else holds it.
+    /// The first lock also write-locks the repository.
+    pub fn lock_write_with_token(
+        &mut self,
+        token: Option<&LockToken>,
+        waiter: &mut dyn LockWaiter,
+    ) -> Result<WriteLocked, BranchError> {
+        let first = !self.lock.is_locked();
+        if first {
+            self.repository
+                .lock_write(waiter)
+                .map_err(BranchError::Repository)?;
+        }
+        match self.lock.lock_write(token, waiter) {
+            Ok(locked) => Ok(locked),
+            Err(e) => {
+                if first {
+                    self.repository.unlock().map_err(BranchError::Repository)?;
+                }
+                Err(BranchError::Locking(e))
+            }
         }
     }
 
@@ -309,23 +441,18 @@ impl Branch {
 
     /// The raw contents of `branch.conf`, or empty if absent.
     pub fn get_config_bytes(&self) -> Result<Vec<u8>, BranchError> {
-        match self.transport.get_bytes("branch.conf") {
-            Ok(b) => Ok(b),
-            Err(TransportError::NoSuchFile(_)) => Ok(Vec::new()),
-            Err(e) => Err(e.into()),
-        }
+        read_config_bytes(self.transport.as_ref())
     }
 
     /// Run `f` under a write lock on the branch: a write lock the caller
     /// holds is counted, and otherwise one is taken for `f` without waiting
     /// for another holder.
     fn with_write_lock<R>(
-        &self,
-        f: impl FnOnce() -> Result<R, BranchError>,
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R, BranchError>,
     ) -> Result<R, BranchError> {
-        let mut branch = self.clone();
-        let locked = branch.write_locked()?;
-        let result = f();
+        let mut locked = self.write_locked()?;
+        let result = f(&mut locked);
         // Release even if f failed; prefer reporting f's error.
         let unlocked = locked.unlock();
         result.and_then(|r| unlocked.map(|_| r))
@@ -338,29 +465,31 @@ impl Branch {
     /// the current tip; `revno` must equal the resulting line count. For 6/7/8
     /// the single `last-revision` line is rewritten.
     pub fn set_last_revision_info(
-        &self,
+        &mut self,
         revno: u64,
         revision_id: &[u8],
     ) -> Result<(), BranchError> {
         if self.format.full_history {
             return self.set_last_revision_info_full_history(revno, revision_id);
         }
-        self.with_write_lock(|| {
+        self.with_write_lock(|branch| {
             let mut content = format!("{revno} ").into_bytes();
             content.extend_from_slice(revision_id);
             content.push(b'\n');
-            self.transport.put_bytes("last-revision", &content, None)?;
+            branch
+                .transport
+                .put_bytes("last-revision", &content, None)?;
             Ok(())
         })
     }
 
     fn set_last_revision_info_full_history(
-        &self,
+        &mut self,
         revno: u64,
         revision_id: &[u8],
     ) -> Result<(), BranchError> {
-        self.with_write_lock(|| {
-            let mut history = self.revision_history()?;
+        self.with_write_lock(|branch| {
+            let mut history = branch.revision_history()?;
             if revision_id == NULL_REVISION {
                 history.clear();
             } else {
@@ -379,13 +508,13 @@ impl Branch {
                     history.len()
                 )));
             }
-            self.write_revision_history(&history)
+            branch.write_revision_history(&history)
         })
     }
 
     /// Replace the full mainline (format 5), under the branch lock.
-    pub fn set_revision_history(&self, history: &[Vec<u8>]) -> Result<(), BranchError> {
-        self.with_write_lock(|| self.write_revision_history(history))
+    pub fn set_revision_history(&mut self, history: &[Vec<u8>]) -> Result<(), BranchError> {
+        self.with_write_lock(|branch| branch.write_revision_history(history))
     }
 
     fn write_revision_history(&self, history: &[Vec<u8>]) -> Result<(), BranchError> {
@@ -398,9 +527,11 @@ impl Branch {
     }
 
     /// Replace the branch tags, under the branch lock.
-    pub fn set_tags(&self, tags: &BTreeMap<String, Vec<u8>>) -> Result<(), BranchError> {
-        self.with_write_lock(|| {
-            self.transport.put_bytes("tags", &encode_tags(tags), None)?;
+    pub fn set_tags(&mut self, tags: &BTreeMap<String, Vec<u8>>) -> Result<(), BranchError> {
+        self.with_write_lock(|branch| {
+            branch
+                .transport
+                .put_bytes("tags", &encode_tags(tags), None)?;
             Ok(())
         })
     }
@@ -408,29 +539,16 @@ impl Branch {
     // --- Config-backed location options (branch.conf no-name section) ---
 
     /// Read a config location option from `branch.conf` only.
-    ///
-    /// The empty string is the
-    /// on-disk representation of "unset" and is normalized to `None`. Only the
-    /// branch's own `branch.conf` is consulted (the `BranchOnlyStack`), not the
-    /// wider locations.conf/bazaar.conf stack, so a value is never inherited.
     fn get_config_location(&self, name: &str) -> Result<Option<String>, BranchError> {
-        let bytes = self.get_config_bytes()?;
-        let mut store = crate::config::IniFileStore::new();
-        store.load_from_bytes(&bytes)?;
-        let value = store
-            .get_sections()
-            .into_iter()
-            .find(|s| s.id().is_none())
-            .and_then(|s| s.get(name).map(|v| store.unquote(v)));
-        Ok(value.filter(|v| !v.is_empty()))
+        read_config_location(self.transport.as_ref(), name)
     }
 
     /// Write a config location option into `branch.conf`'s no-name section,
     /// under the branch lock. `value == None` (or empty) stores the empty
     /// string, matching breezy's "unset" sentinel.
-    fn set_config_location(&self, name: &str, value: Option<&str>) -> Result<(), BranchError> {
-        self.with_write_lock(|| {
-            let bytes = self.get_config_bytes()?;
+    fn set_config_location(&mut self, name: &str, value: Option<&str>) -> Result<(), BranchError> {
+        self.with_write_lock(|branch| {
+            let bytes = branch.get_config_bytes()?;
             let mut store = crate::config::IniFileStore::new();
             store.load_from_bytes(&bytes)?;
             let mut section = store.get_mutable_section(None);
@@ -440,7 +558,8 @@ impl Branch {
             })?;
             section.set(name, &quoted);
             store.apply_changes(&section);
-            self.transport
+            branch
+                .transport
                 .put_bytes("branch.conf", &store.to_bytes(), None)?;
             Ok(())
         })
@@ -477,7 +596,7 @@ impl Branch {
     /// Errors with [`BranchError::Unstackable`] on a non-stackable format. The
     /// value is written to `branch.conf`; wiring the fallback repository is the
     /// caller's job (see [`crate::bzrdir`] open paths).
-    pub fn set_stacked_on_url(&self, url: Option<&str>) -> Result<(), BranchError> {
+    pub fn set_stacked_on_url(&mut self, url: Option<&str>) -> Result<(), BranchError> {
         if !self.format.supports_stacking {
             return Err(BranchError::Unstackable);
         }
@@ -516,7 +635,7 @@ impl Branch {
     }
 
     /// Bind this branch to `location` (its new master), or unbind with `None`.
-    pub fn set_bound_location(&self, location: Option<&str>) -> Result<(), BranchError> {
+    pub fn set_bound_location(&mut self, location: Option<&str>) -> Result<(), BranchError> {
         if self.format.full_history {
             return self.write_bound_file(location);
         }
@@ -530,12 +649,12 @@ impl Branch {
     }
 
     /// Bind to `other_url`. Equivalent to `set_bound_location(Some(url))`.
-    pub fn bind(&self, other_url: &str) -> Result<(), BranchError> {
+    pub fn bind(&mut self, other_url: &str) -> Result<(), BranchError> {
         self.set_bound_location(Some(other_url))
     }
 
     /// Unbind. Equivalent to `set_bound_location(None)`.
-    pub fn unbind(&self) -> Result<(), BranchError> {
+    pub fn unbind(&mut self) -> Result<(), BranchError> {
         self.set_bound_location(None)
     }
 
@@ -554,15 +673,15 @@ impl Branch {
     }
 
     /// Write or delete the format-5 `bound` file, under the branch lock.
-    fn write_bound_file(&self, location: Option<&str>) -> Result<(), BranchError> {
-        self.with_write_lock(|| match location {
+    fn write_bound_file(&mut self, location: Option<&str>) -> Result<(), BranchError> {
+        self.with_write_lock(|branch| match location {
             Some(loc) => {
                 let mut content = loc.as_bytes().to_vec();
                 content.push(b'\n');
-                self.transport.put_bytes("bound", &content, None)?;
+                branch.transport.put_bytes("bound", &content, None)?;
                 Ok(())
             }
-            None => match self.transport.delete("bound") {
+            None => match branch.transport.delete("bound") {
                 Ok(()) | Err(TransportError::NoSuchFile(_)) => Ok(()),
                 Err(e) => Err(e.into()),
             },
@@ -570,7 +689,7 @@ impl Branch {
     }
 
     /// Set a boolean config option in `branch.conf`'s no-name section.
-    fn set_config_bool(&self, name: &str, value: bool) -> Result<(), BranchError> {
+    fn set_config_bool(&mut self, name: &str, value: bool) -> Result<(), BranchError> {
         self.set_config_location(name, Some(if value { "True" } else { "False" }))
     }
 
@@ -603,7 +722,7 @@ impl Branch {
     /// breezy does (the "white lie": format 7 advertises reference support but
     /// rewrites itself to 8 the moment a reference is stored).
     pub fn set_reference_info(
-        &self,
+        &mut self,
         file_id: &[u8],
         branch_location: Option<&str>,
         tree_path: Option<&str>,
@@ -611,8 +730,8 @@ impl Branch {
         if !self.format.supports_reference_locations {
             return Err(BranchError::Unsupported("reference locations".to_string()));
         }
-        self.with_write_lock(|| {
-            let mut info = self.read_all_reference_info()?;
+        self.with_write_lock(|branch| {
+            let mut info = branch.read_all_reference_info()?;
             match branch_location {
                 None => {
                     info.remove(file_id);
@@ -624,10 +743,11 @@ impl Branch {
                     );
                 }
             }
-            self.write_all_reference_info(&info)?;
+            branch.write_all_reference_info(&info)?;
             // Format 7 upgrades to format 8 on first reference write.
-            if self.format.format_string == FORMAT_7.format_string {
-                self.transport
+            if branch.format.format_string == FORMAT_7.format_string {
+                branch
+                    .transport
                     .put_bytes("format", FORMAT_8.format_string, None)?;
             }
             Ok(())
@@ -703,18 +823,7 @@ impl Branch {
     /// `location` file (UTF-8, no trailing newline). For any other format this
     /// returns `None`, matching breezy's `BranchFormat.get_reference` default.
     pub fn get_reference(&self) -> Result<Option<String>, BranchError> {
-        if !self.format.is_reference {
-            return Ok(None);
-        }
-        match self.transport.get_bytes("location") {
-            Ok(b) => {
-                let url = String::from_utf8(b)
-                    .map_err(|_| BranchError::Corrupt("location file not utf-8".to_string()))?;
-                Ok(Some(url))
-            }
-            Err(TransportError::NoSuchFile(_)) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        read_reference(self.transport.as_ref(), self.format)
     }
 
     /// Point this branch reference at `to_url` (written verbatim as UTF-8).
@@ -722,7 +831,7 @@ impl Branch {
     /// Errors with [`BranchError::Unsupported`] on a non-reference format,
     /// matching breezy where only `BranchReferenceFormat` implements
     /// `set_reference`.
-    pub fn set_reference(&self, to_url: &str) -> Result<(), BranchError> {
+    pub fn set_reference(&mut self, to_url: &str) -> Result<(), BranchError> {
         if !self.format.is_reference {
             return Err(BranchError::Unsupported("branch reference".to_string()));
         }
@@ -811,13 +920,25 @@ mod tests {
     use crate::transport::{LocalTransport, Transport};
     use std::sync::Arc;
 
+    /// Open a branch over `transport`, with a 2a repository in its
+    /// `repository` subdirectory, created on first use.
+    fn open_branch(transport: SharedTransport) -> Branch {
+        let repo_t = transport.subtransport("repository").unwrap();
+        let repository: Box<dyn Repository> = if repo_t.has("format").unwrap() {
+            crate::repository::open(repo_t).unwrap()
+        } else {
+            Box::new(crate::repository::Pack2aRepository::create(repo_t).unwrap())
+        };
+        Branch::open(transport, repository)
+    }
+
     /// A branch over a temp dir, plus a borrowed handle to the same
     /// transport for asserting on-disk bytes.
     fn branch_transport() -> (tempfile::TempDir, Branch, Arc<LocalTransport>) {
         let dir = tempfile::tempdir().unwrap();
         let probe = Arc::new(LocalTransport::new(dir.path()));
         let shared: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
-        (dir, Branch::new(shared), probe)
+        (dir, open_branch(shared), probe)
     }
 
     /// A format-5 (full-history) branch over a temp dir.
@@ -829,13 +950,13 @@ mod tests {
             .put_bytes("format", b"Bazaar-NG branch format 5\n", None)
             .unwrap();
         let shared: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
-        (dir, Branch::new(shared), probe)
+        (dir, open_branch(shared), probe)
     }
 
     #[test]
     fn writes_share_a_held_write_lock() {
         let (_dir, mut branch, t) = branch_transport();
-        let locked = branch.write_locked().unwrap();
+        let mut locked = branch.write_locked().unwrap();
         locked.set_last_revision_info(1, b"rev-1").unwrap();
         assert!(t.has("lock/held").unwrap());
         assert_eq!(1, locked.lock().lock_count());
@@ -849,15 +970,17 @@ mod tests {
     #[test]
     fn writes_are_refused_under_a_read_lock_or_another_holder() {
         let (_dir, mut branch, t) = branch_transport();
-        let read = branch.read_locked().unwrap();
+        // A read guard gives no `&mut Branch` to write through; a read lock
+        // taken directly refuses the write.
+        branch.lock_read().unwrap();
         assert!(matches!(
-            read.set_last_revision_info(1, b"rev-1"),
+            branch.set_last_revision_info(1, b"rev-1"),
             Err(BranchError::Locking(
                 crate::lockable_files::LockableFilesError::ReadOnly
             ))
         ));
-        read.unlock().unwrap();
-        let mut other = Branch::new(t.clone() as SharedTransport);
+        branch.unlock().unwrap();
+        let mut other = open_branch(t.clone() as SharedTransport);
         let other = other.write_locked().unwrap();
         assert!(matches!(
             branch.set_last_revision_info(1, b"rev-1"),
@@ -869,10 +992,53 @@ mod tests {
     }
 
     #[test]
+    fn locking_the_branch_locks_its_repository() {
+        use crate::lockable_files::LockMode;
+        let (_dir, mut branch, _t) = branch_transport();
+        branch.lock_read().unwrap();
+        branch.lock_read().unwrap();
+        assert_eq!(
+            (Some(LockMode::Read), 1),
+            (
+                branch.repository().lock().lock_mode(),
+                branch.repository().lock().lock_count()
+            )
+        );
+        branch.unlock().unwrap();
+        assert!(branch.repository().lock().is_locked());
+        branch.unlock().unwrap();
+        assert!(!branch.repository().lock().is_locked());
+
+        let locked = branch.write_locked().unwrap();
+        assert_eq!(
+            Some(LockMode::Write),
+            locked.repository().lock().lock_mode()
+        );
+        locked.unlock().unwrap();
+        assert!(!branch.repository().lock().is_locked());
+    }
+
+    #[test]
+    fn failing_to_lock_the_branch_releases_its_repository() {
+        let (_dir, mut branch, t) = branch_transport();
+        let mut other = open_branch(t.clone() as SharedTransport);
+        let held = other.write_locked().unwrap();
+        assert!(matches!(
+            branch.lock_write(&mut crate::lockable_files::NoWait),
+            Err(BranchError::Locking(
+                crate::lockable_files::LockableFilesError::Contention
+            ))
+        ));
+        assert!(!branch.repository().lock().is_locked());
+        assert!(!branch.lock().is_locked());
+        held.unlock().unwrap();
+    }
+
+    #[test]
     fn lock_guards_release_on_drop_and_unlock() {
         let (_dir, mut branch, t) = branch_transport();
         {
-            let locked = branch.write_locked().unwrap();
+            let mut locked = branch.write_locked().unwrap();
             assert!(WriteGuard::acquired(&locked));
             locked.set_last_revision_info(1, b"rev-1").unwrap();
             assert!(t.has("lock/held").unwrap());
@@ -907,7 +1073,7 @@ mod tests {
 
     #[test]
     fn last_revision_round_trips() {
-        let (_d, branch, _probe) = branch_transport();
+        let (_d, mut branch, _probe) = branch_transport();
         branch.set_last_revision_info(5, b"rev-abc").unwrap();
         assert_eq!(
             branch.last_revision_info().unwrap(),
@@ -918,7 +1084,7 @@ mod tests {
 
     #[test]
     fn last_revision_on_disk_format() {
-        let (_d, branch, probe) = branch_transport();
+        let (_d, mut branch, probe) = branch_transport();
         branch.set_last_revision_info(2, b"x").unwrap();
         assert_eq!(probe.get_bytes("last-revision").unwrap(), b"2 x\n");
     }
@@ -938,7 +1104,7 @@ mod tests {
     #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn format5_appends_to_revision_history() {
-        let (_d, branch, probe) = branch_transport_format5();
+        let (_d, mut branch, probe) = branch_transport_format5();
         branch.set_last_revision_info(1, b"rev-1").unwrap();
         branch.set_last_revision_info(2, b"rev-2").unwrap();
         assert_eq!(branch.last_revision_info().unwrap(), (2, b"rev-2".to_vec()));
@@ -956,7 +1122,7 @@ mod tests {
     #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn format5_set_revision_history_replaces() {
-        let (_d, branch, _probe) = branch_transport_format5();
+        let (_d, mut branch, _probe) = branch_transport_format5();
         branch
             .set_revision_history(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
             .unwrap();
@@ -969,7 +1135,7 @@ mod tests {
     #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn format5_set_last_revision_info_truncates() {
-        let (_d, branch, _probe) = branch_transport_format5();
+        let (_d, mut branch, _probe) = branch_transport_format5();
         branch
             .set_revision_history(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
             .unwrap();
@@ -987,7 +1153,7 @@ mod tests {
     #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn format5_set_last_revision_info_null_empties_history() {
-        let (_d, branch, _probe) = branch_transport_format5();
+        let (_d, mut branch, _probe) = branch_transport_format5();
         branch.set_last_revision_info(1, b"rev-1").unwrap();
         branch.set_last_revision_info(0, NULL_REVISION).unwrap();
         assert_eq!(
@@ -999,7 +1165,7 @@ mod tests {
 
     #[test]
     fn tags_round_trip() {
-        let (_d, branch, _probe) = branch_transport();
+        let (_d, mut branch, _probe) = branch_transport();
         let mut tags = BTreeMap::new();
         tags.insert("v1.0".to_string(), b"rev-1".to_vec());
         tags.insert("v2.0".to_string(), b"rev-2".to_vec());
@@ -1009,7 +1175,7 @@ mod tests {
 
     #[test]
     fn tags_on_disk_matches_breezy_bencode() {
-        let (_d, branch, probe) = branch_transport();
+        let (_d, mut branch, probe) = branch_transport();
         let mut tags = BTreeMap::new();
         tags.insert(
             "v1.0".to_string(),
@@ -1027,12 +1193,12 @@ mod tests {
     /// test_tags.test_delete_tag, which uses a Greek alpha tag name.
     #[test]
     fn tags_unicode_name_round_trips() {
-        let (_d, branch, _probe) = branch_transport();
+        let (_d, mut branch, _probe) = branch_transport();
         let mut tags = BTreeMap::new();
         tags.insert("\u{3b1}".to_string(), b"rev-1".to_vec());
         branch.set_tags(&tags).unwrap();
         // Re-open the branch from the same transport and read the tag back.
-        let reopened = Branch::new(branch.transport.clone());
+        let reopened = open_branch(branch.transport.clone());
         assert_eq!(reopened.tags().unwrap(), tags);
     }
 
@@ -1041,7 +1207,7 @@ mod tests {
     /// our whole-map tag API).
     #[test]
     fn tags_delete_removes_from_map() {
-        let (_d, branch, _probe) = branch_transport();
+        let (_d, mut branch, _probe) = branch_transport();
         let mut tags = BTreeMap::new();
         tags.insert("keep".to_string(), b"rev-1".to_vec());
         tags.insert("drop".to_string(), b"rev-2".to_vec());
@@ -1058,7 +1224,7 @@ mod tests {
     /// test_tags.test_ghost_tag.
     #[test]
     fn tags_ghost_target_is_stored() {
-        let (_d, branch, _probe) = branch_transport();
+        let (_d, mut branch, _probe) = branch_transport();
         let mut tags = BTreeMap::new();
         tags.insert("ghost".to_string(), b"idontexist".to_vec());
         branch.set_tags(&tags).unwrap();
@@ -1092,7 +1258,7 @@ mod tests {
             .put_bytes("format", format.format_string, None)
             .unwrap();
         let shared: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
-        (dir, Branch::new(shared), probe)
+        (dir, open_branch(shared), probe)
     }
 
     // --- Stacking ---
@@ -1108,7 +1274,7 @@ mod tests {
 
     #[test]
     fn stacked_on_url_round_trips() {
-        let (_d, branch, probe) = branch_transport();
+        let (_d, mut branch, probe) = branch_transport();
         branch.set_stacked_on_url(Some("../parent")).unwrap();
         assert_eq!(branch.get_stacked_on_url().unwrap(), "../parent");
         // Stored as a branch.conf no-name key.
@@ -1122,7 +1288,7 @@ mod tests {
 
     #[test]
     fn clearing_stacked_on_url_makes_it_not_stacked() {
-        let (_d, branch, _p) = branch_transport();
+        let (_d, mut branch, _p) = branch_transport();
         branch.set_stacked_on_url(Some("../parent")).unwrap();
         branch.set_stacked_on_url(None).unwrap();
         assert!(matches!(
@@ -1133,7 +1299,7 @@ mod tests {
 
     #[test]
     fn format_6_is_unstackable() {
-        let (_d, branch, _p) = branch_transport_format(&FORMAT_6);
+        let (_d, mut branch, _p) = branch_transport_format(&FORMAT_6);
         assert!(matches!(
             branch.get_stacked_on_url(),
             Err(BranchError::Unstackable)
@@ -1154,7 +1320,7 @@ mod tests {
 
     #[test]
     fn bind_then_get_bound_location() {
-        let (_d, branch, _p) = branch_transport();
+        let (_d, mut branch, _p) = branch_transport();
         branch.bind("http://example.com/master").unwrap();
         assert_eq!(
             branch.get_bound_location().unwrap().as_deref(),
@@ -1164,7 +1330,7 @@ mod tests {
 
     #[test]
     fn unbind_clears_bound_but_keeps_old_location() {
-        let (_d, branch, _p) = branch_transport();
+        let (_d, mut branch, _p) = branch_transport();
         branch.bind("http://example.com/master").unwrap();
         branch.unbind().unwrap();
         assert_eq!(branch.get_bound_location().unwrap(), None);
@@ -1179,7 +1345,7 @@ mod tests {
     #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn format_5_bound_uses_bound_file() {
-        let (_d, branch, probe) = branch_transport_format5();
+        let (_d, mut branch, probe) = branch_transport_format5();
         assert_eq!(branch.get_bound_location().unwrap(), None);
         branch.bind("/srv/master").unwrap();
         assert_eq!(probe.get_bytes("bound").unwrap(), b"/srv/master\n");
@@ -1199,7 +1365,7 @@ mod tests {
 
     #[test]
     fn reference_info_round_trips_on_format_8() {
-        let (_d, branch, _p) = branch_transport_format(&FORMAT_8);
+        let (_d, mut branch, _p) = branch_transport_format(&FORMAT_8);
         assert_eq!(branch.get_reference_info(b"file-1").unwrap(), (None, None));
         branch
             .set_reference_info(b"file-1", Some("../subtree"), Some("sub/dir"))
@@ -1212,7 +1378,7 @@ mod tests {
 
     #[test]
     fn setting_reference_upgrades_format_7_to_8() {
-        let (_d, branch, probe) = branch_transport_format(&FORMAT_7);
+        let (_d, mut branch, probe) = branch_transport_format(&FORMAT_7);
         branch
             .set_reference_info(b"file-1", Some("../subtree"), None)
             .unwrap();
@@ -1222,7 +1388,7 @@ mod tests {
 
     #[test]
     fn deleting_reference_info() {
-        let (_d, branch, _p) = branch_transport_format(&FORMAT_8);
+        let (_d, mut branch, _p) = branch_transport_format(&FORMAT_8);
         branch
             .set_reference_info(b"file-1", Some("../subtree"), None)
             .unwrap();
@@ -1244,7 +1410,7 @@ mod tests {
 
     #[test]
     fn get_reference_is_none_on_normal_branch() {
-        let (_d, branch, _p) = branch_transport();
+        let (_d, mut branch, _p) = branch_transport();
         assert_eq!(branch.get_reference().unwrap(), None);
         assert!(matches!(
             branch.set_reference("x"),
@@ -1254,7 +1420,7 @@ mod tests {
 
     #[test]
     fn reference_round_trips() {
-        let (_d, branch, probe) = branch_transport_format(&REFERENCE_FORMAT_1);
+        let (_d, mut branch, probe) = branch_transport_format(&REFERENCE_FORMAT_1);
         assert_eq!(branch.get_reference().unwrap(), None);
         branch.set_reference("file:///srv/real").unwrap();
         assert_eq!(

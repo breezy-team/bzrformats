@@ -407,13 +407,28 @@ impl CommitOptions {
 ///
 /// `Send + Sync` so a boxed tree can be held by the pyo3 bindings.
 ///
-/// Locking a tree with [`Lockable`] locks the tree itself; locking its
-/// branch is left to the caller. Releasing the last write lock saves the
-/// tree's changes.
+/// Locking a tree with [`Lockable`] locks its branch too:
+/// [`lock_read`](Lockable::lock_read) read-locks the branch and
+/// [`lock_write`](Lockable::lock_write) write-locks it, and every unlock
+/// releases the branch again. Releasing the last write lock saves the tree's
+/// changes.
 pub trait WorkingTree: Lockable<Error = WorkingTreeError> + Send + Sync {
-    /// The tree's lock. Locking the tree's branch with it is left to the
-    /// caller.
+    /// The tree's own lock, without its branch's.
     fn lock(&self) -> &TreeLock;
+
+    /// The branch the tree is a checkout of.
+    fn branch(&self) -> &crate::branch::Branch;
+
+    /// The branch the tree is a checkout of, for writing.
+    fn branch_mut(&mut self) -> &mut crate::branch::Branch;
+
+    /// Lock the tree for writing and its branch for reading, as changes to
+    /// the tree alone need, with `waiter` deciding what to do while someone
+    /// else holds the tree's lock.
+    fn lock_tree_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError>;
 
     /// The inventory of the basis tree as the working tree keeps a copy of
     /// it, or `None` if it keeps none. The base implementation keeps none.
@@ -440,7 +455,6 @@ pub trait WorkingTree: Lockable<Error = WorkingTreeError> + Send + Sync {
     /// default is unsupported; the dirstate format overrides it.
     fn set_parent_ids(
         &mut self,
-        _repository: &dyn crate::repository::Repository,
         _revision_ids: &[Vec<u8>],
         _allow_leftmost_as_ghost: bool,
     ) -> Result<(), WorkingTreeError> {
@@ -523,12 +537,7 @@ pub trait WorkingTree: Lockable<Error = WorkingTreeError> + Send + Sync {
 
     /// Commit the live working tree as a new revision. Returns the new
     /// revision id.
-    fn commit(
-        &mut self,
-        repository: &mut dyn crate::repository::Repository,
-        branch: &crate::branch::Branch,
-        options: &CommitOptions,
-    ) -> Result<Vec<u8>, WorkingTreeError>;
+    fn commit(&mut self, options: &CommitOptions) -> Result<Vec<u8>, WorkingTreeError>;
 
     /// The transport rooted at the directory containing `.bzr`, used to read
     /// and write the tree's control files (`.bzr/checkout/...`).
@@ -749,21 +758,128 @@ impl Conflict {
 ///
 /// A dirstate marker (formats 4/5/6) opens as a [`WorkingTree4`]; the format
 /// 3 marker opens as a [`WorkingTree3`]. An unknown marker is rejected.
-pub fn open(transport: SharedTransport) -> Result<Box<dyn WorkingTree>, WorkingTreeError> {
+pub fn open(
+    transport: SharedTransport,
+    branch: crate::branch::Branch,
+) -> Result<Box<dyn WorkingTree>, WorkingTreeError> {
     // A missing marker keeps the prior behaviour: assume the dirstate tree.
     match transport.get_bytes(".bzr/checkout/format") {
         Ok(marker) => match find_format(&marker) {
-            Some(fmt) if fmt.uses_dirstate => Ok(Box::new(WorkingTree4::open(transport)?)),
+            Some(fmt) if fmt.uses_dirstate => Ok(Box::new(WorkingTree4::open(transport, branch)?)),
             #[cfg(any(feature = "weave", feature = "knit"))]
             Some(fmt) if fmt.format_string == FORMAT_3_MARKER => {
-                Ok(Box::new(WorkingTree3::open(transport)?))
+                Ok(Box::new(WorkingTree3::open(transport, branch)?))
             }
             // A known but unimplemented format or an unknown marker.
             _ => Err(WorkingTreeError::UnsupportedFormat(marker)),
         },
-        Err(TransportError::NoSuchFile(_)) => Ok(Box::new(WorkingTree4::open(transport)?)),
+        Err(TransportError::NoSuchFile(_)) => Ok(Box::new(WorkingTree4::open(transport, branch)?)),
         Err(e) => Err(WorkingTreeError::Transport(e)),
     }
+}
+
+/// Run `f` on `tree` under a tree write lock: a write lock the caller holds
+/// is counted, and otherwise one is taken for `f`, saving the tree's changes
+/// when it is released.
+fn with_tree_write<T: WorkingTree, R>(
+    tree: &mut T,
+    f: impl FnOnce(&mut T) -> Result<R, WorkingTreeError>,
+) -> Result<R, WorkingTreeError> {
+    tree.lock_tree_write(&mut crate::lockable_files::NoWait)?;
+    let result = f(tree);
+    let unlocked = tree.unlock();
+    result.and_then(|r| unlocked.map(|_| r))
+}
+
+/// Lock `tree`'s branch with `lock_branch`, then the tree itself with
+/// `lock_tree`, releasing the branch again if the tree cannot be locked.
+/// Both are handed `waiter`.
+fn lock_with_branch<T: WorkingTree + ?Sized, R>(
+    tree: &mut T,
+    waiter: &mut dyn crate::lockable_files::LockWaiter,
+    lock_branch: impl FnOnce(
+        &mut crate::branch::Branch,
+        &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<(), crate::branch::BranchError>,
+    lock_tree: impl FnOnce(
+        &mut T,
+        &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<R, WorkingTreeError>,
+) -> Result<R, WorkingTreeError> {
+    lock_branch(tree.branch_mut(), waiter).map_err(WorkingTreeError::Branch)?;
+    lock_tree(tree, waiter).inspect_err(|_| {
+        if let Err(e) = tree.branch_mut().unlock() {
+            log::warn!("failed to release branch lock: {e}");
+        }
+    })
+}
+
+/// Release one lock on `tree`'s own lock, then one on its branch, which is
+/// released even if releasing the tree's lock failed after giving it up.
+fn unlock_with_branch<T: WorkingTree + ?Sized>(
+    tree: &mut T,
+) -> Result<Option<crate::lockable_files::LockToken>, WorkingTreeError> {
+    if !tree.lock().files().is_locked() {
+        return Err(WorkingTreeError::Locking(
+            crate::lockable_files::LockableFilesError::NotHeld,
+        ));
+    }
+    let released = tree.lock().unlock().map_err(WorkingTreeError::Locking);
+    let unlocked = tree.branch_mut().unlock().map_err(WorkingTreeError::Branch);
+    released.and_then(|token| unlocked.map(|_| token))
+}
+
+/// Record `changes` against `parents` as revision `revid` in `repository`,
+/// in a write group of its own, adding `signature` if the commit is signed.
+/// File texts are read through `transport`.
+#[allow(clippy::too_many_arguments)]
+fn write_revision(
+    repository: &mut dyn crate::repository::Repository,
+    transport: &SharedTransport,
+    parents: &[Vec<u8>],
+    revid: &[u8],
+    options: &CommitOptions,
+    properties: &std::collections::HashMap<String, Vec<u8>>,
+    changes: &[WorkingTreeChange],
+    signature: Option<&[u8]>,
+) -> Result<(), WorkingTreeError> {
+    repository
+        .start_write_group()
+        .map_err(WorkingTreeError::Repository)?;
+    {
+        let mut builder = repository
+            .get_commit_builder(
+                parents.to_vec(),
+                revid.to_vec(),
+                options.committer.clone(),
+                options.timestamp,
+                options.timezone,
+            )
+            .with_properties(properties.clone());
+        builder
+            .record_iter_changes(changes, |path| {
+                transport
+                    .get_bytes(path)
+                    .map_err(crate::repository::RepositoryError::Transport)
+            })
+            .map_err(WorkingTreeError::Repository)?;
+        builder
+            .finish_inventory()
+            .map_err(WorkingTreeError::Repository)?;
+        builder
+            .commit(&options.message)
+            .map_err(WorkingTreeError::Repository)?;
+    }
+    // The signature goes in while the write group is still open, so it
+    // lands in the same pack as the revision.
+    if let Some(signature) = signature {
+        repository
+            .add_signature_text(revid, signature)
+            .map_err(WorkingTreeError::Repository)?;
+    }
+    repository
+        .commit_write_group()
+        .map_err(WorkingTreeError::Repository)
 }
 
 /// The exact `.bzr/checkout/format` marker for the pre-dirstate format 3
@@ -778,25 +894,13 @@ pub struct WorkingTree4 {
     transport: SharedTransport,
     dirstate: DirState,
     lock: TreeLock,
+    branch: crate::branch::Branch,
     /// The in-memory dirstate has changes to save when the last write lock
     /// is released.
     dirty: bool,
 }
 
 impl WorkingTree4 {
-    /// Run `f` under a tree write lock: a write lock the caller holds is
-    /// counted, and otherwise one is taken for `f`, saving the dirstate when
-    /// it is released.
-    fn with_tree_write<R>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> Result<R, WorkingTreeError>,
-    ) -> Result<R, WorkingTreeError> {
-        let mut locked = self.write_locked()?;
-        let result = f(&mut locked);
-        let unlocked = locked.unlock();
-        result.and_then(|r| unlocked.map(|_| r))
-    }
-
     /// Note that the in-memory dirstate has changes to save.
     fn mark_dirty(&mut self) -> Result<(), WorkingTreeError> {
         self.dirty = true;
@@ -917,8 +1021,11 @@ impl WorkingTree4 {
     }
 
     /// Open the working tree reachable through `transport` (rooted at the
-    /// directory that contains `.bzr`).
-    pub fn open(transport: SharedTransport) -> Result<Self, WorkingTreeError> {
+    /// directory that contains `.bzr`), a checkout of `branch`.
+    pub fn open(
+        transport: SharedTransport,
+        branch: crate::branch::Branch,
+    ) -> Result<Self, WorkingTreeError> {
         let dirstate = read_dirstate(transport.as_ref())?;
         Ok(WorkingTree4 {
             lock: TreeLock::new(
@@ -928,6 +1035,7 @@ impl WorkingTree4 {
             ),
             transport,
             dirstate,
+            branch,
             dirty: false,
         })
     }
@@ -955,7 +1063,7 @@ impl WorkingTree4 {
     /// per-entry tree is not stored, matching brz's dirstate). The dirstate
     /// is rewritten to disk.
     pub fn add_pending_merge(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError> {
-        self.with_tree_write(|wt| wt.add_pending_merge_under_lock(revision_id))
+        with_tree_write(self, |wt| wt.add_pending_merge_under_lock(revision_id))
     }
 
     fn add_pending_merge_under_lock(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError> {
@@ -990,21 +1098,20 @@ impl WorkingTree4 {
     /// `null:`.
     pub fn set_parent_ids(
         &mut self,
-        repository: &dyn crate::repository::Repository,
         revision_ids: &[Vec<u8>],
         allow_leftmost_as_ghost: bool,
     ) -> Result<(), WorkingTreeError> {
-        self.with_tree_write(|wt| {
-            wt.set_parent_ids_under_lock(repository, revision_ids, allow_leftmost_as_ghost)
+        with_tree_write(self, |wt| {
+            wt.set_parent_ids_under_lock(revision_ids, allow_leftmost_as_ghost)
         })
     }
 
     fn set_parent_ids_under_lock(
         &mut self,
-        repository: &dyn crate::repository::Repository,
         revision_ids: &[Vec<u8>],
         allow_leftmost_as_ghost: bool,
     ) -> Result<(), WorkingTreeError> {
+        let repository = self.branch.repository();
         // Which parents are present (have a tree) vs ghosts.
         let present: Vec<bool> = revision_ids
             .iter()
@@ -1068,7 +1175,7 @@ impl WorkingTree4 {
         &mut self,
         delta: &crate::inventory_delta::InventoryDelta,
     ) -> Result<(), WorkingTreeError> {
-        self.with_tree_write(|wt| wt.apply_inventory_delta_under_lock(delta))
+        with_tree_write(self, |wt| wt.apply_inventory_delta_under_lock(delta))
     }
 
     fn apply_inventory_delta_under_lock(
@@ -1402,7 +1509,7 @@ impl WorkingTree4 {
         kind: EntryKind,
         file_id: Option<&[u8]>,
     ) -> Result<Vec<u8>, WorkingTreeError> {
-        self.with_tree_write(|wt| wt.add_under_lock(path, kind, file_id))
+        with_tree_write(self, |wt| wt.add_under_lock(path, kind, file_id))
     }
 
     fn add_under_lock(
@@ -1432,7 +1539,7 @@ impl WorkingTree4 {
     ///
     /// Returns [`WorkingTreeError::NotVersioned`] if `path` is not tracked.
     pub fn remove(&mut self, path: &str) -> Result<(), WorkingTreeError> {
-        self.with_tree_write(|wt| wt.remove_under_lock(path))
+        with_tree_write(self, |wt| wt.remove_under_lock(path))
     }
 
     fn remove_under_lock(&mut self, path: &str) -> Result<(), WorkingTreeError> {
@@ -1479,7 +1586,7 @@ impl WorkingTree4 {
     /// Only a single file or empty directory is moved; moving a directory
     /// with versioned children is not yet supported.
     pub fn rename(&mut self, from_path: &str, to_path: &str) -> Result<(), WorkingTreeError> {
-        self.with_tree_write(|wt| wt.rename_under_lock(from_path, to_path))
+        with_tree_write(self, |wt| wt.rename_under_lock(from_path, to_path))
     }
 
     fn rename_under_lock(
@@ -1558,25 +1665,14 @@ impl WorkingTree4 {
     /// whose version differs across the parents (breezy's `unchanged_merged`
     /// case) is still re-recorded at the new revision so its per-file graph
     /// merges those versions.
-    pub fn commit(
-        &mut self,
-        repository: &mut dyn crate::repository::Repository,
-        branch: &crate::branch::Branch,
-        options: &CommitOptions,
-    ) -> Result<Vec<u8>, WorkingTreeError> {
-        self.with_tree_write(|wt| {
-            with_commit_locks(repository, branch, |repository| {
-                wt.commit_under_lock(repository, branch, options)
-            })
-        })
+    pub fn commit(&mut self, options: &CommitOptions) -> Result<Vec<u8>, WorkingTreeError> {
+        let mut locked = self.write_locked()?;
+        let result = locked.commit_under_lock(options);
+        let unlocked = locked.unlock();
+        result.and_then(|r| unlocked.map(|_| r))
     }
 
-    fn commit_under_lock(
-        &mut self,
-        repository: &mut dyn crate::repository::Repository,
-        branch: &crate::branch::Branch,
-        options: &CommitOptions,
-    ) -> Result<Vec<u8>, WorkingTreeError> {
+    fn commit_under_lock(&mut self, options: &CommitOptions) -> Result<Vec<u8>, WorkingTreeError> {
         // Strict mode refuses to commit while unversioned files are present.
         if options.strict {
             let unknowns = self.unknowns()?;
@@ -1615,6 +1711,7 @@ impl WorkingTree4 {
         // group, so we know exactly which entries changed. The non-basis
         // merge parents are loaded too, so each changed file's per-file text
         // parents reflect the merge.
+        let repository = self.branch.repository();
         let basis = repository
             .revision_tree(&basis_revision_id)
             .map_err(WorkingTreeError::Repository)?;
@@ -1645,55 +1742,32 @@ impl WorkingTree4 {
             }
         }
 
-        repository
-            .start_write_group()
-            .map_err(WorkingTreeError::Repository)?;
-        {
-            let mut builder = repository
-                .get_commit_builder(
-                    parents.clone(),
-                    revid.clone(),
-                    options.committer.clone(),
-                    options.timestamp,
-                    options.timezone,
-                )
-                .with_properties(properties.clone());
-            builder
-                .record_iter_changes(&changes, |path| {
-                    self.transport
-                        .get_bytes(path)
-                        .map_err(crate::repository::RepositoryError::Transport)
-                })
-                .map_err(WorkingTreeError::Repository)?;
-            builder
-                .finish_inventory()
-                .map_err(WorkingTreeError::Repository)?;
-            builder
-                .commit(&options.message)
-                .map_err(WorkingTreeError::Repository)?;
-        }
-
-        // Sign the commit while the write group is still open, so the
-        // signature lands in the same pack as the revision.
-        if let Some(key) = &options.signing_key {
-            let (paths, inv_entries) = self.build_committed_entries(&revid, &basis, &changes)?;
-            let signature = sign_commit(
-                &parents,
-                &revid,
-                options,
-                &properties,
-                &paths,
-                &inv_entries,
-                key,
-            )?;
-            repository
-                .add_signature_text(&revid, &signature)
-                .map_err(WorkingTreeError::Repository)?;
-        }
-
-        repository
-            .commit_write_group()
-            .map_err(WorkingTreeError::Repository)?;
+        let signature = match &options.signing_key {
+            Some(key) => {
+                let (paths, inv_entries) =
+                    self.build_committed_entries(&revid, &basis, &changes)?;
+                Some(sign_commit(
+                    &parents,
+                    &revid,
+                    options,
+                    &properties,
+                    &paths,
+                    &inv_entries,
+                    key,
+                )?)
+            }
+            None => None,
+        };
+        write_revision(
+            self.branch.repository_mut(),
+            &self.transport,
+            &parents,
+            &revid,
+            options,
+            &properties,
+            &changes,
+            signature.as_deref(),
+        )?;
 
         // Unversion any files that were committed as deletions because they
         // had vanished from disk, so they leave the working tree's tracked
@@ -1711,7 +1785,7 @@ impl WorkingTree4 {
 
         // Advance the branch tip.
         let new_revno = self.dirstate_revno() + 1;
-        branch
+        self.branch
             .set_last_revision_info(new_revno, &revid)
             .map_err(WorkingTreeError::Branch)?;
 
@@ -1910,7 +1984,12 @@ impl Lockable for WorkingTree4 {
 
     /// The dirstate is read again with the first lock.
     fn lock_read(&mut self) -> Result<(), WorkingTreeError> {
-        self.lock_and_reload(|lock| lock.lock_read())
+        lock_with_branch(
+            self,
+            &mut crate::lockable_files::NoWait,
+            |branch, _| branch.lock_read(),
+            |tree, _| tree.lock_and_reload(|lock| lock.lock_read()),
+        )
     }
 
     /// The dirstate is read again with the first lock.
@@ -1918,11 +1997,16 @@ impl Lockable for WorkingTree4 {
         &mut self,
         waiter: &mut dyn crate::lockable_files::LockWaiter,
     ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError> {
-        self.lock_and_reload(|lock| lock.lock_write(waiter))
+        lock_with_branch(
+            self,
+            waiter,
+            |branch, waiter| branch.lock_write(waiter).map(drop),
+            |tree, waiter| tree.lock_and_reload(|lock| lock.lock_write(waiter)),
+        )
     }
 
     /// A changed dirstate is saved under the lock before the last write lock
-    /// is released; if saving fails the tree stays locked.
+    /// is released; if saving fails the tree and its branch stay locked.
     fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, WorkingTreeError> {
         let last_write = self.lock.files().lock_count() == 1
             && self.lock.lock_mode() == Some(crate::lockable_files::LockMode::Write);
@@ -1930,11 +2014,32 @@ impl Lockable for WorkingTree4 {
             self.save_dirstate()?;
             self.dirty = false;
         }
-        self.lock.unlock().map_err(WorkingTreeError::Locking)
+        unlock_with_branch(self)
     }
 }
 
 impl WorkingTree for WorkingTree4 {
+    fn branch(&self) -> &crate::branch::Branch {
+        &self.branch
+    }
+
+    fn branch_mut(&mut self) -> &mut crate::branch::Branch {
+        &mut self.branch
+    }
+
+    /// The dirstate is read again with the first lock.
+    fn lock_tree_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError> {
+        lock_with_branch(
+            self,
+            waiter,
+            |branch, _| branch.lock_read(),
+            |tree, waiter| tree.lock_and_reload(|lock| lock.lock_write(waiter)),
+        )
+    }
+
     fn lock(&self) -> &TreeLock {
         &self.lock
     }
@@ -1959,11 +2064,10 @@ impl WorkingTree for WorkingTree4 {
 
     fn set_parent_ids(
         &mut self,
-        repository: &dyn crate::repository::Repository,
         revision_ids: &[Vec<u8>],
         allow_leftmost_as_ghost: bool,
     ) -> Result<(), WorkingTreeError> {
-        WorkingTree4::set_parent_ids(self, repository, revision_ids, allow_leftmost_as_ghost)
+        WorkingTree4::set_parent_ids(self, revision_ids, allow_leftmost_as_ghost)
     }
 
     fn apply_inventory_delta(
@@ -2027,13 +2131,8 @@ impl WorkingTree for WorkingTree4 {
         WorkingTree4::rename(self, from_path, to_path)
     }
 
-    fn commit(
-        &mut self,
-        repository: &mut dyn crate::repository::Repository,
-        branch: &crate::branch::Branch,
-        options: &CommitOptions,
-    ) -> Result<Vec<u8>, WorkingTreeError> {
-        WorkingTree4::commit(self, repository, branch, options)
+    fn commit(&mut self, options: &CommitOptions) -> Result<Vec<u8>, WorkingTreeError> {
+        WorkingTree4::commit(self, options)
     }
 
     fn control_transport(&self) -> &SharedTransport {
@@ -2734,32 +2833,6 @@ fn read_dirstate(
     Ok(dirstate)
 }
 
-/// Run `f` with `branch` and `repository` write-locked, as a commit needs.
-/// Locks the caller holds are counted.
-fn with_commit_locks<R>(
-    repository: &mut dyn crate::repository::Repository,
-    branch: &crate::branch::Branch,
-    f: impl FnOnce(&mut dyn crate::repository::Repository) -> Result<R, WorkingTreeError>,
-) -> Result<R, WorkingTreeError> {
-    // A branch fails to lock with a locking error, reported as the tree's.
-    let branch_err = |e| match e {
-        crate::branch::BranchError::Locking(e) => WorkingTreeError::Locking(e),
-        e => WorkingTreeError::Branch(e),
-    };
-    let mut branch = branch.clone();
-    let branch_lock = branch.write_locked().map_err(branch_err)?;
-    let result = repository
-        .write_locked()
-        .map_err(WorkingTreeError::Repository)
-        .and_then(|mut repository| {
-            let result = f(&mut *repository);
-            let unlocked = repository.unlock().map_err(WorkingTreeError::Repository);
-            result.and_then(|r| unlocked.map(|_| r))
-        });
-    let unlocked = branch_lock.unlock().map_err(branch_err);
-    result.and_then(|r| unlocked.map(|_| r))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2785,14 +2858,10 @@ mod tests {
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let cd = BzrDirMeta::create(&parent).unwrap();
 
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let mut wt = cd.open_workingtree().unwrap();
 
         let revid = wt
             .commit(
-                repo.as_mut(),
-                &branch,
                 &CommitOptions::new("T <t@e>", "empty commit")
                     .timestamp(1577880000)
                     .allow_pointless(true),
@@ -2802,7 +2871,7 @@ mod tests {
         // The dirstate basis was advanced to the new revision, in memory
         // and on disk (re-opening the tree reads the same basis).
         assert_eq!(wt.basis_revision().as_deref(), Some(revid.as_slice()));
-        let reread = WorkingTree4::open(parent.clone()).unwrap();
+        let reread = open_tree(parent.clone()).unwrap();
         assert_eq!(reread.basis_revision().as_deref(), Some(revid.as_slice()));
 
         // Branch advanced to revno 1 at the new revision.
@@ -2831,32 +2900,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let cd = BzrDirMeta::create(&parent).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let mut wt = cd.open_workingtree().unwrap();
 
         parent.put_bytes("a.txt", b"one\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let r1 = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "one").timestamp(1577880000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "one").timestamp(1577880000))
             .unwrap();
 
         // Reopen the control objects (fresh basis/branch tip) before the
         // second commit.
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
         parent.put_bytes("a.txt", b"two\n", None).unwrap();
         let r2 = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "two").timestamp(1577880001),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "two").timestamp(1577880001))
             .unwrap();
         (dir, parent, cd, r1, r2)
     }
@@ -2864,7 +2921,7 @@ mod tests {
     #[test]
     fn basis_inventory_matches_the_repository() {
         let (_dir, parent, cd, _r1, r2) = tree_with_two_commits();
-        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let wt = open_tree(parent.clone()).unwrap();
         let from_dirstate = wt.basis_inventory().unwrap().expect("r2 is the basis");
         let repo = cd.open_repository().unwrap();
         let from_repo = repo.get_inventory(&r2).unwrap();
@@ -2882,11 +2939,9 @@ mod tests {
 
     #[test]
     fn ghost_basis_has_no_inventory() {
-        let (_dir, parent, cd, _r1, _r2) = tree_with_two_commits();
-        let repo = cd.open_repository().unwrap();
-        let mut wt = WorkingTree4::open(parent).unwrap();
-        wt.set_parent_ids(repo.as_ref(), &[b"ghost-rev".to_vec()], true)
-            .unwrap();
+        let (_dir, parent, _cd, _r1, _r2) = tree_with_two_commits();
+        let mut wt = open_tree(parent).unwrap();
+        wt.set_parent_ids(&[b"ghost-rev".to_vec()], true).unwrap();
         assert!(wt.basis_inventory().unwrap().is_none());
     }
 
@@ -2920,32 +2975,30 @@ mod tests {
 
     #[test]
     fn set_parent_ids_rewrites_the_dirstate_basis() {
-        let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
-        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let (_dir, parent, _cd, r1, r2) = tree_with_two_commits();
+        let wt = open_tree(parent.clone()).unwrap();
         assert_eq!(wt.parent_ids(), vec![r2.clone()]);
 
         // Point the tree's parent back at r1; the dirstate basis follows.
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
-        let repo = cd.open_repository().unwrap();
-        wt.set_parent_ids(repo.as_ref(), std::slice::from_ref(&r1), false)
-            .unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
+        wt.set_parent_ids(std::slice::from_ref(&r1), false).unwrap();
         assert_eq!(wt.parent_ids(), vec![r1.clone()]);
         // The basis is persisted.
-        let reread = WorkingTree4::open(parent.clone()).unwrap();
+        let reread = open_tree(parent.clone()).unwrap();
         assert_eq!(reread.basis_revision().as_deref(), Some(r1.as_slice()));
 
         // Setting no parents clears the basis.
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
-        wt.set_parent_ids(repo.as_ref(), &[], false).unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
+        wt.set_parent_ids(&[], false).unwrap();
         assert_eq!(wt.parent_ids(), Vec::<Vec<u8>>::new());
 
         // A ghost merge parent (absent from the repository) is kept alongside
         // the present basis.
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
-        wt.set_parent_ids(repo.as_ref(), &[r1.clone(), b"ghost-rev".to_vec()], false)
+        let mut wt = open_tree(parent.clone()).unwrap();
+        wt.set_parent_ids(&[r1.clone(), b"ghost-rev".to_vec()], false)
             .unwrap();
         assert_eq!(wt.parent_ids(), vec![r1.clone(), b"ghost-rev".to_vec()]);
-        let reread = WorkingTree4::open(parent).unwrap();
+        let reread = open_tree(parent).unwrap();
         assert_eq!(reread.parent_ids(), vec![r1, b"ghost-rev".to_vec()]);
         assert_eq!(reread.path2id("a.txt"), wt.path2id("a.txt"));
     }
@@ -2956,7 +3009,7 @@ mod tests {
         // A parent tree's dirstate row holds the revision the entry last
         // changed in, which is the basis entry's revision.
         let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
-        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let wt = open_tree(parent.clone()).unwrap();
         let repo = cd.open_repository().unwrap();
         let inventory = repo.get_inventory(&r2).unwrap();
         let mut checked = 0;
@@ -2979,26 +3032,23 @@ mod tests {
 
     #[test]
     fn set_parent_ids_drops_ancestor_parents() {
-        let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
-        let repo = cd.open_repository().unwrap();
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
-        wt.set_parent_ids(repo.as_ref(), &[r2.clone(), r1], false)
-            .unwrap();
+        let (_dir, parent, _cd, r1, r2) = tree_with_two_commits();
+        let mut wt = open_tree(parent.clone()).unwrap();
+        wt.set_parent_ids(&[r2.clone(), r1], false).unwrap();
         assert_eq!(wt.parent_ids(), vec![r2.clone()]);
-        let reread = WorkingTree4::open(parent).unwrap();
+        let reread = open_tree(parent).unwrap();
         assert_eq!(reread.parent_ids(), vec![r2]);
     }
 
     #[test]
     fn set_parent_ids_leftmost_ghost() {
-        let (_dir, parent, cd, _r1, r2) = tree_with_two_commits();
-        let repo = cd.open_repository().unwrap();
+        let (_dir, parent, _cd, _r1, r2) = tree_with_two_commits();
         let ghost = b"ghost-rev".to_vec();
 
         // A ghost is refused as the left-hand parent, leaving the parents
         // untouched.
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
-        match wt.set_parent_ids(repo.as_ref(), std::slice::from_ref(&ghost), false) {
+        let mut wt = open_tree(parent.clone()).unwrap();
+        match wt.set_parent_ids(std::slice::from_ref(&ghost), false) {
             Err(WorkingTreeError::Commit(message)) => {
                 assert_eq!(message, "left-hand parent ghost-rev is a ghost")
             }
@@ -3007,25 +3057,24 @@ mod tests {
         assert_eq!(wt.parent_ids(), vec![r2]);
 
         // Unless the caller allows it.
-        wt.set_parent_ids(repo.as_ref(), std::slice::from_ref(&ghost), true)
+        wt.set_parent_ids(std::slice::from_ref(&ghost), true)
             .unwrap();
         assert_eq!(wt.parent_ids(), vec![ghost.clone()]);
-        let reread = WorkingTree4::open(parent).unwrap();
+        let reread = open_tree(parent).unwrap();
         assert_eq!(reread.parent_ids(), vec![ghost]);
     }
 
     /// A reserved revision id such as `null:` cannot be a parent.
     #[test]
     fn set_parent_ids_rejects_reserved_ids() {
-        let (_dir, parent, cd, r1, r2) = tree_with_two_commits();
-        let repo = cd.open_repository().unwrap();
-        let mut wt = WorkingTree4::open(parent).unwrap();
+        let (_dir, parent, _cd, r1, r2) = tree_with_two_commits();
+        let mut wt = open_tree(parent).unwrap();
         for parents in [
             vec![crate::branch::NULL_REVISION.to_vec()],
             vec![r1, b"current:".to_vec()],
         ] {
             let reserved = parents.last().unwrap().clone();
-            match wt.set_parent_ids(repo.as_ref(), &parents, false) {
+            match wt.set_parent_ids(&parents, false) {
                 Err(WorkingTreeError::ReservedId(revision_id)) => {
                     assert_eq!(revision_id, reserved)
                 }
@@ -3043,8 +3092,10 @@ mod tests {
     impl crate::lockable_files::Lockable for UnreadableRepository {
         type Error = RepositoryError;
 
+        // A tree locks its branch, which read-locks this repository; reading
+        // under the lock is what fails.
         fn lock_read(&mut self) -> Result<(), RepositoryError> {
-            unimplemented!()
+            Ok(())
         }
         fn lock_write(
             &mut self,
@@ -3053,7 +3104,7 @@ mod tests {
             unimplemented!()
         }
         fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, RepositoryError> {
-            unimplemented!()
+            Ok(None)
         }
     }
 
@@ -3155,8 +3206,12 @@ mod tests {
     #[test]
     fn set_parent_ids_propagates_repository_errors() {
         let (_dir, parent, _cd, r1, r2) = tree_with_two_commits();
-        let mut wt = WorkingTree4::open(parent).unwrap();
-        match wt.set_parent_ids(&UnreadableRepository, std::slice::from_ref(&r1), true) {
+        let branch = crate::branch::Branch::open(
+            parent.subtransport(".bzr/branch").unwrap(),
+            Box::new(UnreadableRepository),
+        );
+        let mut wt = WorkingTree4::open(parent, branch).unwrap();
+        match wt.set_parent_ids(std::slice::from_ref(&r1), true) {
             Err(WorkingTreeError::Repository(RepositoryError::Corrupt(message))) => {
                 assert_eq!(message, "unreadable index")
             }
@@ -3196,7 +3251,7 @@ mod tests {
 
         // The file is now versioned, and the change persists to disk.
         assert_eq!(wt.path2id("new.txt"), Some(b"new-id".to_vec()));
-        let reread = WorkingTree4::open(parent).unwrap();
+        let reread = open_tree(parent).unwrap();
         assert_eq!(reread.path2id("new.txt"), Some(b"new-id".to_vec()));
     }
 
@@ -3241,7 +3296,7 @@ mod tests {
         ]);
         wt.apply_inventory_delta(&delta).unwrap();
 
-        let reread = WorkingTree4::open(parent).unwrap();
+        let reread = open_tree(parent).unwrap();
         assert_eq!(reread.path2id("gone.txt"), None);
         assert_eq!(reread.path2id("old.txt"), None);
         assert_eq!(reread.path2id("new.txt"), Some(moved_id));
@@ -3265,14 +3320,8 @@ mod tests {
         let mut wt = cd.open_workingtree().unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
 
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let revid = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "one").timestamp(1577880000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "one").timestamp(1577880000))
             .unwrap();
 
         // Reopen the control dir from scratch and read everything back.
@@ -3313,11 +3362,8 @@ mod tests {
         let mut wt = cd.open_workingtree().unwrap();
         wt.add("foo", EntryKind::File, Some(b"Foo:Bar")).unwrap();
 
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
+        let repo = cd.open_repository().unwrap();
         wt.commit(
-            repo.as_mut(),
-            &branch,
             &CommitOptions::new("T <t@e>", "first post")
                 .timestamp(1577880000)
                 .revision_id(b"first".to_vec()),
@@ -3351,13 +3397,20 @@ mod tests {
         );
     }
 
+    /// Open the dirstate tree rooted at `root`, as a checkout of the branch
+    /// in its control directory.
+    fn open_tree(root: SharedTransport) -> Result<WorkingTree4, WorkingTreeError> {
+        let cd = BzrDirMeta::open(root.subtransport(".bzr").unwrap()).unwrap();
+        WorkingTree4::open(root, cd.open_branch().unwrap())
+    }
+
     /// Build a fresh tree and return its root transport plus an open
     /// working tree.
     fn fresh_tree() -> (tempfile::TempDir, SharedTransport, WorkingTree4) {
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let cd = BzrDirMeta::create(&parent).unwrap();
-        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let wt = open_tree(parent.clone()).unwrap();
         let _ = cd;
         (dir, parent, wt)
     }
@@ -3367,7 +3420,7 @@ mod tests {
     #[test]
     fn first_lock_rereads_the_dirstate() {
         let (_dir, transport, mut wt) = fresh_tree();
-        let mut other = WorkingTree4::open(transport.clone()).unwrap();
+        let mut other = open_tree(transport.clone()).unwrap();
         transport.put_bytes("f", b"x", None).unwrap();
         other.add("f", EntryKind::File, None).unwrap();
         assert!(wt.path2id("f").is_none());
@@ -3377,18 +3430,73 @@ mod tests {
     }
 
     #[test]
+    fn locking_the_tree_locks_its_branch_and_repository() {
+        use crate::lockable_files::{LockMode, NoWait};
+        let (_dir, _transport, mut wt) = fresh_tree();
+        let modes = |wt: &WorkingTree4| {
+            (
+                wt.lock().lock_mode(),
+                wt.branch().lock().lock_mode(),
+                wt.branch().repository().lock().lock_mode(),
+            )
+        };
+
+        wt.lock_read().unwrap();
+        assert_eq!(
+            (
+                Some(LockMode::Read),
+                Some(LockMode::Read),
+                Some(LockMode::Read)
+            ),
+            modes(&wt)
+        );
+        Lockable::unlock(&mut wt).unwrap();
+        assert_eq!((None, None, None), modes(&wt));
+
+        WorkingTree::lock_tree_write(&mut wt, &mut NoWait).unwrap();
+        assert_eq!(
+            (
+                Some(LockMode::Write),
+                Some(LockMode::Read),
+                Some(LockMode::Read)
+            ),
+            modes(&wt)
+        );
+        Lockable::unlock(&mut wt).unwrap();
+
+        Lockable::lock_write(&mut wt, &mut NoWait).unwrap();
+        Lockable::lock_read(&mut wt).unwrap();
+        assert_eq!(
+            (
+                Some(LockMode::Write),
+                Some(LockMode::Write),
+                Some(LockMode::Write)
+            ),
+            modes(&wt)
+        );
+        assert_eq!(2, wt.branch().lock().lock_count());
+        Lockable::unlock(&mut wt).unwrap();
+        assert_eq!(1, wt.branch().lock().lock_count());
+        Lockable::unlock(&mut wt).unwrap();
+        assert_eq!((None, None, None), modes(&wt));
+        assert!(matches!(
+            Lockable::unlock(&mut wt),
+            Err(WorkingTreeError::Locking(
+                crate::lockable_files::LockableFilesError::NotHeld
+            ))
+        ));
+    }
+
+    #[test]
     fn add_under_the_tree_write_lock() {
         let (_dir, transport, mut wt) = fresh_tree();
         let mut wt = wt.write_locked().unwrap();
         transport.put_bytes("f", b"x", None).unwrap();
         wt.add("f", EntryKind::File, None).unwrap();
         // Saved with the last unlock, not by the add.
-        assert!(WorkingTree4::open(transport.clone())
-            .unwrap()
-            .path2id("f")
-            .is_none());
+        assert!(open_tree(transport.clone()).unwrap().path2id("f").is_none());
         wt.unlock().unwrap();
-        let reopened = WorkingTree4::open(transport).unwrap();
+        let reopened = open_tree(transport).unwrap();
         assert!(reopened.path2id("f").is_some());
     }
 
@@ -3399,13 +3507,10 @@ mod tests {
             let mut locked = wt.write_locked().unwrap();
             transport.put_bytes("f", b"x", None).unwrap();
             locked.add("f", EntryKind::File, None).unwrap();
-            assert!(WorkingTree4::open(transport.clone())
-                .unwrap()
-                .path2id("f")
-                .is_none());
+            assert!(open_tree(transport.clone()).unwrap().path2id("f").is_none());
         }
         assert_eq!(None, wt.lock().lock_mode());
-        let mut reopened: Box<dyn WorkingTree> = Box::new(WorkingTree4::open(transport).unwrap());
+        let mut reopened: Box<dyn WorkingTree> = Box::new(open_tree(transport).unwrap());
         let read = reopened.read_locked().unwrap();
         assert_eq!(
             Some(crate::lockable_files::LockMode::Read),
@@ -3432,7 +3537,7 @@ mod tests {
         );
 
         // Re-opening the tree reads the same versioned set from disk.
-        let reread = WorkingTree4::open(parent.clone()).unwrap();
+        let reread = open_tree(parent.clone()).unwrap();
         assert_eq!(reread.path2id("a.txt"), Some(file_id));
     }
 
@@ -3554,16 +3659,11 @@ mod tests {
     #[test]
     fn add_then_commit_records_the_files() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
 
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let revid = wt
             .commit(
-                repo.as_mut(),
-                &branch,
                 &crate::workingtree::CommitOptions::new("T <t@e>", "add a").timestamp(1577880000),
             )
             .unwrap();
@@ -3587,19 +3687,13 @@ mod tests {
         parent.put_bytes("b.txt", b"world\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         wt.add("b.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let revid = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "two files").timestamp(1577880000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "two files").timestamp(1577880000))
             .unwrap();
 
         // Re-open the tree (its basis is now the commit), modify a.txt,
         // add c.txt, leave b.txt untouched.
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
         parent.put_bytes("a.txt", b"changed\n", None).unwrap();
         parent.put_bytes("c.txt", b"new\n", None).unwrap();
         wt.add("c.txt", EntryKind::File, None).unwrap();
@@ -3630,17 +3724,13 @@ mod tests {
         let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let revid = wt
             .commit(
-                repo.as_mut(),
-                &branch,
                 &crate::workingtree::CommitOptions::new("T <t@e>", "add a").timestamp(1577880000),
             )
             .unwrap();
 
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
         wt.remove("a.txt").unwrap();
         let repo = cd.open_repository().unwrap();
         let basis = repo.revision_tree(&revid).unwrap();
@@ -3661,12 +3751,8 @@ mod tests {
         let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let revid = wt
             .commit(
-                repo.as_mut(),
-                &branch,
                 &crate::workingtree::CommitOptions::new("T <t@e>", "add a").timestamp(1577880000),
             )
             .unwrap();
@@ -3674,7 +3760,7 @@ mod tests {
         let path = parent.local_path("a.txt").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o645)).unwrap();
 
-        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let wt = open_tree(parent.clone()).unwrap();
         let repo = cd.open_repository().unwrap();
         let basis = repo.revision_tree(&revid).unwrap();
         assert_eq!(wt.iter_changes(&basis).unwrap().len(), 0);
@@ -3692,12 +3778,8 @@ mod tests {
         let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let revid = wt
             .commit(
-                repo.as_mut(),
-                &branch,
                 &crate::workingtree::CommitOptions::new("T <t@e>", "add a").timestamp(1577880000),
             )
             .unwrap();
@@ -3708,7 +3790,7 @@ mod tests {
         perms.set_mode(perms.mode() | 0o111);
         std::fs::set_permissions(&path, perms).unwrap();
 
-        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let wt = open_tree(parent.clone()).unwrap();
         let repo = cd.open_repository().unwrap();
         let basis = repo.revision_tree(&revid).unwrap();
         let changes = wt.iter_changes(&basis).unwrap();
@@ -3859,25 +3941,17 @@ mod tests {
         parent.put_bytes("b.txt", b"b one\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         wt.add("b.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let rev1 = wt
             .commit(
-                repo.as_mut(),
-                &branch,
                 &crate::workingtree::CommitOptions::new("T <t@e>", "first").timestamp(1577880000),
             )
             .unwrap();
 
         // Second commit: change only a.txt.
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
         parent.put_bytes("a.txt", b"a two\n", None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let rev2 = wt
             .commit(
-                repo.as_mut(),
-                &branch,
                 &crate::workingtree::CommitOptions::new("T <t@e>", "second").timestamp(1577890000),
             )
             .unwrap();
@@ -3928,9 +4002,7 @@ mod tests {
             .branch_nick("trunk")
             .revision_id(b"my-explicit-revid".to_vec());
 
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
-        let revid = wt.commit(repo.as_mut(), &branch, &options).unwrap();
+        let revid = wt.commit(&options).unwrap();
         assert_eq!(revid, b"my-explicit-revid".to_vec());
 
         let repo = cd.open_repository().unwrap();
@@ -3954,7 +4026,6 @@ mod tests {
     #[test]
     fn commit_rejects_cr_in_revprops() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         let mut props = std::collections::HashMap::new();
@@ -3962,10 +4033,8 @@ mod tests {
         let options = CommitOptions::new("T <t@e>", "msg")
             .timestamp(1577880000)
             .revprops(props);
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         assert!(matches!(
-            wt.commit(repo.as_mut(), &branch, &options),
+            wt.commit(&options),
             Err(WorkingTreeError::Commit(_))
         ));
     }
@@ -3974,36 +4043,21 @@ mod tests {
     #[test]
     fn pointless_commit_is_refused_then_allowed() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
-        wt.commit(
-            repo.as_mut(),
-            &branch,
-            &CommitOptions::new("T <t@e>", "first").timestamp(1577880000),
-        )
-        .unwrap();
+        wt.commit(&CommitOptions::new("T <t@e>", "first").timestamp(1577880000))
+            .unwrap();
 
         // Re-open with no changes: a plain commit is pointless.
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
         assert!(matches!(
-            wt.commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "empty").timestamp(1577890000)
-            ),
+            wt.commit(&CommitOptions::new("T <t@e>", "empty").timestamp(1577890000)),
             Err(WorkingTreeError::PointlessCommit)
         ));
 
         // With allow_pointless it succeeds.
         let revid = wt
             .commit(
-                repo.as_mut(),
-                &branch,
                 &CommitOptions::new("T <t@e>", "empty")
                     .timestamp(1577890000)
                     .allow_pointless(true),
@@ -4022,26 +4076,14 @@ mod tests {
         parent.put_bytes("b.txt", b"b\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         wt.add("b.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
-        wt.commit(
-            repo.as_mut(),
-            &branch,
-            &CommitOptions::new("T <t@e>", "two").timestamp(1577880000),
-        )
-        .unwrap();
+        wt.commit(&CommitOptions::new("T <t@e>", "two").timestamp(1577880000))
+            .unwrap();
 
         // Delete a.txt from disk (without calling remove) and commit.
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
         parent.delete("a.txt").unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let rev2 = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "del a").timestamp(1577890000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "del a").timestamp(1577890000))
             .unwrap();
 
         // a.txt is gone from the committed inventory and from the tree.
@@ -4060,7 +4102,7 @@ mod tests {
         parent.put_bytes("tracked.txt", b"t\n", None).unwrap();
         parent.put_bytes("loose.txt", b"l\n", None).unwrap();
         wt.add("tracked.txt", EntryKind::File, None).unwrap();
-        let wt = WorkingTree4::open(parent.clone()).unwrap();
+        let wt = open_tree(parent.clone()).unwrap();
         assert_eq!(wt.unknowns().unwrap(), vec!["loose.txt".to_string()]);
     }
 
@@ -4069,24 +4111,21 @@ mod tests {
     #[test]
     fn strict_commit_refuses_unknown_files() {
         let (_d, parent, mut wt) = fresh_tree();
-        let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"a\n", None).unwrap();
         parent.put_bytes("loose.txt", b"l\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
 
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let strict = CommitOptions::new("T <t@e>", "c")
             .timestamp(1577880000)
             .strict(true);
         assert!(matches!(
-            wt.commit(repo.as_mut(), &branch, &strict),
+            wt.commit(&strict),
             Err(WorkingTreeError::StrictCommitFailed(_))
         ));
 
         // Remove the unknown file; the strict commit now succeeds.
         parent.delete("loose.txt").unwrap();
-        let revid = wt.commit(repo.as_mut(), &branch, &strict).unwrap();
+        let revid = wt.commit(&strict).unwrap();
         assert!(!revid.is_empty());
     }
 
@@ -4100,26 +4139,16 @@ mod tests {
         parent.put_bytes("b.txt", b"b1\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
         wt.add("b.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let rev1 = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "two").timestamp(1577880000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "two").timestamp(1577880000))
             .unwrap();
 
         // Modify both files but commit only a.txt.
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
         parent.put_bytes("a.txt", b"a2\n", None).unwrap();
         parent.put_bytes("b.txt", b"b2\n", None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let rev2 = wt
             .commit(
-                repo.as_mut(),
-                &branch,
                 &CommitOptions::new("T <t@e>", "only a")
                     .timestamp(1577890000)
                     .specific_files(vec!["a.txt".to_string()]),
@@ -4163,12 +4192,8 @@ mod tests {
         let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let revid = wt
             .commit(
-                repo.as_mut(),
-                &branch,
                 &CommitOptions::new("T <t@e>", "signed")
                     .timestamp(1577880000)
                     .signing_key(tsk),
@@ -4190,41 +4215,23 @@ mod tests {
         let cd = BzrDirMeta::open(parent.subtransport(".bzr").unwrap()).unwrap();
         parent.put_bytes("a.txt", b"a1\n", None).unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let rev1 = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "c1").timestamp(1577880000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "c1").timestamp(1577880000))
             .unwrap();
 
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
         parent.put_bytes("a.txt", b"a2\n", None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let rev2 = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "c2").timestamp(1577890000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "c2").timestamp(1577890000))
             .unwrap();
 
         // Add rev1 as a pending merge and commit rev3 with both parents.
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
         wt.add_pending_merge(&rev1).unwrap();
         assert_eq!(wt.parent_ids(), vec![rev2.clone(), rev1.clone()]);
         parent.put_bytes("a.txt", b"a3\n", None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let rev3 = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "merge").timestamp(1577900000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "merge").timestamp(1577900000))
             .unwrap();
 
         // rev3 records both rev2 (basis) and rev1 (merge) as parents.
@@ -4256,27 +4263,15 @@ mod tests {
         parent.put_bytes("a.txt", b"a1\n", None).unwrap();
         let fid_bytes = wt.add("a.txt", EntryKind::File, None).unwrap();
         let fid = crate::FileId::from(fid_bytes.as_slice());
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let rev1 = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "c1").timestamp(1577880000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "c1").timestamp(1577880000))
             .unwrap();
 
         // rev2: a different version of a.txt (the basis branch).
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
         parent.put_bytes("a.txt", b"a2\n", None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let rev2 = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "c2").timestamp(1577890000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "c2").timestamp(1577890000))
             .unwrap();
 
         // The two parents disagree on a.txt's version.
@@ -4294,17 +4289,11 @@ mod tests {
 
         // Merge commit: a.txt content reverts to the basis (rev2) value, so it
         // has no content change vs the basis -- but the merge parents differ.
-        let mut wt = WorkingTree4::open(parent.clone()).unwrap();
+        let mut wt = open_tree(parent.clone()).unwrap();
         wt.add_pending_merge(&rev1).unwrap();
         parent.put_bytes("a.txt", b"a2\n", None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let rev3 = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "merge").timestamp(1577900000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "merge").timestamp(1577900000))
             .unwrap();
 
         // a.txt is recorded at rev3 (not carried over from rev2), and the merge
@@ -4336,14 +4325,8 @@ mod tests {
         parent.put_bytes("a.txt", b"hello\n", None).unwrap();
         let mut wt = cd.open_workingtree().unwrap();
         let file_id = wt.add("a.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let revid = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "a commit").timestamp(1577880000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "a commit").timestamp(1577880000))
             .unwrap();
 
         // Re-open and read the committed revision, inventory and file text.
@@ -4408,12 +4391,8 @@ mod tests {
         props.insert("multiline".to_string(), b"foo\nbar\n\n".to_vec());
 
         let mut wt = cd.open_workingtree().unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let revid = wt
             .commit(
-                repo.as_mut(),
-                &branch,
                 &CommitOptions::new("jaq", "quux")
                     .timestamp(1577880000)
                     .timezone(0)
@@ -4459,6 +4438,19 @@ mod tests {
 
     /// A format-3 working tree over a temp dir, with its checkout dir and
     /// format marker written.
+    /// A branch for a hand-built tree rooted at `root`, with a 2a repository,
+    /// both under `.bzr` and created on first use.
+    #[cfg(any(feature = "weave", feature = "knit"))]
+    fn wt3_branch(root: &SharedTransport) -> crate::branch::Branch {
+        let repo_t = root.subtransport(".bzr/repository").unwrap();
+        let repository: Box<dyn crate::repository::Repository> = if repo_t.has("format").unwrap() {
+            crate::repository::open(repo_t).unwrap()
+        } else {
+            Box::new(crate::repository::Pack2aRepository::create(repo_t).unwrap())
+        };
+        crate::branch::Branch::open(root.subtransport(".bzr/branch").unwrap(), repository)
+    }
+
     #[cfg(any(feature = "weave", feature = "knit"))]
     fn fresh_wt3() -> (tempfile::TempDir, SharedTransport, WorkingTree3) {
         let dir = tempfile::tempdir().unwrap();
@@ -4473,7 +4465,8 @@ mod tests {
             )
             .unwrap();
         let shared: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
-        let wt = WorkingTree3::open(shared).unwrap();
+        let branch = wt3_branch(&shared);
+        let wt = WorkingTree3::open(shared, branch).unwrap();
         (dir, probe, wt)
     }
 
@@ -4491,7 +4484,9 @@ mod tests {
             None,
         )
         .unwrap();
-        let opened = open(Arc::new(LocalTransport::new(dir.path()))).unwrap();
+        let root: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let branch = wt3_branch(&root);
+        let opened = open(root, branch).unwrap();
         assert!(opened.list_files().is_empty());
     }
 
@@ -4505,7 +4500,9 @@ mod tests {
         assert_eq!(wt.get_file_text("a.txt").unwrap(), b"hi\n");
 
         // Re-open from disk: the inventory was persisted.
-        let reopened = WorkingTree3::open(Arc::new(LocalTransport::new(_d.path()))).unwrap();
+        let root: SharedTransport = Arc::new(LocalTransport::new(_d.path()));
+        let branch = wt3_branch(&root);
+        let reopened = WorkingTree3::open(root, branch).unwrap();
         assert_eq!(reopened.path2id("a.txt"), Some(fid));
         let files = reopened.list_files();
         assert_eq!(files.len(), 1);
@@ -4581,14 +4578,8 @@ mod tests {
         let mut wt = cd.open_workingtree().unwrap();
         let file_id = wt.add("a.txt", EntryKind::File, None).unwrap();
 
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
         let revid = wt
-            .commit(
-                repo.as_mut(),
-                &branch,
-                &CommitOptions::new("T <t@e>", "first").timestamp(1577880000),
-            )
+            .commit(&CommitOptions::new("T <t@e>", "first").timestamp(1577880000))
             .unwrap();
 
         // The format-3 basis advanced to the new revision, on disk too.
@@ -4628,14 +4619,8 @@ mod tests {
         parent.put_bytes("a.txt", b"hi\n", None).unwrap();
         let mut wt = cd.open_workingtree().unwrap();
         wt.add("a.txt", EntryKind::File, None).unwrap();
-        let mut repo = cd.open_repository().unwrap();
-        let branch = cd.open_branch().unwrap();
-        wt.commit(
-            repo.as_mut(),
-            &branch,
-            &CommitOptions::new("T <t@e>", "first").timestamp(1577880000),
-        )
-        .unwrap();
+        wt.commit(&CommitOptions::new("T <t@e>", "first").timestamp(1577880000))
+            .unwrap();
 
         // The basis inventory is cached as xml7.
         let cache = parent
@@ -4683,7 +4668,7 @@ mod tests {
         );
 
         // Re-open and read back.
-        let reread = WorkingTree4::open(parent.clone()).unwrap();
+        let reread = open_tree(parent.clone()).unwrap();
         assert_eq!(reread.views().unwrap(), info);
     }
 
@@ -4765,7 +4750,7 @@ mod tests {
 
         wt.set_conflicts(&breezy_conflicts()).unwrap();
 
-        let reread = WorkingTree4::open(parent).unwrap();
+        let reread = open_tree(parent).unwrap();
         assert_eq!(reread.conflicts().unwrap(), breezy_conflicts());
     }
 
@@ -4817,7 +4802,7 @@ mod tests {
         let on_disk = parent.get_bytes(".bzr/checkout/merge-hashes").unwrap();
         assert!(on_disk.starts_with(b"BZR merge-modified list format 1\n"));
 
-        let reread = WorkingTree4::open(parent).unwrap();
+        let reread = open_tree(parent).unwrap();
         assert_eq!(reread.merge_modified_hashes().unwrap(), hashes);
     }
 }
