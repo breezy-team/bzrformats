@@ -57,11 +57,12 @@ fn copy_ordered(
         return Ok(());
     }
 
-    target.start_write_group()?;
-    for rev_id in ordered {
-        copy_revision(source, target, rev_id)?;
-    }
-    target.commit_write_group()
+    super::with_write_group(target, |target| {
+        ordered
+            .iter()
+            .try_for_each(|rev_id| copy_revision(source, target, rev_id))
+    })
+    .map(|_| ())
 }
 
 /// The set of revisions present in `source` (within the requested closure) but

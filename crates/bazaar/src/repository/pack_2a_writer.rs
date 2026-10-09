@@ -52,6 +52,8 @@ pub(super) enum RepackTarget {
 /// The growing `.pack` container, shared by every object kind's store.
 struct SharedPack {
     writer: ContainerWriter<Vec<u8>>,
+    /// The length of the container header, before any record.
+    header_len: usize,
 }
 
 /// A writable [`GcAccess`] that appends groupcompress blocks to a shared
@@ -227,7 +229,8 @@ impl WriteGroup {
         writer
             .begin()
             .map_err(|e| RepositoryError::Corrupt(format!("pack begin: {e}")))?;
-        let pack = Arc::new(Mutex::new(SharedPack { writer }));
+        let header_len = writer.get_ref().len();
+        let pack = Arc::new(Mutex::new(SharedPack { writer, header_len }));
 
         let make = |has_graph: bool| -> WriteStore {
             let access = PackWritingAccess {
@@ -458,6 +461,12 @@ impl WriteGroup {
         Ok(())
     }
 
+    /// Whether any record was added.
+    pub(super) fn data_inserted(&self) -> bool {
+        let pack = self.pack.lock().unwrap();
+        pack.writer.get_ref().len() > pack.header_len
+    }
+
     /// Flush this write group to `transport` (rooted at `.bzr/repository`):
     /// write the new `.pack` and its five indices. Listing it in
     /// `pack-names` is left to the repository.
@@ -468,6 +477,24 @@ impl WriteGroup {
         self,
         transport: &dyn Transport,
     ) -> Result<Option<(String, Vec<u8>)>, RepositoryError> {
+        if !self.data_inserted() {
+            return Ok(None);
+        }
+        self.write_pack(transport, false).map(Some)
+    }
+
+    /// Write the new `.pack` and its five indices to `transport`: into
+    /// `packs/` and `indices/`, or, to `suspend` the write group, all into
+    /// `upload/`.
+    ///
+    /// Returns the pack's `(name, pack-names value bytes)`; the name is the
+    /// md5 of the pack's content, and is the token that resumes a suspended
+    /// pack.
+    pub(super) fn write_pack(
+        self,
+        transport: &dyn Transport,
+        suspend: bool,
+    ) -> Result<(String, Vec<u8>), RepositoryError> {
         // Build each index from its store's collected records.
         let rix = serialise_index(&self.revisions, 1)?;
         let iix = serialise_index(&self.inventories, 1)?;
@@ -488,11 +515,15 @@ impl WriteGroup {
         // write group's internal `pack_name` was only a token used while
         // collecting records (the index values store offsets, not the name).
         let pack_name = md5_hex(&pack_bytes);
+        let (pack_dir, index_dir) = if suspend {
+            ("upload", "upload")
+        } else {
+            ("packs", "indices")
+        };
 
-        transport.put_bytes(&format!("packs/{pack_name}.pack"), &pack_bytes, None)?;
+        transport.put_bytes(&format!("{pack_dir}/{pack_name}.pack"), &pack_bytes, None)?;
         let write_index = |ext: &str, bytes: &[u8]| -> Result<usize, RepositoryError> {
-            let name = format!("indices/{pack_name}{ext}");
-            transport.put_bytes(&name, bytes, None)?;
+            transport.put_bytes(&format!("{index_dir}/{pack_name}{ext}"), bytes, None)?;
             Ok(bytes.len())
         };
         // Order in pack-names value: rix iix tix six cix.
@@ -503,15 +534,18 @@ impl WriteGroup {
             write_index(index_extension(IndexKind::Signature), &six)?,
             write_index(index_extension(IndexKind::Chk), &cix)?,
         ];
-        let new_value = sizes
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
-            .into_bytes();
-
-        Ok(Some((pack_name, new_value)))
+        Ok((pack_name, pack_names_value(&sizes)))
     }
+}
+
+/// The `pack-names` value for a pack whose indices have `sizes`.
+pub(super) fn pack_names_value(sizes: &[usize]) -> Vec<u8> {
+    sizes
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .into_bytes()
 }
 
 /// The lowercase-hex md5 digest of `bytes`, the form brz names a pack by.
