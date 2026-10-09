@@ -286,11 +286,7 @@ class TestControlDir(TestCaseInTempDir):
         rev = wt.commit("T <t@e>", "c", 1577880000, 0)
         # With no extra parents it matches iter_changes (no pending changes).
         reopened = controldir.open(self.test_dir)
-        changes = list(
-            reopened.open_workingtree().iter_changes_with_parents(
-                reopened.open_repository(), rev, []
-            )
-        )
+        changes = list(reopened.open_workingtree().iter_changes_with_parents(rev, []))
         self.assertEqual(changes, [])
 
     def test_branch_tags_round_trip(self):
@@ -597,3 +593,14 @@ class TestLocking(TestCaseInTempDir):
         other = controldir.open(self.test_dir).open_workingtree()
         self.assertRaises(LockActive, other.break_lock, lambda info: True)
         wt.unlock()
+
+    def test_iter_changes_against_the_tree_branch(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"x\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        changes = list(wt.iter_changes(b"null:"))
+        self.assertEqual(
+            ["a.txt"], [c["new_path"] for c in changes if c["new_path"] != ""]
+        )
