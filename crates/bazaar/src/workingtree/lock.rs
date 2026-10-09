@@ -91,6 +91,31 @@ impl TreeLock {
         })
     }
 
+    /// Break the lock directory if someone else holds it and `confirm`
+    /// agrees (see [`LockableFiles::break_lock`]). A dirstate
+    /// tree's lock is not broken while its dirstate is locked, by this tree
+    /// or a live process: that is [`LockableFilesError::Active`].
+    pub fn break_lock(
+        &self,
+        confirm: &mut dyn FnMut(Option<&crate::lockdir::LockHeldInfo>) -> bool,
+    ) -> Result<bool, LockableFilesError> {
+        if let Some(dirstate) = &self.dirstate {
+            let mut dirstate = dirstate.lock().unwrap();
+            if dirstate.lock_state().is_some() {
+                return Err(LockableFilesError::Active);
+            }
+            // The OS lock fails while the process holding it is alive.
+            match dirstate.lock_write() {
+                Ok(()) => dirstate.unlock().map_err(LockableFilesError::Dirstate)?,
+                Err(crate::dirstate::TransportError::LockContention(_)) => {
+                    return Err(LockableFilesError::Active)
+                }
+                Err(e) => return Err(LockableFilesError::Dirstate(e)),
+            }
+        }
+        self.files.break_lock(confirm)
+    }
+
     /// Release the lock taken on the files when the dirstate cannot be
     /// locked; the failure to lock is what is reported.
     fn release_files(&self) {
@@ -164,5 +189,34 @@ mod tests {
         assert!(!first.files().get_physical_lock_status().unwrap());
         assert_eq!(None, first.unlock().unwrap());
         assert_eq!(None, second.unlock().unwrap());
+    }
+
+    #[test]
+    fn break_lock_refuses_while_the_dirstate_is_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = tree_lock(&dir);
+        let other = tree_lock(&dir);
+        lock.lock_write(&mut NoWait).unwrap();
+        assert!(matches!(
+            other.break_lock(&mut |_| true),
+            Err(LockableFilesError::Active)
+        ));
+        assert!(matches!(
+            lock.break_lock(&mut |_| true),
+            Err(LockableFilesError::Active)
+        ));
+        lock.unlock().unwrap();
+    }
+
+    #[test]
+    fn break_lock_breaks_a_stale_lock_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = tree_lock(&dir);
+        // A holder that went away without unlocking leaves the lock
+        // directory held but the dirstate free.
+        let stale = tree_lock(&dir);
+        stale.files().lock_write(None, &mut NoWait).unwrap();
+        assert!(lock.break_lock(&mut |_| true).unwrap());
+        assert!(!dir.path().join(".bzr/checkout/lock/held").exists());
     }
 }

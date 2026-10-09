@@ -38,6 +38,9 @@ pub enum LockableFilesError {
     NotHeld,
     /// The physical lock is held by someone else and the waiter gave up.
     Contention,
+    /// The lock is in use, by this object or a live process, and cannot be
+    /// broken.
+    Active,
     /// The physical lock failed otherwise.
     Lock(LockError),
     /// Locking the dirstate file failed otherwise.
@@ -50,6 +53,7 @@ impl std::fmt::Display for LockableFilesError {
             LockableFilesError::ReadOnly => f.write_str("object is read-locked"),
             LockableFilesError::NotHeld => f.write_str("lock not held"),
             LockableFilesError::Contention => f.write_str("lock is held by someone else"),
+            LockableFilesError::Active => f.write_str("lock is in use and cannot be broken"),
             LockableFilesError::Lock(e) => write!(f, "{e}"),
             LockableFilesError::Dirstate(e) => write!(f, "{e}"),
         }
@@ -298,6 +302,44 @@ impl LockableFiles {
     /// Release the physical lock with the last write lock again.
     pub fn dont_leave_in_place(&self) {
         self.state.lock().unwrap().locked_via_token = false;
+    }
+
+    /// Break the physical lock if someone else holds it and `confirm`
+    /// agrees. `confirm` is given the holder,
+    /// or `None` when the lock's `info` file cannot be parsed. Returns
+    /// whether a lock was broken.
+    ///
+    /// Breaking a lock this object holds is an error.
+    pub fn break_lock(
+        &self,
+        confirm: &mut dyn FnMut(Option<&LockHeldInfo>) -> bool,
+    ) -> Result<bool, LockableFilesError> {
+        let Some(lock_path) = &self.lock_path else {
+            return Ok(false);
+        };
+        if self.state.lock().unwrap().nonce.is_some() {
+            return Err(LockError::BreakOwnLock.into());
+        }
+        let mut lockdir = LockDir::new(self.transport.as_ref(), lock_path);
+        match lockdir.peek() {
+            Ok(None) => Ok(false),
+            Ok(Some(holder)) => {
+                if !confirm(Some(&holder)) {
+                    return Ok(false);
+                }
+                Ok(lockdir.force_break(&holder)?)
+            }
+            Err(LockError::Corrupt(_)) => {
+                let Some(info) = lockdir.held_info_bytes()? else {
+                    return Ok(false);
+                };
+                if !confirm(None) {
+                    return Ok(false);
+                }
+                Ok(lockdir.force_break_corrupt(&info)?)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Whether the physical lock is held, by anyone.
@@ -622,6 +664,80 @@ mod tests {
         ));
         lock.unlock().unwrap();
         assert_eq!(None, lock.lock_mode());
+    }
+
+    #[test]
+    fn break_lock_asks_before_breaking() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = lock_in(&dir);
+        let other = lock_in(&dir);
+        let token = holder
+            .lock_write(None, &mut NoWait)
+            .unwrap()
+            .into_token()
+            .unwrap();
+
+        let mut asked = Vec::new();
+        let mut decline = |info: Option<&LockHeldInfo>| {
+            asked.push(info.and_then(|i| i.nonce.clone()));
+            false
+        };
+        assert!(!other.break_lock(&mut decline).unwrap());
+        assert_eq!(vec![Some(token.as_str().to_string())], asked);
+        assert!(other.get_physical_lock_status().unwrap());
+
+        assert!(other.break_lock(&mut |_| true).unwrap());
+        assert!(!other.get_physical_lock_status().unwrap());
+        // Nothing left to break.
+        assert!(!other.break_lock(&mut |_| true).unwrap());
+    }
+
+    #[test]
+    fn break_lock_refuses_a_lock_this_object_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_in(&dir);
+        lock.lock_write(None, &mut NoWait).unwrap();
+        assert!(matches!(
+            lock.break_lock(&mut |_| true),
+            Err(LockableFilesError::Lock(LockError::BreakOwnLock))
+        ));
+        lock.unlock().unwrap();
+    }
+
+    #[test]
+    fn break_lock_with_corrupt_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_in(&dir);
+        std::fs::create_dir(dir.path().join("lock/held")).unwrap();
+        std::fs::write(dir.path().join("lock/held/info"), b"{ not yaml").unwrap();
+        let mut asked = Vec::new();
+        assert!(lock
+            .break_lock(&mut |info| {
+                asked.push(info.is_none());
+                true
+            })
+            .unwrap());
+        assert_eq!(vec![true], asked);
+        assert!(!dir.path().join("lock/held").exists());
+    }
+
+    #[test]
+    fn force_break_refuses_a_different_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_in(&dir);
+        let second = lock_in(&dir);
+        first.lock_write(None, &mut NoWait).unwrap();
+        let stale = first.peek().unwrap().unwrap();
+        first.unlock().unwrap();
+        second.lock_write(None, &mut NoWait).unwrap();
+        let transport = second.transport().clone();
+        let mut lockdir = LockDir::new(transport.as_ref(), "lock");
+        assert!(matches!(
+            lockdir.force_break(&stale),
+            Err(LockError::BreakMismatch { .. })
+        ));
+        assert!(second.get_physical_lock_status().unwrap());
+        second.unlock().unwrap();
     }
 
     #[test]

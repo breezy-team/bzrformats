@@ -419,6 +419,21 @@ pub trait WorkingTree: Lockable<Error = WorkingTreeError> + Send + Sync {
     /// The branch the tree is a checkout of.
     fn branch(&self) -> &crate::branch::Branch;
 
+    /// Break the tree's lock, then its branch's and repository's, if
+    /// someone else holds them and `confirm` agrees (see
+    /// [`TreeLock::break_lock`]).
+    fn break_lock(
+        &self,
+        confirm: &mut dyn FnMut(Option<&crate::lockdir::LockHeldInfo>) -> bool,
+    ) -> Result<(), WorkingTreeError> {
+        self.lock()
+            .break_lock(confirm)
+            .map_err(WorkingTreeError::Locking)?;
+        self.branch()
+            .break_lock(confirm)
+            .map_err(WorkingTreeError::Branch)
+    }
+
     /// The branch the tree is a checkout of, for writing.
     fn branch_mut(&mut self) -> &mut crate::branch::Branch;
 

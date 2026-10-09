@@ -490,6 +490,8 @@ simple_error!(ReadOnlyError: LockError, "A write attempt was made in a read only
 simple_error!(ReadOnlyObjectDirtiedError: ReadOnlyError, "Cannot change object %(obj)r in read only transaction"; obj);
 simple_error!(OutSideTransaction: BzrFormatsError, "A transaction related operation was attempted after the transaction finished.");
 simple_error!(LockNotHeld: LockError, "Lock not held: %(lock)s"; lock);
+simple_error!(LockActive: LockError, "The lock for '%(lock_description)s' is in use and cannot be broken."; lock_description);
+simple_error!(LockBreakMismatch: LockError, "Lock was released and re-acquired before being broken: %(lock)s: held by %(holder)r, wanted to break %(target)r"; lock, holder, target);
 
 simple_error!(InconsistentDelta: BzrFormatsError, "An inconsistent delta was supplied involving %(path)r, %(file_id)r\nreason: %(reason)s"; path, file_id, reason);
 
@@ -869,6 +871,8 @@ pub(crate) fn errors_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_class::<OutSideTransaction>()?;
     m.add_class::<LockContention>()?;
     m.add_class::<LockNotHeld>()?;
+    m.add_class::<LockActive>()?;
+    m.add_class::<LockBreakMismatch>()?;
     m.add_class::<AlreadyVersionedError>()?;
     m.add_class::<NotVersionedError>()?;
     Ok(m)

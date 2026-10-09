@@ -95,6 +95,20 @@ pub trait Repository: Lockable<Error = RepositoryError> + Send + Sync {
         Ok(locked)
     }
 
+    /// Break the repository's lock directory if someone else holds it and
+    /// `confirm` agrees (see [`LockableFiles::break_lock`]).
+    ///
+    /// [`LockableFiles::break_lock`]: crate::lockable_files::LockableFiles::break_lock
+    fn break_lock(
+        &self,
+        confirm: &mut dyn FnMut(Option<&crate::lockdir::LockHeldInfo>) -> bool,
+    ) -> Result<(), RepositoryError> {
+        self.lock()
+            .break_lock(confirm)
+            .map(drop)
+            .map_err(RepositoryError::Locking)
+    }
+
     /// Whether the repository is locked for writing.
     fn is_write_locked(&self) -> bool {
         self.lock().lock_mode() == Some(crate::lockable_files::LockMode::Write)

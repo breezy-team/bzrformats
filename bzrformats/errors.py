@@ -92,6 +92,8 @@ ReadOnlyObjectDirtiedError = _errors.ReadOnlyObjectDirtiedError
 OutSideTransaction = _errors.OutSideTransaction
 LockContention = _errors.LockContention
 LockNotHeld = _errors.LockNotHeld
+LockActive = _errors.LockActive
+LockBreakMismatch = _errors.LockBreakMismatch
 AlreadyVersionedError = _errors.AlreadyVersionedError
 NotVersionedError = _errors.NotVersionedError
 
@@ -128,6 +130,8 @@ __all__ = [
     "KnitError",
     "KnitHeaderError",
     "KnitIndexUnknownMethod",
+    "LockActive",
+    "LockBreakMismatch",
     "LockContention",
     "LockError",
     "LockNotHeld",

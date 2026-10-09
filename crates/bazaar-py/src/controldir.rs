@@ -14,6 +14,7 @@ use bazaar::bzrdir::{
     find_control_dir_format, BzrDirAllInOne, BzrDirMeta, ControlDir as RsControlDir,
 };
 use bazaar::lockable_files::{LockMode, LockToken, Lockable, LockableFilesError, NoWait};
+use bazaar::lockdir::{LockError, LockHeldInfo};
 use bazaar::repository::Repository as RsRepository;
 use bazaar::transport::{LocalTransport, SharedTransport};
 use bazaar::workingtree::{EntryKind, WorkingTree as RsWorkingTree};
@@ -30,6 +31,8 @@ pyo3::import_exception!(bzrformats.errors, UnsupportedOperation);
 pyo3::import_exception!(bzrformats.errors, LockContention);
 pyo3::import_exception!(bzrformats.errors, LockNotHeld);
 pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
+pyo3::import_exception!(bzrformats.errors, LockActive);
+pyo3::import_exception!(bzrformats.errors, LockBreakMismatch);
 
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     BzrFormatsError::new_err(e.to_string())
@@ -62,7 +65,66 @@ fn lock_err(e: LockableFilesError, what: &str) -> PyErr {
         LockableFilesError::Contention => LockContention::new_err((what.to_string(),)),
         LockableFilesError::NotHeld => LockNotHeld::new_err((what.to_string(),)),
         LockableFilesError::ReadOnly => ReadOnlyError::new_err((what.to_string(),)),
+        LockableFilesError::Active | LockableFilesError::Lock(LockError::BreakOwnLock) => {
+            LockActive::new_err((what.to_string(),))
+        }
+        LockableFilesError::Lock(LockError::BreakMismatch { held, target }) => {
+            LockBreakMismatch::new_err((what.to_string(), held, target))
+        }
         other => BzrFormatsError::new_err(other.to_string()),
+    }
+}
+
+/// A lock holder as the dict passed to a `break_lock` confirmation
+/// callback, with the fields of [`LockHeldInfo`].
+fn holder_dict<'py>(py: Python<'py>, holder: &LockHeldInfo) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("user", &holder.user)?;
+    d.set_item("hostname", &holder.hostname)?;
+    d.set_item("pid", holder.pid)?;
+    d.set_item("nonce", &holder.nonce)?;
+    let start_time = holder
+        .start_time
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64());
+    d.set_item("start_time", start_time)?;
+    for (key, value) in &holder.extra_holder_info {
+        d.set_item(key, value)?;
+    }
+    Ok(d)
+}
+
+/// Run `f` with a callback asking the Python callable `confirm` whether to
+/// break a lock: it is given the holder as a dict, or `None` when the lock's
+/// info is corrupt. Without `confirm` nothing is broken. An exception the
+/// callable raises declines that break and is raised once `f` returns.
+fn with_confirm<R>(
+    py: Python<'_>,
+    confirm: Option<&Bound<'_, PyAny>>,
+    f: impl FnOnce(&mut dyn FnMut(Option<&LockHeldInfo>) -> bool) -> PyResult<R>,
+) -> PyResult<R> {
+    let mut raised: Option<PyErr> = None;
+    let mut ask = |holder: Option<&LockHeldInfo>| -> bool {
+        let Some(confirm) = confirm else {
+            return false;
+        };
+        if raised.is_some() {
+            return false;
+        }
+        let answer = holder
+            .map(|holder| holder_dict(py, holder))
+            .transpose()
+            .and_then(|info| confirm.call1((info,)))
+            .and_then(|answer| answer.is_truthy());
+        answer.unwrap_or_else(|e| {
+            raised = Some(e);
+            false
+        })
+    };
+    let result = f(&mut ask);
+    match raised {
+        Some(e) => Err(e),
+        None => result,
     }
 }
 
@@ -511,8 +573,18 @@ impl Repository {
         })
     }
 
-    // TODO: break_lock, asking for confirmation before breaking a lock
-    // that may belong to a live process.
+    /// Break the repository's lock if someone else holds it and
+    /// `confirm(holder)` returns true; `holder` is a dict describing the
+    /// holder, or `None` when the lock's info is corrupt. Without `confirm`
+    /// nothing is broken.
+    #[pyo3(signature = (confirm=None))]
+    fn break_lock(&self, py: Python<'_>, confirm: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        self.with(py, |repository| {
+            with_confirm(py, confirm.as_ref(), |ask| {
+                repository.break_lock(ask).map_err(repository_err)
+            })
+        })
+    }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let RepositoryRef::Branch(branch) = &self.inner {
@@ -822,8 +894,17 @@ impl Branch {
         })
     }
 
-    // TODO: break_lock, asking for confirmation before breaking a lock
-    // that may belong to a live process.
+    /// Break the branch's lock, then its repository's, if someone else holds
+    /// them and `confirm(holder)` returns true, as for
+    /// `Repository.break_lock`.
+    #[pyo3(signature = (confirm=None))]
+    fn break_lock(&self, py: Python<'_>, confirm: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        self.with(py, |branch| {
+            with_confirm(py, confirm.as_ref(), |ask| {
+                branch.break_lock(ask).map_err(branch_err)
+            })
+        })
+    }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(repository) = &self.repository {
@@ -1079,8 +1160,16 @@ impl WorkingTree {
             .map_err(|e| lock_err(e, "working tree"))
     }
 
-    // TODO: break_lock, asking for confirmation before breaking a lock
-    // that may belong to a live process.
+    /// Break the tree's lock, then its branch's and repository's, if someone
+    /// else holds them and `confirm(holder)` returns true, as for
+    /// `Repository.break_lock`. A tree whose dirstate is in use raises
+    /// `LockActive`.
+    #[pyo3(signature = (confirm=None))]
+    fn break_lock(&self, py: Python<'_>, confirm: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        with_confirm(py, confirm.as_ref(), |ask| {
+            self.inner.break_lock(ask).map_err(tree_err)
+        })
+    }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(branch) = &self.branch {
