@@ -211,11 +211,21 @@ impl WeaveRepository {
         file_id: &[u8],
         revision: &[u8],
     ) -> Result<Vec<u8>, RepositoryError> {
+        let not_present = || RepositoryError::NoSuchFileText {
+            file_id: file_id.to_vec(),
+            revision: revision.to_vec(),
+        };
         let path = format!("weaves/{}.weave", hash_prefix_map(file_id));
-        let data = self.transport.get_bytes(&path)?;
+        let data = match self.transport.get_bytes(&path) {
+            Err(TransportError::NoSuchFile(_)) => return Err(not_present()),
+            result => result?,
+        };
         let weave =
             read_weave_v5(&data).map_err(|e| RepositoryError::Corrupt(format!("{path}: {e:?}")))?;
-        Self::weave_text(&weave, revision)
+        Self::weave_text(&weave, revision).map_err(|e| match e {
+            RepositoryError::NoSuchRevision(_) => not_present(),
+            e => e,
+        })
     }
 
     /// The signature text stored for `revision_id`, or `None` if unsigned.

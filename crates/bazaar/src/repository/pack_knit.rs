@@ -864,9 +864,13 @@ impl KnitPackRepository {
         revision: &[u8],
     ) -> Result<Vec<u8>, RepositoryError> {
         let key: KnitKey = vec![file_id.to_vec(), revision.to_vec()];
-        self.texts
-            .get_text(&key)
-            .map_err(|e| RepositoryError::Corrupt(format!("text {e}")))
+        self.texts.get_text(&key).map_err(|e| match e {
+            crate::knit::KnitError::RevisionNotPresent(_) => RepositoryError::NoSuchFileText {
+                file_id: file_id.to_vec(),
+                revision: revision.to_vec(),
+            },
+            e => RepositoryError::Corrupt(format!("text {e}")),
+        })
     }
 
     /// Read the raw serialised inventory XML for a revision.

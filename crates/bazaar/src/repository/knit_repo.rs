@@ -250,9 +250,13 @@ impl KnitRepository {
             .load_prefix_typed(vec![file_id.to_vec()])
             .map_err(|e| RepositoryError::Corrupt(format!("load text kndx: {e:?}")))?;
         let key: KnitKey = vec![file_id.to_vec(), revision.to_vec()];
-        self.texts
-            .get_text(&key)
-            .map_err(|e| RepositoryError::Corrupt(format!("text: {e}")))
+        self.texts.get_text(&key).map_err(|e| match e {
+            crate::knit::KnitError::RevisionNotPresent(_) => RepositoryError::NoSuchFileText {
+                file_id: file_id.to_vec(),
+                revision: revision.to_vec(),
+            },
+            e => RepositoryError::Corrupt(format!("text: {e}")),
+        })
     }
 
     /// Add a revision, serialised to XML (v5).

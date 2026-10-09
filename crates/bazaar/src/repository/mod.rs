@@ -723,6 +723,23 @@ mod tests {
     /// signature (where supported) round-trip through every write-capable
     /// repository backend. Replaces the per-backend copies of this test.
     #[test]
+    fn missing_text_is_no_such_file_text() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let repo = (s.create)(t);
+            assert!(
+                matches!(
+                    repo.get_file_text(b"file-id", b"revid"),
+                    Err(RepositoryError::NoSuchFileText { .. })
+                ),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    #[test]
     fn revision_text_inventory_signature_round_trip() {
         for s in scenarios() {
             let dir = tempfile::tempdir().unwrap();
