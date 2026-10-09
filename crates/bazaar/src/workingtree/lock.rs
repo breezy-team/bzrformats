@@ -58,8 +58,8 @@ impl TreeLock {
     }
 
     /// Release one lock, and the dirstate's OS lock with the last. Returns
-    /// the nonce of the lock directory if the last write lock released it.
-    pub fn unlock(&self) -> Result<Option<String>, LockableFilesError> {
+    /// the token of the lock directory if the last write lock released it.
+    pub fn unlock(&self) -> Result<Option<crate::lockable_files::LockToken>, LockableFilesError> {
         let mut result = Ok(());
         if let (1, Some(dirstate)) = (self.files.lock_count(), &self.dirstate) {
             let mut dirstate = dirstate.lock().unwrap();

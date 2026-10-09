@@ -249,6 +249,7 @@ fn copy_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lockable_files::LockableExt as _;
     use crate::repository::Pack2aRepository;
     use crate::transport::{LocalTransport, SharedTransport};
     use std::sync::Arc;
@@ -287,8 +288,7 @@ mod tests {
                 vec![ids[i - 2].as_slice()]
             };
             let parent_vecs: Vec<Vec<u8>> = parents.iter().map(|p| p.to_vec()).collect();
-            repo.lock_write(None, &mut crate::lockable_files::NoWait)
-                .unwrap();
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             let text = format!("hello {i}\n").into_bytes();
             repo.add_text(b"file-1", &rev, &[], &text).unwrap();
@@ -385,8 +385,7 @@ mod tests {
         let root = crate::inventory::ROOT_ID;
         let parents: Vec<&[u8]> = vec![parent];
         let parent_vecs: Vec<Vec<u8>> = vec![parent.to_vec()];
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_text(b"file-1", rev, &[], content).unwrap();
         let entries = vec![
@@ -466,8 +465,7 @@ mod tests {
         let mut src = KnitPackRepository::create(st.clone(), knitpack6).unwrap();
         let root = crate::inventory::ROOT_ID;
         let rev = b"rev-1";
-        src.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut src = src.write_locked().unwrap();
         src.start_write_group().unwrap();
         let text = b"hello\n";
         src.add_text(b"file-1", rev, &[], text).unwrap();
@@ -534,12 +532,10 @@ mod tests {
         // Generic path: drive copy_revision directly into a second target.
         let (_gd, gt) = temp_repo();
         let mut generic = Pack2aRepository::create(gt.clone()).unwrap();
-        generic
-            .lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut generic = generic.write_locked().unwrap();
         generic.start_write_group().unwrap();
         for rev in &ids {
-            copy_revision(&source, &mut generic, rev).unwrap();
+            copy_revision(&source, &mut *generic, rev).unwrap();
         }
         generic.commit_write_group().unwrap();
         generic.unlock().unwrap();
@@ -630,8 +626,7 @@ mod tests {
                 vec![ids[i - 2].as_slice()]
             };
             let parent_vecs: Vec<Vec<u8>> = parents.iter().map(|p| p.to_vec()).collect();
-            repo.lock_write(None, &mut crate::lockable_files::NoWait)
-                .unwrap();
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             let text = format!("hello {i}\n").into_bytes();
             repo.add_text(b"file-1", &rev, &[], &text).unwrap();
@@ -714,12 +709,10 @@ mod tests {
         // Generic path: drive copy_revision directly.
         let (_gd, gt) = temp_repo();
         let mut generic = KnitPackRepository::create(gt.clone(), knitpack6).unwrap();
-        generic
-            .lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut generic = generic.write_locked().unwrap();
         generic.start_write_group().unwrap();
         for rev in &ids {
-            copy_revision(&source, &mut generic, rev).unwrap();
+            copy_revision(&source, &mut *generic, rev).unwrap();
         }
         generic.commit_write_group().unwrap();
         generic.unlock().unwrap();

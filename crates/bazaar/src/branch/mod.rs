@@ -13,6 +13,7 @@ pub use format::{all_formats, find_format, BranchFormat};
 use std::collections::BTreeMap;
 
 use crate::declare_branch_format;
+use crate::lockable_files::{LockToken, LockWaiter, Lockable, LockableExt as _, WriteLocked};
 use crate::lockdir::LockError;
 use crate::transport::{SharedTransport, TransportError};
 
@@ -147,11 +148,36 @@ pub type RevisionInfo = (u64, Vec<u8>);
 /// Owns its transport (as a [`SharedTransport`]) for consistency with the
 /// other opener objects, so a `BzrDir` can hand out a `Branch` that
 /// outlives it.
+///
+/// A `Branch` is a handle: clones share the branch's lock, so a clone can
+/// be locked on behalf of code that only holds a `&Branch`.
+#[derive(Clone)]
 pub struct Branch {
     transport: SharedTransport,
     format: &'static BranchFormat,
     /// The branch's lock, which its writes take.
     lock: crate::lockable_files::LockableFiles,
+}
+
+/// Locking a branch takes the lock its writes share; they take it for
+/// themselves while the branch is unlocked.
+impl Lockable for Branch {
+    type Error = BranchError;
+
+    fn lock_read(&mut self) -> Result<(), BranchError> {
+        self.lock.lock_read();
+        Ok(())
+    }
+
+    fn lock_write(&mut self, waiter: &mut dyn LockWaiter) -> Result<WriteLocked, BranchError> {
+        self.lock
+            .lock_write(None, waiter)
+            .map_err(BranchError::Locking)
+    }
+
+    fn unlock(&mut self) -> Result<Option<LockToken>, BranchError> {
+        self.lock.unlock().map_err(BranchError::Locking)
+    }
 }
 
 impl Branch {
@@ -297,17 +323,12 @@ impl Branch {
         &self,
         f: impl FnOnce() -> Result<R, BranchError>,
     ) -> Result<R, BranchError> {
-        self.lock
-            .lock_write(None, &mut crate::lockable_files::NoWait)
-            .map_err(BranchError::Locking)?;
+        let mut branch = self.clone();
+        let locked = branch.write_locked()?;
         let result = f();
         // Release even if f failed; prefer reporting f's error.
-        let unlock = self.lock.unlock().map_err(BranchError::Locking);
-        match (result, unlock) {
-            (Ok(r), Ok(_)) => Ok(r),
-            (Err(e), _) => Err(e),
-            (Ok(_), Err(e)) => Err(e),
-        }
+        let unlocked = locked.unlock();
+        result.and_then(|r| unlocked.map(|_| r))
     }
 
     /// Set the branch tip to `(revno, revision_id)`, under the branch lock.
@@ -786,6 +807,7 @@ fn decode_tags(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, BranchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lockable_files::WriteGuard;
     use crate::transport::{LocalTransport, Transport};
     use std::sync::Arc;
 
@@ -812,15 +834,12 @@ mod tests {
 
     #[test]
     fn writes_share_a_held_write_lock() {
-        let (_dir, branch, t) = branch_transport();
-        branch
-            .lock()
-            .lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
-        branch.set_last_revision_info(1, b"rev-1").unwrap();
+        let (_dir, mut branch, t) = branch_transport();
+        let locked = branch.write_locked().unwrap();
+        locked.set_last_revision_info(1, b"rev-1").unwrap();
         assert!(t.has("lock/held").unwrap());
-        assert_eq!(1, branch.lock().lock_count());
-        branch.lock().unlock().unwrap();
+        assert_eq!(1, locked.lock().lock_count());
+        locked.unlock().unwrap();
         assert!(!t.has("lock/held").unwrap());
         // Unlocked, a write takes the lock for itself.
         branch.set_last_revision_info(2, b"rev-2").unwrap();
@@ -829,27 +848,51 @@ mod tests {
 
     #[test]
     fn writes_are_refused_under_a_read_lock_or_another_holder() {
-        let (_dir, branch, t) = branch_transport();
-        branch.lock().lock_read();
+        let (_dir, mut branch, t) = branch_transport();
+        let read = branch.read_locked().unwrap();
         assert!(matches!(
-            branch.set_last_revision_info(1, b"rev-1"),
+            read.set_last_revision_info(1, b"rev-1"),
             Err(BranchError::Locking(
                 crate::lockable_files::LockableFilesError::ReadOnly
             ))
         ));
-        branch.lock().unlock().unwrap();
-        let other = Branch::new(t.clone() as SharedTransport);
-        other
-            .lock()
-            .lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        read.unlock().unwrap();
+        let mut other = Branch::new(t.clone() as SharedTransport);
+        let other = other.write_locked().unwrap();
         assert!(matches!(
             branch.set_last_revision_info(1, b"rev-1"),
             Err(BranchError::Locking(
                 crate::lockable_files::LockableFilesError::Contention
             ))
         ));
-        other.lock().unlock().unwrap();
+        other.unlock().unwrap();
+    }
+
+    #[test]
+    fn lock_guards_release_on_drop_and_unlock() {
+        let (_dir, mut branch, t) = branch_transport();
+        {
+            let locked = branch.write_locked().unwrap();
+            assert!(WriteGuard::acquired(&locked));
+            locked.set_last_revision_info(1, b"rev-1").unwrap();
+            assert!(t.has("lock/held").unwrap());
+        }
+        assert!(!t.has("lock/held").unwrap());
+        assert!(!branch.lock().is_locked());
+
+        let locked = branch.write_locked().unwrap();
+        let token = WriteGuard::token(&locked).cloned();
+        assert!(token.is_some());
+        assert_eq!(token, locked.unlock().unwrap());
+
+        let read = branch.read_locked().unwrap();
+        assert_eq!(
+            Some(crate::lockable_files::LockMode::Read),
+            read.lock().lock_mode()
+        );
+        assert_eq!(b"rev-1".to_vec(), read.last_revision().unwrap());
+        read.unlock().unwrap();
+        assert!(!branch.lock().is_locked());
     }
 
     #[test]

@@ -1290,6 +1290,7 @@ fn empty_dirstate_bytes() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lockable_files::LockableExt as _;
     use crate::transport::LocalTransport;
 
     #[test]
@@ -1790,8 +1791,7 @@ mod tests {
         let base = BzrDirMeta::create(&base_parent).unwrap();
         {
             let mut repo = base.open_repository().unwrap();
-            repo.lock_write(None, &mut crate::lockable_files::NoWait)
-                .unwrap();
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             let rev = crate::revision::Revision::new(
                 crate::RevisionId::from(&b"rev-base"[..]),
@@ -1896,8 +1896,7 @@ mod tests {
         // Give the shared repo a revision so we can tell we resolved to it.
         {
             let mut repo = shared.open_repository().unwrap();
-            repo.lock_write(None, &mut crate::lockable_files::NoWait)
-                .unwrap();
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             let rev = crate::revision::Revision::new(
                 crate::RevisionId::from(&b"rev-shared"[..]),
@@ -1975,8 +1974,7 @@ mod tests {
             let mut repo = cd.open_repository().unwrap();
             let root = crate::inventory::ROOT_ID;
             revid = b"rev-1".to_vec();
-            repo.lock_write(None, &mut crate::lockable_files::NoWait)
-                .unwrap();
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             repo.add_text(b"file-1", &revid, &[], b"hi\n").unwrap();
             let entries = vec![

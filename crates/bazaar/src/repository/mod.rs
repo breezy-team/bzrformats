@@ -47,6 +47,7 @@ pub use tree::RevisionTree;
 pub use weave_repo::WeaveRepository;
 
 use crate::inventory::Inventory;
+use crate::lockable_files::{Lockable, LockableExt as _};
 
 /// The common read interface to a bzr repository.
 ///
@@ -54,7 +55,7 @@ use crate::inventory::Inventory;
 /// can be held as `Box<dyn Repository>` while each format keeps its own
 /// inventory representation (a lazy CHK inventory for 2a, an in-memory one
 /// for knit-pack) behind the box — no conversion between them.
-pub trait Repository: Send + Sync {
+pub trait Repository: Lockable<Error = RepositoryError> + Send + Sync {
     /// The format this repository was opened as.
     fn format(&self) -> &'static RepositoryFormat;
 
@@ -73,25 +74,12 @@ pub trait Repository: Send + Sync {
         Ok(())
     }
 
-    /// Lock the repository for reading.
-    fn lock_read(&mut self) -> Result<(), RepositoryError> {
-        let first = !self.lock().is_locked();
-        self.lock().lock_read();
-        if first {
-            if let Err(e) = self.refresh_data() {
-                self.lock().unlock().map_err(RepositoryError::Locking)?;
-                return Err(e);
-            }
-        }
-        Ok(())
-    }
-
     /// Lock the repository for writing, with `token` taking over a held lock
     /// directory and `waiter` deciding what to do while someone else holds
     /// it.
-    fn lock_write(
+    fn lock_write_with_token(
         &mut self,
-        token: Option<&str>,
+        token: Option<&crate::lockable_files::LockToken>,
         waiter: &mut dyn crate::lockable_files::LockWaiter,
     ) -> Result<crate::lockable_files::WriteLocked, RepositoryError> {
         let first = !self.lock().is_locked();
@@ -106,24 +94,6 @@ pub trait Repository: Send + Sync {
             }
         }
         Ok(locked)
-    }
-
-    /// Release one lock. Returns the nonce of the lock directory if that
-    /// released it. Releasing the last write lock with a write group open
-    /// releases it and is an error.
-    ///
-    /// TODO: also abort the open write group, which this crate
-    /// cannot do yet; it is left open.
-    fn unlock(&mut self) -> Result<Option<String>, RepositoryError> {
-        let lock = self.lock();
-        let group_left_open = lock.lock_count() == 1
-            && lock.lock_mode() == Some(crate::lockable_files::LockMode::Write)
-            && self.is_in_write_group();
-        let released = self.lock().unlock().map_err(RepositoryError::Locking)?;
-        if group_left_open {
-            return Err(RepositoryError::WriteGroupOpen);
-        }
-        Ok(released)
     }
 
     /// Whether the repository is locked for writing.
@@ -523,6 +493,38 @@ impl StackedRepository {
     }
 }
 
+impl Lockable for StackedRepository {
+    type Error = RepositoryError;
+
+    /// The fallbacks are read-locked with the first lock.
+    fn lock_read(&mut self) -> Result<(), RepositoryError> {
+        let first = !self.primary.lock().is_locked();
+        self.primary.lock_read()?;
+        if first {
+            self.lock_fallbacks()?;
+        }
+        Ok(())
+    }
+
+    fn lock_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, RepositoryError> {
+        self.lock_write_with_token(None, waiter)
+    }
+
+    /// The fallbacks are released with the last lock.
+    fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, RepositoryError> {
+        let released = self.primary.unlock()?;
+        if !self.primary.lock().is_locked() {
+            for fallback in &mut self.fallbacks {
+                fallback.unlock()?;
+            }
+        }
+        Ok(released)
+    }
+}
+
 impl Repository for StackedRepository {
     fn lock(&self) -> &crate::lockable_files::LockableFiles {
         self.primary.lock()
@@ -537,36 +539,17 @@ impl Repository for StackedRepository {
     }
 
     /// The fallbacks are read-locked with the first lock.
-    fn lock_read(&mut self) -> Result<(), RepositoryError> {
-        let first = !self.primary.lock().is_locked();
-        self.primary.lock_read()?;
-        if first {
-            self.lock_fallbacks()?;
-        }
-        Ok(())
-    }
-
-    fn lock_write(
+    fn lock_write_with_token(
         &mut self,
-        token: Option<&str>,
+        token: Option<&crate::lockable_files::LockToken>,
         waiter: &mut dyn crate::lockable_files::LockWaiter,
     ) -> Result<crate::lockable_files::WriteLocked, RepositoryError> {
         let first = !self.primary.lock().is_locked();
-        let locked = self.primary.lock_write(token, waiter)?;
+        let locked = self.primary.lock_write_with_token(token, waiter)?;
         if first {
             self.lock_fallbacks()?;
         }
         Ok(locked)
-    }
-
-    fn unlock(&mut self) -> Result<Option<String>, RepositoryError> {
-        let released = self.primary.unlock()?;
-        if !self.primary.lock().is_locked() {
-            for fallback in &mut self.fallbacks {
-                fallback.unlock()?;
-            }
-        }
-        Ok(released)
     }
 
     fn format(&self) -> &'static RepositoryFormat {
@@ -765,6 +748,43 @@ pub fn open(transport: SharedTransport) -> Result<Box<dyn Repository>, Repositor
     (format.open)(transport)
 }
 
+/// Read-lock `repository`, rereading its data with the first lock: how a
+/// repository's [`Lockable::lock_read`] works unless it locks differently.
+pub fn lock_read<R: Repository + ?Sized>(repository: &mut R) -> Result<(), RepositoryError> {
+    let first = !repository.lock().is_locked();
+    repository.lock().lock_read();
+    if first {
+        if let Err(e) = repository.refresh_data() {
+            repository
+                .lock()
+                .unlock()
+                .map_err(RepositoryError::Locking)?;
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Release one lock on `repository`: how a repository's
+/// [`Lockable::unlock`] works unless it locks differently. Releasing the
+/// last write lock with a write group open releases it and is an error.
+///
+/// TODO: also abort the open write group, which this crate cannot do yet;
+/// it is left open.
+pub fn unlock<R: Repository + ?Sized>(
+    repository: &mut R,
+) -> Result<Option<crate::lockable_files::LockToken>, RepositoryError> {
+    let lock = repository.lock();
+    let group_left_open = lock.lock_count() == 1
+        && lock.lock_mode() == Some(crate::lockable_files::LockMode::Write)
+        && repository.is_in_write_group();
+    let released = lock.unlock().map_err(RepositoryError::Locking)?;
+    if group_left_open {
+        return Err(RepositoryError::WriteGroupOpen);
+    }
+    Ok(released)
+}
+
 /// Run `f` on `repository` under a write lock: a write lock the caller
 /// holds is counted, and otherwise one is taken for `f` without waiting for
 /// another holder.
@@ -772,14 +792,10 @@ pub fn with_write_lock<T: Repository + ?Sized, R>(
     repository: &mut T,
     f: impl FnOnce(&mut T) -> Result<R, RepositoryError>,
 ) -> Result<R, RepositoryError> {
-    repository.lock_write(None, &mut crate::lockable_files::NoWait)?;
-    let result = f(repository);
-    let unlocked = repository.unlock();
-    match (result, unlocked) {
-        (Ok(r), Ok(_)) => Ok(r),
-        (Err(e), _) => Err(e),
-        (Ok(_), Err(e)) => Err(e),
-    }
+    let mut locked = repository.write_locked()?;
+    let result = f(&mut locked);
+    let unlocked = locked.unlock();
+    result.and_then(|r| unlocked.map(|_| r))
 }
 
 #[cfg(test)]
@@ -903,8 +919,7 @@ mod tests {
             let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
             let mut repo = (s.create)(t.clone());
 
-            repo.lock_write(None, &mut crate::lockable_files::NoWait)
-                .unwrap();
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             repo.add_revision(&revision(b"rev-1", vec![], "first"), &[])
                 .unwrap();
@@ -1038,8 +1053,7 @@ mod tests {
         let t: SharedTransport = Arc::new(LocalTransport::new(dir));
         let mut repo =
             Box::new(Pack2aRepository::create(t.clone()).unwrap()) as Box<dyn Repository>;
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_revision(&revision(rev, vec![], "msg"), &[])
             .unwrap();
@@ -1133,8 +1147,7 @@ mod tests {
         let testament = testament_short_text_for_revision(repo.as_ref(), b"rev-1").unwrap();
         let signature = crate::gpg::clearsign(&testament, &tsk).unwrap();
         let mut repo = repo;
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_signature_text(b"rev-1", &signature).unwrap();
         repo.commit_write_group().unwrap();
@@ -1163,8 +1176,7 @@ mod tests {
         let (cert, tsk) = gen_signing_cert();
         // Sign something that is NOT the revision's testament.
         let signature = crate::gpg::clearsign(b"not the testament\n", &tsk).unwrap();
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_signature_text(b"rev-1", &signature).unwrap();
         repo.commit_write_group().unwrap();
@@ -1184,8 +1196,7 @@ mod tests {
     fn make_2a_with_rev_at(t: &SharedTransport, rev: &[u8]) -> Box<dyn Repository> {
         let mut repo =
             Box::new(Pack2aRepository::create(t.clone()).unwrap()) as Box<dyn Repository>;
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_revision(&revision(rev, vec![], "msg"), &[])
             .unwrap();
