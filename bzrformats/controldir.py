@@ -19,6 +19,10 @@
 ``open(path)`` and ``create(path, format=...)`` return a :class:`BzrDir`, from
 which :class:`Repository`, :class:`Branch` and :class:`WorkingTree` objects can
 be obtained. ``format_names()`` lists the format names ``create`` accepts.
+
+``Branch``, ``Repository`` and ``WorkingTree`` lock together: locking a
+tree locks its branch, and locking a branch locks its repository. The lock
+methods return the result types re-exported here.
 """
 
 from ._bzr_rs.controldir import (
@@ -32,11 +36,19 @@ from ._bzr_rs.controldir import (
     open,
     upgrade,
 )
+from ._bzr_rs.lock import (
+    BranchWriteLockResult,
+    LogicalLockResult,
+    RepositoryWriteLockResult,
+)
 
 __all__ = [
     "Branch",
+    "BranchWriteLockResult",
     "BzrDir",
+    "LogicalLockResult",
     "Repository",
+    "RepositoryWriteLockResult",
     "WorkingTree",
     "create",
     "create_shared_repository",

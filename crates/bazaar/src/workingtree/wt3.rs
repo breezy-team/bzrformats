@@ -12,6 +12,7 @@
 use std::sync::Mutex;
 
 use crate::hashcache::HashCache;
+use crate::lockable_files::{Lockable as _, LockableExt as _};
 use crate::transport::{SharedTransport, TransportError};
 
 use super::{
@@ -92,6 +93,7 @@ const WT3_ALL_IN_ONE_LAYOUT: Wt3Layout = Wt3Layout {
 pub struct WorkingTree3 {
     transport: SharedTransport,
     lock: super::TreeLock,
+    branch: crate::branch::Branch,
     inventory: crate::inventory::MutableInventory,
     layout: Wt3Layout,
     /// The stat (hash) cache, or `None` when the tree is not on the local
@@ -103,19 +105,27 @@ impl WorkingTree3 {
     /// Open the knit format-3 working tree reachable through `transport`
     /// (rooted at the directory that contains `.bzr`), parsing its working
     /// inventory.
-    pub fn open(transport: SharedTransport) -> Result<Self, WorkingTreeError> {
-        Self::open_with_layout(transport, WT3_CHECKOUT_LAYOUT)
+    /// The tree is a checkout of `branch`.
+    pub fn open(
+        transport: SharedTransport,
+        branch: crate::branch::Branch,
+    ) -> Result<Self, WorkingTreeError> {
+        Self::open_with_layout(transport, branch, WT3_CHECKOUT_LAYOUT)
     }
 
     /// Open the weave all-in-one working tree, whose files live directly under
     /// `.bzr` and whose basis is the branch's `revision-history`.
     #[cfg(feature = "weave")]
-    pub fn open_all_in_one(transport: SharedTransport) -> Result<Self, WorkingTreeError> {
-        Self::open_with_layout(transport, WT3_ALL_IN_ONE_LAYOUT)
+    pub fn open_all_in_one(
+        transport: SharedTransport,
+        branch: crate::branch::Branch,
+    ) -> Result<Self, WorkingTreeError> {
+        Self::open_with_layout(transport, branch, WT3_ALL_IN_ONE_LAYOUT)
     }
 
     fn open_with_layout(
         transport: SharedTransport,
+        branch: crate::branch::Branch,
         layout: Wt3Layout,
     ) -> Result<Self, WorkingTreeError> {
         let inventory = Self::read_inventory(&transport, &layout)?;
@@ -128,6 +138,7 @@ impl WorkingTree3 {
         };
         Ok(WorkingTree3 {
             lock: super::TreeLock::new(SharedTransport::clone(&transport), lock_dir, None),
+            branch,
             transport,
             inventory,
             layout,
@@ -212,12 +223,7 @@ impl WorkingTree3 {
 }
 
 impl WorkingTree3 {
-    fn commit_under_lock(
-        &mut self,
-        repository: &mut dyn crate::repository::Repository,
-        branch: &crate::branch::Branch,
-        options: &CommitOptions,
-    ) -> Result<Vec<u8>, WorkingTreeError> {
+    fn commit_under_lock(&mut self, options: &CommitOptions) -> Result<Vec<u8>, WorkingTreeError> {
         if options.strict {
             let unknowns = self.unknowns()?;
             if !unknowns.is_empty() {
@@ -243,6 +249,7 @@ impl WorkingTree3 {
             return Err(WorkingTreeError::CannotCommitSelectedFileMerge);
         }
 
+        let repository = self.branch.repository();
         let basis = repository
             .revision_tree(&basis_revision_id)
             .map_err(WorkingTreeError::Repository)?;
@@ -272,56 +279,34 @@ impl WorkingTree3 {
             }
         }
 
-        repository
-            .start_write_group()
-            .map_err(WorkingTreeError::Repository)?;
-        {
-            let mut builder = repository
-                .get_commit_builder(
-                    parents.clone(),
-                    revid.clone(),
-                    options.committer.clone(),
-                    options.timestamp,
-                    options.timezone,
-                )
-                .with_properties(properties.clone());
-            builder
-                .record_iter_changes(&changes, |path| {
-                    self.transport
-                        .get_bytes(path)
-                        .map_err(crate::repository::RepositoryError::Transport)
-                })
-                .map_err(WorkingTreeError::Repository)?;
-            builder
-                .finish_inventory()
-                .map_err(WorkingTreeError::Repository)?;
-            builder
-                .commit(&options.message)
-                .map_err(WorkingTreeError::Repository)?;
-        }
-
-        if let Some(key) = &options.signing_key {
-            // The committed inventory entries (root first), needed only to
-            // build the testament for signing.
-            let (paths, inv_entries) =
-                build_committed_entries(&self.transport, &live, &revid, &basis, &changes)?;
-            let signature = sign_commit(
-                &parents,
-                &revid,
-                options,
-                &properties,
-                &paths,
-                &inv_entries,
-                key,
-            )?;
-            repository
-                .add_signature_text(&revid, &signature)
-                .map_err(WorkingTreeError::Repository)?;
-        }
-
-        repository
-            .commit_write_group()
-            .map_err(WorkingTreeError::Repository)?;
+        let signature = match &options.signing_key {
+            Some(key) => {
+                // The committed inventory entries (root first), needed only
+                // to build the testament for signing.
+                let (paths, inv_entries) =
+                    build_committed_entries(&self.transport, &live, &revid, &basis, &changes)?;
+                Some(sign_commit(
+                    &parents,
+                    &revid,
+                    options,
+                    &properties,
+                    &paths,
+                    &inv_entries,
+                    key,
+                )?)
+            }
+            None => None,
+        };
+        super::write_revision(
+            self.branch.repository_mut(),
+            &self.transport,
+            &parents,
+            &revid,
+            options,
+            &properties,
+            &changes,
+            signature.as_deref(),
+        )?;
 
         // Unversion files committed as deletions (they vanished from disk).
         let deleted_paths: Vec<String> = changes
@@ -336,12 +321,13 @@ impl WorkingTree3 {
 
         // Advance the branch tip. The new revno is one past the branch's
         // current tip (format 5's full history determines it).
-        let new_revno = branch
+        let new_revno = self
+            .branch
             .last_revision_info()
             .map_err(WorkingTreeError::Branch)?
             .0
             + 1;
-        branch
+        self.branch
             .set_last_revision_info(new_revno, &revid)
             .map_err(WorkingTreeError::Branch)?;
 
@@ -359,7 +345,7 @@ impl WorkingTree3 {
 
         // Cache the new basis inventory (as xml7), reading it back from the
         // now-committed repository so no working-tree file is re-hashed.
-        self.write_basis_inventory_cache(repository, &revid)?;
+        self.write_basis_inventory_cache(&revid)?;
 
         // Persist any stat-cache entries the diff computed.
         self.flush_hashcache();
@@ -372,26 +358,164 @@ impl crate::lockable_files::Lockable for WorkingTree3 {
     type Error = WorkingTreeError;
 
     fn lock_read(&mut self) -> Result<(), WorkingTreeError> {
-        self.lock.lock_read().map_err(WorkingTreeError::Locking)
+        super::lock_with_branch(
+            self,
+            &mut crate::lockable_files::NoWait,
+            |branch, _| branch.lock_read(),
+            |tree, _| tree.lock.lock_read().map_err(WorkingTreeError::Locking),
+        )
     }
 
     fn lock_write(
         &mut self,
         waiter: &mut dyn crate::lockable_files::LockWaiter,
     ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError> {
-        self.lock
-            .lock_write(waiter)
-            .map_err(WorkingTreeError::Locking)
+        super::lock_with_branch(
+            self,
+            waiter,
+            |branch, waiter| branch.lock_write(waiter).map(drop),
+            |tree, waiter| {
+                tree.lock
+                    .lock_write(waiter)
+                    .map_err(WorkingTreeError::Locking)
+            },
+        )
     }
 
     fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, WorkingTreeError> {
-        self.lock.unlock().map_err(WorkingTreeError::Locking)
+        super::unlock_with_branch(self)
+    }
+}
+
+impl WorkingTree3 {
+    fn add_pending_merge_under_lock(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError> {
+        let mut existing = match self.transport.get_bytes(self.layout.pending_merges) {
+            Ok(b) => b,
+            Err(TransportError::NoSuchFile(_)) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let already = existing
+            .split(|&b| b == b'\n')
+            .any(|line| line == revision_id);
+        if already {
+            return Ok(());
+        }
+        if !existing.is_empty() && !existing.ends_with(b"\n") {
+            existing.push(b'\n');
+        }
+        existing.extend_from_slice(revision_id);
+        existing.push(b'\n');
+        self.transport
+            .put_bytes(self.layout.pending_merges, &existing, None)?;
+        Ok(())
+    }
+
+    fn add_under_lock(
+        &mut self,
+        path: &str,
+        kind: EntryKind,
+        file_id: Option<&[u8]>,
+    ) -> Result<Vec<u8>, WorkingTreeError> {
+        let path = path.trim_matches('/');
+        if let Some(existing) = self.path2id(path) {
+            return Ok(existing);
+        }
+        let file_id = match file_id {
+            Some(id) => id.to_vec(),
+            None => crate::gen_ids::gen_file_id(path),
+        };
+        let parent_id = self.parent_id_for(path)?;
+        let name = basename(path).to_string();
+        let fid = crate::FileId::from(file_id.as_slice());
+        let pid = crate::FileId::from(parent_id.as_slice());
+        let entry = match kind {
+            EntryKind::File => {
+                crate::inventory::Entry::file(fid, name, pid, None, None, None, None, None)
+            }
+            EntryKind::Directory => crate::inventory::Entry::directory(fid, name, pid, None),
+            EntryKind::Symlink => crate::inventory::Entry::link(fid, name, pid, None, None),
+            EntryKind::TreeReference => {
+                crate::inventory::Entry::tree_reference(fid, name, pid, None, None)
+            }
+        };
+        self.inventory
+            .add(entry)
+            .map_err(|e| WorkingTreeError::Commit(format!("add to inventory: {e:?}")))?;
+        self.save_inventory()?;
+        Ok(file_id)
+    }
+
+    fn remove_under_lock(&mut self, path: &str) -> Result<(), WorkingTreeError> {
+        let path = path.trim_matches('/');
+        let file_id = self
+            .path2id(path)
+            .ok_or_else(|| WorkingTreeError::NotVersioned(path.to_string()))?;
+        // delete() removes the entry and its descendants from the inventory.
+        self.inventory
+            .delete(&crate::FileId::from(file_id.as_slice()))
+            .map_err(|e| WorkingTreeError::Commit(format!("remove from inventory: {e:?}")))?;
+        self.save_inventory()
+    }
+
+    fn rename_under_lock(
+        &mut self,
+        from_path: &str,
+        to_path: &str,
+    ) -> Result<(), WorkingTreeError> {
+        let from_path = from_path.trim_matches('/');
+        let to_path = to_path.trim_matches('/');
+        let file_id = self
+            .path2id(from_path)
+            .ok_or_else(|| WorkingTreeError::NotVersioned(from_path.to_string()))?;
+        if self.path2id(to_path).is_some() {
+            return Err(WorkingTreeError::Commit(format!(
+                "destination already versioned: {to_path}"
+            )));
+        }
+        let new_parent = self.parent_id_for(to_path)?;
+        let new_name = basename(to_path).to_string();
+        self.inventory
+            .rename(
+                &crate::FileId::from(file_id.as_slice()),
+                &crate::FileId::from(new_parent.as_slice()),
+                &new_name,
+            )
+            .map_err(|e| WorkingTreeError::Commit(format!("rename in inventory: {e:?}")))?;
+        // Move the file on disk to match the dirstate backend's behaviour.
+        if self.transport.has(from_path)? {
+            self.transport.rename(from_path, to_path)?;
+        }
+        self.save_inventory()
     }
 }
 
 impl WorkingTree for WorkingTree3 {
     fn lock(&self) -> &super::TreeLock {
         &self.lock
+    }
+
+    fn branch(&self) -> &crate::branch::Branch {
+        &self.branch
+    }
+
+    fn branch_mut(&mut self) -> &mut crate::branch::Branch {
+        &mut self.branch
+    }
+
+    fn lock_tree_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError> {
+        super::lock_with_branch(
+            self,
+            waiter,
+            |branch, _| branch.lock_read(),
+            |tree, waiter| {
+                tree.lock
+                    .lock_write(waiter)
+                    .map_err(WorkingTreeError::Locking)
+            },
+        )
     }
 
     fn basis_revision(&self) -> Option<Vec<u8>> {
@@ -429,25 +553,7 @@ impl WorkingTree for WorkingTree3 {
     }
 
     fn add_pending_merge(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError> {
-        let mut existing = match self.transport.get_bytes(self.layout.pending_merges) {
-            Ok(b) => b,
-            Err(TransportError::NoSuchFile(_)) => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        let already = existing
-            .split(|&b| b == b'\n')
-            .any(|line| line == revision_id);
-        if already {
-            return Ok(());
-        }
-        if !existing.is_empty() && !existing.ends_with(b"\n") {
-            existing.push(b'\n');
-        }
-        existing.extend_from_slice(revision_id);
-        existing.push(b'\n');
-        self.transport
-            .put_bytes(self.layout.pending_merges, &existing, None)?;
-        Ok(())
+        super::with_tree_write(self, |wt| wt.add_pending_merge_under_lock(revision_id))
     }
 
     fn list_files(&self) -> Vec<VersionedEntry> {
@@ -524,83 +630,22 @@ impl WorkingTree for WorkingTree3 {
         kind: EntryKind,
         file_id: Option<&[u8]>,
     ) -> Result<Vec<u8>, WorkingTreeError> {
-        let path = path.trim_matches('/');
-        if let Some(existing) = self.path2id(path) {
-            return Ok(existing);
-        }
-        let file_id = match file_id {
-            Some(id) => id.to_vec(),
-            None => crate::gen_ids::gen_file_id(path),
-        };
-        let parent_id = self.parent_id_for(path)?;
-        let name = basename(path).to_string();
-        let fid = crate::FileId::from(file_id.as_slice());
-        let pid = crate::FileId::from(parent_id.as_slice());
-        let entry = match kind {
-            EntryKind::File => {
-                crate::inventory::Entry::file(fid, name, pid, None, None, None, None, None)
-            }
-            EntryKind::Directory => crate::inventory::Entry::directory(fid, name, pid, None),
-            EntryKind::Symlink => crate::inventory::Entry::link(fid, name, pid, None, None),
-            EntryKind::TreeReference => {
-                crate::inventory::Entry::tree_reference(fid, name, pid, None, None)
-            }
-        };
-        self.inventory
-            .add(entry)
-            .map_err(|e| WorkingTreeError::Commit(format!("add to inventory: {e:?}")))?;
-        self.save_inventory()?;
-        Ok(file_id)
+        super::with_tree_write(self, |wt| wt.add_under_lock(path, kind, file_id))
     }
 
     fn remove(&mut self, path: &str) -> Result<(), WorkingTreeError> {
-        let path = path.trim_matches('/');
-        let file_id = self
-            .path2id(path)
-            .ok_or_else(|| WorkingTreeError::NotVersioned(path.to_string()))?;
-        // delete() removes the entry and its descendants from the inventory.
-        self.inventory
-            .delete(&crate::FileId::from(file_id.as_slice()))
-            .map_err(|e| WorkingTreeError::Commit(format!("remove from inventory: {e:?}")))?;
-        self.save_inventory()
+        super::with_tree_write(self, |wt| wt.remove_under_lock(path))
     }
 
     fn rename(&mut self, from_path: &str, to_path: &str) -> Result<(), WorkingTreeError> {
-        let from_path = from_path.trim_matches('/');
-        let to_path = to_path.trim_matches('/');
-        let file_id = self
-            .path2id(from_path)
-            .ok_or_else(|| WorkingTreeError::NotVersioned(from_path.to_string()))?;
-        if self.path2id(to_path).is_some() {
-            return Err(WorkingTreeError::Commit(format!(
-                "destination already versioned: {to_path}"
-            )));
-        }
-        let new_parent = self.parent_id_for(to_path)?;
-        let new_name = basename(to_path).to_string();
-        self.inventory
-            .rename(
-                &crate::FileId::from(file_id.as_slice()),
-                &crate::FileId::from(new_parent.as_slice()),
-                &new_name,
-            )
-            .map_err(|e| WorkingTreeError::Commit(format!("rename in inventory: {e:?}")))?;
-        // Move the file on disk to match the dirstate backend's behaviour.
-        if self.transport.has(from_path)? {
-            self.transport.rename(from_path, to_path)?;
-        }
-        self.save_inventory()
+        super::with_tree_write(self, |wt| wt.rename_under_lock(from_path, to_path))
     }
 
-    fn commit(
-        &mut self,
-        repository: &mut dyn crate::repository::Repository,
-        branch: &crate::branch::Branch,
-        options: &CommitOptions,
-    ) -> Result<Vec<u8>, WorkingTreeError> {
-        super::with_commit_locks(repository, branch, |repository| {
-            self.commit_under_lock(repository, branch, options)
-        })
+    fn commit(&mut self, options: &CommitOptions) -> Result<Vec<u8>, WorkingTreeError> {
+        let mut locked = self.write_locked()?;
+        let result = locked.commit_under_lock(options);
+        let unlocked = locked.unlock();
+        result.and_then(|r| unlocked.map(|_| r))
     }
 
     fn control_transport(&self) -> &SharedTransport {
@@ -638,13 +683,11 @@ impl WorkingTree3 {
     /// The inventory is read back from the repository (a single inventory
     /// record, just written by the commit) rather than re-derived from the
     /// working tree, so no working-tree file is read or hashed again.
-    fn write_basis_inventory_cache(
-        &self,
-        repository: &dyn crate::repository::Repository,
-        revid: &[u8],
-    ) -> Result<(), WorkingTreeError> {
+    fn write_basis_inventory_cache(&self, revid: &[u8]) -> Result<(), WorkingTreeError> {
         use crate::serializer::InventorySerializer;
-        let basis_inv = repository
+        let basis_inv = self
+            .branch
+            .repository()
             .get_inventory(revid)
             .map_err(WorkingTreeError::Repository)?;
         // Rebuild a MutableInventory (root first, then parent-before-child as

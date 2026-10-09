@@ -378,6 +378,74 @@ impl PyLogicalLockResult {
     }
 }
 
+/// `BranchWriteLockResult`: the result of write-locking a branch, with the
+/// branch lock's `token`.
+#[pyclass(name = "BranchWriteLockResult", extends = PyLogicalLockResult)]
+pub(crate) struct PyBranchWriteLockResult;
+
+#[pymethods]
+impl PyBranchWriteLockResult {
+    #[new]
+    pub(crate) fn new(unlock: Py<PyAny>, token: Option<Py<PyAny>>) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyLogicalLockResult { unlock, token }).add_subclass(Self)
+    }
+
+    fn __repr__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<String> {
+        let base = slf.as_super();
+        let token = match &base.token {
+            Some(t) => t.bind(py).repr()?.to_string(),
+            None => "None".to_string(),
+        };
+        Ok(format!(
+            "BranchWriteLockResult({}, {})",
+            base.unlock.bind(py).repr()?,
+            token
+        ))
+    }
+}
+
+/// `RepositoryWriteLockResult`: the result of write-locking a repository,
+/// with the repository lock's `repository_token`.
+#[pyclass(name = "RepositoryWriteLockResult", extends = PyLogicalLockResult)]
+pub(crate) struct PyRepositoryWriteLockResult {
+    repository_token: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyRepositoryWriteLockResult {
+    #[new]
+    pub(crate) fn new(
+        unlock: Py<PyAny>,
+        repository_token: Option<Py<PyAny>>,
+    ) -> PyClassInitializer<Self> {
+        PyClassInitializer::from(PyLogicalLockResult {
+            unlock,
+            token: None,
+        })
+        .add_subclass(Self { repository_token })
+    }
+
+    #[getter]
+    fn repository_token<'py>(&self, py: Python<'py>) -> Bound<'py, PyAny> {
+        match self.repository_token.as_ref() {
+            Some(t) => t.bind(py).clone(),
+            None => py.None().into_bound(py),
+        }
+    }
+
+    fn __repr__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<String> {
+        let token = match &slf.repository_token {
+            Some(t) => t.bind(py).repr()?.to_string(),
+            None => "None".to_string(),
+        };
+        Ok(format!(
+            "RepositoryWriteLockResult({}, {})",
+            token,
+            slf.as_super().unlock.bind(py).repr()?
+        ))
+    }
+}
+
 /// Snapshot the in-process bookkeeping. Returns a dict with two keys:
 /// `read_locks` (mapping path → count) and `write_locks` (set of paths).
 /// Used by `bzrformats.lock` Python tests to verify invariants.
@@ -409,6 +477,8 @@ pub fn _lock_rs(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_class::<PyReadLock>()?;
     m.add_class::<PyWriteLock>()?;
     m.add_class::<PyLogicalLockResult>()?;
+    m.add_class::<PyBranchWriteLockResult>()?;
+    m.add_class::<PyRepositoryWriteLockResult>()?;
     m.add_function(wrap_pyfunction!(_snapshot_state, &m)?)?;
     m.add_function(wrap_pyfunction!(_reset_state, &m)?)?;
     Ok(m)

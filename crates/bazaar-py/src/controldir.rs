@@ -13,16 +13,23 @@ use bazaar::branch::Branch as RsBranch;
 use bazaar::bzrdir::{
     find_control_dir_format, BzrDirAllInOne, BzrDirMeta, ControlDir as RsControlDir,
 };
+use bazaar::lockable_files::{LockMode, LockToken, Lockable, LockableFilesError, NoWait};
 use bazaar::repository::Repository as RsRepository;
 use bazaar::transport::{LocalTransport, SharedTransport};
 use bazaar::workingtree::{EntryKind, WorkingTree as RsWorkingTree};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::{PyTraverseError, PyVisit};
+
+use crate::lock::{PyBranchWriteLockResult, PyLogicalLockResult, PyRepositoryWriteLockResult};
 
 pyo3::import_exception!(bzrformats.errors, BzrFormatsError);
 pyo3::import_exception!(bzrformats.errors, NotStacked);
 pyo3::import_exception!(bzrformats.errors, UnstackableBranchFormat);
 pyo3::import_exception!(bzrformats.errors, UnsupportedOperation);
+pyo3::import_exception!(bzrformats.errors, LockContention);
+pyo3::import_exception!(bzrformats.errors, LockNotHeld);
+pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
 
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     BzrFormatsError::new_err(e.to_string())
@@ -42,8 +49,79 @@ fn branch_err(e: bazaar::branch::BranchError) -> PyErr {
             UnstackableBranchFormat::new_err(("branch", "bzrformats branch"))
         }
         BranchError::Unsupported(op) => UnsupportedOperation::new_err((op, "bzrformats branch")),
+        BranchError::Locking(e) => lock_err(e, "branch"),
+        BranchError::Repository(e) => repository_err(e),
         other => BzrFormatsError::new_err(other.to_string()),
     }
+}
+
+/// Map a failure to lock `what` onto the lock exceptions in
+/// `bzrformats.errors`.
+fn lock_err(e: LockableFilesError, what: &str) -> PyErr {
+    match e {
+        LockableFilesError::Contention => LockContention::new_err((what.to_string(),)),
+        LockableFilesError::NotHeld => LockNotHeld::new_err((what.to_string(),)),
+        LockableFilesError::ReadOnly => ReadOnlyError::new_err((what.to_string(),)),
+        other => BzrFormatsError::new_err(other.to_string()),
+    }
+}
+
+/// Map a repository error, lock failures onto the lock exceptions.
+fn repository_err(e: bazaar::repository::RepositoryError) -> PyErr {
+    match e {
+        bazaar::repository::RepositoryError::Locking(e) => lock_err(e, "repository"),
+        other => err(other),
+    }
+}
+
+/// Map a working tree error, lock failures onto the lock exceptions.
+fn tree_err(e: bazaar::workingtree::WorkingTreeError) -> PyErr {
+    use bazaar::workingtree::WorkingTreeError;
+    match e {
+        WorkingTreeError::Locking(e) => lock_err(e, "working tree"),
+        WorkingTreeError::Branch(e) => branch_err(e),
+        WorkingTreeError::Repository(e) => repository_err(e),
+        other => err(other),
+    }
+}
+
+/// The name of a lock mode, as `peek_lock_mode` returns it.
+fn lock_mode_str(mode: Option<LockMode>) -> Option<&'static str> {
+    mode.map(LockMode::as_str)
+}
+
+/// A `LogicalLockResult` releasing the lock through `unlock`.
+fn logical_lock_result(unlock: Bound<'_, PyAny>) -> PyResult<Py<PyLogicalLockResult>> {
+    Py::new(
+        unlock.py(),
+        PyLogicalLockResult {
+            unlock: unlock.unbind(),
+            token: None,
+        },
+    )
+}
+
+/// The token of a write lock as a Python string, or `None`.
+fn token_object(py: Python<'_>, token: Option<LockToken>) -> Option<Py<PyAny>> {
+    token.map(|t| {
+        pyo3::types::PyString::new(py, t.as_str())
+            .into_any()
+            .unbind()
+    })
+}
+
+/// Where a `Repository` object's repository lives: its own, or the one held
+/// by the branch it was reached through as `branch.repository`.
+enum RepositoryRef {
+    Owned(Box<dyn RsRepository>),
+    Branch(Py<Branch>),
+}
+
+/// Where a `Branch` object's branch lives: its own, or the one held by the
+/// working tree it was reached through as `tree.branch`.
+enum BranchRef {
+    Owned(RsBranch),
+    Tree(Py<WorkingTree>),
 }
 
 fn kind_str(kind: EntryKind) -> &'static str {
@@ -121,24 +199,25 @@ impl BzrDir {
 
     /// Open the repository in this control directory.
     fn open_repository(&self) -> PyResult<Repository> {
-        Ok(Repository {
-            inner: self.inner.open_repository().map_err(err)?,
-        })
+        Ok(Repository::owned(
+            self.inner.open_repository().map_err(err)?,
+        ))
     }
 
     /// Open the repository with any stacked-on fallback activated, so reads
     /// resolve objects held only in the base repository this branch is stacked
     /// on.
     fn open_repository_stacked(&self) -> PyResult<Repository> {
-        Ok(Repository {
-            inner: self.inner.open_repository_stacked().map_err(err)?,
-        })
+        Ok(Repository::owned(
+            self.inner.open_repository_stacked().map_err(err)?,
+        ))
     }
 
     /// Open the branch in this control directory.
     fn open_branch(&self) -> PyResult<Branch> {
         Ok(Branch {
-            inner: self.inner.open_branch().map_err(err)?,
+            inner: BranchRef::Owned(self.inner.open_branch().map_err(err)?),
+            repository: None,
         })
     }
 
@@ -146,6 +225,7 @@ impl BzrDir {
     fn open_workingtree(&self) -> PyResult<WorkingTree> {
         Ok(WorkingTree {
             inner: self.inner.open_workingtree().map_err(err)?,
+            branch: None,
         })
     }
 
@@ -167,9 +247,9 @@ impl BzrDir {
     /// Find the repository serving this control directory, walking up to an
     /// enclosing shared repository when this one has none of its own.
     fn find_repository(&self) -> PyResult<Repository> {
-        Ok(Repository {
-            inner: self.inner.find_repository().map_err(err)?,
-        })
+        Ok(Repository::owned(
+            self.inner.find_repository().map_err(err)?,
+        ))
     }
 }
 
@@ -181,24 +261,66 @@ impl BzrDir {
 // BzrDir.open_repository_stacked, which covers the branch-stacking use case.
 #[pyclass(name = "Repository")]
 struct Repository {
-    inner: Box<dyn RsRepository>,
+    inner: RepositoryRef,
+}
+
+impl Repository {
+    fn owned(repository: Box<dyn RsRepository>) -> Self {
+        Repository {
+            inner: RepositoryRef::Owned(repository),
+        }
+    }
+
+    /// Run `f` on the repository, wherever it lives.
+    fn with<R>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&dyn RsRepository) -> PyResult<R>,
+    ) -> PyResult<R> {
+        match &self.inner {
+            RepositoryRef::Owned(repository) => f(repository.as_ref()),
+            RepositoryRef::Branch(branch) => branch
+                .bind(py)
+                .try_borrow()?
+                .with(py, |branch| f(branch.repository())),
+        }
+    }
+
+    /// Run `f` on the repository for writing, wherever it lives.
+    fn with_mut<R>(
+        &mut self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut dyn RsRepository) -> PyResult<R>,
+    ) -> PyResult<R> {
+        match &mut self.inner {
+            RepositoryRef::Owned(repository) => f(repository.as_mut()),
+            RepositoryRef::Branch(branch) => branch
+                .bind(py)
+                .try_borrow_mut()?
+                .with_mut(py, |branch| f(branch.repository_mut())),
+        }
+    }
 }
 
 #[pymethods]
 impl Repository {
     /// This repository's format as `{format_string: bytes, description: str}`.
     fn format<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let fmt = self.inner.format();
-        let d = PyDict::new(py);
-        d.set_item("format_string", PyBytes::new(py, fmt.format_string()))?;
-        d.set_item("description", fmt.get_format_description())?;
-        Ok(d)
+        self.with(py, |inner| {
+            let fmt = inner.format();
+            let d = PyDict::new(py);
+            d.set_item("format_string", PyBytes::new(py, fmt.format_string()))?;
+            d.set_item("description", fmt.get_format_description())?;
+            Ok(d)
+        })
     }
 
     /// All revision ids in this repository, sorted.
     fn all_revision_ids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let ids = self.inner.all_revision_ids().map_err(err)?;
-        PyList::new(py, ids.iter().map(|i| PyBytes::new(py, i)))
+        self.with(py, |inner| {
+            let ids = inner.all_revision_ids().map_err(err)?;
+            PyList::new(py, ids.iter().map(|i| PyBytes::new(py, i)))
+        })
     }
 
     /// The stored parents of each of `revision_ids`, as a `{revid: [parent]}`
@@ -208,18 +330,20 @@ impl Repository {
         py: Python<'py>,
         revision_ids: Vec<Vec<u8>>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let map = self.inner.get_parent_map(&revision_ids).map_err(err)?;
-        let d = PyDict::new(py);
-        for (revid, parents) in map {
-            let plist = PyList::new(py, parents.iter().map(|p| PyBytes::new(py, p)))?;
-            d.set_item(PyBytes::new(py, &revid), plist)?;
-        }
-        Ok(d)
+        self.with(py, |inner| {
+            let map = inner.get_parent_map(&revision_ids).map_err(err)?;
+            let d = PyDict::new(py);
+            for (revid, parents) in map {
+                let plist = PyList::new(py, parents.iter().map(|p| PyBytes::new(py, p)))?;
+                d.set_item(PyBytes::new(py, &revid), plist)?;
+            }
+            Ok(d)
+        })
     }
 
     /// Whether `revision_id` is present in this repository.
-    fn has_revision(&self, revision_id: &[u8]) -> PyResult<bool> {
-        self.inner.has_revision(revision_id).map_err(err)
+    fn has_revision(&self, py: Python<'_>, revision_id: &[u8]) -> PyResult<bool> {
+        self.with(py, |inner| inner.has_revision(revision_id).map_err(err))
     }
 
     /// The committer, message and parents of a revision, as a dict.
@@ -228,26 +352,28 @@ impl Repository {
         py: Python<'py>,
         revision_id: &[u8],
     ) -> PyResult<Bound<'py, PyDict>> {
-        let rev = self.inner.get_revision(revision_id).map_err(err)?;
-        let d = PyDict::new(py);
-        d.set_item("revision_id", PyBytes::new(py, rev.revision_id.as_bytes()))?;
-        d.set_item("committer", rev.committer.clone())?;
-        d.set_item("message", rev.message.clone())?;
-        d.set_item("timestamp", rev.timestamp)?;
-        let parents = PyList::new(
-            py,
-            rev.parent_ids
-                .iter()
-                .map(|p| PyBytes::new(py, p.as_bytes())),
-        )?;
-        d.set_item("parent_ids", parents)?;
-        d.set_item("timezone", rev.timezone)?;
-        let props = PyDict::new(py);
-        for (k, v) in &rev.properties {
-            props.set_item(k, PyBytes::new(py, v))?;
-        }
-        d.set_item("properties", props)?;
-        Ok(d)
+        self.with(py, |inner| {
+            let rev = inner.get_revision(revision_id).map_err(err)?;
+            let d = PyDict::new(py);
+            d.set_item("revision_id", PyBytes::new(py, rev.revision_id.as_bytes()))?;
+            d.set_item("committer", rev.committer.clone())?;
+            d.set_item("message", rev.message.clone())?;
+            d.set_item("timestamp", rev.timestamp)?;
+            let parents = PyList::new(
+                py,
+                rev.parent_ids
+                    .iter()
+                    .map(|p| PyBytes::new(py, p.as_bytes())),
+            )?;
+            d.set_item("parent_ids", parents)?;
+            d.set_item("timezone", rev.timezone)?;
+            let props = PyDict::new(py);
+            for (k, v) in &rev.properties {
+                props.set_item(k, PyBytes::new(py, v))?;
+            }
+            d.set_item("properties", props)?;
+            Ok(d)
+        })
     }
 
     /// The full text of a versioned file at a revision.
@@ -257,8 +383,10 @@ impl Repository {
         file_id: &[u8],
         revision: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let text = self.inner.get_file_text(file_id, revision).map_err(err)?;
-        Ok(PyBytes::new(py, &text))
+        self.with(py, |inner| {
+            let text = inner.get_file_text(file_id, revision).map_err(err)?;
+            Ok(PyBytes::new(py, &text))
+        })
     }
 
     /// The full text of the file at tree-relative `path` in `revision`.
@@ -268,10 +396,11 @@ impl Repository {
         path: &str,
         revision: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let text = self
-            .inner
-            .get_file_text_at_path(path, revision)
-            .map_err(err)?;
+        let text = self.with(py, |repository| {
+            repository
+                .get_file_text_at_path(path, revision)
+                .map_err(err)
+        })?;
         Ok(PyBytes::new(py, &text))
     }
 
@@ -281,11 +410,10 @@ impl Repository {
         py: Python<'py>,
         revision_id: &[u8],
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        Ok(self
-            .inner
-            .get_signature_text(revision_id)
-            .map_err(err)?
-            .map(|s| PyBytes::new(py, &s)))
+        let signature = self.with(py, |repository| {
+            repository.get_signature_text(revision_id).map_err(err)
+        })?;
+        Ok(signature.map(|s| PyBytes::new(py, &s)))
     }
 
     /// Verify the stored GPG signature of `revision_id` against `keyring`
@@ -294,58 +422,127 @@ impl Repository {
     /// Returns an integer status matching breezy's `gpg` constants:
     /// 0 valid, 1 key missing, 2 not valid, 3 not signed, 4 expired.
     #[cfg(feature = "gpg")]
-    fn verify_revision_signature(&self, revision_id: &[u8], keyring: Vec<Vec<u8>>) -> PyResult<u8> {
-        let result = self
-            .inner
-            .verify_revision_signature_bytes(revision_id, &keyring)
-            .map_err(err)?;
+    fn verify_revision_signature(
+        &self,
+        py: Python<'_>,
+        revision_id: &[u8],
+        keyring: Vec<Vec<u8>>,
+    ) -> PyResult<u8> {
+        let result = self.with(py, |repository| {
+            repository
+                .verify_revision_signature_bytes(revision_id, &keyring)
+                .map_err(err)
+        })?;
         Ok(result as u8)
     }
 
     /// Lock the repository for reading.
-    fn lock_read(&mut self) -> PyResult<()> {
-        self.inner.lock_read().map_err(err)
+    /// Returns a `LogicalLockResult` whose `unlock` releases the lock.
+    fn lock_read(slf: &Bound<'_, Self>) -> PyResult<Py<PyLogicalLockResult>> {
+        slf.try_borrow_mut()?.with_mut(slf.py(), |repository| {
+            repository.lock_read().map_err(repository_err)
+        })?;
+        logical_lock_result(slf.getattr("unlock")?)
     }
 
-    /// Lock the repository for writing, failing if someone else holds it.
-    /// Returns the token of the lock directory, if the format takes one.
-    fn lock_write(&mut self) -> PyResult<Option<String>> {
-        let locked = self
-            .inner
-            .lock_write(&mut bazaar::lockable_files::NoWait)
-            .map_err(err)?;
-        Ok(locked
-            .into_token()
-            .map(bazaar::lockable_files::LockToken::into_string))
+    /// Lock the repository for writing, failing if someone else holds it;
+    /// with `token`, take over the lock held under it. Returns a
+    /// `RepositoryWriteLockResult` carrying the lock's `repository_token`.
+    #[pyo3(signature = (token=None))]
+    fn lock_write(
+        slf: &Bound<'_, Self>,
+        token: Option<String>,
+    ) -> PyResult<Py<PyRepositoryWriteLockResult>> {
+        let py = slf.py();
+        let token = token.map(LockToken::from);
+        let locked = slf.try_borrow_mut()?.with_mut(py, |repository| {
+            repository
+                .lock_write_with_token(token.as_ref(), &mut NoWait)
+                .map_err(repository_err)
+        })?;
+        Py::new(
+            py,
+            PyRepositoryWriteLockResult::new(
+                slf.getattr("unlock")?.unbind(),
+                token_object(py, locked.into_token()),
+            ),
+        )
     }
 
     /// Release one lock.
-    fn unlock(&mut self) -> PyResult<()> {
-        self.inner.unlock().map(|_| ()).map_err(err)
+    fn unlock(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.with_mut(py, |repository| {
+            repository.unlock().map(drop).map_err(repository_err)
+        })
+    }
+
+    fn is_locked(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with(py, |repository| Ok(repository.lock().is_locked()))
+    }
+
+    fn is_write_locked(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with(py, |repository| Ok(repository.is_write_locked()))
+    }
+
+    /// Whether the repository's lock directory is held, by anyone.
+    fn get_physical_lock_status(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with(py, |repository| {
+            repository
+                .lock()
+                .get_physical_lock_status()
+                .map_err(|e| lock_err(e, "repository"))
+        })
+    }
+
+    /// Leave the lock directory held when this object is unlocked.
+    fn leave_lock_in_place(&self, py: Python<'_>) -> PyResult<()> {
+        self.with(py, |repository| {
+            repository.lock().leave_in_place();
+            Ok(())
+        })
+    }
+
+    /// Release the lock directory when this object is unlocked, even if it
+    /// did not take it.
+    fn dont_leave_lock_in_place(&self, py: Python<'_>) -> PyResult<()> {
+        self.with(py, |repository| {
+            repository.lock().dont_leave_in_place();
+            Ok(())
+        })
+    }
+
+    // TODO: break_lock, asking for confirmation before breaking a lock
+    // that may belong to a live process.
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let RepositoryRef::Branch(branch) = &self.inner {
+            visit.call(branch)?;
+        }
+        Ok(())
     }
 
     /// Open a write group: a batch of additions flushed by
     /// `commit_write_group`. Writing requires a write lock and an open write
     /// group.
-    fn start_write_group(&mut self) -> PyResult<()> {
-        self.inner.start_write_group().map_err(err)
+    fn start_write_group(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.with_mut(py, |inner| inner.start_write_group().map_err(err))
     }
 
     /// Flush the open write group, committing its additions.
-    fn commit_write_group(&mut self) -> PyResult<()> {
-        self.inner.commit_write_group().map_err(err)
+    fn commit_write_group(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.with_mut(py, |inner| inner.commit_write_group().map_err(err))
     }
 
     /// Combine the repository's packs into a single pack. A no-op for formats
     /// without packs, or a repository already holding one pack.
-    fn pack(&mut self) -> PyResult<()> {
-        self.inner.pack().map_err(err)
+    fn pack(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.with_mut(py, |inner| inner.pack().map_err(err))
     }
 
     /// Repack the smallest packs if the repository has accumulated too many.
     /// Returns whether a repack happened.
-    fn autopack(&mut self) -> PyResult<bool> {
-        self.inner.autopack().map_err(err)
+    fn autopack(&mut self, py: Python<'_>) -> PyResult<bool> {
+        self.with_mut(py, |inner| inner.autopack().map_err(err))
     }
 
     /// Check repository integrity. Returns a dict with `checked_revisions`,
@@ -353,16 +550,18 @@ impl Repository {
     /// (a list of description strings). An empty `problems` list means the
     /// repository is consistent.
     fn check<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let result = self.inner.check().map_err(err)?;
-        let d = PyDict::new(py);
-        d.set_item("checked_revisions", result.checked_revisions)?;
-        d.set_item("checked_texts", result.checked_texts)?;
-        d.set_item(
-            "ghosts",
-            PyList::new(py, result.ghosts.iter().map(|g| PyBytes::new(py, g)))?,
-        )?;
-        d.set_item("problems", result.problems)?;
-        Ok(d)
+        self.with(py, |inner| {
+            let result = inner.check().map_err(err)?;
+            let d = PyDict::new(py);
+            d.set_item("checked_revisions", result.checked_revisions)?;
+            d.set_item("checked_texts", result.checked_texts)?;
+            d.set_item(
+                "ghosts",
+                PyList::new(py, result.ghosts.iter().map(|g| PyBytes::new(py, g)))?,
+            )?;
+            d.set_item("problems", result.problems)?;
+            Ok(d)
+        })
     }
 
     /// Reconcile (garbage-collect) the repository: regenerate its storage
@@ -370,11 +569,13 @@ impl Repository {
     /// Returns a dict with `garbage_inventories` (count of unreachable
     /// inventories dropped) and `repacked` (whether storage was regenerated).
     fn reconcile<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let result = self.inner.reconcile().map_err(err)?;
-        let d = PyDict::new(py);
-        d.set_item("garbage_inventories", result.garbage_inventories)?;
-        d.set_item("repacked", result.repacked)?;
-        Ok(d)
+        self.with_mut(py, |inner| {
+            let result = inner.reconcile().map_err(err)?;
+            let d = PyDict::new(py);
+            d.set_item("garbage_inventories", result.garbage_inventories)?;
+            d.set_item("repacked", result.repacked)?;
+            Ok(d)
+        })
     }
 
     /// Copy revisions from `source` into this repository, returning the number
@@ -383,12 +584,16 @@ impl Repository {
     #[pyo3(signature = (source, revision_id=None))]
     fn fetch(
         &mut self,
+        py: Python<'_>,
         source: &Bound<'_, Repository>,
         revision_id: Option<&[u8]>,
     ) -> PyResult<usize> {
-        let source = source.borrow();
-        bazaar::repository::fetch(source.inner.as_ref(), self.inner.as_mut(), revision_id)
-            .map_err(err)
+        let source = source.try_borrow()?;
+        source.with(py, |source| {
+            self.with_mut(py, |target| {
+                bazaar::repository::fetch(source, target, revision_id).map_err(err)
+            })
+        })
     }
 
     /// Add a file text keyed by `(file_id, revision)` to the open write group.
@@ -396,21 +601,31 @@ impl Repository {
     #[pyo3(signature = (file_id, revision, bytes, parents=None))]
     fn add_text(
         &mut self,
+        py: Python<'_>,
         file_id: &[u8],
         revision: &[u8],
         bytes: &[u8],
         parents: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     ) -> PyResult<()> {
-        self.inner
-            .add_text(file_id, revision, &parents.unwrap_or_default(), bytes)
-            .map_err(err)
+        self.with_mut(py, |inner| {
+            inner
+                .add_text(file_id, revision, &parents.unwrap_or_default(), bytes)
+                .map_err(err)
+        })
     }
 
     /// Add a signature text for `revision_id` to the open write group.
-    fn add_signature_text(&mut self, revision_id: &[u8], signature: &[u8]) -> PyResult<()> {
-        self.inner
-            .add_signature_text(revision_id, signature)
-            .map_err(err)
+    fn add_signature_text(
+        &mut self,
+        py: Python<'_>,
+        revision_id: &[u8],
+        signature: &[u8],
+    ) -> PyResult<()> {
+        self.with_mut(py, |inner| {
+            inner
+                .add_signature_text(revision_id, signature)
+                .map_err(err)
+        })
     }
 
     /// Add a revision to the open write group.
@@ -425,6 +640,7 @@ impl Repository {
     #[allow(clippy::too_many_arguments)]
     fn add_revision(
         &mut self,
+        py: Python<'_>,
         revision_id: &[u8],
         message: &str,
         committer: Option<String>,
@@ -434,28 +650,30 @@ impl Repository {
         revprops: Option<&Bound<'_, PyDict>>,
         inventory_sha1: Option<Vec<u8>>,
     ) -> PyResult<()> {
-        let parents = parents.unwrap_or_default();
-        let mut properties: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
-        if let Some(props) = revprops {
-            for (k, v) in props.iter() {
-                properties.insert(k.extract()?, v.extract()?);
+        self.with_mut(py, |inner| {
+            let parents = parents.unwrap_or_default();
+            let mut properties: std::collections::HashMap<String, Vec<u8>> =
+                std::collections::HashMap::new();
+            if let Some(props) = revprops {
+                for (k, v) in props.iter() {
+                    properties.insert(k.extract()?, v.extract()?);
+                }
             }
-        }
-        let revision = bazaar::revision::Revision::new(
-            bazaar::RevisionId::from(revision_id),
-            parents
-                .iter()
-                .map(|p| bazaar::RevisionId::from(p.as_slice()))
-                .collect(),
-            committer,
-            message.to_string(),
-            properties,
-            inventory_sha1,
-            timestamp,
-            timezone,
-        );
-        self.inner.add_revision(&revision, &parents).map_err(err)
+            let revision = bazaar::revision::Revision::new(
+                bazaar::RevisionId::from(revision_id),
+                parents
+                    .iter()
+                    .map(|p| bazaar::RevisionId::from(p.as_slice()))
+                    .collect(),
+                committer,
+                message.to_string(),
+                properties,
+                inventory_sha1,
+                timestamp,
+                timezone,
+            );
+            inner.add_revision(&revision, &parents).map_err(err)
+        })
     }
 
     /// The inventory of a revision, as a list of `(path, kind, file_id)`.
@@ -464,157 +682,325 @@ impl Repository {
         py: Python<'py>,
         revision_id: &[u8],
     ) -> PyResult<Bound<'py, PyList>> {
-        let inv = self.inner.get_inventory(revision_id).map_err(err)?;
-        let entries = inv
-            .entries()
-            .map_err(|e| BzrFormatsError::new_err(format!("{e:?}")))?;
-        let out = PyList::empty(py);
-        for (path, entry) in entries {
-            let kind = format!("{:?}", entry.kind()).to_lowercase();
-            let tuple = (path, kind, PyBytes::new(py, entry.file_id().as_bytes()));
-            out.append(tuple)?;
-        }
-        Ok(out)
+        self.with(py, |inner| {
+            let inv = inner.get_inventory(revision_id).map_err(err)?;
+            let entries = inv
+                .entries()
+                .map_err(|e| BzrFormatsError::new_err(format!("{e:?}")))?;
+            let out = PyList::empty(py);
+            for (path, entry) in entries {
+                let kind = format!("{:?}", entry.kind()).to_lowercase();
+                let tuple = (path, kind, PyBytes::new(py, entry.file_id().as_bytes()));
+                out.append(tuple)?;
+            }
+            Ok(out)
+        })
     }
 }
 
 /// A bzr branch.
 #[pyclass(name = "Branch")]
 struct Branch {
-    inner: RsBranch,
+    inner: BranchRef,
+    /// The `repository` object handed out, so it is the same each time.
+    repository: Option<Py<Repository>>,
+}
+
+impl Branch {
+    /// Run `f` on the branch, wherever it lives.
+    fn with<R>(&self, py: Python<'_>, f: impl FnOnce(&RsBranch) -> PyResult<R>) -> PyResult<R> {
+        match &self.inner {
+            BranchRef::Owned(branch) => f(branch),
+            BranchRef::Tree(tree) => f(tree.bind(py).try_borrow()?.inner.branch()),
+        }
+    }
+
+    /// Run `f` on the branch for writing, wherever it lives.
+    fn with_mut<R>(
+        &mut self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut RsBranch) -> PyResult<R>,
+    ) -> PyResult<R> {
+        match &mut self.inner {
+            BranchRef::Owned(branch) => f(branch),
+            BranchRef::Tree(tree) => f(tree.bind(py).try_borrow_mut()?.inner.branch_mut()),
+        }
+    }
 }
 
 #[pymethods]
 impl Branch {
+    /// The repository holding the branch's revisions; the same object each
+    /// time. Locking the branch locks it too.
+    #[getter]
+    fn repository(slf: &Bound<'_, Self>) -> PyResult<Py<Repository>> {
+        let py = slf.py();
+        if let Some(repository) = &slf.try_borrow()?.repository {
+            return Ok(repository.clone_ref(py));
+        }
+        let repository = Py::new(
+            py,
+            Repository {
+                inner: RepositoryRef::Branch(slf.clone().unbind()),
+            },
+        )?;
+        slf.try_borrow_mut()?.repository = Some(repository.clone_ref(py));
+        Ok(repository)
+    }
+
+    /// Lock the branch, and its repository with the first lock, for reading.
+    /// Returns a `LogicalLockResult` whose `unlock` releases the lock.
+    fn lock_read(slf: &Bound<'_, Self>) -> PyResult<Py<PyLogicalLockResult>> {
+        slf.try_borrow_mut()?
+            .with_mut(slf.py(), |branch| branch.lock_read().map_err(branch_err))?;
+        logical_lock_result(slf.getattr("unlock")?)
+    }
+
+    /// Lock the branch, and its repository with the first lock, for writing,
+    /// failing if someone else holds it; with `token`, take over the branch
+    /// lock held under it. Returns a `BranchWriteLockResult` carrying the
+    /// lock's `token`.
+    #[pyo3(signature = (token=None))]
+    fn lock_write(
+        slf: &Bound<'_, Self>,
+        token: Option<String>,
+    ) -> PyResult<Py<PyBranchWriteLockResult>> {
+        let py = slf.py();
+        let token = token.map(LockToken::from);
+        let locked = slf.try_borrow_mut()?.with_mut(py, |branch| {
+            branch
+                .lock_write_with_token(token.as_ref(), &mut NoWait)
+                .map_err(branch_err)
+        })?;
+        Py::new(
+            py,
+            PyBranchWriteLockResult::new(
+                slf.getattr("unlock")?.unbind(),
+                token_object(py, locked.into_token()),
+            ),
+        )
+    }
+
+    /// Release one lock, and the repository's with the last.
+    fn unlock(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.with_mut(py, |branch| branch.unlock().map(drop).map_err(branch_err))
+    }
+
+    fn is_locked(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with(py, |branch| Ok(branch.lock().is_locked()))
+    }
+
+    /// The mode the branch is locked in, `"r"` or `"w"`, or `None`.
+    fn peek_lock_mode(&self, py: Python<'_>) -> PyResult<Option<&'static str>> {
+        self.with(py, |branch| Ok(lock_mode_str(branch.lock().lock_mode())))
+    }
+
+    /// Whether the branch's lock directory is held, by anyone.
+    fn get_physical_lock_status(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with(py, |branch| {
+            branch
+                .lock()
+                .get_physical_lock_status()
+                .map_err(|e| lock_err(e, "branch"))
+        })
+    }
+
+    /// Leave the lock directory held when this object is unlocked.
+    fn leave_lock_in_place(&self, py: Python<'_>) -> PyResult<()> {
+        self.with(py, |branch| {
+            branch.lock().leave_in_place();
+            Ok(())
+        })
+    }
+
+    /// Release the lock directory when this object is unlocked, even if it
+    /// did not take it.
+    fn dont_leave_lock_in_place(&self, py: Python<'_>) -> PyResult<()> {
+        self.with(py, |branch| {
+            branch.lock().dont_leave_in_place();
+            Ok(())
+        })
+    }
+
+    // TODO: break_lock, asking for confirmation before breaking a lock
+    // that may belong to a live process.
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let Some(repository) = &self.repository {
+            visit.call(repository)?;
+        }
+        if let BranchRef::Tree(tree) = &self.inner {
+            visit.call(tree)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&mut self) {
+        self.repository = None;
+    }
+
     /// This branch's format as `{format_string: bytes, description: str}`.
     fn format<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let fmt = self.inner.format();
-        let d = PyDict::new(py);
-        d.set_item("format_string", PyBytes::new(py, fmt.format_string()))?;
-        d.set_item("description", fmt.get_format_description())?;
-        Ok(d)
+        self.with(py, |inner| {
+            let fmt = inner.format();
+            let d = PyDict::new(py);
+            d.set_item("format_string", PyBytes::new(py, fmt.format_string()))?;
+            d.set_item("description", fmt.get_format_description())?;
+            Ok(d)
+        })
     }
 
     /// The tip as `(revno, revision_id)`.
     fn last_revision_info<'py>(&self, py: Python<'py>) -> PyResult<(u64, Bound<'py, PyBytes>)> {
-        let (revno, revid) = self.inner.last_revision_info().map_err(err)?;
-        Ok((revno, PyBytes::new(py, &revid)))
+        self.with(py, |inner| {
+            let (revno, revid) = inner.last_revision_info().map_err(err)?;
+            Ok((revno, PyBytes::new(py, &revid)))
+        })
     }
 
     /// The tip revision id (`b"null:"` for an empty branch).
     fn last_revision<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        Ok(PyBytes::new(py, &self.inner.last_revision().map_err(err)?))
+        self.with(py, |inner| {
+            Ok(PyBytes::new(py, &inner.last_revision().map_err(err)?))
+        })
     }
 
     /// The branch tags as a `{name: revision_id}` dict.
     fn tags<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let tags = self.inner.tags().map_err(err)?;
-        let d = PyDict::new(py);
-        for (name, target) in tags {
-            d.set_item(name, PyBytes::new(py, &target))?;
-        }
-        Ok(d)
+        self.with(py, |inner| {
+            let tags = inner.tags().map_err(err)?;
+            let d = PyDict::new(py);
+            for (name, target) in tags {
+                d.set_item(name, PyBytes::new(py, &target))?;
+            }
+            Ok(d)
+        })
     }
 
     /// The mainline revision ids, oldest first. For a format-5 branch this is
     /// the full `revision-history`; for 6/7/8 it is the tip alone (or empty).
     fn revision_history<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let history = self.inner.revision_history().map_err(err)?;
-        PyList::new(py, history.iter().map(|r| PyBytes::new(py, r)))
+        self.with(py, |inner| {
+            let history = inner.revision_history().map_err(err)?;
+            PyList::new(py, history.iter().map(|r| PyBytes::new(py, r)))
+        })
     }
 
     /// Replace the full mainline (format 5) from a list of revision ids.
-    fn set_revision_history(&self, history: Vec<Vec<u8>>) -> PyResult<()> {
-        self.inner.set_revision_history(&history).map_err(err)
+    fn set_revision_history(&mut self, py: Python<'_>, history: Vec<Vec<u8>>) -> PyResult<()> {
+        self.with_mut(py, |inner| {
+            inner.set_revision_history(&history).map_err(err)
+        })
     }
 
     /// The raw bytes of `branch.conf` (empty if the file is absent).
     fn get_config_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        Ok(PyBytes::new(
-            py,
-            &self.inner.get_config_bytes().map_err(err)?,
-        ))
+        self.with(py, |inner| {
+            Ok(PyBytes::new(py, &inner.get_config_bytes().map_err(err)?))
+        })
     }
 
     /// Set the tip to `(revno, revision_id)`.
-    fn set_last_revision_info(&self, revno: u64, revision_id: &[u8]) -> PyResult<()> {
-        self.inner
-            .set_last_revision_info(revno, revision_id)
-            .map_err(err)
+    fn set_last_revision_info(
+        &mut self,
+        py: Python<'_>,
+        revno: u64,
+        revision_id: &[u8],
+    ) -> PyResult<()> {
+        self.with_mut(py, |inner| {
+            inner
+                .set_last_revision_info(revno, revision_id)
+                .map_err(err)
+        })
     }
 
     /// Replace the branch tags from a `{name: revision_id}` dict.
-    fn set_tags(&self, tags: &Bound<'_, PyDict>) -> PyResult<()> {
-        let mut map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        for (k, v) in tags.iter() {
-            map.insert(k.extract()?, v.extract()?);
-        }
-        self.inner.set_tags(&map).map_err(err)
+    fn set_tags(&mut self, py: Python<'_>, tags: &Bound<'_, PyDict>) -> PyResult<()> {
+        self.with_mut(py, |inner| {
+            let mut map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            for (k, v) in tags.iter() {
+                map.insert(k.extract()?, v.extract()?);
+            }
+            inner.set_tags(&map).map_err(err)
+        })
     }
 
     /// The URL this branch is stacked on. Raises `NotStacked` when a stackable
     /// branch has no stacked-on location, and `UnstackableBranchFormat` for a
     /// format that does not support stacking.
-    fn get_stacked_on_url(&self) -> PyResult<String> {
-        self.inner.get_stacked_on_url().map_err(branch_err)
+    fn get_stacked_on_url(&self, py: Python<'_>) -> PyResult<String> {
+        self.with(py, |inner| inner.get_stacked_on_url().map_err(branch_err))
     }
 
     /// Set (or clear, with `None`) the URL this branch is stacked on.
     #[pyo3(signature = (url=None))]
-    fn set_stacked_on_url(&self, url: Option<&str>) -> PyResult<()> {
-        self.inner.set_stacked_on_url(url).map_err(branch_err)
+    fn set_stacked_on_url(&mut self, py: Python<'_>, url: Option<&str>) -> PyResult<()> {
+        self.with_mut(py, |inner| {
+            inner.set_stacked_on_url(url).map_err(branch_err)
+        })
     }
 
     /// The master branch URL this branch is bound to, or `None` if unbound.
-    fn get_bound_location(&self) -> PyResult<Option<String>> {
-        self.inner.get_bound_location().map_err(branch_err)
+    fn get_bound_location(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        self.with(py, |inner| inner.get_bound_location().map_err(branch_err))
     }
 
     /// The previous master URL after an unbind, or `None`.
-    fn get_old_bound_location(&self) -> PyResult<Option<String>> {
-        self.inner.get_old_bound_location().map_err(branch_err)
+    fn get_old_bound_location(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        self.with(py, |inner| {
+            inner.get_old_bound_location().map_err(branch_err)
+        })
     }
 
     /// Bind this branch to `location` (its new master).
-    fn bind(&self, location: &str) -> PyResult<()> {
-        self.inner.bind(location).map_err(branch_err)
+    fn bind(&mut self, py: Python<'_>, location: &str) -> PyResult<()> {
+        self.with_mut(py, |inner| inner.bind(location).map_err(branch_err))
     }
 
     /// Unbind this branch.
-    fn unbind(&self) -> PyResult<()> {
-        self.inner.unbind().map_err(branch_err)
+    fn unbind(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.with_mut(py, |inner| inner.unbind().map_err(branch_err))
     }
 
     /// The `(branch_location, tree_path)` recorded for a tree-reference
     /// `file_id`, or `(None, None)` if none. Raises `UnsupportedOperation` on a
     /// format without reference locations.
-    fn get_reference_info(&self, file_id: &[u8]) -> PyResult<(Option<String>, Option<String>)> {
-        self.inner.get_reference_info(file_id).map_err(branch_err)
+    fn get_reference_info(
+        &self,
+        py: Python<'_>,
+        file_id: &[u8],
+    ) -> PyResult<(Option<String>, Option<String>)> {
+        self.with(py, |inner| {
+            inner.get_reference_info(file_id).map_err(branch_err)
+        })
     }
 
     /// Record (or, with `branch_location=None`, delete) the reference location
     /// for a tree-reference `file_id`.
     #[pyo3(signature = (file_id, branch_location=None, tree_path=None))]
     fn set_reference_info(
-        &self,
+        &mut self,
+        py: Python<'_>,
         file_id: &[u8],
         branch_location: Option<&str>,
         tree_path: Option<&str>,
     ) -> PyResult<()> {
-        self.inner
-            .set_reference_info(file_id, branch_location, tree_path)
-            .map_err(branch_err)
+        self.with_mut(py, |inner| {
+            inner
+                .set_reference_info(file_id, branch_location, tree_path)
+                .map_err(branch_err)
+        })
     }
 
     /// The URL a branch-reference points at, or `None` if this is not a branch
     /// reference.
-    fn get_reference(&self) -> PyResult<Option<String>> {
-        self.inner.get_reference().map_err(branch_err)
+    fn get_reference(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        self.with(py, |inner| inner.get_reference().map_err(branch_err))
     }
 
     /// Point this branch reference at `to_url`.
-    fn set_reference(&self, to_url: &str) -> PyResult<()> {
-        self.inner.set_reference(to_url).map_err(branch_err)
+    fn set_reference(&mut self, py: Python<'_>, to_url: &str) -> PyResult<()> {
+        self.with_mut(py, |inner| inner.set_reference(to_url).map_err(branch_err))
     }
 }
 
@@ -622,10 +1008,91 @@ impl Branch {
 #[pyclass(name = "WorkingTree")]
 struct WorkingTree {
     inner: Box<dyn RsWorkingTree>,
+    /// The `branch` object handed out, so it is the same each time.
+    branch: Option<Py<Branch>>,
 }
 
 #[pymethods]
 impl WorkingTree {
+    /// The branch this tree is a checkout of; the same object each time.
+    /// Locking the tree locks it too.
+    #[getter]
+    fn branch(slf: &Bound<'_, Self>) -> PyResult<Py<Branch>> {
+        let py = slf.py();
+        if let Some(branch) = &slf.try_borrow()?.branch {
+            return Ok(branch.clone_ref(py));
+        }
+        let branch = Py::new(
+            py,
+            Branch {
+                inner: BranchRef::Tree(slf.clone().unbind()),
+                repository: None,
+            },
+        )?;
+        slf.try_borrow_mut()?.branch = Some(branch.clone_ref(py));
+        Ok(branch)
+    }
+
+    /// Lock the tree and its branch for reading. Returns a
+    /// `LogicalLockResult` whose `unlock` releases the lock.
+    fn lock_read(slf: &Bound<'_, Self>) -> PyResult<Py<PyLogicalLockResult>> {
+        slf.try_borrow_mut()?.inner.lock_read().map_err(tree_err)?;
+        logical_lock_result(slf.getattr("unlock")?)
+    }
+
+    /// Lock the tree for writing and its branch for reading, failing if
+    /// someone else holds the tree. Returns a `LogicalLockResult`.
+    fn lock_tree_write(slf: &Bound<'_, Self>) -> PyResult<Py<PyLogicalLockResult>> {
+        slf.try_borrow_mut()?
+            .inner
+            .lock_tree_write(&mut NoWait)
+            .map_err(tree_err)?;
+        logical_lock_result(slf.getattr("unlock")?)
+    }
+
+    /// Lock the tree and its branch for writing, failing if someone else
+    /// holds either. Returns a `LogicalLockResult`.
+    fn lock_write(slf: &Bound<'_, Self>) -> PyResult<Py<PyLogicalLockResult>> {
+        slf.try_borrow_mut()?
+            .inner
+            .lock_write(&mut NoWait)
+            .map_err(tree_err)?;
+        logical_lock_result(slf.getattr("unlock")?)
+    }
+
+    /// Release one lock on the tree and its branch, saving the tree's changes
+    /// with the last write lock.
+    fn unlock(&mut self) -> PyResult<()> {
+        self.inner.unlock().map(drop).map_err(tree_err)
+    }
+
+    fn is_locked(&self) -> bool {
+        self.inner.lock().files().is_locked()
+    }
+
+    /// Whether the tree's lock directory is held, by anyone.
+    fn get_physical_lock_status(&self) -> PyResult<bool> {
+        self.inner
+            .lock()
+            .files()
+            .get_physical_lock_status()
+            .map_err(|e| lock_err(e, "working tree"))
+    }
+
+    // TODO: break_lock, asking for confirmation before breaking a lock
+    // that may belong to a live process.
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let Some(branch) = &self.branch {
+            visit.call(branch)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&mut self) {
+        self.branch = None;
+    }
+
     /// The basis revision id, or None for a never-committed tree.
     fn basis_revision<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
         self.inner.basis_revision().map(|r| PyBytes::new(py, &r))
@@ -813,8 +1280,11 @@ impl WorkingTree {
         repository: &Bound<'_, Repository>,
         basis_revision_id: &[u8],
     ) -> PyResult<TreeChangesIter> {
-        let repo = repository.borrow();
-        let basis = repo.inner.revision_tree(basis_revision_id).map_err(err)?;
+        let basis = repository
+            .try_borrow()?
+            .with(repository.py(), |repository| {
+                repository.revision_tree(basis_revision_id).map_err(err)
+            })?;
         // The tree-vs-basis diff is a whole-tree comparison, so it runs
         // here; the per-change dicts are built on demand during iteration.
         let changes = self.inner.iter_changes(&basis).map_err(err)?;
@@ -831,12 +1301,16 @@ impl WorkingTree {
         basis_revision_id: &[u8],
         other_revision_ids: Vec<Vec<u8>>,
     ) -> PyResult<TreeChangesIter> {
-        let repo = repository.borrow();
-        let basis = repo.inner.revision_tree(basis_revision_id).map_err(err)?;
-        let others: Vec<_> = other_revision_ids
-            .iter()
-            .map(|r| repo.inner.revision_tree(r).map_err(err))
-            .collect::<Result<_, _>>()?;
+        let (basis, others) = repository
+            .try_borrow()?
+            .with(repository.py(), |repository| {
+                let basis = repository.revision_tree(basis_revision_id).map_err(err)?;
+                let others: Vec<_> = other_revision_ids
+                    .iter()
+                    .map(|r| repository.revision_tree(r).map_err(err))
+                    .collect::<Result<_, _>>()?;
+                Ok((basis, others))
+            })?;
         let changes = self
             .inner
             .iter_changes_with_parents(&basis, &others)
@@ -851,7 +1325,7 @@ impl WorkingTree {
     /// `revprops` is an optional `{str: bytes}` dict of revision properties;
     /// `authors` an optional list of author strings; `revision_id` an
     /// optional explicit id (generated when omitted).
-    #[pyo3(signature = (repository, branch, committer, message, timestamp, timezone,
+    #[pyo3(signature = (committer, message, timestamp, timezone,
         revprops=None, authors=None, revision_id=None, branch_nick=None,
         allow_pointless=false, strict=false, specific_files=None, exclude=None,
         signing_key=None))]
@@ -859,8 +1333,6 @@ impl WorkingTree {
     fn commit<'py>(
         &mut self,
         py: Python<'py>,
-        repository: &Bound<'py, Repository>,
-        branch: &Bound<'py, Branch>,
         committer: &str,
         message: &str,
         timestamp: u64,
@@ -875,8 +1347,6 @@ impl WorkingTree {
         exclude: Option<Vec<String>>,
         signing_key: Option<&[u8]>,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let mut repo = repository.borrow_mut();
-        let branch = branch.borrow();
         let mut options = bazaar::workingtree::CommitOptions::new(committer, message)
             .timestamp(timestamp)
             .timezone(timezone)
@@ -908,10 +1378,7 @@ impl WorkingTree {
         if let Some(key) = signing_key {
             options = options.signing_key(key.to_vec());
         }
-        let revid = self
-            .inner
-            .commit(repo.inner.as_mut(), &branch.inner, &options)
-            .map_err(err)?;
+        let revid = self.inner.commit(&options).map_err(tree_err)?;
         Ok(PyBytes::new(py, &revid))
     }
 }
