@@ -990,6 +990,27 @@ impl KnitPackRepository {
     }
 }
 
+impl crate::lockable_files::Lockable for KnitPackRepository {
+    type Error = super::RepositoryError;
+
+    fn lock_read(&mut self) -> Result<(), super::RepositoryError> {
+        super::lock_read(self)
+    }
+
+    fn lock_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, super::RepositoryError> {
+        super::Repository::lock_write_with_token(self, None, waiter)
+    }
+
+    fn unlock(
+        &mut self,
+    ) -> Result<Option<crate::lockable_files::LockToken>, super::RepositoryError> {
+        super::unlock(self)
+    }
+}
+
 impl super::Repository for KnitPackRepository {
     fn lock(&self) -> &crate::lockable_files::LockableFiles {
         &self.lock
@@ -1592,7 +1613,7 @@ fn serialise_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::Repository as _;
+    use crate::lockable_files::LockableExt as _;
     use crate::transport::LocalTransport;
     use std::sync::Arc;
 
@@ -1633,8 +1654,7 @@ mod tests {
     /// Commit one revision (root-only inventory + one file text) in its own
     /// write group, producing one pack.
     fn commit_one(repo: &mut KnitPackRepository, rev: &[u8]) {
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         let root = crate::inventory::ROOT_ID;
         let entries = vec![
@@ -1749,8 +1769,7 @@ mod tests {
         commit_one(&mut repo, b"rev-good");
         // An inventory + text with no revision -> unreachable garbage.
         let root = crate::inventory::ROOT_ID;
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_inventory_from_entries(
             b"rev-garbage",

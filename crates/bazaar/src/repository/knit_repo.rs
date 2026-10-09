@@ -394,6 +394,27 @@ impl KnitRepository {
     }
 }
 
+impl crate::lockable_files::Lockable for KnitRepository {
+    type Error = super::RepositoryError;
+
+    fn lock_read(&mut self) -> Result<(), super::RepositoryError> {
+        super::lock_read(self)
+    }
+
+    fn lock_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, super::RepositoryError> {
+        super::Repository::lock_write_with_token(self, None, waiter)
+    }
+
+    fn unlock(
+        &mut self,
+    ) -> Result<Option<crate::lockable_files::LockToken>, super::RepositoryError> {
+        super::unlock(self)
+    }
+}
+
 impl super::Repository for KnitRepository {
     fn lock(&self) -> &crate::lockable_files::LockableFiles {
         &self.lock

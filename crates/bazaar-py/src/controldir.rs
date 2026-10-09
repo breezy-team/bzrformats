@@ -312,9 +312,11 @@ impl Repository {
     fn lock_write(&mut self) -> PyResult<Option<String>> {
         let locked = self
             .inner
-            .lock_write(None, &mut bazaar::lockable_files::NoWait)
+            .lock_write(&mut bazaar::lockable_files::NoWait)
             .map_err(err)?;
-        Ok(locked.token)
+        Ok(locked
+            .into_token()
+            .map(bazaar::lockable_files::LockToken::into_string))
     }
 
     /// Release one lock.

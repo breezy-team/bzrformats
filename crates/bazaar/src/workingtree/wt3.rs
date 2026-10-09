@@ -368,6 +368,27 @@ impl WorkingTree3 {
     }
 }
 
+impl crate::lockable_files::Lockable for WorkingTree3 {
+    type Error = WorkingTreeError;
+
+    fn lock_read(&mut self) -> Result<(), WorkingTreeError> {
+        self.lock.lock_read().map_err(WorkingTreeError::Locking)
+    }
+
+    fn lock_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError> {
+        self.lock
+            .lock_write(waiter)
+            .map_err(WorkingTreeError::Locking)
+    }
+
+    fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, WorkingTreeError> {
+        self.lock.unlock().map_err(WorkingTreeError::Locking)
+    }
+}
+
 impl WorkingTree for WorkingTree3 {
     fn lock(&self) -> &super::TreeLock {
         &self.lock

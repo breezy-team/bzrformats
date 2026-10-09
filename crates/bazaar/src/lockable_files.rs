@@ -85,21 +85,71 @@ impl LockWaiter for NoWait {
 struct State {
     mode: Option<LockMode>,
     count: usize,
-    /// The nonce of the physical lock while it is held.
-    nonce: Option<String>,
+    /// The token of the physical lock while it is held.
+    nonce: Option<LockToken>,
     /// The physical lock is not released by the last unlock: it was taken
     /// over with a token, or is to be left in place.
     locked_via_token: bool,
 }
 
-/// The outcome of [`LockableFiles::lock_write`].
+/// The token of a held physical lock: the nonce of its lock directory, by
+/// which another lock object can take the lock over.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LockToken(String);
+
+impl LockToken {
+    /// The token as a string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The token as an owned string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl From<String> for LockToken {
+    fn from(token: String) -> Self {
+        LockToken(token)
+    }
+}
+
+impl From<&str> for LockToken {
+    fn from(token: &str) -> Self {
+        LockToken(token.to_string())
+    }
+}
+
+impl std::fmt::Display for LockToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The outcome of taking a write lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteLocked {
+    token: Option<LockToken>,
+    acquired: bool,
+}
+
+impl WriteLocked {
     /// The token of the physical lock, if the object takes one.
-    pub token: Option<String>,
+    pub fn token(&self) -> Option<&LockToken> {
+        self.token.as_ref()
+    }
+
+    /// The token of the physical lock, if the object takes one.
+    pub fn into_token(self) -> Option<LockToken> {
+        self.token
+    }
+
     /// Whether the physical lock was taken by this call, rather than being
     /// held already or taken over with a token.
-    pub acquired: bool,
+    pub fn acquired(&self) -> bool {
+        self.acquired
+    }
 }
 
 /// A lock on an object's control files. Clones share the lock.
@@ -172,9 +222,10 @@ impl LockableFiles {
     /// taking a new one, and is not released by the last unlock.
     pub fn lock_write(
         &self,
-        token: Option<&str>,
+        token: Option<&LockToken>,
         waiter: &mut dyn LockWaiter,
     ) -> Result<WriteLocked, LockableFilesError> {
+        let token = token.map(LockToken::as_str);
         let mut state = self.state.lock().unwrap();
         match state.mode {
             Some(LockMode::Read) => return Err(LockableFilesError::ReadOnly),
@@ -193,11 +244,11 @@ impl LockableFiles {
             match token {
                 Some(token) => {
                     self.validate_token(Some(token))?;
-                    state.nonce = Some(token.to_string());
+                    state.nonce = Some(LockToken::from(token));
                     state.locked_via_token = true;
                 }
                 None => {
-                    state.nonce = Some(self.wait_lock(lock_path, waiter)?);
+                    state.nonce = Some(LockToken(self.wait_lock(lock_path, waiter)?));
                     state.locked_via_token = false;
                     acquired = true;
                 }
@@ -211,9 +262,9 @@ impl LockableFiles {
         })
     }
 
-    /// Release one lock. Returns the nonce of the physical lock if the last
+    /// Release one lock. Returns the token of the physical lock if the last
     /// write lock released it.
-    pub fn unlock(&self) -> Result<Option<String>, LockableFilesError> {
+    pub fn unlock(&self) -> Result<Option<LockToken>, LockableFilesError> {
         let mut state = self.state.lock().unwrap();
         if state.mode.is_none() {
             return Err(LockableFilesError::NotHeld);
@@ -230,7 +281,7 @@ impl LockableFiles {
         match (mode, &self.lock_path, nonce, via_token) {
             (Some(LockMode::Write), Some(lock_path), Some(nonce), false) => {
                 let mut lockdir = LockDir::new(self.transport.as_ref(), lock_path);
-                lockdir.resume(&nonce)?;
+                lockdir.resume(nonce.as_str())?;
                 lockdir.unlock()?;
                 Ok(Some(nonce))
             }
@@ -310,6 +361,165 @@ impl LockableFiles {
     }
 }
 
+/// An object locked through a counted read or write lock: a branch,
+/// repository or working tree.
+///
+/// These are the raw, counted lock operations; every lock taken must be released
+/// exactly once. Code that locks an object for a scope should use the
+/// guards from [`LockableExt`] instead, and must not release a guard's lock
+/// through these methods.
+pub trait Lockable {
+    /// The error locking or unlocking the object fails with.
+    type Error: std::error::Error;
+
+    /// Take a read lock; a lock of either kind already held is counted.
+    fn lock_read(&mut self) -> Result<(), Self::Error>;
+
+    /// Take a write lock, with `waiter` deciding what to do while someone
+    /// else holds it. A write lock already held is counted; a read lock
+    /// cannot be upgraded.
+    fn lock_write(&mut self, waiter: &mut dyn LockWaiter) -> Result<WriteLocked, Self::Error>;
+
+    /// Release one lock. Returns the token of the physical lock if that
+    /// released it.
+    fn unlock(&mut self) -> Result<Option<LockToken>, Self::Error>;
+}
+
+/// Locks on a [`Lockable`] object that are released when they go out of
+/// scope.
+pub trait LockableExt: Lockable {
+    /// Take a read lock until the guard is dropped.
+    fn read_locked(&mut self) -> Result<ReadGuard<'_, Self>, Self::Error> {
+        self.lock_read()?;
+        Ok(ReadGuard {
+            target: self,
+            released: false,
+        })
+    }
+
+    /// Take a write lock until the guard is dropped, giving up at once if
+    /// someone else holds it.
+    fn write_locked(&mut self) -> Result<WriteGuard<'_, Self>, Self::Error> {
+        self.write_locked_with(&mut NoWait)
+    }
+
+    /// Take a write lock until the guard is dropped, with `waiter` deciding
+    /// what to do while someone else holds it.
+    fn write_locked_with(
+        &mut self,
+        waiter: &mut dyn LockWaiter,
+    ) -> Result<WriteGuard<'_, Self>, Self::Error> {
+        let locked = self.lock_write(waiter)?;
+        Ok(WriteGuard {
+            read: ReadGuard {
+                target: self,
+                released: false,
+            },
+            locked,
+        })
+    }
+}
+
+impl<T: Lockable + ?Sized> LockableExt for T {}
+
+/// A read lock on `T`, released when the guard is dropped.
+///
+/// The guard derefs to `&T` only. That keeps methods taking `&mut T` out of
+/// reach, but it is not a guarantee that nothing is written: an object that
+/// writes through `&self`, as a branch does, refuses the write at runtime
+/// instead. The guard borrows `T` exclusively, so an object has one read
+/// guard at a time even though its read locks are counted.
+///
+/// Dropping the guard releases the lock; a failure to do so is logged, and
+/// panics in debug builds. Call [`unlock`](ReadGuard::unlock) to handle it.
+#[must_use = "the lock is released as soon as the guard is dropped"]
+pub struct ReadGuard<'a, T: Lockable + ?Sized> {
+    target: &'a mut T,
+    released: bool,
+}
+
+impl<T: Lockable + ?Sized> ReadGuard<'_, T> {
+    /// Release the lock. Returns the token of the physical lock if that
+    /// released it.
+    ///
+    /// A method rather than an associated function so that it shadows
+    /// [`Lockable::unlock`] on the locked object, which would release the
+    /// lock out from under the guard.
+    pub fn unlock(mut self) -> Result<Option<LockToken>, T::Error> {
+        self.released = true;
+        self.target.unlock()
+    }
+}
+
+impl<T: Lockable + ?Sized> std::ops::Deref for ReadGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.target
+    }
+}
+
+impl<T: Lockable + ?Sized> Drop for ReadGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Err(e) = self.target.unlock() {
+            log::error!("failed to release lock: {e}");
+            if cfg!(debug_assertions) && !std::thread::panicking() {
+                panic!("failed to release lock: {}", e);
+            }
+        }
+    }
+}
+
+/// A write lock on `T`, released when the guard is dropped.
+///
+/// Dropping the guard releases the lock; a failure to do so, such as a
+/// write group left open or a working tree that could not be saved, is
+/// logged, and panics in debug builds. Call [`unlock`](WriteGuard::unlock)
+/// to handle it.
+#[must_use = "the lock is released as soon as the guard is dropped"]
+pub struct WriteGuard<'a, T: Lockable + ?Sized> {
+    read: ReadGuard<'a, T>,
+    locked: WriteLocked,
+}
+
+impl<T: Lockable + ?Sized> WriteGuard<'_, T> {
+    /// The token of the physical lock, if the object takes one.
+    pub fn token<'g>(guard: &'g Self) -> Option<&'g LockToken> {
+        guard.locked.token()
+    }
+
+    /// Whether the physical lock was taken for this guard, rather than
+    /// being held already.
+    pub fn acquired(guard: &Self) -> bool {
+        guard.locked.acquired()
+    }
+
+    /// Release the lock. Returns the token of the physical lock if that
+    /// released it.
+    ///
+    /// A method for the same reason as [`ReadGuard::unlock`].
+    pub fn unlock(self) -> Result<Option<LockToken>, T::Error> {
+        self.read.unlock()
+    }
+}
+
+impl<T: Lockable + ?Sized> std::ops::Deref for WriteGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.read.target
+    }
+}
+
+impl<T: Lockable + ?Sized> std::ops::DerefMut for WriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.read.target
+    }
+}
+
 /// The lock of the branch whose control files `transport` reaches: every
 /// metadir branch format takes a lock directory, `lock`.
 pub fn branch_lock(transport: SharedTransport) -> LockableFiles {
@@ -333,11 +543,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock = lock_in(&dir);
         let locked = lock.lock_write(None, &mut NoWait).unwrap();
-        assert!(locked.acquired);
-        let token = locked.token.expect("a physical lock has a token");
+        assert!(locked.acquired());
+        let token = locked.into_token().expect("a physical lock has a token");
         assert!(dir.path().join("lock/held/info").exists());
         let again = lock.lock_write(Some(&token), &mut NoWait).unwrap();
-        assert_eq!((Some(token.clone()), false), (again.token, again.acquired));
+        assert_eq!((Some(&token), false), (again.token(), again.acquired()));
         lock.lock_read();
         assert_eq!(3, lock.lock_count());
         assert_eq!(None, lock.unlock().unwrap());
@@ -353,18 +563,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = lock_in(&dir);
         let second = lock_in(&dir);
-        let token = first.lock_write(None, &mut NoWait).unwrap().token.unwrap();
+        let token = first
+            .lock_write(None, &mut NoWait)
+            .unwrap()
+            .into_token()
+            .unwrap();
         assert!(matches!(
             second.lock_write(None, &mut NoWait),
             Err(LockableFilesError::Contention)
         ));
         assert!(matches!(
-            second.lock_write(Some("bogus"), &mut NoWait),
+            second.lock_write(Some(&LockToken::from("bogus")), &mut NoWait),
             Err(LockableFilesError::Lock(LockError::TokenMismatch { .. }))
         ));
         // A lock taken over by token is left for its holder to release.
         let taken = second.lock_write(Some(&token), &mut NoWait).unwrap();
-        assert!(!taken.acquired);
+        assert!(!taken.acquired());
         assert_eq!(None, second.unlock().unwrap());
         assert!(first.get_physical_lock_status().unwrap());
         first.unlock().unwrap();
@@ -417,7 +631,7 @@ mod tests {
             Arc::new(crate::transport::LocalTransport::new(dir.path()));
         let lock = LockableFiles::new(transport, None);
         let locked = lock.lock_write(None, &mut NoWait).unwrap();
-        assert_eq!((None, false), (locked.token, locked.acquired));
+        assert_eq!((None, false), (locked.token(), locked.acquired()));
         assert!(!lock.get_physical_lock_status().unwrap());
         assert_eq!(None, lock.unlock().unwrap());
     }

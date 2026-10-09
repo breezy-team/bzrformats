@@ -31,6 +31,7 @@ pub use wt3::WorkingTree3;
 
 use crate::declare_workingtree_format;
 use crate::dirstate::{DefaultSHA1Provider, DirState, Kind, LoadError};
+use crate::lockable_files::{Lockable, LockableExt as _};
 use crate::transport::{SharedTransport, TransportError};
 
 // Working tree format 3 is the pre-dirstate layout used by the weave and
@@ -405,32 +406,14 @@ impl CommitOptions {
 /// type (e.g. [`WorkingTree4::open`]).
 ///
 /// `Send + Sync` so a boxed tree can be held by the pyo3 bindings.
-pub trait WorkingTree: Send + Sync {
+///
+/// Locking a tree with [`Lockable`] locks the tree itself; locking its
+/// branch is left to the caller. Releasing the last write lock saves the
+/// tree's changes.
+pub trait WorkingTree: Lockable<Error = WorkingTreeError> + Send + Sync {
     /// The tree's lock. Locking the tree's branch with it is left to the
     /// caller.
     fn lock(&self) -> &TreeLock;
-
-    /// Lock the tree for reading. Locking its branch is left to the caller.
-    fn lock_read(&mut self) -> Result<(), WorkingTreeError> {
-        self.lock().lock_read().map_err(WorkingTreeError::Locking)
-    }
-
-    /// Lock the tree itself for writing, with `waiter` deciding what to do
-    /// while someone else holds it.
-    fn lock_tree_write(
-        &mut self,
-        waiter: &mut dyn crate::lockable_files::LockWaiter,
-    ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError> {
-        self.lock()
-            .lock_write(waiter)
-            .map_err(WorkingTreeError::Locking)
-    }
-
-    /// Release one lock, saving the tree's changes with the last write
-    /// lock. Returns the nonce of the lock directory if that released it.
-    fn unlock(&mut self) -> Result<Option<String>, WorkingTreeError> {
-        self.lock().unlock().map_err(WorkingTreeError::Locking)
-    }
 
     /// The inventory of the basis tree as the working tree keeps a copy of
     /// it, or `None` if it keeps none. The base implementation keeps none.
@@ -808,14 +791,10 @@ impl WorkingTree4 {
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<R, WorkingTreeError>,
     ) -> Result<R, WorkingTreeError> {
-        WorkingTree::lock_tree_write(self, &mut crate::lockable_files::NoWait)?;
-        let result = f(self);
-        let unlocked = WorkingTree::unlock(self);
-        match (result, unlocked) {
-            (Ok(r), Ok(_)) => Ok(r),
-            (Err(e), _) => Err(e),
-            (Ok(_), Err(e)) => Err(e),
-        }
+        let mut locked = self.write_locked()?;
+        let result = f(&mut locked);
+        let unlocked = locked.unlock();
+        result.and_then(|r| unlocked.map(|_| r))
     }
 
     /// Note that the in-memory dirstate has changes to save.
@@ -1926,14 +1905,16 @@ impl WorkingTree4 {
     }
 }
 
-impl WorkingTree for WorkingTree4 {
+impl Lockable for WorkingTree4 {
+    type Error = WorkingTreeError;
+
     /// The dirstate is read again with the first lock.
     fn lock_read(&mut self) -> Result<(), WorkingTreeError> {
         self.lock_and_reload(|lock| lock.lock_read())
     }
 
     /// The dirstate is read again with the first lock.
-    fn lock_tree_write(
+    fn lock_write(
         &mut self,
         waiter: &mut dyn crate::lockable_files::LockWaiter,
     ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError> {
@@ -1942,7 +1923,7 @@ impl WorkingTree for WorkingTree4 {
 
     /// A changed dirstate is saved under the lock before the last write lock
     /// is released; if saving fails the tree stays locked.
-    fn unlock(&mut self) -> Result<Option<String>, WorkingTreeError> {
+    fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, WorkingTreeError> {
         let last_write = self.lock.files().lock_count() == 1
             && self.lock.lock_mode() == Some(crate::lockable_files::LockMode::Write);
         if last_write && self.dirty {
@@ -1951,7 +1932,9 @@ impl WorkingTree for WorkingTree4 {
         }
         self.lock.unlock().map_err(WorkingTreeError::Locking)
     }
+}
 
+impl WorkingTree for WorkingTree4 {
     fn lock(&self) -> &TreeLock {
         &self.lock
     }
@@ -2758,19 +2741,22 @@ fn with_commit_locks<R>(
     branch: &crate::branch::Branch,
     f: impl FnOnce(&mut dyn crate::repository::Repository) -> Result<R, WorkingTreeError>,
 ) -> Result<R, WorkingTreeError> {
-    branch
-        .lock()
-        .lock_write(None, &mut crate::lockable_files::NoWait)
-        .map_err(WorkingTreeError::Locking)?;
-    let result = match repository.lock_write(None, &mut crate::lockable_files::NoWait) {
-        Ok(_) => {
-            let result = f(repository);
+    // A branch fails to lock with a locking error, reported as the tree's.
+    let branch_err = |e| match e {
+        crate::branch::BranchError::Locking(e) => WorkingTreeError::Locking(e),
+        e => WorkingTreeError::Branch(e),
+    };
+    let mut branch = branch.clone();
+    let branch_lock = branch.write_locked().map_err(branch_err)?;
+    let result = repository
+        .write_locked()
+        .map_err(WorkingTreeError::Repository)
+        .and_then(|mut repository| {
+            let result = f(&mut *repository);
             let unlocked = repository.unlock().map_err(WorkingTreeError::Repository);
             result.and_then(|r| unlocked.map(|_| r))
-        }
-        Err(e) => Err(WorkingTreeError::Repository(e)),
-    };
-    let unlocked = branch.lock().unlock().map_err(WorkingTreeError::Locking);
+        });
+    let unlocked = branch_lock.unlock().map_err(branch_err);
     result.and_then(|r| unlocked.map(|_| r))
 }
 
@@ -3053,6 +3039,23 @@ mod tests {
 
     /// A repository whose revision index cannot be read.
     struct UnreadableRepository;
+
+    impl crate::lockable_files::Lockable for UnreadableRepository {
+        type Error = RepositoryError;
+
+        fn lock_read(&mut self) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
+        fn lock_write(
+            &mut self,
+            _waiter: &mut dyn crate::lockable_files::LockWaiter,
+        ) -> Result<crate::lockable_files::WriteLocked, RepositoryError> {
+            unimplemented!()
+        }
+        fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, RepositoryError> {
+            unimplemented!()
+        }
+    }
 
     impl crate::repository::Repository for UnreadableRepository {
         fn format(&self) -> &'static crate::repository::RepositoryFormat {
@@ -3368,15 +3371,15 @@ mod tests {
         transport.put_bytes("f", b"x", None).unwrap();
         other.add("f", EntryKind::File, None).unwrap();
         assert!(wt.path2id("f").is_none());
-        WorkingTree::lock_read(&mut wt).unwrap();
+        let wt = wt.read_locked().unwrap();
         assert!(wt.path2id("f").is_some());
-        WorkingTree::unlock(&mut wt).unwrap();
+        wt.unlock().unwrap();
     }
 
     #[test]
     fn add_under_the_tree_write_lock() {
         let (_dir, transport, mut wt) = fresh_tree();
-        WorkingTree::lock_tree_write(&mut wt, &mut crate::lockable_files::NoWait).unwrap();
+        let mut wt = wt.write_locked().unwrap();
         transport.put_bytes("f", b"x", None).unwrap();
         wt.add("f", EntryKind::File, None).unwrap();
         // Saved with the last unlock, not by the add.
@@ -3384,9 +3387,32 @@ mod tests {
             .unwrap()
             .path2id("f")
             .is_none());
-        WorkingTree::unlock(&mut wt).unwrap();
+        wt.unlock().unwrap();
         let reopened = WorkingTree4::open(transport).unwrap();
         assert!(reopened.path2id("f").is_some());
+    }
+
+    #[test]
+    fn tree_write_guard_saves_when_dropped() {
+        let (_dir, transport, mut wt) = fresh_tree();
+        {
+            let mut locked = wt.write_locked().unwrap();
+            transport.put_bytes("f", b"x", None).unwrap();
+            locked.add("f", EntryKind::File, None).unwrap();
+            assert!(WorkingTree4::open(transport.clone())
+                .unwrap()
+                .path2id("f")
+                .is_none());
+        }
+        assert_eq!(None, wt.lock().lock_mode());
+        let mut reopened: Box<dyn WorkingTree> = Box::new(WorkingTree4::open(transport).unwrap());
+        let read = reopened.read_locked().unwrap();
+        assert_eq!(
+            Some(crate::lockable_files::LockMode::Read),
+            read.lock().lock_mode()
+        );
+        read.unlock().unwrap();
+        assert_eq!(None, reopened.lock().lock_mode());
     }
 
     #[test]

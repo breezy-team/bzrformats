@@ -1159,6 +1159,25 @@ impl Pack2aRepository {
     }
 }
 
+impl crate::lockable_files::Lockable for Pack2aRepository {
+    type Error = RepositoryError;
+
+    fn lock_read(&mut self) -> Result<(), RepositoryError> {
+        super::lock_read(self)
+    }
+
+    fn lock_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, RepositoryError> {
+        super::Repository::lock_write_with_token(self, None, waiter)
+    }
+
+    fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, RepositoryError> {
+        super::unlock(self)
+    }
+}
+
 impl super::Repository for Pack2aRepository {
     fn lock(&self) -> &crate::lockable_files::LockableFiles {
         &self.lock
@@ -1447,6 +1466,7 @@ fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackName>, Repositor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lockable_files::{Lockable as _, LockableExt as _};
     use crate::repository::Repository as _;
     use crate::transport::LocalTransport;
     use std::collections::HashMap;
@@ -1500,15 +1520,33 @@ mod tests {
     fn unlock_with_a_write_group_open_is_an_error() {
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t).unwrap();
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        repo.lock_write(&mut crate::lockable_files::NoWait).unwrap();
+        repo.lock_write(&mut crate::lockable_files::NoWait).unwrap();
         repo.start_write_group().unwrap();
         // An inner unlock leaves the write group to the outer lock.
         repo.unlock().unwrap();
         assert!(matches!(
             repo.unlock(),
+            Err(RepositoryError::WriteGroupOpen)
+        ));
+        assert!(!repo.lock().is_locked());
+    }
+
+    #[test]
+    fn lock_guards_release_the_lock() {
+        use crate::repository::Repository;
+        let (_d, t) = temp_repo();
+        let mut repo: Box<dyn Repository> = Box::new(Pack2aRepository::create(t).unwrap());
+        let read = repo.read_locked().unwrap();
+        assert!(read.lock().is_locked());
+        assert!(!read.is_write_locked());
+        drop(read);
+        assert!(!repo.lock().is_locked());
+
+        let mut write = repo.write_locked().unwrap();
+        write.start_write_group().unwrap();
+        assert!(matches!(
+            write.unlock(),
             Err(RepositoryError::WriteGroupOpen)
         ));
         assert!(!repo.lock().is_locked());
@@ -1523,7 +1561,7 @@ mod tests {
         let mut writer = Pack2aRepository::open(t).unwrap();
         commit_one(&mut writer, b"rev-1");
         assert!(!reader.has_revision(b"rev-1").unwrap());
-        reader.lock_read().unwrap();
+        let reader = reader.read_locked().unwrap();
         assert!(reader.has_revision(b"rev-1").unwrap());
         reader.unlock().unwrap();
     }
@@ -1534,10 +1572,11 @@ mod tests {
     fn double_start_write_group_is_rejected() {
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t).unwrap();
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         assert!(repo.start_write_group().is_err());
+        repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
     }
 
     /// Adding to a repository with no open write group is an error (the write
@@ -1560,8 +1599,7 @@ mod tests {
         use crate::FileId;
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
 
         let rev = b"rev-1";
@@ -1637,8 +1675,7 @@ mod tests {
 
         // rev-1: a.txt under the root.
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         let text1 = b"hello\n";
         repo.add_text(b"file-a", b"rev-1", &[], text1).unwrap();
@@ -1668,8 +1705,7 @@ mod tests {
 
         // rev-2: change a.txt, add b.txt -- expressed as an inventory delta.
         let mut repo = Pack2aRepository::open(t.clone()).unwrap();
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         let text1b = b"hello again\n";
         let text2 = b"world\n";
@@ -1734,8 +1770,7 @@ mod tests {
     /// Commit one revision (with a root-only inventory) in its own write group,
     /// producing one pack.
     fn commit_one(repo: &mut Pack2aRepository, rev: &[u8]) {
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_revision(&make_revision(rev, vec![], "m", None), &[])
             .unwrap();
@@ -1873,8 +1908,7 @@ mod tests {
     /// file text is reachable), unlike `commit_one` which adds an orphan text.
     fn commit_with_file(repo: &mut Pack2aRepository, rev: &[u8], text: &[u8]) {
         let root = crate::inventory::ROOT_ID;
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_text(b"file-1", rev, &[], text).unwrap();
         let entries = vec![
@@ -1911,8 +1945,7 @@ mod tests {
         commit_with_file(&mut repo, b"rev-good", b"hello\n");
         // A second write group that writes an inventory + text but no revision:
         // its inventory is unreachable garbage.
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_inventory_from_entries(
             b"rev-garbage",
@@ -1968,8 +2001,7 @@ mod tests {
     fn pack_name_is_content_md5() {
         let (_d, t) = temp_repo();
         let mut repo = Pack2aRepository::create(t.clone()).unwrap();
-        repo.lock_write(None, &mut crate::lockable_files::NoWait)
-            .unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_revision(&make_revision(b"rev-1", vec![], "m", None), &[])
             .unwrap();
