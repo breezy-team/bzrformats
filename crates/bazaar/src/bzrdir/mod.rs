@@ -52,11 +52,16 @@ pub const WORKINGTREE_FORMAT_6: &[u8] = b"Bazaar Working Tree Format 6 (bzr 1.14
 // repository, branch and working-tree marker. A combo is gated behind the
 // same feature as the older repository backend it creates, so it is only
 // registered when that backend is built.
+#[cfg(feature = "knit")]
 const B5: &[u8] = b"Bazaar-NG branch format 5\n";
+#[cfg(feature = "knitpack")]
 const B6: &[u8] = b"Bazaar Branch Format 6 (bzr 0.15)\n";
 const B7: &[u8] = BRANCH_FORMAT_7;
+#[cfg(feature = "knit")]
 const WT3: &[u8] = b"Bazaar-NG Working Tree format 3";
+#[cfg(any(feature = "knitpack", all(feature = "knit", test)))]
 const WT4: &[u8] = WORKINGTREE_FORMAT_4;
+#[cfg(feature = "knitpack")]
 const WT5: &[u8] = b"Bazaar Working Tree Format 5 (bzr 1.11)\n";
 const WT6: &[u8] = WORKINGTREE_FORMAT_6;
 
@@ -1447,6 +1452,7 @@ mod tests {
         BzrDirMeta::open(bzr_transport(root)).unwrap()
     }
 
+    #[cfg(any(feature = "knit", feature = "knitpack"))]
     fn markers(format: &ControlDirFormat) -> [&'static [u8]; 3] {
         [format.repo_marker, format.branch_marker, format.wt_marker]
     }

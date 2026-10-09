@@ -18,6 +18,7 @@ pub type Entry = (Vec<Vec<u8>>, Vec<u8>, Vec<Vec<Vec<Vec<u8>>>>);
 /// A pack index opened in whichever on-disk format it uses.
 pub struct PackIndex {
     entries: Vec<Entry>,
+    #[cfg(feature = "knitpack")]
     node_ref_lists: usize,
 }
 
@@ -37,26 +38,28 @@ impl PackIndex {
         if bytes.starts_with(crate::btree_index::BTREE_SIGNATURE) {
             let btree = BTreeGraphIndex::from_bytes(bytes)
                 .map_err(|e| IndexError::Other(format!("btree index: {e:?}")))?;
-            let node_ref_lists = btree.node_ref_lists();
             let entries = btree
                 .iter_all_entries()
                 .map(|(k, v, r)| (k.clone(), v.clone(), r.clone()))
                 .collect();
             Ok(PackIndex {
                 entries,
-                node_ref_lists,
+                #[cfg(feature = "knitpack")]
+                node_ref_lists: btree.node_ref_lists(),
             })
         } else {
             // Format-1 GraphIndex: parse the whole file in one pass.
             // parse_full already drops absent nodes.
-            let (header, body) = index::parse_full(bytes)?;
-            let entries = body
+            let parsed = index::parse_full(bytes)?;
+            let entries = parsed
+                .1
                 .into_iter()
                 .map(|(key, (value, references))| (key, value, references))
                 .collect();
             Ok(PackIndex {
                 entries,
-                node_ref_lists: header.node_ref_lists,
+                #[cfg(feature = "knitpack")]
+                node_ref_lists: parsed.0.node_ref_lists,
             })
         }
     }
@@ -67,6 +70,7 @@ impl PackIndex {
     }
 
     /// The number of reference lists each entry carries (the graph arity).
+    #[cfg(feature = "knitpack")]
     pub fn node_ref_lists(&self) -> usize {
         self.node_ref_lists
     }

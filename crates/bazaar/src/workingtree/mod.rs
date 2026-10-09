@@ -4316,6 +4316,7 @@ mod tests {
     /// per-file text for the tree root, a non-rich-root one must not (this is
     /// what brz's record_iter_changes does, and writing a root text produces
     /// a repository brz never would).
+    #[cfg(any(feature = "knit", feature = "knitpack"))]
     fn create_commit_read(format_name: &str, rich_root: bool) {
         let dir = tempfile::tempdir().unwrap();
         let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
@@ -4364,6 +4365,7 @@ mod tests {
         create_commit_read("rich-root-pack", true);
     }
 
+    #[cfg(feature = "knit")]
     #[test]
     fn create_commit_read_knit() {
         // The non-pack knit format (branch 5 + working tree 3 + knit repo)
@@ -4425,12 +4427,14 @@ mod tests {
         revision_attributes_round_trip("2a");
     }
 
+    #[cfg(feature = "knitpack")]
     #[test]
     fn revision_attributes_round_trip_knit_pack() {
         // The pack formats serialise revisions with XML.
         revision_attributes_round_trip("1.9");
     }
 
+    #[cfg(feature = "knit")]
     #[test]
     fn revision_attributes_round_trip_knit() {
         revision_attributes_round_trip("knit");
