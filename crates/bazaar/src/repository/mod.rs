@@ -697,6 +697,7 @@ impl Repository for StackedRepository {
 /// first element is the revision id) to the revision-id-keyed map the
 /// [`Repository::get_parent_map`] interface returns. Shared by the knit-pack
 /// and non-pack knit backends, which both key by `KnitKey`.
+#[cfg(any(feature = "knit", feature = "knitpack"))]
 pub(crate) fn unkey_knit_parent_map(
     raw: std::collections::HashMap<crate::knit::KnitKey, Vec<crate::knit::KnitKey>>,
 ) -> std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> {

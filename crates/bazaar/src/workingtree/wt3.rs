@@ -30,6 +30,7 @@ enum Wt3Basis {
     /// The branch's `revision-history` file, whose last line is the basis
     /// (the weave all-in-one layout). The working tree does not write it --
     /// the branch advances it -- so the tree only reads it.
+    #[cfg(feature = "weave")]
     RevisionHistory(&'static str),
 }
 
@@ -134,6 +135,7 @@ impl WorkingTree3 {
         // `.bzr/branch-lock`, which is not taken here.
         let lock_dir = match layout.basis {
             Wt3Basis::LastRevisionFile(_) => Some(super::lock::CHECKOUT_LOCK),
+            #[cfg(feature = "weave")]
             Wt3Basis::RevisionHistory(_) => None,
         };
         Ok(WorkingTree3 {
@@ -337,8 +339,10 @@ impl WorkingTree3 {
         // basis lives in a dedicated last-revision file; for the all-in-one
         // layout it is the branch's revision-history, which the branch already
         // advanced above, so nothing more to write there.
-        if let Wt3Basis::LastRevisionFile(path) = self.layout.basis {
-            self.transport.put_bytes(path, &revid, None)?;
+        match self.layout.basis {
+            Wt3Basis::LastRevisionFile(path) => self.transport.put_bytes(path, &revid, None)?,
+            #[cfg(feature = "weave")]
+            Wt3Basis::RevisionHistory(_) => {}
         }
         self.transport
             .put_bytes(self.layout.pending_merges, b"", None)?;
@@ -521,6 +525,7 @@ impl WorkingTree for WorkingTree3 {
     fn basis_revision(&self) -> Option<Vec<u8>> {
         let bytes = match self.layout.basis {
             Wt3Basis::LastRevisionFile(path) => self.transport.get_bytes(path).ok()?,
+            #[cfg(feature = "weave")]
             Wt3Basis::RevisionHistory(path) => {
                 // The basis is the last line of revision-history.
                 let history = self.transport.get_bytes(path).ok()?;
