@@ -16,7 +16,6 @@ mod knit_repo;
 mod pack_2a;
 mod pack_2a_writer;
 mod pack_collection;
-#[cfg(feature = "knitpack")]
 mod pack_index;
 #[cfg(feature = "knitpack")]
 mod pack_knit;
@@ -895,6 +894,61 @@ mod tests {
     /// Two revisions, a file text with a per-file parent, an inventory, and a
     /// signature (where supported) round-trip through every write-capable
     /// repository backend. Replaces the per-backend copies of this test.
+    /// A committed write group is readable through the repository object
+    /// that wrote it, without reopening the repository.
+    #[test]
+    fn committed_data_is_readable_through_the_writer() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(t);
+            {
+                let mut repo = repo.write_locked().unwrap();
+                repo.start_write_group().unwrap();
+                repo.add_revision(&revision(b"rev-1", vec![], "first"), &[])
+                    .unwrap();
+                repo.add_inventory_from_entries(
+                    b"rev-1",
+                    &[],
+                    crate::inventory::ROOT_ID,
+                    &entries(b"rev-1"),
+                )
+                .unwrap();
+                repo.commit_write_group().unwrap();
+                assert!(repo.has_revision(b"rev-1").unwrap(), "{}", s.label);
+                repo.unlock().unwrap();
+            }
+            assert!(repo.has_revision(b"rev-1").unwrap(), "{}", s.label);
+            {
+                let repo = repo.read_locked().unwrap();
+                assert!(repo.has_revision(b"rev-1").unwrap(), "{}", s.label);
+                repo.unlock().unwrap();
+            }
+
+            // Packing moves the old packs aside; the data stays readable.
+            {
+                let mut repo = repo.write_locked().unwrap();
+                repo.start_write_group().unwrap();
+                repo.add_revision(
+                    &revision(b"rev-2", vec![b"rev-1"], "second"),
+                    &[b"rev-1".to_vec()],
+                )
+                .unwrap();
+                repo.commit_write_group().unwrap();
+                repo.unlock().unwrap();
+            }
+            repo.pack().unwrap();
+            for rev in [&b"rev-1"[..], b"rev-2"] {
+                assert_eq!(
+                    rev,
+                    repo.get_revision(rev).unwrap().revision_id.as_bytes(),
+                    "{}",
+                    s.label
+                );
+            }
+        }
+    }
+
     #[test]
     fn missing_text_is_no_such_file_text() {
         for s in scenarios() {
