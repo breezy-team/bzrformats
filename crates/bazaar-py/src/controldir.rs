@@ -1360,20 +1360,17 @@ impl WorkingTree {
     }
 
     /// The changes between this working tree and the basis `basis_revision_id`
-    /// (resolved against `repository`), as a list of dicts with keys
+    /// (read from the tree's branch's repository), as a list of dicts with keys
     /// `file_id`, `old_path`, `new_path`, `content_change`, `kind`,
     /// `executable`. A `None` path means the entry is added (`old_path`) or
     /// removed (`new_path`).
-    fn iter_changes(
-        &self,
-        repository: &Bound<'_, Repository>,
-        basis_revision_id: &[u8],
-    ) -> PyResult<TreeChangesIter> {
-        let basis = repository
-            .try_borrow()?
-            .with(repository.py(), |repository| {
-                repository.revision_tree(basis_revision_id).map_err(err)
-            })?;
+    fn iter_changes(&self, basis_revision_id: &[u8]) -> PyResult<TreeChangesIter> {
+        let basis = self
+            .inner
+            .branch()
+            .repository()
+            .revision_tree(basis_revision_id)
+            .map_err(err)?;
         // The tree-vs-basis diff is a whole-tree comparison, so it runs
         // here; the per-change dicts are built on demand during iteration.
         let changes = self.inner.iter_changes(&basis).map_err(err)?;
@@ -1386,20 +1383,15 @@ impl WorkingTree {
     /// `other_revision_ids` for per-file text parents.
     fn iter_changes_with_parents(
         &self,
-        repository: &Bound<'_, Repository>,
         basis_revision_id: &[u8],
         other_revision_ids: Vec<Vec<u8>>,
     ) -> PyResult<TreeChangesIter> {
-        let (basis, others) = repository
-            .try_borrow()?
-            .with(repository.py(), |repository| {
-                let basis = repository.revision_tree(basis_revision_id).map_err(err)?;
-                let others: Vec<_> = other_revision_ids
-                    .iter()
-                    .map(|r| repository.revision_tree(r).map_err(err))
-                    .collect::<Result<_, _>>()?;
-                Ok((basis, others))
-            })?;
+        let repository = self.inner.branch().repository();
+        let basis = repository.revision_tree(basis_revision_id).map_err(err)?;
+        let others: Vec<_> = other_revision_ids
+            .iter()
+            .map(|r| repository.revision_tree(r).map_err(err))
+            .collect::<Result<_, _>>()?;
         let changes = self
             .inner
             .iter_changes_with_parents(&basis, &others)
