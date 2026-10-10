@@ -277,6 +277,17 @@ class TestControlDir(TestCaseInTempDir):
         self.assertEqual(got["committer"], "T <t@e>")
         self.assertEqual(got["properties"]["k"], b"v")
 
+    def test_abort_write_group_discards_additions(self):
+        cd = controldir.create(self.test_dir)
+        repo = cd.open_repository()
+        repo.lock_write()
+        repo.start_write_group()
+        repo.add_revision(b"rev-x", "hello", "T <t@e>", 1577880000.0, 0, parents=[])
+        repo.abort_write_group()
+        repo.unlock()
+        reopened = controldir.open(self.test_dir).open_repository()
+        self.assertFalse(reopened.has_revision(b"rev-x"))
+
     def test_iter_changes_with_parents(self):
         cd = controldir.create(self.test_dir)
         with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:

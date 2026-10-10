@@ -268,6 +268,10 @@ pub trait Repository: Lockable<Error = RepositoryError> + Send + Sync {
     /// Flush the open write group, committing its additions.
     fn commit_write_group(&mut self) -> Result<(), RepositoryError>;
 
+    /// Close the open write group, discarding its additions. Formats whose
+    /// writes land immediately have no write group, and keep them.
+    fn abort_write_group(&mut self) -> Result<(), RepositoryError>;
+
     /// Combine the repository's packs into a single pack.
     ///
     /// The default is a no-op (formats without packs have nothing to combine);
@@ -698,6 +702,10 @@ impl Repository for StackedRepository {
         self.primary.commit_write_group()
     }
 
+    fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
+        self.primary.abort_write_group()
+    }
+
     fn add_fallback_repository(
         &mut self,
         fallback: Box<dyn Repository>,
@@ -781,10 +789,8 @@ pub fn lock_read<R: Repository + ?Sized>(repository: &mut R) -> Result<(), Repos
 
 /// Release one lock on `repository`: how a repository's
 /// [`Lockable::unlock`] works unless it locks differently. Releasing the
-/// last write lock with a write group open releases it and is an error.
-///
-/// TODO: also abort the open write group, which this crate cannot do yet;
-/// it is left open.
+/// last write lock with a write group open aborts the write group, releases
+/// the lock and is an error.
 pub fn unlock<R: Repository + ?Sized>(
     repository: &mut R,
 ) -> Result<Option<crate::lockable_files::LockToken>, RepositoryError> {
@@ -792,7 +798,16 @@ pub fn unlock<R: Repository + ?Sized>(
     let group_left_open = lock.lock_count() == 1
         && lock.lock_mode() == Some(crate::lockable_files::LockMode::Write)
         && repository.is_in_write_group();
-    let released = lock.unlock().map_err(RepositoryError::Locking)?;
+    let aborted = if group_left_open {
+        repository.abort_write_group()
+    } else {
+        Ok(())
+    };
+    let released = repository
+        .lock()
+        .unlock()
+        .map_err(RepositoryError::Locking)?;
+    aborted?;
     if group_left_open {
         return Err(RepositoryError::WriteGroupOpen);
     }
@@ -961,6 +976,67 @@ mod tests {
                     s.label
                 );
             }
+        }
+    }
+
+    /// Aborting a write group discards what was added to it; formats that
+    /// write immediately have no write group to discard.
+    #[test]
+    fn aborted_write_group_is_discarded() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(SharedTransport::clone(&t));
+            let mut locked = repo.write_locked().unwrap();
+            locked.start_write_group().unwrap();
+            let grouped = locked.is_in_write_group();
+            locked
+                .add_revision(&revision(b"rev-1", vec![], "first"), &[])
+                .unwrap();
+            locked.abort_write_group().unwrap();
+            assert!(!locked.is_in_write_group(), "{}", s.label);
+            locked.unlock().unwrap();
+            let reopened = (s.reopen)(t);
+            assert_eq!(
+                !grouped,
+                reopened.has_revision(b"rev-1").unwrap(),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    /// Releasing the last write lock with a write group open aborts the
+    /// write group, so the next write lock can start a new one.
+    #[test]
+    fn unlock_aborts_an_open_write_group() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(SharedTransport::clone(&t));
+            let mut locked = repo.write_locked().unwrap();
+            locked.start_write_group().unwrap();
+            if !locked.is_in_write_group() {
+                continue;
+            }
+            locked
+                .add_revision(&revision(b"rev-1", vec![], "first"), &[])
+                .unwrap();
+            assert!(
+                matches!(locked.unlock(), Err(RepositoryError::WriteGroupOpen)),
+                "{}",
+                s.label
+            );
+            assert!(!repo.is_in_write_group(), "{}", s.label);
+            assert!(!repo.lock().is_locked(), "{}", s.label);
+            assert!(!(s.reopen)(SharedTransport::clone(&t))
+                .has_revision(b"rev-1")
+                .unwrap());
+
+            let mut locked = repo.write_locked().unwrap();
+            locked.start_write_group().unwrap();
+            locked.commit_write_group().unwrap();
+            locked.unlock().unwrap();
         }
     }
 

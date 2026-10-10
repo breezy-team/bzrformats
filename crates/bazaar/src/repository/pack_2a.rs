@@ -830,6 +830,15 @@ impl Pack2aRepository {
         Ok(())
     }
 
+    /// Discard the open write group: nothing of it has been written, as the
+    /// new pack is only written by [`commit_write_group`](Self::commit_write_group).
+    pub fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
+        self.write_group
+            .take()
+            .map(drop)
+            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))
+    }
+
     /// Stream the `missing` revisions from another 2a repository into this one,
     /// copying raw records (revisions, inventories, texts, CHK pages,
     /// signatures) without decoding and re-encoding them.
@@ -1317,6 +1326,10 @@ impl super::Repository for Pack2aRepository {
         Pack2aRepository::commit_write_group(self)
     }
 
+    fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
+        Pack2aRepository::abort_write_group(self)
+    }
+
     fn pack(&mut self) -> Result<(), RepositoryError> {
         Pack2aRepository::pack(self)
     }
@@ -1494,7 +1507,7 @@ mod tests {
     }
 
     /// Releasing the last write lock with a write group open is an error,
-    /// but the lock is released.
+    /// but the write group is aborted and the lock released.
     #[test]
     fn unlock_with_a_write_group_open_is_an_error() {
         let (_d, t) = temp_repo();
@@ -1504,11 +1517,23 @@ mod tests {
         repo.start_write_group().unwrap();
         // An inner unlock leaves the write group to the outer lock.
         repo.unlock().unwrap();
+        assert!(repo.write_group.is_some());
         assert!(matches!(
             repo.unlock(),
             Err(RepositoryError::WriteGroupOpen)
         ));
+        assert!(repo.write_group.is_none());
         assert!(!repo.lock().is_locked());
+    }
+
+    #[test]
+    fn abort_without_a_write_group_is_an_error() {
+        let (_d, t) = temp_repo();
+        let mut repo = Pack2aRepository::create(t).unwrap();
+        assert!(matches!(
+            repo.abort_write_group(),
+            Err(RepositoryError::Corrupt(_))
+        ));
     }
 
     #[test]

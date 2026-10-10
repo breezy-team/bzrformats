@@ -525,6 +525,10 @@ impl super::Repository for KnitRepository {
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
         Ok(())
     }
+
+    fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
+        Ok(())
+    }
 }
 
 /// Verify the `format` marker is a supported non-pack knit format.
