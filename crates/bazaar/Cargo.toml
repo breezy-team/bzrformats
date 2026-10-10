@@ -43,7 +43,7 @@ unicode-normalization = "0.1.19"
 inventory = "0.3"
 indexmap = "2"
 hostname = "0.4.1"
-whoami = "1.5"
+whoami = "2.1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 

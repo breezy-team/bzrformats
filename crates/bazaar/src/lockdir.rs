@@ -95,13 +95,21 @@ pub struct LockHeldInfo {
 impl LockHeldInfo {
     /// Build holder info for the current process.
     pub fn for_this_process(extra_holder_info: HashMap<String, String>) -> Self {
+        // The hostname and user are informational holder metadata only
+        // (pid, nonce and start_time identify the holder), so a lookup
+        // failure is logged and recorded as absent rather than failing
+        // the lock.
         let hostname = match crate::osutils::get_host_name() {
             Ok(h) => Some(h),
-            // The hostname is informational holder metadata only (pid, nonce,
-            // user and start_time identify the holder), so a lookup failure
-            // is logged and recorded as absent rather than failing the lock.
             Err(e) => {
                 log::warn!("could not determine hostname for lock holder info: {e}");
+                None
+            }
+        };
+        let user = match crate::osutils::get_user_name() {
+            Ok(u) => Some(u),
+            Err(e) => {
+                log::warn!("could not determine user name for lock holder info: {e}");
                 None
             }
         };
@@ -110,7 +118,7 @@ impl LockHeldInfo {
             pid: Some(std::process::id()),
             nonce: Some(crate::osutils::rand_chars(20)),
             start_time: Some(SystemTime::now()),
-            user: Some(crate::osutils::get_user_name()),
+            user,
             extra_holder_info,
         }
     }
@@ -141,7 +149,7 @@ impl LockHeldInfo {
     pub fn is_locked_by_this_process(&self) -> bool {
         self.hostname == crate::osutils::get_host_name().ok()
             && self.pid == Some(std::process::id())
-            && self.user == Some(crate::osutils::get_user_name())
+            && self.user == crate::osutils::get_user_name().ok()
     }
 }
 
