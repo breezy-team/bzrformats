@@ -52,6 +52,7 @@ pub mod textmerge;
 pub mod transform;
 pub mod transport;
 pub mod tuned_gzip;
+pub mod urlutils;
 pub mod versionedfile;
 pub mod views;
 pub mod weave;
