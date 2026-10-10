@@ -42,29 +42,42 @@ declare_repository_format! {
 /// `.bzr` (the control directory itself).
 pub struct WeaveRepository {
     format: &'static RepositoryFormat,
+    /// The repository's lock.
+    lock: crate::lockable_files::LockableFiles,
     transport: SharedTransport,
 }
 
 impl WeaveRepository {
     /// Open the weave repository whose stores live directly under `transport`
-    /// (rooted at `.bzr`). `format` is the recognised weave format.
+    /// (rooted at `.bzr`). `format` is the recognised weave format, and
+    /// `os_lock` the lock on `.bzr/branch-lock` it shares with the control
+    /// directory's branch and working tree.
     pub fn open(
         transport: SharedTransport,
         format: &'static RepositoryFormat,
+        os_lock: crate::lockable_files::TransportLock,
     ) -> Result<Self, RepositoryError> {
         if !format.is_all_in_one() {
             return Err(RepositoryError::UnsupportedFormat(
                 format.get_format_description(),
             ));
         }
-        Ok(WeaveRepository { format, transport })
+        Ok(WeaveRepository {
+            lock: crate::lockable_files::LockableFiles::with_os_lock(
+                SharedTransport::clone(&transport),
+                os_lock,
+            ),
+            format,
+            transport,
+        })
     }
 
     /// Create an empty all-in-one weave repository scaffold under `transport`
     /// (rooted at `.bzr`) and open it. Writes the `weaves/` and
-    /// `revision-store/` directories and an empty `inventory.weave`. The
-    /// branch and working-tree files are the control directory's job, not the
-    /// repository's.
+    /// `revision-store/` directories, an empty `inventory.weave` and, as
+    /// breezy's weave formats do, the empty `branch-lock` the control
+    /// directory's objects lock. The branch and working-tree files are the
+    /// control directory's job, not the repository's.
     pub fn create(
         transport: SharedTransport,
         format: &'static RepositoryFormat,
@@ -81,7 +94,12 @@ impl WeaveRepository {
             &write_weave_v5(&WeaveFile::default()),
             None,
         )?;
-        Self::open(transport, format)
+        let os_lock = crate::lockable_files::TransportLock::new(
+            SharedTransport::clone(&transport),
+            crate::lockable_files::BRANCH_LOCK,
+        );
+        os_lock.create().map_err(RepositoryError::Locking)?;
+        Self::open(transport, format, os_lock)
     }
 
     /// The format this repository was opened as.
@@ -384,7 +402,32 @@ impl WeaveRepository {
     }
 }
 
+impl crate::lockable_files::Lockable for WeaveRepository {
+    type Error = super::RepositoryError;
+
+    fn lock_read(&mut self) -> Result<(), super::RepositoryError> {
+        super::lock_read(self)
+    }
+
+    fn lock_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, super::RepositoryError> {
+        super::Repository::lock_write_with_token(self, None, waiter)
+    }
+
+    fn unlock(
+        &mut self,
+    ) -> Result<Option<crate::lockable_files::LockToken>, super::RepositoryError> {
+        super::unlock(self)
+    }
+}
+
 impl super::Repository for WeaveRepository {
+    fn lock(&self) -> &crate::lockable_files::LockableFiles {
+        &self.lock
+    }
+
     fn format(&self) -> &'static RepositoryFormat {
         WeaveRepository::format(self)
     }
@@ -423,6 +466,10 @@ impl super::Repository for WeaveRepository {
     }
 
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        // Writing needs the write lock.
+        if self.lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
+            return Err(RepositoryError::NotWriteLocked);
+        }
         // Weave writes append immediately; there is no write group.
         Ok(())
     }
@@ -484,6 +531,10 @@ impl super::Repository for WeaveRepository {
     }
 
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+
+    fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
         Ok(())
     }
 }

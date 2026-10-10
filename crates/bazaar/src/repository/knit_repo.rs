@@ -35,6 +35,7 @@ declare_repository_format! {
         inventory_serializer: &XMLInventorySerializer5,
         open: open_knit,
         create: create_knit,
+        uses_lock_dir: true,
         supported: true,
         deprecated: true,
     }
@@ -48,6 +49,7 @@ declare_repository_format! {
         inventory_serializer: &XMLInventorySerializer7,
         open: open_knit,
         create: create_knit,
+        uses_lock_dir: true,
         rich_root_data: true,
         supports_tree_reference: true,
         supported: true,
@@ -64,6 +66,7 @@ declare_repository_format! {
         inventory_serializer: &XMLInventorySerializer6,
         open: open_knit,
         create: create_knit,
+        uses_lock_dir: true,
         rich_root_data: true,
         supported: true,
         deprecated: true,
@@ -93,6 +96,8 @@ where
 /// `.bzr/repository`.
 pub struct KnitRepository {
     format: &'static RepositoryFormat,
+    /// The repository's lock.
+    lock: crate::lockable_files::LockableFiles,
     revisions: KnitStore<ConstantMapper, KnitPlainFactory>,
     inventories: KnitStore<ConstantMapper, KnitPlainFactory>,
     signatures: KnitStore<ConstantMapper, KnitPlainFactory>,
@@ -141,6 +146,10 @@ impl KnitRepository {
             .subtransport("knits")
             .map_err(|e| RepositoryError::Corrupt(format!("knits subtransport: {e}")))?;
         Ok(KnitRepository {
+            lock: crate::lockable_files::LockableFiles::new(
+                SharedTransport::clone(&transport),
+                format.uses_lock_dir.then_some("lock"),
+            ),
             format,
             revisions,
             inventories,
@@ -385,7 +394,32 @@ impl KnitRepository {
     }
 }
 
+impl crate::lockable_files::Lockable for KnitRepository {
+    type Error = super::RepositoryError;
+
+    fn lock_read(&mut self) -> Result<(), super::RepositoryError> {
+        super::lock_read(self)
+    }
+
+    fn lock_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, super::RepositoryError> {
+        super::Repository::lock_write_with_token(self, None, waiter)
+    }
+
+    fn unlock(
+        &mut self,
+    ) -> Result<Option<crate::lockable_files::LockToken>, super::RepositoryError> {
+        super::unlock(self)
+    }
+}
+
 impl super::Repository for KnitRepository {
+    fn lock(&self) -> &crate::lockable_files::LockableFiles {
+        &self.lock
+    }
+
     fn format(&self) -> &'static RepositoryFormat {
         KnitRepository::format(self)
     }
@@ -424,6 +458,10 @@ impl super::Repository for KnitRepository {
     }
 
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {
+        // Writing needs the write lock.
+        if self.lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
+            return Err(RepositoryError::NotWriteLocked);
+        }
         // Knit writes append immediately; there is no write group.
         Ok(())
     }
@@ -485,6 +523,10 @@ impl super::Repository for KnitRepository {
     }
 
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+
+    fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
         Ok(())
     }
 }

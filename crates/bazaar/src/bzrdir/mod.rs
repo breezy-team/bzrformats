@@ -52,11 +52,16 @@ pub const WORKINGTREE_FORMAT_6: &[u8] = b"Bazaar Working Tree Format 6 (bzr 1.14
 // repository, branch and working-tree marker. A combo is gated behind the
 // same feature as the older repository backend it creates, so it is only
 // registered when that backend is built.
+#[cfg(feature = "knit")]
 const B5: &[u8] = b"Bazaar-NG branch format 5\n";
+#[cfg(feature = "knitpack")]
 const B6: &[u8] = b"Bazaar Branch Format 6 (bzr 0.15)\n";
 const B7: &[u8] = BRANCH_FORMAT_7;
+#[cfg(feature = "knit")]
 const WT3: &[u8] = b"Bazaar-NG Working Tree format 3";
+#[cfg(any(feature = "knitpack", all(feature = "knit", test)))]
 const WT4: &[u8] = WORKINGTREE_FORMAT_4;
+#[cfg(feature = "knitpack")]
 const WT5: &[u8] = b"Bazaar Working Tree Format 5 (bzr 1.11)\n";
 const WT6: &[u8] = WORKINGTREE_FORMAT_6;
 
@@ -276,6 +281,14 @@ impl Component {
     }
 }
 
+/// Create the lock directory `lock` of the component `transport` reaches,
+/// when the component is made.
+fn create_lock_dir(transport: &SharedTransport) -> Result<(), BzrDirError> {
+    crate::lockable_files::LockableFiles::new(SharedTransport::clone(transport), Some("lock"))
+        .create_lock()
+        .map_err(|e| BzrDirError::Component(format!("creating lock directory: {e}")))
+}
+
 /// An opened `.bzr` control directory.
 ///
 /// Two layouts implement this: [`BzrDirMeta`] for the meta-directory
@@ -355,14 +368,26 @@ pub trait ControlDir: Send + Sync {
     /// The location the branch `name` refers to, as recorded, if it is a
     /// branch reference.
     fn branch_reference(&self, name: &str) -> Result<Option<String>, BzrDirError> {
-        crate::branch::Branch::new(self.branch_transport(name)?)
-            .get_reference()
+        crate::branch::reference_location(self.branch_transport(name)?.as_ref())
             .map_err(|e| BzrDirError::Component(format!("reading branch reference: {e}")))
     }
 
     /// Open the branch `name` itself, without following a reference.
     fn open_branch_named(&self, name: &str) -> Result<crate::branch::Branch, BzrDirError> {
-        Ok(crate::branch::Branch::new(self.branch_transport(name)?))
+        let transport = self.branch_transport(name)?;
+        let repository = self.branch_repository(transport.as_ref())?;
+        Ok(crate::branch::Branch::open(transport, repository))
+    }
+
+    /// The repository of the branch reachable through `branch_transport`:
+    /// the one [`find_repository`](Self::find_repository) finds. The default
+    /// ignores stacking; [`BzrDirMeta`] adds the stacked-on repository as a
+    /// fallback.
+    fn branch_repository(
+        &self,
+        _branch_transport: &dyn Transport,
+    ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        self.find_repository()
     }
 
     /// Open the repository with any stacked-on fallback activated.
@@ -509,8 +534,9 @@ impl BzrDirMeta {
                 String::from_utf8_lossy(format.repo_marker)
             ))
         })?;
-        (repo_format.create)(repo_format, repo_t)
+        (repo_format.create)(repo_format, SharedTransport::clone(&repo_t))
             .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
+        create_lock_dir(&repo_t)?;
 
         // Branch: format marker, null tip, empty config and tags. Format 5
         // (full history) keeps the tip in revision-history rather than a
@@ -529,6 +555,7 @@ impl BzrDirMeta {
         }
         branch.put_bytes("branch.conf", b"", None)?;
         branch.put_bytes("tags", b"", None)?;
+        create_lock_dir(&branch)?;
 
         // Working tree: format marker and conflicts. A dirstate format (4/5/6)
         // writes an empty dirstate and (6+) a views file; the pre-dirstate
@@ -537,6 +564,7 @@ impl BzrDirMeta {
         checkout.mkdir("")?;
         checkout.put_bytes("format", format.wt_marker, None)?;
         checkout.put_bytes("conflicts", b"BZR conflict list format 1\n", None)?;
+        create_lock_dir(&checkout)?;
         let wt_uses_dirstate = crate::workingtree::find_format(format.wt_marker)
             .map(|f| f.uses_dirstate)
             .unwrap_or(true);
@@ -599,8 +627,9 @@ impl BzrDirMeta {
         bzr.put_bytes("branch-format", METADIR_MARKER, None)?;
 
         let repo_t = bzr.subtransport("repository")?;
-        (repo_format.create)(repo_format, repo_t)
+        (repo_format.create)(repo_format, SharedTransport::clone(&repo_t))
             .map_err(|e| BzrDirError::Component(format!("creating repository: {e}")))?;
+        create_lock_dir(&repo_t)?;
 
         // Mark it shared.
         bzr.subtransport("repository")?
@@ -656,21 +685,44 @@ impl BzrDirMeta {
             return Ok((None, repository));
         }
         let sub = self.transport.subtransport(Component::Branch.subdir())?;
-        let branch = crate::branch::Branch::new(sub);
-        if let Some(location) = branch
-            .get_reference()
+        if let Some(location) = crate::branch::reference_location(sub.as_ref())
             .map_err(|e| BzrDirError::Component(format!("reading branch reference: {e}")))?
         {
             let target = BzrDirMeta::open(self.reference_control_transport(&location)?)?;
             return target.cloning_source_formats();
         }
         match self.find_repository() {
-            Ok(repository) => Ok((Some(branch.format()), Some(repository.format()))),
+            Ok(repository) => Ok((
+                Some(crate::branch::branch_format(sub.as_ref())),
+                Some(repository.format()),
+            )),
             // A branch without a repository cannot be opened, so it has no
             // format to offer either.
             Err(BzrDirError::NoRepositoryPresent) => Ok((None, None)),
             Err(e) => Err(e),
         }
+    }
+
+    /// Wrap `repo` with the repository of the branch reachable through
+    /// `branch_transport` is stacked on as its fallback; `repo` itself if
+    /// that branch is not stacked.
+    fn stack_repository(
+        &self,
+        repo: Box<dyn crate::repository::Repository>,
+        branch_transport: &dyn Transport,
+    ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        let Some(stacked_on) = crate::branch::stacked_on_location(branch_transport)
+            .map_err(|e| BzrDirError::Component(format!("reading stacked-on location: {e}")))?
+        else {
+            return Ok(repo);
+        };
+        use crate::repository::Repository as _;
+        let base = self.open_stacked_on_repository(&stacked_on)?;
+        let mut stacked = crate::repository::StackedRepository::new(repo);
+        stacked
+            .add_fallback_repository(base)
+            .map_err(|e| BzrDirError::Component(format!("wiring fallback repository: {e}")))?;
+        Ok(Box::new(stacked))
     }
 
     /// Open the repository of the branch this one is stacked on, following the
@@ -828,25 +880,18 @@ impl ControlDir for BzrDirMeta {
         if !self.has_branch {
             return Ok(repo);
         }
-        let branch = self.open_branch()?;
-        let stacked_on = match branch.get_stacked_on_url() {
-            Ok(url) => url,
-            // Not stacked, or a format that cannot stack: plain repository.
-            Err(crate::branch::BranchError::NotStacked)
-            | Err(crate::branch::BranchError::Unstackable) => return Ok(repo),
-            Err(e) => {
-                return Err(BzrDirError::Component(format!(
-                    "reading stacked-on location: {e}"
-                )))
-            }
-        };
-        use crate::repository::Repository as _;
-        let base = self.open_stacked_on_repository(&stacked_on)?;
-        let mut stacked = crate::repository::StackedRepository::new(repo);
-        stacked
-            .add_fallback_repository(base)
-            .map_err(|e| BzrDirError::Component(format!("wiring fallback repository: {e}")))?;
-        Ok(Box::new(stacked))
+        let branch = self.transport.subtransport(Component::Branch.subdir())?;
+        self.stack_repository(repo, branch.as_ref())
+    }
+
+    /// The branch's repository with the repository of the branch it is
+    /// stacked on, if any, as its fallback.
+    fn branch_repository(
+        &self,
+        branch_transport: &dyn Transport,
+    ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
+        let repo = self.find_repository()?;
+        self.stack_repository(repo, branch_transport)
     }
 
     /// Open the branch in this control directory.
@@ -860,14 +905,13 @@ impl ControlDir for BzrDirMeta {
             return Err(BzrDirError::NotABzrDir);
         }
         let sub = self.transport.subtransport(Component::Branch.subdir())?;
-        let branch = crate::branch::Branch::new(sub);
-        match branch
-            .get_reference()
+        if let Some(location) = crate::branch::reference_location(sub.as_ref())
             .map_err(|e| BzrDirError::Component(format!("reading branch reference: {e}")))?
         {
-            Some(location) => self.open_referenced_branch(&location),
-            None => Ok(branch),
+            return self.open_referenced_branch(&location);
         }
+        let repository = self.branch_repository(sub.as_ref())?;
+        Ok(crate::branch::Branch::open(sub, repository))
     }
 
     /// The format to create a clone or sprout of this control directory in.
@@ -933,8 +977,9 @@ impl ControlDir for BzrDirMeta {
         if !self.has_workingtree {
             return Err(BzrDirError::NotABzrDir);
         }
+        let branch = self.open_branch()?;
         let root = self.transport.subtransport("..")?;
-        crate::workingtree::open(root)
+        crate::workingtree::open(root, branch)
             .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))
     }
 
@@ -1033,6 +1078,10 @@ impl ControlDir for BzrDirMeta {
 pub struct BzrDirAllInOne {
     transport: SharedTransport,
     format: &'static crate::repository::RepositoryFormat,
+    /// The lock on `.bzr/branch-lock`, shared by every repository, branch
+    /// and working tree opened from here, as breezy's all-in-one formats
+    /// share their control files.
+    os_lock: crate::lockable_files::TransportLock,
 }
 
 #[cfg(feature = "weave")]
@@ -1052,7 +1101,14 @@ impl BzrDirAllInOne {
         let format = crate::repository::find_format(&marker)
             .filter(|f| f.is_all_in_one() && f.is_supported());
         match format {
-            Some(format) => Ok(BzrDirAllInOne { transport, format }),
+            Some(format) => Ok(BzrDirAllInOne {
+                os_lock: crate::lockable_files::TransportLock::new(
+                    SharedTransport::clone(&transport),
+                    crate::lockable_files::BRANCH_LOCK,
+                ),
+                transport,
+                format,
+            }),
             None => Err(BzrDirError::NotMetaDir(marker)),
         }
     }
@@ -1108,8 +1164,12 @@ impl ControlDir for BzrDirAllInOne {
     }
 
     fn open_repository(&self) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
-        let repo = crate::repository::WeaveRepository::open(self.transport.clone(), self.format)
-            .map_err(|e| BzrDirError::Component(format!("opening repository: {e}")))?;
+        let repo = crate::repository::WeaveRepository::open(
+            self.transport.clone(),
+            self.format,
+            self.os_lock.clone(),
+        )
+        .map_err(|e| BzrDirError::Component(format!("opening repository: {e}")))?;
         Ok(Box::new(repo))
     }
 
@@ -1125,6 +1185,8 @@ impl ControlDir for BzrDirAllInOne {
         Ok(crate::branch::Branch::with_format(
             self.transport.clone(),
             format,
+            self.open_repository()?,
+            self.os_lock.clone(),
         ))
     }
 
@@ -1135,9 +1197,11 @@ impl ControlDir for BzrDirAllInOne {
     /// `checkout/` subdir or dirstate. Like the metadir tree it is rooted at
     /// the directory that *contains* `.bzr`.
     fn open_workingtree(&self) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError> {
+        let branch = self.open_branch()?;
         let root = self.transport.subtransport("..")?;
-        let wt = crate::workingtree::WorkingTree3::open_all_in_one(root)
-            .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))?;
+        let wt =
+            crate::workingtree::WorkingTree3::open_all_in_one(root, branch, self.os_lock.clone())
+                .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))?;
         Ok(Box::new(wt))
     }
 }
@@ -1223,7 +1287,7 @@ pub fn upgrade(
     }
 
     // Carry over the branch tip and tags.
-    let new_branch = new.open_branch()?;
+    let mut new_branch = new.open_branch()?;
     new_branch
         .set_last_revision_info(revno, &tip)
         .map_err(|e| BzrDirError::Component(format!("setting branch tip: {e}")))?;
@@ -1278,6 +1342,7 @@ fn empty_dirstate_bytes() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lockable_files::LockableExt as _;
     use crate::transport::LocalTransport;
 
     #[test]
@@ -1404,6 +1469,7 @@ mod tests {
         BzrDirMeta::open(bzr_transport(root)).unwrap()
     }
 
+    #[cfg(any(feature = "knit", feature = "knitpack"))]
     fn markers(format: &ControlDirFormat) -> [&'static [u8]; 3] {
         [format.repo_marker, format.branch_marker, format.wt_marker]
     }
@@ -1778,6 +1844,7 @@ mod tests {
         let base = BzrDirMeta::create(&base_parent).unwrap();
         {
             let mut repo = base.open_repository().unwrap();
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             let rev = crate::revision::Revision::new(
                 crate::RevisionId::from(&b"rev-base"[..]),
@@ -1797,6 +1864,7 @@ mod tests {
             repo.add_inventory_from_entries(b"rev-base", &[], ROOT_ID, &entries)
                 .unwrap();
             repo.commit_write_group().unwrap();
+            repo.unlock().unwrap();
         }
 
         // The stacked branch lives under `top/`: its own (empty) 2a repository,
@@ -1881,6 +1949,7 @@ mod tests {
         // Give the shared repo a revision so we can tell we resolved to it.
         {
             let mut repo = shared.open_repository().unwrap();
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             let rev = crate::revision::Revision::new(
                 crate::RevisionId::from(&b"rev-shared"[..]),
@@ -1904,6 +1973,7 @@ mod tests {
             )
             .unwrap();
             repo.commit_write_group().unwrap();
+            repo.unlock().unwrap();
         }
 
         // A branch-only control directory inside the shared repository's tree.
@@ -1957,6 +2027,7 @@ mod tests {
             let mut repo = cd.open_repository().unwrap();
             let root = crate::inventory::ROOT_ID;
             revid = b"rev-1".to_vec();
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             repo.add_text(b"file-1", &revid, &[], b"hi\n").unwrap();
             let entries = vec![
@@ -1989,6 +2060,7 @@ mod tests {
             );
             repo.add_revision(&rev, &[]).unwrap();
             repo.commit_write_group().unwrap();
+            repo.unlock().unwrap();
         }
         cd.open_branch()
             .unwrap()

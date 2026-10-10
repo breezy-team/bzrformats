@@ -38,22 +38,30 @@ pub fn fetch(
     }
     let ordered = toposort(source, &missing)?;
     let copied = ordered.len();
+    super::with_write_lock(target, |target| copy_ordered(source, target, &ordered))?;
+    Ok(copied)
+}
 
+/// Copy `ordered` from `source` into the write-locked `target`.
+fn copy_ordered(
+    source: &dyn Repository,
+    target: &mut dyn Repository,
+    ordered: &[Vec<u8>],
+) -> Result<(), RepositoryError> {
     // Give the target a chance to copy these revisions with a format-specific
     // fast path (e.g. two 2a repositories streaming raw records). The target
     // decides whether it can; `false` means "no fast path applies", so fall
     // back to the generic per-revision rebuild. The generic fetcher stays free
     // of any per-format knowledge.
-    if target.try_fetch_from(source, &ordered)? {
-        return Ok(copied);
+    if target.try_fetch_from(source, ordered)? {
+        return Ok(());
     }
 
     target.start_write_group()?;
-    for rev_id in &ordered {
+    for rev_id in ordered {
         copy_revision(source, target, rev_id)?;
     }
-    target.commit_write_group()?;
-    Ok(copied)
+    target.commit_write_group()
 }
 
 /// The set of revisions present in `source` (within the requested closure) but
@@ -241,6 +249,7 @@ fn copy_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lockable_files::LockableExt as _;
     use crate::repository::Pack2aRepository;
     use crate::transport::{LocalTransport, SharedTransport};
     use std::sync::Arc;
@@ -279,6 +288,7 @@ mod tests {
                 vec![ids[i - 2].as_slice()]
             };
             let parent_vecs: Vec<Vec<u8>> = parents.iter().map(|p| p.to_vec()).collect();
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             let text = format!("hello {i}\n").into_bytes();
             repo.add_text(b"file-1", &rev, &[], &text).unwrap();
@@ -303,6 +313,7 @@ mod tests {
             repo.add_revision(&revision(&rev, parents), &parent_vecs)
                 .unwrap();
             repo.commit_write_group().unwrap();
+            repo.unlock().unwrap();
             ids.push(rev);
         }
         ids
@@ -374,6 +385,7 @@ mod tests {
         let root = crate::inventory::ROOT_ID;
         let parents: Vec<&[u8]> = vec![parent];
         let parent_vecs: Vec<Vec<u8>> = vec![parent.to_vec()];
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_text(b"file-1", rev, &[], content).unwrap();
         let entries = vec![
@@ -397,6 +409,7 @@ mod tests {
         repo.add_revision(&revision(rev, parents), &parent_vecs)
             .unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
     }
 
     /// Fetch a revision from a source that has diverged from the target: both
@@ -452,6 +465,7 @@ mod tests {
         let mut src = KnitPackRepository::create(st.clone(), knitpack6).unwrap();
         let root = crate::inventory::ROOT_ID;
         let rev = b"rev-1";
+        let mut src = src.write_locked().unwrap();
         src.start_write_group().unwrap();
         let text = b"hello\n";
         src.add_text(b"file-1", rev, &[], text).unwrap();
@@ -475,6 +489,7 @@ mod tests {
             .unwrap();
         src.add_revision(&revision(rev, vec![]), &[]).unwrap();
         src.commit_write_group().unwrap();
+        src.unlock().unwrap();
         let source = KnitPackRepository::open(st).unwrap();
 
         // Target: a 2a (CHK) repository.
@@ -517,11 +532,13 @@ mod tests {
         // Generic path: drive copy_revision directly into a second target.
         let (_gd, gt) = temp_repo();
         let mut generic = Pack2aRepository::create(gt.clone()).unwrap();
+        let mut generic = generic.write_locked().unwrap();
         generic.start_write_group().unwrap();
         for rev in &ids {
-            copy_revision(&source, &mut generic, rev).unwrap();
+            copy_revision(&source, &mut *generic, rev).unwrap();
         }
         generic.commit_write_group().unwrap();
+        generic.unlock().unwrap();
         let generic = Pack2aRepository::open(gt).unwrap();
 
         // Both targets hold the same revisions and read identically.
@@ -609,6 +626,7 @@ mod tests {
                 vec![ids[i - 2].as_slice()]
             };
             let parent_vecs: Vec<Vec<u8>> = parents.iter().map(|p| p.to_vec()).collect();
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             let text = format!("hello {i}\n").into_bytes();
             repo.add_text(b"file-1", &rev, &[], &text).unwrap();
@@ -633,6 +651,7 @@ mod tests {
             repo.add_revision(&revision(&rev, parents), &parent_vecs)
                 .unwrap();
             repo.commit_write_group().unwrap();
+            repo.unlock().unwrap();
             ids.push(rev);
         }
         ids
@@ -690,11 +709,13 @@ mod tests {
         // Generic path: drive copy_revision directly.
         let (_gd, gt) = temp_repo();
         let mut generic = KnitPackRepository::create(gt.clone(), knitpack6).unwrap();
+        let mut generic = generic.write_locked().unwrap();
         generic.start_write_group().unwrap();
         for rev in &ids {
-            copy_revision(&source, &mut generic, rev).unwrap();
+            copy_revision(&source, &mut *generic, rev).unwrap();
         }
         generic.commit_write_group().unwrap();
+        generic.unlock().unwrap();
         let generic = KnitPackRepository::open(gt).unwrap();
 
         for rev in &ids {

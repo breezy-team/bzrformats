@@ -38,6 +38,16 @@ pub enum LockError {
     },
     /// The held `info` file could not be parsed.
     Corrupt(String),
+    /// The lock about to be broken is no longer held by the holder it was
+    /// to be broken for.
+    BreakMismatch {
+        /// The holder found, as its `info` file reads.
+        held: String,
+        /// The holder the lock was to be broken for.
+        target: String,
+    },
+    /// This handle holds the lock it was asked to break.
+    BreakOwnLock,
     /// An underlying transport error.
     Transport(TransportError),
 }
@@ -52,6 +62,12 @@ impl std::fmt::Display for LockError {
                 "the lock token {given:?} does not match lock token {held:?}"
             ),
             LockError::Corrupt(m) => write!(f, "corrupt lock info: {m}"),
+            LockError::BreakMismatch { held, target } => write!(
+                f,
+                "lock was released and re-acquired before being broken: held by {held}, \
+                 wanted to break {target}"
+            ),
+            LockError::BreakOwnLock => write!(f, "cannot break a lock this handle holds"),
             LockError::Transport(e) => write!(f, "transport error: {e}"),
         }
     }
@@ -234,7 +250,16 @@ impl<'t> LockDir<'t> {
 
     fn create_pending_dir(&self, info: &LockHeldInfo) -> Result<String, LockError> {
         let tmpname = format!("{}/{}.tmp", self.path, crate::osutils::rand_chars(10));
-        self.transport.mkdir(&tmpname)?;
+        match self.transport.mkdir(&tmpname) {
+            Ok(()) => {}
+            // The lock directory does not exist yet: create it and try
+            // again.
+            Err(TransportError::NoSuchFile(_)) => {
+                self.create()?;
+                self.transport.mkdir(&tmpname)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
         self.transport
             .put_bytes(&format!("{tmpname}{INFO_NAME}"), &info.to_bytes(), None)?;
         Ok(tmpname)
@@ -251,6 +276,90 @@ impl<'t> LockDir<'t> {
         if let Err(e) = self.transport.rmdir(tmpname) {
             log::warn!("error removing pending lock dir {tmpname}: {e}");
         }
+    }
+
+    /// Break the lock if `dead_holder`, as [`peek`](Lock::peek) returned it,
+    /// still holds it; the user should have agreed that the holder is dead,
+    /// or two writers will think they hold the lock. Returns whether a lock
+    /// was broken: `false` if it was released meanwhile.
+    ///
+    /// Errors with [`LockError::BreakMismatch`] if someone else holds the
+    /// lock by now.
+    pub fn force_break(&mut self, dead_holder: &LockHeldInfo) -> Result<bool, LockError> {
+        if self.lock_held {
+            return Err(LockError::BreakOwnLock);
+        }
+        let Some(current) = self.peek()? else {
+            return Ok(false);
+        };
+        if &current != dead_holder {
+            return Err(LockError::BreakMismatch {
+                held: format!("{current:?}"),
+                target: format!("{dead_holder:?}"),
+            });
+        }
+        let broken = self.move_held_aside()?;
+        let info_path = format!("{broken}{INFO_NAME}");
+        let broken_info = self.read_info_at(&info_path)?;
+        // Someone may have taken the lock between the check and the rename.
+        if broken_info.as_ref() != Some(dead_holder) {
+            return Err(LockError::BreakMismatch {
+                held: format!("{broken_info:?}"),
+                target: format!("{dead_holder:?}"),
+            });
+        }
+        self.remove_broken(&broken)?;
+        Ok(true)
+    }
+
+    /// Break a lock whose `info` file cannot be parsed, if it still reads
+    /// `corrupt_info`. Returns
+    /// whether a lock was broken.
+    pub fn force_break_corrupt(&mut self, corrupt_info: &[u8]) -> Result<bool, LockError> {
+        if self.lock_held {
+            return Err(LockError::BreakOwnLock);
+        }
+        if self.held_info_bytes()?.is_none() {
+            return Ok(false);
+        }
+        let broken = self.move_held_aside()?;
+        let broken_info = self.transport.get_bytes(&format!("{broken}{INFO_NAME}"))?;
+        if broken_info != corrupt_info {
+            return Err(LockError::BreakMismatch {
+                held: String::from_utf8_lossy(&broken_info).into_owned(),
+                target: String::from_utf8_lossy(corrupt_info).into_owned(),
+            });
+        }
+        self.remove_broken(&broken)?;
+        Ok(true)
+    }
+
+    /// The raw contents of the held `info` file, if the lock is held.
+    pub fn held_info_bytes(&self) -> Result<Option<Vec<u8>>, LockError> {
+        match self.transport.get_bytes(&self.held_info_path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(TransportError::NoSuchFile(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Rename `held/` to a unique name in the lock directory, so it is no
+    /// longer the lock, and return that name.
+    fn move_held_aside(&self) -> Result<String, LockError> {
+        let broken = format!(
+            "{}/broken.{}.tmp",
+            self.path,
+            crate::osutils::rand_chars(20)
+        );
+        self.transport.rename(&self.held_dir, &broken)?;
+        Ok(broken)
+    }
+
+    /// Remove a held directory moved aside by `move_held_aside`.
+    fn remove_broken(&self, broken: &str) -> Result<(), LockError> {
+        self.transport.delete(&format!("{broken}{INFO_NAME}"))?;
+        self.transport.rmdir(broken)?;
+        Ok(())
     }
 
     fn read_info_at(&self, path: &str) -> Result<Option<LockHeldInfo>, LockError> {
@@ -376,6 +485,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = LocalTransport::new(dir.path());
         (dir, t)
+    }
+
+    #[test]
+    fn attempt_lock_creates_a_missing_lock_dir() {
+        let (dir, t) = temp_transport();
+        let mut lock = LockDir::new(&t, "lock");
+        lock.attempt_lock().unwrap();
+        assert!(dir.path().join("lock/held/info").exists());
+        lock.unlock().unwrap();
     }
 
     #[test]

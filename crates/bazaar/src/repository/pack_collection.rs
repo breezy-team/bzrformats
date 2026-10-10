@@ -7,6 +7,15 @@
 //! `plan_autopack_combinations`. These are pure functions over a repository's
 //! pack list (each pack summarised by its revision count), kept separate from
 //! the I/O of `pack()` so they can be unit-tested in isolation.
+//!
+//! [`PackNames`] is the in-memory pack list and its reconciliation with the
+//! `pack-names` file, likewise ported from `RepositoryPackCollection`.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::RepositoryError;
+use crate::pack_repo::{index_extension, IndexKind};
+use crate::transport::{SharedTransport, Transport, TransportError};
 
 /// The target distribution of pack sizes for `total_revisions` revisions, as a
 /// list of revision-count buckets, largest first.
@@ -96,6 +105,295 @@ pub fn plan_autopack_combinations(pack_revision_counts: &[u64]) -> Vec<usize> {
         return Vec::new();
     }
     selected
+}
+
+/// One `pack-names` entry: a pack's name and the index sizes recorded for it.
+pub type PackEntry = (String, Vec<u8>);
+
+/// The packs a pack repository reads from, kept in step with `pack-names`:
+/// those listed when it was last read or written, and those added and
+/// removed since.
+///
+/// Packs this process writes or repacks away change the in-memory list
+/// first; saving `pack-names` then merges those changes with whatever other
+/// processes have written since the list was last read.
+#[derive(Debug, Default)]
+pub struct PackNames {
+    /// The packs in memory, with their index sizes.
+    names: BTreeMap<String, Vec<u8>>,
+    /// The `pack-names` entries as last read or written.
+    at_load: BTreeSet<PackEntry>,
+}
+
+impl PackNames {
+    /// The packs listed in `entries`, as just read from `pack-names`.
+    pub fn from_disk(entries: Vec<PackEntry>) -> Self {
+        PackNames {
+            at_load: entries.iter().cloned().collect(),
+            names: entries.into_iter().collect(),
+        }
+    }
+
+    /// The names of the packs in memory.
+    pub fn names(&self) -> Vec<String> {
+        self.names.keys().cloned().collect()
+    }
+
+    /// The entries of the packs in memory.
+    pub fn entries(&self) -> Vec<PackEntry> {
+        self.names
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+
+    /// Add a pack this process wrote. Returns `false`,
+    /// changing nothing, if a pack of that name is already listed.
+    pub fn allocate(&mut self, name: String, value: Vec<u8>) -> bool {
+        if self.names.contains_key(&name) {
+            return false;
+        }
+        self.names.insert(name, value);
+        true
+    }
+
+    /// Drop a pack this process repacked away.
+    pub fn remove(&mut self, name: &str) {
+        self.names.remove(name);
+    }
+
+    /// The entries `pack-names` should hold given `disk`, its current
+    /// contents: those on disk, less the packs removed here since the list
+    /// was last read or written, plus those added here.
+    pub fn merge(&self, disk: &[PackEntry]) -> BTreeSet<PackEntry> {
+        let current: BTreeSet<PackEntry> = self.entries().into_iter().collect();
+        let mut merged: BTreeSet<PackEntry> = disk.iter().cloned().collect();
+        for deleted in self.at_load.difference(&current) {
+            merged.remove(deleted);
+        }
+        merged.extend(current.difference(&self.at_load).cloned());
+        merged
+    }
+
+    /// Record `entries` as what `pack-names` now holds on disk.
+    pub fn set_at_load(&mut self, entries: BTreeSet<PackEntry>) {
+        self.at_load = entries;
+    }
+
+    /// Make the packs in memory exactly `entries`. Returns the names of the
+    /// packs removed and added; a pack whose index sizes changed is both.
+    pub fn sync_to(&mut self, entries: &BTreeSet<PackEntry>) -> (Vec<String>, Vec<String>) {
+        let wanted: BTreeMap<&String, &Vec<u8>> =
+            entries.iter().map(|(name, value)| (name, value)).collect();
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        self.names.retain(|name, value| match wanted.get(name) {
+            Some(&wanted_value) if wanted_value == value => true,
+            _ => {
+                removed.push(name.clone());
+                false
+            }
+        });
+        for (name, value) in entries {
+            if !self.names.contains_key(name) {
+                self.names.insert(name.clone(), value.clone());
+                added.push(name.clone());
+            }
+        }
+        (removed, added)
+    }
+}
+
+/// A combined index of one object kind over a repository's packs, which a
+/// [`PackCollection`] adds packs to and removes them from.
+pub trait CombinedIndex {
+    /// Add the entries of `pack`'s index for `kind`.
+    fn add_pack(
+        &self,
+        transport: &dyn Transport,
+        pack: &str,
+        kind: IndexKind,
+    ) -> Result<(), RepositoryError>;
+
+    /// Drop the entries of `pack`.
+    fn remove_pack(&self, pack: &str);
+}
+
+/// A reader of pack data, which a [`PackCollection`] tells to drop what it
+/// holds of a pack that is no longer read.
+pub trait PackReader {
+    /// Drop anything held of `pack`.
+    fn forget(&self, pack: &str);
+}
+
+/// The packs of a pack repository and the stores reading them.
+///
+/// The stores' combined indices and readers are registered with
+/// [`add_store`](Self::add_store); packs the repository writes or repacks
+/// away are added to and removed from them in place, and `pack-names` is
+/// written by merging those changes with whatever other processes have
+/// written since it was read.
+pub struct PackCollection<I, R> {
+    transport: SharedTransport,
+    /// Whether `pack-names` is a btree index rather than a format-1 one.
+    uses_btree: bool,
+    names: PackNames,
+    indices: Vec<(IndexKind, I)>,
+    readers: Vec<R>,
+}
+
+impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
+    /// The packs listed in the `pack-names` of the repository `transport`
+    /// is rooted at, with no stores yet.
+    pub fn open(transport: SharedTransport, uses_btree: bool) -> Result<Self, RepositoryError> {
+        let names = PackNames::from_disk(read_pack_names(transport.as_ref())?);
+        Ok(PackCollection {
+            transport,
+            uses_btree,
+            names,
+            indices: Vec::new(),
+            readers: Vec::new(),
+        })
+    }
+
+    /// The names of the packs the stores read.
+    pub fn names(&self) -> Vec<String> {
+        self.names.names()
+    }
+
+    /// Register a store's combined index for `kind` and its pack reader, to
+    /// be kept in step with the packs.
+    pub fn add_store(&mut self, kind: IndexKind, index: I, reader: R) {
+        self.indices.push((kind, index));
+        self.readers.push(reader);
+    }
+
+    /// Add a pack the repository wrote; `pack-names`
+    /// lists it from the next save.
+    pub fn allocate(&mut self, name: String, value: Vec<u8>) -> Result<(), RepositoryError> {
+        if !self.names.allocate(name.clone(), value) {
+            return Err(RepositoryError::Corrupt(format!(
+                "pack {name} already exists"
+            )));
+        }
+        self.update_stores(&[], &[name])
+    }
+
+    /// Write `pack-names`, merging the packs added and removed here with
+    /// those other processes changed since it was read, and read the
+    /// result.
+    pub fn save(&mut self) -> Result<(), RepositoryError> {
+        let disk = read_pack_names(self.transport.as_ref())?;
+        let merged = self.names.merge(&disk);
+        write_pack_names(self.transport.as_ref(), self.uses_btree, &merged)?;
+        self.names.set_at_load(merged.clone());
+        self.sync(&merged)
+    }
+
+    /// Read `pack-names` again, keeping the packs added and removed here.
+    pub fn reload(&mut self) -> Result<(), RepositoryError> {
+        let disk = read_pack_names(self.transport.as_ref())?;
+        let merged = self.names.merge(&disk);
+        self.names.set_at_load(disk.into_iter().collect());
+        self.sync(&merged)
+    }
+
+    /// Replace `old` packs with `new_pack`, if any: read it instead of them,
+    /// save `pack-names`, and move them into `obsolete_packs/`.
+    pub fn replace(
+        &mut self,
+        old: &[String],
+        new_pack: Option<PackEntry>,
+    ) -> Result<(), RepositoryError> {
+        if let Some((name, value)) = new_pack {
+            self.allocate(name, value)?;
+        }
+        for pack in old {
+            self.names.remove(pack);
+        }
+        self.update_stores(old, &[])?;
+        self.save()?;
+        self.obsolete(old)
+    }
+
+    /// Make the stores read exactly the packs in `entries`.
+    fn sync(&mut self, entries: &BTreeSet<PackEntry>) -> Result<(), RepositoryError> {
+        let (removed, added) = self.names.sync_to(entries);
+        self.update_stores(&removed, &added)
+    }
+
+    /// Make the stores read `added` and stop reading `removed`.
+    fn update_stores(&self, removed: &[String], added: &[String]) -> Result<(), RepositoryError> {
+        for pack in removed {
+            for (_, index) in &self.indices {
+                index.remove_pack(pack);
+            }
+            for reader in &self.readers {
+                reader.forget(pack);
+            }
+        }
+        for pack in added {
+            for (kind, index) in &self.indices {
+                index.add_pack(self.transport.as_ref(), pack, *kind)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Move `packs` and their indices into `obsolete_packs/`. Old packs are
+    /// moved rather than deleted, matching brz, so a mistaken pack can be
+    /// recovered.
+    fn obsolete(&self, packs: &[String]) -> Result<(), RepositoryError> {
+        let transport = self.transport.as_ref();
+        if !transport.has("obsolete_packs")? {
+            transport.mkdir("obsolete_packs")?;
+        }
+        let move_away = |from: String, basename: String| match transport
+            .rename(&from, &format!("obsolete_packs/{basename}"))
+        {
+            Ok(()) | Err(TransportError::NoSuchFile(_)) => Ok(()),
+            Err(e) => Err(RepositoryError::from(e)),
+        };
+        for name in packs {
+            move_away(format!("packs/{name}.pack"), format!("{name}.pack"))?;
+            for (kind, _) in &self.indices {
+                let ext = index_extension(*kind);
+                move_away(format!("indices/{name}{ext}"), format!("{name}{ext}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Read `pack-names`, returning each pack's name and index sizes.
+pub fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackEntry>, RepositoryError> {
+    let index = super::pack_index::PackIndex::open(transport, "pack-names")?;
+    Ok(index
+        .iter_all_entries()
+        .filter_map(|(key, value, _refs)| {
+            key.first()
+                .map(|name| (String::from_utf8_lossy(name).into_owned(), value.clone()))
+        })
+        .collect())
+}
+
+/// Write `pack-names` listing `entries`.
+fn write_pack_names(
+    transport: &dyn Transport,
+    uses_btree: bool,
+    entries: &BTreeSet<PackEntry>,
+) -> Result<(), RepositoryError> {
+    let mut names = super::pack_index::IndexBuilder::new(uses_btree, 0, 1);
+    for (name, value) in entries {
+        names
+            .add_node(vec![name.clone().into_bytes()], value.clone(), vec![])
+            .map_err(|e| RepositoryError::Corrupt(format!("pack-names node: {e}")))?;
+    }
+    let bytes = names
+        .finish()
+        .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e}")))?;
+    transport.put_bytes("pack-names", &bytes, None)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -199,5 +497,45 @@ mod tests {
             plan_autopack_combinations(&counts),
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         );
+    }
+
+    fn entry(name: &str, value: &str) -> PackEntry {
+        (name.to_string(), value.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn merge_keeps_other_writers_changes() {
+        let mut packs = PackNames::from_disk(vec![entry("a", "1"), entry("b", "1")]);
+        // This process repacks a away into c.
+        packs.remove("a");
+        assert!(packs.allocate("c".to_string(), b"2".to_vec()));
+        // Meanwhile another process added d and repacked b away.
+        let disk = vec![entry("a", "1"), entry("d", "3")];
+        assert_eq!(
+            BTreeSet::from([entry("c", "2"), entry("d", "3")]),
+            packs.merge(&disk)
+        );
+    }
+
+    #[test]
+    fn allocate_refuses_a_listed_pack() {
+        let mut packs = PackNames::from_disk(vec![entry("a", "1")]);
+        assert!(!packs.allocate("a".to_string(), b"2".to_vec()));
+        assert_eq!(vec![entry("a", "1")], packs.entries());
+    }
+
+    #[test]
+    fn sync_reports_removed_and_added_packs() {
+        let mut packs = PackNames::from_disk(vec![entry("a", "1"), entry("b", "1")]);
+        let target = BTreeSet::from([entry("b", "2"), entry("c", "1")]);
+        let (removed, added) = packs.sync_to(&target);
+        assert_eq!(
+            (
+                vec!["a".to_string(), "b".to_string()],
+                vec!["b".to_string(), "c".to_string()]
+            ),
+            (removed, added)
+        );
+        assert_eq!(vec![entry("b", "2"), entry("c", "1")], packs.entries());
     }
 }

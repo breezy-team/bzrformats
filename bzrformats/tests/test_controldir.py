@@ -21,6 +21,9 @@ import os
 from .. import controldir
 from ..errors import (
     BzrFormatsError,
+    LockActive,
+    LockContention,
+    LockNotHeld,
     NotStacked,
     UnsupportedOperation,
 )
@@ -41,12 +44,8 @@ class TestControlDir(TestCaseInTempDir):
 
     def test_commit_empty_tree_round_trip(self):
         cd = controldir.create(self.test_dir)
-        repo = cd.open_repository()
-        branch = cd.open_branch()
         wt = cd.open_workingtree()
-        revid = wt.commit(
-            repo, branch, "T <t@e>", "empty", 1577880000, 0, allow_pointless=True
-        )
+        revid = wt.commit("T <t@e>", "empty", 1577880000, 0, allow_pointless=True)
 
         reopened = controldir.open(self.test_dir)
         self.assertEqual(reopened.open_branch().last_revision_info(), (1, revid))
@@ -64,9 +63,7 @@ class TestControlDir(TestCaseInTempDir):
             f.write(b"hello\n")
         wt = cd.open_workingtree()
         file_id = wt.add("a.txt", "file")
-        revid = wt.commit(
-            cd.open_repository(), cd.open_branch(), "T <t@e>", "add a", 1577880000, 0
-        )
+        revid = wt.commit("T <t@e>", "add a", 1577880000, 0)
 
         reopened = controldir.open(self.test_dir)
         repo = reopened.open_repository()
@@ -82,8 +79,6 @@ class TestControlDir(TestCaseInTempDir):
         wt = cd.open_workingtree()
         wt.add("a.txt", "file")
         revid = wt.commit(
-            cd.open_repository(),
-            cd.open_branch(),
             "T <t@e>",
             "msg",
             1577880000,
@@ -101,16 +96,12 @@ class TestControlDir(TestCaseInTempDir):
             f.write(b"hi\n")
         wt = cd.open_workingtree()
         wt.add("a.txt", "file")
-        wt.commit(
-            cd.open_repository(), cd.open_branch(), "T <t@e>", "first", 1577880000, 0
-        )
+        wt.commit("T <t@e>", "first", 1577880000, 0)
         # A second commit with nothing changed is refused.
         wt2 = controldir.open(self.test_dir).open_workingtree()
         self.assertRaises(
             BzrFormatsError,
             wt2.commit,
-            cd.open_repository(),
-            cd.open_branch(),
             "T <t@e>",
             "empty",
             1577890000,
@@ -129,8 +120,6 @@ class TestControlDir(TestCaseInTempDir):
         self.assertRaises(
             BzrFormatsError,
             wt.commit,
-            cd.open_repository(),
-            cd.open_branch(),
             "T <t@e>",
             "c",
             1577880000,
@@ -146,16 +135,12 @@ class TestControlDir(TestCaseInTempDir):
         wt = cd.open_workingtree()
         a_id = wt.add("a.txt", "file")
         b_id = wt.add("b.txt", "file")
-        rev1 = wt.commit(
-            cd.open_repository(), cd.open_branch(), "T <t@e>", "two", 1577880000, 0
-        )
+        rev1 = wt.commit("T <t@e>", "two", 1577880000, 0)
         for n, c in [("a.txt", b"a2\n"), ("b.txt", b"b2\n")]:
             with open(os.path.join(self.test_dir, n), "wb") as f:
                 f.write(c)
         wt2 = controldir.open(self.test_dir).open_workingtree()
         rev2 = wt2.commit(
-            cd.open_repository(),
-            cd.open_branch(),
             "T <t@e>",
             "only a",
             1577890000,
@@ -274,6 +259,7 @@ class TestControlDir(TestCaseInTempDir):
     def test_add_revision_round_trip(self):
         cd = controldir.create(self.test_dir)
         repo = cd.open_repository()
+        repo.lock_write()
         repo.start_write_group()
         repo.add_revision(
             b"rev-x",
@@ -285,10 +271,22 @@ class TestControlDir(TestCaseInTempDir):
             revprops={"k": b"v"},
         )
         repo.commit_write_group()
+        repo.unlock()
         got = controldir.open(self.test_dir).open_repository().get_revision(b"rev-x")
         self.assertEqual(got["message"], "hello")
         self.assertEqual(got["committer"], "T <t@e>")
         self.assertEqual(got["properties"]["k"], b"v")
+
+    def test_abort_write_group_discards_additions(self):
+        cd = controldir.create(self.test_dir)
+        repo = cd.open_repository()
+        repo.lock_write()
+        repo.start_write_group()
+        repo.add_revision(b"rev-x", "hello", "T <t@e>", 1577880000.0, 0, parents=[])
+        repo.abort_write_group()
+        repo.unlock()
+        reopened = controldir.open(self.test_dir).open_repository()
+        self.assertFalse(reopened.has_revision(b"rev-x"))
 
     def test_iter_changes_with_parents(self):
         cd = controldir.create(self.test_dir)
@@ -296,16 +294,10 @@ class TestControlDir(TestCaseInTempDir):
             f.write(b"x\n")
         wt = cd.open_workingtree()
         wt.add("a.txt", "file")
-        rev = wt.commit(
-            cd.open_repository(), cd.open_branch(), "T <t@e>", "c", 1577880000, 0
-        )
+        rev = wt.commit("T <t@e>", "c", 1577880000, 0)
         # With no extra parents it matches iter_changes (no pending changes).
         reopened = controldir.open(self.test_dir)
-        changes = list(
-            reopened.open_workingtree().iter_changes_with_parents(
-                reopened.open_repository(), rev, []
-            )
-        )
+        changes = list(reopened.open_workingtree().iter_changes_with_parents(rev, []))
         self.assertEqual(changes, [])
 
     def test_branch_tags_round_trip(self):
@@ -340,8 +332,6 @@ class TestControlDir(TestCaseInTempDir):
         base_cd = controldir.create(base)
         wt = base_cd.open_workingtree()
         revid = wt.commit(
-            base_cd.open_repository(),
-            base_cd.open_branch(),
             "T <t@e>",
             "base",
             1577880000,
@@ -403,8 +393,6 @@ class TestControlDir(TestCaseInTempDir):
     def test_pack_keeps_data_readable(self):
         cd = controldir.create(self.test_dir)
         r1 = cd.open_workingtree().commit(
-            cd.open_repository(),
-            cd.open_branch(),
             "T <t@e>",
             "one",
             1577880000,
@@ -413,8 +401,6 @@ class TestControlDir(TestCaseInTempDir):
         )
         reopened = controldir.open(self.test_dir)
         r2 = reopened.open_workingtree().commit(
-            reopened.open_repository(),
-            reopened.open_branch(),
             "T <t@e>",
             "two",
             1577890000,
@@ -435,8 +421,6 @@ class TestControlDir(TestCaseInTempDir):
         os.makedirs(src)
         scd = controldir.create(src)
         revid = scd.open_workingtree().commit(
-            scd.open_repository(),
-            scd.open_branch(),
             "T <t@e>",
             "one",
             1577880000,
@@ -457,8 +441,6 @@ class TestControlDir(TestCaseInTempDir):
         os.makedirs(path)
         cd = controldir.create(path, "1.9")
         revid = cd.open_workingtree().commit(
-            cd.open_repository(),
-            cd.open_branch(),
             "T <t@e>",
             "one",
             1577880000,
@@ -479,9 +461,7 @@ class TestControlDir(TestCaseInTempDir):
             f.write(b"hi\n")
         wt = cd.open_workingtree()
         wt.add("a.txt", "file")
-        wt.commit(
-            cd.open_repository(), cd.open_branch(), "T <t@e>", "add a", 1577880000, 0
-        )
+        wt.commit("T <t@e>", "add a", 1577880000, 0)
         result = controldir.open(self.test_dir).open_repository().check()
         self.assertEqual(result["problems"], [])
         self.assertEqual(result["ghosts"], [])
@@ -494,12 +474,144 @@ class TestControlDir(TestCaseInTempDir):
             f.write(b"hi\n")
         wt = cd.open_workingtree()
         wt.add("a.txt", "file")
-        revid = wt.commit(
-            cd.open_repository(), cd.open_branch(), "T <t@e>", "add a", 1577880000, 0
-        )
+        revid = wt.commit("T <t@e>", "add a", 1577880000, 0)
         result = controldir.open(self.test_dir).open_repository().reconcile()
         self.assertEqual(result["garbage_inventories"], 0)
         # Data still present and consistent after reconcile.
         repo = controldir.open(self.test_dir).open_repository()
         self.assertTrue(repo.has_revision(revid))
         self.assertEqual(repo.check()["problems"], [])
+
+
+class TestLocking(TestCaseInTempDir):
+    def test_objects_reached_through_their_owner_are_stable(self):
+        wt = controldir.create(self.test_dir).open_workingtree()
+        self.assertIs(wt.branch, wt.branch)
+        self.assertIs(wt.branch.repository, wt.branch.repository)
+
+    def test_tree_locks_cascade_to_branch_and_repository(self):
+        wt = controldir.create(self.test_dir).open_workingtree()
+        branch = wt.branch
+        repository = branch.repository
+        for lock, branch_mode, repository_write_locked in [
+            (wt.lock_read, "r", False),
+            (wt.lock_tree_write, "r", False),
+            (wt.lock_write, "w", True),
+        ]:
+            lock()
+            self.assertEqual(
+                (True, branch_mode, True, repository_write_locked),
+                (
+                    wt.is_locked(),
+                    branch.peek_lock_mode(),
+                    repository.is_locked(),
+                    repository.is_write_locked(),
+                ),
+            )
+            wt.unlock()
+            self.assertEqual(
+                (False, None, False),
+                (wt.is_locked(), branch.peek_lock_mode(), repository.is_locked()),
+            )
+
+    def test_read_locks_are_counted_and_shared(self):
+        cd = controldir.create(self.test_dir)
+        branch = cd.open_branch()
+        other = controldir.open(self.test_dir).open_branch()
+        branch.lock_read()
+        branch.lock_read()
+        other.lock_read()
+        branch.unlock()
+        self.assertEqual("r", branch.peek_lock_mode())
+        self.assertTrue(branch.repository.is_locked())
+        branch.unlock()
+        other.unlock()
+        self.assertFalse(branch.repository.is_locked())
+
+    def test_lock_results(self):
+        cd = controldir.create(self.test_dir)
+        branch = cd.open_branch()
+        result = branch.lock_read()
+        self.assertIsInstance(result, controldir.LogicalLockResult)
+        result.unlock()
+        self.assertFalse(branch.is_locked())
+
+        result = branch.lock_write()
+        self.assertIsInstance(result, controldir.BranchWriteLockResult)
+        self.assertIsInstance(result.token, str)
+        self.assertTrue(branch.get_physical_lock_status())
+        result.unlock()
+        self.assertFalse(branch.get_physical_lock_status())
+
+        repository = cd.open_repository()
+        result = repository.lock_write()
+        self.assertIsInstance(result, controldir.RepositoryWriteLockResult)
+        result.unlock()
+
+        wt = cd.open_workingtree()
+        with wt.lock_write():
+            self.assertTrue(wt.branch.repository.is_write_locked())
+        self.assertFalse(wt.is_locked())
+
+    def test_contention_and_unlocking_twice(self):
+        cd = controldir.create(self.test_dir)
+        branch = cd.open_branch()
+        other = controldir.open(self.test_dir).open_branch()
+        branch.lock_write()
+        self.assertRaises(LockContention, other.lock_write)
+        self.assertFalse(other.is_locked())
+        branch.unlock()
+        self.assertRaises(LockNotHeld, branch.unlock)
+
+    def test_commit_uses_the_tree_branch(self):
+        wt = controldir.create(self.test_dir).open_workingtree()
+        revid = wt.commit("T <t@e>", "empty", 1577880000, 0, allow_pointless=True)
+        self.assertEqual((1, revid), wt.branch.last_revision_info())
+        self.assertTrue(wt.branch.repository.has_revision(revid))
+
+    def test_break_lock_asks_before_breaking(self):
+        cd = controldir.create(self.test_dir)
+        holder = cd.open_branch()
+        token = holder.lock_write().token
+        branch = controldir.open(self.test_dir).open_branch()
+        asked = []
+
+        def decline(info):
+            asked.append(info["nonce"])
+            return False
+
+        branch.break_lock(decline)
+        self.assertEqual([token], asked)
+        branch.break_lock()
+        self.assertTrue(branch.get_physical_lock_status())
+        branch.break_lock(lambda info: True)
+        self.assertFalse(branch.get_physical_lock_status())
+
+    def test_break_lock_raises_what_confirm_raises(self):
+        cd = controldir.create(self.test_dir)
+        cd.open_branch().lock_write()
+
+        def confirm(info):
+            raise KeyboardInterrupt
+
+        branch = controldir.open(self.test_dir).open_branch()
+        self.assertRaises(KeyboardInterrupt, branch.break_lock, confirm)
+        self.assertTrue(branch.get_physical_lock_status())
+
+    def test_break_lock_refuses_a_tree_in_use(self):
+        wt = controldir.create(self.test_dir).open_workingtree()
+        wt.lock_write()
+        other = controldir.open(self.test_dir).open_workingtree()
+        self.assertRaises(LockActive, other.break_lock, lambda info: True)
+        wt.unlock()
+
+    def test_iter_changes_against_the_tree_branch(self):
+        cd = controldir.create(self.test_dir)
+        with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:
+            f.write(b"x\n")
+        wt = cd.open_workingtree()
+        wt.add("a.txt", "file")
+        changes = list(wt.iter_changes(b"null:"))
+        self.assertEqual(
+            ["a.txt"], [c["new_path"] for c in changes if c["new_path"] != ""]
+        )

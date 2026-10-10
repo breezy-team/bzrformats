@@ -16,7 +16,6 @@ mod knit_repo;
 mod pack_2a;
 mod pack_2a_writer;
 mod pack_collection;
-#[cfg(feature = "knitpack")]
 mod pack_index;
 #[cfg(feature = "knitpack")]
 mod pack_knit;
@@ -47,6 +46,7 @@ pub use tree::RevisionTree;
 pub use weave_repo::WeaveRepository;
 
 use crate::inventory::Inventory;
+use crate::lockable_files::{Lockable, LockableExt as _};
 
 /// The common read interface to a bzr repository.
 ///
@@ -54,9 +54,65 @@ use crate::inventory::Inventory;
 /// can be held as `Box<dyn Repository>` while each format keeps its own
 /// inventory representation (a lazy CHK inventory for 2a, an in-memory one
 /// for knit-pack) behind the box — no conversion between them.
-pub trait Repository: Send + Sync {
+pub trait Repository: Lockable<Error = RepositoryError> + Send + Sync {
     /// The format this repository was opened as.
     fn format(&self) -> &'static RepositoryFormat;
+
+    /// The repository's lock: a count of read and write locks, with a lock
+    /// directory for the formats that take one.
+    fn lock(&self) -> &crate::lockable_files::LockableFiles;
+
+    /// Whether a write group is open.
+    fn is_in_write_group(&self) -> bool {
+        false
+    }
+
+    /// Reread what other processes may have changed while the repository
+    /// was unlocked; called on the first lock.
+    fn refresh_data(&mut self) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+
+    /// Lock the repository for writing, with `token` taking over a held lock
+    /// directory and `waiter` deciding what to do while someone else holds
+    /// it.
+    fn lock_write_with_token(
+        &mut self,
+        token: Option<&crate::lockable_files::LockToken>,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, RepositoryError> {
+        let first = !self.lock().is_locked();
+        let locked = self
+            .lock()
+            .lock_write(token, waiter)
+            .map_err(RepositoryError::Locking)?;
+        if first {
+            if let Err(e) = self.refresh_data() {
+                self.lock().unlock().map_err(RepositoryError::Locking)?;
+                return Err(e);
+            }
+        }
+        Ok(locked)
+    }
+
+    /// Break the repository's lock directory if someone else holds it and
+    /// `confirm` agrees (see [`LockableFiles::break_lock`]).
+    ///
+    /// [`LockableFiles::break_lock`]: crate::lockable_files::LockableFiles::break_lock
+    fn break_lock(
+        &self,
+        confirm: &mut dyn FnMut(Option<&crate::lockdir::LockHeldInfo>) -> bool,
+    ) -> Result<(), RepositoryError> {
+        self.lock()
+            .break_lock(confirm)
+            .map(drop)
+            .map_err(RepositoryError::Locking)
+    }
+
+    /// Whether the repository is locked for writing.
+    fn is_write_locked(&self) -> bool {
+        self.lock().lock_mode() == Some(crate::lockable_files::LockMode::Write)
+    }
 
     /// Downcast support, so a backend's format-specific fast path can recover a
     /// same-format `source` (e.g. another `Pack2aRepository`). Each backend
@@ -211,6 +267,10 @@ pub trait Repository: Send + Sync {
 
     /// Flush the open write group, committing its additions.
     fn commit_write_group(&mut self) -> Result<(), RepositoryError>;
+
+    /// Close the open write group, discarding its additions. Formats whose
+    /// writes land immediately have no write group, and keep them.
+    fn abort_write_group(&mut self) -> Result<(), RepositoryError>;
 
     /// Combine the repository's packs into a single pack.
     ///
@@ -434,7 +494,81 @@ impl StackedRepository {
     }
 }
 
+impl StackedRepository {
+    /// Read-lock the fallbacks, releasing the primary again on failure.
+    fn lock_fallbacks(&mut self) -> Result<(), RepositoryError> {
+        for i in 0..self.fallbacks.len() {
+            if let Err(e) = self.fallbacks[i].lock_read() {
+                for fallback in &mut self.fallbacks[..i] {
+                    fallback.unlock()?;
+                }
+                self.primary.unlock()?;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Lockable for StackedRepository {
+    type Error = RepositoryError;
+
+    /// The fallbacks are read-locked with the first lock.
+    fn lock_read(&mut self) -> Result<(), RepositoryError> {
+        let first = !self.primary.lock().is_locked();
+        self.primary.lock_read()?;
+        if first {
+            self.lock_fallbacks()?;
+        }
+        Ok(())
+    }
+
+    fn lock_write(
+        &mut self,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, RepositoryError> {
+        self.lock_write_with_token(None, waiter)
+    }
+
+    /// The fallbacks are released with the last lock.
+    fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, RepositoryError> {
+        let released = self.primary.unlock()?;
+        if !self.primary.lock().is_locked() {
+            for fallback in &mut self.fallbacks {
+                fallback.unlock()?;
+            }
+        }
+        Ok(released)
+    }
+}
+
 impl Repository for StackedRepository {
+    fn lock(&self) -> &crate::lockable_files::LockableFiles {
+        self.primary.lock()
+    }
+
+    fn is_in_write_group(&self) -> bool {
+        self.primary.is_in_write_group()
+    }
+
+    fn refresh_data(&mut self) -> Result<(), RepositoryError> {
+        self.primary.refresh_data()
+    }
+
+    /// The fallbacks are read-locked with the first lock.
+    fn lock_write_with_token(
+        &mut self,
+        token: Option<&crate::lockable_files::LockToken>,
+        waiter: &mut dyn crate::lockable_files::LockWaiter,
+    ) -> Result<crate::lockable_files::WriteLocked, RepositoryError> {
+        let first = !self.primary.lock().is_locked();
+        let locked = self.primary.lock_write_with_token(token, waiter)?;
+        if first {
+            self.lock_fallbacks()?;
+        }
+        Ok(locked)
+    }
+
     fn format(&self) -> &'static RepositoryFormat {
         self.primary.format()
     }
@@ -568,6 +702,10 @@ impl Repository for StackedRepository {
         self.primary.commit_write_group()
     }
 
+    fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
+        self.primary.abort_write_group()
+    }
+
     fn add_fallback_repository(
         &mut self,
         fallback: Box<dyn Repository>,
@@ -581,6 +719,7 @@ impl Repository for StackedRepository {
 /// first element is the revision id) to the revision-id-keyed map the
 /// [`Repository::get_parent_map`] interface returns. Shared by the knit-pack
 /// and non-pack knit backends, which both key by `KnitKey`.
+#[cfg(any(feature = "knit", feature = "knitpack"))]
 pub(crate) fn unkey_knit_parent_map(
     raw: std::collections::HashMap<crate::knit::KnitKey, Vec<crate::knit::KnitKey>>,
 ) -> std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> {
@@ -629,6 +768,66 @@ pub fn open(transport: SharedTransport) -> Result<Box<dyn Repository>, Repositor
     let format =
         find_format(&marker).ok_or_else(|| RepositoryError::UnknownFormat(marker.clone()))?;
     (format.open)(transport)
+}
+
+/// Read-lock `repository`, rereading its data with the first lock: how a
+/// repository's [`Lockable::lock_read`] works unless it locks differently.
+pub fn lock_read<R: Repository + ?Sized>(repository: &mut R) -> Result<(), RepositoryError> {
+    let first = !repository.lock().is_locked();
+    repository
+        .lock()
+        .lock_read()
+        .map_err(RepositoryError::Locking)?;
+    if first {
+        if let Err(e) = repository.refresh_data() {
+            repository
+                .lock()
+                .unlock()
+                .map_err(RepositoryError::Locking)?;
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Release one lock on `repository`: how a repository's
+/// [`Lockable::unlock`] works unless it locks differently. Releasing the
+/// last write lock with a write group open aborts the write group, releases
+/// the lock and is an error.
+pub fn unlock<R: Repository + ?Sized>(
+    repository: &mut R,
+) -> Result<Option<crate::lockable_files::LockToken>, RepositoryError> {
+    let lock = repository.lock();
+    let group_left_open = lock.lock_count() == 1
+        && lock.lock_mode() == Some(crate::lockable_files::LockMode::Write)
+        && repository.is_in_write_group();
+    let aborted = if group_left_open {
+        repository.abort_write_group()
+    } else {
+        Ok(())
+    };
+    let released = repository
+        .lock()
+        .unlock()
+        .map_err(RepositoryError::Locking)?;
+    aborted?;
+    if group_left_open {
+        return Err(RepositoryError::WriteGroupOpen);
+    }
+    Ok(released)
+}
+
+/// Run `f` on `repository` under a write lock: a write lock the caller
+/// holds is counted, and otherwise one is taken for `f` without waiting for
+/// another holder.
+pub fn with_write_lock<T: Repository + ?Sized, R>(
+    repository: &mut T,
+    f: impl FnOnce(&mut T) -> Result<R, RepositoryError>,
+) -> Result<R, RepositoryError> {
+    let mut locked = repository.write_locked()?;
+    let result = f(&mut locked);
+    let unlocked = locked.unlock();
+    result.and_then(|r| unlocked.map(|_| r))
 }
 
 #[cfg(test)]
@@ -688,7 +887,13 @@ mod tests {
             Scenario {
                 label: "weave",
                 create: |t| Box::new(WeaveRepository::create(t, weave6()).unwrap()),
-                reopen: |t| Box::new(WeaveRepository::open(t, weave6()).unwrap()),
+                reopen: |t| {
+                    let os_lock = crate::lockable_files::TransportLock::new(
+                        SharedTransport::clone(&t),
+                        crate::lockable_files::BRANCH_LOCK,
+                    );
+                    Box::new(WeaveRepository::open(t, weave6(), os_lock).unwrap())
+                },
                 signs: true,
             },
         ]
@@ -728,6 +933,122 @@ mod tests {
     /// Two revisions, a file text with a per-file parent, an inventory, and a
     /// signature (where supported) round-trip through every write-capable
     /// repository backend. Replaces the per-backend copies of this test.
+    /// A committed write group is readable through the repository object
+    /// that wrote it, without reopening the repository.
+    #[test]
+    fn committed_data_is_readable_through_the_writer() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(t);
+            {
+                let mut repo = repo.write_locked().unwrap();
+                repo.start_write_group().unwrap();
+                repo.add_revision(&revision(b"rev-1", vec![], "first"), &[])
+                    .unwrap();
+                repo.add_inventory_from_entries(
+                    b"rev-1",
+                    &[],
+                    crate::inventory::ROOT_ID,
+                    &entries(b"rev-1"),
+                )
+                .unwrap();
+                repo.commit_write_group().unwrap();
+                assert!(repo.has_revision(b"rev-1").unwrap(), "{}", s.label);
+                repo.unlock().unwrap();
+            }
+            assert!(repo.has_revision(b"rev-1").unwrap(), "{}", s.label);
+            {
+                let repo = repo.read_locked().unwrap();
+                assert!(repo.has_revision(b"rev-1").unwrap(), "{}", s.label);
+                repo.unlock().unwrap();
+            }
+
+            // Packing moves the old packs aside; the data stays readable.
+            {
+                let mut repo = repo.write_locked().unwrap();
+                repo.start_write_group().unwrap();
+                repo.add_revision(
+                    &revision(b"rev-2", vec![b"rev-1"], "second"),
+                    &[b"rev-1".to_vec()],
+                )
+                .unwrap();
+                repo.commit_write_group().unwrap();
+                repo.unlock().unwrap();
+            }
+            repo.pack().unwrap();
+            for rev in [&b"rev-1"[..], b"rev-2"] {
+                assert_eq!(
+                    rev,
+                    repo.get_revision(rev).unwrap().revision_id.as_bytes(),
+                    "{}",
+                    s.label
+                );
+            }
+        }
+    }
+
+    /// Aborting a write group discards what was added to it; formats that
+    /// write immediately have no write group to discard.
+    #[test]
+    fn aborted_write_group_is_discarded() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(SharedTransport::clone(&t));
+            let mut locked = repo.write_locked().unwrap();
+            locked.start_write_group().unwrap();
+            let grouped = locked.is_in_write_group();
+            locked
+                .add_revision(&revision(b"rev-1", vec![], "first"), &[])
+                .unwrap();
+            locked.abort_write_group().unwrap();
+            assert!(!locked.is_in_write_group(), "{}", s.label);
+            locked.unlock().unwrap();
+            let reopened = (s.reopen)(t);
+            assert_eq!(
+                !grouped,
+                reopened.has_revision(b"rev-1").unwrap(),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    /// Releasing the last write lock with a write group open aborts the
+    /// write group, so the next write lock can start a new one.
+    #[test]
+    fn unlock_aborts_an_open_write_group() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(SharedTransport::clone(&t));
+            let mut locked = repo.write_locked().unwrap();
+            locked.start_write_group().unwrap();
+            if !locked.is_in_write_group() {
+                continue;
+            }
+            locked
+                .add_revision(&revision(b"rev-1", vec![], "first"), &[])
+                .unwrap();
+            assert!(
+                matches!(locked.unlock(), Err(RepositoryError::WriteGroupOpen)),
+                "{}",
+                s.label
+            );
+            assert!(!repo.is_in_write_group(), "{}", s.label);
+            assert!(!repo.lock().is_locked(), "{}", s.label);
+            assert!(!(s.reopen)(SharedTransport::clone(&t))
+                .has_revision(b"rev-1")
+                .unwrap());
+
+            let mut locked = repo.write_locked().unwrap();
+            locked.start_write_group().unwrap();
+            locked.commit_write_group().unwrap();
+            locked.unlock().unwrap();
+        }
+    }
+
     #[test]
     fn missing_text_is_no_such_file_text() {
         for s in scenarios() {
@@ -752,6 +1073,7 @@ mod tests {
             let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
             let mut repo = (s.create)(t.clone());
 
+            let mut repo = repo.write_locked().unwrap();
             repo.start_write_group().unwrap();
             repo.add_revision(&revision(b"rev-1", vec![], "first"), &[])
                 .unwrap();
@@ -780,6 +1102,7 @@ mod tests {
                     .unwrap();
             }
             repo.commit_write_group().unwrap();
+            repo.unlock().unwrap();
 
             let repo = (s.reopen)(t);
             let mut ids = repo.all_revision_ids().unwrap();
@@ -884,6 +1207,7 @@ mod tests {
         let t: SharedTransport = Arc::new(LocalTransport::new(dir));
         let mut repo =
             Box::new(Pack2aRepository::create(t.clone()).unwrap()) as Box<dyn Repository>;
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_revision(&revision(rev, vec![], "msg"), &[])
             .unwrap();
@@ -891,6 +1215,7 @@ mod tests {
             .unwrap();
         repo.add_text(b"file-1", rev, &[], b"hello\n").unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
         Box::new(Pack2aRepository::open(t).unwrap())
     }
 
@@ -976,9 +1301,11 @@ mod tests {
         let testament = testament_short_text_for_revision(repo.as_ref(), b"rev-1").unwrap();
         let signature = crate::gpg::clearsign(&testament, &tsk).unwrap();
         let mut repo = repo;
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_signature_text(b"rev-1", &signature).unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
         // Reopen so the freshly written signature pack is visible to reads.
         let repo = Box::new(Pack2aRepository::open(t.clone()).unwrap()) as Box<dyn Repository>;
 
@@ -1003,9 +1330,11 @@ mod tests {
         let (cert, tsk) = gen_signing_cert();
         // Sign something that is NOT the revision's testament.
         let signature = crate::gpg::clearsign(b"not the testament\n", &tsk).unwrap();
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_signature_text(b"rev-1", &signature).unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
         let repo = Box::new(Pack2aRepository::open(t.clone()).unwrap()) as Box<dyn Repository>;
 
         assert_eq!(
@@ -1021,6 +1350,7 @@ mod tests {
     fn make_2a_with_rev_at(t: &SharedTransport, rev: &[u8]) -> Box<dyn Repository> {
         let mut repo =
             Box::new(Pack2aRepository::create(t.clone()).unwrap()) as Box<dyn Repository>;
+        let mut repo = repo.write_locked().unwrap();
         repo.start_write_group().unwrap();
         repo.add_revision(&revision(rev, vec![], "msg"), &[])
             .unwrap();
@@ -1028,6 +1358,7 @@ mod tests {
             .unwrap();
         repo.add_text(b"file-1", rev, &[], b"hello\n").unwrap();
         repo.commit_write_group().unwrap();
+        repo.unlock().unwrap();
         Box::new(Pack2aRepository::open(t.clone()).unwrap())
     }
 }
