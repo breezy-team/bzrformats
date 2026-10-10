@@ -894,6 +894,7 @@ fn write_revision(
     }
     repository
         .commit_write_group()
+        .map(drop)
         .map_err(WorkingTreeError::Repository)
 }
 
@@ -3211,7 +3212,7 @@ mod tests {
         ) -> Result<Option<Vec<u8>>, RepositoryError> {
             unimplemented!()
         }
-        fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+        fn commit_write_group(&mut self) -> Result<Option<Vec<String>>, RepositoryError> {
             unimplemented!()
         }
         fn abort_write_group(&mut self) -> Result<(), RepositoryError> {

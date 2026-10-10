@@ -193,7 +193,7 @@ impl PackKnitIndex {
     ) -> Result<Self, RepositoryError> {
         let index = PackKnitIndex::default();
         for pack in packs {
-            index.add_pack(transport, pack, kind)?;
+            index.add_pack(transport, pack, kind, false)?;
         }
         Ok(index)
     }
@@ -206,8 +206,9 @@ impl super::pack_collection::CombinedIndex for PackKnitIndex {
         transport: &dyn Transport,
         pack: &str,
         kind: IndexKind,
+        resumed: bool,
     ) -> Result<(), RepositoryError> {
-        let name = format!("indices/{pack}{}", index_extension(kind));
+        let name = super::pack_collection::index_path(pack, index_extension(kind), resumed);
         let index = super::pack_index::PackIndex::open(transport, &name)?;
         let mut state = self.state.write().unwrap();
         if index.node_ref_lists() > 0 {
@@ -363,6 +364,8 @@ impl KnitIndex for PackKnitIndex {
 #[derive(Clone)]
 struct PackKnitAccess {
     transport: SharedTransport,
+    /// The packs of a resumed write group, read from the upload directory.
+    resumed: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PackName>>>,
     cache: std::sync::Arc<std::sync::Mutex<HashMap<PackName, std::sync::Arc<Vec<u8>>>>>,
 }
 
@@ -370,6 +373,7 @@ impl PackKnitAccess {
     fn new(transport: SharedTransport) -> Self {
         PackKnitAccess {
             transport,
+            resumed: Default::default(),
             cache: Default::default(),
         }
     }
@@ -378,7 +382,8 @@ impl PackKnitAccess {
         if let Some(b) = self.cache.lock().unwrap().get(pack) {
             return Ok(b.clone());
         }
-        let path = format!("packs/{pack}.pack");
+        let resumed = self.resumed.lock().unwrap().contains(pack);
+        let path = super::pack_collection::pack_path(pack, resumed);
         let bytes = self
             .transport
             .get_bytes(&path)
@@ -412,6 +417,15 @@ impl PackKnitAccess {
 impl super::pack_collection::PackReader for PackKnitAccess {
     fn forget(&self, pack: &str) {
         self.cache.lock().unwrap().remove(pack);
+    }
+
+    fn set_resumed(&self, pack: &str, resumed: bool) {
+        let mut set = self.resumed.lock().unwrap();
+        if resumed {
+            set.insert(pack.to_string());
+        } else {
+            set.remove(pack);
+        }
     }
 }
 
@@ -537,8 +551,14 @@ impl KnitPackRepository {
             ));
         }
         transport.mkdir("")?;
-        transport.mkdir("indices")?;
-        transport.mkdir("packs")?;
+        for dir in [
+            "indices",
+            "obsolete_packs",
+            "packs",
+            super::pack_collection::UPLOAD_DIR,
+        ] {
+            transport.mkdir(dir)?;
+        }
         transport.put_bytes("format", format.format_string(), None)?;
         let empty = super::pack_index::IndexBuilder::new(format.uses_btree_index, 0, 1)
             .finish()
@@ -554,9 +574,7 @@ impl KnitPackRepository {
             return Err(RepositoryError::NotWriteLocked);
         }
         if self.write_group.is_some() {
-            return Err(RepositoryError::Corrupt(
-                "a write group is already open".to_string(),
-            ));
+            return Err(RepositoryError::AlreadyInWriteGroup);
         }
         self.write_group = Some(WriteGroup::new(
             &new_pack_name(),
@@ -568,7 +586,7 @@ impl KnitPackRepository {
     fn group(&self) -> Result<&WriteGroup, RepositoryError> {
         self.write_group
             .as_ref()
-            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))
+            .ok_or(RepositoryError::NotInWriteGroup)
     }
 
     /// Add a revision, serialised to XML (v5).
@@ -654,29 +672,75 @@ impl KnitPackRepository {
         }
     }
 
-    /// Flush the open write group.
-    pub fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+    /// Commit the open write group: write its pack and indices if anything
+    /// was added, move the packs it resumed into place, list them all in
+    /// `pack-names` and autopack.
+    ///
+    /// Returns the names of the packs written, by autopack if it ran,
+    /// which can be passed to `pack` as a hint.
+    pub fn commit_write_group(&mut self) -> Result<Vec<PackName>, RepositoryError> {
         let group = self
             .write_group
             .take()
-            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))?;
-        let (name, value) = group.finish(self.transport.as_ref())?;
-        self.packs.allocate(name, value)?;
+            .ok_or(RepositoryError::NotInWriteGroup)?;
+        let mut new_packs = Vec::new();
+        if let Some((name, value)) = group.finish(self.transport.as_ref())? {
+            new_packs.push(name.clone());
+            self.packs.allocate(name, value)?;
+        }
+        new_packs.extend(self.packs.finish_resumed()?);
+        if new_packs.is_empty() {
+            return Ok(new_packs);
+        }
         // Autopack if the repository has accumulated too many packs, as brz
         // does on commit_write_group; a repack saves the pack names itself.
-        if !self.autopack()? {
-            self.packs.save()?;
+        match self.autopack_locked()? {
+            Some(packed) => Ok(packed),
+            None => {
+                self.packs.save()?;
+                Ok(new_packs)
+            }
         }
-        Ok(())
     }
 
-    /// Discard the open write group: nothing of it has been written, as the
-    /// new pack is only written by [`commit_write_group`](Self::commit_write_group).
+    /// Abort the open write group: drop what it added and delete the packs
+    /// it resumed.
     pub fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
         self.write_group
             .take()
-            .map(drop)
-            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))
+            .ok_or(RepositoryError::NotInWriteGroup)?;
+        self.packs.abort_resumed()
+    }
+
+    /// Suspend the open write group: write what it added to the upload
+    /// directory rather than committing it, and return the tokens that
+    /// resume it.
+    pub fn suspend_write_group(&mut self) -> Result<Vec<String>, RepositoryError> {
+        let group = self
+            .write_group
+            .take()
+            .ok_or(RepositoryError::NotInWriteGroup)?;
+        let mut tokens = self.packs.resumed();
+        self.packs.drop_resumed();
+        if group.data_inserted() {
+            let (name, _) = group.write_pack(self.transport.as_ref(), true)?;
+            tokens.push(name);
+        }
+        Ok(tokens)
+    }
+
+    /// Open a write group holding the suspended write group `tokens`. Their
+    /// data is readable at once, and committing the write group commits it.
+    pub fn resume_write_group(&mut self, tokens: &[String]) -> Result<(), RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::AlreadyInWriteGroup);
+        }
+        self.start_write_group()?;
+        if let Err(e) = self.packs.resume(tokens) {
+            self.write_group = None;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Stream the `missing` revisions from another knit-pack repository into
@@ -774,7 +838,7 @@ impl KnitPackRepository {
         group.copy_store_keys(&self.texts, RepackTarget::Texts, &text_keys)?;
         // The reconciled pack replaces every old one.
         let new_pack = group.finish(self.transport.as_ref())?;
-        self.packs.replace(&old_packs, Some(new_pack))?;
+        self.packs.replace(&old_packs, new_pack)?;
 
         Ok(super::ReconcileResult {
             garbage_inventories,
@@ -802,16 +866,19 @@ impl KnitPackRepository {
         if old_packs.len() <= 1 {
             return Ok(());
         }
-        self.repack(&old_packs)
+        self.repack(&old_packs).map(drop)
     }
 
     /// Repack the smallest packs when the repository has too many, per the
     /// pack-distribution heuristic. Returns whether a repack happened.
     pub fn autopack(&mut self) -> Result<bool, RepositoryError> {
         super::with_write_lock(self, |repository| repository.autopack_locked())
+            .map(|packed| packed.is_some())
     }
 
-    fn autopack_locked(&mut self) -> Result<bool, RepositoryError> {
+    /// Autopack under the held write lock, returning the names of the packs
+    /// written if it repacked.
+    fn autopack_locked(&mut self) -> Result<Option<Vec<PackName>>, RepositoryError> {
         if self.write_group.is_some() {
             return Err(RepositoryError::Corrupt(
                 "cannot autopack with an open write group".to_string(),
@@ -819,7 +886,7 @@ impl KnitPackRepository {
         }
         let all_packs = self.packs.names();
         if all_packs.len() <= 1 {
-            return Ok(false);
+            return Ok(None);
         }
         // Revision count per pack, from each pack's revision index.
         let mut counts = Vec::with_capacity(all_packs.len());
@@ -833,15 +900,18 @@ impl KnitPackRepository {
         }
         let selected = super::pack_collection::plan_autopack_combinations(&counts);
         if selected.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let to_combine: Vec<PackName> = selected.iter().map(|&i| all_packs[i].clone()).collect();
-        self.repack(&to_combine)?;
-        Ok(true)
+        self.repack(&to_combine)
     }
 
     /// Combine `to_combine` into a single new pack, which replaces them.
-    fn repack(&mut self, to_combine: &[PackName]) -> Result<(), RepositoryError> {
+    /// Returns the name of the new pack, if any.
+    fn repack(
+        &mut self,
+        to_combine: &[PackName],
+    ) -> Result<Option<Vec<PackName>>, RepositoryError> {
         let revisions = build_store(&self.transport, to_combine, IndexKind::Revision)?;
         let inventories = build_store(&self.transport, to_combine, IndexKind::Inventory)?;
         let texts = build_store(&self.transport, to_combine, IndexKind::Text)?;
@@ -855,7 +925,9 @@ impl KnitPackRepository {
         group.copy_store(&texts, RepackTarget::Texts)?;
         group.copy_store(&signatures, RepackTarget::Signatures)?;
         let new_pack = group.finish(self.transport.as_ref())?;
-        self.packs.replace(to_combine, Some(new_pack))
+        let name = new_pack.as_ref().map(|(name, _)| vec![name.clone()]);
+        self.packs.replace(to_combine, new_pack)?;
+        Ok(name)
     }
 
     /// All revision ids in this repository, sorted.
@@ -1177,12 +1249,20 @@ impl super::Repository for KnitPackRepository {
         KnitPackRepository::get_signature_text(self, revision_id)
     }
 
-    fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
-        KnitPackRepository::commit_write_group(self)
+    fn commit_write_group(&mut self) -> Result<Option<Vec<String>>, RepositoryError> {
+        KnitPackRepository::commit_write_group(self).map(Some)
     }
 
     fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
         KnitPackRepository::abort_write_group(self)
+    }
+
+    fn suspend_write_group(&mut self) -> Result<Vec<String>, RepositoryError> {
+        KnitPackRepository::suspend_write_group(self)
+    }
+
+    fn resume_write_group(&mut self, tokens: &[String]) -> Result<(), RepositoryError> {
+        KnitPackRepository::resume_write_group(self, tokens)
     }
 
     fn pack(&mut self) -> Result<(), RepositoryError> {
@@ -1423,6 +1503,8 @@ struct WriteGroup {
     /// Whether to write B+Tree indices (1.9+) or format-1 GraphIndex (0.92,
     /// 1.6).
     uses_btree: bool,
+    /// The length of the container header, before any record.
+    header_len: usize,
 }
 
 impl WriteGroup {
@@ -1431,6 +1513,7 @@ impl WriteGroup {
         writer
             .begin()
             .map_err(|e| RepositoryError::Corrupt(format!("pack begin: {e}")))?;
+        let header_len = writer.get_ref().len();
         let pack = Arc::new(Mutex::new(writer));
         let make = |has_deltas: bool| -> WriteStore {
             let access = KnitWriteAccess {
@@ -1453,6 +1536,7 @@ impl WriteGroup {
             signatures,
             texts,
             uses_btree,
+            header_len,
         })
     }
 
@@ -1493,10 +1577,33 @@ impl WriteGroup {
         Ok(())
     }
 
+    /// Whether any record was added.
+    fn data_inserted(&self) -> bool {
+        self.pack.lock().unwrap().get_ref().len() > self.header_len
+    }
+
     /// Flush the pack and its four indices; listing it in `pack-names` is
     /// left to the repository. Returns the new pack's name (its content md5)
-    /// and its `pack-names` value.
-    fn finish(self, transport: &dyn Transport) -> Result<(String, Vec<u8>), RepositoryError> {
+    /// and its `pack-names` value, or `None` if nothing was added.
+    fn finish(
+        self,
+        transport: &dyn Transport,
+    ) -> Result<Option<(String, Vec<u8>)>, RepositoryError> {
+        if !self.data_inserted() {
+            return Ok(None);
+        }
+        self.write_pack(transport, false).map(Some)
+    }
+
+    /// Write the pack and its four indices to `transport`: into `packs/` and
+    /// `indices/`, or, to `suspend` the write group, all into `upload/`.
+    /// Returns the pack's `(name, pack-names value)`; the name is the md5 of
+    /// the pack's content.
+    fn write_pack(
+        self,
+        transport: &dyn Transport,
+        suspend: bool,
+    ) -> Result<(String, Vec<u8>), RepositoryError> {
         let WriteGroup {
             pack,
             revisions,
@@ -1504,6 +1611,7 @@ impl WriteGroup {
             signatures,
             texts,
             uses_btree,
+            header_len: _,
         } = self;
         let rix = serialise_index(revisions.index, 1, uses_btree)?;
         let iix = serialise_index(inventories.index, 1, uses_btree)?;
@@ -1523,10 +1631,18 @@ impl WriteGroup {
         // write group's token was only used while collecting records; index
         // values store offsets, not the pack name).
         let pack_name = md5_hex(&pack_bytes);
-        transport.put_bytes(&format!("packs/{pack_name}.pack"), &pack_bytes, None)?;
+        let (pack_dir, index_dir) = if suspend {
+            (
+                super::pack_collection::UPLOAD_DIR,
+                super::pack_collection::UPLOAD_DIR,
+            )
+        } else {
+            ("packs", "indices")
+        };
+        transport.put_bytes(&format!("{pack_dir}/{pack_name}.pack"), &pack_bytes, None)?;
 
         let write_index = |ext: &str, bytes: &[u8]| -> Result<usize, RepositoryError> {
-            transport.put_bytes(&format!("indices/{pack_name}{ext}"), bytes, None)?;
+            transport.put_bytes(&format!("{index_dir}/{pack_name}{ext}"), bytes, None)?;
             Ok(bytes.len())
         };
         // Knit-pack pack-names order: rix iix tix six (no cix).
@@ -1536,14 +1652,7 @@ impl WriteGroup {
             write_index(index_extension(IndexKind::Text), &tix)?,
             write_index(index_extension(IndexKind::Signature), &six)?,
         ];
-        let new_value = sizes
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
-            .into_bytes();
-
-        Ok((pack_name, new_value))
+        Ok((pack_name, super::pack_2a_writer::pack_names_value(&sizes)))
     }
 }
 
