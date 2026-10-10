@@ -526,6 +526,10 @@ impl super::Repository for WeaveRepository {
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
         Ok(())
     }
+
+    fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
+        Ok(())
+    }
 }
 
 /// Split a byte buffer into lines, each keeping its trailing newline.

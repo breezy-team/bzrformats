@@ -670,6 +670,15 @@ impl KnitPackRepository {
         Ok(())
     }
 
+    /// Discard the open write group: nothing of it has been written, as the
+    /// new pack is only written by [`commit_write_group`](Self::commit_write_group).
+    pub fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
+        self.write_group
+            .take()
+            .map(drop)
+            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))
+    }
+
     /// Stream the `missing` revisions from another knit-pack repository into
     /// this one, copying raw records (revisions, inventories, texts,
     /// signatures) without decoding and re-encoding them.
@@ -1170,6 +1179,10 @@ impl super::Repository for KnitPackRepository {
 
     fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
         KnitPackRepository::commit_write_group(self)
+    }
+
+    fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
+        KnitPackRepository::abort_write_group(self)
     }
 
     fn pack(&mut self) -> Result<(), RepositoryError> {

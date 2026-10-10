@@ -605,6 +605,11 @@ impl Repository {
         self.with_mut(py, |inner| inner.commit_write_group().map_err(err))
     }
 
+    /// Close the open write group, discarding its additions.
+    fn abort_write_group(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.with_mut(py, |inner| inner.abort_write_group().map_err(err))
+    }
+
     /// Combine the repository's packs into a single pack. A no-op for formats
     /// without packs, or a repository already holding one pack.
     fn pack(&mut self, py: Python<'_>) -> PyResult<()> {

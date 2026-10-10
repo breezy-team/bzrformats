@@ -3214,6 +3214,9 @@ mod tests {
         fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
             unimplemented!()
         }
+        fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
+            unimplemented!()
+        }
     }
 
     /// A parent the repository could not be asked about is an error, not a
