@@ -438,23 +438,13 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    /// Tests share the global lock-bookkeeping state, so they must
-    /// run serially. Each test acquires this mutex (recovering from
-    /// poison) and resets state on entry.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn scoped_state() -> std::sync::MutexGuard<'static, ()> {
-        let guard = match TEST_LOCK.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        reset_for_tests();
-        guard
-    }
+    // The lock bookkeeping is process-wide and shared with every other
+    // test holding an OS lock, so each test locks a file of its own and
+    // only looks at that file's entries; resetting the bookkeeping here
+    // would release other tests' locks.
 
     #[test]
     fn two_read_locks_share() {
-        let _guard = scoped_state();
         let f = NamedTempFile::new().unwrap();
         let path = f.path().to_path_buf();
         let mut a = ReadLock::new(&path).unwrap();
@@ -471,7 +461,6 @@ mod tests {
 
     #[test]
     fn write_blocks_when_reader_open() {
-        let _guard = scoped_state();
         let f = NamedTempFile::new().unwrap();
         let path = f.path().to_path_buf();
         let mut rl = ReadLock::new(&path).unwrap();
@@ -487,7 +476,6 @@ mod tests {
 
     #[test]
     fn read_after_write_logs_but_succeeds() {
-        let _guard = scoped_state();
         let f = NamedTempFile::new().unwrap();
         let path = f.path().to_path_buf();
         let mut wl = WriteLock::new(&path).unwrap();
@@ -505,7 +493,6 @@ mod tests {
 
     #[test]
     fn temporary_write_lock_with_other_reader_keeps_read() {
-        let _guard = scoped_state();
         let f = NamedTempFile::new().unwrap();
         let path = f.path().to_path_buf();
         let a = ReadLock::new(&path).unwrap();
@@ -524,7 +511,6 @@ mod tests {
 
     #[test]
     fn temporary_write_lock_solo_reader_succeeds() {
-        let _guard = scoped_state();
         let f = NamedTempFile::new().unwrap();
         let path = f.path().to_path_buf();
         let a = ReadLock::new(&path).unwrap();
@@ -544,7 +530,6 @@ mod tests {
 
     #[test]
     fn restore_read_lock_keeps_tallies_consistent() {
-        let _guard = scoped_state();
         let f = NamedTempFile::new().unwrap();
         let path = f.path().to_path_buf();
         let wl = WriteLock::new(&path).unwrap();
@@ -559,7 +544,6 @@ mod tests {
 
     #[test]
     fn write_lock_creates_missing_file() {
-        let _guard = scoped_state();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new-file");
         assert!(!path.exists());
@@ -572,7 +556,6 @@ mod tests {
 
     #[test]
     fn read_lock_failure_does_not_leak() {
-        let _guard = scoped_state();
         let bogus = std::path::PathBuf::from("/no/such/path/for-bzrformats-tests");
         match ReadLock::new(&bogus) {
             Err(LockError::Io(_)) => {}
