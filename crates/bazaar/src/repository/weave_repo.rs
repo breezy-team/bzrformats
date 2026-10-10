@@ -49,22 +49,23 @@ pub struct WeaveRepository {
 
 impl WeaveRepository {
     /// Open the weave repository whose stores live directly under `transport`
-    /// (rooted at `.bzr`). `format` is the recognised weave format.
+    /// (rooted at `.bzr`). `format` is the recognised weave format, and
+    /// `os_lock` the lock on `.bzr/branch-lock` it shares with the control
+    /// directory's branch and working tree.
     pub fn open(
         transport: SharedTransport,
         format: &'static RepositoryFormat,
+        os_lock: crate::lockable_files::TransportLock,
     ) -> Result<Self, RepositoryError> {
         if !format.is_all_in_one() {
             return Err(RepositoryError::UnsupportedFormat(
                 format.get_format_description(),
             ));
         }
-        // TODO: lock the all-in-one repository with an OS lock on
-        // `.bzr/branch-lock`; here it only counts locks.
         Ok(WeaveRepository {
-            lock: crate::lockable_files::LockableFiles::new(
+            lock: crate::lockable_files::LockableFiles::with_os_lock(
                 SharedTransport::clone(&transport),
-                None,
+                os_lock,
             ),
             format,
             transport,
@@ -73,9 +74,10 @@ impl WeaveRepository {
 
     /// Create an empty all-in-one weave repository scaffold under `transport`
     /// (rooted at `.bzr`) and open it. Writes the `weaves/` and
-    /// `revision-store/` directories and an empty `inventory.weave`. The
-    /// branch and working-tree files are the control directory's job, not the
-    /// repository's.
+    /// `revision-store/` directories, an empty `inventory.weave` and, as
+    /// breezy's weave formats do, the empty `branch-lock` the control
+    /// directory's objects lock. The branch and working-tree files are the
+    /// control directory's job, not the repository's.
     pub fn create(
         transport: SharedTransport,
         format: &'static RepositoryFormat,
@@ -92,7 +94,12 @@ impl WeaveRepository {
             &write_weave_v5(&WeaveFile::default()),
             None,
         )?;
-        Self::open(transport, format)
+        let os_lock = crate::lockable_files::TransportLock::new(
+            SharedTransport::clone(&transport),
+            crate::lockable_files::BRANCH_LOCK,
+        );
+        os_lock.create().map_err(RepositoryError::Locking)?;
+        Self::open(transport, format, os_lock)
     }
 
     /// The format this repository was opened as.

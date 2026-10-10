@@ -111,35 +111,38 @@ impl WorkingTree3 {
         transport: SharedTransport,
         branch: crate::branch::Branch,
     ) -> Result<Self, WorkingTreeError> {
-        Self::open_with_layout(transport, branch, WT3_CHECKOUT_LAYOUT)
+        let lock = super::TreeLock::new(
+            SharedTransport::clone(&transport),
+            Some(super::lock::CHECKOUT_LOCK),
+            None,
+        );
+        Self::open_with_layout(transport, branch, lock, WT3_CHECKOUT_LAYOUT)
     }
 
     /// Open the weave all-in-one working tree, whose files live directly under
-    /// `.bzr` and whose basis is the branch's `revision-history`.
+    /// `.bzr` and whose basis is the branch's `revision-history`. It is
+    /// locked through `os_lock`, the lock on `.bzr/branch-lock` it shares
+    /// with its branch and repository.
     #[cfg(feature = "weave")]
     pub fn open_all_in_one(
         transport: SharedTransport,
         branch: crate::branch::Branch,
+        os_lock: crate::lockable_files::TransportLock,
     ) -> Result<Self, WorkingTreeError> {
-        Self::open_with_layout(transport, branch, WT3_ALL_IN_ONE_LAYOUT)
+        let lock = super::TreeLock::with_os_lock(SharedTransport::clone(&transport), os_lock);
+        Self::open_with_layout(transport, branch, lock, WT3_ALL_IN_ONE_LAYOUT)
     }
 
     fn open_with_layout(
         transport: SharedTransport,
         branch: crate::branch::Branch,
+        lock: super::TreeLock,
         layout: Wt3Layout,
     ) -> Result<Self, WorkingTreeError> {
         let inventory = Self::read_inventory(&transport, &layout)?;
         let hashcache = Self::open_hashcache(&transport, &layout);
-        // TODO: lock the all-in-one tree through an OS lock on
-        // `.bzr/branch-lock`, which is not taken here.
-        let lock_dir = match layout.basis {
-            Wt3Basis::LastRevisionFile(_) => Some(super::lock::CHECKOUT_LOCK),
-            #[cfg(feature = "weave")]
-            Wt3Basis::RevisionHistory(_) => None,
-        };
         Ok(WorkingTree3 {
-            lock: super::TreeLock::new(SharedTransport::clone(&transport), lock_dir, None),
+            lock,
             branch,
             transport,
             inventory,
@@ -506,14 +509,28 @@ impl WorkingTree for WorkingTree3 {
         &mut self.branch
     }
 
+    /// An all-in-one tree shares its OS lock with its branch, which cannot
+    /// hold it for reading while the tree holds it for writing; as in
+    /// breezy, this then write-locks the branch too.
     fn lock_tree_write(
         &mut self,
         waiter: &mut dyn crate::lockable_files::LockWaiter,
     ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError> {
+        let shares_branch_lock = match self.layout.basis {
+            Wt3Basis::LastRevisionFile(_) => false,
+            #[cfg(feature = "weave")]
+            Wt3Basis::RevisionHistory(_) => true,
+        };
         super::lock_with_branch(
             self,
             waiter,
-            |branch, _| branch.lock_read(),
+            |branch, waiter| {
+                if shares_branch_lock {
+                    branch.lock_write(waiter).map(drop)
+                } else {
+                    branch.lock_read()
+                }
+            },
             |tree, waiter| {
                 tree.lock
                     .lock_write(waiter)

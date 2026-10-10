@@ -1078,6 +1078,10 @@ impl ControlDir for BzrDirMeta {
 pub struct BzrDirAllInOne {
     transport: SharedTransport,
     format: &'static crate::repository::RepositoryFormat,
+    /// The lock on `.bzr/branch-lock`, shared by every repository, branch
+    /// and working tree opened from here, as breezy's all-in-one formats
+    /// share their control files.
+    os_lock: crate::lockable_files::TransportLock,
 }
 
 #[cfg(feature = "weave")]
@@ -1097,7 +1101,14 @@ impl BzrDirAllInOne {
         let format = crate::repository::find_format(&marker)
             .filter(|f| f.is_all_in_one() && f.is_supported());
         match format {
-            Some(format) => Ok(BzrDirAllInOne { transport, format }),
+            Some(format) => Ok(BzrDirAllInOne {
+                os_lock: crate::lockable_files::TransportLock::new(
+                    SharedTransport::clone(&transport),
+                    crate::lockable_files::BRANCH_LOCK,
+                ),
+                transport,
+                format,
+            }),
             None => Err(BzrDirError::NotMetaDir(marker)),
         }
     }
@@ -1153,8 +1164,12 @@ impl ControlDir for BzrDirAllInOne {
     }
 
     fn open_repository(&self) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
-        let repo = crate::repository::WeaveRepository::open(self.transport.clone(), self.format)
-            .map_err(|e| BzrDirError::Component(format!("opening repository: {e}")))?;
+        let repo = crate::repository::WeaveRepository::open(
+            self.transport.clone(),
+            self.format,
+            self.os_lock.clone(),
+        )
+        .map_err(|e| BzrDirError::Component(format!("opening repository: {e}")))?;
         Ok(Box::new(repo))
     }
 
@@ -1171,6 +1186,7 @@ impl ControlDir for BzrDirAllInOne {
             self.transport.clone(),
             format,
             self.open_repository()?,
+            self.os_lock.clone(),
         ))
     }
 
@@ -1183,8 +1199,9 @@ impl ControlDir for BzrDirAllInOne {
     fn open_workingtree(&self) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError> {
         let branch = self.open_branch()?;
         let root = self.transport.subtransport("..")?;
-        let wt = crate::workingtree::WorkingTree3::open_all_in_one(root, branch)
-            .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))?;
+        let wt =
+            crate::workingtree::WorkingTree3::open_all_in_one(root, branch, self.os_lock.clone())
+                .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))?;
         Ok(Box::new(wt))
     }
 }
