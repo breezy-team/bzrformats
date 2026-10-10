@@ -104,6 +104,8 @@ pub enum BranchError {
     /// An operation is not supported by this branch format (e.g. reference
     /// locations on format 5).
     Unsupported(String),
+    /// The master branch of a bound branch could not be opened.
+    Master(Box<crate::bzrdir::BzrDirError>),
 }
 
 impl std::fmt::Display for BranchError {
@@ -118,6 +120,7 @@ impl std::fmt::Display for BranchError {
             BranchError::NotStacked => write!(f, "branch is not stacked"),
             BranchError::Unstackable => write!(f, "branch format does not support stacking"),
             BranchError::Unsupported(op) => write!(f, "unsupported branch operation: {op}"),
+            BranchError::Master(e) => write!(f, "opening master branch: {e}"),
         }
     }
 }
@@ -323,12 +326,10 @@ impl Branch {
         self.repository.as_mut()
     }
 
-    /// Break the branch's lock directory, then its repository's, if someone
-    /// else holds them and `confirm` agrees (see
+    /// Break the branch's lock directory, then its repository's, then those
+    /// of its master if it is bound, where someone else holds them and
+    /// `confirm` agrees (see
     /// [`LockableFiles::break_lock`](crate::lockable_files::LockableFiles::break_lock)).
-    ///
-    /// TODO: also break the lock of a bound branch's master;
-    /// this crate cannot open the master branch yet.
     pub fn break_lock(
         &self,
         confirm: &mut dyn FnMut(Option<&crate::lockdir::LockHeldInfo>) -> bool,
@@ -338,7 +339,34 @@ impl Branch {
             .map_err(BranchError::Locking)?;
         self.repository
             .break_lock(confirm)
-            .map_err(BranchError::Repository)
+            .map_err(BranchError::Repository)?;
+        match self.get_master_branch()? {
+            Some(master) => master.break_lock(confirm),
+            None => Ok(()),
+        }
+    }
+
+    /// The master branch of a bound branch, or `None` if it is not bound.
+    /// Only a master on the local filesystem, at an absolute path or
+    /// `file://` URL, can be opened.
+    pub fn get_master_branch(&self) -> Result<Option<Branch>, BranchError> {
+        let Some(location) = self.get_bound_location()? else {
+            return Ok(None);
+        };
+        let path = location.strip_prefix("file://").unwrap_or(&location);
+        if !path.starts_with('/') {
+            return Err(BranchError::Unsupported(format!(
+                "opening the master branch at {location}"
+            )));
+        }
+        let root = crate::transport::LocalTransport::new("/");
+        let control = root
+            .subtransport(path.trim_start_matches('/'))?
+            .subtransport(".bzr")?;
+        crate::bzrdir::open(control)
+            .and_then(|control_dir| control_dir.open_branch())
+            .map(Some)
+            .map_err(|e| BranchError::Master(Box::new(e)))
     }
 
     /// Lock the branch for writing, with `token` taking over a held branch
@@ -1356,6 +1384,87 @@ mod tests {
             branch.get_old_bound_location().unwrap().as_deref(),
             Some("http://example.com/master")
         );
+    }
+
+    /// A master branch in a control directory of its own under `dir`, and
+    /// the `file://` URL a branch binds to it by.
+    fn master_in(dir: &tempfile::TempDir) -> (Branch, String) {
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let control_dir = crate::bzrdir::BzrDirMeta::create(&parent).unwrap();
+        let master = crate::bzrdir::ControlDir::open_branch(&control_dir).unwrap();
+        (master, format!("file://{}", dir.path().display()))
+    }
+
+    #[test]
+    fn master_branch_of_a_bound_branch() {
+        let (_d, mut branch, _p) = branch_transport();
+        assert!(branch.get_master_branch().unwrap().is_none());
+
+        let master_dir = tempfile::tempdir().unwrap();
+        let (master, url) = master_in(&master_dir);
+        branch.bind(&url).unwrap();
+        let opened = branch.get_master_branch().unwrap().unwrap();
+        assert_eq!(
+            master.last_revision_info().unwrap(),
+            opened.last_revision_info().unwrap()
+        );
+        // A plain absolute path is a location on the local filesystem too.
+        branch
+            .bind(&master_dir.path().display().to_string())
+            .unwrap();
+        assert!(branch.get_master_branch().unwrap().is_some());
+
+        branch.bind("http://example.com/master").unwrap();
+        assert!(matches!(
+            branch.get_master_branch(),
+            Err(BranchError::Unsupported(_))
+        ));
+        let missing = tempfile::tempdir().unwrap();
+        branch
+            .bind(&format!("file://{}", missing.path().display()))
+            .unwrap();
+        assert!(matches!(
+            branch.get_master_branch(),
+            Err(BranchError::Master(e)) if matches!(*e, crate::bzrdir::BzrDirError::NotABzrDir)
+        ));
+    }
+
+    #[test]
+    fn break_lock_breaks_the_masters_lock() {
+        let (_d, mut branch, _p) = branch_transport();
+        let master_dir = tempfile::tempdir().unwrap();
+        let (master, url) = master_in(&master_dir);
+        branch.bind(&url).unwrap();
+        // A holder that went away without unlocking the master.
+        master
+            .lock()
+            .lock_write(None, &mut crate::lockable_files::NoWait)
+            .unwrap();
+        let held = master_dir.path().join(".bzr/branch/lock/held");
+        assert!(held.exists());
+
+        let mut asked = 0;
+        branch
+            .break_lock(&mut |_| {
+                asked += 1;
+                false
+            })
+            .unwrap();
+        assert_eq!(1, asked);
+        assert!(held.exists());
+
+        branch.break_lock(&mut |_| true).unwrap();
+        assert!(!held.exists());
+    }
+
+    #[test]
+    fn break_lock_of_an_unreachable_master_is_an_error() {
+        let (_d, mut branch, _p) = branch_transport();
+        branch.bind("http://example.com/master").unwrap();
+        assert!(matches!(
+            branch.break_lock(&mut |_| true),
+            Err(BranchError::Unsupported(_))
+        ));
     }
 
     // --- Bound branches (format 5: file-based) ---
