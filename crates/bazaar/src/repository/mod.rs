@@ -121,10 +121,16 @@ pub trait Repository: Send + Sync {
             // The null revision is the empty tree (the basis of a first
             // commit); there is no stored inventory for it.
             let empty = crate::inventory::MutableInventory::new();
-            return Ok(RevisionTree::new(revision_id.to_vec(), Box::new(empty)));
+            return Ok(RevisionTree::new(
+                crate::RevisionId::from(revision_id),
+                Box::new(empty),
+            ));
         }
         let inventory = self.get_inventory(revision_id)?;
-        Ok(RevisionTree::new(revision_id.to_vec(), inventory))
+        Ok(RevisionTree::new(
+            crate::RevisionId::from(revision_id),
+            inventory,
+        ))
     }
 
     /// Read the full text of a versioned file at a given revision.

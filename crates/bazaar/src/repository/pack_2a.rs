@@ -1501,7 +1501,7 @@ mod tests {
         // last-changed revision.
         use crate::repository::Repository as _;
         let tree = repo.revision_tree(rev).unwrap();
-        assert_eq!(tree.revision_id(), rev);
+        assert_eq!(tree.revision_id().as_bytes(), rev);
         let fid = crate::FileId::from(&b"file-1"[..]);
         assert_eq!(tree.id2path(&fid).unwrap().as_deref(), Some("a.txt"));
         assert_eq!(
