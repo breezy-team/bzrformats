@@ -559,8 +559,10 @@ impl Repository {
     /// Leave the lock directory held when this object is unlocked.
     fn leave_lock_in_place(&self, py: Python<'_>) -> PyResult<()> {
         self.with(py, |repository| {
-            repository.lock().leave_in_place();
-            Ok(())
+            repository
+                .lock()
+                .leave_in_place()
+                .map_err(|e| lock_err(e, "repository"))
         })
     }
 
@@ -568,8 +570,10 @@ impl Repository {
     /// did not take it.
     fn dont_leave_lock_in_place(&self, py: Python<'_>) -> PyResult<()> {
         self.with(py, |repository| {
-            repository.lock().dont_leave_in_place();
-            Ok(())
+            repository
+                .lock()
+                .dont_leave_in_place()
+                .map_err(|e| lock_err(e, "repository"))
         })
     }
 
@@ -885,8 +889,10 @@ impl Branch {
     /// Leave the lock directory held when this object is unlocked.
     fn leave_lock_in_place(&self, py: Python<'_>) -> PyResult<()> {
         self.with(py, |branch| {
-            branch.lock().leave_in_place();
-            Ok(())
+            branch
+                .lock()
+                .leave_in_place()
+                .map_err(|e| lock_err(e, "branch"))
         })
     }
 
@@ -894,8 +900,10 @@ impl Branch {
     /// did not take it.
     fn dont_leave_lock_in_place(&self, py: Python<'_>) -> PyResult<()> {
         self.with(py, |branch| {
-            branch.lock().dont_leave_in_place();
-            Ok(())
+            branch
+                .lock()
+                .dont_leave_in_place()
+                .map_err(|e| lock_err(e, "branch"))
         })
     }
 

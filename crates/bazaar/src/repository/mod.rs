@@ -774,7 +774,10 @@ pub fn open(transport: SharedTransport) -> Result<Box<dyn Repository>, Repositor
 /// repository's [`Lockable::lock_read`] works unless it locks differently.
 pub fn lock_read<R: Repository + ?Sized>(repository: &mut R) -> Result<(), RepositoryError> {
     let first = !repository.lock().is_locked();
-    repository.lock().lock_read();
+    repository
+        .lock()
+        .lock_read()
+        .map_err(RepositoryError::Locking)?;
     if first {
         if let Err(e) = repository.refresh_data() {
             repository
@@ -884,7 +887,13 @@ mod tests {
             Scenario {
                 label: "weave",
                 create: |t| Box::new(WeaveRepository::create(t, weave6()).unwrap()),
-                reopen: |t| Box::new(WeaveRepository::open(t, weave6()).unwrap()),
+                reopen: |t| {
+                    let os_lock = crate::lockable_files::TransportLock::new(
+                        SharedTransport::clone(&t),
+                        crate::lockable_files::BRANCH_LOCK,
+                    );
+                    Box::new(WeaveRepository::open(t, weave6(), os_lock).unwrap())
+                },
                 signs: true,
             },
         ]

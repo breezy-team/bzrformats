@@ -1,10 +1,13 @@
 //! The lock of a branch, repository or working tree: a count of read or
-//! write locks, and for objects that take one, a physical [`LockDir`] held
-//! while they are write-locked.
+//! write locks, and for objects that take one, a physical lock: a
+//! [`LockDir`] held while they are write-locked, or for the objects of an
+//! all-in-one control directory a [`TransportLock`] held while they are
+//! locked at all.
 //!
-//! Read locks are logical; they take no lock directory. Waiting for a
-//! lock held by someone else is left to the caller's [`LockWaiter`], since
-//! how long to wait and what to tell the user is UI policy.
+//! Read locks on a lock directory are logical; they take no lock
+//! directory. Waiting for a lock held by someone else is left to the
+//! caller's [`LockWaiter`], since how long to wait and what to tell the
+//! user is UI policy.
 
 use crate::lockdir::{Lock as _, LockDir, LockError, LockHeldInfo};
 use crate::transport::SharedTransport;
@@ -45,6 +48,11 @@ pub enum LockableFilesError {
     Lock(LockError),
     /// Locking the dirstate file failed otherwise.
     Dirstate(crate::dirstate::TransportError),
+    /// The OS lock failed otherwise.
+    Os(crate::lock::LockError),
+    /// The object's lock is an OS lock, which has no token to take it over
+    /// with or to leave it in place by.
+    TokensUnsupported,
 }
 
 impl std::fmt::Display for LockableFilesError {
@@ -56,6 +64,10 @@ impl std::fmt::Display for LockableFilesError {
             LockableFilesError::Active => f.write_str("lock is in use and cannot be broken"),
             LockableFilesError::Lock(e) => write!(f, "{e}"),
             LockableFilesError::Dirstate(e) => write!(f, "{e}"),
+            LockableFilesError::Os(e) => write!(f, "{e}"),
+            LockableFilesError::TokensUnsupported => {
+                f.write_str("lock does not support tokens or being left in place")
+            }
         }
     }
 }
@@ -156,13 +168,138 @@ impl WriteLocked {
     }
 }
 
+/// The physical lock an object takes.
+#[derive(Clone)]
+enum Physical {
+    /// None: the lock only counts, as for pack repositories.
+    None,
+    /// A lock directory, relative to the object's transport, held while the
+    /// object is write-locked.
+    Dir(String),
+    /// An OS lock held while the object is locked.
+    Os(TransportLock),
+}
+
+/// The file an all-in-one control directory's OS lock is taken on,
+/// relative to `.bzr`.
+pub const BRANCH_LOCK: &str = "branch-lock";
+
+/// The OS lock on `.bzr/branch-lock` that the repository, branch and
+/// working tree of an all-in-one control directory share, as breezy's
+/// `TransportLock`: a shared lock while they are read-locked, an exclusive
+/// one while any of them is write-locked. Clones share the lock.
+///
+/// Each object counts its own locks and holds the OS lock while it is
+/// locked; the OS lock is released once no object holds it. A write lock is
+/// kept until every holder has released it. A transport without local
+/// files takes no OS lock, as breezy's remote transports do not.
+#[derive(Clone)]
+pub struct TransportLock {
+    transport: SharedTransport,
+    path: String,
+    state: Arc<Mutex<TransportLockState>>,
+}
+
+#[derive(Default)]
+struct TransportLockState {
+    mode: Option<LockMode>,
+    /// The number of objects holding the lock.
+    holders: usize,
+    /// The OS lock, when the transport has local files.
+    os: Option<OsLock>,
+}
+
+enum OsLock {
+    Read(crate::lock::ReadLock),
+    Write(crate::lock::WriteLock),
+}
+
+impl TransportLock {
+    /// The OS lock on the file `path` reached through `transport`.
+    pub fn new(transport: SharedTransport, path: &str) -> Self {
+        TransportLock {
+            transport,
+            path: path.to_string(),
+            state: Arc::new(Mutex::new(TransportLockState::default())),
+        }
+    }
+
+    /// Create the empty lock file, as a new control directory needs.
+    pub fn create(&self) -> Result<(), LockableFilesError> {
+        self.transport
+            .put_bytes(&self.path, b"", None)
+            .map_err(|e| LockError::from(e).into())
+    }
+
+    /// The mode the lock is held in, if any object holds it.
+    pub fn lock_mode(&self) -> Option<LockMode> {
+        self.state.lock().unwrap().mode
+    }
+
+    /// Hold the lock in `mode` for one more object. A held write lock
+    /// covers a read; a held read lock cannot be upgraded.
+    fn acquire(
+        &self,
+        mode: LockMode,
+        waiter: &mut dyn LockWaiter,
+    ) -> Result<(), LockableFilesError> {
+        let mut state = self.state.lock().unwrap();
+        match (state.mode, mode) {
+            (Some(LockMode::Write), _) | (Some(LockMode::Read), LockMode::Read) => {
+                state.holders += 1;
+                return Ok(());
+            }
+            (Some(LockMode::Read), LockMode::Write) => return Err(LockableFilesError::ReadOnly),
+            (None, _) => {}
+        }
+        if let Some(path) = self.transport.local_path(&self.path) {
+            state.os = Some(loop {
+                let taken = match mode {
+                    LockMode::Read => crate::lock::ReadLock::new(&path).map(OsLock::Read),
+                    LockMode::Write => crate::lock::WriteLock::new(&path).map(OsLock::Write),
+                };
+                match taken {
+                    Ok(lock) => break lock,
+                    Err(crate::lock::LockError::Contention(_)) => {
+                        if !waiter.contended(None) {
+                            return Err(LockableFilesError::Contention);
+                        }
+                    }
+                    Err(e) => return Err(LockableFilesError::Os(e)),
+                }
+            });
+        }
+        state.mode = Some(mode);
+        state.holders = 1;
+        Ok(())
+    }
+
+    /// Stop holding the lock for one object, releasing the OS lock with
+    /// the last.
+    fn release(&self) -> Result<(), LockableFilesError> {
+        let mut state = self.state.lock().unwrap();
+        if state.holders == 0 {
+            return Err(LockableFilesError::NotHeld);
+        }
+        state.holders -= 1;
+        if state.holders > 0 {
+            return Ok(());
+        }
+        state.mode = None;
+        match state.os.take() {
+            Some(OsLock::Read(mut lock)) => lock.unlock(),
+            Some(OsLock::Write(mut lock)) => lock.unlock(),
+            None => Ok(()),
+        }
+        .map_err(LockableFilesError::Os)
+    }
+}
+
 /// A lock on an object's control files. Clones share the lock.
 #[derive(Clone)]
 pub struct LockableFiles {
     transport: SharedTransport,
-    /// The lock directory, relative to `transport`; `None` for objects that
-    /// take no physical lock, such as pack repositories.
-    lock_path: Option<String>,
+    physical: Physical,
     state: Arc<Mutex<State>>,
 }
 
@@ -170,9 +307,23 @@ impl LockableFiles {
     /// The lock of the object whose control files `transport` reaches, with
     /// its lock directory at `lock_path` (`None` for no physical lock).
     pub fn new(transport: SharedTransport, lock_path: Option<&str>) -> Self {
+        let physical = match lock_path {
+            Some(path) => Physical::Dir(path.to_string()),
+            None => Physical::None,
+        };
         LockableFiles {
             transport,
-            lock_path: lock_path.map(str::to_string),
+            physical,
+            state: Arc::new(Mutex::new(State::default())),
+        }
+    }
+
+    /// The lock of an object of an all-in-one control directory, which
+    /// shares `os_lock` with the control directory's other objects.
+    pub fn with_os_lock(transport: SharedTransport, os_lock: TransportLock) -> Self {
+        LockableFiles {
+            transport,
+            physical: Physical::Os(os_lock),
             state: Arc::new(Mutex::new(State::default())),
         }
     }
@@ -184,15 +335,22 @@ impl LockableFiles {
 
     /// The lock directory, relative to the transport, if there is one.
     pub fn lock_path(&self) -> Option<&str> {
-        self.lock_path.as_deref()
+        match &self.physical {
+            Physical::Dir(path) => Some(path),
+            Physical::None | Physical::Os(_) => None,
+        }
     }
 
-    /// Create the lock directory, as a new control directory needs.
+    /// Create the lock directory or file, as a new control directory needs.
     pub fn create_lock(&self) -> Result<(), LockableFilesError> {
-        if let Some(lock_path) = &self.lock_path {
-            LockDir::new(self.transport.as_ref(), lock_path).create()?;
+        match &self.physical {
+            Physical::Dir(lock_path) => {
+                LockDir::new(self.transport.as_ref(), lock_path).create()?;
+                Ok(())
+            }
+            Physical::Os(os_lock) => os_lock.create(),
+            Physical::None => Ok(()),
         }
-        Ok(())
     }
 
     /// Whether the object is locked.
@@ -212,12 +370,17 @@ impl LockableFiles {
     }
 
     /// Take a read lock; a lock of either kind already held is counted.
-    pub fn lock_read(&self) {
+    /// Only an OS lock is taken for reading.
+    pub fn lock_read(&self) -> Result<(), LockableFilesError> {
         let mut state = self.state.lock().unwrap();
         if state.mode.is_none() {
+            if let Physical::Os(os_lock) = &self.physical {
+                os_lock.acquire(LockMode::Read, &mut NoWait)?;
+            }
             state.mode = Some(LockMode::Read);
         }
         state.count += 1;
+        Ok(())
     }
 
     /// Take a write lock. A write lock already held is counted, after
@@ -229,6 +392,9 @@ impl LockableFiles {
         token: Option<&LockToken>,
         waiter: &mut dyn LockWaiter,
     ) -> Result<WriteLocked, LockableFilesError> {
+        if token.is_some() && matches!(self.physical, Physical::Os(_)) {
+            return Err(LockableFilesError::TokensUnsupported);
+        }
         let token = token.map(LockToken::as_str);
         let mut state = self.state.lock().unwrap();
         match state.mode {
@@ -244,19 +410,22 @@ impl LockableFiles {
             None => {}
         }
         let mut acquired = false;
-        if let Some(lock_path) = &self.lock_path {
-            match token {
-                Some(token) => {
-                    self.validate_token(Some(token))?;
-                    state.nonce = Some(LockToken::from(token));
-                    state.locked_via_token = true;
-                }
-                None => {
-                    state.nonce = Some(LockToken(self.wait_lock(lock_path, waiter)?));
-                    state.locked_via_token = false;
-                    acquired = true;
-                }
+        match (&self.physical, token) {
+            (Physical::Dir(_), Some(token)) => {
+                self.validate_token(Some(token))?;
+                state.nonce = Some(LockToken::from(token));
+                state.locked_via_token = true;
             }
+            (Physical::Dir(lock_path), None) => {
+                state.nonce = Some(LockToken(self.wait_lock(lock_path, waiter)?));
+                state.locked_via_token = false;
+                acquired = true;
+            }
+            (Physical::Os(os_lock), _) => {
+                os_lock.acquire(LockMode::Write, waiter)?;
+                acquired = true;
+            }
+            (Physical::None, _) => {}
         }
         state.mode = Some(LockMode::Write);
         state.count = 1;
@@ -282,12 +451,16 @@ impl LockableFiles {
         let nonce = state.nonce.take();
         let via_token = std::mem::take(&mut state.locked_via_token);
         drop(state);
-        match (mode, &self.lock_path, nonce, via_token) {
-            (Some(LockMode::Write), Some(lock_path), Some(nonce), false) => {
+        match (mode, &self.physical, nonce, via_token) {
+            (Some(LockMode::Write), Physical::Dir(lock_path), Some(nonce), false) => {
                 let mut lockdir = LockDir::new(self.transport.as_ref(), lock_path);
                 lockdir.resume(nonce.as_str())?;
                 lockdir.unlock()?;
                 Ok(Some(nonce))
+            }
+            (_, Physical::Os(os_lock), _, _) => {
+                os_lock.release()?;
+                Ok(None)
             }
             _ => Ok(None),
         }
@@ -295,13 +468,21 @@ impl LockableFiles {
 
     /// Leave the physical lock in place when the last write lock is
     /// released.
-    pub fn leave_in_place(&self) {
-        self.state.lock().unwrap().locked_via_token = true;
+    pub fn leave_in_place(&self) -> Result<(), LockableFilesError> {
+        self.set_leave_in_place(true)
     }
 
     /// Release the physical lock with the last write lock again.
-    pub fn dont_leave_in_place(&self) {
-        self.state.lock().unwrap().locked_via_token = false;
+    pub fn dont_leave_in_place(&self) -> Result<(), LockableFilesError> {
+        self.set_leave_in_place(false)
+    }
+
+    fn set_leave_in_place(&self, leave: bool) -> Result<(), LockableFilesError> {
+        if let Physical::Os(_) = self.physical {
+            return Err(LockableFilesError::TokensUnsupported);
+        }
+        self.state.lock().unwrap().locked_via_token = leave;
+        Ok(())
     }
 
     /// Break the physical lock if someone else holds it and `confirm`
@@ -309,12 +490,13 @@ impl LockableFiles {
     /// or `None` when the lock's `info` file cannot be parsed. Returns
     /// whether a lock was broken.
     ///
-    /// Breaking a lock this object holds is an error.
+    /// Breaking a lock this object holds is an error. An OS lock is never
+    /// left behind by a holder that went away, so there is none to break.
     pub fn break_lock(
         &self,
         confirm: &mut dyn FnMut(Option<&LockHeldInfo>) -> bool,
     ) -> Result<bool, LockableFilesError> {
-        let Some(lock_path) = &self.lock_path else {
+        let Physical::Dir(lock_path) = &self.physical else {
             return Ok(false);
         };
         if self.state.lock().unwrap().nonce.is_some() {
@@ -342,21 +524,19 @@ impl LockableFiles {
         }
     }
 
-    /// Whether the physical lock is held, by anyone.
+    /// Whether the lock directory is held, by anyone; an OS lock, like
+    /// breezy's `TransportLock`, does not say.
     pub fn get_physical_lock_status(&self) -> Result<bool, LockableFilesError> {
-        match &self.lock_path {
-            None => Ok(false),
-            Some(lock_path) => Ok(LockDir::new(self.transport.as_ref(), lock_path)
-                .peek()?
-                .is_some()),
-        }
+        Ok(self.peek()?.is_some())
     }
 
-    /// The holder of the physical lock, if it is held.
+    /// The holder of the lock directory, if it is held.
     pub fn peek(&self) -> Result<Option<LockHeldInfo>, LockableFilesError> {
-        match &self.lock_path {
-            None => Ok(None),
-            Some(lock_path) => Ok(LockDir::new(self.transport.as_ref(), lock_path).peek()?),
+        match &self.physical {
+            Physical::Dir(lock_path) => {
+                Ok(LockDir::new(self.transport.as_ref(), lock_path).peek()?)
+            }
+            Physical::None | Physical::Os(_) => Ok(None),
         }
     }
 
@@ -590,7 +770,7 @@ mod tests {
         assert!(dir.path().join("lock/held/info").exists());
         let again = lock.lock_write(Some(&token), &mut NoWait).unwrap();
         assert_eq!((Some(&token), false), (again.token(), again.acquired()));
-        lock.lock_read();
+        lock.lock_read().unwrap();
         assert_eq!(3, lock.lock_count());
         assert_eq!(None, lock.unlock().unwrap());
         assert_eq!(None, lock.unlock().unwrap());
@@ -655,7 +835,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock = lock_in(&dir);
         assert!(matches!(lock.unlock(), Err(LockableFilesError::NotHeld)));
-        lock.lock_read();
+        lock.lock_read().unwrap();
         assert_eq!(Some(LockMode::Read), lock.lock_mode());
         assert!(!lock.get_physical_lock_status().unwrap());
         assert!(matches!(
@@ -738,6 +918,170 @@ mod tests {
         ));
         assert!(second.get_physical_lock_status().unwrap());
         second.unlock().unwrap();
+    }
+
+    fn os_lock_in(dir: &tempfile::TempDir) -> TransportLock {
+        let transport: SharedTransport =
+            Arc::new(crate::transport::LocalTransport::new(dir.path()));
+        let os_lock = TransportLock::new(transport, BRANCH_LOCK);
+        os_lock.create().unwrap();
+        os_lock
+    }
+
+    fn os_locked(os_lock: &TransportLock) -> LockableFiles {
+        LockableFiles::with_os_lock(os_lock.transport.clone(), os_lock.clone())
+    }
+
+    /// The in-process holders of the OS lock on `dir`'s `branch-lock`: its
+    /// read count and whether it is write-locked.
+    fn os_holders(dir: &tempfile::TempDir) -> (usize, bool) {
+        let path = dir.path().join(BRANCH_LOCK);
+        let (reads, writes) = crate::lock::snapshot();
+        (
+            reads.get(&path).copied().unwrap_or(0),
+            writes.contains(&path),
+        )
+    }
+
+    #[test]
+    fn os_lock_is_held_until_its_last_holder_releases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let os_lock = os_lock_in(&dir);
+        let tree = os_locked(&os_lock);
+        let branch = os_locked(&os_lock);
+        let locked = tree.lock_write(None, &mut NoWait).unwrap();
+        assert_eq!((None, true), (locked.token(), locked.acquired()));
+        assert_eq!((0, true), os_holders(&dir));
+        // A write lock covers a read.
+        branch.lock_read().unwrap();
+        assert_eq!(Some(LockMode::Write), os_lock.lock_mode());
+        assert_eq!(None, tree.unlock().unwrap());
+        assert_eq!((0, true), os_holders(&dir));
+        assert_eq!(None, branch.unlock().unwrap());
+        assert_eq!((0, false), os_holders(&dir));
+        assert_eq!(None, os_lock.lock_mode());
+    }
+
+    #[test]
+    fn os_lock_is_taken_for_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let os_lock = os_lock_in(&dir);
+        let first = os_locked(&os_lock);
+        let second = os_locked(&os_lock);
+        first.lock_read().unwrap();
+        first.lock_read().unwrap();
+        second.lock_read().unwrap();
+        assert_eq!((1, false), os_holders(&dir));
+        assert!(matches!(
+            second.lock_write(None, &mut NoWait),
+            Err(LockableFilesError::ReadOnly)
+        ));
+        first.unlock().unwrap();
+        first.unlock().unwrap();
+        assert_eq!((1, false), os_holders(&dir));
+        second.unlock().unwrap();
+        assert_eq!((0, false), os_holders(&dir));
+    }
+
+    #[test]
+    fn a_held_os_read_lock_cannot_be_upgraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let os_lock = os_lock_in(&dir);
+        let branch = os_locked(&os_lock);
+        let tree = os_locked(&os_lock);
+        branch.lock_read().unwrap();
+        assert!(matches!(
+            tree.lock_write(None, &mut NoWait),
+            Err(LockableFilesError::ReadOnly)
+        ));
+        assert!(!tree.is_locked());
+        branch.unlock().unwrap();
+    }
+
+    #[test]
+    fn separate_os_locks_on_one_file_contend() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = os_locked(&os_lock_in(&dir));
+        let second = os_locked(&os_lock_in(&dir));
+        first.lock_read().unwrap();
+        let mut asked = 0;
+        struct Count<'a>(&'a mut usize);
+        impl LockWaiter for Count<'_> {
+            fn contended(&mut self, holder: Option<&LockHeldInfo>) -> bool {
+                assert!(holder.is_none());
+                *self.0 += 1;
+                *self.0 < 2
+            }
+        }
+        assert!(matches!(
+            second.lock_write(None, &mut Count(&mut asked)),
+            Err(LockableFilesError::Contention)
+        ));
+        assert_eq!(2, asked);
+        assert!(!second.is_locked());
+        first.unlock().unwrap();
+        second.lock_write(None, &mut NoWait).unwrap();
+        assert!(matches!(
+            first.lock_write(None, &mut NoWait),
+            Err(LockableFilesError::Contention)
+        ));
+        second.unlock().unwrap();
+    }
+
+    #[test]
+    fn os_lock_has_no_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = os_locked(&os_lock_in(&dir));
+        assert!(matches!(
+            lock.lock_write(Some(&LockToken::from("token")), &mut NoWait),
+            Err(LockableFilesError::TokensUnsupported)
+        ));
+        assert!(!lock.is_locked());
+        assert!(matches!(
+            lock.leave_in_place(),
+            Err(LockableFilesError::TokensUnsupported)
+        ));
+        assert!(matches!(
+            lock.dont_leave_in_place(),
+            Err(LockableFilesError::TokensUnsupported)
+        ));
+        lock.lock_write(None, &mut NoWait).unwrap();
+        assert!(matches!(
+            lock.lock_write(Some(&LockToken::from("token")), &mut NoWait),
+            Err(LockableFilesError::TokensUnsupported)
+        ));
+        assert_eq!(1, lock.lock_count());
+        assert!(!lock.get_physical_lock_status().unwrap());
+        assert!(!lock.break_lock(&mut |_| true).unwrap());
+        lock.unlock().unwrap();
+    }
+
+    #[test]
+    fn os_read_lock_needs_the_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport: SharedTransport =
+            Arc::new(crate::transport::LocalTransport::new(dir.path()));
+        let lock = LockableFiles::with_os_lock(
+            transport.clone(),
+            TransportLock::new(transport, BRANCH_LOCK),
+        );
+        assert!(matches!(
+            lock.lock_read(),
+            Err(LockableFilesError::Os(crate::lock::LockError::Io(_)))
+        ));
+        assert!(!lock.is_locked());
+    }
+
+    #[test]
+    fn os_lock_on_a_non_local_transport_only_counts() {
+        let transport: SharedTransport =
+            Arc::new(crate::transport::testing::MemoryTransport::new());
+        let os_lock = TransportLock::new(transport.clone(), BRANCH_LOCK);
+        let lock = LockableFiles::with_os_lock(transport, os_lock.clone());
+        lock.lock_write(None, &mut NoWait).unwrap();
+        assert_eq!(Some(LockMode::Write), os_lock.lock_mode());
+        lock.unlock().unwrap();
+        assert_eq!(None, os_lock.lock_mode());
     }
 
     #[test]

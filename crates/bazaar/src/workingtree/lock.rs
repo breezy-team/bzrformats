@@ -1,6 +1,8 @@
 //! The lock of a working tree: the lock directory `.bzr/checkout/lock` for
 //! writing, and for a dirstate tree an OS lock on the dirstate file while
-//! the tree is locked. Locking the tree's branch is left to the caller.
+//! the tree is locked; an all-in-one tree instead shares the OS lock on
+//! `.bzr/branch-lock` with its branch. Locking the tree's branch is left to
+//! the caller.
 
 use crate::dirstate::Transport as _;
 use crate::lockable_files::{LockMode, LockWaiter, LockableFiles, LockableFilesError, WriteLocked};
@@ -34,6 +36,18 @@ impl TreeLock {
         }
     }
 
+    /// The lock of an all-in-one tree rooted at `transport`, which shares
+    /// `os_lock` with its branch and repository.
+    pub fn with_os_lock(
+        transport: SharedTransport,
+        os_lock: crate::lockable_files::TransportLock,
+    ) -> Self {
+        TreeLock {
+            files: LockableFiles::with_os_lock(transport, os_lock),
+            dirstate: None,
+        }
+    }
+
     /// The tree's lockable files: the lock count, mode and lock directory.
     pub fn files(&self) -> &LockableFiles {
         &self.files
@@ -41,7 +55,7 @@ impl TreeLock {
 
     /// Lock the tree for reading.
     pub fn lock_read(&self) -> Result<(), LockableFilesError> {
-        self.files.lock_read();
+        self.files.lock_read()?;
         self.lock_dirstate(false)
             .inspect_err(|_| self.release_files())
     }

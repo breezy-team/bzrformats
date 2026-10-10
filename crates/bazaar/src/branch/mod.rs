@@ -170,12 +170,18 @@ impl Lockable for Branch {
     type Error = BranchError;
 
     fn lock_read(&mut self) -> Result<(), BranchError> {
-        if !self.lock.is_locked() {
+        let first = !self.lock.is_locked();
+        if first {
             self.repository
                 .lock_read()
                 .map_err(BranchError::Repository)?;
         }
-        self.lock.lock_read();
+        if let Err(e) = self.lock.lock_read() {
+            if first {
+                self.repository.unlock().map_err(BranchError::Repository)?;
+            }
+            return Err(BranchError::Locking(e));
+        }
         Ok(())
     }
 
@@ -298,16 +304,18 @@ impl Branch {
     /// The all-in-one weave layout has no `.bzr/branch/format` file -- the
     /// branch lives at `.bzr` itself with its tip in `.bzr/revision-history`
     /// -- so the format (full-history branch format 5) is supplied directly.
-    ///
-    /// TODO: lock the all-in-one branch with an OS lock on
-    /// `.bzr/branch-lock`; its writes here only count their locks.
+    /// It is locked through `os_lock`, the lock on `.bzr/branch-lock` it
+    /// shares with the control directory's repository and working tree.
     pub fn with_format(
         transport: SharedTransport,
         format: &'static BranchFormat,
         repository: Box<dyn Repository>,
+        os_lock: crate::lockable_files::TransportLock,
     ) -> Self {
-        let lock =
-            crate::lockable_files::LockableFiles::new(SharedTransport::clone(&transport), None);
+        let lock = crate::lockable_files::LockableFiles::with_os_lock(
+            SharedTransport::clone(&transport),
+            os_lock,
+        );
         Branch {
             transport,
             format,

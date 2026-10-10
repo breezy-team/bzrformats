@@ -3359,6 +3359,69 @@ mod tests {
         assert_eq!(repo.get_file_text(&file_id, &revid).unwrap(), b"hi\n");
     }
 
+    /// The repository, branch and working tree of an all-in-one control
+    /// directory lock through one OS lock on `.bzr/branch-lock`, which
+    /// another opening of the control directory contends with.
+    #[cfg(feature = "weave")]
+    #[test]
+    fn weave_all_in_one_objects_share_the_branch_lock() {
+        use crate::bzrdir::BzrDirAllInOne;
+        use crate::lockable_files::{LockMode, LockableFilesError, NoWait};
+        use crate::repository::RepositoryError;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirAllInOne::create(&parent).unwrap();
+        let lock_path = dir.path().join(".bzr/branch-lock");
+        assert!(lock_path.exists());
+        let os_holders = || {
+            let (reads, writes) = crate::lock::snapshot();
+            (
+                reads.get(&lock_path).copied().unwrap_or(0),
+                writes.contains(&lock_path),
+            )
+        };
+
+        let mut wt = cd.open_workingtree().unwrap();
+        wt.lock_write(&mut NoWait).unwrap();
+        assert_eq!((0, true), os_holders());
+        assert_eq!(
+            Some(LockMode::Write),
+            wt.branch().repository().lock().lock_mode()
+        );
+
+        let other = BzrDirAllInOne::open(parent.subtransport(".bzr").unwrap()).unwrap();
+        let mut other_branch = other.open_branch().unwrap();
+        assert!(matches!(
+            other_branch.lock_write(&mut NoWait),
+            Err(crate::branch::BranchError::Repository(
+                RepositoryError::Locking(LockableFilesError::Contention)
+            ))
+        ));
+        assert!(!other_branch.lock().is_locked());
+
+        wt.unlock().unwrap();
+        assert_eq!((0, false), os_holders());
+        assert!(!wt.branch().repository().lock().is_locked());
+
+        wt.lock_read().unwrap();
+        assert_eq!((1, false), os_holders());
+        wt.unlock().unwrap();
+        assert_eq!((0, false), os_holders());
+
+        // The tree cannot hold the shared lock for writing while its branch
+        // holds it for reading, so locking the tree alone write-locks the
+        // branch as well.
+        wt.lock_tree_write(&mut NoWait).unwrap();
+        assert_eq!(Some(LockMode::Write), wt.branch().lock().lock_mode());
+        assert_eq!((0, true), os_holders());
+        wt.unlock().unwrap();
+        assert_eq!((0, false), os_holders());
+
+        other_branch.lock_write(&mut NoWait).unwrap();
+        other_branch.unlock().unwrap();
+    }
+
     /// The weave on-disk layout, ported from breezy's
     /// `weave_fmt.test_repository.TestFormat7.test_disk_layout`: committing a
     /// file whose id contains a `:` writes its per-file weave at the
