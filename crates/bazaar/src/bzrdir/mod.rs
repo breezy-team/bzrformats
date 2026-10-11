@@ -646,18 +646,36 @@ impl BzrDirMeta {
     /// control directory, and its branch returned (which may itself be a
     /// reference, so the open recurses through [`open`]).
     fn open_referenced_branch(&self, location: &str) -> Result<crate::branch::Branch, BzrDirError> {
-        let target = open(self.reference_control_transport(location)?)?;
-        target.open_branch()
+        let (transport, name) = self.reference_target(location)?;
+        let target = open(transport)?;
+        if name.is_empty() {
+            return target.open_branch();
+        }
+        match target.branch_reference(&name)? {
+            Some(next) => self.open_referenced_branch(&next),
+            None => target.open_branch_named(&name),
+        }
     }
 
     /// The transport of the control directory a branch reference's
-    /// `location` points at.
-    fn reference_control_transport(&self, location: &str) -> Result<SharedTransport, BzrDirError> {
-        let path = location.strip_prefix("file://").unwrap_or(location);
+    /// `location` points at, and the name of the branch there: the URL's
+    /// `branch` segment parameter, or empty for the default branch.
+    fn reference_target(&self, location: &str) -> Result<(SharedTransport, String), BzrDirError> {
+        let url_err = |e: crate::urlutils::Error| {
+            BzrDirError::Component(format!("branch reference {location:?}: {e}"))
+        };
+        let (base, params) =
+            crate::urlutils::split_segment_parameters(location).map_err(url_err)?;
+        let path = base.strip_prefix("file://").unwrap_or(base);
+        let path = crate::urlutils::unescape(path).map_err(url_err)?;
         // The reference points at the directory containing `.bzr`; descend into
         // its control directory.
-        let containing = self.transport.subtransport(path)?;
-        Ok(containing.subtransport(".bzr")?)
+        let containing = self.transport.subtransport(&path)?;
+        let name = match params.get("branch") {
+            Some(value) => crate::urlutils::unescape(value).map_err(url_err)?,
+            None => String::new(),
+        };
+        Ok((containing.subtransport(".bzr")?, name))
     }
 
     /// The branch and repository formats a clone of this control directory
@@ -688,7 +706,10 @@ impl BzrDirMeta {
         if let Some(location) = crate::branch::reference_location(sub.as_ref())
             .map_err(|e| BzrDirError::Component(format!("reading branch reference: {e}")))?
         {
-            let target = BzrDirMeta::open(self.reference_control_transport(&location)?)?;
+            // TODO: take the formats of the referenced branch itself when it
+            // is a colocated one, rather than its control directory's.
+            let (transport, _name) = self.reference_target(&location)?;
+            let target = BzrDirMeta::open(transport)?;
             return target.cloning_source_formats();
         }
         match self.find_repository() {
@@ -1819,6 +1840,52 @@ mod tests {
             target_root.to_str().unwrap().as_bytes(),
         )
         .unwrap();
+
+        let ref_bzr_transport: SharedTransport = std::sync::Arc::new(LocalTransport::new(&ref_bzr));
+        let cd = BzrDirMeta::open(ref_bzr_transport).unwrap();
+        let branch = cd.open_branch().unwrap();
+        assert_eq!(
+            branch.last_revision_info().unwrap(),
+            (3, b"rev-real".to_vec())
+        );
+    }
+
+    /// A reference to a colocated branch names it with a `branch` segment
+    /// parameter, and the path of its URL is percent-encoded.
+    #[test]
+    fn open_branch_follows_reference_to_colocated_branch() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The real branch is the colocated branch `blah` of the control
+        // directory under `tar get/`.
+        let target_root = dir.path().join("tar get");
+        std::fs::create_dir_all(&target_root).unwrap();
+        let target_parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(&target_root));
+        let target = BzrDirMeta::create(&target_parent).unwrap();
+        target
+            .open_branch()
+            .unwrap()
+            .set_last_revision_info(3, b"rev-real")
+            .unwrap();
+        let target_bzr = target_root.join(".bzr");
+        std::fs::create_dir_all(target_bzr.join("branches")).unwrap();
+        std::fs::rename(target_bzr.join("branch"), target_bzr.join("branches/blah")).unwrap();
+        std::fs::write(target_bzr.join("branch-list"), b"blah\n").unwrap();
+
+        let ref_root = dir.path().join("ref");
+        let ref_bzr = ref_root.join(".bzr");
+        std::fs::create_dir_all(ref_bzr.join("branch")).unwrap();
+        std::fs::write(ref_bzr.join("branch-format"), METADIR_MARKER).unwrap();
+        std::fs::write(
+            ref_bzr.join("branch/format"),
+            b"Bazaar-NG Branch Reference Format 1\n",
+        )
+        .unwrap();
+        let url = format!(
+            "file://{}/,branch=blah",
+            target_root.to_str().unwrap().replace(' ', "%20")
+        );
+        std::fs::write(ref_bzr.join("branch/location"), url.as_bytes()).unwrap();
 
         let ref_bzr_transport: SharedTransport = std::sync::Arc::new(LocalTransport::new(&ref_bzr));
         let cd = BzrDirMeta::open(ref_bzr_transport).unwrap();
