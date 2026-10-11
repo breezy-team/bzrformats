@@ -288,6 +288,27 @@ class TestControlDir(TestCaseInTempDir):
         reopened = controldir.open(self.test_dir).open_repository()
         self.assertFalse(reopened.has_revision(b"rev-x"))
 
+    def test_suspend_and_resume_write_group(self):
+        cd = controldir.create(self.test_dir)
+        repo = cd.open_repository()
+        repo.lock_write()
+        repo.start_write_group()
+        repo.add_revision(b"rev-x", "hello", "T <t@e>", 1577880000.0, 0, parents=[])
+        tokens = repo.suspend_write_group()
+        self.assertFalse(repo.is_in_write_group())
+        repo.unlock()
+        self.assertEqual(1, len(tokens))
+
+        repo = controldir.open(self.test_dir).open_repository()
+        repo.lock_write()
+        repo.resume_write_group(tokens)
+        self.assertTrue(repo.is_in_write_group())
+        self.assertEqual("hello", repo.get_revision(b"rev-x")["message"])
+        self.assertEqual(tokens, repo.commit_write_group())
+        repo.unlock()
+        got = controldir.open(self.test_dir).open_repository().get_revision(b"rev-x")
+        self.assertEqual("hello", got["message"])
+
     def test_iter_changes_with_parents(self):
         cd = controldir.create(self.test_dir)
         with open(os.path.join(self.test_dir, "a.txt"), "wb") as f:

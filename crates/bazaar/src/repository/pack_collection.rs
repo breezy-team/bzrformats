@@ -207,12 +207,14 @@ impl PackNames {
 /// A combined index of one object kind over a repository's packs, which a
 /// [`PackCollection`] adds packs to and removes them from.
 pub trait CombinedIndex {
-    /// Add the entries of `pack`'s index for `kind`.
+    /// Add the entries of `pack`'s index for `kind`, read from the upload
+    /// directory if the pack is `resumed` from a suspended write group.
     fn add_pack(
         &self,
         transport: &dyn Transport,
         pack: &str,
         kind: IndexKind,
+        resumed: bool,
     ) -> Result<(), RepositoryError>;
 
     /// Drop the entries of `pack`.
@@ -224,6 +226,10 @@ pub trait CombinedIndex {
 pub trait PackReader {
     /// Drop anything held of `pack`.
     fn forget(&self, pack: &str);
+
+    /// Read `pack` from the upload directory if it is `resumed` from a
+    /// suspended write group, or from `packs/` otherwise.
+    fn set_resumed(&self, pack: &str, resumed: bool);
 }
 
 /// The packs of a pack repository and the stores reading them.
@@ -238,6 +244,9 @@ pub struct PackCollection<I, R> {
     /// Whether `pack-names` is a btree index rather than a format-1 one.
     uses_btree: bool,
     names: PackNames,
+    /// The packs of a resumed write group, read from the upload directory
+    /// and not yet listed in `pack-names`.
+    resumed: BTreeSet<String>,
     indices: Vec<(IndexKind, I)>,
     readers: Vec<R>,
 }
@@ -251,6 +260,7 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
             transport,
             uses_btree,
             names,
+            resumed: BTreeSet::new(),
             indices: Vec::new(),
             readers: Vec::new(),
         })
@@ -334,10 +344,109 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
         }
         for pack in added {
             for (kind, index) in &self.indices {
-                index.add_pack(self.transport.as_ref(), pack, *kind)?;
+                index.add_pack(self.transport.as_ref(), pack, *kind, false)?;
             }
         }
         Ok(())
+    }
+
+    /// The extensions of a pack's indices, in `pack-names` order.
+    fn index_extensions(&self) -> Vec<&'static str> {
+        self.indices
+            .iter()
+            .map(|(kind, _)| index_extension(*kind))
+            .collect()
+    }
+
+    /// The packs of the resumed write group.
+    pub fn resumed(&self) -> Vec<String> {
+        self.resumed.iter().cloned().collect()
+    }
+
+    /// Read the suspended write group `tokens` from the upload directory.
+    /// Each token is the name of a suspended pack.
+    pub fn resume(&mut self, tokens: &[String]) -> Result<(), RepositoryError> {
+        let exts = self.index_extensions();
+        for token in tokens {
+            check_resumable(self.transport.as_ref(), token, &exts)?;
+        }
+        for token in tokens {
+            if let Err(e) = self.add_resumed(token) {
+                self.drop_resumed();
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Make the stores read the suspended pack `name`.
+    fn add_resumed(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.resumed.insert(name.to_string());
+        for reader in &self.readers {
+            reader.set_resumed(name, true);
+        }
+        for (kind, index) in &self.indices {
+            index.add_pack(self.transport.as_ref(), name, *kind, true)?;
+        }
+        Ok(())
+    }
+
+    /// Stop reading the resumed packs, leaving their files in the upload
+    /// directory.
+    pub fn drop_resumed(&mut self) {
+        for name in std::mem::take(&mut self.resumed) {
+            for (_, index) in &self.indices {
+                index.remove_pack(&name);
+            }
+            for reader in &self.readers {
+                reader.forget(&name);
+                reader.set_resumed(&name, false);
+            }
+        }
+    }
+
+    /// Stop reading the resumed packs and delete their files.
+    pub fn abort_resumed(&mut self) -> Result<(), RepositoryError> {
+        let names = self.resumed();
+        self.drop_resumed();
+        let transport = self.transport.as_ref();
+        for name in names {
+            transport.delete(&pack_path(&name, true))?;
+            for ext in self.index_extensions() {
+                transport.delete(&index_path(&name, ext, true))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Move the resumed packs and their indices into `packs/` and
+    /// `indices/`, to be listed in `pack-names` from the next save.
+    /// Returns their names.
+    pub fn finish_resumed(&mut self) -> Result<Vec<String>, RepositoryError> {
+        let exts = self.index_extensions();
+        let transport = self.transport.as_ref();
+        let names = self.resumed();
+        for name in &names {
+            let mut sizes = Vec::with_capacity(exts.len());
+            for ext in &exts {
+                let from = index_path(name, ext, true);
+                sizes.push(transport.get_bytes(&from)?.len());
+                transport.rename(&from, &index_path(name, ext, false))?;
+            }
+            transport.rename(&pack_path(name, true), &pack_path(name, false))?;
+            self.resumed.remove(name);
+            for reader in &self.readers {
+                reader.forget(name);
+                reader.set_resumed(name, false);
+            }
+            let value = super::pack_2a_writer::pack_names_value(&sizes);
+            if !self.names.allocate(name.clone(), value) {
+                return Err(RepositoryError::Corrupt(format!(
+                    "pack {name} already exists"
+                )));
+            }
+        }
+        Ok(names)
     }
 
     /// Move `packs` and their indices into `obsolete_packs/`. Old packs are
@@ -393,6 +502,54 @@ fn write_pack_names(
         .finish()
         .map_err(|e| RepositoryError::Corrupt(format!("pack-names finish: {e}")))?;
     transport.put_bytes("pack-names", &bytes, None)?;
+    Ok(())
+}
+
+/// The directory, under `.bzr/repository`, a suspended write group's packs
+/// and their indices wait in until the write group is resumed and
+/// committed.
+pub(super) const UPLOAD_DIR: &str = "upload";
+
+/// The path of the `.pack` file of pack `name`: in `packs/`, or in the
+/// upload directory for a pack of a resumed write group.
+pub(super) fn pack_path(name: &str, resumed: bool) -> String {
+    let dir = if resumed { UPLOAD_DIR } else { "packs" };
+    format!("{dir}/{name}.pack")
+}
+
+/// The path of the index with extension `ext` of pack `name`: in
+/// `indices/`, or in the upload directory for a pack of a resumed write
+/// group.
+pub(super) fn index_path(name: &str, ext: &str, resumed: bool) -> String {
+    let dir = if resumed { UPLOAD_DIR } else { "indices" };
+    format!("{dir}/{name}{ext}")
+}
+
+/// Check that `token` names a suspended pack with the indices `exts`.
+fn check_resumable(
+    transport: &dyn Transport,
+    token: &str,
+    exts: &[&str],
+) -> Result<(), RepositoryError> {
+    let unresumable = |reason: String| RepositoryError::UnresumableWriteGroup {
+        tokens: vec![token.to_string()],
+        reason,
+    };
+    // Tokens are the md5 sums of the suspended pack files.
+    if token.len() != 32
+        || !token
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(unresumable("Malformed write group token".to_string()));
+    }
+    let paths = std::iter::once(pack_path(token, true))
+        .chain(exts.iter().map(|ext| index_path(token, ext, true)));
+    for path in paths {
+        if !transport.has(&path)? {
+            return Err(unresumable(format!("No such file: {path}")));
+        }
+    }
     Ok(())
 }
 

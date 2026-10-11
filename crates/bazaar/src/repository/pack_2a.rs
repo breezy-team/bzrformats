@@ -97,10 +97,22 @@ pub enum RepositoryError {
     UnsupportedFormat(&'static str),
     /// A write was attempted without a write lock.
     NotWriteLocked,
-    /// The last write lock was released with a write group open.
-    WriteGroupOpen,
+    /// The last write lock was released with a write group open, which
+    /// aborted the write group.
+    WriteGroupOpen {
+        /// The token of the lock directory the unlock released, if it did.
+        released: Option<crate::lockable_files::LockToken>,
+    },
     /// Locking the repository failed.
     Locking(crate::lockable_files::LockableFilesError),
+    /// A write group is already open.
+    AlreadyInWriteGroup,
+    /// No write group is open.
+    NotInWriteGroup,
+    /// The repository cannot suspend write groups.
+    UnsuspendableWriteGroup,
+    /// The suspended write group `tokens` cannot be resumed.
+    UnresumableWriteGroup { tokens: Vec<String>, reason: String },
 }
 
 impl std::fmt::Display for RepositoryError {
@@ -128,10 +140,18 @@ impl std::fmt::Display for RepositoryError {
                 write!(f, "unsupported repository format: {desc}")
             }
             RepositoryError::NotWriteLocked => f.write_str("repository is not write locked"),
-            RepositoryError::WriteGroupOpen => {
+            RepositoryError::WriteGroupOpen { .. } => {
                 f.write_str("Must end write group before releasing write lock")
             }
             RepositoryError::Locking(e) => write!(f, "repository lock error: {e}"),
+            RepositoryError::AlreadyInWriteGroup => f.write_str("already in a write group"),
+            RepositoryError::NotInWriteGroup => f.write_str("no write group is open"),
+            RepositoryError::UnsuspendableWriteGroup => {
+                f.write_str("repository cannot suspend a write group")
+            }
+            RepositoryError::UnresumableWriteGroup { tokens, reason } => {
+                write!(f, "cannot resume write group {tokens:?}: {reason}")
+            }
         }
     }
 }
@@ -221,21 +241,21 @@ impl PackGcIndex {
     ) -> Result<Self, RepositoryError> {
         let index = PackGcIndex::default();
         for pack in packs {
-            index.add_pack(transport, pack, kind)?;
+            index.add_pack(transport, pack, kind, false)?;
         }
         Ok(index)
     }
 }
 
 impl super::pack_collection::CombinedIndex for PackGcIndex {
-    /// Add the entries of `pack`'s index for `kind`.
     fn add_pack(
         &self,
         transport: &dyn Transport,
         pack: &str,
         kind: IndexKind,
+        resumed: bool,
     ) -> Result<(), RepositoryError> {
-        let name = format!("indices/{pack}{}", index_extension(kind));
+        let name = super::pack_collection::index_path(pack, index_extension(kind), resumed);
         let index = BTreeGraphIndex::open(transport, &name)?;
         let mut state = self.state.write().unwrap();
         if index.node_ref_lists() > 0 {
@@ -333,6 +353,8 @@ pub use crate::transport::SharedTransport;
 #[derive(Clone)]
 struct PackGcAccess {
     transport: SharedTransport,
+    /// The packs of a resumed write group, read from the upload directory.
+    resumed: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PackName>>>,
     /// Cache of whole pack files, keyed by pack name. The packs a single
     /// repository produces are small enough to hold in memory; this avoids
     /// re-reading the file for every record.
@@ -343,6 +365,7 @@ impl PackGcAccess {
     fn new(transport: SharedTransport) -> Self {
         PackGcAccess {
             transport,
+            resumed: Default::default(),
             cache: Default::default(),
         }
     }
@@ -351,7 +374,8 @@ impl PackGcAccess {
         if let Some(bytes) = self.cache.lock().unwrap().get(pack) {
             return Ok(bytes.clone());
         }
-        let path = format!("packs/{pack}.pack");
+        let resumed = self.resumed.lock().unwrap().contains(pack);
+        let path = super::pack_collection::pack_path(pack, resumed);
         let bytes = self
             .transport
             .get_bytes(&path)
@@ -368,6 +392,15 @@ impl PackGcAccess {
 impl super::pack_collection::PackReader for PackGcAccess {
     fn forget(&self, pack: &str) {
         self.cache.lock().unwrap().remove(pack);
+    }
+
+    fn set_resumed(&self, pack: &str, resumed: bool) {
+        let mut set = self.resumed.lock().unwrap();
+        if resumed {
+            set.insert(pack.to_string());
+        } else {
+            set.remove(pack);
+        }
     }
 }
 
@@ -521,13 +554,19 @@ impl Pack2aRepository {
     /// `.bzr/repository` directory), then open it.
     ///
     /// Writes the `format` marker, an empty `pack-names`, and the
-    /// `indices/` and `packs/` directories.
+    /// directories a pack repository keeps its packs in.
     pub fn create(transport: SharedTransport) -> Result<Self, RepositoryError> {
         // The repository directory itself may not exist yet (mkdir does not
         // create parents).
         transport.mkdir("")?;
-        transport.mkdir("indices")?;
-        transport.mkdir("packs")?;
+        for dir in [
+            "indices",
+            "obsolete_packs",
+            "packs",
+            super::pack_collection::UPLOAD_DIR,
+        ] {
+            transport.mkdir(dir)?;
+        }
         transport.put_bytes(
             "format",
             b"Bazaar repository format 2a (needs bzr 1.16 or later)\n",
@@ -670,9 +709,7 @@ impl Pack2aRepository {
             return Err(RepositoryError::NotWriteLocked);
         }
         if self.write_group.is_some() {
-            return Err(RepositoryError::Corrupt(
-                "a write group is already open".to_string(),
-            ));
+            return Err(RepositoryError::AlreadyInWriteGroup);
         }
         let pack_name = new_pack_name();
         self.write_group = Some(super::pack_2a_writer::WriteGroup::new(
@@ -685,7 +722,7 @@ impl Pack2aRepository {
     fn write_group_mut(&mut self) -> Result<&super::pack_2a_writer::WriteGroup, RepositoryError> {
         self.write_group
             .as_ref()
-            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))
+            .ok_or(RepositoryError::NotInWriteGroup)
     }
 
     /// Add a revision to the open write group, serialising it to bencode
@@ -811,32 +848,75 @@ impl Pack2aRepository {
         ))
     }
 
-    /// Flush the open write group: write its pack, indices and an updated
-    /// `pack-names`, and make the new pack readable through this object.
-    pub fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
+    /// Commit the open write group: write its pack and indices if anything
+    /// was added, move the packs it resumed into place, list them all in
+    /// `pack-names` and autopack.
+    ///
+    /// Returns the names of the packs written, by autopack if it ran,
+    /// which can be passed to `pack` as a hint.
+    pub fn commit_write_group(&mut self) -> Result<Vec<PackName>, RepositoryError> {
         let group = self
             .write_group
             .take()
-            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))?;
-        let Some((name, value)) = group.finish(self.transport.as_ref())? else {
-            return Ok(());
-        };
-        self.packs.allocate(name, value)?;
+            .ok_or(RepositoryError::NotInWriteGroup)?;
+        let mut new_packs = Vec::new();
+        if let Some((name, value)) = group.finish(self.transport.as_ref())? {
+            new_packs.push(name.clone());
+            self.packs.allocate(name, value)?;
+        }
+        new_packs.extend(self.packs.finish_resumed()?);
+        if new_packs.is_empty() {
+            return Ok(new_packs);
+        }
         // Autopack if the repository has accumulated too many packs, as brz
         // does on commit_write_group; a repack saves the pack names itself.
-        if !self.autopack()? {
-            self.packs.save()?;
+        match self.autopack_locked()? {
+            Some(packed) => Ok(packed),
+            None => {
+                self.packs.save()?;
+                Ok(new_packs)
+            }
         }
-        Ok(())
     }
 
-    /// Discard the open write group: nothing of it has been written, as the
-    /// new pack is only written by [`commit_write_group`](Self::commit_write_group).
+    /// Abort the open write group: drop what it added and delete the packs
+    /// it resumed.
     pub fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
         self.write_group
             .take()
-            .map(drop)
-            .ok_or_else(|| RepositoryError::Corrupt("no write group is open".to_string()))
+            .ok_or(RepositoryError::NotInWriteGroup)?;
+        self.packs.abort_resumed()
+    }
+
+    /// Suspend the open write group: write what it added to the upload
+    /// directory rather than committing it, and return the tokens that
+    /// resume it.
+    pub fn suspend_write_group(&mut self) -> Result<Vec<String>, RepositoryError> {
+        let group = self
+            .write_group
+            .take()
+            .ok_or(RepositoryError::NotInWriteGroup)?;
+        let mut tokens = self.packs.resumed();
+        self.packs.drop_resumed();
+        if group.data_inserted() {
+            let (name, _) = group.write_pack(self.transport.as_ref(), true)?;
+            tokens.push(name);
+        }
+        Ok(tokens)
+    }
+
+    /// Open a write group holding the suspended write group `tokens`. Their
+    /// data is readable at once, and committing the write group commits it.
+    pub fn resume_write_group(&mut self, tokens: &[String]) -> Result<(), RepositoryError> {
+        if self.write_group.is_some() {
+            return Err(RepositoryError::AlreadyInWriteGroup);
+        }
+        self.start_write_group()?;
+        if let Err(e) = self.packs.resume(tokens) {
+            self.write_group = None;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Stream the `missing` revisions from another 2a repository into this one,
@@ -1098,7 +1178,7 @@ impl Pack2aRepository {
             // Zero or one pack: already as packed as it gets.
             return Ok(());
         }
-        self.repack(&old_packs)
+        self.repack(&old_packs).map(drop)
     }
 
     /// Repack the smallest packs when the repository has accumulated too many,
@@ -1112,9 +1192,12 @@ impl Pack2aRepository {
     /// Requires no open write group.
     pub fn autopack(&mut self) -> Result<bool, RepositoryError> {
         super::with_write_lock(self, |repository| repository.autopack_locked())
+            .map(|packed| packed.is_some())
     }
 
-    fn autopack_locked(&mut self) -> Result<bool, RepositoryError> {
+    /// Autopack under the held write lock, returning the names of the packs
+    /// written if it repacked.
+    fn autopack_locked(&mut self) -> Result<Option<Vec<PackName>>, RepositoryError> {
         if self.write_group.is_some() {
             return Err(RepositoryError::Corrupt(
                 "cannot autopack with an open write group".to_string(),
@@ -1122,7 +1205,7 @@ impl Pack2aRepository {
         }
         let all_packs = self.packs.names();
         if all_packs.len() <= 1 {
-            return Ok(false);
+            return Ok(None);
         }
         // Revision count per pack, from each pack's revision index.
         let mut counts = Vec::with_capacity(all_packs.len());
@@ -1134,15 +1217,18 @@ impl Pack2aRepository {
         }
         let selected = super::pack_collection::plan_autopack_combinations(&counts);
         if selected.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let to_combine: Vec<PackName> = selected.iter().map(|&i| all_packs[i].clone()).collect();
-        self.repack(&to_combine)?;
-        Ok(true)
+        self.repack(&to_combine)
     }
 
     /// Combine `to_combine` into a single new pack, which replaces them.
-    fn repack(&mut self, to_combine: &[PackName]) -> Result<(), RepositoryError> {
+    /// Returns the name of the new pack, if any.
+    fn repack(
+        &mut self,
+        to_combine: &[PackName],
+    ) -> Result<Option<Vec<PackName>>, RepositoryError> {
         // Read-side stores over the packs being combined, one per object kind.
         let revisions = build_store(&self.transport, to_combine, IndexKind::Revision)?;
         let inventories = build_store(&self.transport, to_combine, IndexKind::Inventory)?;
@@ -1164,7 +1250,9 @@ impl Pack2aRepository {
         group.copy_store(&signatures, RepackTarget::Signatures)?;
 
         let new_pack = group.finish(self.transport.as_ref())?;
-        self.packs.replace(to_combine, new_pack)
+        let name = new_pack.as_ref().map(|(name, _)| vec![name.clone()]);
+        self.packs.replace(to_combine, new_pack)?;
+        Ok(name)
     }
 }
 
@@ -1322,12 +1410,20 @@ impl super::Repository for Pack2aRepository {
         Pack2aRepository::get_signature_text(self, revision_id)
     }
 
-    fn commit_write_group(&mut self) -> Result<(), RepositoryError> {
-        Pack2aRepository::commit_write_group(self)
+    fn commit_write_group(&mut self) -> Result<Option<Vec<String>>, RepositoryError> {
+        Pack2aRepository::commit_write_group(self).map(Some)
     }
 
     fn abort_write_group(&mut self) -> Result<(), RepositoryError> {
         Pack2aRepository::abort_write_group(self)
+    }
+
+    fn suspend_write_group(&mut self) -> Result<Vec<String>, RepositoryError> {
+        Pack2aRepository::suspend_write_group(self)
+    }
+
+    fn resume_write_group(&mut self, tokens: &[String]) -> Result<(), RepositoryError> {
+        Pack2aRepository::resume_write_group(self, tokens)
     }
 
     fn pack(&mut self) -> Result<(), RepositoryError> {
@@ -1520,7 +1616,7 @@ mod tests {
         assert!(repo.write_group.is_some());
         assert!(matches!(
             repo.unlock(),
-            Err(RepositoryError::WriteGroupOpen)
+            Err(RepositoryError::WriteGroupOpen { .. })
         ));
         assert!(repo.write_group.is_none());
         assert!(!repo.lock().is_locked());
@@ -1532,7 +1628,7 @@ mod tests {
         let mut repo = Pack2aRepository::create(t).unwrap();
         assert!(matches!(
             repo.abort_write_group(),
-            Err(RepositoryError::Corrupt(_))
+            Err(RepositoryError::NotInWriteGroup)
         ));
     }
 
@@ -1551,7 +1647,7 @@ mod tests {
         write.start_write_group().unwrap();
         assert!(matches!(
             write.unlock(),
-            Err(RepositoryError::WriteGroupOpen)
+            Err(RepositoryError::WriteGroupOpen { .. })
         ));
         assert!(!repo.lock().is_locked());
     }
@@ -1948,7 +2044,7 @@ mod tests {
         let after = read_pack_names(t.as_ref()).unwrap();
         assert_eq!(after, before, "single pack untouched");
         // Nothing was obsoleted.
-        assert!(!t.has("obsolete_packs").unwrap_or(false));
+        assert_eq!(Vec::<String>::new(), t.list_dir("obsolete_packs").unwrap());
     }
 
     /// Commit a revision whose inventory actually references the file (so the

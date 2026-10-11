@@ -604,14 +604,30 @@ impl Repository {
         self.with_mut(py, |inner| inner.start_write_group().map_err(err))
     }
 
-    /// Flush the open write group, committing its additions.
-    fn commit_write_group(&mut self, py: Python<'_>) -> PyResult<()> {
+    /// Commit the open write group's additions. Returns the names of the
+    /// packs written, or None for formats without packs.
+    fn commit_write_group(&mut self, py: Python<'_>) -> PyResult<Option<Vec<String>>> {
         self.with_mut(py, |inner| inner.commit_write_group().map_err(err))
     }
 
-    /// Close the open write group, discarding its additions.
+    /// Abort the open write group.
     fn abort_write_group(&mut self, py: Python<'_>) -> PyResult<()> {
         self.with_mut(py, |inner| inner.abort_write_group().map_err(err))
+    }
+
+    /// Suspend the open write group, returning the tokens that resume it.
+    fn suspend_write_group(&mut self, py: Python<'_>) -> PyResult<Vec<String>> {
+        self.with_mut(py, |inner| inner.suspend_write_group().map_err(err))
+    }
+
+    /// Open a write group holding the suspended write group `tokens`.
+    fn resume_write_group(&mut self, py: Python<'_>, tokens: Vec<String>) -> PyResult<()> {
+        self.with_mut(py, |inner| inner.resume_write_group(&tokens).map_err(err))
+    }
+
+    /// Whether a write group is open.
+    fn is_in_write_group(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with(py, |inner| Ok(inner.is_in_write_group()))
     }
 
     /// Combine the repository's packs into a single pack. A no-op for formats
