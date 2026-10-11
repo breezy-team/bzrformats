@@ -465,6 +465,48 @@ impl super::Repository for WeaveRepository {
         WeaveRepository::get_file_text(self, file_id, revision)
     }
 
+    fn get_text_parent_map(
+        &self,
+        keys: &[crate::versionedfile::Key],
+    ) -> Result<
+        std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
+        RepositoryError,
+    > {
+        let mut by_file: std::collections::BTreeMap<&[u8], Vec<crate::versionedfile::Key>> =
+            Default::default();
+        for key in keys {
+            if let Some(file_id) = key.segments().first() {
+                by_file.entry(file_id).or_default().push(key.clone());
+            }
+        }
+        let mut found = std::collections::HashMap::new();
+        for (file_id, keys) in by_file {
+            let path = format!("weaves/{}.weave", hash_prefix_map(file_id));
+            let texts = WeaveTexts {
+                file_id: file_id.to_vec(),
+                weave: self.read_or_empty_weave(&path)?,
+            };
+            found.extend(crate::annotate::AnnotateSource::get_parent_map(
+                &texts, &keys,
+            )?);
+        }
+        Ok(found)
+    }
+
+    /// The texts' ancestry is diffed, as Python annotates weaves: a weave's
+    /// own annotation cannot take a text that is not in it.
+    fn text_annotator(
+        &self,
+        file_id: &crate::FileId,
+    ) -> Result<Box<dyn crate::annotate::TextAnnotator + '_>, RepositoryError> {
+        let path = format!("weaves/{}.weave", hash_prefix_map(file_id.as_bytes()));
+        let weave = self.read_or_empty_weave(&path)?;
+        Ok(Box::new(crate::annotate::Annotator::new(WeaveTexts {
+            file_id: file_id.as_bytes().to_vec(),
+            weave,
+        })))
+    }
+
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {
         // Writing needs the write lock.
         if self.lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
@@ -562,6 +604,78 @@ fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     flate2::read::GzDecoder::new(data).read_to_end(&mut out)?;
     Ok(out)
+}
+
+/// The texts of one file's weave, keyed `(file_id, revision)` as an
+/// annotator reads them.
+struct WeaveTexts {
+    file_id: Vec<u8>,
+    weave: WeaveFile,
+}
+
+impl WeaveTexts {
+    /// The weave version of `key`, if it is a text of this file.
+    fn version(&self, key: &crate::versionedfile::Key) -> Option<usize> {
+        match key.segments() {
+            [file_id, revision] if *file_id == self.file_id => self.weave.lookup(revision),
+            _ => None,
+        }
+    }
+
+    fn key(&self, version: usize) -> crate::versionedfile::Key {
+        crate::versionedfile::Key::fixed(vec![
+            self.file_id.clone(),
+            self.weave.names[version].clone(),
+        ])
+    }
+}
+
+impl crate::annotate::AnnotateSource for WeaveTexts {
+    fn get_parent_map(
+        &self,
+        keys: &[crate::versionedfile::Key],
+    ) -> Result<
+        std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
+        crate::knit::KnitError,
+    > {
+        Ok(keys
+            .iter()
+            .filter_map(|key| {
+                let version = self.version(key)?;
+                let parents = self.weave.parents[version]
+                    .iter()
+                    .map(|&parent| self.key(parent))
+                    .collect();
+                Some((key.clone(), parents))
+            })
+            .collect())
+    }
+
+    /// A weave holds each version after its parents, so version order is
+    /// topological.
+    fn get_line_texts(
+        &self,
+        keys: &[crate::versionedfile::Key],
+    ) -> Result<Vec<crate::annotate::KeyLines>, crate::knit::KnitError> {
+        let mut versions = keys
+            .iter()
+            .map(|key| {
+                self.version(key).ok_or_else(|| {
+                    crate::knit::KnitError::RevisionNotPresent(key.segments().to_vec())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        versions.sort_unstable();
+        versions
+            .into_iter()
+            .map(|version| {
+                let lines = self.weave.get_lines(version).map_err(|e| {
+                    crate::knit::KnitError::Corrupt(format!("weave get_lines: {e:?}"))
+                })?;
+                Ok((self.key(version), lines))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
