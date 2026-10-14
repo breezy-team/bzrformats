@@ -4,6 +4,7 @@ use std::fmt::{Debug, Error, Formatter};
 
 pub const DEFAULT_CHUNK_SIZE: usize = 4096;
 
+pub mod annotate;
 pub mod bencode_serializer;
 pub mod bisect_multi;
 pub mod branch;

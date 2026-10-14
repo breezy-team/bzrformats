@@ -1350,6 +1350,28 @@ impl super::Repository for Pack2aRepository {
         Pack2aRepository::get_file_text(self, file_id, revision)
     }
 
+    fn get_text_parent_map(
+        &self,
+        keys: &[crate::versionedfile::Key],
+    ) -> Result<
+        std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
+        RepositoryError,
+    > {
+        Ok(crate::versionedfile::VersionedFiles::get_parent_map(
+            &self.texts,
+            keys,
+        )?)
+    }
+
+    /// Groupcompress records carry no line origins, so the texts' ancestry
+    /// is diffed.
+    fn text_annotator(
+        &self,
+        _file_id: &crate::FileId,
+    ) -> Result<Box<dyn crate::annotate::TextAnnotator + '_>, RepositoryError> {
+        Ok(Box::new(crate::annotate::Annotator::new(&self.texts)))
+    }
+
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {
         Pack2aRepository::start_write_group(self)
     }
