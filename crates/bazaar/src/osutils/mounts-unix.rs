@@ -142,7 +142,11 @@ fn load_mounts() -> Vec<MountEntry> {
 fn test_load_mounts() {
     let mounts = load_mounts();
     assert!(!mounts.is_empty());
-    assert!(mounts[mounts.len() - 1].path == PathBuf::from("/"));
+    // "/" is absent from /proc/mounts in a chroot whose root is not a mount
+    // point, so only check the ordering.
+    assert!(mounts
+        .windows(2)
+        .all(|w| w[0].path.as_os_str().len() >= w[1].path.as_os_str().len()));
 }
 
 pub fn find_mount_entry<P: AsRef<Path>>(entries: &[MountEntry], path: P) -> Option<&MountEntry> {
