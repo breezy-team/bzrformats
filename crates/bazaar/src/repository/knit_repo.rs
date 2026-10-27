@@ -104,6 +104,8 @@ pub struct KnitRepository {
     inventories: KnitStore<ConstantMapper, KnitPlainFactory>,
     signatures: KnitStore<ConstantMapper, KnitPlainFactory>,
     texts: KnitStore<HashPrefixMapper, KnitAnnotateFactory>,
+    /// The `knits/` directory the file texts live in.
+    knits: SharedTransport,
 }
 
 impl KnitRepository {
@@ -158,6 +160,7 @@ impl KnitRepository {
             inventories,
             signatures,
             texts: make_store(&knits, HashPrefixMapper, KnitAnnotateFactory),
+            knits,
         })
     }
 
@@ -465,6 +468,61 @@ impl super::Repository for KnitRepository {
         revision_id: &[u8],
     ) -> Result<Box<dyn crate::inventory::Inventory>, RepositoryError> {
         Ok(Box::new(KnitRepository::get_inventory(self, revision_id)?))
+    }
+
+    fn get_text_parent_map(
+        &self,
+        keys: &[crate::versionedfile::Key],
+    ) -> Result<
+        std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
+        RepositoryError,
+    > {
+        // The per-file text knits are loaded lazily by their file_id prefix.
+        let mut file_ids: Vec<&[u8]> = keys
+            .iter()
+            .filter_map(|key| key.segments().first().map(Vec::as_slice))
+            .collect();
+        file_ids.sort_unstable();
+        file_ids.dedup();
+        for file_id in file_ids {
+            self.texts
+                .index()
+                .load_prefix_typed(vec![file_id.to_vec()])
+                .map_err(|e| RepositoryError::Corrupt(format!("load text kndx: {e:?}")))?;
+        }
+        let knit_keys: Vec<KnitKey> = keys.iter().map(|key| key.segments().to_vec()).collect();
+        Ok(self
+            .texts
+            .get_parent_map(&knit_keys)?
+            .into_iter()
+            .map(|(key, parents)| {
+                (
+                    crate::versionedfile::Key::fixed(key),
+                    parents
+                        .into_iter()
+                        .map(crate::versionedfile::Key::fixed)
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
+    /// The file's knit records carry the line origins, which the knit
+    /// annotator reuses.
+    fn text_annotator(
+        &self,
+        file_id: &crate::FileId,
+    ) -> Result<Box<dyn crate::annotate::TextAnnotator + '_>, RepositoryError> {
+        let index = KndxIndex::new(self.knits.clone(), HashPrefixMapper);
+        // The per-file text knit is loaded lazily by its file_id prefix.
+        index
+            .load_prefix_typed(vec![file_id.as_bytes().to_vec()])
+            .map_err(|e| RepositoryError::Corrupt(format!("load text kndx: {e:?}")))?;
+        Ok(Box::new(crate::knit::KnitAnnotator::new(
+            index,
+            KnitKeyAccess::new(self.knits.clone(), HashPrefixMapper),
+            KnitAnnotateFactory,
+        )))
     }
 
     fn get_file_text(&self, file_id: &[u8], revision: &[u8]) -> Result<Vec<u8>, RepositoryError> {

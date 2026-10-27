@@ -17,17 +17,167 @@
 //! File annotation driven by a VersionedFiles, ported from
 //! `bzrformats.annotate`.
 //!
-//! `VersionedFileAnnotator` is a `subclass`-able pyo3 class: `knit._KnitAnnotator`
-//! is a Python subclass that overrides `_get_needed_texts` /
-//! `_get_parent_annotations_and_matches` and reaches into the per-step
-//! bookkeeping dicts. To preserve that, all mutable state lives in the instance
-//! `__dict__` (the pyclass carries `dict`), and the overridable hooks are
-//! invoked through `slf.call_method(...)` so Python overrides win, exactly as
-//! Python method dispatch would.
+//! A `VersionedFileAnnotator` itself runs the crate's annotator
+//! ([`bazaar::annotate::Annotator`]) over the Python store.
+//!
+//! It is also a `subclass`-able pyo3 class: `knit._KnitAnnotator` overrides
+//! `_get_needed_texts` / `_get_parent_annotations_and_matches` and reaches
+//! into the per-step bookkeeping dicts. For subclasses all mutable state
+//! lives in the instance `__dict__` (the pyclass carries `dict`), and the
+//! overridable hooks are invoked through `slf.call_method(...)` so Python
+//! overrides win, exactly as Python method dispatch would.
 
-use pyo3::exceptions::PyKeyError;
+use bazaar::annotate::{AnnotateSource, Annotator, KeyLines};
+use bazaar::knit::KnitError;
+use bazaar::versionedfile::Key;
+use pyo3::exceptions::{PyKeyError, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PySet, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PySet, PyTuple};
+use std::collections::HashMap;
+use std::convert::TryFrom;
+use std::sync::Mutex;
+
+/// A Python versioned file as a source for the crate's annotator.
+///
+/// The annotator's keys stand in for the Python keys, which need not be
+/// tuples of bytes (git trees key texts by `(path, revision)` with a `str`
+/// path): each distinct Python key gets the next number, and the store is
+/// always called with the original key objects. A Python exception raised
+/// by the store is kept to be raised again once the annotator returns.
+struct PyAnnotateSource {
+    vf: Py<PyAny>,
+    /// The Python keys, indexed by the number standing in for them.
+    keys: Mutex<Vec<Py<PyAny>>>,
+    /// The number standing in for each Python key.
+    numbers: Py<PyDict>,
+    /// A Python exception to raise once the annotator returns.
+    error: std::sync::Arc<Mutex<Option<PyErr>>>,
+}
+
+impl PyAnnotateSource {
+    fn new(py: Python<'_>, vf: Py<PyAny>) -> Self {
+        PyAnnotateSource {
+            vf,
+            keys: Mutex::new(Vec::new()),
+            numbers: PyDict::new(py).unbind(),
+            error: Default::default(),
+        }
+    }
+
+    /// The annotator's key for the Python key `key`.
+    fn to_key(&self, key: &Bound<'_, PyAny>) -> PyResult<Key> {
+        let numbers = self.numbers.bind(key.py());
+        let number = match numbers.get_item(key)? {
+            Some(number) => number.extract::<u64>()?,
+            None => {
+                let mut keys = self.keys.lock().unwrap();
+                let number = keys.len() as u64;
+                keys.push(key.clone().unbind());
+                numbers.set_item(key, number)?;
+                number
+            }
+        };
+        Ok(Key::fixed(vec![number.to_be_bytes().to_vec()]))
+    }
+
+    /// The Python key the annotator's `key` stands for.
+    fn to_py<'py>(&self, py: Python<'py>, key: &Key) -> PyResult<Bound<'py, PyAny>> {
+        let number = key
+            .segments()
+            .first()
+            .and_then(|segment| <[u8; 8]>::try_from(segment.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("not an annotator key: {key:?}")))?;
+        let keys = self.keys.lock().unwrap();
+        let key = keys
+            .get(number as usize)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("unknown annotator key {number}")))?;
+        Ok(key.bind(py).clone())
+    }
+
+    /// Keep `err` to raise once the annotator returns, and stop it.
+    fn fail(&self, err: PyErr) -> KnitError {
+        let message = err.to_string();
+        *self.error.lock().unwrap() = Some(err);
+        KnitError::Corrupt(message)
+    }
+
+    /// The Python form of an error from the annotator: the store's own
+    /// exception if it raised one, `RevisionNotPresent` for a missing text.
+    fn py_err(&self, py: Python<'_>, err: KnitError) -> PyErr {
+        if let Some(err) = self.error.lock().unwrap().take() {
+            return err;
+        }
+        match err {
+            KnitError::RevisionNotPresent(segments) => {
+                match self.to_py(py, &Key::fixed(segments)) {
+                    Ok(key) => revision_not_present(py, key, self.vf.bind(py)),
+                    Err(e) => e,
+                }
+            }
+            other => PyRuntimeError::new_err(other.to_string()),
+        }
+    }
+
+    fn py_keys<'py>(&self, py: Python<'py>, keys: &[Key]) -> PyResult<Bound<'py, PyList>> {
+        PyList::new(
+            py,
+            keys.iter()
+                .map(|key| self.to_py(py, key))
+                .collect::<PyResult<Vec<_>>>()?,
+        )
+    }
+}
+
+impl AnnotateSource for PyAnnotateSource {
+    fn get_parent_map(&self, keys: &[Key]) -> Result<HashMap<Key, Vec<Key>>, KnitError> {
+        Python::attach(|py| -> PyResult<HashMap<Key, Vec<Key>>> {
+            let found = self
+                .vf
+                .bind(py)
+                .call_method1("get_parent_map", (self.py_keys(py, keys)?,))?;
+            let mut out = HashMap::new();
+            for item in found.cast::<PyDict>()?.iter() {
+                let (key, parents) = item;
+                // A versioned file without a graph has no parents.
+                let parents = if parents.is_none() {
+                    Vec::new()
+                } else {
+                    parents
+                        .try_iter()?
+                        .map(|parent| self.to_key(&parent?))
+                        .collect::<PyResult<_>>()?
+                };
+                out.insert(self.to_key(&key)?, parents);
+            }
+            Ok(out)
+        })
+        .map_err(|e| self.fail(e))
+    }
+
+    fn get_line_texts(&self, keys: &[Key]) -> Result<Vec<KeyLines>, KnitError> {
+        Python::attach(|py| -> PyResult<Result<Vec<KeyLines>, KnitError>> {
+            let stream = self.vf.bind(py).call_method1(
+                "get_record_stream",
+                (self.py_keys(py, keys)?, "topological", true),
+            )?;
+            let mut out = Vec::new();
+            for record in stream.try_iter()? {
+                let record = record?;
+                let key = self.to_key(&record.getattr("key")?)?;
+                let storage_kind: String = record.getattr("storage_kind")?.extract()?;
+                if storage_kind == "absent" {
+                    return Ok(Err(KnitError::RevisionNotPresent(key.segments().to_vec())));
+                }
+                let lines: Vec<Vec<u8>> =
+                    record.call_method1("get_bytes_as", ("lines",))?.extract()?;
+                out.push((key, lines));
+            }
+            Ok(Ok(out))
+        })
+        .unwrap_or_else(|e| Err(self.fail(e)))
+    }
+}
 
 /// Drives annotation of texts stored in a VersionedFiles.
 #[pyclass(
@@ -36,12 +186,101 @@ use pyo3::types::{PyDict, PyList, PySet, PyTuple};
     dict,
     module = "bzrformats._bzr_rs.annotate"
 )]
-pub struct VersionedFileAnnotator;
+pub struct VersionedFileAnnotator {
+    /// The crate's annotator, which an instance of this class itself uses;
+    /// subclasses use the per-step hooks instead and leave it unset.
+    annotator: Mutex<Option<Annotator<PyAnnotateSource>>>,
+}
 
 impl VersionedFileAnnotator {
+    /// The base of a subclass, which annotates through the per-step hooks.
+    pub(crate) fn for_subclass() -> Self {
+        VersionedFileAnnotator {
+            annotator: Mutex::new(None),
+        }
+    }
+
     /// Read instance attribute `name` as a Bound value.
     fn attr<'py>(slf: &Bound<'py, Self>, name: &str) -> PyResult<Bound<'py, PyAny>> {
         slf.getattr(name)
+    }
+
+    /// Run `f` on the crate's annotator if this object uses it: when it is
+    /// exactly a `VersionedFileAnnotator`, not a subclass.
+    fn with_annotator<R>(
+        slf: &Bound<'_, Self>,
+        f: impl FnOnce(&mut Annotator<PyAnnotateSource>) -> PyResult<R>,
+    ) -> Option<PyResult<R>> {
+        if !slf.get_type().is(slf.py().get_type::<Self>()) {
+            return None;
+        }
+        let this = slf.borrow();
+        let mut annotator = this.annotator.lock().unwrap();
+        annotator.as_mut().map(f)
+    }
+
+    /// Choose among `heads`, which a line could equally come from, as
+    /// `_resolve_annotation_tie` does: the first in Python's order, or as
+    /// the module's `_break_annotation_tie` hook decides when it is set.
+    fn break_tie(
+        py: Python<'_>,
+        source: &PyAnnotateSource,
+        heads: &[Key],
+        line: &[u8],
+        tiebreaker: &Bound<'_, PyAny>,
+    ) -> PyResult<Key> {
+        let py_heads = source.py_keys(py, heads)?;
+        let chosen = if tiebreaker.is_none() {
+            py_heads.sort()?;
+            py_heads.get_item(0)?
+        } else {
+            let line = PyBytes::new(py, line);
+            let mut chosen = py_heads.get_item(0)?;
+            for possible in py_heads.iter().skip(1) {
+                let pair = PyTuple::new(
+                    py,
+                    [
+                        PyTuple::new(py, [&chosen, line.as_any()])?,
+                        PyTuple::new(py, [&possible, line.as_any()])?,
+                    ],
+                )?;
+                chosen = tiebreaker.call1((pair,))?.get_item(0)?;
+            }
+            chosen
+        };
+        source.to_key(&chosen)
+    }
+
+    /// Report progress through the progress bar `pb`; an exception it raises
+    /// stops the annotation and is raised once the annotator returns.
+    fn progress(source: &PyAnnotateSource, pb: Py<PyAny>) -> bazaar::annotate::Progress {
+        let error = std::sync::Arc::clone(&source.error);
+        Box::new(move |msg, current, total| {
+            Python::attach(|py| {
+                pb.bind(py)
+                    .call_method1("update", (msg, current, total))
+                    .map(drop)
+            })
+            .map_err(|e| {
+                let message = e.to_string();
+                *error.lock().unwrap() = Some(e);
+                KnitError::Corrupt(message)
+            })
+        })
+    }
+
+    /// The Python form of one line's annotation: its keys as a tuple, in
+    /// the order Python sorts them.
+    fn py_annotation<'py>(
+        py: Python<'py>,
+        source: &PyAnnotateSource,
+        annotation: &[Key],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let keys = source.py_keys(py, annotation)?;
+        if keys.len() > 1 {
+            keys.sort()?;
+        }
+        Ok(keys.to_tuple().into_any())
     }
 }
 
@@ -51,8 +290,12 @@ impl VersionedFileAnnotator {
     #[new]
     #[pyo3(signature = (vf))]
     fn new(vf: Bound<'_, PyAny>) -> Self {
-        let _ = vf;
-        VersionedFileAnnotator
+        VersionedFileAnnotator {
+            annotator: Mutex::new(Some(Annotator::new(PyAnnotateSource::new(
+                vf.py(),
+                vf.unbind(),
+            )))),
+        }
     }
 
     fn __init__(slf: &Bound<'_, Self>, vf: Bound<'_, PyAny>) -> PyResult<()> {
@@ -412,6 +655,22 @@ impl VersionedFileAnnotator {
         text: Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let py = slf.py();
+        let lines = py
+            .import("bzrformats.osutils")?
+            .getattr("split_lines")?
+            .call1((&text,))?;
+        if let Some(done) = Self::with_annotator(slf, |annotator| {
+            let source = annotator.source();
+            let key = source.to_key(&key)?;
+            let parents = parent_keys
+                .try_iter()?
+                .map(|parent| source.to_key(&parent?))
+                .collect::<PyResult<_>>()?;
+            annotator.add_special_text(key, parents, lines.extract()?);
+            Ok(())
+        }) {
+            return done;
+        }
         Self::attr(slf, "_parent_map")?
             .cast::<PyDict>()?
             .set_item(&key, parent_keys)?;
@@ -434,6 +693,27 @@ impl VersionedFileAnnotator {
         pb: Option<Bound<'py, PyAny>>,
     ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
         let py = slf.py();
+        if let Some(done) = Self::with_annotator(slf, |annotator| {
+            let rust_key = annotator.source().to_key(&key)?;
+            let progress = pb
+                .as_ref()
+                .map(|pb| Self::progress(annotator.source(), pb.clone().unbind()));
+            annotator.set_progress(progress);
+            let annotated = annotator.annotate(&rust_key);
+            annotator.set_progress(None);
+            let (annotations, lines) = annotated.map_err(|e| annotator.source().py_err(py, e))?;
+            let source = annotator.source();
+            let annotations = PyList::new(
+                py,
+                annotations
+                    .iter()
+                    .map(|annotation| Self::py_annotation(py, source, annotation))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )?;
+            Ok((annotations.into_any(), PyList::new(py, lines)?.into_any()))
+        }) {
+            return done;
+        }
         let needed = slf.call_method1("_get_needed_texts", (&key, pb))?;
         for item in needed.try_iter()? {
             let item = item?;
@@ -518,6 +798,29 @@ impl VersionedFileAnnotator {
         let custom_tiebreaker = py
             .import("bzrformats.annotate")?
             .getattr("_break_annotation_tie")?;
+        if let Some(done) = Self::with_annotator(slf, |annotator| {
+            let rust_key = annotator.source().to_key(&key)?;
+            let mut tie_error = None;
+            let flat = annotator.annotate_flat_with(&rust_key, |source, heads, line| {
+                let chosen = Self::break_tie(py, source, &heads, line, &custom_tiebreaker);
+                chosen.unwrap_or_else(|e| {
+                    tie_error.get_or_insert(e);
+                    heads[0].clone()
+                })
+            });
+            let source = annotator.source();
+            let flat = flat.map_err(|e| source.py_err(py, e))?;
+            if let Some(e) = tie_error {
+                return Err(e);
+            }
+            let out = PyList::empty(py);
+            for (origin, line) in flat {
+                out.append((source.to_py(py, &origin)?, PyBytes::new(py, &line)))?;
+            }
+            Ok(out)
+        }) {
+            return done;
+        }
         let result = slf.call_method1("annotate", (&key,))?;
         let result = result.cast::<PyTuple>()?;
         let annotations = result.get_item(0)?;

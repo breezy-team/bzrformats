@@ -48,6 +48,39 @@ pub use weave_repo::WeaveRepository;
 use crate::inventory::Inventory;
 use crate::lockable_files::{Lockable, LockableExt as _};
 
+/// One annotated line: the revision that introduced it, and the line bytes.
+/// Returned in file order by the annotate methods.
+pub type AnnotatedLine = (crate::RevisionId, Vec<u8>);
+
+/// The key of the text of `file_id` as of `revision`.
+fn text_key(file_id: &crate::FileId, revision: &crate::RevisionId) -> crate::versionedfile::Key {
+    crate::versionedfile::Key::fixed(vec![
+        file_id.as_bytes().to_vec(),
+        revision.as_bytes().to_vec(),
+    ])
+}
+
+/// Annotate `key` with `annotator`, reporting each line's origin by its
+/// revision. A text missing from the ancestry is reported as itself.
+fn annotate_text(
+    mut annotator: Box<dyn crate::annotate::TextAnnotator + '_>,
+    key: &crate::versionedfile::Key,
+) -> Result<Vec<AnnotatedLine>, RepositoryError> {
+    let flat = annotator.annotate_flat(key).map_err(|e| match e {
+        crate::knit::KnitError::RevisionNotPresent(missing) if missing.len() == 2 => {
+            RepositoryError::NoSuchFileText {
+                file_id: missing[0].clone(),
+                revision: missing[1].clone(),
+            }
+        }
+        e => RepositoryError::Corrupt(format!("annotating {key:?}: {e}")),
+    })?;
+    Ok(flat
+        .into_iter()
+        .map(|(origin, line)| (crate::RevisionId::from(origin.version_id()), line))
+        .collect())
+}
+
 /// The common read interface to a bzr repository.
 ///
 /// Object-safe: `get_inventory` returns `Box<dyn Inventory>`, so a repository
@@ -206,6 +239,64 @@ pub trait Repository: Lockable<Error = RepositoryError> + Send + Sync {
             .path2id(path)
             .ok_or_else(|| RepositoryError::NoSuchRevision(path.as_bytes().to_vec()))?;
         self.get_file_text(file_id.as_bytes(), revision)
+    }
+
+    /// The parents of each file text in `keys`, keyed `(file_id, revision)`,
+    /// for the texts the repository holds. The base implementation is
+    /// unsupported.
+    fn get_text_parent_map(
+        &self,
+        keys: &[crate::versionedfile::Key],
+    ) -> Result<
+        std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
+        RepositoryError,
+    > {
+        let _ = keys;
+        Err(RepositoryError::UnsupportedFormat("get_text_parent_map"))
+    }
+
+    /// An annotator over the texts of `file_id`, as the repository's format
+    /// annotates them: from knit records where they carry line origins, and
+    /// otherwise by diffing the texts' ancestry. The base implementation is
+    /// unsupported.
+    fn text_annotator(
+        &self,
+        file_id: &crate::FileId,
+    ) -> Result<Box<dyn crate::annotate::TextAnnotator + '_>, RepositoryError> {
+        let _ = file_id;
+        Err(RepositoryError::UnsupportedFormat("annotate"))
+    }
+
+    /// Annotate the text of `file_id` as of `revision` line by line, giving
+    /// each line the revision that introduced it. Mirrors what
+    /// `Tree.annotate_iter` builds on.
+    fn annotate_file_lines(
+        &self,
+        file_id: &crate::FileId,
+        revision: &crate::RevisionId,
+    ) -> Result<Vec<AnnotatedLine>, RepositoryError> {
+        annotate_text(self.text_annotator(file_id)?, &text_key(file_id, revision))
+    }
+
+    /// Annotate `working_lines`, a not-yet-committed text of `file_id` whose
+    /// parents are its texts as of `parent_revisions`. Lines new in
+    /// `working_lines` are attributed to `default_revision`. Mirrors the
+    /// working-tree path of `Tree.annotate_iter`.
+    fn annotate_file_lines_special(
+        &self,
+        file_id: &crate::FileId,
+        default_revision: &crate::RevisionId,
+        parent_revisions: &[crate::RevisionId],
+        working_lines: Vec<Vec<u8>>,
+    ) -> Result<Vec<AnnotatedLine>, RepositoryError> {
+        let key = text_key(file_id, default_revision);
+        let parents = parent_revisions
+            .iter()
+            .map(|revision| text_key(file_id, revision))
+            .collect();
+        let mut annotator = self.text_annotator(file_id)?;
+        annotator.add_special_text(key.clone(), parents, working_lines);
+        annotate_text(annotator, &key)
     }
 
     /// Open a write group: a batch of additions flushed atomically by
@@ -471,6 +562,69 @@ pub struct StackedRepository {
     fallbacks: Vec<Box<dyn Repository>>,
 }
 
+/// The file texts of a stacked repository, for an annotator: each text from
+/// the first of the primary and the fallbacks that holds it.
+struct StackedTexts<'a>(&'a StackedRepository);
+
+impl crate::annotate::AnnotateSource for StackedTexts<'_> {
+    fn get_parent_map(
+        &self,
+        keys: &[crate::versionedfile::Key],
+    ) -> Result<
+        std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
+        crate::knit::KnitError,
+    > {
+        self.0
+            .get_text_parent_map(keys)
+            .map_err(|e| crate::knit::KnitError::Corrupt(e.to_string()))
+    }
+
+    fn get_line_texts(
+        &self,
+        keys: &[crate::versionedfile::Key],
+    ) -> Result<Vec<crate::annotate::KeyLines>, crate::knit::KnitError> {
+        let parents = self.get_parent_map(keys)?;
+        let present = keys
+            .iter()
+            .map(|key| {
+                parents
+                    .get(key)
+                    .map(|parents| (key.clone(), parents.clone()))
+                    .ok_or_else(|| {
+                        crate::knit::KnitError::RevisionNotPresent(key.segments().to_vec())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let order = vcs_graph::tsort::TopoSorter::new(present.into_iter())
+            .sorted()
+            .map_err(|e| crate::knit::KnitError::Corrupt(format!("text ancestry: {e:?}")))?;
+        order
+            .into_iter()
+            .map(|key| {
+                let [file_id, revision] = key.segments() else {
+                    return Err(crate::knit::KnitError::RevisionNotPresent(
+                        key.segments().to_vec(),
+                    ));
+                };
+                let text = self
+                    .0
+                    .get_file_text(file_id, revision)
+                    .map_err(|e| match e {
+                        RepositoryError::NoSuchFileText { .. } => {
+                            crate::knit::KnitError::RevisionNotPresent(key.segments().to_vec())
+                        }
+                        e => crate::knit::KnitError::Corrupt(e.to_string()),
+                    })?;
+                let lines = text
+                    .split_inclusive(|&b| b == b'\n')
+                    .map(<[u8]>::to_vec)
+                    .collect();
+                Ok((key, lines))
+            })
+            .collect()
+    }
+}
+
 /// Whether `e` signals that an object is simply absent (so a fallback should be
 /// consulted) rather than a hard error.
 fn is_not_present(e: &RepositoryError) -> bool {
@@ -649,6 +803,39 @@ impl Repository for StackedRepository {
 
     fn get_file_text(&self, file_id: &[u8], revision: &[u8]) -> Result<Vec<u8>, RepositoryError> {
         self.first_present(|r| r.get_file_text(file_id, revision))
+    }
+
+    fn get_text_parent_map(
+        &self,
+        keys: &[crate::versionedfile::Key],
+    ) -> Result<
+        std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
+        RepositoryError,
+    > {
+        let mut found = self.primary.get_text_parent_map(keys)?;
+        for fallback in &self.fallbacks {
+            let missing: Vec<crate::versionedfile::Key> = keys
+                .iter()
+                .filter(|key| !found.contains_key(*key))
+                .cloned()
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
+            found.extend(fallback.get_text_parent_map(&missing)?);
+        }
+        Ok(found)
+    }
+
+    /// The texts' ancestry may reach into the fallbacks, so it is diffed
+    /// across all the repositories, as Python annotates a stacked store.
+    fn text_annotator(
+        &self,
+        _file_id: &crate::FileId,
+    ) -> Result<Box<dyn crate::annotate::TextAnnotator + '_>, RepositoryError> {
+        Ok(Box::new(crate::annotate::Annotator::new(StackedTexts(
+            self,
+        ))))
     }
 
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {
@@ -1078,6 +1265,98 @@ mod tests {
                 "{}",
                 s.label
             );
+        }
+    }
+
+    /// Every format annotates a committed text and a working text built on
+    /// it, each line attributed to the revision that introduced it.
+    #[test]
+    fn annotate_file_lines_attributes_each_line() {
+        let file_id = crate::FileId::from(b"file-1".to_vec());
+        let rev = |id: &[u8]| crate::RevisionId::from(id.to_vec());
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(t.clone());
+            let mut locked = repo.write_locked().unwrap();
+            locked.start_write_group().unwrap();
+            locked
+                .add_text(b"file-1", b"rev-1", &[], b"a\nb\n")
+                .unwrap();
+            locked
+                .add_text(
+                    b"file-1",
+                    b"rev-2",
+                    &[(b"file-1".to_vec(), b"rev-1".to_vec())],
+                    b"a\nB\nc\n",
+                )
+                .unwrap();
+            locked.commit_write_group().unwrap();
+            locked.unlock().unwrap();
+
+            let repo = (s.reopen)(t);
+            assert_eq!(
+                vec![
+                    (rev(b"rev-1"), b"a\n".to_vec()),
+                    (rev(b"rev-2"), b"B\n".to_vec()),
+                    (rev(b"rev-2"), b"c\n".to_vec()),
+                ],
+                repo.annotate_file_lines(&file_id, &rev(b"rev-2")).unwrap(),
+                "{}",
+                s.label
+            );
+            assert_eq!(
+                vec![
+                    (rev(b"rev-1"), b"a\n".to_vec()),
+                    (rev(b"rev-2"), b"B\n".to_vec()),
+                    (rev(b"current:"), b"new\n".to_vec()),
+                ],
+                repo.annotate_file_lines_special(
+                    &file_id,
+                    &rev(b"current:"),
+                    &[rev(b"rev-2")],
+                    vec![b"a\n".to_vec(), b"B\n".to_vec(), b"new\n".to_vec()],
+                )
+                .unwrap(),
+                "{}",
+                s.label
+            );
+        }
+    }
+
+    /// A text missing from the ancestry is reported as itself, not as the
+    /// text being annotated.
+    #[test]
+    fn annotate_reports_the_missing_text() {
+        let file_id = crate::FileId::from(b"file-1".to_vec());
+        let rev = |id: &[u8]| crate::RevisionId::from(id.to_vec());
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(t.clone());
+            let mut locked = repo.write_locked().unwrap();
+            locked.start_write_group().unwrap();
+            locked.add_text(b"file-1", b"rev-1", &[], b"a\n").unwrap();
+            locked.commit_write_group().unwrap();
+            locked.unlock().unwrap();
+
+            let repo = (s.reopen)(t);
+            match repo.annotate_file_lines_special(
+                &file_id,
+                &rev(b"current:"),
+                &[rev(b"rev-1"), rev(b"ghost")],
+                vec![b"a\n".to_vec()],
+            ) {
+                Err(RepositoryError::NoSuchFileText { file_id, revision }) => {
+                    assert_eq!(
+                        (b"file-1".to_vec(), b"ghost".to_vec()),
+                        (file_id, revision),
+                        "{}",
+                        s.label
+                    )
+                }
+                other => panic!("{}: expected NoSuchFileText, got {other:?}", s.label),
+            }
         }
     }
 
@@ -1792,6 +2071,59 @@ mod tests {
             stacked.get_revision(b"rev-missing"),
             Err(RepositoryError::NoSuchRevision(_))
         ));
+    }
+
+    /// A stacked repository annotates a text whose ancestry is in a
+    /// fallback, which its primary alone cannot.
+    #[test]
+    fn stacked_repository_annotates_through_fallback() {
+        let file_id = crate::FileId::from(b"file-1".to_vec());
+        let rev = |id: &[u8]| crate::RevisionId::from(id.to_vec());
+        let add_texts = |repo: &mut Box<dyn Repository>, texts: &[(&[u8], &[u8], &[u8])]| {
+            let mut locked = repo.write_locked().unwrap();
+            locked.start_write_group().unwrap();
+            for (revision, parent, text) in texts {
+                let parents: Vec<(Vec<u8>, Vec<u8>)> = if parent.is_empty() {
+                    vec![]
+                } else {
+                    vec![(b"file-1".to_vec(), parent.to_vec())]
+                };
+                locked
+                    .add_text(b"file-1", revision, &parents, text)
+                    .unwrap();
+            }
+            locked.commit_write_group().unwrap();
+            locked.unlock().unwrap();
+        };
+
+        let base_dir = tempfile::tempdir().unwrap();
+        let base_t: SharedTransport = Arc::new(LocalTransport::new(base_dir.path()));
+        let mut base: Box<dyn Repository> = Box::new(Pack2aRepository::create(base_t).unwrap());
+        add_texts(&mut base, &[(b"rev-1", b"", b"a\nb\n")]);
+
+        let top_dir = tempfile::tempdir().unwrap();
+        let top_t: SharedTransport = Arc::new(LocalTransport::new(top_dir.path()));
+        let mut primary: Box<dyn Repository> =
+            Box::new(Pack2aRepository::create(top_t.clone()).unwrap());
+        add_texts(&mut primary, &[(b"rev-2", b"rev-1", b"a\nB\n")]);
+
+        // On its own the primary lacks the parent text.
+        assert!(matches!(
+            primary.annotate_file_lines(&file_id, &rev(b"rev-2")),
+            Err(RepositoryError::NoSuchFileText { revision, .. }) if revision == b"rev-1"
+        ));
+
+        let mut stacked = StackedRepository::new(primary);
+        stacked.add_fallback_repository(base).unwrap();
+        assert_eq!(
+            vec![
+                (rev(b"rev-1"), b"a\n".to_vec()),
+                (rev(b"rev-2"), b"B\n".to_vec()),
+            ],
+            stacked
+                .annotate_file_lines(&file_id, &rev(b"rev-2"))
+                .unwrap()
+        );
     }
 
     /// A plain backend reports that it does not support fallbacks.

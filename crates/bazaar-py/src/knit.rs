@@ -3262,7 +3262,7 @@ impl KnitAnnotatorPy {
     #[new]
     fn new(vf: Bound<'_, PyAny>) -> PyClassInitializer<Self> {
         let _ = vf;
-        PyClassInitializer::from(crate::annotate::VersionedFileAnnotator)
+        PyClassInitializer::from(crate::annotate::VersionedFileAnnotator::for_subclass())
             .add_subclass(KnitAnnotatorPy)
     }
 

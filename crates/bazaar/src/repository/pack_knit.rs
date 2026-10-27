@@ -1185,6 +1185,42 @@ impl super::Repository for KnitPackRepository {
         )?))
     }
 
+    fn get_text_parent_map(
+        &self,
+        keys: &[crate::versionedfile::Key],
+    ) -> Result<
+        std::collections::HashMap<crate::versionedfile::Key, Vec<crate::versionedfile::Key>>,
+        RepositoryError,
+    > {
+        let knit_keys: Vec<KnitKey> = keys.iter().map(|key| key.segments().to_vec()).collect();
+        Ok(self
+            .texts
+            .get_parent_map(&knit_keys)?
+            .into_iter()
+            .map(|(key, parents)| {
+                (
+                    crate::versionedfile::Key::fixed(key),
+                    parents
+                        .into_iter()
+                        .map(crate::versionedfile::Key::fixed)
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
+    /// Knit records carry the line origins, which the knit annotator reuses.
+    fn text_annotator(
+        &self,
+        _file_id: &crate::FileId,
+    ) -> Result<Box<dyn crate::annotate::TextAnnotator + '_>, RepositoryError> {
+        Ok(Box::new(crate::knit::KnitAnnotator::new(
+            self.texts.index().clone(),
+            self.texts.access().clone(),
+            KnitPlainFactory,
+        )))
+    }
+
     fn get_file_text(&self, file_id: &[u8], revision: &[u8]) -> Result<Vec<u8>, RepositoryError> {
         KnitPackRepository::get_file_text(self, file_id, revision)
     }
