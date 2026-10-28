@@ -25,6 +25,7 @@ from ..errors import (
     LockContention,
     LockNotHeld,
     NotStacked,
+    ReadOnlyError,
     UnsupportedOperation,
 )
 from . import TestCaseInTempDir
@@ -562,6 +563,17 @@ class TestLocking(TestCaseInTempDir):
         self.assertFalse(other.is_locked())
         branch.unlock()
         self.assertRaises(LockNotHeld, branch.unlock)
+
+    def test_mutators_raise_lock_errors(self):
+        cd = controldir.create(self.test_dir)
+        holder = cd.open_branch()
+        branch = controldir.open(self.test_dir).open_branch()
+        holder.lock_write()
+        self.assertRaises(LockContention, branch.set_tags, {"t": b"rev"})
+        holder.unlock()
+        branch.lock_read()
+        self.assertRaises(ReadOnlyError, branch.set_tags, {"t": b"rev"})
+        branch.unlock()
 
     def test_commit_uses_the_tree_branch(self):
         wt = controldir.create(self.test_dir).open_workingtree()

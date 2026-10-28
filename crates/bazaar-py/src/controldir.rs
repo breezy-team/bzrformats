@@ -34,8 +34,51 @@ pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
 pyo3::import_exception!(bzrformats.errors, LockActive);
 pyo3::import_exception!(bzrformats.errors, LockBreakMismatch);
 
-fn err<E: std::fmt::Display>(e: E) -> PyErr {
+/// The Python exception for a Rust error: the matching breezy-style
+/// exception where there is one, so lock failures raised by mutators that
+/// lock internally are the lock exceptions too.
+fn err<E: IntoPyErr>(e: E) -> PyErr {
+    e.into_py_err()
+}
+
+/// A Rust error with a Python exception to map onto.
+trait IntoPyErr {
+    fn into_py_err(self) -> PyErr;
+}
+
+/// The generic exception, for errors without a more specific one.
+fn generic_err<E: std::fmt::Display>(e: E) -> PyErr {
     BzrFormatsError::new_err(e.to_string())
+}
+
+impl IntoPyErr for bazaar::branch::BranchError {
+    fn into_py_err(self) -> PyErr {
+        branch_err(self)
+    }
+}
+
+impl IntoPyErr for bazaar::repository::RepositoryError {
+    fn into_py_err(self) -> PyErr {
+        repository_err(self)
+    }
+}
+
+impl IntoPyErr for bazaar::workingtree::WorkingTreeError {
+    fn into_py_err(self) -> PyErr {
+        tree_err(self)
+    }
+}
+
+impl IntoPyErr for bazaar::bzrdir::BzrDirError {
+    fn into_py_err(self) -> PyErr {
+        generic_err(self)
+    }
+}
+
+impl IntoPyErr for bazaar::transport::TransportError {
+    fn into_py_err(self) -> PyErr {
+        generic_err(self)
+    }
 }
 
 /// Map a branch error onto the matching breezy-style exception, so downstream
@@ -132,7 +175,7 @@ fn with_confirm<R>(
 fn repository_err(e: bazaar::repository::RepositoryError) -> PyErr {
     match e {
         bazaar::repository::RepositoryError::Locking(e) => lock_err(e, "repository"),
-        other => err(other),
+        other => generic_err(other),
     }
 }
 
@@ -143,7 +186,7 @@ fn tree_err(e: bazaar::workingtree::WorkingTreeError) -> PyErr {
         WorkingTreeError::Locking(e) => lock_err(e, "working tree"),
         WorkingTreeError::Branch(e) => branch_err(e),
         WorkingTreeError::Repository(e) => repository_err(e),
-        other => err(other),
+        other => generic_err(other),
     }
 }
 
