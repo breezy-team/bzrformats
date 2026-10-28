@@ -928,36 +928,35 @@ impl Pack2aRepository {
                 .map_err(|raw| RepositoryError::Corrupt(format!("search_key_name: {raw:?}")))?
         };
 
-        self.start_write_group()?;
-        let group = self.write_group.as_ref().expect("just opened");
+        super::in_write_group(self, |repo| {
+            let group = repo.write_group.as_ref().expect("just opened");
 
-        // Per-revision stores and texts copy by key, verbatim.
-        use super::pack_2a_writer::RepackTarget;
-        group.copy_store_keys(&source.revisions, RepackTarget::Revisions, &rev_keys)?;
-        group.copy_store_keys(&source.inventories, RepackTarget::Inventories, &rev_keys)?;
-        group.copy_store_keys(&source.signatures, RepackTarget::Signatures, &rev_keys)?;
-        group.copy_store_keys(source.texts_store(), RepackTarget::Texts, &text_keys)?;
+            // Per-revision stores and texts copy by key, verbatim.
+            use super::pack_2a_writer::RepackTarget;
+            group.copy_store_keys(&source.revisions, RepackTarget::Revisions, &rev_keys)?;
+            group.copy_store_keys(&source.inventories, RepackTarget::Inventories, &rev_keys)?;
+            group.copy_store_keys(&source.signatures, RepackTarget::Signatures, &rev_keys)?;
+            group.copy_store_keys(source.texts_store(), RepackTarget::Texts, &text_keys)?;
 
-        // CHK pages: every page reachable from the new inventory roots that is
-        // not already reachable from the existing ones.
-        let cache: std::sync::Arc<dyn crate::chk_map::PageCache> =
-            std::sync::Arc::new(crate::chk_map::InMemoryPageCache::new());
-        let records = crate::chk_map::iter_interesting_nodes(
-            source.chk_bytes.as_ref(),
-            cache.as_ref(),
-            &interesting_roots,
-            &uninteresting_roots,
-            search_key_func,
-        )
-        .map_err(|e| RepositoryError::Corrupt(format!("chk difference walk: {e:?}")))?;
-        for record in records {
-            if let (Some(page_key), Some(page_bytes)) = (record.page_key, record.page_bytes) {
-                group.add_chk_page(&page_key, page_bytes)?;
+            // CHK pages: every page reachable from the new inventory roots that is
+            // not already reachable from the existing ones.
+            let cache: std::sync::Arc<dyn crate::chk_map::PageCache> =
+                std::sync::Arc::new(crate::chk_map::InMemoryPageCache::new());
+            let records = crate::chk_map::iter_interesting_nodes(
+                source.chk_bytes.as_ref(),
+                cache.as_ref(),
+                &interesting_roots,
+                &uninteresting_roots,
+                search_key_func,
+            )
+            .map_err(|e| RepositoryError::Corrupt(format!("chk difference walk: {e:?}")))?;
+            for record in records {
+                if let (Some(page_key), Some(page_bytes)) = (record.page_key, record.page_bytes) {
+                    group.add_chk_page(&page_key, page_bytes)?;
+                }
             }
-        }
-
-        self.commit_write_group()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// The texts store, for the streaming fetch fast path.
@@ -1037,29 +1036,36 @@ impl Pack2aRepository {
         };
 
         self.start_write_group()?;
-        let group = self.write_group.as_ref().expect("just opened");
-        use super::pack_2a_writer::RepackTarget;
-        group.copy_store_keys(&self.revisions, RepackTarget::Revisions, &rev_keys)?;
-        group.copy_store_keys(&self.inventories, RepackTarget::Inventories, &rev_keys)?;
-        group.copy_store_keys(&self.signatures, RepackTarget::Signatures, &rev_keys)?;
-        group.copy_store_keys(&self.texts, RepackTarget::Texts, &text_keys)?;
+        let copied = (|| {
+            let group = self.write_group.as_ref().expect("just opened");
+            use super::pack_2a_writer::RepackTarget;
+            group.copy_store_keys(&self.revisions, RepackTarget::Revisions, &rev_keys)?;
+            group.copy_store_keys(&self.inventories, RepackTarget::Inventories, &rev_keys)?;
+            group.copy_store_keys(&self.signatures, RepackTarget::Signatures, &rev_keys)?;
+            group.copy_store_keys(&self.texts, RepackTarget::Texts, &text_keys)?;
 
-        // Every CHK page reachable from the reachable inventories. The old packs
-        // are being discarded, so there are no uninteresting roots to subtract.
-        let cache: std::sync::Arc<dyn crate::chk_map::PageCache> =
-            std::sync::Arc::new(crate::chk_map::InMemoryPageCache::new());
-        let records = crate::chk_map::iter_interesting_nodes(
-            self.chk_bytes.as_ref(),
-            cache.as_ref(),
-            &interesting_roots,
-            &[],
-            search_key_func,
-        )
-        .map_err(|e| RepositoryError::Corrupt(format!("chk difference walk: {e:?}")))?;
-        for record in records {
-            if let (Some(page_key), Some(page_bytes)) = (record.page_key, record.page_bytes) {
-                group.add_chk_page(&page_key, page_bytes)?;
+            // Every CHK page reachable from the reachable inventories. The old packs
+            // are being discarded, so there are no uninteresting roots to subtract.
+            let cache: std::sync::Arc<dyn crate::chk_map::PageCache> =
+                std::sync::Arc::new(crate::chk_map::InMemoryPageCache::new());
+            let records = crate::chk_map::iter_interesting_nodes(
+                self.chk_bytes.as_ref(),
+                cache.as_ref(),
+                &interesting_roots,
+                &[],
+                search_key_func,
+            )
+            .map_err(|e| RepositoryError::Corrupt(format!("chk difference walk: {e:?}")))?;
+            for record in records {
+                if let (Some(page_key), Some(page_bytes)) = (record.page_key, record.page_bytes) {
+                    group.add_chk_page(&page_key, page_bytes)?;
+                }
             }
+            Ok(())
+        })();
+        if let Err(e) = copied {
+            self.abort_write_group()?;
+            return Err(e);
         }
 
         // The reconciled pack replaces every old one.

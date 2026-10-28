@@ -669,8 +669,8 @@ impl Repository {
         source: &Bound<'_, Repository>,
         revision_id: Option<&[u8]>,
     ) -> PyResult<usize> {
-        let source = source.try_borrow()?;
-        source.with(py, |source| {
+        let mut source = source.try_borrow_mut()?;
+        source.with_mut(py, |source| {
             self.with_mut(py, |target| {
                 bazaar::repository::fetch(source, target, revision_id).map_err(err)
             })

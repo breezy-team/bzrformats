@@ -718,14 +718,13 @@ impl KnitPackRepository {
             }
         }
 
-        self.start_write_group()?;
-        let group = self.write_group.as_ref().expect("just opened");
-        group.copy_store_keys(&source.revisions, RepackTarget::Revisions, &rev_keys)?;
-        group.copy_store_keys(&source.inventories, RepackTarget::Inventories, &rev_keys)?;
-        group.copy_store_keys(&source.signatures, RepackTarget::Signatures, &rev_keys)?;
-        group.copy_store_keys(&source.texts, RepackTarget::Texts, &text_keys)?;
-        self.commit_write_group()?;
-        Ok(())
+        super::in_write_group(self, |repo| {
+            let group = repo.write_group.as_ref().expect("just opened");
+            group.copy_store_keys(&source.revisions, RepackTarget::Revisions, &rev_keys)?;
+            group.copy_store_keys(&source.inventories, RepackTarget::Inventories, &rev_keys)?;
+            group.copy_store_keys(&source.signatures, RepackTarget::Signatures, &rev_keys)?;
+            group.copy_store_keys(&source.texts, RepackTarget::Texts, &text_keys)
+        })
     }
 
     /// Reconcile: regenerate storage keeping only data reachable from this

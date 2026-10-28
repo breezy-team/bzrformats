@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{Repository, RepositoryError};
+use crate::lockable_files::LockableExt as _;
 
 /// Copy revisions from `source` into `target`.
 ///
@@ -24,22 +25,28 @@ use super::{Repository, RepositoryError};
 /// full ancestry; `None` copies every revision in `source`. Revisions already
 /// present in `target` are skipped. Returns the number of revisions copied.
 ///
-/// The copy runs in a single write group on `target`, committed at the end.
+/// `source` is read-locked and `target` write-locked before working out what
+/// to copy, so both are read as they are once locked. The copy runs in a
+/// single write group on `target`, committed at the end.
 pub fn fetch(
-    source: &dyn Repository,
+    source: &mut dyn Repository,
     target: &mut dyn Repository,
     revision_id: Option<&[u8]>,
 ) -> Result<usize, RepositoryError> {
-    // The revisions we must copy: the requested closure, minus what the target
-    // already has, in topological (parents-first) order.
-    let missing = missing_revisions(source, target, revision_id)?;
-    if missing.is_empty() {
-        return Ok(0);
-    }
-    let ordered = toposort(source, &missing)?;
-    let copied = ordered.len();
-    super::with_write_lock(target, |target| copy_ordered(source, target, &ordered))?;
-    Ok(copied)
+    let source = source.read_locked()?;
+    let copied = super::with_write_lock(target, |target| {
+        // The revisions we must copy: the requested closure, minus what the
+        // target already has, in topological (parents-first) order.
+        let missing = missing_revisions(&*source, target, revision_id)?;
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        let ordered = toposort(&*source, &missing)?;
+        copy_ordered(&*source, target, &ordered)?;
+        Ok(ordered.len())
+    });
+    let unlocked = source.unlock();
+    copied.and_then(|copied| unlocked.map(|_| copied))
 }
 
 /// Copy `ordered` from `source` into the write-locked `target`.
@@ -57,11 +64,12 @@ fn copy_ordered(
         return Ok(());
     }
 
-    target.start_write_group()?;
-    for rev_id in ordered {
-        copy_revision(source, target, rev_id)?;
-    }
-    target.commit_write_group()
+    super::in_write_group(target, |target| {
+        for rev_id in ordered {
+            copy_revision(source, target, rev_id)?;
+        }
+        Ok(())
+    })
 }
 
 /// The set of revisions present in `source` (within the requested closure) but
@@ -249,7 +257,6 @@ fn copy_revision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lockable_files::LockableExt as _;
     use crate::repository::Pack2aRepository;
     use crate::transport::{LocalTransport, SharedTransport};
     use std::sync::Arc;
@@ -325,12 +332,12 @@ mod tests {
     fn fetch_copies_ancestry() {
         let (_sd, st) = temp_repo();
         let ids = make_chain(&st, 3);
-        let source = Pack2aRepository::open(st).unwrap();
+        let mut source = Pack2aRepository::open(st).unwrap();
 
         let (_td, tt) = temp_repo();
         let mut target = Pack2aRepository::create(tt.clone()).unwrap();
 
-        let copied = fetch(&source, &mut target, Some(&ids[2])).unwrap();
+        let copied = fetch(&mut source, &mut target, Some(&ids[2])).unwrap();
         assert_eq!(copied, 3);
 
         let target = Pack2aRepository::open(tt).unwrap();
@@ -350,15 +357,15 @@ mod tests {
     fn fetch_everything_then_noop() {
         let (_sd, st) = temp_repo();
         let ids = make_chain(&st, 2);
-        let source = Pack2aRepository::open(st).unwrap();
+        let mut source = Pack2aRepository::open(st).unwrap();
 
         let (_td, tt) = temp_repo();
         let mut target = Pack2aRepository::create(tt.clone()).unwrap();
 
-        assert_eq!(fetch(&source, &mut target, None).unwrap(), 2);
+        assert_eq!(fetch(&mut source, &mut target, None).unwrap(), 2);
         // Re-open target and fetch again: nothing left to copy.
         let mut target = Pack2aRepository::open(tt).unwrap();
-        assert_eq!(fetch(&source, &mut target, None).unwrap(), 0);
+        assert_eq!(fetch(&mut source, &mut target, None).unwrap(), 0);
         let _ = ids;
     }
 
@@ -368,15 +375,58 @@ mod tests {
     fn fetch_only_missing() {
         let (_sd, st) = temp_repo();
         let ids = make_chain(&st, 3);
-        let source = Pack2aRepository::open(st).unwrap();
+        let mut source = Pack2aRepository::open(st).unwrap();
 
         let (_td, tt) = temp_repo();
         let mut target = Pack2aRepository::create(tt.clone()).unwrap();
         // Seed the target with rev-1 only.
-        assert_eq!(fetch(&source, &mut target, Some(&ids[0])).unwrap(), 1);
+        assert_eq!(fetch(&mut source, &mut target, Some(&ids[0])).unwrap(), 1);
         let mut target = Pack2aRepository::open(tt).unwrap();
         // Now fetch the tip: only rev-2 and rev-3 remain.
-        assert_eq!(fetch(&source, &mut target, Some(&ids[2])).unwrap(), 2);
+        assert_eq!(fetch(&mut source, &mut target, Some(&ids[2])).unwrap(), 2);
+    }
+
+    /// A target opened before another writer fetched into it works out what
+    /// is missing from what it holds once locked, not from when it was opened.
+    #[test]
+    fn fetch_into_stale_target_skips_revisions_added_since_open() {
+        let (_sd, st) = temp_repo();
+        make_chain(&st, 1);
+        let mut source = Pack2aRepository::open(st).unwrap();
+        let (_td, tt) = temp_repo();
+        Pack2aRepository::create(tt.clone()).unwrap();
+        let mut stale = Pack2aRepository::open(tt.clone()).unwrap();
+
+        let mut other = Pack2aRepository::open(tt.clone()).unwrap();
+        assert_eq!(fetch(&mut source, &mut other, None).unwrap(), 1);
+
+        assert_eq!(fetch(&mut source, &mut stale, None).unwrap(), 0);
+        assert_eq!(
+            1,
+            super::super::pack_collection::read_pack_names(tt.as_ref())
+                .unwrap()
+                .len(),
+            "no duplicate pack was written"
+        );
+    }
+
+    /// A source opened before more revisions were committed to it has them
+    /// fetched too.
+    #[test]
+    fn fetch_from_stale_source_copies_revisions_added_since_open() {
+        let (_sd, st) = temp_repo();
+        let ids = make_chain(&st, 1);
+        let mut stale = Pack2aRepository::open(st.clone()).unwrap();
+        commit_file_rev(
+            &mut Pack2aRepository::open(st).unwrap(),
+            b"rev-2",
+            &ids[0],
+            b"two\n",
+        );
+
+        let (_td, tt) = temp_repo();
+        let mut target = Pack2aRepository::create(tt).unwrap();
+        assert_eq!(fetch(&mut stale, &mut target, None).unwrap(), 2);
     }
 
     /// Commit one revision `rev` (child of `parent`) that sets `file-1`'s
@@ -424,18 +474,18 @@ mod tests {
         let base = make_chain(&st, 1);
         let mut source = Pack2aRepository::open(st.clone()).unwrap();
         commit_file_rev(&mut source, b"rev-2s", &base[0], b"other change\n");
-        let source = Pack2aRepository::open(st).unwrap();
+        let mut source = Pack2aRepository::open(st).unwrap();
 
         // Target: fetch the shared base, then commit its own diverged rev-2t.
         let (_td, tt) = temp_repo();
         let mut target = Pack2aRepository::create(tt.clone()).unwrap();
-        assert_eq!(fetch(&source, &mut target, Some(&base[0])).unwrap(), 1);
+        assert_eq!(fetch(&mut source, &mut target, Some(&base[0])).unwrap(), 1);
         let mut target = Pack2aRepository::open(tt.clone()).unwrap();
         commit_file_rev(&mut target, b"rev-2t", &base[0], b"this change\n");
 
         // Fetch the source's diverged revision: must copy just rev-2s.
         let mut target = Pack2aRepository::open(tt.clone()).unwrap();
-        assert_eq!(fetch(&source, &mut target, Some(b"rev-2s")).unwrap(), 1);
+        assert_eq!(fetch(&mut source, &mut target, Some(b"rev-2s")).unwrap(), 1);
 
         // Both diverged texts read back from the target.
         let target = Pack2aRepository::open(tt).unwrap();
@@ -490,13 +540,13 @@ mod tests {
         src.add_revision(&revision(rev, vec![]), &[]).unwrap();
         src.commit_write_group().unwrap();
         src.unlock().unwrap();
-        let source = KnitPackRepository::open(st).unwrap();
+        let mut source = KnitPackRepository::open(st).unwrap();
 
         // Target: a 2a (CHK) repository.
         let (_td, tt) = temp_repo();
         let mut target = Pack2aRepository::create(tt.clone()).unwrap();
 
-        assert_eq!(fetch(&source, &mut target, Some(rev)).unwrap(), 1);
+        assert_eq!(fetch(&mut source, &mut target, Some(rev)).unwrap(), 1);
 
         // The revision, its file text and inventory read back from the 2a repo.
         let target = Pack2aRepository::open(tt).unwrap();
@@ -521,12 +571,12 @@ mod tests {
     fn streaming_matches_generic() {
         let (_sd, st) = temp_repo();
         let ids = make_chain(&st, 4);
-        let source = Pack2aRepository::open(st).unwrap();
+        let mut source = Pack2aRepository::open(st).unwrap();
 
         // Fast path: the normal fetch (2a -> 2a uses streaming).
         let (_fd, ft) = temp_repo();
         let mut fast = Pack2aRepository::create(ft.clone()).unwrap();
-        fetch(&source, &mut fast, Some(&ids[3])).unwrap();
+        fetch(&mut source, &mut fast, Some(&ids[3])).unwrap();
         let fast = Pack2aRepository::open(ft).unwrap();
 
         // Generic path: drive copy_revision directly into a second target.
@@ -584,15 +634,15 @@ mod tests {
     fn streaming_incremental_into_nonempty() {
         let (_sd, st) = temp_repo();
         let ids = make_chain(&st, 4);
-        let source = Pack2aRepository::open(st).unwrap();
+        let mut source = Pack2aRepository::open(st).unwrap();
 
         let (_td, tt) = temp_repo();
         let mut target = Pack2aRepository::create(tt.clone()).unwrap();
         // First fetch up to rev-2.
-        assert_eq!(fetch(&source, &mut target, Some(&ids[1])).unwrap(), 2);
+        assert_eq!(fetch(&mut source, &mut target, Some(&ids[1])).unwrap(), 2);
         // Then the tip: only rev-3 and rev-4 are missing.
         let mut target = Pack2aRepository::open(tt.clone()).unwrap();
-        assert_eq!(fetch(&source, &mut target, Some(&ids[3])).unwrap(), 2);
+        assert_eq!(fetch(&mut source, &mut target, Some(&ids[3])).unwrap(), 2);
 
         // Everything reads back.
         let target = Pack2aRepository::open(tt).unwrap();
@@ -669,11 +719,11 @@ mod tests {
 
         let (_sd, st) = temp_repo();
         let ids = make_knitpack_chain(&st, 3);
-        let source = KnitPackRepository::open(st).unwrap();
+        let mut source = KnitPackRepository::open(st).unwrap();
 
         let (_td, tt) = temp_repo();
         let mut target = KnitPackRepository::create(tt.clone(), knitpack6).unwrap();
-        assert_eq!(fetch(&source, &mut target, Some(&ids[2])).unwrap(), 3);
+        assert_eq!(fetch(&mut source, &mut target, Some(&ids[2])).unwrap(), 3);
 
         let target = KnitPackRepository::open(tt).unwrap();
         let mut got = target.all_revision_ids().unwrap();
@@ -698,12 +748,12 @@ mod tests {
 
         let (_sd, st) = temp_repo();
         let ids = make_knitpack_chain(&st, 3);
-        let source = KnitPackRepository::open(st).unwrap();
+        let mut source = KnitPackRepository::open(st).unwrap();
 
         // Fast path (knit-pack -> knit-pack streams).
         let (_fd, ft) = temp_repo();
         let mut fast = KnitPackRepository::create(ft.clone(), knitpack6).unwrap();
-        fetch(&source, &mut fast, Some(&ids[2])).unwrap();
+        fetch(&mut source, &mut fast, Some(&ids[2])).unwrap();
         let fast = KnitPackRepository::open(ft).unwrap();
 
         // Generic path: drive copy_revision directly.

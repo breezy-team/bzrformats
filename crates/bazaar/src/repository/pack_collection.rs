@@ -14,8 +14,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::RepositoryError;
+use crate::lockable_files::{LockWaiter, LockableFilesError};
+use crate::lockdir::{Lock as _, LockDir, LockError, LockHeldInfo};
 use crate::pack_repo::{index_extension, IndexKind};
 use crate::transport::{SharedTransport, Transport, TransportError};
+use std::time::{Duration, Instant};
 
 /// The target distribution of pack sizes for `total_revisions` revisions, as a
 /// list of revision-count buckets, largest first.
@@ -282,12 +285,35 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
     /// Write `pack-names`, merging the packs added and removed here with
     /// those other processes changed since it was read, and read the
     /// result.
+    ///
+    /// The merge is done holding the repository's lock directory, as
+    /// breezy's `_save_pack_names` does, so that concurrent writers don't
+    /// drop each other's packs. Another holder is waited for for up to 30
+    /// seconds.
     pub fn save(&mut self) -> Result<(), RepositoryError> {
+        self.save_waiting(&mut WaitFor::new(NAMES_LOCK_TIMEOUT))
+    }
+
+    fn save_waiting(&mut self, waiter: &mut dyn LockWaiter) -> Result<(), RepositoryError> {
+        let merged = {
+            let mut lock = LockDir::new(self.transport.as_ref(), NAMES_LOCK);
+            take_lock(&mut lock, waiter)?;
+            let merged = self.merge_into_disk();
+            lock.unlock()
+                .map_err(|e| RepositoryError::Locking(LockableFilesError::Lock(e)))?;
+            merged?
+        };
+        self.names.set_at_load(merged.clone());
+        self.sync(&merged)
+    }
+
+    /// Merge the packs added and removed here into `pack-names` as it is
+    /// on disk, and write it.
+    fn merge_into_disk(&self) -> Result<BTreeSet<PackEntry>, RepositoryError> {
         let disk = read_pack_names(self.transport.as_ref())?;
         let merged = self.names.merge(&disk);
         write_pack_names(self.transport.as_ref(), self.uses_btree, &merged)?;
-        self.names.set_at_load(merged.clone());
-        self.sync(&merged)
+        Ok(merged)
     }
 
     /// Read `pack-names` again, keeping the packs added and removed here.
@@ -362,6 +388,57 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
             }
         }
         Ok(())
+    }
+}
+
+/// The lock directory, relative to the repository, held while `pack-names`
+/// is rewritten.
+const NAMES_LOCK: &str = "lock";
+
+/// How long to wait for another writer of `pack-names`, matching breezy's
+/// default lock directory timeout.
+const NAMES_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait between attempts to take a held lock.
+const NAMES_LOCK_POLL: Duration = Duration::from_millis(100);
+
+/// Waits for a lock until a deadline.
+struct WaitFor {
+    deadline: Instant,
+}
+
+impl WaitFor {
+    fn new(timeout: Duration) -> Self {
+        WaitFor {
+            deadline: Instant::now() + timeout,
+        }
+    }
+}
+
+impl LockWaiter for WaitFor {
+    fn contended(&mut self, _holder: Option<&LockHeldInfo>) -> bool {
+        if Instant::now() >= self.deadline {
+            return false;
+        }
+        std::thread::sleep(NAMES_LOCK_POLL);
+        true
+    }
+}
+
+/// Take `lock`, asking `waiter` whether to try again while it is held.
+fn take_lock(lock: &mut LockDir, waiter: &mut dyn LockWaiter) -> Result<(), RepositoryError> {
+    loop {
+        match lock.attempt_lock() {
+            Ok(_) => return Ok(()),
+            Err(LockError::AlreadyHeld) => {}
+            Err(e) => return Err(RepositoryError::Locking(LockableFilesError::Lock(e))),
+        }
+        let holder = lock
+            .peek()
+            .map_err(|e| RepositoryError::Locking(LockableFilesError::Lock(e)))?;
+        if !waiter.contended(holder.as_ref()) {
+            return Err(RepositoryError::Locking(LockableFilesError::Contention));
+        }
     }
 }
 
@@ -522,6 +599,64 @@ mod tests {
         let mut packs = PackNames::from_disk(vec![entry("a", "1")]);
         assert!(!packs.allocate("a".to_string(), b"2".to_vec()));
         assert_eq!(vec![entry("a", "1")], packs.entries());
+    }
+
+    struct NoIndex;
+
+    impl CombinedIndex for NoIndex {
+        fn add_pack(
+            &self,
+            _: &dyn Transport,
+            _: &str,
+            _: IndexKind,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+
+        fn remove_pack(&self, _: &str) {}
+    }
+
+    struct NoReader;
+
+    impl PackReader for NoReader {
+        fn forget(&self, _: &str) {}
+    }
+
+    fn empty_collection(dir: &tempfile::TempDir) -> PackCollection<NoIndex, NoReader> {
+        let t: SharedTransport =
+            std::sync::Arc::new(crate::transport::LocalTransport::new(dir.path()));
+        write_pack_names(t.as_ref(), true, &BTreeSet::new()).unwrap();
+        PackCollection::open(t, true).unwrap()
+    }
+
+    /// `pack-names` is not rewritten while another writer holds the
+    /// repository's lock directory.
+    #[test]
+    fn save_waits_for_the_names_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut packs = empty_collection(&dir);
+        packs.allocate("a".to_string(), b"1".to_vec()).unwrap();
+        let other = crate::transport::LocalTransport::new(dir.path());
+        let mut held = LockDir::new(&other, NAMES_LOCK);
+        held.attempt_lock().unwrap();
+
+        assert!(matches!(
+            packs.save_waiting(&mut crate::lockable_files::NoWait),
+            Err(RepositoryError::Locking(LockableFilesError::Contention))
+        ));
+        assert_eq!(Vec::<PackEntry>::new(), read_pack_names(&other).unwrap());
+
+        struct Release<'a, 't>(&'a mut LockDir<'t>);
+        impl LockWaiter for Release<'_, '_> {
+            fn contended(&mut self, holder: Option<&LockHeldInfo>) -> bool {
+                assert!(holder.is_some());
+                self.0.unlock().unwrap();
+                true
+            }
+        }
+        packs.save_waiting(&mut Release(&mut held)).unwrap();
+        assert_eq!(vec![entry("a", "1")], read_pack_names(&other).unwrap());
+        assert!(LockDir::new(&other, NAMES_LOCK).peek().unwrap().is_none());
     }
 
     #[test]

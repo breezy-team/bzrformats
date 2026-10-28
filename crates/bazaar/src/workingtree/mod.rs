@@ -858,10 +858,7 @@ fn write_revision(
     changes: &[WorkingTreeChange],
     signature: Option<&[u8]>,
 ) -> Result<(), WorkingTreeError> {
-    repository
-        .start_write_group()
-        .map_err(WorkingTreeError::Repository)?;
-    {
+    crate::repository::in_write_group(repository, |repository| {
         let mut builder = repository
             .get_commit_builder(
                 parents.to_vec(),
@@ -871,30 +868,21 @@ fn write_revision(
                 options.timezone,
             )
             .with_properties(properties.clone());
-        builder
-            .record_iter_changes(changes, |path| {
-                transport
-                    .get_bytes(path)
-                    .map_err(crate::repository::RepositoryError::Transport)
-            })
-            .map_err(WorkingTreeError::Repository)?;
-        builder
-            .finish_inventory()
-            .map_err(WorkingTreeError::Repository)?;
-        builder
-            .commit(&options.message)
-            .map_err(WorkingTreeError::Repository)?;
-    }
-    // The signature goes in while the write group is still open, so it
-    // lands in the same pack as the revision.
-    if let Some(signature) = signature {
-        repository
-            .add_signature_text(revid, signature)
-            .map_err(WorkingTreeError::Repository)?;
-    }
-    repository
-        .commit_write_group()
-        .map_err(WorkingTreeError::Repository)
+        builder.record_iter_changes(changes, |path| {
+            transport
+                .get_bytes(path)
+                .map_err(crate::repository::RepositoryError::Transport)
+        })?;
+        builder.finish_inventory()?;
+        builder.commit(&options.message)?;
+        // The signature goes in while the write group is still open, so it
+        // lands in the same pack as the revision.
+        if let Some(signature) = signature {
+            repository.add_signature_text(revid, signature)?;
+        }
+        Ok(())
+    })
+    .map_err(WorkingTreeError::Repository)
 }
 
 /// The exact `.bzr/checkout/format` marker for the pre-dirstate format 3
@@ -3227,7 +3215,8 @@ mod tests {
         let branch = crate::branch::Branch::open(
             parent.subtransport(".bzr/branch").unwrap(),
             Box::new(UnreadableRepository),
-        );
+        )
+        .unwrap();
         let mut wt = WorkingTree4::open(parent, branch).unwrap();
         match wt.set_parent_ids(std::slice::from_ref(&r1), true) {
             Err(WorkingTreeError::Repository(RepositoryError::Corrupt(message))) => {
@@ -4533,7 +4522,7 @@ mod tests {
         } else {
             Box::new(crate::repository::Pack2aRepository::create(repo_t).unwrap())
         };
-        crate::branch::Branch::open(root.subtransport(".bzr/branch").unwrap(), repository)
+        crate::branch::Branch::open(root.subtransport(".bzr/branch").unwrap(), repository).unwrap()
     }
 
     #[cfg(any(feature = "weave", feature = "knit"))]

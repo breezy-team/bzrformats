@@ -530,15 +530,19 @@ impl Lockable for StackedRepository {
         self.lock_write_with_token(None, waiter)
     }
 
-    /// The fallbacks are released with the last lock.
+    /// The fallbacks are released with the last lock, even if releasing the
+    /// primary failed after giving up its lock (e.g. on an open write group);
+    /// the first error is returned.
     fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, RepositoryError> {
-        let released = self.primary.unlock()?;
+        let mut released = self.primary.unlock();
         if !self.primary.lock().is_locked() {
             for fallback in &mut self.fallbacks {
-                fallback.unlock()?;
+                if let Err(e) = fallback.unlock() {
+                    released = released.and(Err(e));
+                }
             }
         }
-        Ok(released)
+        released
     }
 }
 
@@ -817,6 +821,27 @@ pub fn unlock<R: Repository + ?Sized>(
     Ok(released)
 }
 
+/// Run `f` on `repository` in a write group of its own, committed when `f`
+/// succeeds. The group is aborted if `f` or the commit fails, so the
+/// repository is not left in a write group; a failure to abort is logged and
+/// the original error returned, as breezy's `abort_write_group(suppress_errors=True)`.
+pub fn in_write_group<R: Repository + ?Sized, T, E: From<RepositoryError>>(
+    repository: &mut R,
+    f: impl FnOnce(&mut R) -> Result<T, E>,
+) -> Result<T, E> {
+    repository.start_write_group()?;
+    let result = f(repository).and_then(|r| {
+        repository.commit_write_group()?;
+        Ok(r)
+    });
+    if result.is_err() && repository.is_in_write_group() {
+        if let Err(e) = repository.abort_write_group() {
+            log::warn!("failed to abort write group: {e}");
+        }
+    }
+    result
+}
+
 /// Run `f` on `repository` under a write lock: a write lock the caller
 /// holds is counted, and otherwise one is taken for `f` without waiting for
 /// another holder.
@@ -1049,6 +1074,39 @@ mod tests {
         }
     }
 
+    /// A write group whose body fails is aborted, so the repository can
+    /// start another.
+    #[test]
+    fn in_write_group_aborts_on_failure() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(SharedTransport::clone(&t));
+            let mut locked = repo.write_locked().unwrap();
+            let mut grouped = false;
+            let result: Result<(), RepositoryError> = in_write_group(&mut *locked, |repo| {
+                grouped = repo.is_in_write_group();
+                repo.add_revision(&revision(b"rev-1", vec![], "first"), &[])?;
+                Err(RepositoryError::Corrupt("failed".to_string()))
+            });
+            assert!(
+                matches!(result, Err(RepositoryError::Corrupt(_))),
+                "{}",
+                s.label
+            );
+            assert!(!locked.is_in_write_group(), "{}", s.label);
+            in_write_group(&mut *locked, |_| Ok::<_, RepositoryError>(())).unwrap();
+            locked.unlock().unwrap();
+            // Without write groups the revision was written directly.
+            assert_eq!(
+                !grouped,
+                (s.reopen)(t).has_revision(b"rev-1").unwrap(),
+                "{}",
+                s.label
+            );
+        }
+    }
+
     #[test]
     fn missing_text_is_no_such_file_text() {
         for s in scenarios() {
@@ -1253,6 +1311,31 @@ mod tests {
             stacked.get_revision(b"rev-missing"),
             Err(RepositoryError::NoSuchRevision(_))
         ));
+    }
+
+    /// Unlocking a stacked repository with a write group open still releases
+    /// the fallbacks along with the primary.
+    #[test]
+    fn stacked_unlock_with_write_group_open_releases_fallbacks() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let base = make_2a_with_rev(base_dir.path(), b"rev-base");
+        let top_dir = tempfile::tempdir().unwrap();
+        let top_t: SharedTransport = Arc::new(LocalTransport::new(top_dir.path()));
+        let primary = Box::new(Pack2aRepository::create(top_t).unwrap()) as Box<dyn Repository>;
+        let mut stacked = StackedRepository::new(primary);
+        stacked.add_fallback_repository(base).unwrap();
+
+        stacked
+            .lock_write(&mut crate::lockable_files::NoWait)
+            .unwrap();
+        assert!(stacked.fallbacks[0].lock().is_locked());
+        stacked.start_write_group().unwrap();
+        assert!(matches!(
+            stacked.unlock(),
+            Err(RepositoryError::WriteGroupOpen)
+        ));
+        assert!(!stacked.lock().is_locked());
+        assert!(!stacked.fallbacks[0].lock().is_locked());
     }
 
     /// A plain backend reports that it does not support fallbacks.

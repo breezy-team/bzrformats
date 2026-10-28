@@ -106,6 +106,8 @@ pub enum BranchError {
     Unsupported(String),
     /// The master branch of a bound branch could not be opened.
     Master(Box<crate::bzrdir::BzrDirError>),
+    /// The branch's `format` marker is not one this crate knows.
+    UnknownFormat(Vec<u8>),
 }
 
 impl std::fmt::Display for BranchError {
@@ -121,6 +123,11 @@ impl std::fmt::Display for BranchError {
             BranchError::Unstackable => write!(f, "branch format does not support stacking"),
             BranchError::Unsupported(op) => write!(f, "unsupported branch operation: {op}"),
             BranchError::Master(e) => write!(f, "opening master branch: {e}"),
+            BranchError::UnknownFormat(marker) => write!(
+                f,
+                "unknown branch format: {:?}",
+                String::from_utf8_lossy(marker)
+            ),
         }
     }
 }
@@ -204,11 +211,13 @@ impl Lockable for Branch {
 
 /// The format of the branch reachable through `transport`, from its
 /// `format` marker, as [`Branch::open`] opens it. A missing marker is
-/// treated as the modern default format.
-pub fn branch_format(transport: &dyn Transport) -> &'static BranchFormat {
+/// treated as the modern default format; a marker this crate does not know
+/// is [`BranchError::UnknownFormat`].
+pub fn branch_format(transport: &dyn Transport) -> Result<&'static BranchFormat, BranchError> {
     match transport.get_bytes("format") {
-        Ok(marker) => find_format(&marker).unwrap_or(DEFAULT_FORMAT),
-        Err(_) => DEFAULT_FORMAT,
+        Ok(marker) => find_format(&marker).ok_or(BranchError::UnknownFormat(marker)),
+        Err(TransportError::NoSuchFile(_)) => Ok(DEFAULT_FORMAT),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -216,14 +225,14 @@ pub fn branch_format(transport: &dyn Transport) -> &'static BranchFormat {
 /// is a branch reference; read before the branch is opened, since a
 /// reference has no repository of its own.
 pub fn reference_location(transport: &dyn Transport) -> Result<Option<String>, BranchError> {
-    read_reference(transport, branch_format(transport))
+    read_reference(transport, branch_format(transport)?)
 }
 
 /// The location the branch reachable through `transport` is stacked on, if
 /// it is stacked; read before the branch is opened, to find the fallback
 /// for its repository.
 pub fn stacked_on_location(transport: &dyn Transport) -> Result<Option<String>, BranchError> {
-    if !branch_format(transport).supports_stacking {
+    if !branch_format(transport)?.supports_stacking {
         return Ok(None);
     }
     read_config_location(transport, "stacked_on_location")
@@ -285,17 +294,20 @@ fn read_reference(
 impl Branch {
     /// Open the branch reachable through `transport` (rooted at
     /// `.bzr/branch`), with its revisions in `repository`, reading its
-    /// `format` marker to learn how the tip is stored. A missing marker is
-    /// treated as the modern default format.
-    pub fn open(transport: SharedTransport, repository: Box<dyn Repository>) -> Self {
-        let format = branch_format(transport.as_ref());
+    /// `format` marker to learn how the tip is stored, as [`branch_format`]
+    /// does.
+    pub fn open(
+        transport: SharedTransport,
+        repository: Box<dyn Repository>,
+    ) -> Result<Self, BranchError> {
+        let format = branch_format(transport.as_ref())?;
         let lock = crate::lockable_files::branch_lock(SharedTransport::clone(&transport));
-        Branch {
+        Ok(Branch {
             transport,
             format,
             lock,
             repository,
-        }
+        })
     }
 
     /// Open the branch reachable through `transport` as a specific `format`,
@@ -361,12 +373,12 @@ impl Branch {
         let Some(location) = self.get_bound_location()? else {
             return Ok(None);
         };
-        let path = location.strip_prefix("file://").unwrap_or(&location);
-        if !path.starts_with('/') {
-            return Err(BranchError::Unsupported(format!(
-                "opening the master branch at {location}"
-            )));
-        }
+        let path = crate::bzrdir::location_path(&location)
+            .ok()
+            .filter(|path| path.starts_with('/'))
+            .ok_or_else(|| {
+                BranchError::Unsupported(format!("opening the master branch at {location}"))
+            })?;
         let root = crate::transport::LocalTransport::new("/");
         let control = root
             .subtransport(path.trim_start_matches('/'))?
@@ -983,7 +995,7 @@ mod tests {
         } else {
             Box::new(crate::repository::Pack2aRepository::create(repo_t).unwrap())
         };
-        Branch::open(transport, repository)
+        Branch::open(transport, repository).unwrap()
     }
 
     /// A branch over a temp dir, plus a borrowed handle to the same
@@ -1542,6 +1554,33 @@ mod tests {
     }
 
     // --- Branch reference format ---
+
+    /// A missing marker is the default format, but an unknown or unreadable
+    /// one is an error rather than being taken for the default.
+    #[test]
+    fn branch_format_reports_unknown_and_unreadable_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = LocalTransport::new(dir.path());
+        assert_eq!(
+            DEFAULT_FORMAT.format_string,
+            branch_format(&t).unwrap().format_string
+        );
+
+        std::fs::write(dir.path().join("format"), b"Bazaar Branch Format 99\n").unwrap();
+        match branch_format(&t) {
+            Err(BranchError::UnknownFormat(marker)) => {
+                assert_eq!(b"Bazaar Branch Format 99\n".to_vec(), marker)
+            }
+            other => panic!(
+                "expected an unknown format, got {:?}",
+                other.map(|f| f.description)
+            ),
+        }
+
+        std::fs::remove_file(dir.path().join("format")).unwrap();
+        std::fs::create_dir(dir.path().join("format")).unwrap();
+        assert!(matches!(branch_format(&t), Err(BranchError::Transport(_))));
+    }
 
     #[test]
     fn get_reference_is_none_on_normal_branch() {
