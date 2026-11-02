@@ -858,10 +858,7 @@ fn write_revision(
     changes: &[WorkingTreeChange],
     signature: Option<&[u8]>,
 ) -> Result<(), WorkingTreeError> {
-    repository
-        .start_write_group()
-        .map_err(WorkingTreeError::Repository)?;
-    {
+    crate::repository::with_write_group(repository, |repository| {
         let mut builder = repository
             .get_commit_builder(
                 parents.to_vec(),
@@ -871,31 +868,22 @@ fn write_revision(
                 options.timezone,
             )
             .with_properties(properties.clone());
-        builder
-            .record_iter_changes(changes, |path| {
-                transport
-                    .get_bytes(path)
-                    .map_err(crate::repository::RepositoryError::Transport)
-            })
-            .map_err(WorkingTreeError::Repository)?;
-        builder
-            .finish_inventory()
-            .map_err(WorkingTreeError::Repository)?;
-        builder
-            .commit(&options.message)
-            .map_err(WorkingTreeError::Repository)?;
-    }
-    // The signature goes in while the write group is still open, so it
-    // lands in the same pack as the revision.
-    if let Some(signature) = signature {
-        repository
-            .add_signature_text(revid, signature)
-            .map_err(WorkingTreeError::Repository)?;
-    }
-    repository
-        .commit_write_group()
-        .map(drop)
-        .map_err(WorkingTreeError::Repository)
+        builder.record_iter_changes(changes, |path| {
+            transport
+                .get_bytes(path)
+                .map_err(crate::repository::RepositoryError::Transport)
+        })?;
+        builder.finish_inventory()?;
+        builder.commit(&options.message)?;
+        // The signature goes in while the write group is still open, so it
+        // lands in the same pack as the revision.
+        if let Some(signature) = signature {
+            repository.add_signature_text(revid, signature)?;
+        }
+        Ok(())
+    })
+    .map(drop)
+    .map_err(WorkingTreeError::Repository)
 }
 
 /// The exact `.bzr/checkout/format` marker for the pre-dirstate format 3
