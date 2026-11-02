@@ -4545,6 +4545,25 @@ mod tests {
         (dir, probe, wt)
     }
 
+    /// A format-3 tree reads its inventory again with its first lock, so it
+    /// does not overwrite what another tree object added since it was opened.
+    #[cfg(any(feature = "weave", feature = "knit"))]
+    #[test]
+    fn wt3_sees_changes_made_since_it_was_opened() {
+        let (dir, probe, mut first) = fresh_wt3();
+        std::fs::write(dir.path().join("b"), b"b\n").unwrap();
+        std::fs::write(dir.path().join("c"), b"c\n").unwrap();
+        let mut second =
+            WorkingTree3::open(SharedTransport::clone(&probe), wt3_branch(&probe)).unwrap();
+        second.add("b", EntryKind::File, None).unwrap();
+        first.add("c", EntryKind::File, None).unwrap();
+
+        let reopened =
+            WorkingTree3::open(SharedTransport::clone(&probe), wt3_branch(&probe)).unwrap();
+        assert!(reopened.path2id("b").is_some());
+        assert!(reopened.path2id("c").is_some());
+    }
+
     #[cfg(any(feature = "weave", feature = "knit"))]
     #[test]
     fn wt3_open_dispatches_on_format_marker() {

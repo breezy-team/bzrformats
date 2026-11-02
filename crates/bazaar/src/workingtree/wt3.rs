@@ -361,32 +361,39 @@ impl WorkingTree3 {
     }
 }
 
+/// The first lock reads the working inventory again, as breezy's
+/// `_reset_data` does, so changes another process made since the tree was
+/// opened are not overwritten.
 impl crate::lockable_files::Lockable for WorkingTree3 {
     type Error = WorkingTreeError;
 
     fn lock_read(&mut self) -> Result<(), WorkingTreeError> {
-        super::lock_with_branch(
-            self,
-            &mut crate::lockable_files::NoWait,
-            |branch, _| branch.lock_read(),
-            |tree, _| tree.lock.lock_read().map_err(WorkingTreeError::Locking),
-        )
+        self.lock_and_reload(|tree| {
+            super::lock_with_branch(
+                tree,
+                &mut crate::lockable_files::NoWait,
+                |branch, _| branch.lock_read(),
+                |tree, _| tree.lock.lock_read().map_err(WorkingTreeError::Locking),
+            )
+        })
     }
 
     fn lock_write(
         &mut self,
         waiter: &mut dyn crate::lockable_files::LockWaiter,
     ) -> Result<crate::lockable_files::WriteLocked, WorkingTreeError> {
-        super::lock_with_branch(
-            self,
-            waiter,
-            |branch, waiter| branch.lock_write(waiter).map(drop),
-            |tree, waiter| {
-                tree.lock
-                    .lock_write(waiter)
-                    .map_err(WorkingTreeError::Locking)
-            },
-        )
+        self.lock_and_reload(|tree| {
+            super::lock_with_branch(
+                tree,
+                waiter,
+                |branch, waiter| branch.lock_write(waiter).map(drop),
+                |tree, waiter| {
+                    tree.lock
+                        .lock_write(waiter)
+                        .map_err(WorkingTreeError::Locking)
+                },
+            )
+        })
     }
 
     fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, WorkingTreeError> {
@@ -395,6 +402,26 @@ impl crate::lockable_files::Lockable for WorkingTree3 {
 }
 
 impl WorkingTree3 {
+    /// Run `lock`, and read the working inventory again if it took the
+    /// first lock; the lock is released again if that fails.
+    fn lock_and_reload<R>(
+        &mut self,
+        lock: impl FnOnce(&mut Self) -> Result<R, WorkingTreeError>,
+    ) -> Result<R, WorkingTreeError> {
+        let first = !self.lock.files().is_locked();
+        let locked = lock(self)?;
+        if first {
+            match Self::read_inventory(&self.transport, &self.layout) {
+                Ok(inventory) => self.inventory = inventory,
+                Err(e) => {
+                    crate::lockable_files::Lockable::unlock(self)?;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(locked)
+    }
+
     fn add_pending_merge_under_lock(&mut self, revision_id: &[u8]) -> Result<(), WorkingTreeError> {
         let mut existing = match self.transport.get_bytes(self.layout.pending_merges) {
             Ok(b) => b,
@@ -521,22 +548,24 @@ impl WorkingTree for WorkingTree3 {
             #[cfg(feature = "weave")]
             Wt3Basis::RevisionHistory(_) => true,
         };
-        super::lock_with_branch(
-            self,
-            waiter,
-            |branch, waiter| {
-                if shares_branch_lock {
-                    branch.lock_write(waiter).map(drop)
-                } else {
-                    branch.lock_read()
-                }
-            },
-            |tree, waiter| {
-                tree.lock
-                    .lock_write(waiter)
-                    .map_err(WorkingTreeError::Locking)
-            },
-        )
+        self.lock_and_reload(|tree| {
+            super::lock_with_branch(
+                tree,
+                waiter,
+                |branch, waiter| {
+                    if shares_branch_lock {
+                        branch.lock_write(waiter).map(drop)
+                    } else {
+                        branch.lock_read()
+                    }
+                },
+                |tree, waiter| {
+                    tree.lock
+                        .lock_write(waiter)
+                        .map_err(WorkingTreeError::Locking)
+                },
+            )
+        })
     }
 
     fn basis_revision(&self) -> Option<Vec<u8>> {
