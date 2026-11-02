@@ -971,11 +971,11 @@ mod tests {
                 label: "weave",
                 create: |t| Box::new(WeaveRepository::create(t, weave6()).unwrap()),
                 reopen: |t| {
-                    let os_lock = crate::lockable_files::TransportLock::new(
+                    let lock = crate::lockable_files::LockableFiles::with_os_lock(
                         SharedTransport::clone(&t),
                         crate::lockable_files::BRANCH_LOCK,
                     );
-                    Box::new(WeaveRepository::open(t, weave6(), os_lock).unwrap())
+                    Box::new(WeaveRepository::open(t, weave6(), lock).unwrap())
                 },
                 signs: true,
             },

@@ -121,15 +121,15 @@ impl WorkingTree3 {
 
     /// Open the weave all-in-one working tree, whose files live directly under
     /// `.bzr` and whose basis is the branch's `revision-history`. It is
-    /// locked through `os_lock`, the lock on `.bzr/branch-lock` it shares
+    /// locked through `lock`, the lock on `.bzr/branch-lock` it shares
     /// with its branch and repository.
     #[cfg(feature = "weave")]
     pub fn open_all_in_one(
         transport: SharedTransport,
         branch: crate::branch::Branch,
-        os_lock: crate::lockable_files::TransportLock,
+        lock: crate::lockable_files::LockableFiles,
     ) -> Result<Self, WorkingTreeError> {
-        let lock = super::TreeLock::with_os_lock(SharedTransport::clone(&transport), os_lock);
+        let lock = super::TreeLock::shared(lock);
         Self::open_with_layout(transport, branch, lock, WT3_ALL_IN_ONE_LAYOUT)
     }
 

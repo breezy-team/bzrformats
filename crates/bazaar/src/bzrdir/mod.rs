@@ -1099,7 +1099,7 @@ pub struct BzrDirAllInOne {
     /// The lock on `.bzr/branch-lock`, shared by every repository, branch
     /// and working tree opened from here, as breezy's all-in-one formats
     /// share their control files.
-    os_lock: crate::lockable_files::TransportLock,
+    control_files: crate::lockable_files::LockableFiles,
 }
 
 #[cfg(feature = "weave")]
@@ -1120,7 +1120,7 @@ impl BzrDirAllInOne {
             .filter(|f| f.is_all_in_one() && f.is_supported());
         match format {
             Some(format) => Ok(BzrDirAllInOne {
-                os_lock: crate::lockable_files::TransportLock::new(
+                control_files: crate::lockable_files::LockableFiles::with_os_lock(
                     SharedTransport::clone(&transport),
                     crate::lockable_files::BRANCH_LOCK,
                 ),
@@ -1185,7 +1185,7 @@ impl ControlDir for BzrDirAllInOne {
         let repo = crate::repository::WeaveRepository::open(
             self.transport.clone(),
             self.format,
-            self.os_lock.clone(),
+            self.control_files.clone(),
         )
         .map_err(|e| BzrDirError::Component(format!("opening repository: {e}")))?;
         Ok(Box::new(repo))
@@ -1204,7 +1204,7 @@ impl ControlDir for BzrDirAllInOne {
             self.transport.clone(),
             format,
             self.open_repository()?,
-            self.os_lock.clone(),
+            self.control_files.clone(),
         ))
     }
 
@@ -1217,9 +1217,12 @@ impl ControlDir for BzrDirAllInOne {
     fn open_workingtree(&self) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError> {
         let branch = self.open_branch()?;
         let root = self.transport.subtransport("..")?;
-        let wt =
-            crate::workingtree::WorkingTree3::open_all_in_one(root, branch, self.os_lock.clone())
-                .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))?;
+        let wt = crate::workingtree::WorkingTree3::open_all_in_one(
+            root,
+            branch,
+            self.control_files.clone(),
+        )
+        .map_err(|e| BzrDirError::Component(format!("opening working tree: {e}")))?;
         Ok(Box::new(wt))
     }
 }
@@ -1802,6 +1805,41 @@ mod tests {
         let weave_path = bzr.join(format!("weaves/{weave_name}.weave"));
         std::fs::create_dir_all(weave_path.parent().unwrap()).unwrap();
         std::fs::write(weave_path, WEAVE_FILE_WEAVE).unwrap();
+    }
+
+    /// The repository, branch and tree of an all-in-one control directory
+    /// share one lock, counted together, as in breezy: a branch read-locked
+    /// while its repository is write-locked can be written.
+    #[cfg(feature = "weave")]
+    #[test]
+    fn all_in_one_objects_share_their_lock() {
+        use crate::lockable_files::Lockable as _;
+        let dir = tempfile::tempdir().unwrap();
+        make_weave_bzrdir(dir.path());
+        let cd = open(bzr_transport(dir.path())).unwrap();
+
+        let mut branch = cd.open_branch().unwrap();
+        branch
+            .repository_mut()
+            .lock_write(&mut crate::lockable_files::NoWait)
+            .unwrap();
+        branch.lock_read().unwrap();
+        assert_eq!(
+            Some(crate::lockable_files::LockMode::Write),
+            branch.lock().lock_mode()
+        );
+        assert_eq!(3, branch.lock().lock_count());
+        branch.set_last_revision_info(1, WEAVE_REVID).unwrap();
+        branch.unlock().unwrap();
+        assert_eq!(1, branch.lock().lock_count());
+        branch.repository_mut().unlock().unwrap();
+        assert!(!branch.lock().is_locked());
+
+        let mut wt = cd.open_workingtree().unwrap();
+        wt.lock_write(&mut crate::lockable_files::NoWait).unwrap();
+        assert_eq!(3, wt.lock().files().lock_count());
+        wt.unlock().unwrap();
+        assert!(!wt.lock().files().is_locked());
     }
 
     #[cfg(feature = "weave")]

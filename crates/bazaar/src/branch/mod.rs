@@ -168,23 +168,28 @@ pub struct Branch {
     /// The branch's lock, which its writes take.
     lock: crate::lockable_files::LockableFiles,
     repository: Box<dyn Repository>,
+    /// Whether the branch shares its lock with its repository, as an
+    /// all-in-one branch does.
+    shares_repository_lock: bool,
 }
 
 /// Locking a branch locks its repository in the same mode with the first
-/// lock, and releases it with the last. Writes take a write
-/// lock for themselves while the branch is unlocked.
+/// lock, and releases it with the last. A branch that shares its lock with
+/// its repository locks and releases the repository with every lock, as
+/// breezy's all-in-one branches do, so that the shared count balances.
+/// Writes take a write lock for themselves while the branch is unlocked.
 impl Lockable for Branch {
     type Error = BranchError;
 
     fn lock_read(&mut self) -> Result<(), BranchError> {
-        let first = !self.lock.is_locked();
-        if first {
+        let cascade = self.locks_repository();
+        if cascade {
             self.repository
                 .lock_read()
                 .map_err(BranchError::Repository)?;
         }
         if let Err(e) = self.lock.lock_read() {
-            if first {
+            if cascade {
                 self.repository.unlock().map_err(BranchError::Repository)?;
             }
             return Err(BranchError::Locking(e));
@@ -201,7 +206,7 @@ impl Lockable for Branch {
     fn unlock(&mut self) -> Result<Option<LockToken>, BranchError> {
         let was_locked = self.lock.is_locked();
         let released = self.lock.unlock().map_err(BranchError::Locking);
-        if was_locked && !self.lock.is_locked() {
+        if was_locked && (self.shares_repository_lock || !self.lock.is_locked()) {
             let unlocked = self.repository.unlock().map_err(BranchError::Repository);
             return released.and_then(|token| unlocked.map(|_| token));
         }
@@ -307,6 +312,7 @@ impl Branch {
             format,
             lock,
             repository,
+            shares_repository_lock: false,
         })
     }
 
@@ -316,24 +322,26 @@ impl Branch {
     /// The all-in-one weave layout has no `.bzr/branch/format` file -- the
     /// branch lives at `.bzr` itself with its tip in `.bzr/revision-history`
     /// -- so the format (full-history branch format 5) is supplied directly.
-    /// It is locked through `os_lock`, the lock on `.bzr/branch-lock` it
-    /// shares with the control directory's repository and working tree.
+    /// It is locked through `lock`, the lock on `.bzr/branch-lock` it shares
+    /// with `repository` and the control directory's working tree.
     pub fn with_format(
         transport: SharedTransport,
         format: &'static BranchFormat,
         repository: Box<dyn Repository>,
-        os_lock: crate::lockable_files::TransportLock,
+        lock: crate::lockable_files::LockableFiles,
     ) -> Self {
-        let lock = crate::lockable_files::LockableFiles::with_os_lock(
-            SharedTransport::clone(&transport),
-            os_lock,
-        );
         Branch {
             transport,
             format,
             lock,
             repository,
+            shares_repository_lock: true,
         }
+    }
+
+    /// Whether taking a lock on the branch takes one on its repository.
+    fn locks_repository(&self) -> bool {
+        self.shares_repository_lock || !self.lock.is_locked()
     }
 
     /// The repository holding the branch's revisions.
@@ -400,8 +408,8 @@ impl Branch {
         token: Option<&LockToken>,
         waiter: &mut dyn LockWaiter,
     ) -> Result<WriteLocked, BranchError> {
-        let first = !self.lock.is_locked();
-        if first {
+        let cascade = self.locks_repository();
+        if cascade {
             self.repository
                 .lock_write(waiter)
                 .map_err(BranchError::Repository)?;
@@ -409,7 +417,7 @@ impl Branch {
         match self.lock.lock_write(token, waiter) {
             Ok(locked) => Ok(locked),
             Err(e) => {
-                if first {
+                if cascade {
                     self.repository.unlock().map_err(BranchError::Repository)?;
                 }
                 Err(BranchError::Locking(e))
