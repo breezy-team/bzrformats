@@ -94,6 +94,10 @@ LockContention = _errors.LockContention
 LockNotHeld = _errors.LockNotHeld
 LockActive = _errors.LockActive
 LockBreakMismatch = _errors.LockBreakMismatch
+LockBroken = _errors.LockBroken
+LockFailed = _errors.LockFailed
+TokenLockingNotSupported = _errors.TokenLockingNotSupported
+TokenMismatch = _errors.TokenMismatch
 AlreadyVersionedError = _errors.AlreadyVersionedError
 NotVersionedError = _errors.NotVersionedError
 
@@ -132,8 +136,10 @@ __all__ = [
     "KnitIndexUnknownMethod",
     "LockActive",
     "LockBreakMismatch",
+    "LockBroken",
     "LockContention",
     "LockError",
+    "LockFailed",
     "LockNotHeld",
     "NoSuchFile",
     "NoSuchId",
@@ -150,6 +156,8 @@ __all__ = [
     "RevisionAlreadyPresent",
     "RevisionNotPresent",
     "SHA1KnitCorrupt",
+    "TokenLockingNotSupported",
+    "TokenMismatch",
     "UnavailableRepresentation",
     "UnexpectedEndOfContainerError",
     "UnexpectedInventoryFormat",

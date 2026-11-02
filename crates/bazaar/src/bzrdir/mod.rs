@@ -226,6 +226,32 @@ impl std::fmt::Display for BzrDirError {
 
 impl std::error::Error for BzrDirError {}
 
+/// Why [`ControlDir::break_lock`] failed.
+#[derive(Debug)]
+pub enum BreakLockError {
+    /// The object whose lock to break could not be opened.
+    Open(BzrDirError),
+    /// Breaking the working tree's lock, or its branch's, failed.
+    Tree(crate::workingtree::WorkingTreeError),
+    /// Breaking the branch's lock, or its repository's, failed.
+    Branch(crate::branch::BranchError),
+    /// Breaking the repository's lock failed.
+    Repository(crate::repository::RepositoryError),
+}
+
+impl std::fmt::Display for BreakLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BreakLockError::Open(e) => write!(f, "{e}"),
+            BreakLockError::Tree(e) => write!(f, "{e}"),
+            BreakLockError::Branch(e) => write!(f, "{e}"),
+            BreakLockError::Repository(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for BreakLockError {}
+
 impl From<TransportError> for BzrDirError {
     fn from(e: TransportError) -> Self {
         BzrDirError::Transport(e)
@@ -407,6 +433,32 @@ pub trait ControlDir: Send + Sync {
 
     /// Open the working tree in this control directory.
     fn open_workingtree(&self) -> Result<Box<dyn crate::workingtree::WorkingTree>, BzrDirError>;
+
+    /// Break the lock of the first object here, as breezy's
+    /// `BzrDir.break_lock` does: the working tree if there is one, which
+    /// breaks its branch's and repository's too, otherwise the branch,
+    /// otherwise the repository. `confirm` decides on each lock held, as
+    /// [`LockableFiles::break_lock`](crate::lockable_files::LockableFiles::break_lock)
+    /// describes.
+    fn break_lock(
+        &self,
+        confirm: &mut dyn FnMut(Option<&crate::lockdir::LockHeldInfo>) -> bool,
+    ) -> Result<(), BreakLockError> {
+        if self.has_workingtree() {
+            let tree = self.open_workingtree().map_err(BreakLockError::Open)?;
+            tree.break_lock(confirm).map_err(BreakLockError::Tree)
+        } else if self.has_branch() {
+            let branch = self.open_branch().map_err(BreakLockError::Open)?;
+            branch.break_lock(confirm).map_err(BreakLockError::Branch)
+        } else if self.has_repository() {
+            let repository = self.open_repository().map_err(BreakLockError::Open)?;
+            repository
+                .break_lock(confirm)
+                .map_err(BreakLockError::Repository)
+        } else {
+            Ok(())
+        }
+    }
 
     /// The control-directory format to create when cloning/sprouting from this
     /// one, so the new line of development is in the same format as its
@@ -1929,6 +1981,35 @@ mod tests {
             branch.last_revision_info().unwrap(),
             (3, b"rev-real".to_vec())
         );
+    }
+
+    /// Breaking the locks of a control directory breaks those of its tree,
+    /// branch and repository.
+    #[test]
+    fn break_lock_breaks_the_tree_branch_and_repository_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(dir.path()));
+        let cd = BzrDirMeta::create(&parent).unwrap();
+        let bzr = cd.transport().clone();
+        for lock_dir in ["checkout/lock", "branch/lock", "repository/lock"] {
+            crate::lockdir::hold_lock(bzr.as_ref(), lock_dir);
+        }
+        let mut asked = 0;
+        cd.break_lock(&mut |holder| {
+            assert!(holder.is_some());
+            asked += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(3, asked);
+        for lock_dir in ["checkout/lock", "branch/lock", "repository/lock"] {
+            let lock = crate::lockdir::LockDir::new(bzr.as_ref(), lock_dir);
+            assert!(
+                crate::lockdir::Lock::peek(&lock).unwrap().is_none(),
+                "{}",
+                lock_dir
+            );
+        }
     }
 
     /// Write a branch reference to `location` at `branch_dir`.

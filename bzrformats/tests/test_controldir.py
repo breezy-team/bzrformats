@@ -24,10 +24,13 @@ from .. import controldir, lock
 from ..errors import (
     BzrFormatsError,
     LockActive,
+    LockBroken,
     LockContention,
     LockNotHeld,
     NotStacked,
     ReadOnlyError,
+    TokenLockingNotSupported,
+    TokenMismatch,
     UnsupportedOperation,
 )
 from . import TestCaseInTempDir
@@ -645,6 +648,54 @@ class TestLocking(TestCaseInTempDir):
             [entry for entry in seen if entry[1] == "lock"][:4],
         )
         self.assertRaises(KeyError, lock.hooks.install_named_hook, "bogus", print)
+
+    def test_unlocking_a_broken_lock(self):
+        cd = controldir.create(self.test_dir)
+        holder = cd.open_branch()
+        holder.lock_write()
+        controldir.open(self.test_dir).open_branch().break_lock(lambda info: True)
+        self.assertRaises(LockBroken, holder.unlock)
+
+    def test_lock_write_with_a_token_not_held(self):
+        branch = controldir.create(self.test_dir).open_branch()
+        self.assertRaises(TokenMismatch, branch.lock_write, "bogus")
+        self.assertFalse(branch.is_locked())
+
+    def test_pack_repository_lock(self):
+        repository = controldir.create(self.test_dir).open_repository()
+        repository.lock_write("ignored")
+        self.assertRaises(NotImplementedError, repository.leave_lock_in_place)
+        repository.unlock()
+
+    def test_all_in_one_lock(self):
+        cd = controldir.create(self.test_dir, format="weave")
+        branch = cd.open_branch()
+        self.assertRaises(TokenLockingNotSupported, branch.lock_write, "token")
+        self.assertRaises(NotImplementedError, branch.break_lock, lambda info: True)
+        repository = branch.repository
+        repository.lock_write()
+        branch.lock_read()
+        self.assertEqual("w", branch.peek_lock_mode())
+        branch.unlock()
+        repository.unlock()
+        self.assertFalse(branch.is_locked())
+
+    def test_tree_lock_mode(self):
+        wt = controldir.create(self.test_dir).open_workingtree()
+        self.assertEqual((None, False), (wt.peek_lock_mode(), wt.is_write_locked()))
+        wt.lock_read()
+        self.assertEqual(("r", False), (wt.peek_lock_mode(), wt.is_write_locked()))
+        wt.unlock()
+        wt.lock_tree_write()
+        self.assertEqual(("w", True), (wt.peek_lock_mode(), wt.is_write_locked()))
+        wt.unlock()
+
+    def test_bzrdir_break_lock(self):
+        cd = controldir.create(self.test_dir)
+        holder = cd.open_branch()
+        holder.lock_write()
+        controldir.open(self.test_dir).break_lock(lambda info: True)
+        self.assertFalse(holder.get_physical_lock_status())
 
     def test_commit_uses_the_tree_branch(self):
         wt = controldir.create(self.test_dir).open_workingtree()

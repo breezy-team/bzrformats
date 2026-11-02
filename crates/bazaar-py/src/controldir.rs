@@ -33,6 +33,10 @@ pyo3::import_exception!(bzrformats.errors, LockNotHeld);
 pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
 pyo3::import_exception!(bzrformats.errors, LockActive);
 pyo3::import_exception!(bzrformats.errors, LockBreakMismatch);
+pyo3::import_exception!(bzrformats.errors, LockBroken);
+pyo3::import_exception!(bzrformats.errors, LockFailed);
+pyo3::import_exception!(bzrformats.errors, TokenLockingNotSupported);
+pyo3::import_exception!(bzrformats.errors, TokenMismatch);
 
 /// The Python exception for a Rust error: the matching breezy-style
 /// exception where there is one, so lock failures raised by mutators that
@@ -75,6 +79,18 @@ impl IntoPyErr for bazaar::bzrdir::BzrDirError {
     }
 }
 
+impl IntoPyErr for bazaar::bzrdir::BreakLockError {
+    fn into_py_err(self) -> PyErr {
+        use bazaar::bzrdir::BreakLockError;
+        match self {
+            BreakLockError::Open(e) => err(e),
+            BreakLockError::Tree(e) => tree_err(e),
+            BreakLockError::Branch(e) => branch_err(e),
+            BreakLockError::Repository(e) => repository_err(e),
+        }
+    }
+}
+
 impl IntoPyErr for bazaar::transport::TransportError {
     fn into_py_err(self) -> PyErr {
         generic_err(self)
@@ -114,6 +130,20 @@ fn lock_err(e: LockableFilesError, what: &str) -> PyErr {
         LockableFilesError::Lock(LockError::BreakMismatch { held, target }) => {
             LockBreakMismatch::new_err((what.to_string(), held, target))
         }
+        LockableFilesError::Lock(LockError::TokenMismatch { given, held }) => {
+            TokenMismatch::new_err((given, held))
+        }
+        LockableFilesError::Broken(_) => LockBroken::new_err((what.to_string(),)),
+        LockableFilesError::TokensUnsupported => {
+            TokenLockingNotSupported::new_err((what.to_string(),))
+        }
+        LockableFilesError::Unsupported(operation) => {
+            pyo3::exceptions::PyNotImplementedError::new_err(format!("{what}: {operation}"))
+        }
+        LockableFilesError::Lock(LockError::Transport(e)) => {
+            LockFailed::new_err((what.to_string(), e.to_string()))
+        }
+        LockableFilesError::Os(e) => LockFailed::new_err((what.to_string(), e.to_string())),
         other => BzrFormatsError::new_err(other.to_string()),
     }
 }
@@ -300,6 +330,16 @@ impl BzrDir {
     /// Whether this control directory contains a working tree.
     fn has_workingtree(&self) -> bool {
         self.inner.has_workingtree()
+    }
+
+    /// Break the lock of the working tree, or if there is none the branch,
+    /// or the repository, as breezy's `BzrDir.break_lock`; `confirm` is as
+    /// for `Repository.break_lock`.
+    #[pyo3(signature = (confirm=None))]
+    fn break_lock(&self, py: Python<'_>, confirm: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        with_confirm(py, confirm.as_ref(), |ask| {
+            self.inner.break_lock(ask).map_err(err)
+        })
     }
 
     /// Open the repository in this control directory.
@@ -1225,6 +1265,16 @@ impl WorkingTree {
 
     fn is_locked(&self) -> bool {
         self.inner.lock().files().is_locked()
+    }
+
+    /// The mode the tree is locked in, `"r"` or `"w"`, or `None`.
+    fn peek_lock_mode(&self) -> Option<&'static str> {
+        lock_mode_str(self.inner.lock().files().lock_mode())
+    }
+
+    /// Whether the tree is locked for writing.
+    fn is_write_locked(&self) -> bool {
+        self.inner.lock().files().lock_mode() == Some(LockMode::Write)
     }
 
     /// Whether the tree's lock directory is held, by anyone.
