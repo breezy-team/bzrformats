@@ -11,7 +11,9 @@
 
 use crate::lockdir::{Lock as _, LockDir, LockError, LockHeldInfo};
 use crate::transport::SharedTransport;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The mode an object is locked in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +106,98 @@ impl LockWaiter for NoWait {
     }
 }
 
+/// How long [`Wait::default`] waits for a held lock unless
+/// [`set_default_timeout`] changed it: breezy's `_DEFAULT_TIMEOUT_SECONDS`.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long [`Wait`] waits between attempts by default: breezy's
+/// `_DEFAULT_POLL_SECONDS`.
+pub const DEFAULT_POLL: Duration = Duration::from_secs(1);
+
+// The unit tests fail at once on contention, as breezy's test suite does.
+static DEFAULT_TIMEOUT_MS: AtomicU64 = AtomicU64::new(if cfg!(test) {
+    0
+} else {
+    DEFAULT_TIMEOUT.as_millis() as u64
+});
+
+/// The timeout [`Wait::default`] uses.
+pub fn default_timeout() -> Duration {
+    Duration::from_millis(DEFAULT_TIMEOUT_MS.load(Ordering::Relaxed))
+}
+
+/// Change the timeout [`Wait::default`] uses for the whole process, as
+/// setting breezy's `lockdir._DEFAULT_TIMEOUT_SECONDS` does; test suites set
+/// it to zero so contention fails at once.
+pub fn set_default_timeout(timeout: Duration) {
+    DEFAULT_TIMEOUT_MS.store(timeout.as_millis() as u64, Ordering::Relaxed);
+}
+
+static SLEEP: std::sync::OnceLock<fn(Duration)> = std::sync::OnceLock::new();
+
+/// Make [`Wait`] sleep between attempts with `sleep` instead of
+/// [`std::thread::sleep`], as an embedding interpreter needs to let its
+/// other threads run meanwhile. Only the first call has an effect.
+pub fn set_wait_sleep(sleep: fn(Duration)) {
+    let _ = SLEEP.set(sleep);
+}
+
+/// Waits for a held lock until a deadline, as breezy's `LockDir.wait_lock`
+/// does, logging who holds it whenever that changes. This is the waiter
+/// locks taken for a single operation use.
+pub struct Wait {
+    deadline: Instant,
+    poll: Duration,
+    last_holder: Option<LockHeldInfo>,
+}
+
+impl Wait {
+    /// Wait up to `timeout`, trying again every `poll`.
+    pub fn new(timeout: Duration, poll: Duration) -> Self {
+        Wait {
+            deadline: Instant::now() + timeout,
+            poll,
+            last_holder: None,
+        }
+    }
+}
+
+impl Default for Wait {
+    /// Wait up to the [default timeout](default_timeout), trying again every
+    /// [`DEFAULT_POLL`].
+    fn default() -> Self {
+        Wait::new(default_timeout(), DEFAULT_POLL)
+    }
+}
+
+impl LockWaiter for Wait {
+    fn contended(&mut self, holder: Option<&LockHeldInfo>) -> bool {
+        let now = Instant::now();
+        if now + self.poll >= self.deadline {
+            return false;
+        }
+        if let Some(holder) = holder.filter(|h| self.last_holder.as_ref() != Some(*h)) {
+            let start = if self.last_holder.is_none() {
+                "Unable to obtain"
+            } else {
+                "Lock owner changed for"
+            };
+            log::warn!(
+                "{start} lock held by {}@{} (pid {}). Will continue to try for {}s.",
+                holder.user.as_deref().unwrap_or("unknown"),
+                holder.hostname.as_deref().unwrap_or("unknown"),
+                holder
+                    .pid
+                    .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
+                self.deadline.saturating_duration_since(now).as_secs(),
+            );
+            self.last_holder = Some(holder.clone());
+        }
+        SLEEP.get().copied().unwrap_or(std::thread::sleep)(self.poll);
+        true
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
     mode: Option<LockMode>,
@@ -113,6 +207,10 @@ struct State {
     /// The physical lock is not released by the last unlock: it was taken
     /// over with a token, or is to be left in place.
     locked_via_token: bool,
+    /// A thread is taking the physical lock for a first write lock. It does
+    /// so without holding the state, so that waiting for another holder
+    /// does not block threads asking about the lock.
+    acquiring: bool,
 }
 
 /// The token of a held physical lock: the nonce of its lock directory, by
@@ -257,6 +355,18 @@ impl TransportLock {
     }
 }
 
+/// The physical lock a first write lock took.
+enum Taken {
+    /// The lock directory held already, taken over with its token.
+    ViaToken(LockToken),
+    /// The lock directory, taken here.
+    LockDir(LockToken),
+    /// The OS lock, taken here.
+    Os,
+    /// No physical lock: the lock only counts.
+    Nothing,
+}
+
 /// A lock on an object's control files. Clones share the lock.
 #[derive(Clone)]
 pub struct LockableFiles {
@@ -345,6 +455,9 @@ impl LockableFiles {
     /// Only an OS lock is taken for reading.
     pub fn lock_read(&self) -> Result<(), LockableFilesError> {
         let mut state = self.state.lock().unwrap();
+        if state.acquiring {
+            return Err(LockableFilesError::Contention);
+        }
         if state.mode.is_none() {
             if let Physical::Os(os_lock) = &self.physical {
                 os_lock.acquire(LockMode::Read, &mut NoWait)?;
@@ -372,43 +485,76 @@ impl LockableFiles {
             Physical::Counted(_) => None,
             _ => token.map(LockToken::as_str),
         };
+        loop {
+            let mut state = self.state.lock().unwrap();
+            match state.mode {
+                Some(LockMode::Read) => return Err(LockableFilesError::ReadOnly),
+                Some(LockMode::Write) => {
+                    self.validate_token(token)?;
+                    state.count += 1;
+                    return Ok(WriteLocked {
+                        token: state.nonce.clone(),
+                        acquired: false,
+                    });
+                }
+                None if state.acquiring => {
+                    drop(state);
+                    if !waiter.contended(None) {
+                        return Err(LockableFilesError::Contention);
+                    }
+                }
+                None => {
+                    state.acquiring = true;
+                    break;
+                }
+            }
+        }
+        let taken = self.take_physical(token, waiter);
         let mut state = self.state.lock().unwrap();
-        match state.mode {
-            Some(LockMode::Read) => return Err(LockableFilesError::ReadOnly),
-            Some(LockMode::Write) => {
-                self.validate_token(token)?;
-                state.count += 1;
-                return Ok(WriteLocked {
-                    token: state.nonce.clone(),
-                    acquired: false,
-                });
-            }
-            None => {}
-        }
-        let mut acquired = false;
-        match (&self.physical, token) {
-            (Physical::Dir(_), Some(token)) => {
-                self.validate_token(Some(token))?;
-                state.nonce = Some(LockToken::from(token));
+        state.acquiring = false;
+        let acquired = match taken? {
+            Taken::ViaToken(nonce) => {
+                state.nonce = Some(nonce);
                 state.locked_via_token = true;
+                false
             }
-            (Physical::Dir(lock_path), None) => {
-                state.nonce = Some(LockToken(self.wait_lock(lock_path, waiter)?));
+            Taken::LockDir(nonce) => {
+                state.nonce = Some(nonce);
                 state.locked_via_token = false;
-                acquired = true;
+                true
             }
-            (Physical::Os(os_lock), _) => {
-                os_lock.acquire(LockMode::Write, waiter)?;
-                acquired = true;
-            }
-            (Physical::Counted(_), _) => {}
-        }
+            Taken::Os => true,
+            Taken::Nothing => false,
+        };
         state.mode = Some(LockMode::Write);
         state.count = 1;
         Ok(WriteLocked {
             token: state.nonce.clone(),
             acquired,
         })
+    }
+
+    /// Take the physical lock for a first write lock, or with `token` take
+    /// over the one held.
+    fn take_physical(
+        &self,
+        token: Option<&str>,
+        waiter: &mut dyn LockWaiter,
+    ) -> Result<Taken, LockableFilesError> {
+        match (&self.physical, token) {
+            (Physical::Dir(_), Some(token)) => {
+                self.validate_token(Some(token))?;
+                Ok(Taken::ViaToken(LockToken::from(token)))
+            }
+            (Physical::Dir(lock_path), None) => Ok(Taken::LockDir(LockToken(
+                self.wait_lock(lock_path, waiter)?,
+            ))),
+            (Physical::Os(os_lock), _) => {
+                os_lock.acquire(LockMode::Write, waiter)?;
+                Ok(Taken::Os)
+            }
+            (Physical::Counted(_), _) => Ok(Taken::Nothing),
+        }
     }
 
     /// Release one lock. Returns the token of the physical lock if the last
@@ -597,10 +743,10 @@ pub trait LockableExt: Lockable {
         })
     }
 
-    /// Take a write lock until the guard is dropped, giving up at once if
-    /// someone else holds it.
+    /// Take a write lock until the guard is dropped, waiting for someone
+    /// else holding it as [`Wait::default`] does.
     fn write_locked(&mut self) -> Result<WriteGuard<'_, Self>, Self::Error> {
-        self.write_locked_with(&mut NoWait)
+        self.write_locked_with(&mut Wait::default())
     }
 
     /// Take a write lock until the guard is dropped, with `waiter` deciding
@@ -1061,6 +1207,20 @@ mod tests {
         assert_eq!(Some(LockMode::Write), lock.lock_mode());
         lock.unlock().unwrap();
         assert_eq!(None, lock.lock_mode());
+    }
+
+    /// `Wait` tries again until its deadline, asking nothing of a holder
+    /// it has already seen.
+    #[test]
+    fn wait_tries_again_until_its_deadline() {
+        let holder = LockHeldInfo::for_this_process(Default::default());
+        let mut wait = Wait::new(Duration::from_millis(50), Duration::from_millis(10));
+        let mut attempts = 0;
+        while wait.contended(Some(&holder)) {
+            attempts += 1;
+        }
+        assert!((1..=5).contains(&attempts), "{}", attempts);
+        assert!(!Wait::new(Duration::ZERO, DEFAULT_POLL).contended(None));
     }
 
     #[test]

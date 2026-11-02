@@ -472,8 +472,34 @@ fn _reset_state() {
     rs_lock::reset_for_tests();
 }
 
+/// How long, in seconds, locks taken for a single operation wait for
+/// another holder; 30 unless changed.
+#[pyfunction]
+fn default_timeout() -> f64 {
+    bazaar::lockable_files::default_timeout().as_secs_f64()
+}
+
+/// Change how long, in seconds, locks wait for another holder, as setting
+/// breezy's `lockdir._DEFAULT_TIMEOUT_SECONDS` does.
+#[pyfunction]
+fn set_default_timeout(seconds: f64) -> PyResult<()> {
+    let timeout = std::time::Duration::try_from_secs_f64(seconds)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    bazaar::lockable_files::set_default_timeout(timeout);
+    Ok(())
+}
+
+/// Sleep without holding the GIL, so other threads, such as one about to
+/// release the lock being waited for, can run.
+fn sleep_detached(duration: std::time::Duration) {
+    Python::attach(|py| py.detach(|| std::thread::sleep(duration)))
+}
+
 pub fn _lock_rs(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
+    bazaar::lockable_files::set_wait_sleep(sleep_detached);
     let m = PyModule::new(py, "lock")?;
+    m.add_function(wrap_pyfunction!(default_timeout, &m)?)?;
+    m.add_function(wrap_pyfunction!(set_default_timeout, &m)?)?;
     m.add_class::<PyReadLock>()?;
     m.add_class::<PyWriteLock>()?;
     m.add_class::<PyLogicalLockResult>()?;

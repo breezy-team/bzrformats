@@ -800,7 +800,7 @@ fn with_tree_write<T: WorkingTree, R>(
     tree: &mut T,
     f: impl FnOnce(&mut T) -> Result<R, WorkingTreeError>,
 ) -> Result<R, WorkingTreeError> {
-    tree.lock_tree_write(&mut crate::lockable_files::NoWait)?;
+    tree.lock_tree_write(&mut crate::lockable_files::Wait::default())?;
     let result = f(tree);
     let unlocked = tree.unlock();
     result.and_then(|r| unlocked.map(|_| r))

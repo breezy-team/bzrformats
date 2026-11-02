@@ -15,10 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::RepositoryError;
 use crate::lockable_files::{LockWaiter, LockableFilesError};
-use crate::lockdir::{Lock as _, LockDir, LockError, LockHeldInfo};
+use crate::lockdir::{Lock as _, LockDir, LockError};
 use crate::pack_repo::{index_extension, IndexKind};
 use crate::transport::{SharedTransport, Transport, TransportError};
-use std::time::{Duration, Instant};
 
 /// The target distribution of pack sizes for `total_revisions` revisions, as a
 /// list of revision-count buckets, largest first.
@@ -298,10 +297,10 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
     ///
     /// The merge is done holding the repository's lock directory, as
     /// breezy's `_save_pack_names` does, so that concurrent writers don't
-    /// drop each other's packs. Another holder is waited for for up to 30
-    /// seconds.
+    /// drop each other's packs. Another holder is waited for as
+    /// [`Wait::default`](crate::lockable_files::Wait::default) waits.
     pub fn save(&mut self) -> Result<(), RepositoryError> {
-        self.save_waiting(&mut WaitFor::new(NAMES_LOCK_TIMEOUT))
+        self.save_waiting(&mut crate::lockable_files::Wait::default())
     }
 
     fn save_waiting(&mut self, waiter: &mut dyn LockWaiter) -> Result<(), RepositoryError> {
@@ -504,36 +503,6 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
 /// is rewritten.
 const NAMES_LOCK: &str = "lock";
 
-/// How long to wait for another writer of `pack-names`, matching breezy's
-/// default lock directory timeout.
-const NAMES_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long to wait between attempts to take a held lock.
-const NAMES_LOCK_POLL: Duration = Duration::from_millis(100);
-
-/// Waits for a lock until a deadline.
-struct WaitFor {
-    deadline: Instant,
-}
-
-impl WaitFor {
-    fn new(timeout: Duration) -> Self {
-        WaitFor {
-            deadline: Instant::now() + timeout,
-        }
-    }
-}
-
-impl LockWaiter for WaitFor {
-    fn contended(&mut self, _holder: Option<&LockHeldInfo>) -> bool {
-        if Instant::now() >= self.deadline {
-            return false;
-        }
-        std::thread::sleep(NAMES_LOCK_POLL);
-        true
-    }
-}
-
 /// Take `lock`, asking `waiter` whether to try again while it is held.
 fn take_lock(lock: &mut LockDir, waiter: &mut dyn LockWaiter) -> Result<(), RepositoryError> {
     loop {
@@ -633,6 +602,7 @@ fn check_resumable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lockdir::LockHeldInfo;
 
     #[test]
     fn pack_distribution_powers_of_ten() {

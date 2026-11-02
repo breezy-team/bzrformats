@@ -13,7 +13,7 @@ use bazaar::branch::Branch as RsBranch;
 use bazaar::bzrdir::{
     find_control_dir_format, BzrDirAllInOne, BzrDirMeta, ControlDir as RsControlDir,
 };
-use bazaar::lockable_files::{LockMode, LockToken, Lockable, LockableFilesError, NoWait};
+use bazaar::lockable_files::{LockMode, LockToken, Lockable, LockableFilesError, Wait};
 use bazaar::lockdir::{LockError, LockHeldInfo};
 use bazaar::repository::Repository as RsRepository;
 use bazaar::transport::{LocalTransport, SharedTransport};
@@ -550,8 +550,9 @@ impl Repository {
         logical_lock_result(slf.getattr("unlock")?)
     }
 
-    /// Lock the repository for writing, failing if someone else holds it;
-    /// with `token`, take over the lock held under it. Returns a
+    /// Lock the repository for writing, waiting for someone else holding it
+    /// as long as `lock.default_timeout()`; with `token`, take over the lock
+    /// held under it. Returns a
     /// `RepositoryWriteLockResult` carrying the lock's `repository_token`.
     #[pyo3(signature = (token=None))]
     fn lock_write(
@@ -562,7 +563,7 @@ impl Repository {
         let token = token.map(LockToken::from);
         let locked = slf.try_borrow_mut()?.with_mut(py, |repository| {
             repository
-                .lock_write_with_token(token.as_ref(), &mut NoWait)
+                .lock_write_with_token(token.as_ref(), &mut Wait::default())
                 .map_err(repository_err)
         })?;
         Py::new(
@@ -897,8 +898,9 @@ impl Branch {
     }
 
     /// Lock the branch, and its repository with the first lock, for writing,
-    /// failing if someone else holds it; with `token`, take over the branch
-    /// lock held under it. Returns a `BranchWriteLockResult` carrying the
+    /// waiting for someone else holding it as long as
+    /// `lock.default_timeout()`; with `token`, take over the branch lock held
+    /// under it. Returns a `BranchWriteLockResult` carrying the
     /// lock's `token`.
     #[pyo3(signature = (token=None))]
     fn lock_write(
@@ -909,7 +911,7 @@ impl Branch {
         let token = token.map(LockToken::from);
         let locked = slf.try_borrow_mut()?.with_mut(py, |branch| {
             branch
-                .lock_write_with_token(token.as_ref(), &mut NoWait)
+                .lock_write_with_token(token.as_ref(), &mut Wait::default())
                 .map_err(branch_err)
         })?;
         Py::new(
@@ -1193,22 +1195,24 @@ impl WorkingTree {
         logical_lock_result(slf.getattr("unlock")?)
     }
 
-    /// Lock the tree for writing and its branch for reading, failing if
-    /// someone else holds the tree. Returns a `LogicalLockResult`.
+    /// Lock the tree for writing and its branch for reading, waiting for
+    /// someone else holding the tree as long as `lock.default_timeout()`.
+    /// Returns a `LogicalLockResult`.
     fn lock_tree_write(slf: &Bound<'_, Self>) -> PyResult<Py<PyLogicalLockResult>> {
         slf.try_borrow_mut()?
             .inner
-            .lock_tree_write(&mut NoWait)
+            .lock_tree_write(&mut Wait::default())
             .map_err(tree_err)?;
         logical_lock_result(slf.getattr("unlock")?)
     }
 
-    /// Lock the tree and its branch for writing, failing if someone else
-    /// holds either. Returns a `LogicalLockResult`.
+    /// Lock the tree and its branch for writing, waiting for someone else
+    /// holding either as long as `lock.default_timeout()`. Returns a
+    /// `LogicalLockResult`.
     fn lock_write(slf: &Bound<'_, Self>) -> PyResult<Py<PyLogicalLockResult>> {
         slf.try_borrow_mut()?
             .inner
-            .lock_write(&mut NoWait)
+            .lock_write(&mut Wait::default())
             .map_err(tree_err)?;
         logical_lock_result(slf.getattr("unlock")?)
     }

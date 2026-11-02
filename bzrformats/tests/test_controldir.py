@@ -17,8 +17,10 @@
 """Tests for the standalone control-directory API."""
 
 import os
+import threading
+import time
 
-from .. import controldir
+from .. import controldir, lock
 from ..errors import (
     BzrFormatsError,
     LockActive,
@@ -515,12 +517,12 @@ class TestLocking(TestCaseInTempDir):
         wt = controldir.create(self.test_dir).open_workingtree()
         branch = wt.branch
         repository = branch.repository
-        for lock, branch_mode, repository_write_locked in [
+        for take_lock, branch_mode, repository_write_locked in [
             (wt.lock_read, "r", False),
             (wt.lock_tree_write, "r", False),
             (wt.lock_write, "w", True),
         ]:
-            lock()
+            take_lock()
             self.assertEqual(
                 (True, branch_mode, True, repository_write_locked),
                 (
@@ -594,6 +596,23 @@ class TestLocking(TestCaseInTempDir):
         holder.unlock()
         branch.lock_read()
         self.assertRaises(ReadOnlyError, branch.set_tags, {"t": b"rev"})
+        branch.unlock()
+
+    def test_lock_write_waits_for_the_holder(self):
+        cd = controldir.create(self.test_dir)
+        holder = cd.open_branch()
+        holder.lock_write()
+        branch = controldir.open(self.test_dir).open_branch()
+        lock.set_default_timeout(10)
+        releaser = threading.Timer(0.2, holder.unlock)
+        releaser.start()
+        started = time.monotonic()
+        with self.assertLogs("bazaar.lockable_files", "WARNING") as logs:
+            branch.lock_write()
+        releaser.join()
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(1, len(logs.output))
+        self.assertIn("Unable to obtain lock held by", logs.output[0])
         branch.unlock()
 
     def test_commit_uses_the_tree_branch(self):

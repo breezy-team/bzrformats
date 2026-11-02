@@ -18,7 +18,7 @@ except ImportError:
 
 from urllib.parse import quote as urlquote
 
-from .. import osutils
+from .. import lock, osutils
 
 
 def pathname2url(path):
@@ -64,6 +64,9 @@ class TestCase(testtools.TestCase if testtools else unittest.TestCase):
         self.overrideEnv("BRZ_HOME", self._test_home_dir)
         self.overrideEnv("EMAIL", "jrandom@example.com")
         self.overrideEnv("BRZ_EMAIL", None)
+        # Fail at once on lock contention, as breezy's test suite does.
+        self.addCleanup(lock.set_default_timeout, lock.default_timeout())
+        lock.set_default_timeout(0)
 
     def tearDown(self):
         try:
