@@ -529,10 +529,7 @@ impl Pack2aRepository {
             IndexKind::Chk,
         )?);
         Ok(Pack2aRepository {
-            lock: crate::lockable_files::LockableFiles::new(
-                SharedTransport::clone(&transport),
-                format.uses_lock_dir.then_some("lock"),
-            ),
+            lock: super::repository_lock(SharedTransport::clone(&transport), format),
             format,
             transport,
             revisions,

@@ -26,7 +26,7 @@ impl TreeLock {
     /// The lock of the tree rooted at `transport`, with its lock directory
     /// at `lock_dir` (`None` for none); `dirstate` is the tree-relative
     /// path of its dirstate, for dirstate trees.
-    pub fn new(transport: SharedTransport, lock_dir: Option<&str>, dirstate: Option<&str>) -> Self {
+    pub fn new(transport: SharedTransport, lock_dir: &str, dirstate: Option<&str>) -> Self {
         let dirstate = dirstate
             .and_then(|path| transport.local_path(path))
             .map(|path| Arc::new(Mutex::new(crate::dirstate::FileTransport::new(path))));
@@ -165,11 +165,7 @@ mod tests {
         std::fs::write(dir.path().join(".bzr/checkout/dirstate"), b"").unwrap();
         let transport: SharedTransport =
             Arc::new(crate::transport::LocalTransport::new(dir.path()));
-        let lock = TreeLock::new(
-            transport,
-            Some(CHECKOUT_LOCK),
-            Some(".bzr/checkout/dirstate"),
-        );
+        let lock = TreeLock::new(transport, CHECKOUT_LOCK, Some(".bzr/checkout/dirstate"));
         lock.files().create_lock().unwrap();
         lock
     }

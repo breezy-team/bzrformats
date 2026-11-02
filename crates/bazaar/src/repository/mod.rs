@@ -829,6 +829,20 @@ pub fn lock_read<R: Repository + ?Sized>(repository: &mut R) -> Result<(), Repos
     Ok(())
 }
 
+/// The lock of a metadir repository of `format` rooted at `transport`: its
+/// lock directory `lock`, which write locks take only if the format
+/// [uses it](RepositoryFormat::uses_lock_dir).
+pub(crate) fn repository_lock(
+    transport: SharedTransport,
+    format: &RepositoryFormat,
+) -> crate::lockable_files::LockableFiles {
+    if format.uses_lock_dir {
+        crate::lockable_files::LockableFiles::new(transport, "lock")
+    } else {
+        crate::lockable_files::LockableFiles::counted(transport, "lock")
+    }
+}
+
 /// Release one lock on `repository`: how a repository's
 /// [`Lockable::unlock`] works unless it locks differently. Releasing the
 /// last write lock with a write group open aborts the write group, releases
@@ -1829,6 +1843,22 @@ mod tests {
         ));
         assert!(!stacked.lock().is_locked());
         assert!(!stacked.fallbacks[0].lock().is_locked());
+    }
+
+    /// A pack repository's write lock only counts, but the lock directory it
+    /// takes while saving its pack names is reported and broken through it.
+    #[test]
+    fn pack_repository_breaks_a_stale_names_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let repo = Pack2aRepository::create(SharedTransport::clone(&t)).unwrap();
+        let mut stale = crate::lockdir::LockDir::new(t.as_ref(), "lock");
+        crate::lockdir::Lock::attempt_lock(&mut stale).unwrap();
+        std::mem::forget(stale);
+
+        assert!(repo.lock().get_physical_lock_status().unwrap());
+        repo.break_lock(&mut |holder| holder.is_some()).unwrap();
+        assert!(!repo.lock().get_physical_lock_status().unwrap());
     }
 
     /// A plain backend reports that it does not support fallbacks.

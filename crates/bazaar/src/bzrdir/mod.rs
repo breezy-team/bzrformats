@@ -284,7 +284,7 @@ impl Component {
 /// Create the lock directory `lock` of the component `transport` reaches,
 /// when the component is made.
 fn create_lock_dir(transport: &SharedTransport) -> Result<(), BzrDirError> {
-    crate::lockable_files::LockableFiles::new(SharedTransport::clone(transport), Some("lock"))
+    crate::lockable_files::LockableFiles::new(SharedTransport::clone(transport), "lock")
         .create_lock()
         .map_err(|e| BzrDirError::Component(format!("creating lock directory: {e}")))
 }

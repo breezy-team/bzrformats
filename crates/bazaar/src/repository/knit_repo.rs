@@ -149,10 +149,7 @@ impl KnitRepository {
             .map_err(|e| RepositoryError::Corrupt(format!("knits subtransport: {e}")))?;
         Ok(KnitRepository {
             in_write_group: false,
-            lock: crate::lockable_files::LockableFiles::new(
-                SharedTransport::clone(&transport),
-                format.uses_lock_dir.then_some("lock"),
-            ),
+            lock: super::repository_lock(SharedTransport::clone(&transport), format),
             format,
             revisions,
             inventories,

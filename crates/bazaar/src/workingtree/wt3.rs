@@ -113,7 +113,7 @@ impl WorkingTree3 {
     ) -> Result<Self, WorkingTreeError> {
         let lock = super::TreeLock::new(
             SharedTransport::clone(&transport),
-            Some(super::lock::CHECKOUT_LOCK),
+            super::lock::CHECKOUT_LOCK,
             None,
         );
         Self::open_with_layout(transport, branch, lock, WT3_CHECKOUT_LAYOUT)

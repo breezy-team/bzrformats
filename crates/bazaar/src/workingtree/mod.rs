@@ -1034,7 +1034,7 @@ impl WorkingTree4 {
         Ok(WorkingTree4 {
             lock: TreeLock::new(
                 SharedTransport::clone(&transport),
-                Some(lock::CHECKOUT_LOCK),
+                lock::CHECKOUT_LOCK,
                 Some(DIRSTATE_PATH),
             ),
             transport,

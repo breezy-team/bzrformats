@@ -80,8 +80,9 @@ pub struct RepositoryFormat {
     pub supported: bool,
     /// Whether the format is deprecated (still readable, upgrade advised).
     pub deprecated: bool,
-    /// Whether write locks take a lock directory, `lock`, as the knit
-    /// formats' do; the pack formats only count their locks.
+    /// Whether write locks take the lock directory `lock`, as the knit
+    /// formats' do; the pack formats only count their locks, and take it
+    /// while saving their pack names.
     pub uses_lock_dir: bool,
     /// Whether this is an all-in-one (pre-metadir) format whose stores live
     /// directly under `.bzr` with no `.bzr/repository/format` marker. Such a

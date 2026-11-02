@@ -524,10 +524,7 @@ impl KnitPackRepository {
         let format = check_format(transport.as_ref())?;
         let mut packs = Packs::open(SharedTransport::clone(&transport), format.uses_btree_index)?;
         Ok(KnitPackRepository {
-            lock: crate::lockable_files::LockableFiles::new(
-                SharedTransport::clone(&transport),
-                format.uses_lock_dir.then_some("lock"),
-            ),
+            lock: super::repository_lock(SharedTransport::clone(&transport), format),
             format,
             revisions: build_registered_store(&mut packs, &transport, IndexKind::Revision)?,
             inventories: build_registered_store(&mut packs, &transport, IndexKind::Inventory)?,

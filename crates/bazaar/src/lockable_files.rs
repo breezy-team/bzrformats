@@ -51,8 +51,15 @@ pub enum LockableFilesError {
     /// The OS lock failed otherwise.
     Os(crate::lock::LockError),
     /// The object's lock is an OS lock, which has no token to take it over
-    /// with or to leave it in place by.
+    /// with.
     TokensUnsupported,
+    /// The object's lock does not support the operation, as breezy's raise
+    /// `NotImplementedError`: leaving a lock in place that has no token, or
+    /// breaking an OS lock.
+    Unsupported(&'static str),
+    /// The lock directory was broken, and maybe taken by someone else,
+    /// while this object held it.
+    Broken(LockError),
 }
 
 impl std::fmt::Display for LockableFilesError {
@@ -65,9 +72,9 @@ impl std::fmt::Display for LockableFilesError {
             LockableFilesError::Lock(e) => write!(f, "{e}"),
             LockableFilesError::Dirstate(e) => write!(f, "{e}"),
             LockableFilesError::Os(e) => write!(f, "{e}"),
-            LockableFilesError::TokensUnsupported => {
-                f.write_str("lock does not support tokens or being left in place")
-            }
+            LockableFilesError::TokensUnsupported => f.write_str("lock does not support tokens"),
+            LockableFilesError::Unsupported(what) => write!(f, "lock does not support {what}"),
+            LockableFilesError::Broken(e) => write!(f, "lock was broken while still held: {e}"),
         }
     }
 }
@@ -171,8 +178,11 @@ impl WriteLocked {
 /// The physical lock an object takes.
 #[derive(Clone)]
 enum Physical {
-    /// None: the lock only counts, as for pack repositories.
-    None,
+    /// A lock directory, relative to the object's transport, that write
+    /// locks do not take: the lock only counts. Pack repositories take it
+    /// only while saving their pack names, so it is what their lock reports
+    /// and breaks.
+    Counted(String),
     /// A lock directory, relative to the object's transport, held while the
     /// object is write-locked.
     Dir(String),
@@ -305,12 +315,19 @@ pub struct LockableFiles {
 
 impl LockableFiles {
     /// The lock of the object whose control files `transport` reaches, with
-    /// its lock directory at `lock_path` (`None` for no physical lock).
-    pub fn new(transport: SharedTransport, lock_path: Option<&str>) -> Self {
-        let physical = match lock_path {
-            Some(path) => Physical::Dir(path.to_string()),
-            None => Physical::None,
-        };
+    /// its lock directory at `lock_path`.
+    pub fn new(transport: SharedTransport, lock_path: &str) -> Self {
+        Self::with_physical(transport, Physical::Dir(lock_path.to_string()))
+    }
+
+    /// The lock of an object whose write locks only count, as a pack
+    /// repository's do, but whose lock directory `lock_path` is reported and
+    /// broken through it.
+    pub fn counted(transport: SharedTransport, lock_path: &str) -> Self {
+        Self::with_physical(transport, Physical::Counted(lock_path.to_string()))
+    }
+
+    fn with_physical(transport: SharedTransport, physical: Physical) -> Self {
         LockableFiles {
             transport,
             physical,
@@ -321,11 +338,7 @@ impl LockableFiles {
     /// The lock of an object of an all-in-one control directory, which
     /// shares `os_lock` with the control directory's other objects.
     pub fn with_os_lock(transport: SharedTransport, os_lock: TransportLock) -> Self {
-        LockableFiles {
-            transport,
-            physical: Physical::Os(os_lock),
-            state: Arc::new(Mutex::new(State::default())),
-        }
+        Self::with_physical(transport, Physical::Os(os_lock))
     }
 
     /// The transport the lock lives on.
@@ -336,20 +349,19 @@ impl LockableFiles {
     /// The lock directory, relative to the transport, if there is one.
     pub fn lock_path(&self) -> Option<&str> {
         match &self.physical {
-            Physical::Dir(path) => Some(path),
-            Physical::None | Physical::Os(_) => None,
+            Physical::Dir(path) | Physical::Counted(path) => Some(path),
+            Physical::Os(_) => None,
         }
     }
 
     /// Create the lock directory or file, as a new control directory needs.
     pub fn create_lock(&self) -> Result<(), LockableFilesError> {
         match &self.physical {
-            Physical::Dir(lock_path) => {
+            Physical::Dir(lock_path) | Physical::Counted(lock_path) => {
                 LockDir::new(self.transport.as_ref(), lock_path).create()?;
                 Ok(())
             }
             Physical::Os(os_lock) => os_lock.create(),
-            Physical::None => Ok(()),
         }
     }
 
@@ -386,7 +398,8 @@ impl LockableFiles {
     /// Take a write lock. A write lock already held is counted, after
     /// checking `token` against it; a read lock cannot be upgraded. With
     /// `token`, a physical lock held already is taken over instead of
-    /// taking a new one, and is not released by the last unlock.
+    /// taking a new one, and is not released by the last unlock. A lock that
+    /// only counts ignores `token`, as breezy's pack repositories do.
     pub fn lock_write(
         &self,
         token: Option<&LockToken>,
@@ -395,7 +408,10 @@ impl LockableFiles {
         if token.is_some() && matches!(self.physical, Physical::Os(_)) {
             return Err(LockableFilesError::TokensUnsupported);
         }
-        let token = token.map(LockToken::as_str);
+        let token = match self.physical {
+            Physical::Counted(_) => None,
+            _ => token.map(LockToken::as_str),
+        };
         let mut state = self.state.lock().unwrap();
         match state.mode {
             Some(LockMode::Read) => return Err(LockableFilesError::ReadOnly),
@@ -425,7 +441,7 @@ impl LockableFiles {
                 os_lock.acquire(LockMode::Write, waiter)?;
                 acquired = true;
             }
-            (Physical::None, _) => {}
+            (Physical::Counted(_), _) => {}
         }
         state.mode = Some(LockMode::Write);
         state.count = 1;
@@ -454,7 +470,10 @@ impl LockableFiles {
         match (mode, &self.physical, nonce, via_token) {
             (Some(LockMode::Write), Physical::Dir(lock_path), Some(nonce), false) => {
                 let mut lockdir = LockDir::new(self.transport.as_ref(), lock_path);
-                lockdir.resume(nonce.as_str())?;
+                lockdir.resume(nonce.as_str()).map_err(|e| match e {
+                    e @ LockError::TokenMismatch { .. } => LockableFilesError::Broken(e),
+                    e => e.into(),
+                })?;
                 lockdir.unlock()?;
                 Ok(Some(nonce))
             }
@@ -478,8 +497,8 @@ impl LockableFiles {
     }
 
     fn set_leave_in_place(&self, leave: bool) -> Result<(), LockableFilesError> {
-        if let Physical::Os(_) = self.physical {
-            return Err(LockableFilesError::TokensUnsupported);
+        if !matches!(self.physical, Physical::Dir(_)) {
+            return Err(LockableFilesError::Unsupported("leaving the lock in place"));
         }
         self.state.lock().unwrap().locked_via_token = leave;
         Ok(())
@@ -491,13 +510,15 @@ impl LockableFiles {
     /// whether a lock was broken.
     ///
     /// Breaking a lock this object holds is an error. An OS lock is never
-    /// left behind by a holder that went away, so there is none to break.
+    /// left behind by a holder that went away, so, as in breezy, breaking
+    /// one is [`LockableFilesError::Unsupported`].
     pub fn break_lock(
         &self,
         confirm: &mut dyn FnMut(Option<&LockHeldInfo>) -> bool,
     ) -> Result<bool, LockableFilesError> {
-        let Physical::Dir(lock_path) = &self.physical else {
-            return Ok(false);
+        let lock_path = match &self.physical {
+            Physical::Dir(lock_path) | Physical::Counted(lock_path) => lock_path,
+            Physical::Os(_) => return Err(LockableFilesError::Unsupported("breaking an OS lock")),
         };
         if self.state.lock().unwrap().nonce.is_some() {
             return Err(LockError::BreakOwnLock.into());
@@ -533,10 +554,10 @@ impl LockableFiles {
     /// The holder of the lock directory, if it is held.
     pub fn peek(&self) -> Result<Option<LockHeldInfo>, LockableFilesError> {
         match &self.physical {
-            Physical::Dir(lock_path) => {
+            Physical::Dir(lock_path) | Physical::Counted(lock_path) => {
                 Ok(LockDir::new(self.transport.as_ref(), lock_path).peek()?)
             }
-            Physical::None | Physical::Os(_) => Ok(None),
+            Physical::Os(_) => Ok(None),
         }
     }
 
@@ -745,7 +766,7 @@ impl<T: Lockable + ?Sized> std::ops::DerefMut for WriteGuard<'_, T> {
 /// The lock of the branch whose control files `transport` reaches: every
 /// metadir branch format takes a lock directory, `lock`.
 pub fn branch_lock(transport: SharedTransport) -> LockableFiles {
-    LockableFiles::new(transport, Some("lock"))
+    LockableFiles::new(transport, "lock")
 }
 
 #[cfg(test)]
@@ -755,7 +776,7 @@ mod tests {
     fn lock_in(dir: &tempfile::TempDir) -> LockableFiles {
         let transport: SharedTransport =
             Arc::new(crate::transport::LocalTransport::new(dir.path()));
-        let lock = LockableFiles::new(transport, Some("lock"));
+        let lock = LockableFiles::new(transport, "lock");
         lock.create_lock().unwrap();
         lock
     }
@@ -1039,11 +1060,11 @@ mod tests {
         assert!(!lock.is_locked());
         assert!(matches!(
             lock.leave_in_place(),
-            Err(LockableFilesError::TokensUnsupported)
+            Err(LockableFilesError::Unsupported(_))
         ));
         assert!(matches!(
             lock.dont_leave_in_place(),
-            Err(LockableFilesError::TokensUnsupported)
+            Err(LockableFilesError::Unsupported(_))
         ));
         lock.lock_write(None, &mut NoWait).unwrap();
         assert!(matches!(
@@ -1052,7 +1073,10 @@ mod tests {
         ));
         assert_eq!(1, lock.lock_count());
         assert!(!lock.get_physical_lock_status().unwrap());
-        assert!(!lock.break_lock(&mut |_| true).unwrap());
+        assert!(matches!(
+            lock.break_lock(&mut |_| true),
+            Err(LockableFilesError::Unsupported(_))
+        ));
         lock.unlock().unwrap();
     }
 
@@ -1089,10 +1113,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let transport: SharedTransport =
             Arc::new(crate::transport::LocalTransport::new(dir.path()));
-        let lock = LockableFiles::new(transport, None);
-        let locked = lock.lock_write(None, &mut NoWait).unwrap();
+        let lock = LockableFiles::counted(transport, "lock");
+        let locked = lock
+            .lock_write(Some(&LockToken::from("bogus")), &mut NoWait)
+            .unwrap();
         assert_eq!((None, false), (locked.token(), locked.acquired()));
         assert!(!lock.get_physical_lock_status().unwrap());
+        assert!(matches!(
+            lock.leave_in_place(),
+            Err(LockableFilesError::Unsupported(_))
+        ));
         assert_eq!(None, lock.unlock().unwrap());
+    }
+
+    /// A count-only lock reports and breaks its lock directory, which a pack
+    /// repository takes while saving its pack names.
+    #[test]
+    fn count_only_lock_reports_and_breaks_its_lock_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport: SharedTransport =
+            Arc::new(crate::transport::LocalTransport::new(dir.path()));
+        let lock = LockableFiles::counted(SharedTransport::clone(&transport), "lock");
+        lock.create_lock().unwrap();
+        let mut stale = LockDir::new(transport.as_ref(), "lock");
+        stale.attempt_lock().unwrap();
+        std::mem::forget(stale);
+
+        assert!(lock.get_physical_lock_status().unwrap());
+        let mut asked = 0;
+        assert!(lock
+            .break_lock(&mut |holder| {
+                assert!(holder.is_some());
+                asked += 1;
+                true
+            })
+            .unwrap());
+        assert_eq!(1, asked);
+        assert!(!lock.get_physical_lock_status().unwrap());
     }
 }
