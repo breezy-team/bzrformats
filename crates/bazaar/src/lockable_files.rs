@@ -587,12 +587,9 @@ impl LockableFiles {
         loop {
             let mut lockdir = LockDir::new(self.transport.as_ref(), lock_path);
             match lockdir.attempt_lock() {
-                Ok(nonce) => {
-                    // The handle would release the lock when dropped; it is
-                    // released through its nonce instead.
-                    std::mem::forget(lockdir);
-                    return Ok(nonce);
-                }
+                // The lock is released through its nonce rather than the
+                // handle.
+                Ok(_) => return Ok(lockdir.into_nonce().expect("the lock was just taken")),
                 Err(LockError::AlreadyHeld) => {}
                 Err(e) => return Err(e.into()),
             }
@@ -1135,9 +1132,7 @@ mod tests {
             Arc::new(crate::transport::LocalTransport::new(dir.path()));
         let lock = LockableFiles::counted(SharedTransport::clone(&transport), "lock");
         lock.create_lock().unwrap();
-        let mut stale = LockDir::new(transport.as_ref(), "lock");
-        stale.attempt_lock().unwrap();
-        std::mem::forget(stale);
+        crate::lockdir::hold_lock(transport.as_ref(), "lock");
 
         assert!(lock.get_physical_lock_status().unwrap());
         let mut asked = 0;

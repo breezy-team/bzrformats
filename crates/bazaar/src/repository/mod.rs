@@ -1892,9 +1892,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
         let repo = Pack2aRepository::create(SharedTransport::clone(&t)).unwrap();
-        let mut stale = crate::lockdir::LockDir::new(t.as_ref(), "lock");
-        crate::lockdir::Lock::attempt_lock(&mut stale).unwrap();
-        std::mem::forget(stale);
+        crate::lockdir::hold_lock(t.as_ref(), "lock");
 
         assert!(repo.lock().get_physical_lock_status().unwrap());
         repo.break_lock(&mut |holder| holder.is_some()).unwrap();

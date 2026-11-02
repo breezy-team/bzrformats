@@ -240,6 +240,14 @@ impl<'t> LockDir<'t> {
         Ok(())
     }
 
+    /// Stop tracking the lock this handle holds without releasing it,
+    /// returning its nonce, through which another handle can
+    /// [`resume`](Self::resume) it; `None` if this handle holds no lock.
+    pub fn into_nonce(mut self) -> Option<String> {
+        self.lock_held = false;
+        self.nonce.take()
+    }
+
     /// Create the lock directory (the container for `held/`).
     ///
     /// Idempotent: an existing directory is fine.
@@ -456,6 +464,15 @@ impl Drop for LockDir<'_> {
     }
 }
 
+/// Take the lock at `path` and leave it held, as a process that went away
+/// would; returns its nonce.
+#[cfg(test)]
+pub(crate) fn hold_lock(transport: &dyn Transport, path: &str) -> String {
+    let mut lock = LockDir::new(transport, path);
+    lock.attempt_lock().unwrap();
+    lock.into_nonce().unwrap()
+}
+
 /// Recursively remove the directory at `path` through `transport`, deleting its
 /// contents first (a directory cannot be removed while non-empty). A missing
 /// entry is not an error.
@@ -587,11 +604,9 @@ mod tests {
     #[test]
     fn resume_adopts_lock_by_nonce() {
         let (_dir, t) = temp_transport();
-        let mut a = LockDir::new(&t, "test_lock");
-        a.create().unwrap();
-        let nonce = a.attempt_lock().unwrap();
+        LockDir::new(&t, "test_lock").create().unwrap();
         // The original handle goes away without releasing the lock.
-        std::mem::forget(a);
+        let nonce = hold_lock(&t, "test_lock");
 
         let mut b = LockDir::new(&t, "test_lock");
         assert!(!b.is_held());
