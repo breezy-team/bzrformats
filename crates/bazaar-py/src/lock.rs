@@ -472,6 +472,157 @@ fn _reset_state() {
     rs_lock::reset_for_tests();
 }
 
+/// `LockResult`: the lock a lock hook is called about, as breezy's.
+#[pyclass(name = "LockResult", frozen, eq)]
+#[derive(PartialEq)]
+struct PyLockResult {
+    #[pyo3(get)]
+    lock_url: String,
+    #[pyo3(get)]
+    details: Option<String>,
+}
+
+#[pymethods]
+impl PyLockResult {
+    #[new]
+    #[pyo3(signature = (lock_url, details=None))]
+    fn new(lock_url: String, details: Option<String>) -> Self {
+        PyLockResult { lock_url, details }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("LockResult({}, {:?})", self.lock_url, self.details)
+    }
+}
+
+/// The hooks a lock directory taken, released or broken is reported to.
+const HOOK_NAMES: [&str; 3] = ["lock_acquired", "lock_released", "lock_broken"];
+
+/// `LockHooks`: the callables called with a `LockResult` for every lock
+/// directory taken (`lock_acquired`), released (`lock_released`) or broken
+/// (`lock_broken`), as breezy's `Lock.hooks`. An exception a hook raises
+/// cannot stop the lock operation; it is reported as unraisable.
+#[pyclass(name = "LockHooks", frozen)]
+struct PyLockHooks {
+    hooks: std::sync::Mutex<Vec<InstalledHook>>,
+}
+
+/// A callable installed for a lock hook.
+struct InstalledHook {
+    hook_name: &'static str,
+    callable: Py<PyAny>,
+    label: Option<String>,
+}
+
+impl PyLockHooks {
+    fn hook_name(name: &str) -> PyResult<&'static str> {
+        HOOK_NAMES
+            .iter()
+            .copied()
+            .find(|known| *known == name)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(name.to_string()))
+    }
+
+    fn callables(&self, py: Python<'_>, name: &str) -> Vec<Py<PyAny>> {
+        self.hooks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|hook| hook.hook_name == name)
+            .map(|hook| hook.callable.clone_ref(py))
+            .collect()
+    }
+}
+
+#[pymethods]
+impl PyLockHooks {
+    /// Call `a_callable` for the hook `hook_name`, labelled `name`.
+    #[pyo3(signature = (hook_name, a_callable, name=None))]
+    fn install_named_hook(
+        &self,
+        hook_name: &str,
+        a_callable: Py<PyAny>,
+        name: Option<String>,
+    ) -> PyResult<()> {
+        let hook_name = Self::hook_name(hook_name)?;
+        self.hooks.lock().unwrap().push(InstalledHook {
+            hook_name,
+            callable: a_callable,
+            label: name,
+        });
+        Ok(())
+    }
+
+    /// Stop calling the callable installed for `hook_name` as `label`.
+    fn uninstall_named_hook(&self, hook_name: &str, label: &str) -> PyResult<()> {
+        let hook_name = Self::hook_name(hook_name)?;
+        let mut hooks = self.hooks.lock().unwrap();
+        let position = hooks
+            .iter()
+            .position(|hook| hook.hook_name == hook_name && hook.label.as_deref() == Some(label))
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(label.to_string()))?;
+        hooks.remove(position);
+        Ok(())
+    }
+
+    fn __getitem__(&self, py: Python<'_>, hook_name: &str) -> PyResult<Vec<Py<PyAny>>> {
+        Ok(self.callables(py, Self::hook_name(hook_name)?))
+    }
+}
+
+static HOOKS: std::sync::OnceLock<Py<PyLockHooks>> = std::sync::OnceLock::new();
+
+/// The process's lock hooks, reporting the Rust lock directories' events
+/// to them the first time.
+fn lock_hooks(py: Python<'_>) -> PyResult<&'static Py<PyLockHooks>> {
+    if let Some(hooks) = HOOKS.get() {
+        return Ok(hooks);
+    }
+    let hooks = Py::new(
+        py,
+        PyLockHooks {
+            hooks: std::sync::Mutex::new(Vec::new()),
+        },
+    )?;
+    if HOOKS.set(hooks).is_ok() {
+        bazaar::lockdir::add_lock_hook(std::sync::Arc::new(run_hooks));
+    }
+    Ok(HOOKS.get().expect("set above"))
+}
+
+fn run_hooks(event: bazaar::lockdir::LockEvent, result: &bazaar::lockdir::LockResult) {
+    use bazaar::lockdir::LockEvent;
+    let name = match event {
+        LockEvent::Acquired => "lock_acquired",
+        LockEvent::Released => "lock_released",
+        LockEvent::Broken => "lock_broken",
+    };
+    Python::attach(|py| {
+        let Some(hooks) = HOOKS.get() else {
+            return;
+        };
+        let callables = hooks.get().callables(py, name);
+        if callables.is_empty() {
+            return;
+        }
+        let result = match Py::new(
+            py,
+            PyLockResult {
+                lock_url: result.lock_url.clone(),
+                details: result.details.clone(),
+            },
+        ) {
+            Ok(result) => result,
+            Err(e) => return e.write_unraisable(py, None),
+        };
+        for callable in callables {
+            if let Err(e) = callable.call1(py, (result.clone_ref(py),)) {
+                e.write_unraisable(py, Some(callable.bind(py)));
+            }
+        }
+    })
+}
+
 /// How long, in seconds, locks taken for a single operation wait for
 /// another holder; 30 unless changed.
 #[pyfunction]
@@ -498,6 +649,9 @@ fn sleep_detached(duration: std::time::Duration) {
 pub fn _lock_rs(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     bazaar::lockable_files::set_wait_sleep(sleep_detached);
     let m = PyModule::new(py, "lock")?;
+    m.add_class::<PyLockResult>()?;
+    m.add_class::<PyLockHooks>()?;
+    m.add("hooks", lock_hooks(py)?.clone_ref(py))?;
     m.add_function(wrap_pyfunction!(default_timeout, &m)?)?;
     m.add_function(wrap_pyfunction!(set_default_timeout, &m)?)?;
     m.add_class::<PyReadLock>()?;

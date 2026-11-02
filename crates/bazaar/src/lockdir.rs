@@ -10,9 +10,13 @@
 //! This mirrors `breezy.lockdir`, but operates purely on a [`Transport`]
 //! and carries none of breezy's UI/config policy (no interactive
 //! break-lock prompting, no configurable poll loop). Callers that need
-//! to wait poll [`LockDir::attempt_lock`] themselves.
+//! to wait poll [`LockDir::attempt_lock`] themselves. Taking, releasing and
+//! breaking a lock is reported to the hooks added with [`add_lock_hook`],
+//! as it is to breezy's `Lock.hooks`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +24,67 @@ use serde::{Deserialize, Serialize};
 use crate::transport::{Transport, TransportError};
 
 const INFO_NAME: &str = "/info";
+
+/// Something that happened to a lock directory, as breezy's `Lock.hooks`
+/// report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockEvent {
+    /// The lock was taken (`lock_acquired`).
+    Acquired,
+    /// The lock was released (`lock_released`).
+    Released,
+    /// The lock was broken (`lock_broken`).
+    Broken,
+}
+
+/// The lock a [`LockEvent`] happened to: breezy's `LockResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockResult {
+    /// Where the lock directory is.
+    pub lock_url: String,
+    /// The nonce of the lock taken, released or broken; `None` for a lock
+    /// broken whose holder could not be read.
+    pub details: Option<String>,
+}
+
+/// A function called for every [`LockEvent`] in the process.
+pub type LockHook = Arc<dyn Fn(LockEvent, &LockResult) + Send + Sync>;
+
+/// A hook added with [`add_lock_hook`], by which it is removed again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LockHookId(u64);
+
+static LOCK_HOOKS: Mutex<Vec<(LockHookId, LockHook)>> = Mutex::new(Vec::new());
+static NEXT_LOCK_HOOK: AtomicU64 = AtomicU64::new(0);
+
+/// Call `hook` for every lock directory taken, released or broken in the
+/// process, as breezy's `Lock.hooks` do.
+pub fn add_lock_hook(hook: LockHook) -> LockHookId {
+    let id = LockHookId(NEXT_LOCK_HOOK.fetch_add(1, Ordering::Relaxed));
+    LOCK_HOOKS.lock().unwrap().push((id, hook));
+    id
+}
+
+/// Stop calling the hook `id`; returns whether it was added.
+pub fn remove_lock_hook(id: LockHookId) -> bool {
+    let mut hooks = LOCK_HOOKS.lock().unwrap();
+    let before = hooks.len();
+    hooks.retain(|(hook_id, _)| *hook_id != id);
+    hooks.len() != before
+}
+
+fn run_lock_hooks(event: LockEvent, result: LockResult) {
+    // Called without holding the registry, so a hook may add or remove hooks.
+    let hooks: Vec<LockHook> = LOCK_HOOKS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, hook)| Arc::clone(hook))
+        .collect();
+    for hook in hooks {
+        hook(event, &result);
+    }
+}
 
 /// Errors from lock operations.
 #[derive(Debug)]
@@ -317,7 +382,17 @@ impl<'t> LockDir<'t> {
             });
         }
         self.remove_broken(&broken)?;
+        run_lock_hooks(LockEvent::Broken, self.result(dead_holder.nonce.clone()));
         Ok(true)
+    }
+
+    /// The lock as hooks are told about it, with `details`.
+    fn result(&self, details: Option<String>) -> LockResult {
+        let lock_url = match self.transport.local_path(&self.path) {
+            Some(path) => path.display().to_string(),
+            None => self.path.clone(),
+        };
+        LockResult { lock_url, details }
     }
 
     /// Break a lock whose `info` file cannot be parsed, if it still reads
@@ -339,6 +414,7 @@ impl<'t> LockDir<'t> {
             });
         }
         self.remove_broken(&broken)?;
+        run_lock_hooks(LockEvent::Broken, self.result(None));
         Ok(true)
     }
 
@@ -416,6 +492,7 @@ impl Lock for LockDir<'_> {
             Some(held) if held.nonce.as_deref() == Some(nonce.as_str()) => {
                 self.nonce = Some(nonce.clone());
                 self.lock_held = true;
+                run_lock_hooks(LockEvent::Acquired, self.result(Some(nonce.clone())));
                 Ok(nonce)
             }
             _ => Err(LockError::AlreadyHeld),
@@ -435,7 +512,7 @@ impl Lock for LockDir<'_> {
         );
         self.transport.rename(&self.held_dir, &tmpname)?;
         self.lock_held = false;
-        self.nonce = None;
+        let old_nonce = self.nonce.take();
         self.transport.delete(&format!("{tmpname}{INFO_NAME}"))?;
         // Removing the holder dir usually leaves an empty directory, but a
         // racing locker may have moved its own pending dir inside ours; breezy
@@ -444,6 +521,7 @@ impl Lock for LockDir<'_> {
         if let Err(e) = delete_tree(self.transport, &tmpname) {
             log::warn!("error removing released lock dir {tmpname}: {e}");
         }
+        run_lock_hooks(LockEvent::Released, self.result(old_nonce));
         Ok(())
     }
 
@@ -502,6 +580,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = LocalTransport::new(dir.path());
         (dir, t)
+    }
+
+    /// Hooks are told about each lock taken, released and broken.
+    #[test]
+    fn hooks_see_locks_taken_released_and_broken() {
+        let (dir, t) = temp_transport();
+        let root = dir.path().display().to_string();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let id = {
+            let seen = Arc::clone(&seen);
+            add_lock_hook(Arc::new(move |event, result: &LockResult| {
+                if result.lock_url.starts_with(&root) {
+                    seen.lock().unwrap().push((event, result.details.clone()));
+                }
+            }))
+        };
+        let mut lock = LockDir::new(&t, "lock");
+        let first = lock.attempt_lock().unwrap();
+        lock.unlock().unwrap();
+        let second = hold_lock(&t, "lock");
+        let mut breaker = LockDir::new(&t, "lock");
+        let holder = breaker.peek().unwrap().unwrap();
+        assert!(breaker.force_break(&holder).unwrap());
+        assert!(remove_lock_hook(id));
+        assert!(!remove_lock_hook(id));
+
+        assert_eq!(
+            vec![
+                (LockEvent::Acquired, Some(first.clone())),
+                (LockEvent::Released, Some(first)),
+                (LockEvent::Acquired, Some(second.clone())),
+                (LockEvent::Broken, Some(second)),
+            ],
+            *seen.lock().unwrap()
+        );
     }
 
     #[test]

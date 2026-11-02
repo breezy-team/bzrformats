@@ -615,6 +615,37 @@ class TestLocking(TestCaseInTempDir):
         self.assertIn("Unable to obtain lock held by", logs.output[0])
         branch.unlock()
 
+    def test_lock_hooks(self):
+        cd = controldir.create(self.test_dir)
+        seen = []
+
+        def record(name):
+            def hook(result):
+                if result.lock_url.startswith(self.test_dir):
+                    seen.append((name, os.path.basename(result.lock_url)))
+
+            return hook
+
+        for name in ["lock_acquired", "lock_released", "lock_broken"]:
+            lock.hooks.install_named_hook(name, record(name), "test")
+            self.addCleanup(lock.hooks.uninstall_named_hook, name, "test")
+        branch = cd.open_branch()
+        branch.lock_write()
+        branch.unlock()
+        holder = cd.open_branch()
+        holder.lock_write()
+        controldir.open(self.test_dir).open_branch().break_lock(lambda info: True)
+        self.assertEqual(
+            [
+                ("lock_acquired", "lock"),
+                ("lock_released", "lock"),
+                ("lock_acquired", "lock"),
+                ("lock_broken", "lock"),
+            ],
+            [entry for entry in seen if entry[1] == "lock"][:4],
+        )
+        self.assertRaises(KeyError, lock.hooks.install_named_hook, "bogus", print)
+
     def test_commit_uses_the_tree_branch(self):
         wt = controldir.create(self.test_dir).open_workingtree()
         revid = wt.commit("T <t@e>", "empty", 1577880000, 0, allow_pointless=True)
