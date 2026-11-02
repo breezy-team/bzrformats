@@ -13,7 +13,7 @@ use bazaar::branch::Branch as RsBranch;
 use bazaar::bzrdir::{
     find_control_dir_format, BzrDirAllInOne, BzrDirMeta, ControlDir as RsControlDir,
 };
-use bazaar::lockable_files::{LockMode, LockToken, Lockable, LockableFilesError, NoWait};
+use bazaar::lockable_files::{LockMode, LockToken, Lockable, LockableFilesError, Wait};
 use bazaar::lockdir::{LockError, LockHeldInfo};
 use bazaar::repository::Repository as RsRepository;
 use bazaar::transport::{LocalTransport, SharedTransport};
@@ -33,9 +33,68 @@ pyo3::import_exception!(bzrformats.errors, LockNotHeld);
 pyo3::import_exception!(bzrformats.errors, ReadOnlyError);
 pyo3::import_exception!(bzrformats.errors, LockActive);
 pyo3::import_exception!(bzrformats.errors, LockBreakMismatch);
+pyo3::import_exception!(bzrformats.errors, LockBroken);
+pyo3::import_exception!(bzrformats.errors, LockFailed);
+pyo3::import_exception!(bzrformats.errors, TokenLockingNotSupported);
+pyo3::import_exception!(bzrformats.errors, TokenMismatch);
 
-fn err<E: std::fmt::Display>(e: E) -> PyErr {
+/// The Python exception for a Rust error: the matching breezy-style
+/// exception where there is one, so lock failures raised by mutators that
+/// lock internally are the lock exceptions too.
+fn err<E: IntoPyErr>(e: E) -> PyErr {
+    e.into_py_err()
+}
+
+/// A Rust error with a Python exception to map onto.
+trait IntoPyErr {
+    fn into_py_err(self) -> PyErr;
+}
+
+/// The generic exception, for errors without a more specific one.
+fn generic_err<E: std::fmt::Display>(e: E) -> PyErr {
     BzrFormatsError::new_err(e.to_string())
+}
+
+impl IntoPyErr for bazaar::branch::BranchError {
+    fn into_py_err(self) -> PyErr {
+        branch_err(self)
+    }
+}
+
+impl IntoPyErr for bazaar::repository::RepositoryError {
+    fn into_py_err(self) -> PyErr {
+        repository_err(self)
+    }
+}
+
+impl IntoPyErr for bazaar::workingtree::WorkingTreeError {
+    fn into_py_err(self) -> PyErr {
+        tree_err(self)
+    }
+}
+
+impl IntoPyErr for bazaar::bzrdir::BzrDirError {
+    fn into_py_err(self) -> PyErr {
+        generic_err(self)
+    }
+}
+
+impl IntoPyErr for bazaar::bzrdir::BreakLockError {
+    fn into_py_err(self) -> PyErr {
+        use bazaar::bzrdir::BreakLockError;
+        match self {
+            BreakLockError::Open(e) => err(e),
+            BreakLockError::Tree(e) => tree_err(e),
+            BreakLockError::Branch(e) => branch_err(e),
+            BreakLockError::Repository(e) => repository_err(e),
+        }
+    }
+}
+
+impl IntoPyErr for bazaar::transport::TransportError {
+    fn into_py_err(self) -> PyErr {
+        generic_err(self)
+    }
 }
 
 /// Map a branch error onto the matching breezy-style exception, so downstream
@@ -71,6 +130,20 @@ fn lock_err(e: LockableFilesError, what: &str) -> PyErr {
         LockableFilesError::Lock(LockError::BreakMismatch { held, target }) => {
             LockBreakMismatch::new_err((what.to_string(), held, target))
         }
+        LockableFilesError::Lock(LockError::TokenMismatch { given, held }) => {
+            TokenMismatch::new_err((given, held))
+        }
+        LockableFilesError::Broken(_) => LockBroken::new_err((what.to_string(),)),
+        LockableFilesError::TokensUnsupported => {
+            TokenLockingNotSupported::new_err((what.to_string(),))
+        }
+        LockableFilesError::Unsupported(operation) => {
+            pyo3::exceptions::PyNotImplementedError::new_err(format!("{what}: {operation}"))
+        }
+        LockableFilesError::Lock(LockError::Transport(e)) => {
+            LockFailed::new_err((what.to_string(), e.to_string()))
+        }
+        LockableFilesError::Os(e) => LockFailed::new_err((what.to_string(), e.to_string())),
         other => BzrFormatsError::new_err(other.to_string()),
     }
 }
@@ -132,7 +205,7 @@ fn with_confirm<R>(
 fn repository_err(e: bazaar::repository::RepositoryError) -> PyErr {
     match e {
         bazaar::repository::RepositoryError::Locking(e) => lock_err(e, "repository"),
-        other => err(other),
+        other => generic_err(other),
     }
 }
 
@@ -143,7 +216,7 @@ fn tree_err(e: bazaar::workingtree::WorkingTreeError) -> PyErr {
         WorkingTreeError::Locking(e) => lock_err(e, "working tree"),
         WorkingTreeError::Branch(e) => branch_err(e),
         WorkingTreeError::Repository(e) => repository_err(e),
-        other => err(other),
+        other => generic_err(other),
     }
 }
 
@@ -257,6 +330,16 @@ impl BzrDir {
     /// Whether this control directory contains a working tree.
     fn has_workingtree(&self) -> bool {
         self.inner.has_workingtree()
+    }
+
+    /// Break the lock of the working tree, or if there is none the branch,
+    /// or the repository, as breezy's `BzrDir.break_lock`; `confirm` is as
+    /// for `Repository.break_lock`.
+    #[pyo3(signature = (confirm=None))]
+    fn break_lock(&self, py: Python<'_>, confirm: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        with_confirm(py, confirm.as_ref(), |ask| {
+            self.inner.break_lock(ask).map_err(err)
+        })
     }
 
     /// Open the repository in this control directory.
@@ -507,8 +590,9 @@ impl Repository {
         logical_lock_result(slf.getattr("unlock")?)
     }
 
-    /// Lock the repository for writing, failing if someone else holds it;
-    /// with `token`, take over the lock held under it. Returns a
+    /// Lock the repository for writing, waiting for someone else holding it
+    /// as long as `lock.default_timeout()`; with `token`, take over the lock
+    /// held under it. Returns a
     /// `RepositoryWriteLockResult` carrying the lock's `repository_token`.
     #[pyo3(signature = (token=None))]
     fn lock_write(
@@ -519,7 +603,7 @@ impl Repository {
         let token = token.map(LockToken::from);
         let locked = slf.try_borrow_mut()?.with_mut(py, |repository| {
             repository
-                .lock_write_with_token(token.as_ref(), &mut NoWait)
+                .lock_write_with_token(token.as_ref(), &mut Wait::default())
                 .map_err(repository_err)
         })?;
         Py::new(
@@ -685,8 +769,8 @@ impl Repository {
         source: &Bound<'_, Repository>,
         revision_id: Option<&[u8]>,
     ) -> PyResult<usize> {
-        let source = source.try_borrow()?;
-        source.with(py, |source| {
+        let mut source = source.try_borrow_mut()?;
+        source.with_mut(py, |source| {
             self.with_mut(py, |target| {
                 bazaar::repository::fetch(source, target, revision_id).map_err(err)
             })
@@ -854,8 +938,9 @@ impl Branch {
     }
 
     /// Lock the branch, and its repository with the first lock, for writing,
-    /// failing if someone else holds it; with `token`, take over the branch
-    /// lock held under it. Returns a `BranchWriteLockResult` carrying the
+    /// waiting for someone else holding it as long as
+    /// `lock.default_timeout()`; with `token`, take over the branch lock held
+    /// under it. Returns a `BranchWriteLockResult` carrying the
     /// lock's `token`.
     #[pyo3(signature = (token=None))]
     fn lock_write(
@@ -866,7 +951,7 @@ impl Branch {
         let token = token.map(LockToken::from);
         let locked = slf.try_borrow_mut()?.with_mut(py, |branch| {
             branch
-                .lock_write_with_token(token.as_ref(), &mut NoWait)
+                .lock_write_with_token(token.as_ref(), &mut Wait::default())
                 .map_err(branch_err)
         })?;
         Py::new(
@@ -1150,22 +1235,24 @@ impl WorkingTree {
         logical_lock_result(slf.getattr("unlock")?)
     }
 
-    /// Lock the tree for writing and its branch for reading, failing if
-    /// someone else holds the tree. Returns a `LogicalLockResult`.
+    /// Lock the tree for writing and its branch for reading, waiting for
+    /// someone else holding the tree as long as `lock.default_timeout()`.
+    /// Returns a `LogicalLockResult`.
     fn lock_tree_write(slf: &Bound<'_, Self>) -> PyResult<Py<PyLogicalLockResult>> {
         slf.try_borrow_mut()?
             .inner
-            .lock_tree_write(&mut NoWait)
+            .lock_tree_write(&mut Wait::default())
             .map_err(tree_err)?;
         logical_lock_result(slf.getattr("unlock")?)
     }
 
-    /// Lock the tree and its branch for writing, failing if someone else
-    /// holds either. Returns a `LogicalLockResult`.
+    /// Lock the tree and its branch for writing, waiting for someone else
+    /// holding either as long as `lock.default_timeout()`. Returns a
+    /// `LogicalLockResult`.
     fn lock_write(slf: &Bound<'_, Self>) -> PyResult<Py<PyLogicalLockResult>> {
         slf.try_borrow_mut()?
             .inner
-            .lock_write(&mut NoWait)
+            .lock_write(&mut Wait::default())
             .map_err(tree_err)?;
         logical_lock_result(slf.getattr("unlock")?)
     }
@@ -1178,6 +1265,16 @@ impl WorkingTree {
 
     fn is_locked(&self) -> bool {
         self.inner.lock().files().is_locked()
+    }
+
+    /// The mode the tree is locked in, `"r"` or `"w"`, or `None`.
+    fn peek_lock_mode(&self) -> Option<&'static str> {
+        lock_mode_str(self.inner.lock().files().lock_mode())
+    }
+
+    /// Whether the tree is locked for writing.
+    fn is_write_locked(&self) -> bool {
+        self.inner.lock().files().lock_mode() == Some(LockMode::Write)
     }
 
     /// Whether the tree's lock directory is held, by anyone.

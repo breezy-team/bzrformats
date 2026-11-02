@@ -800,7 +800,7 @@ fn with_tree_write<T: WorkingTree, R>(
     tree: &mut T,
     f: impl FnOnce(&mut T) -> Result<R, WorkingTreeError>,
 ) -> Result<R, WorkingTreeError> {
-    tree.lock_tree_write(&mut crate::lockable_files::NoWait)?;
+    tree.lock_tree_write(&mut crate::lockable_files::Wait::default())?;
     let result = f(tree);
     let unlocked = tree.unlock();
     result.and_then(|r| unlocked.map(|_| r))
@@ -858,10 +858,7 @@ fn write_revision(
     changes: &[WorkingTreeChange],
     signature: Option<&[u8]>,
 ) -> Result<(), WorkingTreeError> {
-    repository
-        .start_write_group()
-        .map_err(WorkingTreeError::Repository)?;
-    {
+    crate::repository::with_write_group(repository, |repository| {
         let mut builder = repository
             .get_commit_builder(
                 parents.to_vec(),
@@ -871,31 +868,22 @@ fn write_revision(
                 options.timezone,
             )
             .with_properties(properties.clone());
-        builder
-            .record_iter_changes(changes, |path| {
-                transport
-                    .get_bytes(path)
-                    .map_err(crate::repository::RepositoryError::Transport)
-            })
-            .map_err(WorkingTreeError::Repository)?;
-        builder
-            .finish_inventory()
-            .map_err(WorkingTreeError::Repository)?;
-        builder
-            .commit(&options.message)
-            .map_err(WorkingTreeError::Repository)?;
-    }
-    // The signature goes in while the write group is still open, so it
-    // lands in the same pack as the revision.
-    if let Some(signature) = signature {
-        repository
-            .add_signature_text(revid, signature)
-            .map_err(WorkingTreeError::Repository)?;
-    }
-    repository
-        .commit_write_group()
-        .map(drop)
-        .map_err(WorkingTreeError::Repository)
+        builder.record_iter_changes(changes, |path| {
+            transport
+                .get_bytes(path)
+                .map_err(crate::repository::RepositoryError::Transport)
+        })?;
+        builder.finish_inventory()?;
+        builder.commit(&options.message)?;
+        // The signature goes in while the write group is still open, so it
+        // lands in the same pack as the revision.
+        if let Some(signature) = signature {
+            repository.add_signature_text(revid, signature)?;
+        }
+        Ok(())
+    })
+    .map(drop)
+    .map_err(WorkingTreeError::Repository)
 }
 
 /// The exact `.bzr/checkout/format` marker for the pre-dirstate format 3
@@ -1046,7 +1034,7 @@ impl WorkingTree4 {
         Ok(WorkingTree4 {
             lock: TreeLock::new(
                 SharedTransport::clone(&transport),
-                Some(lock::CHECKOUT_LOCK),
+                lock::CHECKOUT_LOCK,
                 Some(DIRSTATE_PATH),
             ),
             transport,
@@ -3228,7 +3216,8 @@ mod tests {
         let branch = crate::branch::Branch::open(
             parent.subtransport(".bzr/branch").unwrap(),
             Box::new(UnreadableRepository),
-        );
+        )
+        .unwrap();
         let mut wt = WorkingTree4::open(parent, branch).unwrap();
         match wt.set_parent_ids(std::slice::from_ref(&r1), true) {
             Err(WorkingTreeError::Repository(RepositoryError::Corrupt(message))) => {
@@ -4534,7 +4523,7 @@ mod tests {
         } else {
             Box::new(crate::repository::Pack2aRepository::create(repo_t).unwrap())
         };
-        crate::branch::Branch::open(root.subtransport(".bzr/branch").unwrap(), repository)
+        crate::branch::Branch::open(root.subtransport(".bzr/branch").unwrap(), repository).unwrap()
     }
 
     #[cfg(any(feature = "weave", feature = "knit"))]
@@ -4554,6 +4543,25 @@ mod tests {
         let branch = wt3_branch(&shared);
         let wt = WorkingTree3::open(shared, branch).unwrap();
         (dir, probe, wt)
+    }
+
+    /// A format-3 tree reads its inventory again with its first lock, so it
+    /// does not overwrite what another tree object added since it was opened.
+    #[cfg(any(feature = "weave", feature = "knit"))]
+    #[test]
+    fn wt3_sees_changes_made_since_it_was_opened() {
+        let (dir, probe, mut first) = fresh_wt3();
+        std::fs::write(dir.path().join("b"), b"b\n").unwrap();
+        std::fs::write(dir.path().join("c"), b"c\n").unwrap();
+        let mut second =
+            WorkingTree3::open(SharedTransport::clone(&probe), wt3_branch(&probe)).unwrap();
+        second.add("b", EntryKind::File, None).unwrap();
+        first.add("c", EntryKind::File, None).unwrap();
+
+        let reopened =
+            WorkingTree3::open(SharedTransport::clone(&probe), wt3_branch(&probe)).unwrap();
+        assert!(reopened.path2id("b").is_some());
+        assert!(reopened.path2id("c").is_some());
     }
 
     #[cfg(any(feature = "weave", feature = "knit"))]

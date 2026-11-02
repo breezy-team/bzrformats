@@ -11,9 +11,13 @@
 //! [`PackNames`] is the in-memory pack list and its reconciliation with the
 //! `pack-names` file, likewise ported from `RepositoryPackCollection`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, RwLock};
 
 use super::RepositoryError;
+use crate::knit::KnitError;
+use crate::lockable_files::{LockWaiter, LockableFilesError};
+use crate::lockdir::{Lock as _, LockDir, LockError};
 use crate::pack_repo::{index_extension, IndexKind};
 use crate::transport::{SharedTransport, Transport, TransportError};
 
@@ -207,18 +211,117 @@ impl PackNames {
 /// A combined index of one object kind over a repository's packs, which a
 /// [`PackCollection`] adds packs to and removes them from.
 pub trait CombinedIndex {
-    /// Add the entries of `pack`'s index for `kind`, read from the upload
-    /// directory if the pack is `resumed` from a suspended write group.
-    fn add_pack(
-        &self,
-        transport: &dyn Transport,
-        pack: &str,
-        kind: IndexKind,
-        resumed: bool,
-    ) -> Result<(), RepositoryError>;
+    /// Add the entries of `pack`'s index, read from the upload directory if
+    /// the pack is `resumed` from a suspended write group.
+    fn add_pack(&self, pack: &str, resumed: bool) -> Result<(), RepositoryError>;
 
     /// Drop the entries of `pack`.
     fn remove_pack(&self, pack: &str);
+}
+
+/// Reads the entries of one pack's index, at the given path, into the
+/// entries of a [`LazyPackIndex`].
+pub type ReadPackIndex<K, V> =
+    fn(&dyn Transport, &str, &str, &mut HashMap<K, V>) -> Result<(), RepositoryError>;
+
+/// The entries of the indices of one kind over a repository's packs, merged.
+/// The index of a pack listed in `pack-names` is read the first time the
+/// entries are needed, so opening a repository reads no indices; a pack
+/// resumed from a suspended write group is read at once, as finishing the
+/// write group moves its indices. Clones share the entries, so the
+/// repository can add and remove packs under the stores reading them.
+pub struct LazyPackIndex<K, V> {
+    transport: SharedTransport,
+    kind: IndexKind,
+    read_pack: ReadPackIndex<K, V>,
+    /// The pack an entry lives in.
+    pack_of: fn(&V) -> &str,
+    state: Arc<RwLock<LazyPackIndexState<K, V>>>,
+}
+
+struct LazyPackIndexState<K, V> {
+    entries: HashMap<K, V>,
+    /// The packs whose indices have not been read yet.
+    pending: Vec<String>,
+}
+
+impl<K, V> Clone for LazyPackIndex<K, V> {
+    fn clone(&self) -> Self {
+        LazyPackIndex {
+            transport: SharedTransport::clone(&self.transport),
+            kind: self.kind,
+            read_pack: self.read_pack,
+            pack_of: self.pack_of,
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash, V> LazyPackIndex<K, V> {
+    /// The index of `kind` over `packs`, whose index files are read through
+    /// `transport` (rooted at the repository) with `read_pack`.
+    pub fn new(
+        transport: SharedTransport,
+        packs: &[String],
+        kind: IndexKind,
+        read_pack: ReadPackIndex<K, V>,
+        pack_of: fn(&V) -> &str,
+    ) -> Self {
+        LazyPackIndex {
+            transport,
+            kind,
+            read_pack,
+            pack_of,
+            state: Arc::new(RwLock::new(LazyPackIndexState {
+                entries: HashMap::new(),
+                pending: packs.to_vec(),
+            })),
+        }
+    }
+
+    /// The kind of the indices.
+    pub fn kind(&self) -> IndexKind {
+        self.kind
+    }
+
+    /// Run `f` on the entries, reading the indices of the packs added
+    /// since the last time first.
+    pub fn with_entries<R>(&self, f: impl FnOnce(&HashMap<K, V>) -> R) -> Result<R, KnitError> {
+        {
+            let state = self.state.read().unwrap();
+            if state.pending.is_empty() {
+                return Ok(f(&state.entries));
+            }
+        }
+        let mut state = self.state.write().unwrap();
+        let state = &mut *state;
+        while let Some(pack) = state.pending.last() {
+            let name = index_path(pack, index_extension(self.kind), false);
+            (self.read_pack)(self.transport.as_ref(), &name, pack, &mut state.entries)
+                .map_err(|e| KnitError::Corrupt(format!("reading {name}: {e}")))?;
+            state.pending.pop();
+        }
+        Ok(f(&state.entries))
+    }
+}
+
+impl<K: Eq + std::hash::Hash, V> CombinedIndex for LazyPackIndex<K, V> {
+    fn add_pack(&self, pack: &str, resumed: bool) -> Result<(), RepositoryError> {
+        let mut state = self.state.write().unwrap();
+        if !resumed {
+            state.pending.push(pack.to_string());
+            return Ok(());
+        }
+        let name = index_path(pack, index_extension(self.kind), true);
+        (self.read_pack)(self.transport.as_ref(), &name, pack, &mut state.entries)
+    }
+
+    fn remove_pack(&self, pack: &str) {
+        let mut state = self.state.write().unwrap();
+        state.pending.retain(|pending| pending != pack);
+        let pack_of = self.pack_of;
+        state.entries.retain(|_, value| pack_of(value) != pack);
+    }
 }
 
 /// A reader of pack data, which a [`PackCollection`] tells to drop what it
@@ -292,12 +395,35 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
     /// Write `pack-names`, merging the packs added and removed here with
     /// those other processes changed since it was read, and read the
     /// result.
+    ///
+    /// The merge is done holding the repository's lock directory, as
+    /// breezy's `_save_pack_names` does, so that concurrent writers don't
+    /// drop each other's packs. Another holder is waited for as
+    /// [`Wait::default`](crate::lockable_files::Wait::default) waits.
     pub fn save(&mut self) -> Result<(), RepositoryError> {
+        self.save_waiting(&mut crate::lockable_files::Wait::default())
+    }
+
+    fn save_waiting(&mut self, waiter: &mut dyn LockWaiter) -> Result<(), RepositoryError> {
+        let merged = {
+            let mut lock = LockDir::new(self.transport.as_ref(), NAMES_LOCK);
+            take_lock(&mut lock, waiter)?;
+            let merged = self.merge_into_disk();
+            lock.unlock()
+                .map_err(|e| RepositoryError::Locking(LockableFilesError::Lock(e)))?;
+            merged?
+        };
+        self.names.set_at_load(merged.clone());
+        self.sync(&merged)
+    }
+
+    /// Merge the packs added and removed here into `pack-names` as it is
+    /// on disk, and write it.
+    fn merge_into_disk(&self) -> Result<BTreeSet<PackEntry>, RepositoryError> {
         let disk = read_pack_names(self.transport.as_ref())?;
         let merged = self.names.merge(&disk);
         write_pack_names(self.transport.as_ref(), self.uses_btree, &merged)?;
-        self.names.set_at_load(merged.clone());
-        self.sync(&merged)
+        Ok(merged)
     }
 
     /// Read `pack-names` again, keeping the packs added and removed here.
@@ -343,8 +469,8 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
             }
         }
         for pack in added {
-            for (kind, index) in &self.indices {
-                index.add_pack(self.transport.as_ref(), pack, *kind, false)?;
+            for (_, index) in &self.indices {
+                index.add_pack(pack, false)?;
             }
         }
         Ok(())
@@ -385,8 +511,8 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
         for reader in &self.readers {
             reader.set_resumed(name, true);
         }
-        for (kind, index) in &self.indices {
-            index.add_pack(self.transport.as_ref(), name, *kind, true)?;
+        for (_, index) in &self.indices {
+            index.add_pack(name, true)?;
         }
         Ok(())
     }
@@ -474,6 +600,27 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
     }
 }
 
+/// The lock directory, relative to the repository, held while `pack-names`
+/// is rewritten.
+const NAMES_LOCK: &str = "lock";
+
+/// Take `lock`, asking `waiter` whether to try again while it is held.
+fn take_lock(lock: &mut LockDir, waiter: &mut dyn LockWaiter) -> Result<(), RepositoryError> {
+    loop {
+        match lock.attempt_lock() {
+            Ok(_) => return Ok(()),
+            Err(LockError::AlreadyHeld) => {}
+            Err(e) => return Err(RepositoryError::Locking(LockableFilesError::Lock(e))),
+        }
+        let holder = lock
+            .peek()
+            .map_err(|e| RepositoryError::Locking(LockableFilesError::Lock(e)))?;
+        if !waiter.contended(holder.as_ref()) {
+            return Err(RepositoryError::Locking(LockableFilesError::Contention));
+        }
+    }
+}
+
 /// Read `pack-names`, returning each pack's name and index sizes.
 pub fn read_pack_names(transport: &dyn Transport) -> Result<Vec<PackEntry>, RepositoryError> {
     let index = super::pack_index::PackIndex::open(transport, "pack-names")?;
@@ -556,6 +703,7 @@ fn check_resumable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lockdir::LockHeldInfo;
 
     #[test]
     fn pack_distribution_powers_of_ten() {
@@ -679,6 +827,61 @@ mod tests {
         let mut packs = PackNames::from_disk(vec![entry("a", "1")]);
         assert!(!packs.allocate("a".to_string(), b"2".to_vec()));
         assert_eq!(vec![entry("a", "1")], packs.entries());
+    }
+
+    struct NoIndex;
+
+    impl CombinedIndex for NoIndex {
+        fn add_pack(&self, _: &str, _: bool) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+
+        fn remove_pack(&self, _: &str) {}
+    }
+
+    struct NoReader;
+
+    impl PackReader for NoReader {
+        fn forget(&self, _: &str) {}
+
+        fn set_resumed(&self, _: &str, _: bool) {}
+    }
+
+    fn empty_collection(dir: &tempfile::TempDir) -> PackCollection<NoIndex, NoReader> {
+        let t: SharedTransport =
+            std::sync::Arc::new(crate::transport::LocalTransport::new(dir.path()));
+        write_pack_names(t.as_ref(), true, &BTreeSet::new()).unwrap();
+        PackCollection::open(t, true).unwrap()
+    }
+
+    /// `pack-names` is not rewritten while another writer holds the
+    /// repository's lock directory.
+    #[test]
+    fn save_waits_for_the_names_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut packs = empty_collection(&dir);
+        packs.allocate("a".to_string(), b"1".to_vec()).unwrap();
+        let other = crate::transport::LocalTransport::new(dir.path());
+        let mut held = LockDir::new(&other, NAMES_LOCK);
+        held.attempt_lock().unwrap();
+
+        assert!(matches!(
+            packs.save_waiting(&mut crate::lockable_files::NoWait),
+            Err(RepositoryError::Locking(LockableFilesError::Contention))
+        ));
+        assert_eq!(Vec::<PackEntry>::new(), read_pack_names(&other).unwrap());
+
+        struct Release<'a, 't>(&'a mut LockDir<'t>);
+        impl LockWaiter for Release<'_, '_> {
+            fn contended(&mut self, holder: Option<&LockHeldInfo>) -> bool {
+                assert!(holder.is_some());
+                self.0.unlock().unwrap();
+                true
+            }
+        }
+        packs.save_waiting(&mut Release(&mut held)).unwrap();
+        assert_eq!(vec![entry("a", "1")], read_pack_names(&other).unwrap());
+        assert!(LockDir::new(&other, NAMES_LOCK).peek().unwrap().is_none());
     }
 
     #[test]

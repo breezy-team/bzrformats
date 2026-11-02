@@ -22,7 +22,6 @@ use crate::transport::{SharedTransport, Transport};
 
 use super::format::RepositoryFormat;
 use super::pack_2a::RepositoryError;
-use super::pack_collection::CombinedIndex as _;
 use super::unkey_knit_parent_map;
 use crate::declare_repository_format;
 use crate::xml_serializer::{
@@ -164,98 +163,63 @@ enum RepackTarget {
     Signatures,
 }
 
-/// A [`KnitIndex`] built from the per-pack btree indices of one kind,
-/// merged across all packs. Clones share the index, so the repository can
-/// add and remove packs under the store reading through it.
-#[derive(Clone, Default)]
-struct PackKnitIndex {
-    state: std::sync::Arc<std::sync::RwLock<PackKnitIndexState>>,
+/// A [`KnitIndex`] built from the per-pack indices of one kind, merged
+/// across all packs, each read when first needed.
+type PackKnitIndex = super::pack_collection::LazyPackIndex<KnitKey, KnitRecordDetails<PackName>>;
+
+/// The combined index for `kind` across `packs`.
+fn pack_knit_index(
+    transport: &SharedTransport,
+    packs: &[PackName],
+    kind: IndexKind,
+) -> PackKnitIndex {
+    PackKnitIndex::new(
+        SharedTransport::clone(transport),
+        packs,
+        kind,
+        read_knit_pack_index,
+        |details| &details.index_memo.file_ref,
+    )
 }
 
-#[derive(Default)]
-struct PackKnitIndexState {
-    /// key -> record details (method, noeol, location, parents).
-    entries: HashMap<KnitKey, KnitRecordDetails<PackName>>,
-    has_graph: bool,
-}
-
-impl PackKnitIndex {
-    /// Build the combined index for `kind` across `packs`.
-    ///
-    /// `key_segments` is the number of key elements (1 for revisions and
-    /// inventories, 2 for texts). The btree value is `<flag><pos> <size>`;
-    /// the second reference list (when present and non-empty) names the
-    /// compression parent and marks the record as a line-delta.
-    fn load(
-        transport: &dyn Transport,
-        packs: &[PackName],
-        kind: IndexKind,
-    ) -> Result<Self, RepositoryError> {
-        let index = PackKnitIndex::default();
-        for pack in packs {
-            index.add_pack(transport, pack, kind, false)?;
-        }
-        Ok(index)
+/// Add the entries of the index `name` of `pack` to `entries`.
+///
+/// The index value is `<flag><pos> <size>`; the second reference list (when
+/// present and non-empty) names the compression parent and marks the record
+/// as a line-delta.
+fn read_knit_pack_index(
+    transport: &dyn Transport,
+    name: &str,
+    pack: &str,
+    entries: &mut HashMap<KnitKey, KnitRecordDetails<PackName>>,
+) -> Result<(), RepositoryError> {
+    let index = super::pack_index::PackIndex::open(transport, name)?;
+    for (key, value, refs) in index.iter_all_entries() {
+        let parsed = parse_knit_index_value(value)
+            .map_err(|e| RepositoryError::Corrupt(format!("knit index value: {e}")))?;
+        let parents: Vec<KnitKey> = refs.first().cloned().unwrap_or_default();
+        let compression_parent: Option<KnitKey> = refs.get(1).and_then(|cp| cp.first().cloned());
+        let method = if compression_parent.is_some() {
+            KnitMethod::LineDelta
+        } else {
+            KnitMethod::Fulltext
+        };
+        entries.insert(
+            key.clone(),
+            KnitRecordDetails {
+                method,
+                noeol: parsed.noeol,
+                index_memo: KnitIndexMemo {
+                    file_ref: pack.to_string(),
+                    offset: parsed.pos,
+                    length: parsed.size as usize,
+                },
+                compression_parent,
+                parents,
+            },
+        );
     }
-}
-
-impl super::pack_collection::CombinedIndex for PackKnitIndex {
-    /// Add the entries of `pack`'s index for `kind`.
-    fn add_pack(
-        &self,
-        transport: &dyn Transport,
-        pack: &str,
-        kind: IndexKind,
-        resumed: bool,
-    ) -> Result<(), RepositoryError> {
-        let name = super::pack_collection::index_path(pack, index_extension(kind), resumed);
-        let index = super::pack_index::PackIndex::open(transport, &name)?;
-        let mut state = self.state.write().unwrap();
-        if index.node_ref_lists() > 0 {
-            state.has_graph = true;
-        }
-        {
-            let entries = &mut state.entries;
-            for (key, value, refs) in index.iter_all_entries() {
-                let parsed = parse_knit_index_value(value)
-                    .map_err(|e| RepositoryError::Corrupt(format!("knit index value: {e}")))?;
-                let parents: Vec<KnitKey> = refs.first().cloned().unwrap_or_default();
-                // A non-empty second reference list (the compression parent)
-                // means this record is a line-delta against it.
-                let compression_parent: Option<KnitKey> =
-                    refs.get(1).and_then(|cp| cp.first().cloned());
-                let method = if compression_parent.is_some() {
-                    KnitMethod::LineDelta
-                } else {
-                    KnitMethod::Fulltext
-                };
-                entries.insert(
-                    key.clone(),
-                    KnitRecordDetails {
-                        method,
-                        noeol: parsed.noeol,
-                        index_memo: KnitIndexMemo {
-                            file_ref: pack.to_string(),
-                            offset: parsed.pos,
-                            length: parsed.size as usize,
-                        },
-                        compression_parent,
-                        parents,
-                    },
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Drop the entries of `pack`.
-    fn remove_pack(&self, pack: &str) {
-        self.state
-            .write()
-            .unwrap()
-            .entries
-            .retain(|_, details| details.index_memo.file_ref != pack);
-    }
+    Ok(())
 }
 
 impl KnitIndex for PackKnitIndex {
@@ -265,39 +229,30 @@ impl KnitIndex for PackKnitIndex {
         &self,
         keys: &[KnitKey],
     ) -> Result<HashMap<KnitKey, KnitRecordDetails<Self::F>>, KnitError> {
-        let mut out = HashMap::new();
-        for key in keys {
-            if let Some(d) = self.state.read().unwrap().entries.get(key) {
-                out.insert(key.clone(), d.clone());
-            }
-        }
-        Ok(out)
+        self.with_entries(|entries| {
+            keys.iter()
+                .filter_map(|key| Some((key.clone(), entries.get(key)?.clone())))
+                .collect()
+        })
     }
 
     fn keys(&self) -> Result<Vec<KnitKey>, KnitError> {
-        Ok(self.state.read().unwrap().entries.keys().cloned().collect())
+        self.with_entries(|entries| entries.keys().cloned().collect())
     }
 
     fn get_parent_map(
         &self,
         keys: &[KnitKey],
     ) -> Result<HashMap<KnitKey, Vec<KnitKey>>, KnitError> {
-        let mut out = HashMap::new();
-        for key in keys {
-            if let Some(d) = self.state.read().unwrap().entries.get(key) {
-                out.insert(key.clone(), d.parents.clone());
-            }
-        }
-        Ok(out)
+        self.with_entries(|entries| {
+            keys.iter()
+                .filter_map(|key| Some((key.clone(), entries.get(key)?.parents.clone())))
+                .collect()
+        })
     }
 
     fn get_method(&self, key: &KnitKey) -> Result<KnitMethod, KnitError> {
-        self.state
-            .read()
-            .unwrap()
-            .entries
-            .get(key)
-            .map(|d| d.method)
+        self.with_entries(|entries| entries.get(key).map(|d| d.method))?
             .ok_or_else(|| KnitError::RevisionNotPresent(key.clone()))
     }
 
@@ -328,12 +283,18 @@ impl KnitIndex for PackKnitIndex {
         });
     }
 
+    /// Fixed by the kind, as the pack formats define their indices:
+    /// revisions, inventories and texts record their parents, signatures
+    /// do not.
     fn has_graph(&self) -> bool {
-        self.state.read().unwrap().has_graph
+        matches!(
+            self.kind(),
+            IndexKind::Revision | IndexKind::Inventory | IndexKind::Text
+        )
     }
 
     fn contains(&self, key: &KnitKey) -> Result<bool, KnitError> {
-        Ok(self.state.read().unwrap().entries.contains_key(key))
+        self.with_entries(|entries| entries.contains_key(key))
     }
 
     fn get_missing_compression_parents(&self) -> Result<Vec<KnitKey>, KnitError> {
@@ -491,7 +452,7 @@ fn build_store_with_handles(
     packs: &[PackName],
     kind: IndexKind,
 ) -> Result<(Store, PackKnitIndex, PackKnitAccess), RepositoryError> {
-    let index = PackKnitIndex::load(transport.as_ref(), packs, kind)?;
+    let index = pack_knit_index(transport, packs, kind);
     let access = PackKnitAccess::new(transport.clone());
     // max_delta_chain of 200 mirrors breezy's pack repositories.
     let store = KnitVersionedFiles::new(index.clone(), access.clone(), KnitPlainFactory, 200);
@@ -524,10 +485,7 @@ impl KnitPackRepository {
         let format = check_format(transport.as_ref())?;
         let mut packs = Packs::open(SharedTransport::clone(&transport), format.uses_btree_index)?;
         Ok(KnitPackRepository {
-            lock: crate::lockable_files::LockableFiles::new(
-                SharedTransport::clone(&transport),
-                format.uses_lock_dir.then_some("lock"),
-            ),
+            lock: super::repository_lock(SharedTransport::clone(&transport), format),
             format,
             revisions: build_registered_store(&mut packs, &transport, IndexKind::Revision)?,
             inventories: build_registered_store(&mut packs, &transport, IndexKind::Inventory)?,
@@ -782,14 +740,14 @@ impl KnitPackRepository {
             }
         }
 
-        self.start_write_group()?;
-        let group = self.write_group.as_ref().expect("just opened");
-        group.copy_store_keys(&source.revisions, RepackTarget::Revisions, &rev_keys)?;
-        group.copy_store_keys(&source.inventories, RepackTarget::Inventories, &rev_keys)?;
-        group.copy_store_keys(&source.signatures, RepackTarget::Signatures, &rev_keys)?;
-        group.copy_store_keys(&source.texts, RepackTarget::Texts, &text_keys)?;
-        self.commit_write_group()?;
-        Ok(())
+        super::with_write_group(self, |repo| {
+            let group = repo.write_group.as_ref().expect("just opened");
+            group.copy_store_keys(&source.revisions, RepackTarget::Revisions, &rev_keys)?;
+            group.copy_store_keys(&source.inventories, RepackTarget::Inventories, &rev_keys)?;
+            group.copy_store_keys(&source.signatures, RepackTarget::Signatures, &rev_keys)?;
+            group.copy_store_keys(&source.texts, RepackTarget::Texts, &text_keys)
+        })
+        .map(drop)
     }
 
     /// Reconcile: regenerate storage keeping only data reachable from this

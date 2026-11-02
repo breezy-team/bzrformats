@@ -514,14 +514,19 @@ impl StackedRepository {
 }
 
 impl StackedRepository {
-    /// Read-lock the fallbacks, releasing the primary again on failure.
+    /// Read-lock the fallbacks, releasing those locked and the primary
+    /// again on failure. The failure to lock is what is reported; a failure
+    /// to release is logged, as breezy suppresses it.
     fn lock_fallbacks(&mut self) -> Result<(), RepositoryError> {
         for i in 0..self.fallbacks.len() {
             if let Err(e) = self.fallbacks[i].lock_read() {
-                for fallback in &mut self.fallbacks[..i] {
-                    fallback.unlock()?;
+                let released = self.fallbacks[..i]
+                    .iter_mut()
+                    .map(|fallback| fallback.unlock())
+                    .chain(std::iter::once(self.primary.unlock()));
+                for failure in released.filter_map(Result::err) {
+                    log::warn!("failed to release repository lock: {failure}");
                 }
-                self.primary.unlock()?;
                 return Err(e);
             }
         }
@@ -549,15 +554,22 @@ impl Lockable for StackedRepository {
         self.lock_write_with_token(None, waiter)
     }
 
-    /// The fallbacks are released with the last lock.
+    /// The fallbacks are released with the last lock, even if releasing the
+    /// primary failed after giving up its lock (e.g. on an open write group);
+    /// the first error is returned.
     fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, RepositoryError> {
-        let released = self.primary.unlock()?;
+        let mut released = self.primary.unlock();
         if !self.primary.lock().is_locked() {
             for fallback in &mut self.fallbacks {
-                fallback.unlock()?;
+                let unlocked = fallback.unlock();
+                if released.is_ok() {
+                    if let Err(e) = unlocked {
+                        released = Err(e);
+                    }
+                }
             }
         }
-        Ok(released)
+        released
     }
 }
 
@@ -817,6 +829,31 @@ pub fn lock_read<R: Repository + ?Sized>(repository: &mut R) -> Result<(), Repos
     Ok(())
 }
 
+/// Fail with [`RepositoryError::NotWriteLocked`] unless `lock` is held for
+/// writing, as breezy's versioned files check before each write.
+pub(crate) fn check_write_locked(
+    lock: &crate::lockable_files::LockableFiles,
+) -> Result<(), RepositoryError> {
+    if lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
+        return Err(RepositoryError::NotWriteLocked);
+    }
+    Ok(())
+}
+
+/// The lock of a metadir repository of `format` rooted at `transport`: its
+/// lock directory `lock`, which write locks take only if the format
+/// [uses it](RepositoryFormat::uses_lock_dir).
+pub(crate) fn repository_lock(
+    transport: SharedTransport,
+    format: &RepositoryFormat,
+) -> crate::lockable_files::LockableFiles {
+    if format.uses_lock_dir {
+        crate::lockable_files::LockableFiles::new(transport, "lock")
+    } else {
+        crate::lockable_files::LockableFiles::counted(transport, "lock")
+    }
+}
+
 /// Release one lock on `repository`: how a repository's
 /// [`Lockable::unlock`] works unless it locks differently. Releasing the
 /// last write lock with a write group open aborts the write group, releases
@@ -934,11 +971,11 @@ mod tests {
                 label: "weave",
                 create: |t| Box::new(WeaveRepository::create(t, weave6()).unwrap()),
                 reopen: |t| {
-                    let os_lock = crate::lockable_files::TransportLock::new(
+                    let lock = crate::lockable_files::LockableFiles::with_os_lock(
                         SharedTransport::clone(&t),
                         crate::lockable_files::BRANCH_LOCK,
                     );
-                    Box::new(WeaveRepository::open(t, weave6(), os_lock).unwrap())
+                    Box::new(WeaveRepository::open(t, weave6(), lock).unwrap())
                 },
                 signs: true,
             },
@@ -1031,6 +1068,35 @@ mod tests {
                     s.label
                 );
             }
+        }
+    }
+
+    /// Every format refuses writes unless write-locked, including those
+    /// without write groups.
+    #[test]
+    fn writes_need_a_write_lock() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(SharedTransport::clone(&t));
+            assert!(
+                repo.add_revision(&revision(b"rev-1", vec![], "first"), &[])
+                    .is_err(),
+                "{}",
+                s.label
+            );
+            repo.lock_read().unwrap();
+            assert!(
+                repo.add_text(b"file-1", b"rev-1", &[], b"text\n").is_err(),
+                "{}",
+                s.label
+            );
+            repo.unlock().unwrap();
+            assert!(
+                !(s.reopen)(t).has_revision(b"rev-1").unwrap(),
+                "{}",
+                s.label
+            );
         }
     }
 
@@ -1758,6 +1824,24 @@ mod tests {
         Box::new(Pack2aRepository::open(t).unwrap())
     }
 
+    /// Opening a 2a repository reads none of its pack indices; one that
+    /// cannot be read is an error once it is needed.
+    #[test]
+    fn pack_2a_indices_are_read_when_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        make_2a_with_rev(dir.path(), b"rev-1");
+        for index in std::fs::read_dir(dir.path().join("indices")).unwrap() {
+            let index = index.unwrap().path();
+            if index.extension().is_some_and(|ext| ext == "rix") {
+                std::fs::remove_file(index).unwrap();
+            }
+        }
+        let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let repo = Pack2aRepository::open(t).unwrap();
+        assert!(repo.get_file_text(b"file-1", b"rev-1").is_ok());
+        assert!(repo.has_revision(b"rev-1").is_err());
+    }
+
     /// A stacked repository resolves revisions, inventories and file texts that
     /// live only in a fallback, while its own all_revision_ids stays primary.
     #[test]
@@ -1792,6 +1876,45 @@ mod tests {
             stacked.get_revision(b"rev-missing"),
             Err(RepositoryError::NoSuchRevision(_))
         ));
+    }
+
+    /// Unlocking a stacked repository with a write group open still releases
+    /// the fallbacks along with the primary.
+    #[test]
+    fn stacked_unlock_with_write_group_open_releases_fallbacks() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let base = make_2a_with_rev(base_dir.path(), b"rev-base");
+        let top_dir = tempfile::tempdir().unwrap();
+        let top_t: SharedTransport = Arc::new(LocalTransport::new(top_dir.path()));
+        let primary = Box::new(Pack2aRepository::create(top_t).unwrap()) as Box<dyn Repository>;
+        let mut stacked = StackedRepository::new(primary);
+        stacked.add_fallback_repository(base).unwrap();
+
+        stacked
+            .lock_write(&mut crate::lockable_files::NoWait)
+            .unwrap();
+        assert!(stacked.fallbacks[0].lock().is_locked());
+        stacked.start_write_group().unwrap();
+        assert!(matches!(
+            stacked.unlock(),
+            Err(RepositoryError::WriteGroupOpen { .. })
+        ));
+        assert!(!stacked.lock().is_locked());
+        assert!(!stacked.fallbacks[0].lock().is_locked());
+    }
+
+    /// A pack repository's write lock only counts, but the lock directory it
+    /// takes while saving its pack names is reported and broken through it.
+    #[test]
+    fn pack_repository_breaks_a_stale_names_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let repo = Pack2aRepository::create(SharedTransport::clone(&t)).unwrap();
+        crate::lockdir::hold_lock(t.as_ref(), "lock");
+
+        assert!(repo.lock().get_physical_lock_status().unwrap());
+        repo.break_lock(&mut |holder| holder.is_some()).unwrap();
+        assert!(!repo.lock().get_physical_lock_status().unwrap());
     }
 
     /// A plain backend reports that it does not support fallbacks.

@@ -106,6 +106,8 @@ pub enum BranchError {
     Unsupported(String),
     /// The master branch of a bound branch could not be opened.
     Master(Box<crate::bzrdir::BzrDirError>),
+    /// The branch's `format` marker is not one this crate knows.
+    UnknownFormat(Vec<u8>),
 }
 
 impl std::fmt::Display for BranchError {
@@ -121,6 +123,11 @@ impl std::fmt::Display for BranchError {
             BranchError::Unstackable => write!(f, "branch format does not support stacking"),
             BranchError::Unsupported(op) => write!(f, "unsupported branch operation: {op}"),
             BranchError::Master(e) => write!(f, "opening master branch: {e}"),
+            BranchError::UnknownFormat(marker) => write!(
+                f,
+                "unknown branch format: {:?}",
+                String::from_utf8_lossy(marker)
+            ),
         }
     }
 }
@@ -161,23 +168,28 @@ pub struct Branch {
     /// The branch's lock, which its writes take.
     lock: crate::lockable_files::LockableFiles,
     repository: Box<dyn Repository>,
+    /// Whether the branch shares its lock with its repository, as an
+    /// all-in-one branch does.
+    shares_repository_lock: bool,
 }
 
 /// Locking a branch locks its repository in the same mode with the first
-/// lock, and releases it with the last. Writes take a write
-/// lock for themselves while the branch is unlocked.
+/// lock, and releases it with the last. A branch that shares its lock with
+/// its repository locks and releases the repository with every lock, as
+/// breezy's all-in-one branches do, so that the shared count balances.
+/// Writes take a write lock for themselves while the branch is unlocked.
 impl Lockable for Branch {
     type Error = BranchError;
 
     fn lock_read(&mut self) -> Result<(), BranchError> {
-        let first = !self.lock.is_locked();
-        if first {
+        let cascade = self.locks_repository();
+        if cascade {
             self.repository
                 .lock_read()
                 .map_err(BranchError::Repository)?;
         }
         if let Err(e) = self.lock.lock_read() {
-            if first {
+            if cascade {
                 self.repository.unlock().map_err(BranchError::Repository)?;
             }
             return Err(BranchError::Locking(e));
@@ -194,7 +206,7 @@ impl Lockable for Branch {
     fn unlock(&mut self) -> Result<Option<LockToken>, BranchError> {
         let was_locked = self.lock.is_locked();
         let released = self.lock.unlock().map_err(BranchError::Locking);
-        if was_locked && !self.lock.is_locked() {
+        if was_locked && (self.shares_repository_lock || !self.lock.is_locked()) {
             let unlocked = self.repository.unlock().map_err(BranchError::Repository);
             return released.and_then(|token| unlocked.map(|_| token));
         }
@@ -204,11 +216,13 @@ impl Lockable for Branch {
 
 /// The format of the branch reachable through `transport`, from its
 /// `format` marker, as [`Branch::open`] opens it. A missing marker is
-/// treated as the modern default format.
-pub fn branch_format(transport: &dyn Transport) -> &'static BranchFormat {
+/// treated as the modern default format; a marker this crate does not know
+/// is [`BranchError::UnknownFormat`].
+pub fn branch_format(transport: &dyn Transport) -> Result<&'static BranchFormat, BranchError> {
     match transport.get_bytes("format") {
-        Ok(marker) => find_format(&marker).unwrap_or(DEFAULT_FORMAT),
-        Err(_) => DEFAULT_FORMAT,
+        Ok(marker) => find_format(&marker).ok_or(BranchError::UnknownFormat(marker)),
+        Err(TransportError::NoSuchFile(_)) => Ok(DEFAULT_FORMAT),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -216,14 +230,14 @@ pub fn branch_format(transport: &dyn Transport) -> &'static BranchFormat {
 /// is a branch reference; read before the branch is opened, since a
 /// reference has no repository of its own.
 pub fn reference_location(transport: &dyn Transport) -> Result<Option<String>, BranchError> {
-    read_reference(transport, branch_format(transport))
+    read_reference(transport, branch_format(transport)?)
 }
 
 /// The location the branch reachable through `transport` is stacked on, if
 /// it is stacked; read before the branch is opened, to find the fallback
 /// for its repository.
 pub fn stacked_on_location(transport: &dyn Transport) -> Result<Option<String>, BranchError> {
-    if !branch_format(transport).supports_stacking {
+    if !branch_format(transport)?.supports_stacking {
         return Ok(None);
     }
     read_config_location(transport, "stacked_on_location")
@@ -285,17 +299,21 @@ fn read_reference(
 impl Branch {
     /// Open the branch reachable through `transport` (rooted at
     /// `.bzr/branch`), with its revisions in `repository`, reading its
-    /// `format` marker to learn how the tip is stored. A missing marker is
-    /// treated as the modern default format.
-    pub fn open(transport: SharedTransport, repository: Box<dyn Repository>) -> Self {
-        let format = branch_format(transport.as_ref());
+    /// `format` marker to learn how the tip is stored, as [`branch_format`]
+    /// does.
+    pub fn open(
+        transport: SharedTransport,
+        repository: Box<dyn Repository>,
+    ) -> Result<Self, BranchError> {
+        let format = branch_format(transport.as_ref())?;
         let lock = crate::lockable_files::branch_lock(SharedTransport::clone(&transport));
-        Branch {
+        Ok(Branch {
             transport,
             format,
             lock,
             repository,
-        }
+            shares_repository_lock: false,
+        })
     }
 
     /// Open the branch reachable through `transport` as a specific `format`,
@@ -304,24 +322,26 @@ impl Branch {
     /// The all-in-one weave layout has no `.bzr/branch/format` file -- the
     /// branch lives at `.bzr` itself with its tip in `.bzr/revision-history`
     /// -- so the format (full-history branch format 5) is supplied directly.
-    /// It is locked through `os_lock`, the lock on `.bzr/branch-lock` it
-    /// shares with the control directory's repository and working tree.
+    /// It is locked through `lock`, the lock on `.bzr/branch-lock` it shares
+    /// with `repository` and the control directory's working tree.
     pub fn with_format(
         transport: SharedTransport,
         format: &'static BranchFormat,
         repository: Box<dyn Repository>,
-        os_lock: crate::lockable_files::TransportLock,
+        lock: crate::lockable_files::LockableFiles,
     ) -> Self {
-        let lock = crate::lockable_files::LockableFiles::with_os_lock(
-            SharedTransport::clone(&transport),
-            os_lock,
-        );
         Branch {
             transport,
             format,
             lock,
             repository,
+            shares_repository_lock: true,
         }
+    }
+
+    /// Whether taking a lock on the branch takes one on its repository.
+    fn locks_repository(&self) -> bool {
+        self.shares_repository_lock || !self.lock.is_locked()
     }
 
     /// The repository holding the branch's revisions.
@@ -361,10 +381,13 @@ impl Branch {
         let Some(location) = self.get_bound_location()? else {
             return Ok(None);
         };
-        let path = location.strip_prefix("file://").unwrap_or(&location);
+        let unsupported =
+            |why: String| BranchError::Unsupported(format!("opening the master branch: {why}"));
+        let path =
+            crate::bzrdir::location_path(&location).map_err(|e| unsupported(e.to_string()))?;
         if !path.starts_with('/') {
-            return Err(BranchError::Unsupported(format!(
-                "opening the master branch at {location}"
+            return Err(unsupported(format!(
+                "{location} is not an absolute location"
             )));
         }
         let root = crate::transport::LocalTransport::new("/");
@@ -385,8 +408,8 @@ impl Branch {
         token: Option<&LockToken>,
         waiter: &mut dyn LockWaiter,
     ) -> Result<WriteLocked, BranchError> {
-        let first = !self.lock.is_locked();
-        if first {
+        let cascade = self.locks_repository();
+        if cascade {
             self.repository
                 .lock_write(waiter)
                 .map_err(BranchError::Repository)?;
@@ -394,7 +417,7 @@ impl Branch {
         match self.lock.lock_write(token, waiter) {
             Ok(locked) => Ok(locked),
             Err(e) => {
-                if first {
+                if cascade {
                     self.repository.unlock().map_err(BranchError::Repository)?;
                 }
                 Err(BranchError::Locking(e))
@@ -983,7 +1006,7 @@ mod tests {
         } else {
             Box::new(crate::repository::Pack2aRepository::create(repo_t).unwrap())
         };
-        Branch::open(transport, repository)
+        Branch::open(transport, repository).unwrap()
     }
 
     /// A branch over a temp dir, plus a borrowed handle to the same
@@ -1542,6 +1565,33 @@ mod tests {
     }
 
     // --- Branch reference format ---
+
+    /// A missing marker is the default format, but an unknown or unreadable
+    /// one is an error rather than being taken for the default.
+    #[test]
+    fn branch_format_reports_unknown_and_unreadable_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = LocalTransport::new(dir.path());
+        assert_eq!(
+            DEFAULT_FORMAT.format_string,
+            branch_format(&t).unwrap().format_string
+        );
+
+        std::fs::write(dir.path().join("format"), b"Bazaar Branch Format 99\n").unwrap();
+        match branch_format(&t) {
+            Err(BranchError::UnknownFormat(marker)) => {
+                assert_eq!(b"Bazaar Branch Format 99\n".to_vec(), marker)
+            }
+            other => panic!(
+                "expected an unknown format, got {:?}",
+                other.map(|f| f.description)
+            ),
+        }
+
+        std::fs::remove_file(dir.path().join("format")).unwrap();
+        std::fs::create_dir(dir.path().join("format")).unwrap();
+        assert!(matches!(branch_format(&t), Err(BranchError::Transport(_))));
+    }
 
     #[test]
     fn get_reference_is_none_on_normal_branch() {

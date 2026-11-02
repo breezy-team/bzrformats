@@ -52,12 +52,12 @@ pub struct WeaveRepository {
 impl WeaveRepository {
     /// Open the weave repository whose stores live directly under `transport`
     /// (rooted at `.bzr`). `format` is the recognised weave format, and
-    /// `os_lock` the lock on `.bzr/branch-lock` it shares with the control
+    /// `lock` the lock on `.bzr/branch-lock` it shares with the control
     /// directory's branch and working tree.
     pub fn open(
         transport: SharedTransport,
         format: &'static RepositoryFormat,
-        os_lock: crate::lockable_files::TransportLock,
+        lock: crate::lockable_files::LockableFiles,
     ) -> Result<Self, RepositoryError> {
         if !format.is_all_in_one() {
             return Err(RepositoryError::UnsupportedFormat(
@@ -66,10 +66,7 @@ impl WeaveRepository {
         }
         Ok(WeaveRepository {
             in_write_group: false,
-            lock: crate::lockable_files::LockableFiles::with_os_lock(
-                SharedTransport::clone(&transport),
-                os_lock,
-            ),
+            lock,
             format,
             transport,
         })
@@ -97,12 +94,12 @@ impl WeaveRepository {
             &write_weave_v5(&WeaveFile::default()),
             None,
         )?;
-        let os_lock = crate::lockable_files::TransportLock::new(
+        let lock = crate::lockable_files::LockableFiles::with_os_lock(
             SharedTransport::clone(&transport),
             crate::lockable_files::BRANCH_LOCK,
         );
-        os_lock.create().map_err(RepositoryError::Locking)?;
-        Self::open(transport, format, os_lock)
+        lock.create_lock().map_err(RepositoryError::Locking)?;
+        Self::open(transport, format, lock)
     }
 
     /// The format this repository was opened as.
@@ -480,10 +477,7 @@ impl super::Repository for WeaveRepository {
     }
 
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {
-        // Writing needs the write lock.
-        if self.lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
-            return Err(RepositoryError::NotWriteLocked);
-        }
+        super::check_write_locked(&self.lock)?;
         if self.in_write_group {
             return Err(RepositoryError::AlreadyInWriteGroup);
         }
@@ -502,6 +496,7 @@ impl super::Repository for WeaveRepository {
         revision: &crate::revision::Revision,
         parents: &[Vec<u8>],
     ) -> Result<(), RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         WeaveRepository::add_revision(self, revision, parents)
     }
 
@@ -512,6 +507,7 @@ impl super::Repository for WeaveRepository {
         root_id: &[u8],
         entries: &[crate::inventory::Entry],
     ) -> Result<Vec<u8>, RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         WeaveRepository::add_inventory_from_entries(self, revision_id, parents, root_id, entries)
     }
 
@@ -522,6 +518,7 @@ impl super::Repository for WeaveRepository {
         new_revision_id: &[u8],
         parents: &[Vec<u8>],
     ) -> Result<Vec<u8>, RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         WeaveRepository::add_inventory_by_delta(
             self,
             basis_revision_id,
@@ -538,6 +535,7 @@ impl super::Repository for WeaveRepository {
         parents: &[(Vec<u8>, Vec<u8>)],
         bytes: &[u8],
     ) -> Result<(), RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         WeaveRepository::add_text(self, file_id, revision, parents, bytes)
     }
 
@@ -546,6 +544,7 @@ impl super::Repository for WeaveRepository {
         revision_id: &[u8],
         signature: &[u8],
     ) -> Result<(), RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         WeaveRepository::add_signature_text(self, revision_id, signature)
     }
 

@@ -17,14 +17,20 @@
 """Tests for the standalone control-directory API."""
 
 import os
+import threading
+import time
 
-from .. import controldir
+from .. import controldir, lock
 from ..errors import (
     BzrFormatsError,
     LockActive,
+    LockBroken,
     LockContention,
     LockNotHeld,
     NotStacked,
+    ReadOnlyError,
+    TokenLockingNotSupported,
+    TokenMismatch,
     UnsupportedOperation,
 )
 from . import TestCaseInTempDir
@@ -514,12 +520,12 @@ class TestLocking(TestCaseInTempDir):
         wt = controldir.create(self.test_dir).open_workingtree()
         branch = wt.branch
         repository = branch.repository
-        for lock, branch_mode, repository_write_locked in [
+        for take_lock, branch_mode, repository_write_locked in [
             (wt.lock_read, "r", False),
             (wt.lock_tree_write, "r", False),
             (wt.lock_write, "w", True),
         ]:
-            lock()
+            take_lock()
             self.assertEqual(
                 (True, branch_mode, True, repository_write_locked),
                 (
@@ -583,6 +589,113 @@ class TestLocking(TestCaseInTempDir):
         self.assertFalse(other.is_locked())
         branch.unlock()
         self.assertRaises(LockNotHeld, branch.unlock)
+
+    def test_mutators_raise_lock_errors(self):
+        cd = controldir.create(self.test_dir)
+        holder = cd.open_branch()
+        branch = controldir.open(self.test_dir).open_branch()
+        holder.lock_write()
+        self.assertRaises(LockContention, branch.set_tags, {"t": b"rev"})
+        holder.unlock()
+        branch.lock_read()
+        self.assertRaises(ReadOnlyError, branch.set_tags, {"t": b"rev"})
+        branch.unlock()
+
+    def test_lock_write_waits_for_the_holder(self):
+        cd = controldir.create(self.test_dir)
+        holder = cd.open_branch()
+        holder.lock_write()
+        branch = controldir.open(self.test_dir).open_branch()
+        lock.set_default_timeout(10)
+        releaser = threading.Timer(0.2, holder.unlock)
+        releaser.start()
+        started = time.monotonic()
+        with self.assertLogs("bazaar.lockable_files", "WARNING") as logs:
+            branch.lock_write()
+        releaser.join()
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(1, len(logs.output))
+        self.assertIn("Unable to obtain lock held by", logs.output[0])
+        branch.unlock()
+
+    def test_lock_hooks(self):
+        cd = controldir.create(self.test_dir)
+        seen = []
+
+        def record(name):
+            def hook(result):
+                if result.lock_url.startswith(self.test_dir):
+                    seen.append((name, os.path.basename(result.lock_url)))
+
+            return hook
+
+        for name in ["lock_acquired", "lock_released", "lock_broken"]:
+            lock.hooks.install_named_hook(name, record(name), "test")
+            self.addCleanup(lock.hooks.uninstall_named_hook, name, "test")
+        branch = cd.open_branch()
+        branch.lock_write()
+        branch.unlock()
+        holder = cd.open_branch()
+        holder.lock_write()
+        controldir.open(self.test_dir).open_branch().break_lock(lambda info: True)
+        self.assertEqual(
+            [
+                ("lock_acquired", "lock"),
+                ("lock_released", "lock"),
+                ("lock_acquired", "lock"),
+                ("lock_broken", "lock"),
+            ],
+            [entry for entry in seen if entry[1] == "lock"][:4],
+        )
+        self.assertRaises(KeyError, lock.hooks.install_named_hook, "bogus", print)
+
+    def test_unlocking_a_broken_lock(self):
+        cd = controldir.create(self.test_dir)
+        holder = cd.open_branch()
+        holder.lock_write()
+        controldir.open(self.test_dir).open_branch().break_lock(lambda info: True)
+        self.assertRaises(LockBroken, holder.unlock)
+
+    def test_lock_write_with_a_token_not_held(self):
+        branch = controldir.create(self.test_dir).open_branch()
+        self.assertRaises(TokenMismatch, branch.lock_write, "bogus")
+        self.assertFalse(branch.is_locked())
+
+    def test_pack_repository_lock(self):
+        repository = controldir.create(self.test_dir).open_repository()
+        repository.lock_write("ignored")
+        self.assertRaises(NotImplementedError, repository.leave_lock_in_place)
+        repository.unlock()
+
+    def test_all_in_one_lock(self):
+        cd = controldir.create(self.test_dir, format="weave")
+        branch = cd.open_branch()
+        self.assertRaises(TokenLockingNotSupported, branch.lock_write, "token")
+        self.assertRaises(NotImplementedError, branch.break_lock, lambda info: True)
+        repository = branch.repository
+        repository.lock_write()
+        branch.lock_read()
+        self.assertEqual("w", branch.peek_lock_mode())
+        branch.unlock()
+        repository.unlock()
+        self.assertFalse(branch.is_locked())
+
+    def test_tree_lock_mode(self):
+        wt = controldir.create(self.test_dir).open_workingtree()
+        self.assertEqual((None, False), (wt.peek_lock_mode(), wt.is_write_locked()))
+        wt.lock_read()
+        self.assertEqual(("r", False), (wt.peek_lock_mode(), wt.is_write_locked()))
+        wt.unlock()
+        wt.lock_tree_write()
+        self.assertEqual(("w", True), (wt.peek_lock_mode(), wt.is_write_locked()))
+        wt.unlock()
+
+    def test_bzrdir_break_lock(self):
+        cd = controldir.create(self.test_dir)
+        holder = cd.open_branch()
+        holder.lock_write()
+        controldir.open(self.test_dir).break_lock(lambda info: True)
+        self.assertFalse(holder.get_physical_lock_status())
 
     def test_commit_uses_the_tree_branch(self):
         wt = controldir.create(self.test_dir).open_workingtree()

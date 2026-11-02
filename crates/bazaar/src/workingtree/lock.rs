@@ -1,7 +1,7 @@
 //! The lock of a working tree: the lock directory `.bzr/checkout/lock` for
 //! writing, and for a dirstate tree an OS lock on the dirstate file while
-//! the tree is locked; an all-in-one tree instead shares the OS lock on
-//! `.bzr/branch-lock` with its branch. Locking the tree's branch is left to
+//! the tree is locked; an all-in-one tree instead shares its branch's lock,
+//! an OS lock on `.bzr/branch-lock`. Locking the tree's branch is left to
 //! the caller.
 
 use crate::dirstate::Transport as _;
@@ -26,7 +26,7 @@ impl TreeLock {
     /// The lock of the tree rooted at `transport`, with its lock directory
     /// at `lock_dir` (`None` for none); `dirstate` is the tree-relative
     /// path of its dirstate, for dirstate trees.
-    pub fn new(transport: SharedTransport, lock_dir: Option<&str>, dirstate: Option<&str>) -> Self {
+    pub fn new(transport: SharedTransport, lock_dir: &str, dirstate: Option<&str>) -> Self {
         let dirstate = dirstate
             .and_then(|path| transport.local_path(path))
             .map(|path| Arc::new(Mutex::new(crate::dirstate::FileTransport::new(path))));
@@ -36,14 +36,11 @@ impl TreeLock {
         }
     }
 
-    /// The lock of an all-in-one tree rooted at `transport`, which shares
-    /// `os_lock` with its branch and repository.
-    pub fn with_os_lock(
-        transport: SharedTransport,
-        os_lock: crate::lockable_files::TransportLock,
-    ) -> Self {
+    /// The lock of an all-in-one tree, `files`, which it shares with its
+    /// branch and repository.
+    pub fn shared(files: LockableFiles) -> Self {
         TreeLock {
-            files: LockableFiles::with_os_lock(transport, os_lock),
+            files,
             dirstate: None,
         }
     }
@@ -165,11 +162,7 @@ mod tests {
         std::fs::write(dir.path().join(".bzr/checkout/dirstate"), b"").unwrap();
         let transport: SharedTransport =
             Arc::new(crate::transport::LocalTransport::new(dir.path()));
-        let lock = TreeLock::new(
-            transport,
-            Some(CHECKOUT_LOCK),
-            Some(".bzr/checkout/dirstate"),
-        );
+        let lock = TreeLock::new(transport, CHECKOUT_LOCK, Some(".bzr/checkout/dirstate"));
         lock.files().create_lock().unwrap();
         lock
     }

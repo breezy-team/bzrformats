@@ -492,6 +492,10 @@ simple_error!(OutSideTransaction: BzrFormatsError, "A transaction related operat
 simple_error!(LockNotHeld: LockError, "Lock not held: %(lock)s"; lock);
 simple_error!(LockActive: LockError, "The lock for '%(lock_description)s' is in use and cannot be broken."; lock_description);
 simple_error!(LockBreakMismatch: LockError, "Lock was released and re-acquired before being broken: %(lock)s: held by %(holder)r, wanted to break %(target)r"; lock, holder, target);
+simple_error!(LockBroken: LockError, "Lock was broken while still open: %(lock)s - check storage consistency!"; lock);
+simple_error!(TokenMismatch: LockBroken, "The lock token %(given_token)r does not match lock token %(lock_token)r."; given_token, lock_token);
+simple_error!(TokenLockingNotSupported: LockError, "The object %(obj)s does not support token specifying a token when locking."; obj);
+simple_error!(LockFailed: LockError, "Cannot lock %(lock)s: %(why)s"; lock, why);
 
 simple_error!(InconsistentDelta: BzrFormatsError, "An inconsistent delta was supplied involving %(path)r, %(file_id)r\nreason: %(reason)s"; path, file_id, reason);
 
@@ -873,6 +877,10 @@ pub(crate) fn errors_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_class::<LockNotHeld>()?;
     m.add_class::<LockActive>()?;
     m.add_class::<LockBreakMismatch>()?;
+    m.add_class::<LockBroken>()?;
+    m.add_class::<TokenMismatch>()?;
+    m.add_class::<TokenLockingNotSupported>()?;
+    m.add_class::<LockFailed>()?;
     m.add_class::<AlreadyVersionedError>()?;
     m.add_class::<NotVersionedError>()?;
     Ok(m)
