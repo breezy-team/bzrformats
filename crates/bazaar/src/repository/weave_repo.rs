@@ -480,10 +480,7 @@ impl super::Repository for WeaveRepository {
     }
 
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {
-        // Writing needs the write lock.
-        if self.lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
-            return Err(RepositoryError::NotWriteLocked);
-        }
+        super::check_write_locked(&self.lock)?;
         if self.in_write_group {
             return Err(RepositoryError::AlreadyInWriteGroup);
         }
@@ -502,6 +499,7 @@ impl super::Repository for WeaveRepository {
         revision: &crate::revision::Revision,
         parents: &[Vec<u8>],
     ) -> Result<(), RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         WeaveRepository::add_revision(self, revision, parents)
     }
 
@@ -512,6 +510,7 @@ impl super::Repository for WeaveRepository {
         root_id: &[u8],
         entries: &[crate::inventory::Entry],
     ) -> Result<Vec<u8>, RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         WeaveRepository::add_inventory_from_entries(self, revision_id, parents, root_id, entries)
     }
 
@@ -522,6 +521,7 @@ impl super::Repository for WeaveRepository {
         new_revision_id: &[u8],
         parents: &[Vec<u8>],
     ) -> Result<Vec<u8>, RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         WeaveRepository::add_inventory_by_delta(
             self,
             basis_revision_id,
@@ -538,6 +538,7 @@ impl super::Repository for WeaveRepository {
         parents: &[(Vec<u8>, Vec<u8>)],
         bytes: &[u8],
     ) -> Result<(), RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         WeaveRepository::add_text(self, file_id, revision, parents, bytes)
     }
 
@@ -546,6 +547,7 @@ impl super::Repository for WeaveRepository {
         revision_id: &[u8],
         signature: &[u8],
     ) -> Result<(), RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         WeaveRepository::add_signature_text(self, revision_id, signature)
     }
 

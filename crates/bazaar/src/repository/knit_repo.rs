@@ -274,6 +274,7 @@ impl KnitRepository {
         revision: &crate::revision::Revision,
         parents: &[Vec<u8>],
     ) -> Result<(), RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         use crate::serializer::RevisionSerializer;
         let bytes = crate::xml_serializer::XMLRevisionSerializer5
             .write_revision_to_string(revision)
@@ -293,6 +294,7 @@ impl KnitRepository {
         revision_id: &[u8],
         signature: &[u8],
     ) -> Result<(), RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         let key: KnitKey = vec![revision_id.to_vec()];
         self.signatures
             .add_lines(key, Vec::new(), split_lines(signature), false)
@@ -321,6 +323,7 @@ impl KnitRepository {
         _root_id: &[u8],
         entries: &[crate::inventory::Entry],
     ) -> Result<Vec<u8>, RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         let mut inv = crate::inventory::MutableInventory::new();
         inv.revision_id = Some(crate::RevisionId::from(revision_id));
         for entry in entries {
@@ -339,6 +342,7 @@ impl KnitRepository {
         new_revision_id: &[u8],
         parents: &[Vec<u8>],
     ) -> Result<Vec<u8>, RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         let basis = if basis_revision_id == crate::branch::NULL_REVISION {
             crate::inventory::MutableInventory::new()
         } else {
@@ -378,6 +382,7 @@ impl KnitRepository {
         parents: &[(Vec<u8>, Vec<u8>)],
         bytes: &[u8],
     ) -> Result<(), RepositoryError> {
+        super::check_write_locked(&self.lock)?;
         self.texts
             .index()
             .load_prefix_typed(vec![file_id.to_vec()])
@@ -469,10 +474,7 @@ impl super::Repository for KnitRepository {
     }
 
     fn start_write_group(&mut self) -> Result<(), RepositoryError> {
-        // Writing needs the write lock.
-        if self.lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
-            return Err(RepositoryError::NotWriteLocked);
-        }
+        super::check_write_locked(&self.lock)?;
         if self.in_write_group {
             return Err(RepositoryError::AlreadyInWriteGroup);
         }

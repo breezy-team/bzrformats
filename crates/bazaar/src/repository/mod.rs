@@ -829,6 +829,17 @@ pub fn lock_read<R: Repository + ?Sized>(repository: &mut R) -> Result<(), Repos
     Ok(())
 }
 
+/// Fail with [`RepositoryError::NotWriteLocked`] unless `lock` is held for
+/// writing, as breezy's versioned files check before each write.
+pub(crate) fn check_write_locked(
+    lock: &crate::lockable_files::LockableFiles,
+) -> Result<(), RepositoryError> {
+    if lock.lock_mode() != Some(crate::lockable_files::LockMode::Write) {
+        return Err(RepositoryError::NotWriteLocked);
+    }
+    Ok(())
+}
+
 /// The lock of a metadir repository of `format` rooted at `transport`: its
 /// lock directory `lock`, which write locks take only if the format
 /// [uses it](RepositoryFormat::uses_lock_dir).
@@ -1057,6 +1068,35 @@ mod tests {
                     s.label
                 );
             }
+        }
+    }
+
+    /// Every format refuses writes unless write-locked, including those
+    /// without write groups.
+    #[test]
+    fn writes_need_a_write_lock() {
+        for s in scenarios() {
+            let dir = tempfile::tempdir().unwrap();
+            let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+            let mut repo = (s.create)(SharedTransport::clone(&t));
+            assert!(
+                repo.add_revision(&revision(b"rev-1", vec![], "first"), &[])
+                    .is_err(),
+                "{}",
+                s.label
+            );
+            repo.lock_read().unwrap();
+            assert!(
+                repo.add_text(b"file-1", b"rev-1", &[], b"text\n").is_err(),
+                "{}",
+                s.label
+            );
+            repo.unlock().unwrap();
+            assert!(
+                !(s.reopen)(t).has_revision(b"rev-1").unwrap(),
+                "{}",
+                s.label
+            );
         }
     }
 
