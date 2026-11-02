@@ -3228,7 +3228,8 @@ mod tests {
         let branch = crate::branch::Branch::open(
             parent.subtransport(".bzr/branch").unwrap(),
             Box::new(UnreadableRepository),
-        );
+        )
+        .unwrap();
         let mut wt = WorkingTree4::open(parent, branch).unwrap();
         match wt.set_parent_ids(std::slice::from_ref(&r1), true) {
             Err(WorkingTreeError::Repository(RepositoryError::Corrupt(message))) => {
@@ -4534,7 +4535,7 @@ mod tests {
         } else {
             Box::new(crate::repository::Pack2aRepository::create(repo_t).unwrap())
         };
-        crate::branch::Branch::open(root.subtransport(".bzr/branch").unwrap(), repository)
+        crate::branch::Branch::open(root.subtransport(".bzr/branch").unwrap(), repository).unwrap()
     }
 
     #[cfg(any(feature = "weave", feature = "knit"))]

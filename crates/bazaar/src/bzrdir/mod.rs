@@ -376,7 +376,8 @@ pub trait ControlDir: Send + Sync {
     fn open_branch_named(&self, name: &str) -> Result<crate::branch::Branch, BzrDirError> {
         let transport = self.branch_transport(name)?;
         let repository = self.branch_repository(transport.as_ref())?;
-        Ok(crate::branch::Branch::open(transport, repository))
+        crate::branch::Branch::open(transport, repository)
+            .map_err(|e| BzrDirError::Component(format!("opening branch: {e}")))
     }
 
     /// The repository of the branch reachable through `branch_transport`:
@@ -713,10 +714,14 @@ impl BzrDirMeta {
             return target.cloning_source_formats();
         }
         match self.find_repository() {
-            Ok(repository) => Ok((
-                Some(crate::branch::branch_format(sub.as_ref())),
-                Some(repository.format()),
-            )),
+            Ok(repository) => {
+                Ok((
+                    Some(crate::branch::branch_format(sub.as_ref()).map_err(|e| {
+                        BzrDirError::Component(format!("reading branch format: {e}"))
+                    })?),
+                    Some(repository.format()),
+                ))
+            }
             // A branch without a repository cannot be opened, so it has no
             // format to offer either.
             Err(BzrDirError::NoRepositoryPresent) => Ok((None, None)),
@@ -932,7 +937,8 @@ impl ControlDir for BzrDirMeta {
             return self.open_referenced_branch(&location);
         }
         let repository = self.branch_repository(sub.as_ref())?;
-        Ok(crate::branch::Branch::open(sub, repository))
+        crate::branch::Branch::open(sub, repository)
+            .map_err(|e| BzrDirError::Component(format!("opening branch: {e}")))
     }
 
     /// The format to create a clone or sprout of this control directory in.
