@@ -373,10 +373,13 @@ impl Branch {
         let Some(location) = self.get_bound_location()? else {
             return Ok(None);
         };
-        let path = location.strip_prefix("file://").unwrap_or(&location);
+        let unsupported =
+            |why: String| BranchError::Unsupported(format!("opening the master branch: {why}"));
+        let path =
+            crate::bzrdir::location_path(&location).map_err(|e| unsupported(e.to_string()))?;
         if !path.starts_with('/') {
-            return Err(BranchError::Unsupported(format!(
-                "opening the master branch at {location}"
+            return Err(unsupported(format!(
+                "{location} is not an absolute location"
             )));
         }
         let root = crate::transport::LocalTransport::new("/");

@@ -642,41 +642,32 @@ impl BzrDirMeta {
     /// Open the branch a reference's `location` points at.
     ///
     /// The location is the URL of the referenced branch's containing directory
-    /// (where its `.bzr` lives). breezy writes an absolute URL; a `file://`
-    /// prefix is stripped to a local path. The reference is opened as its own
-    /// control directory, and its branch returned (which may itself be a
-    /// reference, so the open recurses through [`open`]).
+    /// (where its `.bzr` lives), with a `branch` segment parameter naming a
+    /// colocated branch there. The referenced branch may itself be a
+    /// reference, whose location is resolved from its own control directory;
+    /// a chain that comes back to a branch it passed through is an error.
     fn open_referenced_branch(&self, location: &str) -> Result<crate::branch::Branch, BzrDirError> {
-        let (transport, name) = self.reference_target(location)?;
-        let target = open(transport)?;
-        if name.is_empty() {
-            return target.open_branch();
+        let mut base = SharedTransport::clone(&self.transport);
+        let mut location = location.to_string();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let (transport, name) = reference_target(&base, &location)?;
+            let key = (transport.local_path(""), name.clone());
+            if !seen.insert(key) {
+                return Err(BzrDirError::Component(format!(
+                    "branch reference cycle at {location}"
+                )));
+            }
+            let target = open(SharedTransport::clone(&transport))?;
+            match target.branch_reference(&name)? {
+                Some(next) => {
+                    base = transport;
+                    location = next;
+                }
+                None if name.is_empty() => return target.open_branch(),
+                None => return target.open_branch_named(&name),
+            }
         }
-        match target.branch_reference(&name)? {
-            Some(next) => self.open_referenced_branch(&next),
-            None => target.open_branch_named(&name),
-        }
-    }
-
-    /// The transport of the control directory a branch reference's
-    /// `location` points at, and the name of the branch there: the URL's
-    /// `branch` segment parameter, or empty for the default branch.
-    fn reference_target(&self, location: &str) -> Result<(SharedTransport, String), BzrDirError> {
-        let url_err = |e: crate::urlutils::Error| {
-            BzrDirError::Component(format!("branch reference {location:?}: {e}"))
-        };
-        let (base, params) =
-            crate::urlutils::split_segment_parameters(location).map_err(url_err)?;
-        let path = base.strip_prefix("file://").unwrap_or(base);
-        let path = crate::urlutils::unescape(path).map_err(url_err)?;
-        // The reference points at the directory containing `.bzr`; descend into
-        // its control directory.
-        let containing = self.transport.subtransport(&path)?;
-        let name = match params.get("branch") {
-            Some(value) => crate::urlutils::unescape(value).map_err(url_err)?,
-            None => String::new(),
-        };
-        Ok((containing.subtransport(".bzr")?, name))
     }
 
     /// The branch and repository formats a clone of this control directory
@@ -709,7 +700,7 @@ impl BzrDirMeta {
         {
             // TODO: take the formats of the referenced branch itself when it
             // is a colocated one, rather than its control directory's.
-            let (transport, _name) = self.reference_target(&location)?;
+            let (transport, _name) = reference_target(&self.transport, &location)?;
             let target = BzrDirMeta::open(transport)?;
             return target.cloning_source_formats();
         }
@@ -757,8 +748,7 @@ impl BzrDirMeta {
         &self,
         location: &str,
     ) -> Result<Box<dyn crate::repository::Repository>, BzrDirError> {
-        let path = location.strip_prefix("file://").unwrap_or(location);
-        let containing = self.transport.subtransport(path)?;
+        let containing = self.transport.subtransport(location_path(location)?)?;
         let base_bzr = containing.subtransport(".bzr")?;
         let base = BzrDirMeta::open(base_bzr)?;
         // Recurse so the base's own stacking (if any) is activated too.
@@ -851,13 +841,14 @@ impl ControlDir for BzrDirMeta {
     }
 
     /// `branch` for the default branch and `branches/NAME` for a colocated
-    /// one. The transport takes
-    /// the raw name; escaping it for a URL is the transport's business.
+    /// one, the name escaped as transport paths are.
     fn branch_transport(&self, name: &str) -> Result<SharedTransport, BzrDirError> {
         if name.is_empty() {
             return Ok(self.transport.subtransport(Component::Branch.subdir())?);
         }
-        Ok(self.transport.subtransport(&format!("branches/{name}"))?)
+        Ok(self
+            .transport
+            .subtransport(&format!("branches/{}", crate::key_mapper::url_quote(name)))?)
     }
 
     fn transport(&self) -> &SharedTransport {
@@ -1366,6 +1357,52 @@ fn empty_dirstate_bytes() -> Vec<u8> {
     state.get_lines().concat()
 }
 
+/// The transport of the control directory a branch reference's `location`
+/// points at, resolved from the control directory `base`, and the name of the
+/// branch there: the URL's `branch` segment parameter, or empty for the
+/// default branch.
+fn reference_target(
+    base: &SharedTransport,
+    location: &str,
+) -> Result<(SharedTransport, String), BzrDirError> {
+    let url_err = |e: crate::urlutils::Error| {
+        BzrDirError::Component(format!("branch reference {location:?}: {e}"))
+    };
+    let (url, params) = crate::urlutils::split_segment_parameters(location).map_err(url_err)?;
+    // The reference points at the directory containing `.bzr`; descend into
+    // its control directory.
+    let containing = base.subtransport(location_path(url)?)?;
+    let name = match params.get("branch") {
+        Some(value) => crate::urlutils::unescape(value).map_err(url_err)?,
+        None => String::new(),
+    };
+    Ok((containing.subtransport(".bzr")?, name))
+}
+
+/// The transport path of a location recorded in a control file (a branch
+/// reference, stacked-on or bound location): a `file://` URL's path, which
+/// is absolute, or a relative or absolute path as is.
+///
+/// The path stays URL-escaped, as transports take escaped paths. Locations
+/// on other hosts or with other schemes are not supported.
+pub(crate) fn location_path(location: &str) -> Result<&str, BzrDirError> {
+    let Some(rest) = location.strip_prefix("file://") else {
+        if location.contains("://") {
+            return Err(BzrDirError::Component(format!(
+                "unsupported location {location}"
+            )));
+        }
+        return Ok(location);
+    };
+    let path = rest.strip_prefix("localhost").unwrap_or(rest);
+    if !path.starts_with('/') {
+        return Err(BzrDirError::Component(format!(
+            "unsupported location {location}: not on this host"
+        )));
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1854,6 +1891,109 @@ mod tests {
             branch.last_revision_info().unwrap(),
             (3, b"rev-real".to_vec())
         );
+    }
+
+    /// Write a branch reference to `location` at `branch_dir`.
+    fn write_reference(branch_dir: &std::path::Path, location: &str) {
+        std::fs::create_dir_all(branch_dir).unwrap();
+        std::fs::write(
+            branch_dir.join("format"),
+            b"Bazaar-NG Branch Reference Format 1\n",
+        )
+        .unwrap();
+        std::fs::write(branch_dir.join("location"), location.as_bytes()).unwrap();
+    }
+
+    /// Create a metadir control directory at `root` whose branch is a
+    /// reference to `location`, and return its `.bzr`.
+    fn make_reference_dir(root: &std::path::Path, location: &str) -> std::path::PathBuf {
+        let bzr = root.join(".bzr");
+        std::fs::create_dir_all(&bzr).unwrap();
+        std::fs::write(bzr.join("branch-format"), METADIR_MARKER).unwrap();
+        write_reference(&bzr.join("branch"), location);
+        bzr
+    }
+
+    /// Create a standalone branch at `root` with tip `(3, rev-real)`.
+    fn make_tip_branch(root: &std::path::Path) {
+        std::fs::create_dir_all(root).unwrap();
+        let parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(root));
+        BzrDirMeta::create(&parent)
+            .unwrap()
+            .open_branch()
+            .unwrap()
+            .set_last_revision_info(3, b"rev-real")
+            .unwrap();
+    }
+
+    fn open_meta(bzr: &std::path::Path) -> BzrDirMeta {
+        BzrDirMeta::open(std::sync::Arc::new(LocalTransport::new(bzr))).unwrap()
+    }
+
+    /// A reference URL's path is unescaped once: `%25` is a literal `%` in
+    /// the directory name.
+    #[test]
+    fn open_branch_follows_reference_with_escaped_percent() {
+        let dir = tempfile::tempdir().unwrap();
+        make_tip_branch(&dir.path().join("a%41"));
+        let url = format!("file://{}/a%2541", dir.path().to_str().unwrap());
+        let ref_bzr = make_reference_dir(&dir.path().join("ref"), &url);
+        let branch = open_meta(&ref_bzr).open_branch().unwrap();
+        assert_eq!(
+            (3, b"rev-real".to_vec()),
+            branch.last_revision_info().unwrap()
+        );
+    }
+
+    /// A colocated branch that is itself a reference has its location
+    /// resolved from its own control directory, not the first reference's.
+    #[test]
+    fn open_branch_follows_chained_reference_from_colocated_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        make_tip_branch(&dir.path().join("y"));
+        let x = dir.path().join("x");
+        std::fs::create_dir_all(&x).unwrap();
+        let x_parent: SharedTransport = std::sync::Arc::new(LocalTransport::new(&x));
+        BzrDirMeta::create(&x_parent).unwrap();
+        // Relative to x/.bzr.
+        write_reference(&x.join(".bzr/branches/a"), "../../y");
+        std::fs::write(x.join(".bzr/branch-list"), b"a\n").unwrap();
+
+        let url = format!("file://{}/,branch=a", x.to_str().unwrap());
+        let ref_bzr = make_reference_dir(&dir.path().join("deep/ref"), &url);
+        let branch = open_meta(&ref_bzr).open_branch().unwrap();
+        assert_eq!(
+            (3, b"rev-real".to_vec()),
+            branch.last_revision_info().unwrap()
+        );
+    }
+
+    /// References that point at each other are an error rather than an
+    /// endless loop.
+    #[test]
+    fn open_branch_rejects_reference_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("p");
+        let q = dir.path().join("q");
+        let p_bzr = make_reference_dir(&p, &format!("file://{}", q.to_str().unwrap()));
+        make_reference_dir(&q, &format!("file://{}", p.to_str().unwrap()));
+        match open_meta(&p_bzr).open_branch() {
+            Err(BzrDirError::Component(message)) => {
+                assert!(message.starts_with("branch reference cycle"), "{}", message)
+            }
+            Err(e) => panic!("unexpected error {}", e),
+            Ok(_) => panic!("opened a branch through a reference cycle"),
+        }
+    }
+
+    #[test]
+    fn location_path_of_urls_and_paths() {
+        assert_eq!("/srv/a%20b", location_path("file:///srv/a%20b").unwrap());
+        assert_eq!("/srv/m", location_path("file://localhost/srv/m").unwrap());
+        assert_eq!("../trunk", location_path("../trunk").unwrap());
+        assert_eq!("/srv/m", location_path("/srv/m").unwrap());
+        assert!(location_path("file://elsewhere/srv/m").is_err());
+        assert!(location_path("bzr+ssh://host/srv/m").is_err());
     }
 
     /// A reference to a colocated branch names it with a `branch` segment
