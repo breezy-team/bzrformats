@@ -514,14 +514,19 @@ impl StackedRepository {
 }
 
 impl StackedRepository {
-    /// Read-lock the fallbacks, releasing the primary again on failure.
+    /// Read-lock the fallbacks, releasing those locked and the primary
+    /// again on failure. The failure to lock is what is reported; a failure
+    /// to release is logged, as breezy suppresses it.
     fn lock_fallbacks(&mut self) -> Result<(), RepositoryError> {
         for i in 0..self.fallbacks.len() {
             if let Err(e) = self.fallbacks[i].lock_read() {
-                for fallback in &mut self.fallbacks[..i] {
-                    fallback.unlock()?;
+                let released = self.fallbacks[..i]
+                    .iter_mut()
+                    .map(|fallback| fallback.unlock())
+                    .chain(std::iter::once(self.primary.unlock()));
+                for failure in released.filter_map(Result::err) {
+                    log::warn!("failed to release repository lock: {failure}");
                 }
-                self.primary.unlock()?;
                 return Err(e);
             }
         }
@@ -549,15 +554,22 @@ impl Lockable for StackedRepository {
         self.lock_write_with_token(None, waiter)
     }
 
-    /// The fallbacks are released with the last lock.
+    /// The fallbacks are released with the last lock, even if releasing the
+    /// primary failed after giving up its lock (e.g. on an open write group);
+    /// the first error is returned.
     fn unlock(&mut self) -> Result<Option<crate::lockable_files::LockToken>, RepositoryError> {
-        let released = self.primary.unlock()?;
+        let mut released = self.primary.unlock();
         if !self.primary.lock().is_locked() {
             for fallback in &mut self.fallbacks {
-                fallback.unlock()?;
+                let unlocked = fallback.unlock();
+                if released.is_ok() {
+                    if let Err(e) = unlocked {
+                        released = Err(e);
+                    }
+                }
             }
         }
-        Ok(released)
+        released
     }
 }
 
@@ -1792,6 +1804,31 @@ mod tests {
             stacked.get_revision(b"rev-missing"),
             Err(RepositoryError::NoSuchRevision(_))
         ));
+    }
+
+    /// Unlocking a stacked repository with a write group open still releases
+    /// the fallbacks along with the primary.
+    #[test]
+    fn stacked_unlock_with_write_group_open_releases_fallbacks() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let base = make_2a_with_rev(base_dir.path(), b"rev-base");
+        let top_dir = tempfile::tempdir().unwrap();
+        let top_t: SharedTransport = Arc::new(LocalTransport::new(top_dir.path()));
+        let primary = Box::new(Pack2aRepository::create(top_t).unwrap()) as Box<dyn Repository>;
+        let mut stacked = StackedRepository::new(primary);
+        stacked.add_fallback_repository(base).unwrap();
+
+        stacked
+            .lock_write(&mut crate::lockable_files::NoWait)
+            .unwrap();
+        assert!(stacked.fallbacks[0].lock().is_locked());
+        stacked.start_write_group().unwrap();
+        assert!(matches!(
+            stacked.unlock(),
+            Err(RepositoryError::WriteGroupOpen { .. })
+        ));
+        assert!(!stacked.lock().is_locked());
+        assert!(!stacked.fallbacks[0].lock().is_locked());
     }
 
     /// A plain backend reports that it does not support fallbacks.
