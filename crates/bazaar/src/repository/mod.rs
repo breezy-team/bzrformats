@@ -1824,6 +1824,24 @@ mod tests {
         Box::new(Pack2aRepository::open(t).unwrap())
     }
 
+    /// Opening a 2a repository reads none of its pack indices; one that
+    /// cannot be read is an error once it is needed.
+    #[test]
+    fn pack_2a_indices_are_read_when_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        make_2a_with_rev(dir.path(), b"rev-1");
+        for index in std::fs::read_dir(dir.path().join("indices")).unwrap() {
+            let index = index.unwrap().path();
+            if index.extension().is_some_and(|ext| ext == "rix") {
+                std::fs::remove_file(index).unwrap();
+            }
+        }
+        let t: SharedTransport = Arc::new(LocalTransport::new(dir.path()));
+        let repo = Pack2aRepository::open(t).unwrap();
+        assert!(repo.get_file_text(b"file-1", b"rev-1").is_ok());
+        assert!(repo.has_revision(b"rev-1").is_err());
+    }
+
     /// A stacked repository resolves revisions, inventories and file texts that
     /// live only in a fallback, while its own all_revision_ids stays primary.
     #[test]

@@ -11,9 +11,11 @@
 //! [`PackNames`] is the in-memory pack list and its reconciliation with the
 //! `pack-names` file, likewise ported from `RepositoryPackCollection`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, RwLock};
 
 use super::RepositoryError;
+use crate::knit::KnitError;
 use crate::lockable_files::{LockWaiter, LockableFilesError};
 use crate::lockdir::{Lock as _, LockDir, LockError};
 use crate::pack_repo::{index_extension, IndexKind};
@@ -209,18 +211,117 @@ impl PackNames {
 /// A combined index of one object kind over a repository's packs, which a
 /// [`PackCollection`] adds packs to and removes them from.
 pub trait CombinedIndex {
-    /// Add the entries of `pack`'s index for `kind`, read from the upload
-    /// directory if the pack is `resumed` from a suspended write group.
-    fn add_pack(
-        &self,
-        transport: &dyn Transport,
-        pack: &str,
-        kind: IndexKind,
-        resumed: bool,
-    ) -> Result<(), RepositoryError>;
+    /// Add the entries of `pack`'s index, read from the upload directory if
+    /// the pack is `resumed` from a suspended write group.
+    fn add_pack(&self, pack: &str, resumed: bool) -> Result<(), RepositoryError>;
 
     /// Drop the entries of `pack`.
     fn remove_pack(&self, pack: &str);
+}
+
+/// Reads the entries of one pack's index, at the given path, into the
+/// entries of a [`LazyPackIndex`].
+pub type ReadPackIndex<K, V> =
+    fn(&dyn Transport, &str, &str, &mut HashMap<K, V>) -> Result<(), RepositoryError>;
+
+/// The entries of the indices of one kind over a repository's packs, merged.
+/// The index of a pack listed in `pack-names` is read the first time the
+/// entries are needed, so opening a repository reads no indices; a pack
+/// resumed from a suspended write group is read at once, as finishing the
+/// write group moves its indices. Clones share the entries, so the
+/// repository can add and remove packs under the stores reading them.
+pub struct LazyPackIndex<K, V> {
+    transport: SharedTransport,
+    kind: IndexKind,
+    read_pack: ReadPackIndex<K, V>,
+    /// The pack an entry lives in.
+    pack_of: fn(&V) -> &str,
+    state: Arc<RwLock<LazyPackIndexState<K, V>>>,
+}
+
+struct LazyPackIndexState<K, V> {
+    entries: HashMap<K, V>,
+    /// The packs whose indices have not been read yet.
+    pending: Vec<String>,
+}
+
+impl<K, V> Clone for LazyPackIndex<K, V> {
+    fn clone(&self) -> Self {
+        LazyPackIndex {
+            transport: SharedTransport::clone(&self.transport),
+            kind: self.kind,
+            read_pack: self.read_pack,
+            pack_of: self.pack_of,
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash, V> LazyPackIndex<K, V> {
+    /// The index of `kind` over `packs`, whose index files are read through
+    /// `transport` (rooted at the repository) with `read_pack`.
+    pub fn new(
+        transport: SharedTransport,
+        packs: &[String],
+        kind: IndexKind,
+        read_pack: ReadPackIndex<K, V>,
+        pack_of: fn(&V) -> &str,
+    ) -> Self {
+        LazyPackIndex {
+            transport,
+            kind,
+            read_pack,
+            pack_of,
+            state: Arc::new(RwLock::new(LazyPackIndexState {
+                entries: HashMap::new(),
+                pending: packs.to_vec(),
+            })),
+        }
+    }
+
+    /// The kind of the indices.
+    pub fn kind(&self) -> IndexKind {
+        self.kind
+    }
+
+    /// Run `f` on the entries, reading the indices of the packs added
+    /// since the last time first.
+    pub fn with_entries<R>(&self, f: impl FnOnce(&HashMap<K, V>) -> R) -> Result<R, KnitError> {
+        {
+            let state = self.state.read().unwrap();
+            if state.pending.is_empty() {
+                return Ok(f(&state.entries));
+            }
+        }
+        let mut state = self.state.write().unwrap();
+        let state = &mut *state;
+        while let Some(pack) = state.pending.last() {
+            let name = index_path(pack, index_extension(self.kind), false);
+            (self.read_pack)(self.transport.as_ref(), &name, pack, &mut state.entries)
+                .map_err(|e| KnitError::Corrupt(format!("reading {name}: {e}")))?;
+            state.pending.pop();
+        }
+        Ok(f(&state.entries))
+    }
+}
+
+impl<K: Eq + std::hash::Hash, V> CombinedIndex for LazyPackIndex<K, V> {
+    fn add_pack(&self, pack: &str, resumed: bool) -> Result<(), RepositoryError> {
+        let mut state = self.state.write().unwrap();
+        if !resumed {
+            state.pending.push(pack.to_string());
+            return Ok(());
+        }
+        let name = index_path(pack, index_extension(self.kind), true);
+        (self.read_pack)(self.transport.as_ref(), &name, pack, &mut state.entries)
+    }
+
+    fn remove_pack(&self, pack: &str) {
+        let mut state = self.state.write().unwrap();
+        state.pending.retain(|pending| pending != pack);
+        let pack_of = self.pack_of;
+        state.entries.retain(|_, value| pack_of(value) != pack);
+    }
 }
 
 /// A reader of pack data, which a [`PackCollection`] tells to drop what it
@@ -368,8 +469,8 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
             }
         }
         for pack in added {
-            for (kind, index) in &self.indices {
-                index.add_pack(self.transport.as_ref(), pack, *kind, false)?;
+            for (_, index) in &self.indices {
+                index.add_pack(pack, false)?;
             }
         }
         Ok(())
@@ -410,8 +511,8 @@ impl<I: CombinedIndex, R: PackReader> PackCollection<I, R> {
         for reader in &self.readers {
             reader.set_resumed(name, true);
         }
-        for (kind, index) in &self.indices {
-            index.add_pack(self.transport.as_ref(), name, *kind, true)?;
+        for (_, index) in &self.indices {
+            index.add_pack(name, true)?;
         }
         Ok(())
     }
@@ -731,13 +832,7 @@ mod tests {
     struct NoIndex;
 
     impl CombinedIndex for NoIndex {
-        fn add_pack(
-            &self,
-            _: &dyn Transport,
-            _: &str,
-            _: IndexKind,
-            _: bool,
-        ) -> Result<(), RepositoryError> {
+        fn add_pack(&self, _: &str, _: bool) -> Result<(), RepositoryError> {
             Ok(())
         }
 

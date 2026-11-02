@@ -18,8 +18,6 @@ pub type Entry = (Vec<Vec<u8>>, Vec<u8>, Vec<Vec<Vec<Vec<u8>>>>);
 /// A pack index opened in whichever on-disk format it uses.
 pub struct PackIndex {
     entries: Vec<Entry>,
-    #[cfg(feature = "knitpack")]
-    node_ref_lists: usize,
 }
 
 impl PackIndex {
@@ -42,11 +40,7 @@ impl PackIndex {
                 .iter_all_entries()
                 .map(|(k, v, r)| (k.clone(), v.clone(), r.clone()))
                 .collect();
-            Ok(PackIndex {
-                entries,
-                #[cfg(feature = "knitpack")]
-                node_ref_lists: btree.node_ref_lists(),
-            })
+            Ok(PackIndex { entries })
         } else {
             // Format-1 GraphIndex: parse the whole file in one pass.
             // parse_full already drops absent nodes.
@@ -56,23 +50,13 @@ impl PackIndex {
                 .into_iter()
                 .map(|(key, (value, references))| (key, value, references))
                 .collect();
-            Ok(PackIndex {
-                entries,
-                #[cfg(feature = "knitpack")]
-                node_ref_lists: parsed.0.node_ref_lists,
-            })
+            Ok(PackIndex { entries })
         }
     }
 
     /// Every entry, as `(key, value, reference-lists)`.
     pub fn iter_all_entries(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter()
-    }
-
-    /// The number of reference lists each entry carries (the graph arity).
-    #[cfg(feature = "knitpack")]
-    pub fn node_ref_lists(&self) -> usize {
-        self.node_ref_lists
     }
 }
 

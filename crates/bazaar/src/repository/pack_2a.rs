@@ -26,7 +26,6 @@ use crate::transport::{Transport, TransportError};
 use crate::versionedfile::Key;
 
 use super::format::RepositoryFormat;
-use super::pack_collection::CombinedIndex as _;
 use crate::bencode_serializer::BEncodeRevisionSerializer1;
 use crate::declare_repository_format;
 use crate::xml_serializer::Chk255BigPageInventorySerializer;
@@ -213,86 +212,52 @@ fn parse_index_value(value: &[u8]) -> Result<(u64, u64, u64, u64), RepositoryErr
 }
 
 /// A [`GcIndex`] built from the per-pack btree indices of one kind
-/// (revisions, inventories, texts or chk), merged across all packs.
+/// (revisions, inventories, texts or chk), merged across all packs, each
+/// read when first needed.
 ///
 /// Each key resolves to the pack it lives in plus the record's location
-/// inside that pack's groupcompress data. Clones share the index, so the
-/// repository can add and remove packs under the store reading through it.
-#[derive(Clone, Default)]
-struct PackGcIndex {
-    state: std::sync::Arc<std::sync::RwLock<PackGcIndexState>>,
+/// inside that pack's groupcompress data.
+type PackGcIndex = super::pack_collection::LazyPackIndex<Key, GcBuildDetails<PackName>>;
+
+/// The combined index for `kind` across `packs`, rooted at
+/// `.bzr/repository`.
+fn pack_gc_index(transport: &SharedTransport, packs: &[PackName], kind: IndexKind) -> PackGcIndex {
+    PackGcIndex::new(
+        SharedTransport::clone(transport),
+        packs,
+        kind,
+        read_gc_pack_index,
+        |details| &details.index_memo.read_memo.index,
+    )
 }
 
-#[derive(Default)]
-struct PackGcIndexState {
-    /// key -> (build details, graph parents).
-    entries: HashMap<Key, GcBuildDetails<PackName>>,
-    /// Whether the underlying index stores graph parents.
-    has_graph: bool,
-}
-
-impl PackGcIndex {
-    /// Build the combined index for `kind` across `packs`, reading each
-    /// pack's index file via `transport` (rooted at `.bzr/repository`).
-    fn load(
-        transport: &dyn Transport,
-        packs: &[PackName],
-        kind: IndexKind,
-    ) -> Result<Self, RepositoryError> {
-        let index = PackGcIndex::default();
-        for pack in packs {
-            index.add_pack(transport, pack, kind, false)?;
-        }
-        Ok(index)
+/// Add the entries of the index `name` of `pack` to `entries`.
+fn read_gc_pack_index(
+    transport: &dyn Transport,
+    name: &str,
+    pack: &str,
+    entries: &mut HashMap<Key, GcBuildDetails<PackName>>,
+) -> Result<(), RepositoryError> {
+    let index = BTreeGraphIndex::open(transport, name)?;
+    for (key, value, refs) in index.iter_all_entries() {
+        let (start, length, basis_end, delta_end) = parse_index_value(value)?;
+        let read_memo = ReadMemo::new(pack.to_string(), start, start + length);
+        let index_memo = IndexMemo::new(read_memo, basis_end, delta_end);
+        let parents = if index.node_ref_lists() > 0 {
+            let first = refs.first().cloned().unwrap_or_default();
+            Some(first.into_iter().map(Key::fixed).collect())
+        } else {
+            None
+        };
+        entries.insert(
+            Key::fixed(key.clone()),
+            GcBuildDetails {
+                index_memo,
+                parents,
+            },
+        );
     }
-}
-
-impl super::pack_collection::CombinedIndex for PackGcIndex {
-    fn add_pack(
-        &self,
-        transport: &dyn Transport,
-        pack: &str,
-        kind: IndexKind,
-        resumed: bool,
-    ) -> Result<(), RepositoryError> {
-        let name = super::pack_collection::index_path(pack, index_extension(kind), resumed);
-        let index = BTreeGraphIndex::open(transport, &name)?;
-        let mut state = self.state.write().unwrap();
-        if index.node_ref_lists() > 0 {
-            state.has_graph = true;
-        }
-        {
-            let entries = &mut state.entries;
-            for (key, value, refs) in index.iter_all_entries() {
-                let (start, length, basis_end, delta_end) = parse_index_value(value)?;
-                let read_memo = ReadMemo::new(pack.to_string(), start, start + length);
-                let index_memo = IndexMemo::new(read_memo, basis_end, delta_end);
-                let parents = if index.node_ref_lists() > 0 {
-                    let first = refs.first().cloned().unwrap_or_default();
-                    Some(first.into_iter().map(Key::fixed).collect())
-                } else {
-                    None
-                };
-                entries.insert(
-                    Key::fixed(key.clone()),
-                    GcBuildDetails {
-                        index_memo,
-                        parents,
-                    },
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Drop the entries of `pack`.
-    fn remove_pack(&self, pack: &str) {
-        self.state
-            .write()
-            .unwrap()
-            .entries
-            .retain(|_, details| details.index_memo.read_memo.index != pack);
-    }
+    Ok(())
 }
 
 impl GcIndex for PackGcIndex {
@@ -302,35 +267,33 @@ impl GcIndex for PackGcIndex {
         &self,
         keys: &[Key],
     ) -> Result<HashMap<Key, GcBuildDetails<Self::F>>, KnitError> {
-        let state = self.state.read().unwrap();
-        let mut out = HashMap::new();
-        for key in keys {
-            if let Some(details) = state.entries.get(key) {
-                out.insert(key.clone(), details.clone());
-            }
-        }
-        Ok(out)
+        self.with_entries(|entries| {
+            keys.iter()
+                .filter_map(|key| Some((key.clone(), entries.get(key)?.clone())))
+                .collect()
+        })
     }
 
     fn get_parent_map(&self, keys: &[Key]) -> Result<HashMap<Key, Vec<Key>>, KnitError> {
-        let state = self.state.read().unwrap();
-        let mut out = HashMap::new();
-        for key in keys {
-            if let Some(details) = state.entries.get(key) {
-                if let Some(parents) = &details.parents {
-                    out.insert(key.clone(), parents.clone());
-                }
-            }
-        }
-        Ok(out)
+        self.with_entries(|entries| {
+            keys.iter()
+                .filter_map(|key| Some((key.clone(), entries.get(key)?.parents.clone()?)))
+                .collect()
+        })
     }
 
     fn keys(&self) -> Result<Vec<Key>, KnitError> {
-        Ok(self.state.read().unwrap().entries.keys().cloned().collect())
+        self.with_entries(|entries| entries.keys().cloned().collect())
     }
 
+    /// Fixed by the kind, as the 2a format defines its indices: revisions,
+    /// inventories and texts record their parents, signatures and CHK
+    /// pages do not.
     fn has_graph(&self) -> bool {
-        self.state.read().unwrap().has_graph
+        matches!(
+            self.kind(),
+            IndexKind::Revision | IndexKind::Inventory | IndexKind::Text
+        )
     }
 
     fn check_write_ok(&self) -> Result<(), KnitError> {
@@ -473,7 +436,7 @@ fn build_store_with_handles(
     packs: &[PackName],
     kind: IndexKind,
 ) -> Result<(Store, PackGcIndex, PackGcAccess), RepositoryError> {
-    let index = PackGcIndex::load(transport.as_ref(), packs, kind)?;
+    let index = pack_gc_index(transport, packs, kind);
     let access = PackGcAccess::new(transport.clone());
     let store = GroupCompressVersionedFiles::new(index.clone(), access.clone(), false);
     Ok((store, index, access))
