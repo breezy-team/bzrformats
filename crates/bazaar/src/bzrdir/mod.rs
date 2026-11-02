@@ -1272,7 +1272,7 @@ pub fn upgrade(
     }
 
     // Already at the target repository format? Nothing to do.
-    let source_repo = source.open_repository()?;
+    let mut source_repo = source.open_repository()?;
     if source_repo.format().format_string == target_format.repo_marker {
         return Err(BzrDirError::Component(
             "already in the target format".to_string(),
@@ -1300,7 +1300,7 @@ pub fn upgrade(
     // Fetch every revision into the new repository.
     {
         let mut new_repo = new.open_repository()?;
-        crate::repository::fetch(source_repo.as_ref(), new_repo.as_mut(), None)
+        crate::repository::fetch(source_repo.as_mut(), new_repo.as_mut(), None)
             .map_err(|e| BzrDirError::Component(format!("fetching revisions: {e}")))?;
     }
 
