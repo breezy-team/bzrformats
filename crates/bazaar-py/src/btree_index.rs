@@ -19,6 +19,7 @@ use crate::index::PyGraphIndexBuilder;
 
 import_exception!(bzrformats.index, BadIndexFormatSignature);
 import_exception!(bzrformats.index, BadIndexOptions);
+import_exception!(bzrformats.index, BadIndexData);
 import_exception!(bzrformats.index, BadIndexDuplicateKey);
 
 /// The on-disk B+Tree page size.
@@ -40,13 +41,18 @@ impl DummyTransport {
     fn recommended_page_size(&self) -> usize {
         page_size()
     }
+
+    /// Used when reporting a corrupt spilled backing, which has no real URL.
+    fn abspath(&self, relpath: String) -> String {
+        relpath
+    }
 }
 
 fn header_err_to_py(err: BTreeIndexError) -> PyErr {
     match err {
         BTreeIndexError::BadSignature => BadIndexFormatSignature::new_err(("", "BTreeGraphIndex")),
         BTreeIndexError::BadOptions => BadIndexOptions::new_err(("",)),
-        BTreeIndexError::BadInternalNode => {
+        BTreeIndexError::BadInternalNode | BTreeIndexError::BadCompression => {
             pyo3::exceptions::PyValueError::new_err(err.to_string())
         }
     }
@@ -1348,8 +1354,14 @@ impl BTreeGraphIndex {
             } else {
                 data.as_bytes().to_vec()
             };
-            let decompressed = decompress_page(&payload)
-                .map_err(|e| PyValueError::new_err(format!("bad btree node: {e}")))?;
+            let decompressed = match decompress_page(&payload) {
+                Ok(d) => d,
+                Err(_) => {
+                    let me = slf.borrow();
+                    let path = me.transport.bind(py).call_method1("abspath", (&me.name,))?;
+                    return Err(BadIndexData::new_err((path.unbind(),)));
+                }
+            };
             let key_length = slf.borrow()._key_length().unwrap_or(1);
             let nrl = slf.borrow().lock_node_ref_lists().unwrap_or(0);
             let node: Bound<'py, PyAny> = if decompressed.starts_with(LEAF_FLAG) {

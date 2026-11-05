@@ -578,6 +578,18 @@ class TestBTreeIndex(BTreeTestCase):
         self.assertEqual(internal_node_pre_clear, set(index._internal_node_cache))
         self.assertEqual(0, len(index._leaf_node_cache))
 
+    def test_truncated_root_node(self):
+        builder = btree_index.BTreeBuilder(key_elements=1, reference_lists=0)
+        for i in range(15):
+            builder.add_node((b"key%d" % i,), b"value")
+        content = builder.finish().read()
+        header_end = content.index(b"row_lengths=1\n") + len(b"row_lengths=1\n")
+        t = self.get_transport("")
+        t.put_bytes("index", content[: header_end + 13])
+        index = btree_index.BTreeGraphIndex(t, "index", header_end + 13)
+        e = self.assertRaises(_mod_index.BadIndexData, index.key_count)
+        self.assertEqual(t.abspath("index"), e.value)
+
     def test_trivial_constructor(self):
         t = TracingTransport(self.get_transport(""))
         btree_index.BTreeGraphIndex(t, "index", None)
