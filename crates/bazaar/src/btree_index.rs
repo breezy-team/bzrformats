@@ -39,6 +39,8 @@ pub enum BTreeIndexError {
     /// An internal node's body was too short — missing the type line, the
     /// offset line, or an integer that couldn't be parsed.
     BadInternalNode,
+    /// A page's zlib stream was corrupt or truncated.
+    BadCompression,
 }
 
 impl std::fmt::Display for BTreeIndexError {
@@ -47,6 +49,7 @@ impl std::fmt::Display for BTreeIndexError {
             BTreeIndexError::BadSignature => write!(f, "bad btree index format signature"),
             BTreeIndexError::BadOptions => write!(f, "bad btree index options"),
             BTreeIndexError::BadInternalNode => write!(f, "bad btree internal node"),
+            BTreeIndexError::BadCompression => write!(f, "corrupt compressed btree page"),
         }
     }
 }
@@ -429,7 +432,7 @@ pub fn decompress_page(data: &[u8]) -> Result<Vec<u8>, BTreeIndexError> {
     let mut z = flate2::read::ZlibDecoder::new(data);
     let mut decompressed = Vec::with_capacity(PAGE_SIZE);
     z.read_to_end(&mut decompressed)
-        .map_err(|_| BTreeIndexError::BadInternalNode)?;
+        .map_err(|_| BTreeIndexError::BadCompression)?;
     Ok(decompressed)
 }
 
