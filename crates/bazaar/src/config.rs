@@ -32,8 +32,8 @@ mod option;
 
 pub use configobj::{quote_value, unquote_value, ConfigObj, ConfigObjError, SectionNode};
 pub use option::{
-    bool_from_store, int_from_store, int_si_from_store, list_from_store, Option as ConfigOption,
-    OptionRegistry,
+    bool_from_store, int_from_store, int_si_from_store, list_from_store, Converter,
+    Option as ConfigOption, OptionRegistry,
 };
 
 /// Errors from the config layer.
