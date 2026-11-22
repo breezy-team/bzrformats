@@ -67,6 +67,11 @@ impl Option {
         self.default.as_deref()
     }
 
+    /// The converter this option uses to interpret its on-disk value.
+    pub fn converter(&self) -> Converter {
+        self.converter
+    }
+
     /// Convert an already-unquoted on-disk value per the option's converter.
     ///
     /// Returns `None` when the converter rejects the input (e.g. a non-boolean
@@ -97,11 +102,15 @@ impl OptionRegistry {
         OptionRegistry::default()
     }
 
-    /// A registry pre-populated with the branch-relevant options breezy
-    /// declares (the ones that govern stacking, binding, and branch identity).
+    /// A registry pre-populated with the options breezy declares in its global
+    /// `option_registry` (`breezy/config.py`) that have static defaults.
     ///
-    /// Home-directory options (email, signing policy, etc.) are not registered
-    /// here; breezy adds those on its side when it composes the global stores.
+    /// Options this registry cannot describe are not registered here; breezy
+    /// supplies those on its side when it composes the global stores. That
+    /// covers a default computed by a callable (email address, mail client,
+    /// SSL cert paths, orphan policy), a value taken from the environment
+    /// (`ssh`, `progress_bar`) and a converter with no equivalent here (the
+    /// signature policies, the float `serve.client_timeout`).
     pub fn with_defaults() -> Self {
         let mut r = OptionRegistry::new();
         r.register(Option::string("stacked_on_location", None));
@@ -112,12 +121,85 @@ impl OptionRegistry {
         r.register(Option::string("public_branch", None));
         r.register(Option::string("submit_branch", None));
         r.register(Option::string("nickname", None));
-        r.register(Option::string("default_format", Some("2a")));
+        r.register(Option::string("child_submit_format", None));
+        r.register(Option::string("child_submit_to", None));
+        r.register(Option::string("submit_to", None));
         r.register(Option::with_converter(
             "append_revisions_only",
             None,
             Converter::Bool,
         ));
+        r.register(Option::with_converter(
+            "branch.fetch_tags",
+            Some("False"),
+            Converter::Bool,
+        ));
+        r.register(Option::with_converter("push_strict", None, Converter::Bool));
+        r.register(Option::with_converter("send_strict", None, Converter::Bool));
+
+        r.register(Option::with_converter(
+            "bzr.workingtree.worth_saving_limit",
+            Some("10"),
+            Converter::Int,
+        ));
+        r.register(Option::with_converter(
+            "dirstate.fdatasync",
+            Some("True"),
+            Converter::Bool,
+        ));
+        r.register(Option::with_converter(
+            "repository.fdatasync",
+            Some("True"),
+            Converter::Bool,
+        ));
+        r.register(Option::with_converter(
+            "add.maximum_file_size",
+            Some("20MB"),
+            Converter::IntSi,
+        ));
+
+        r.register(Option::with_converter(
+            "calculate_revnos",
+            Some("True"),
+            Converter::Bool,
+        ));
+        r.register(Option::string("log_format", Some("long")));
+        r.register(Option::with_converter(
+            "validate_signatures_in_log",
+            Some("False"),
+            Converter::Bool,
+        ));
+
+        r.register(Option::with_converter(
+            "acceptable_keys",
+            None,
+            Converter::List,
+        ));
+        r.register(Option::string("gpg_signing_key", None));
+
+        r.register(Option::with_converter(
+            "locks.steal_dead",
+            Some("True"),
+            Converter::Bool,
+        ));
+        r.register(Option::string("default_format", Some("2a")));
+        r.register(Option::string("post_commit", None));
+
+        r.register(Option::string("editor", None));
+        r.register(Option::string("language", None));
+        r.register(Option::string("output_encoding", None));
+        r.register(Option::string("bugtracker", None));
+
+        r.register(Option::string("smtp_server", None));
+        r.register(Option::string("smtp_username", None));
+        r.register(Option::string("smtp_password", None));
+
+        r.register(Option::with_converter(
+            "selftest.timeout",
+            Some("1200"),
+            Converter::Int,
+        ));
+
         r
     }
 
@@ -230,6 +312,28 @@ mod tests {
         );
         assert!(r.get("stacked_on_location").unwrap().default().is_none());
         assert_eq!(r.get("bound").unwrap().converter, Converter::Bool);
+    }
+
+    #[test]
+    fn registry_static_defaults() {
+        let r = OptionRegistry::with_defaults();
+        let fetch_tags = r.get("branch.fetch_tags").unwrap();
+        assert_eq!(fetch_tags.default(), Some("False"));
+        assert_eq!(fetch_tags.converter(), Converter::Bool);
+        let max_size = r.get("add.maximum_file_size").unwrap();
+        assert_eq!(max_size.default(), Some("20MB"));
+        assert_eq!(max_size.converter(), Converter::IntSi);
+        let timeout = r.get("selftest.timeout").unwrap();
+        assert_eq!(timeout.default(), Some("1200"));
+        assert_eq!(timeout.converter(), Converter::Int);
+        assert_eq!(
+            r.get("acceptable_keys").unwrap().converter(),
+            Converter::List
+        );
+        // Options the registry cannot describe are left to breezy.
+        for name in ["email", "ssh", "check_signatures", "serve.client_timeout"] {
+            assert!(r.get(name).is_none(), "{} is registered", name);
+        }
     }
 
     #[test]
