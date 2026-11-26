@@ -4148,6 +4148,11 @@ where
         &self.index
     }
 
+    /// The backing access to the raw records.
+    pub fn access(&self) -> &A {
+        &self.access
+    }
+
     /// Run `op`, retrying it if it fails with [`KnitError::Retry`].
     ///
     /// On a retry error the pack listing changed underneath the read
@@ -6207,6 +6212,43 @@ where
     pub fn annotate_flat(&mut self, key: &KnitKey) -> Result<Vec<(KnitKey, Vec<u8>)>, KnitError> {
         let (annotations, lines) = self.annotate(key)?;
         self.heads_to_flat(annotations, lines)
+    }
+}
+
+impl<I, A, F> crate::annotate::TextAnnotator for KnitAnnotator<I, A, F>
+where
+    I: KnitIndex,
+    A: KnitAccess<F = I::F>,
+    F: KnitFactory,
+    F::Content: Clone,
+{
+    fn add_special_text(
+        &mut self,
+        key: crate::versionedfile::Key,
+        parent_keys: Vec<crate::versionedfile::Key>,
+        lines: Vec<Vec<u8>>,
+    ) {
+        KnitAnnotator::add_special_text(
+            self,
+            key.segments().to_vec(),
+            parent_keys
+                .iter()
+                .map(|parent| parent.segments().to_vec())
+                .collect(),
+            lines,
+        )
+    }
+
+    fn annotate_flat(
+        &mut self,
+        key: &crate::versionedfile::Key,
+    ) -> Result<Vec<(crate::versionedfile::Key, Vec<u8>)>, KnitError> {
+        Ok(
+            KnitAnnotator::annotate_flat(self, &key.segments().to_vec())?
+                .into_iter()
+                .map(|(origin, line)| (crate::versionedfile::Key::fixed(origin), line))
+                .collect(),
+        )
     }
 }
 

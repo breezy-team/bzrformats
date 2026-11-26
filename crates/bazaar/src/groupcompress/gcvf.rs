@@ -1091,10 +1091,10 @@ where
             .collect::<Result<Vec<_>, _>>()
     }
 
-    fn annotate(&self, _key: &GcKey) -> Result<Vec<(GcKey, Vec<u8>)>, crate::knit::KnitError> {
-        Err(crate::knit::KnitError::NotImplemented(
-            "groupcompress annotate",
-        ))
+    /// Groupcompress records carry no line origins, so the texts' ancestry
+    /// is diffed, as `GroupCompressVersionedFiles.annotate` does.
+    fn annotate(&self, key: &GcKey) -> Result<Vec<(GcKey, Vec<u8>)>, crate::knit::KnitError> {
+        crate::annotate::Annotator::new(self).annotate_flat(key)
     }
 
     fn get_missing_compression_parent_keys(&self) -> Result<Vec<GcKey>, crate::knit::KnitError> {
@@ -1595,9 +1595,9 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct MemIndex(std::rc::Rc<std::cell::RefCell<MemStore>>);
+    struct MemIndex(std::sync::Arc<std::sync::Mutex<MemStore>>);
     #[derive(Clone)]
-    struct MemAccess(std::rc::Rc<std::cell::RefCell<MemStore>>);
+    struct MemAccess(std::sync::Arc<std::sync::Mutex<MemStore>>);
 
     impl GcIndex for MemIndex {
         type F = String;
@@ -1606,7 +1606,7 @@ mod tests {
             keys: &[GcKey],
         ) -> Result<std::collections::HashMap<GcKey, GcBuildDetails<String>>, crate::knit::KnitError>
         {
-            let store = self.0.borrow();
+            let store = self.0.lock().unwrap();
             Ok(keys
                 .iter()
                 .filter_map(|k| store.details.get(k).map(|d| (k.clone(), d.clone())))
@@ -1616,7 +1616,7 @@ mod tests {
             &self,
             keys: &[GcKey],
         ) -> Result<std::collections::HashMap<GcKey, Vec<GcKey>>, crate::knit::KnitError> {
-            let store = self.0.borrow();
+            let store = self.0.lock().unwrap();
             Ok(keys
                 .iter()
                 .filter_map(|k| {
@@ -1628,7 +1628,7 @@ mod tests {
                 .collect())
         }
         fn keys(&self) -> Result<Vec<GcKey>, crate::knit::KnitError> {
-            Ok(self.0.borrow().details.keys().cloned().collect())
+            Ok(self.0.lock().unwrap().details.keys().cloned().collect())
         }
         fn has_graph(&self) -> bool {
             true
@@ -1641,7 +1641,7 @@ mod tests {
             records: &[(GcKey, IndexMemo<String>, Option<Vec<GcKey>>)],
             _random_id: bool,
         ) -> Result<(), crate::knit::KnitError> {
-            let mut store = self.0.borrow_mut();
+            let mut store = self.0.lock().unwrap();
             for (key, memo, parents) in records {
                 store.details.insert(
                     key.clone(),
@@ -1661,7 +1661,7 @@ mod tests {
             &self,
             memos: &[ReadMemo<String>],
         ) -> Result<Vec<Vec<u8>>, crate::knit::KnitError> {
-            let store = self.0.borrow();
+            let store = self.0.lock().unwrap();
             memos
                 .iter()
                 .map(|m| {
@@ -1682,7 +1682,7 @@ mod tests {
             _size: usize,
             chunks: Vec<Vec<u8>>,
         ) -> Result<ReadMemo<String>, crate::knit::KnitError> {
-            let mut store = self.0.borrow_mut();
+            let mut store = self.0.lock().unwrap();
             let idx = store.blocks.len();
             let bytes: Vec<u8> = chunks.concat();
             let len = bytes.len() as u64;
@@ -1695,7 +1695,7 @@ mod tests {
     fn insert_record_stream_then_get_record_stream_round_trips() {
         use crate::versionedfile::{ChunkedContentFactory, ContentFactory};
 
-        let store = std::rc::Rc::new(std::cell::RefCell::new(MemStore::default()));
+        let store = std::sync::Arc::new(std::sync::Mutex::new(MemStore::default()));
         let vf = GroupCompressVersionedFiles::new(
             MemIndex(store.clone()),
             MemAccess(store.clone()),
@@ -1737,7 +1737,7 @@ mod tests {
 
     #[test]
     fn add_lines_then_get_sha1s_and_iter_lines() {
-        let store = std::rc::Rc::new(std::cell::RefCell::new(MemStore::default()));
+        let store = std::sync::Arc::new(std::sync::Mutex::new(MemStore::default()));
         let vf = GroupCompressVersionedFiles::new(
             MemIndex(store.clone()),
             MemAccess(store.clone()),
@@ -1771,5 +1771,89 @@ mod tests {
 
         // check passes over a sound store.
         vf.check().unwrap();
+    }
+
+    #[test]
+    fn annotate_flat_attributes_each_line_to_its_origin() {
+        use crate::annotate::Annotator;
+        let store = std::sync::Arc::new(std::sync::Mutex::new(MemStore::default()));
+        let vf = GroupCompressVersionedFiles::new(
+            MemIndex(store.clone()),
+            MemAccess(store.clone()),
+            true,
+        );
+        // r1 introduces two lines; r2 (child of r1) keeps line 1, changes line
+        // 2 and appends line 3.
+        let r1 = gckey(b"r1");
+        let r2 = gckey(b"r2");
+        vf.add_lines(
+            r1.clone(),
+            Some(vec![]),
+            vec![b"a\n".to_vec(), b"b\n".to_vec()],
+        )
+        .unwrap();
+        vf.add_lines(
+            r2.clone(),
+            Some(vec![r1.clone()]),
+            vec![b"a\n".to_vec(), b"B\n".to_vec(), b"c\n".to_vec()],
+        )
+        .unwrap();
+
+        let mut annotator = Annotator::new(&vf);
+        let flat = annotator.annotate_flat(&r2).unwrap();
+        // Line "a" comes from r1 (unchanged); "B" and "c" are new in r2.
+        assert_eq!(
+            flat,
+            vec![
+                (r1.clone(), b"a\n".to_vec()),
+                (r2.clone(), b"B\n".to_vec()),
+                (r2.clone(), b"c\n".to_vec()),
+            ]
+        );
+
+        // Annotating the parent alone attributes both lines to r1.
+        let mut annotator = Annotator::new(&vf);
+        let flat = annotator.annotate_flat(&r1).unwrap();
+        assert_eq!(
+            flat,
+            vec![(r1.clone(), b"a\n".to_vec()), (r1.clone(), b"b\n".to_vec()),]
+        );
+    }
+
+    #[test]
+    fn annotate_special_text_attributes_new_lines_to_default() {
+        use crate::annotate::Annotator;
+        let store = std::sync::Arc::new(std::sync::Mutex::new(MemStore::default()));
+        let vf = GroupCompressVersionedFiles::new(
+            MemIndex(store.clone()),
+            MemAccess(store.clone()),
+            true,
+        );
+        let r1 = gckey(b"r1");
+        vf.add_lines(
+            r1.clone(),
+            Some(vec![]),
+            vec![b"a\n".to_vec(), b"b\n".to_vec()],
+        )
+        .unwrap();
+
+        // An edited working copy: keeps "a", changes "b", appends a new line.
+        // It is not in the store; inject it with r1 as its parent.
+        let working = gckey(b"current:");
+        let mut annotator = Annotator::new(&vf);
+        annotator.add_special_text(
+            working.clone(),
+            vec![r1.clone()],
+            vec![b"a\n".to_vec(), b"B\n".to_vec(), b"new\n".to_vec()],
+        );
+        let flat = annotator.annotate_flat(&working).unwrap();
+        assert_eq!(
+            flat,
+            vec![
+                (r1.clone(), b"a\n".to_vec()),
+                (working.clone(), b"B\n".to_vec()),
+                (working.clone(), b"new\n".to_vec()),
+            ]
+        );
     }
 }
